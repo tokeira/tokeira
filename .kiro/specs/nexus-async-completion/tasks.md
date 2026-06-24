@@ -203,7 +203,7 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
     - _Feature: nexus-async-completion, Property 3, Property 6_
     - _Requirements: 4.1, 5.1, 5.3, 7.1_
 
-- [ ] 5. Edge + HTTP server — wire translation, inbound endpoint, server
+- [x] 5. Edge + HTTP server — wire translation, inbound endpoint, server
   - [x] 5.1 Emit callback fields in `start_operation_to_proto` (`translate/nexus.rs`)
     - Populate `callback`/`callback_header` from the task's `callback_url`/`callback_token` (replacing
       the empty synthesis from `edge-nexus-task-transport`).
@@ -212,22 +212,57 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
       {Temporal-Callback-Token: callback_token}` when present; empty when absent (preserves the
       no-callback contract for External-target dispatch).
     - _Requirements: 1.1, 1.2_
-  - [ ] 5.2 Inbound `/nexus/callback` handler (`tokeira-edge`)
+  - [x] 5.2 Inbound `/nexus/callback` handler (`tokeira-edge`)
     - Parse `Temporal-Callback-Token` (decode + version), `Nexus-Operation-State`, and body (result
       payload for `succeeded`; Nexus failure for `failed`/`canceled`, reusing the `RespondNexusTaskFailed`
       failure conversion); map → `NexusResolution`; call `resolve_nexus_operation`. Return 2xx; bad/
       missing token → bad-request handler error; absent/already-resolved op (kernel
       `Stale`/`Unknown`) → not-found handler result. Mirrors `completionHandler.CompleteOperation @ v1.31.0`.
+    - Landed (`crates/tokeira-edge/src/nexus_callback.rs`): transport-agnostic
+      `handle_nexus_callback(runtime, callback_token_header, operation_state_header,
+      content_type_header, body) -> CallbackResponse{status,body}`. `succeeded` → `body_to_payloads`
+      (the firing path's serializer, now `pub`) → `Completed`; `failed`/`canceled` require
+      `application/json` + a decodable `NexusCompletionFailureBody` (matching v1.31.0's
+      `isMediaTypeJSON` + `json.Unmarshal` for *both* states, completion.go:257-268) → `Failed{failure}`
+      (the body's `failure` is already a kernel `Payload`, so no proto re-wrap) / `Canceled`. Status
+      taxonomy: decode failures (missing/bad/wrong-version token, missing/unknown state, non-JSON or
+      malformed failure body) → `400`; `Ok(true)` → `200`; `Ok(false)` (absent/stale/already-resolved,
+      idempotent) → `404`; `Err` (transient) → `503`. Nexus-Link parsing deferred (design "Out of
+      Scope"). Operation-state header name exposed as `pub const NEXUS_OPERATION_STATE_HEADER`.
     - _Requirements: 3.1, 3.3, 3.4, 3.5, 5.1, 5.2_
-  - [ ] 5.3 HTTP server wiring in `apps/tokeirad` (hyper)
+  - [x] 5.3 HTTP server wiring in `apps/tokeirad` (hyper)
     - Stand up a `hyper` HTTP/1.1 listener serving `POST /nexus/callback` alongside the gRPC server in
       the serve path; bind from config; point the runtime completion client's `temporal://system`
       resolution at this address. Bump the lockfile: `cargo update -p hyper@1.9.0 --precise 1.10.1`.
+    - Landed (`apps/tokeirad/src/lib.rs`): hand-rolled `hyper::server::conn::http1` listener
+      (`spawn_nexus_callback_server` + `nexus_callback_response` adapter, `service_fn`) bound to
+      `policy.nexus_completion.http_addr`, gated on `background_cancel` with graceful per-connection
+      shutdown, delegating to `handle_nexus_callback` through the same `RuntimeAdapter`
+      (`WorkflowRuntimeApi`) the gRPC surface uses. The listener is bound **before** the runtime is
+      built so the firing client's `system_callback_url` is rewritten (`with_loopback_port`) to the
+      actually-bound port — closing the loopback even with an ephemeral `:0` bind. The real
+      `HttpNexusCompletionClient` + a `NexusCompletionRuntimeConfig` derived from
+      `NexusCompletionConfig` replace the Wave-4 `NoopNexusCompletionClient`. The firing path now
+      appends `NEXUS_CALLBACK_PATH` (`/nexus/callback`) to the resolved loopback base (external URLs
+      posted verbatim). `start_in_memory` uses an ephemeral nexus port so parallel servers never
+      collide. Lockfile bumped `hyper 1.9.0 → 1.10.1` (h2 0.4.13 → 0.4.15 transitively).
     - _Requirements: 3.1, 3.2_
-  - [ ] 5.4 Property test P9 — inbound endpoint resolves valid / bad-token / not-found
+  - [x] 5.4 Property test P9 — inbound endpoint resolves valid / bad-token / not-found
+    - Landed (`crates/tokeira-edge/tests/nexus_callback.rs`, 13 tests): a scripted `FakeRuntime`
+      `WorkflowRuntimeApi` drives `handle_nexus_callback` directly — succeeded/failed/canceled →
+      `200` + the forwarded `(run_key, op_id, scheduled_event_id, resolution)`; `Ok(false)` → `404`;
+      `Err` → `503`; missing / undecodable / wrong-version token, missing/unknown state, failed
+      without `application/json`, malformed failure body → `400` with **no** resolution submitted.
     - _Feature: nexus-async-completion, Property 9_
     - _Requirements: 3.1, 3.3, 3.4, 3.5, 5.2_
-  - [ ] 5.5 Edge test P7 — Describe surfaces callback state/attempt/last_attempt_failure
+  - [x] 5.5 Edge test P7 — Describe surfaces callback state/attempt/last_attempt_failure
+    - Landed (`crates/tokeira-edge/src/grpc/translate.rs` tests): `workflow_callback_info_to_proto`
+      surfaces a `BackingOff` callback's `attempt`, `last_attempt_failure`, and next-retry time; a
+      `Succeeded` callback carries no failure / no pending retry; and the six kernel callback states
+      map 1:1 to `enums::CallbackState`. Wired the previously-hardcoded
+      `CallbackInfo.next_attempt_schedule_time` from the kernel's `next_attempt_at` (a v1.31.0-faithful
+      Describe fidelity fix). The existing `describe_..._completion_callbacks` integration test already
+      covers the `Standby` registration case end-to-end through gRPC.
     - _Feature: nexus-async-completion, Property 7_
     - _Requirements: 6.1_
 
@@ -236,7 +271,30 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
     `cargo check --workspace`.
 
 - [ ] 7. Integration — end-to-end async round-trip (`apps/tokeirad/tests/`)
-  - [ ] 7.1 Async analogue of the verified sync round-trip
+  - **Conformance validated (2026-06-24):** the operator's `TestNexusAsyncOperationWithMultipleCallers`
+    (both `conflict-policy-fail` and `conflict-policy-use-existing`) now PASSES end-to-end against
+    tokeirad with the real Temporal Go SDK (v1.41.1) worker: caller schedules an async
+    `WorkflowRunOperation`, the worker starts the handler workflow with the completion callback, the
+    handler workflow closes, tokeira fires the loopback `POST /nexus/callback`, and every caller
+    observes the result (or the typed `WorkflowExecutionAlreadyStarted` failure). Surfaced + fixed three
+    integration-seam bugs not covered by the wave's unit tests:
+    1. **Worker-dispatch callback URL** — the `StartOperation` callback sent to a Worker handler must be
+       a concrete `http(s)://…/nexus/callback` (the handler POSTs it back itself); tokeira was sending
+       the `temporal://system` sentinel, which a Worker SDK rejects ("unknown scheme"). Now resolved up
+       front via `system_callback_post_url` (the `UseSystemCallbackURL=false` shape @ v1.31.0).
+       (`crates/tokeira-runtime/src/publisher.rs`)
+    2. **Callback-token header case** — the inbound `StartWorkflowExecution` path lowercases callback
+       header keys (mirroring v1.31.0's `nexus.Header`), so the firing path's case-SENSITIVE
+       `header.get("Temporal-Callback-Token")` missed → empty token → inbound 400 → caller hung. Now a
+       case-insensitive lookup. Regression test
+       `completion_callback_fires_with_lowercased_token_header`. (`crates/tokeira-runtime/src/publisher.rs`)
+    3. **`WorkflowExecutionAlreadyStarted` gRPC detail** (pre-existing, general `StartWorkflowExecution`
+       fidelity — not async-completion-specific) — tokeira returned a bare `AlreadyExists` without the
+       `WorkflowExecutionAlreadyStartedFailure` detail, so the worker SDK reconstructed a generic error
+       and the caller could not extract the typed application error. Now emits the typed detail (mirrors
+       the existing activity-already-started path). Regression test
+       `workflow_already_started_status_carries_typed_detail`. (`crates/tokeira-edge/src/grpc/errors.rs`)
+  - [ ] 7.1 Async analogue of the verified sync round-trip (tokeira-authored test still pending)
     - Schedule an async op; external poller replies `AsyncSuccess`; a second (handler) workflow closes;
       tokeira fires the callback (loopback POST to its own `/nexus/callback`); assert the caller observes
       `NexusOperationCompleted` with the handler's result. Cross-namespace (handler in agents-ns,

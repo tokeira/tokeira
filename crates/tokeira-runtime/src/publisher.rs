@@ -722,15 +722,21 @@ where
                     namespace_id,
                     task_queue,
                 } => {
-                    // Attach a completion callback so the handler's backing workflow
-                    // delivers the eventual async outcome back to this originator's
-                    // pending op. Worker (in-cluster) targets use the
-                    // `temporal://system` sentinel, resolved to our own listener when
-                    // the callback fires (design §2). `request_id` reuses
-                    // `operation_id` — the only routing key in scope here — matching
-                    // how `StartOperation.request_id` is already populated below (a
-                    // tokeira convention; v1.31.0's `NexusOperationCompletion.request_id`
-                    // is a distinct field, documented in nexus-async-completion 3.1).
+                    // Attach a completion callback so the Worker handler delivers the
+                    // eventual async outcome back to this originator's pending op. The
+                    // handler POSTs that completion itself, so the callback URL must be a
+                    // concrete `http(s)://…/nexus/callback` address it can reach — our own
+                    // inbound listener — NOT the `temporal://system` sentinel (a Worker SDK
+                    // rejects a non-HTTP scheme: "unknown scheme: temporal://system"). This
+                    // is the `UseSystemCallbackURL = false` shape (the callback-URL-template
+                    // mode, `components/nexusoperations/executors.go:122-160 @ v1.31.0`):
+                    // tokeira delivers Worker completions over HTTP to its own listener
+                    // rather than via the SDK's system-callback internal route, so it always
+                    // resolves the address up front. `request_id` reuses `operation_id` — the
+                    // only routing key in scope here — matching how `StartOperation.request_id`
+                    // is already populated below (a tokeira convention; v1.31.0's
+                    // `NexusOperationCompletion.request_id` is a distinct field, documented in
+                    // nexus-async-completion 3.1).
                     let token = crate::nexus::NexusCompletionToken {
                         originator_run_key,
                         operation_id: operation_id.clone(),
@@ -739,7 +745,9 @@ where
                     };
                     let (callback_url, callback_token) = match token.encode() {
                         Ok(encoded) => (
-                            Some(crate::nexus::SYSTEM_CALLBACK_URL.to_string()),
+                            Some(crate::nexus::system_callback_post_url(
+                                &self.nexus_completion_config.system_callback_url,
+                            )),
                             Some(encoded),
                         ),
                         Err(error) => {
@@ -973,9 +981,19 @@ where
         outcome: &CallbackCompletionOutcome,
     ) {
         let CallbackSpec::Nexus { url, header } = &callback.spec;
+        // Look the token header up case-INSENSITIVELY. HTTP header names are
+        // case-insensitive, and the inbound `StartWorkflowExecution` path lowercases
+        // every callback header key (`callback_to_edge`, mirroring v1.31.0's
+        // `nexus.Header`, `common/nexus/nexusrpc/api.go:56,110 @ v1.31.0`) — so a callback
+        // attached by a Worker handler is stored as `temporal-callback-token`, while a
+        // callback tokeira authors directly uses the mixed-case `Temporal-Callback-Token`
+        // const. A case-sensitive `get` would miss the lowercased form and fire with an
+        // empty token, which the inbound listener then rejects (400) — silently breaking
+        // the loopback.
         let token = header
-            .get(TEMPORAL_CALLBACK_TOKEN_HEADER)
-            .cloned()
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(TEMPORAL_CALLBACK_TOKEN_HEADER))
+            .map(|(_, value)| value.clone())
             .unwrap_or_default();
 
         // Map the kernel outcome onto the wire completion, synthesizing the Nexus
@@ -1007,10 +1025,12 @@ where
         };
 
         // Resolve the `temporal://system` sentinel to the configured local listener (the
-        // loopback v1.31.0 performs via `routeSystemCallbackRequest`); external URLs are
-        // posted as-is.
+        // loopback v1.31.0 performs via `routeSystemCallbackRequest`), appending the fixed
+        // completion path; external URLs already encode their own path and are posted as-is.
         let target = if url == SYSTEM_CALLBACK_URL {
-            self.nexus_completion_config.system_callback_url.clone()
+            crate::nexus::system_callback_post_url(
+                &self.nexus_completion_config.system_callback_url,
+            )
         } else {
             url.clone()
         };

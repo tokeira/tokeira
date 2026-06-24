@@ -875,10 +875,20 @@ proptest! {
                     prop_assert_eq!(actual_operation, expected_operation.clone());
                     prop_assert_eq!(request_id, expected_operation_id.clone());
                     prop_assert_eq!(payload, Some(Payload::new(input_bytes.clone())));
-                    // Property 1: a Worker-target dispatch carries the system callback
-                    // URL + a decodable, version-checked completion token whose
-                    // routing keys equal the dispatched operation's.
-                    prop_assert_eq!(callback_url, Some(SYSTEM_CALLBACK_URL.to_string()));
+                    // Property 1: a Worker-target dispatch carries the resolved HTTP
+                    // completion callback URL (the handler POSTs its async outcome here)
+                    // + a decodable, version-checked completion token whose routing keys
+                    // equal the dispatched operation's. The URL is the configured listener
+                    // base joined with the callback path — never the `temporal://system`
+                    // sentinel, which a Worker SDK cannot POST to.
+                    prop_assert_eq!(
+                        callback_url,
+                        Some(format!(
+                            "{}{}",
+                            NexusCompletionRuntimeConfig::default().system_callback_url,
+                            tokeira_runtime::NEXUS_CALLBACK_PATH
+                        ))
+                    );
                     let encoded = callback_token.expect("completion token attached");
                     let token = NexusCompletionToken::decode(&encoded)
                         .expect("completion token decodes + version-checks");
@@ -1669,12 +1679,92 @@ async fn completion_callback_delivered_on_close_succeeds() -> Result<()> {
     assert_eq!(calls.len(), 1, "exactly one delivery attempt");
     assert_eq!(
         calls[0].url,
-        NexusCompletionRuntimeConfig::default().system_callback_url
+        format!(
+            "{}{}",
+            NexusCompletionRuntimeConfig::default().system_callback_url,
+            tokeira_runtime::NEXUS_CALLBACK_PATH
+        )
     );
     assert_eq!(calls[0].state, "succeeded");
     let decoded = NexusCompletionToken::decode(&calls[0].token).expect("token round-trips");
     assert_eq!(decoded.operation_id, "op-async");
     assert_eq!(decoded.scheduled_event_id, 7);
+    Ok(())
+}
+
+/// Regression: a callback attached via the real `StartWorkflowExecution` path is stored
+/// with a **lowercased** header key (`callback_to_edge` lowercases keys to mirror
+/// v1.31.0's `nexus.Header`). The firing path must still find the token — a case-sensitive
+/// lookup would miss it, fire with an empty token, and the inbound listener would 400, so
+/// the caller's async op would never resolve (the multiple-callers conformance timeout).
+#[tokio::test]
+async fn completion_callback_fires_with_lowercased_token_header() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    let registry = seed_registry(vec![]);
+    let client = Arc::new(RecordingCompletionClient::new(
+        Vec::new(),
+        CompletionDeliveryOutcome::Delivered,
+    ));
+    let runtime = runtime_with_completion_client(store.clone(), registry, client.clone());
+
+    let token = NexusCompletionToken {
+        originator_run_key: RunKey(uuid::Uuid::from_u128(99)),
+        operation_id: "op-lower".to_string(),
+        scheduled_event_id: 11,
+        request_id: "op-lower".to_string(),
+    }
+    .encode()
+    .expect("encode token");
+
+    // The key as the inbound StartWorkflowExecution path stores it: lowercase.
+    let callback = CompletionCallback {
+        spec: CallbackSpec::Nexus {
+            url: SYSTEM_CALLBACK_URL.to_string(),
+            header: std::collections::BTreeMap::from([(
+                "temporal-callback-token".to_string(),
+                token.clone(),
+            )]),
+        },
+        links: Vec::new(),
+        trigger: CallbackTrigger::WorkflowClosed,
+        registration_time: None,
+        state: CallbackState::Standby,
+        attempt: 0,
+        last_attempt_failure: None,
+        next_attempt_at: None,
+    };
+
+    let run_key = close_workflow_with_callback(
+        &runtime,
+        namespace_id,
+        WorkflowId("handler-wf-lower".to_string()),
+        callback,
+        WorkflowCommand::CompleteWorkflow {
+            result: payloads("agent-result"),
+        },
+    )
+    .await?;
+
+    wait_for_run(&store, run_key, |state| {
+        state
+            .completion_callbacks
+            .first()
+            .map(|cb| cb.state.clone())
+            == Some(CallbackState::Succeeded)
+    })
+    .await?;
+
+    let calls = client.calls();
+    assert_eq!(calls.len(), 1, "exactly one delivery attempt");
+    assert!(
+        !calls[0].token.is_empty(),
+        "the lowercased token header must still be found and forwarded"
+    );
+    let decoded = NexusCompletionToken::decode(&calls[0].token)
+        .expect("the forwarded token decodes (it was not dropped)");
+    assert_eq!(decoded.operation_id, "op-lower");
+    assert_eq!(decoded.scheduled_event_id, 11);
     Ok(())
 }
 

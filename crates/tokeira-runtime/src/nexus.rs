@@ -39,12 +39,36 @@ pub const COMPLETION_TOKEN_VERSION: u8 = 1;
 /// (`common/nexus/callback_token.go:17 @ v1.31.0`).
 pub const TEMPORAL_CALLBACK_TOKEN_HEADER: &str = "Temporal-Callback-Token";
 
+/// HTTP header carrying the terminal operation state (`succeeded`/`failed`/`canceled`)
+/// on a completion `POST`. Verbatim from `headerOperationState = "nexus-operation-state"`
+/// (`common/nexus/nexusrpc/api.go:23 @ v1.31.0`). The firing client sets it; the inbound
+/// `/nexus/callback` server reads it to select the resolution shape.
+pub const NEXUS_OPERATION_STATE_HEADER: &str = "nexus-operation-state";
+
 /// In-cluster callback URL sentinel attached to a Worker-target `StartOperation`.
 /// Verbatim from `SystemCallbackURL = "temporal://system"`
 /// (`common/nexus/constants.go @ v1.31.0`). The runtime resolves it to the
 /// configured local HTTP listener (`NexusCompletionConfig.system_callback_url`)
 /// when firing — the loopback v1.31.0 performs via `routeSystemCallbackRequest`.
 pub const SYSTEM_CALLBACK_URL: &str = "temporal://system";
+
+/// Path of the inbound completion endpoint, appended to the resolved loopback base URL
+/// (`NexusCompletionConfig.system_callback_url`) when firing a `temporal://system`
+/// callback, and served by the `tokeirad` listener. A tokeira-local convention: v1.31.0
+/// routes the system callback to its frontend's per-namespace Nexus completion route
+/// (`routeSystemCallbackRequest @ v1.31.0`); the single-cluster loopback uses one fixed
+/// path. External callback URLs already encode their own path and are POSTed verbatim.
+pub const NEXUS_CALLBACK_PATH: &str = "/nexus/callback";
+
+/// The HTTP URL an async Nexus completion is `POST`ed to: the configured listener base
+/// (`NexusCompletionConfig.system_callback_url`) joined with [`NEXUS_CALLBACK_PATH`]. Used
+/// both when minting the callback URL handed to a Worker handler (which POSTs its eventual
+/// async outcome here) and when the firing client resolves a `temporal://system` callback
+/// to a concrete address. A trailing slash on the base is trimmed so the join never
+/// doubles `/`.
+pub fn system_callback_post_url(base: &str) -> String {
+    format!("{}{}", base.trim_end_matches('/'), NEXUS_CALLBACK_PATH)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NexusStartResult {

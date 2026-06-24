@@ -17,7 +17,15 @@ gRPC-broker Nexus transport:
 
 1. **Outbound attachment** — when tokeira dispatches a Nexus `StartOperation` it sends a callback URL
    and a `Temporal-Callback-Token` so the handler side attaches a completion callback to its backing
-   workflow.
+   workflow. The URL is a **concrete `http(s)://…/nexus/callback` address** (tokeira's own inbound
+   listener), not the `temporal://system` sentinel: the Worker handler POSTs the eventual outcome
+   itself, and a Worker SDK rejects a non-HTTP callback scheme ("unknown scheme: temporal://system").
+   This is the `UseSystemCallbackURL = false` shape (the callback-URL-template mode,
+   `components/nexusoperations/executors.go:122-160 @ v1.31.0`) — tokeira delivers Worker completions
+   over HTTP to its own listener rather than via the SDK's system-callback internal route, so it
+   resolves the address up front from `NexusCompletionConfig.system_callback_url`. The
+   `temporal://system` sentinel remains the *stored* callback URL for an in-cluster handler **workflow**
+   (resolved to the same listener at fire time, item 2).
 2. **Handler-close firing** — when a tokeira workflow that carries a Nexus completion callback closes,
    the runtime fires the callback: it builds the outcome from the workflow's terminal event and, for an
    in-cluster (`temporal://system`) callback, delivers it **in-process** to the originator's pending
@@ -342,7 +350,7 @@ second event.
 | Condition | Handling | Source @ v1.31.0 |
 |---|---|---|
 | Callback token missing / undecodable / wrong version | callback → `Failed` (non-retryable); no resolution submitted | `DecodeCallbackToken` (version check) |
-| Originator run absent / pending op already resolved | treat as `Succeeded` (idempotent ack); no second event | `CompleteNexusOperation` NotFound/already-complete |
+| Originator run absent / pending op already resolved | inbound returns **`404` NotFound**; firing classifies NotFound as non-retryable → callback → `Failed`; **no second terminal event** (idempotent at the operation level — the outcome is already recorded) | `CompletionHandler` maps a closed op's `hsm.ErrInvalidTransition` to `serviceerror.NewNotFound` (`components/nexusoperations/completion.go:198-200 @ v1.31.0`); the firing side treats `NotFound` as non-retryable (`isRetryableCallError` → `HandlerError.Retryable()`, `components/callbacks/nexus_invocation.go @ v1.31.0`) |
 | Originator lane submit / POST transient (5xx, transport) | callback → `BackingOff`; retried with bounded backoff | callbacks component retry |
 | Workflow failed/timed-out/terminated | `Failure` outcome → `NexusResolution::Failed` | `GetNexusCompletion` failed arm |
 | Workflow canceled | `Canceled` outcome → `NexusResolution::Canceled` | `GetNexusCompletion` canceled arm |

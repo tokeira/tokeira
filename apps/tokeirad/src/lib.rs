@@ -19,6 +19,7 @@
 
 use std::{
     collections::HashMap,
+    convert::Infallible,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -27,6 +28,13 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use clap::Parser;
+use http_body_util::{BodyExt, Full};
+use hyper::{
+    Method, Request, Response, StatusCode,
+    body::{Bytes, Incoming},
+    service::service_fn,
+};
+use hyper_util::rt::TokioIo;
 use tokio::{
     net::TcpListener,
     sync::{broadcast, oneshot},
@@ -45,19 +53,21 @@ pub mod observability;
 use tokeira_chasm::Library as _;
 use tokeira_config::{Cli, ConfigStorageKind, TokeiraConfig};
 use tokeira_edge::{
-    CacheBackedRouter, EdgeInterceptors, EdgeRoutingConfig, HistoryNotifyingRepository,
-    HistoryWaitRegistry, InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter,
-    LongPollConfig, LongPollGate, NamespaceCache, OperatorService, PendingQueryStore,
-    PollerRegistry, ResolvedNamespace, RoutingCache, WorkflowExecutionDescription, WorkflowService,
+    CacheBackedRouter, CallbackResponse, EdgeInterceptors, EdgeRoutingConfig,
+    HistoryNotifyingRepository, HistoryWaitRegistry, InMemoryNamespaceCache, InMemoryOperatorApi,
+    LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache, OperatorService,
+    PendingQueryStore, PollerRegistry, ResolvedNamespace, RoutingCache,
+    WorkflowExecutionDescription, WorkflowService,
     conformance::{WireCoverageLayer, WireCoverageRecorder},
     grpc::{
         operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
         workflow_service::WorkflowServiceGrpc,
     },
+    handle_nexus_callback,
     operator_service::{ClusterInfo, OperatorApi, SearchAttributeDefinition},
     run_routing_subscription,
     translate::to_internal::namespace_id_for,
-    workflow_service::ExecutionResolver,
+    workflow_service::{ExecutionResolver, WorkflowRuntimeApi},
 };
 use tokeira_kernel::LoadedRun;
 use tokeira_projection::{
@@ -65,10 +75,13 @@ use tokeira_projection::{
     VisibilityQueryService, VisibilitySink, VisibilityStore,
 };
 use tokeira_runtime::{
-    ConnectionBudgetApplier, HttpNexusClient, InMemoryNexusEndpointStore,
-    InMemoryTaskQueueConfigStore, MembershipConfig, NexusCompletionDeps, NexusEndpointRegistry,
-    NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore, RuntimeConfig,
-    ScheduleEngineConfig, ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
+    CompletionCallbackScannerConfig, ConnectionBudgetApplier, HttpNexusClient,
+    HttpNexusCompletionClient, InMemoryNexusEndpointStore, InMemoryTaskQueueConfigStore,
+    MembershipConfig, NEXUS_CALLBACK_PATH, NEXUS_OPERATION_STATE_HEADER, NexusCompletionDeps,
+    NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusEndpointSpec,
+    NexusEndpointSpecTarget, NexusEndpointStore, RuntimeConfig, ScheduleEngineConfig,
+    ScheduleStore, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime, VersioningRuleStore,
+    run_schedule_engine,
 };
 use tokeira_storage::{
     InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
@@ -229,7 +242,13 @@ impl TokeiradHandle {
     /// configuration uses `TokeiraConfig::default()`, which selects the
     /// in-memory storage path.
     pub async fn start_in_memory(addr: SocketAddr) -> Result<Self> {
-        let effective_config = Arc::new(TokeiraConfig::default());
+        let mut config = TokeiraConfig::default();
+        // Bind the inbound Nexus completion listener on an ephemeral loopback port so
+        // parallel in-memory servers (tests, multi-node harnesses) never collide on the
+        // fixed default port; the runtime resolves `temporal://system` to the bound port.
+        config.policy.nexus_completion.http_addr = "127.0.0.1:0".to_string();
+        config.policy.nexus_completion.system_callback_url = "http://127.0.0.1:0".to_string();
+        let effective_config = Arc::new(config);
         let (server_task, bound_addr, shutdown_tx, background_cancel, log_broadcast, _recorder) =
             build_and_serve(addr, effective_config).await?;
         Ok(Self {
@@ -738,6 +757,50 @@ where
             .placement
             .controller_endpoint
             .is_none();
+
+    // Bind the inbound Nexus completion listener up front, before constructing the
+    // runtime: the firing client's loopback target (`system_callback_url`) must reflect
+    // the *actually bound* port, which matters when `http_addr` requests an ephemeral
+    // `:0` port (parallel in-memory servers, tests). The accept loop is spawned later,
+    // once `background_cancel` and the runtime adapter exist; binding here only reserves
+    // the socket and reads back its address.
+    let nexus_completion_cfg = effective_config.policy.nexus_completion.clone();
+    let nexus_callback_listener = TcpListener::bind(&nexus_completion_cfg.http_addr)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to bind nexus completion listener on {}",
+                nexus_completion_cfg.http_addr
+            )
+        })?;
+    let nexus_callback_addr = nexus_callback_listener
+        .local_addr()
+        .context("failed to resolve bound nexus completion listener address")?;
+    let resolved_system_callback_url = with_loopback_port(
+        &nexus_completion_cfg.system_callback_url,
+        nexus_callback_addr.port(),
+    );
+    info!(
+        bind = %nexus_callback_addr,
+        loopback = %resolved_system_callback_url,
+        "nexus completion callback listener bound"
+    );
+    let nexus_completion_deps = NexusCompletionDeps {
+        client: Arc::new(HttpNexusCompletionClient::new()),
+        config: NexusCompletionRuntimeConfig {
+            system_callback_url: resolved_system_callback_url,
+            retry_initial_interval: time::Duration::milliseconds(
+                nexus_completion_cfg.retry_initial_interval_ms as i64,
+            ),
+            retry_max_interval: time::Duration::milliseconds(
+                nexus_completion_cfg.retry_max_interval_ms as i64,
+            ),
+            retry_backoff_coefficient: nexus_completion_cfg.retry_backoff_coefficient,
+            retry_max_attempts: nexus_completion_cfg.retry_max_attempts,
+        },
+        scanner: CompletionCallbackScannerConfig::default(),
+    };
+
     let runtime = Arc::new(
         TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
             repo.clone(),
@@ -750,11 +813,10 @@ where
             runtime_config.nexus_timeout_scanner,
             nexus_registry,
             Arc::new(HttpNexusClient::new()),
-            // Wave 4: no completion delivery yet — the real `HttpNexusCompletionClient`
-            // and the inbound `/nexus/callback` listener are wired together in Wave 5, so
-            // a callback has somewhere to land. A `Noop` here avoids a real client POSTing
-            // to a listener that does not exist (which would back off forever).
-            NexusCompletionDeps::default(),
+            // Wave 5: the real `HttpNexusCompletionClient` POSTs completions to the
+            // inbound `/nexus/callback` listener bound above; `system_callback_url` was
+            // resolved to that listener's actual address so the loopback closes.
+            nexus_completion_deps,
             effective_config.infrastructure.placement.shard_count,
             node_id.to_string(),
             node_endpoint.as_authority(),
@@ -846,6 +908,14 @@ where
     let worker_registry = runtime.worker_registry();
     let nexus_task_broker = runtime.nexus_task_broker();
     let runtime_adapter = Arc::new(RuntimeAdapter::new(runtime.clone()));
+    // Serve the inbound completion endpoint on the pre-bound listener. The adapter is the
+    // same `WorkflowRuntimeApi` the gRPC surface uses, so a callback resolves the
+    // originator's pending operation through the identical runtime path.
+    spawn_nexus_callback_server(
+        nexus_callback_listener,
+        runtime_adapter.clone() as Arc<dyn WorkflowRuntimeApi>,
+        background_cancel.clone(),
+    );
     let resolver = Arc::new(StoreExecutionResolver::new(repo.clone()));
     tokeira_projection::seed_predefined_search_attributes(
         &visibility_query_store,
@@ -1093,6 +1163,128 @@ where
         log_broadcast,
         wire_coverage_recorder,
     ))
+}
+
+/// Replace the port in a `scheme://host[:port]` loopback base URL with the actually-bound
+/// listener `port`. This keeps `system_callback_url` (scheme + host from config) pointed at
+/// the listener even when `http_addr` requested an ephemeral `:0` port.
+fn with_loopback_port(base: &str, port: u16) -> String {
+    let trimmed = base.trim_end_matches('/');
+    match trimmed.rsplit_once(':') {
+        // Only treat the suffix as a port when it is all digits — otherwise the match is
+        // the `:` inside the scheme (`http://host` with no port) and we append instead.
+        Some((prefix, suffix))
+            if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            format!("{prefix}:{port}")
+        }
+        _ => format!("{trimmed}:{port}"),
+    }
+}
+
+/// Serve the inbound `POST /nexus/callback` completion endpoint on `listener` until
+/// `cancel` fires. Each request is delegated to [`handle_nexus_callback`], which resolves
+/// the originator workflow's pending operation — the inbound half of the async-completion
+/// loopback the runtime's firing client drives.
+fn spawn_nexus_callback_server(
+    listener: TcpListener,
+    runtime: Arc<dyn WorkflowRuntimeApi>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            let stream = tokio::select! {
+                _ = cancel.cancelled() => break,
+                accept = listener.accept() => match accept {
+                    Ok((stream, _peer)) => stream,
+                    Err(error) => {
+                        tracing::warn!(?error, "nexus callback listener accept failed");
+                        continue;
+                    }
+                },
+            };
+            let io = TokioIo::new(stream);
+            let runtime = runtime.clone();
+            let conn_cancel = cancel.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| {
+                    let runtime = runtime.clone();
+                    async move {
+                        Ok::<_, Infallible>(
+                            nexus_callback_response(runtime.as_ref(), request).await,
+                        )
+                    }
+                });
+                let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, service);
+                tokio::pin!(conn);
+                tokio::select! {
+                    result = conn.as_mut() => {
+                        if let Err(error) = result {
+                            tracing::debug!(?error, "nexus callback connection closed with error");
+                        }
+                    }
+                    _ = conn_cancel.cancelled() => {
+                        conn.as_mut().graceful_shutdown();
+                        let _ = conn.await;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Adapt a hyper request to the transport-agnostic edge handler. Non-`POST` requests and
+/// any path other than `/nexus/callback` are 404; the handler owns all other status
+/// mapping (decode failures → 400, accepted → 200, not-found/stale → 404, internal → 503).
+async fn nexus_callback_response(
+    runtime: &dyn WorkflowRuntimeApi,
+    request: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let (parts, body) = request.into_parts();
+
+    if parts.method != Method::POST || parts.uri.path() != NEXUS_CALLBACK_PATH {
+        return nexus_response(StatusCode::NOT_FOUND, None);
+    }
+
+    let header = |name: &str| {
+        parts
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let token = header(TEMPORAL_CALLBACK_TOKEN_HEADER);
+    let state = header(NEXUS_OPERATION_STATE_HEADER);
+    let content_type = header(hyper::header::CONTENT_TYPE.as_str());
+
+    let body_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => {
+            tracing::debug!(?error, "failed to read nexus callback request body");
+            return nexus_response(
+                StatusCode::BAD_REQUEST,
+                Some(b"failed to read request body".to_vec()),
+            );
+        }
+    };
+
+    let CallbackResponse { status, body } = handle_nexus_callback(
+        runtime,
+        token.as_deref(),
+        state.as_deref(),
+        content_type.as_deref(),
+        &body_bytes,
+    )
+    .await;
+
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    nexus_response(status, body)
+}
+
+fn nexus_response(status: StatusCode, body: Option<Vec<u8>>) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(body.unwrap_or_default())));
+    *response.status_mut() = status;
+    response
 }
 
 /// Broadcast buffer for [`LogEvent`]s fanned out to test harnesses.
@@ -1530,6 +1722,26 @@ mod tests {
     // Endpoint target/config types are referenced only by the Nexus endpoint store
     // tests below; importing them here (not at crate scope) keeps the lib build clean.
     use tokeira_runtime::{EndpointTarget, NexusEndpointConfig};
+
+    #[test]
+    fn with_loopback_port_rewrites_or_appends_port() {
+        // A base URL with an explicit port has it replaced with the bound port.
+        assert_eq!(
+            with_loopback_port("http://127.0.0.1:7253", 51_000),
+            "http://127.0.0.1:51000"
+        );
+        // A trailing slash is trimmed before rewriting.
+        assert_eq!(
+            with_loopback_port("http://127.0.0.1:7253/", 51_000),
+            "http://127.0.0.1:51000"
+        );
+        // A port-less base URL gets the port appended (the scheme `:` is not mistaken for
+        // a port because the suffix is not all-digits).
+        assert_eq!(
+            with_loopback_port("http://localhost", 51_000),
+            "http://localhost:51000"
+        );
+    }
 
     #[test]
     fn version_renderer_is_deterministic() {

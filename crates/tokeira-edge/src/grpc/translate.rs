@@ -2675,7 +2675,10 @@ fn workflow_callback_info_to_proto(callback: &KernelCompletionCallback) -> workf
             .last_attempt_failure
             .as_ref()
             .map(payload_to_failure),
-        next_attempt_schedule_time: None,
+        // When the callback is backing off, the kernel records when its next delivery is
+        // due (`CompletionCallback.next_attempt_at`); surface it as v1.31.0 does for a
+        // `BackingOff` callback (`CallbackInfo.next_attempt_schedule_time`).
+        next_attempt_schedule_time: callback.next_attempt_at.map(to_proto_timestamp),
         blocked_reason: String::new(),
     }
 }
@@ -5216,6 +5219,90 @@ mod tests {
             })),
             Some(time::Duration::seconds(60))
         );
+    }
+
+    /// A `CompletionCallback` driven past `Standby` (one failed delivery attempt, now
+    /// backing off) surfaces its lifecycle on `CallbackInfo`: the `BackingOff` state, the
+    /// attempt count, the recorded failure, and the next-retry time the kernel tracks. This
+    /// is the read-side of the async-completion callback lifecycle (Wave 5, P7).
+    #[test]
+    fn backing_off_completion_callback_surfaces_attempt_state_and_failure() {
+        let next_attempt =
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        let callback = KernelCompletionCallback {
+            spec: KernelCallbackSpec::Nexus {
+                url: "temporal://system".to_string(),
+                header: std::collections::BTreeMap::new(),
+            },
+            links: Vec::new(),
+            trigger: KernelCallbackTrigger::WorkflowClosed,
+            registration_time: Some(time::OffsetDateTime::UNIX_EPOCH),
+            state: KernelCallbackState::BackingOff,
+            attempt: 2,
+            last_attempt_failure: Some(tokeira_types::Payload {
+                data: b"delivery refused".to_vec(),
+                metadata: std::collections::BTreeMap::new(),
+            }),
+            next_attempt_at: Some(next_attempt),
+        };
+
+        let info = workflow_callback_info_to_proto(&callback);
+
+        assert_eq!(info.state, enums::CallbackState::BackingOff as i32);
+        assert_eq!(info.attempt, 2);
+        assert!(
+            info.last_attempt_failure.is_some(),
+            "a recorded delivery failure is surfaced"
+        );
+        assert!(
+            info.next_attempt_schedule_time.is_some(),
+            "a backing-off callback surfaces its next retry time"
+        );
+    }
+
+    /// A succeeded callback surfaces the terminal state and carries no failure / no pending
+    /// retry, even though the attempt counter is non-zero.
+    #[test]
+    fn succeeded_completion_callback_surfaces_terminal_state() {
+        let callback = KernelCompletionCallback {
+            spec: KernelCallbackSpec::Nexus {
+                url: "temporal://system".to_string(),
+                header: std::collections::BTreeMap::new(),
+            },
+            links: Vec::new(),
+            trigger: KernelCallbackTrigger::WorkflowClosed,
+            registration_time: Some(time::OffsetDateTime::UNIX_EPOCH),
+            state: KernelCallbackState::Succeeded,
+            attempt: 1,
+            last_attempt_failure: None,
+            next_attempt_at: None,
+        };
+
+        let info = workflow_callback_info_to_proto(&callback);
+
+        assert_eq!(info.state, enums::CallbackState::Succeeded as i32);
+        assert_eq!(info.attempt, 1);
+        assert!(info.last_attempt_failure.is_none());
+        assert!(info.next_attempt_schedule_time.is_none());
+    }
+
+    /// The six kernel callback states map 1:1 to the wire enum, in the v1.31.0 order
+    /// (`enums::CallbackState`): Standby=1, Scheduled=2, BackingOff=3, Failed=4,
+    /// Succeeded=5, Blocked=6.
+    #[test]
+    fn callback_state_maps_one_to_one() {
+        use enums::CallbackState as P;
+        let cases = [
+            (KernelCallbackState::Standby, P::Standby),
+            (KernelCallbackState::Scheduled, P::Scheduled),
+            (KernelCallbackState::BackingOff, P::BackingOff),
+            (KernelCallbackState::Failed, P::Failed),
+            (KernelCallbackState::Succeeded, P::Succeeded),
+            (KernelCallbackState::Blocked, P::Blocked),
+        ];
+        for (kernel, proto) in cases {
+            assert_eq!(kernel_callback_state_to_proto(&kernel), proto);
+        }
     }
 
     #[test]

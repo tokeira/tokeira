@@ -42,8 +42,8 @@ use tokeira_types::{Payload, Payloads};
 use url::Url;
 
 use crate::nexus::{
-    CompletionDeliveryOutcome, NexusCompletion, NexusCompletionClient, NexusHttpClient,
-    NexusStartResult, TEMPORAL_CALLBACK_TOKEN_HEADER,
+    CompletionDeliveryOutcome, NEXUS_OPERATION_STATE_HEADER, NexusCompletion,
+    NexusCompletionClient, NexusHttpClient, NexusStartResult, TEMPORAL_CALLBACK_TOKEN_HEADER,
 };
 
 // Header names and the operation-unsuccessful status are lower-cased wire
@@ -53,9 +53,10 @@ const HEADER_REQUEST_ID: &str = "nexus-request-id";
 const HEADER_LINK: &str = "nexus-link";
 const HEADER_OPERATION_TOKEN: &str = "nexus-operation-token";
 const HEADER_OPERATION_TIMEOUT: &str = "operation-timeout";
-/// `Nexus-Operation-State` header on a completion `POST` (`headerOperationState =
-/// "nexus-operation-state"`, `common/nexus/nexusrpc/api.go:23 @ v1.31.0`).
-const HEADER_OPERATION_STATE: &str = "nexus-operation-state";
+/// `nexus-operation-state` header on a completion `POST` (`headerOperationState`,
+/// `common/nexus/nexusrpc/api.go:23 @ v1.31.0`). Aliases the public protocol const so
+/// the firing client and the inbound `/nexus/callback` server share one source of truth.
+const HEADER_OPERATION_STATE: &str = NEXUS_OPERATION_STATE_HEADER;
 /// `nexus-request-retryable` response header that overrides the status-derived
 /// retryability (`headerRetryable`, `common/nexus/nexusrpc/api.go:28 @ v1.31.0`).
 const HEADER_RETRYABLE: &str = "nexus-request-retryable";
@@ -531,7 +532,11 @@ fn x_temporal_payload_bytes(payload: &Payload) -> Vec<u8> {
 ///
 /// An empty body with no content-type is `binary/null` (the SDK's nil shape). The
 /// result is always a single-element `Payloads` (a Nexus result is one value).
-fn body_to_payloads(body: &[u8], content_type: Option<&str>) -> Payloads {
+///
+/// Reused by the inbound `/nexus/callback` handler (tokeira-edge, Wave 5) to decode a
+/// `succeeded` completion body — one serializer for both the sync-result and
+/// async-completion paths.
+pub fn body_to_payloads(body: &[u8], content_type: Option<&str>) -> Payloads {
     let Some(content_type) = content_type.map(str::trim).filter(|s| !s.is_empty()) else {
         // No content-type: nil result iff body is also empty, else opaque bytes.
         let mut metadata = std::collections::BTreeMap::new();

@@ -47,21 +47,15 @@ returns the **concrete** `*metricstest.Capture`; the corpus calls `capture.Snaps
 (usually before a deferred `StopCapture`). You cannot wrap these by substituting a type. To make
 `Snapshot()` reflect tokeira's metrics you must populate that live `CaptureHandler` at the right moment.
 
-**Recommended (deterministic): a surgical pull-source seam in `common/metrics/metricstest`.** Add an
+**The approach (deterministic): a surgical pull-source seam in `common/metrics/metricstest`.** Add an
 optional registered callback that `Capture.Snapshot()` (or the capture's drain) invokes first; in
 Shape-2 the fork registers a callback that scrapes tokeira's `/metrics`, computes deltas since
 `StartCapture`, translates to Temporal names/tags, and records them into the capture before it returns.
 This is a small, stable edit to server-side `metricstest` (not a corpus **test body**), and it gives
 exact `StartCapture → act → Snapshot` semantics. It is a **new fork-edit location** beyond the onebox
-seam + ledger — flag that in the run notes; weigh rebase cost; it is the price of determinism.
+seam + ledger — note it for rebases; it is the price of determinism.
 
-**Fallback (no metricstest edit): a background replay poller.** While a capture is active, a goroutine
-scrapes tokeira every few ms and replays translated deltas into the `CaptureHandler` via its
-`Counter/Gauge/Timer/Histogram` methods. No server-code edit, but racy against a fast `Snapshot` — only
-acceptable if the asserted effect is always observable (the test awaits workflow completion) before it
-snapshots. **Raise the choice** rather than guessing; prefer the seam unless rebase cost is judged too high.
-
-Either way the mechanics are: scrape `/metrics` (Prometheus text format) → parse → delta vs the
+The mechanics are: scrape `/metrics` (Prometheus text format) → parse → delta vs the
 `StartCapture` baseline → map name+labels → record into the `CaptureHandler` so `Snapshot()[temporalName]`
 returns matching `CapturedRecording`s with the expected tags.
 
@@ -120,8 +114,8 @@ fmt` / `cargo lint` / `cargo test`; commit via `fsWrite` to `artifacts/cm-*.txt`
 then `rm -rf artifacts`; **never** `git add .`/`-A` (forbidden: `.claude/`,
 `.kiro/specs/temporal-functional-conformance/reference/runall-results.json`); push to `main`.
 
-**Fork (Go):** edits confined to the onebox/Shape-2 seam, the ledger/skip registry, and — if chosen —
-the `metricstest` pull-source seam; **never a corpus test body** (the corpus stays byte-for-byte upstream
+**Fork (Go):** edits confined to the onebox/Shape-2 seam, the ledger/skip registry, and the
+`metricstest` pull-source seam; **never a corpus test body** (the corpus stays byte-for-byte upstream
 so it rebases on each compat bump). Pin `GOTOOLCHAIN=go1.26.2`. Ground-truth fixes to the tag;
 config-as-constant; **raise ambiguity, do not guess**. Commit/push on the fork's `tokeira/conformance-v1.31.0`
 branch per the fork's flow (separate repo).
@@ -137,7 +131,5 @@ branch per the fork's flow (separate repo).
 
 ## 9. Raise-points
 
-- The §3 Snapshot-timing decision (metricstest seam vs background poller) — choose early, flag the
-  fork-edit-surface implication.
 - Any mapped metric with **no honest tokeira equivalent** — raise rather than fake; decide add-vs-skip.
 - Auth-gated tests remain blocked on the auth TBD (`decisions.md`); out of scope here.

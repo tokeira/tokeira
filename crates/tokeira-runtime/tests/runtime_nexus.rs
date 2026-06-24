@@ -9,15 +9,17 @@ use opentelemetry::KeyValue;
 use proptest::prelude::*;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    HistoryEvent, HistoryEventKind, SignalRequest, StartRequest, WorkflowCommand,
-    WorkflowTaskCompletedRequest,
+    CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback, HistoryEvent,
+    HistoryEventKind, SignalRequest, StartRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, COMPLETION_TOKEN_VERSION, EndpointTarget,
-    InMemoryNexusEndpointStore, LaneConfig, NexusCompletionToken, NexusEndpointRegistry,
+    ActivityTimeoutScannerConfig, BacklogConfig, COMPLETION_TOKEN_VERSION,
+    CompletionCallbackScannerConfig, CompletionDeliveryOutcome, EndpointTarget,
+    InMemoryNexusEndpointStore, LaneConfig, NexusCompletion, NexusCompletionClient,
+    NexusCompletionDeps, NexusCompletionRuntimeConfig, NexusCompletionToken, NexusEndpointRegistry,
     NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore, NexusHttpClient,
-    NexusStartResult, NexusTaskRequest, NexusTimeoutScannerConfig, TimerScannerConfig,
-    TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    NexusStartResult, NexusTaskRequest, NexusTimeoutScannerConfig, SYSTEM_CALLBACK_URL,
+    TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -537,6 +539,7 @@ fn runtime_with_registry(
         },
         registry,
         client,
+        NexusCompletionDeps::default(),
     )
 }
 
@@ -855,18 +858,33 @@ proptest! {
                 .expect("start task");
             prop_assert_eq!(start_task.token.run_key, run_key);
             prop_assert_eq!(start_task.token.operation_id, expected_operation_id.clone());
+            // The task token's scheduled_event_id is the op's fencing key; the
+            // completion token must carry the same value (Property 1).
+            let task_scheduled_event_id = start_task.token.scheduled_event_id;
             match start_task.request {
                 NexusTaskRequest::StartOperation {
                     service: actual_service,
                     operation: actual_operation,
                     request_id,
                     payload,
-                    ..
+                    scheduled_time: _,
+                    callback_url,
+                    callback_token,
                 } => {
                     prop_assert_eq!(actual_service, expected_service.clone());
                     prop_assert_eq!(actual_operation, expected_operation.clone());
                     prop_assert_eq!(request_id, expected_operation_id.clone());
                     prop_assert_eq!(payload, Some(Payload::new(input_bytes.clone())));
+                    // Property 1: a Worker-target dispatch carries the system callback
+                    // URL + a decodable, version-checked completion token whose
+                    // routing keys equal the dispatched operation's.
+                    prop_assert_eq!(callback_url, Some(SYSTEM_CALLBACK_URL.to_string()));
+                    let encoded = callback_token.expect("completion token attached");
+                    let token = NexusCompletionToken::decode(&encoded)
+                        .expect("completion token decodes + version-checks");
+                    prop_assert_eq!(token.originator_run_key, run_key);
+                    prop_assert_eq!(token.operation_id, expected_operation_id.clone());
+                    prop_assert_eq!(token.scheduled_event_id, task_scheduled_event_id);
                 }
                 other => panic!("unexpected start request: {other:?}"),
             }
@@ -1432,4 +1450,525 @@ fn completion_token_decode_rejects_garbage_inner_payload() {
             .contains("invalid nexus completion token payload"),
         "unexpected error: {err}"
     );
+}
+
+// ---- nexus-async-completion Wave 4: completion-callback firing + scanner ----
+
+/// Records each `complete_operation` call and returns scripted outcomes (the last one
+/// repeats once the script is exhausted), so a test can assert the firing handler built
+/// the right request and drove the right lifecycle transition.
+#[derive(Clone)]
+struct RecordingCompletionClient {
+    calls: Arc<Mutex<Vec<RecordedCompletion>>>,
+    outcomes: Arc<Mutex<std::collections::VecDeque<CompletionDeliveryOutcome>>>,
+    default_outcome: CompletionDeliveryOutcome,
+}
+
+#[derive(Clone, Debug)]
+struct RecordedCompletion {
+    url: String,
+    token: String,
+    state: String,
+}
+
+impl RecordingCompletionClient {
+    fn new(
+        script: Vec<CompletionDeliveryOutcome>,
+        default_outcome: CompletionDeliveryOutcome,
+    ) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            outcomes: Arc::new(Mutex::new(script.into())),
+            default_outcome,
+        }
+    }
+
+    fn calls(&self) -> Vec<RecordedCompletion> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl NexusCompletionClient for RecordingCompletionClient {
+    async fn complete_operation(
+        &self,
+        url: &str,
+        token: &str,
+        completion: NexusCompletion,
+        _links: &[tokeira_kernel::Link],
+    ) -> Result<CompletionDeliveryOutcome> {
+        self.calls.lock().unwrap().push(RecordedCompletion {
+            url: url.to_string(),
+            token: token.to_string(),
+            state: completion.operation_state().to_string(),
+        });
+        Ok(self
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| self.default_outcome.clone()))
+    }
+}
+
+/// Build a runtime whose completion client is the recording mock and whose scanner ticks
+/// fast (so a re-fire is observable without a long wait).
+fn runtime_with_completion_client(
+    store: Arc<InMemoryStore>,
+    registry: NexusEndpointRegistry,
+    completion_client: Arc<RecordingCompletionClient>,
+) -> TokeiraRuntime<InMemoryStore> {
+    TokeiraRuntime::new_with_nexus(
+        store,
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        registry,
+        Arc::new(MockNexusClient::new(
+            NexusStartResult::AsyncAccepted {
+                operation_token: "tok".to_string(),
+                links: Vec::new(),
+            },
+            true,
+        )),
+        NexusCompletionDeps {
+            client: completion_client,
+            config: NexusCompletionRuntimeConfig::default(),
+            scanner: CompletionCallbackScannerConfig {
+                scan_interval: tokio::time::Duration::from_millis(10),
+                max_per_scan: 100,
+            },
+        },
+    )
+}
+
+/// A `temporal://system` Nexus completion callback carrying `token` in its
+/// `Temporal-Callback-Token` header — the shape tokeira attaches to a handler workflow.
+fn system_completion_callback(token: &str) -> CompletionCallback {
+    CompletionCallback {
+        spec: CallbackSpec::Nexus {
+            url: SYSTEM_CALLBACK_URL.to_string(),
+            header: std::collections::BTreeMap::from([(
+                "Temporal-Callback-Token".to_string(),
+                token.to_string(),
+            )]),
+        },
+        links: Vec::new(),
+        trigger: CallbackTrigger::WorkflowClosed,
+        registration_time: None,
+        state: CallbackState::Standby,
+        attempt: 0,
+        last_attempt_failure: None,
+        next_attempt_at: None,
+    }
+}
+
+/// Poll the run state until `predicate` holds (bounded), mirroring `wait_for_history`.
+async fn wait_for_run<F>(
+    store: &InMemoryStore,
+    run_key: RunKey,
+    predicate: F,
+) -> Result<tokeira_kernel::WorkflowState>
+where
+    F: Fn(&tokeira_kernel::WorkflowState) -> bool,
+{
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let tokeira_kernel::LoadedRun::Existing(state) = store.load_run(run_key).await?
+            && predicate(&state)
+        {
+            return Ok(state);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for run condition");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Start a workflow carrying `callback`, run one WFT, and close it with `close`.
+async fn close_workflow_with_callback(
+    runtime: &TokeiraRuntime<InMemoryStore>,
+    namespace_id: NamespaceId,
+    workflow_id: WorkflowId,
+    callback: CompletionCallback,
+    close: WorkflowCommand,
+) -> Result<RunKey> {
+    let mut start = start_request(namespace_id, workflow_id, "req-start");
+    start.completion_callbacks = vec![callback];
+    let run_key = applied_state(&runtime.start_workflow(start).await?).run_key;
+    let task = poll_wft(runtime, namespace_id, "workflow-q").await?;
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: task.token,
+            identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![close],
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+    Ok(run_key)
+}
+
+#[tokio::test]
+async fn completion_callback_delivered_on_close_succeeds() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    let registry = seed_registry(vec![]);
+    let client = Arc::new(RecordingCompletionClient::new(
+        Vec::new(),
+        CompletionDeliveryOutcome::Delivered,
+    ));
+    let runtime = runtime_with_completion_client(store.clone(), registry, client.clone());
+
+    let token = NexusCompletionToken {
+        originator_run_key: RunKey(uuid::Uuid::from_u128(42)),
+        operation_id: "op-async".to_string(),
+        scheduled_event_id: 7,
+        request_id: "op-async".to_string(),
+    }
+    .encode()
+    .expect("encode token");
+
+    let run_key = close_workflow_with_callback(
+        &runtime,
+        namespace_id,
+        WorkflowId("handler-wf".to_string()),
+        system_completion_callback(&token),
+        WorkflowCommand::CompleteWorkflow {
+            result: payloads("agent-result"),
+        },
+    )
+    .await?;
+
+    // The callback reaches `Succeeded` once the (Noop-Delivered) POST is acknowledged.
+    let closed = wait_for_run(&store, run_key, |state| {
+        state
+            .completion_callbacks
+            .first()
+            .map(|cb| cb.state.clone())
+            == Some(CallbackState::Succeeded)
+    })
+    .await?;
+    assert_eq!(closed.completion_callbacks.len(), 1);
+
+    // The firing handler resolved `temporal://system` to the configured listener and sent
+    // the original token + a `succeeded` state.
+    let calls = client.calls();
+    assert_eq!(calls.len(), 1, "exactly one delivery attempt");
+    assert_eq!(
+        calls[0].url,
+        NexusCompletionRuntimeConfig::default().system_callback_url
+    );
+    assert_eq!(calls[0].state, "succeeded");
+    let decoded = NexusCompletionToken::decode(&calls[0].token).expect("token round-trips");
+    assert_eq!(decoded.operation_id, "op-async");
+    assert_eq!(decoded.scheduled_event_id, 7);
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_callback_failed_close_delivers_failed_state() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    let client = Arc::new(RecordingCompletionClient::new(
+        Vec::new(),
+        CompletionDeliveryOutcome::Delivered,
+    ));
+    let runtime =
+        runtime_with_completion_client(store.clone(), seed_registry(vec![]), client.clone());
+
+    let token = NexusCompletionToken {
+        originator_run_key: RunKey(uuid::Uuid::from_u128(43)),
+        operation_id: "op-fail".to_string(),
+        scheduled_event_id: 9,
+        request_id: "op-fail".to_string(),
+    }
+    .encode()
+    .expect("encode token");
+
+    let run_key = close_workflow_with_callback(
+        &runtime,
+        namespace_id,
+        WorkflowId("handler-wf-fail".to_string()),
+        system_completion_callback(&token),
+        WorkflowCommand::FailWorkflow {
+            failure: Payload::new(b"boom".to_vec()),
+        },
+    )
+    .await?;
+
+    wait_for_run(&store, run_key, |state| {
+        state
+            .completion_callbacks
+            .first()
+            .map(|cb| cb.state.clone())
+            == Some(CallbackState::Succeeded)
+    })
+    .await?;
+    let calls = client.calls();
+    assert_eq!(calls.len(), 1);
+    // A failed handler workflow delivers state=failed (GetNexusCompletion failed arm).
+    assert_eq!(calls[0].state, "failed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_callback_retryable_backs_off_then_scanner_refires() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    // First attempt is retryable, then delivered — exercising BackingOff → scanner re-fire
+    // → Succeeded.
+    let client = Arc::new(RecordingCompletionClient::new(
+        vec![CompletionDeliveryOutcome::RetryableError {
+            detail: "503".to_string(),
+        }],
+        CompletionDeliveryOutcome::Delivered,
+    ));
+    let runtime =
+        runtime_with_completion_client(store.clone(), seed_registry(vec![]), client.clone());
+
+    let token = NexusCompletionToken {
+        originator_run_key: RunKey(uuid::Uuid::from_u128(44)),
+        operation_id: "op-retry".to_string(),
+        scheduled_event_id: 5,
+        request_id: "op-retry".to_string(),
+    }
+    .encode()
+    .expect("encode token");
+
+    let run_key = close_workflow_with_callback(
+        &runtime,
+        namespace_id,
+        WorkflowId("handler-wf-retry".to_string()),
+        system_completion_callback(&token),
+        WorkflowCommand::CompleteWorkflow {
+            result: payloads("ok"),
+        },
+    )
+    .await?;
+
+    // After the retryable first attempt the callback backs off with a future
+    // next_attempt_at and an incremented attempt count.
+    wait_for_run(&store, run_key, |state| {
+        state
+            .completion_callbacks
+            .first()
+            .map(|cb| cb.state.clone())
+            == Some(CallbackState::BackingOff)
+    })
+    .await?;
+
+    // The scanner (fast tick) re-fires the BackingOff callback once next_attempt_at passes;
+    // the second attempt is Delivered, so it terminally succeeds.
+    let resolved = wait_for_run(&store, run_key, |state| {
+        state
+            .completion_callbacks
+            .first()
+            .map(|cb| cb.state.clone())
+            == Some(CallbackState::Succeeded)
+    })
+    .await?;
+    assert_eq!(resolved.completion_callbacks[0].attempt, 1);
+    assert!(
+        client.calls().len() >= 2,
+        "the scanner re-fired the backing-off callback"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sweep_rebuilds_backing_off_completion_callbacks() -> Result<()> {
+    // The shard-takeover rebuild query surfaces exactly the runs whose completion callbacks
+    // are BackingOff (the volatile scanner index is reconstructed from this on takeover).
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    // Always-retryable client keeps the callback in BackingOff so we can query for it.
+    let client = Arc::new(RecordingCompletionClient::new(
+        Vec::new(),
+        CompletionDeliveryOutcome::RetryableError {
+            detail: "stuck".to_string(),
+        },
+    ));
+    let runtime = runtime_with_completion_client(store.clone(), seed_registry(vec![]), client);
+
+    let token = NexusCompletionToken {
+        originator_run_key: RunKey(uuid::Uuid::from_u128(99)),
+        operation_id: "op-sweep".to_string(),
+        scheduled_event_id: 3,
+        request_id: "op-sweep".to_string(),
+    }
+    .encode()
+    .expect("encode token");
+
+    let run_key = close_workflow_with_callback(
+        &runtime,
+        namespace_id,
+        WorkflowId("swept".to_string()),
+        system_completion_callback(&token),
+        WorkflowCommand::CompleteWorkflow {
+            result: payloads("ok"),
+        },
+    )
+    .await?;
+
+    wait_for_run(&store, run_key, |state| {
+        state
+            .completion_callbacks
+            .first()
+            .map(|cb| cb.state.clone())
+            == Some(CallbackState::BackingOff)
+    })
+    .await?;
+
+    // The default single-shard store homes every run on shard 0; the rebuild query finds
+    // the backing-off callback there.
+    let entries = store
+        .list_runs_with_pending_completion_callbacks_for_shard(
+            tokeira_types::ShardId(0),
+            usize::MAX,
+        )
+        .await?;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.run_key == run_key && entry.callback_index == 0),
+        "backing-off callback must be swept, got {entries:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_callback_non_retryable_delivery_fails_terminally() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    let client = Arc::new(RecordingCompletionClient::new(
+        vec![CompletionDeliveryOutcome::NonRetryableError {
+            detail: "400 bad token".to_string(),
+        }],
+        CompletionDeliveryOutcome::Delivered,
+    ));
+    let runtime =
+        runtime_with_completion_client(store.clone(), seed_registry(vec![]), client.clone());
+
+    let token = NexusCompletionToken {
+        originator_run_key: RunKey(uuid::Uuid::from_u128(77)),
+        operation_id: "op-nonretry".to_string(),
+        scheduled_event_id: 4,
+        request_id: "op-nonretry".to_string(),
+    }
+    .encode()
+    .expect("encode token");
+
+    let run_key = close_workflow_with_callback(
+        &runtime,
+        namespace_id,
+        WorkflowId("handler-wf-nonretry".to_string()),
+        system_completion_callback(&token),
+        WorkflowCommand::CompleteWorkflow {
+            result: payloads("ok"),
+        },
+    )
+    .await?;
+
+    // A non-retryable delivery error terminally fails the callback (no backoff, no retry).
+    wait_for_run(&store, run_key, |state| {
+        state
+            .completion_callbacks
+            .first()
+            .map(|cb| cb.state.clone())
+            == Some(CallbackState::Failed)
+    })
+    .await?;
+    assert_eq!(
+        client.calls().len(),
+        1,
+        "no retry after a non-retryable error"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_callback_exhausts_max_attempts_to_failed() -> Result<()> {
+    // retry_max_attempts = 1 means a single delivery attempt: the first retryable failure
+    // exhausts the budget and the callback fails terminally rather than backing off.
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    let client = Arc::new(RecordingCompletionClient::new(
+        Vec::new(),
+        CompletionDeliveryOutcome::RetryableError {
+            detail: "503".to_string(),
+        },
+    ));
+    let runtime = TokeiraRuntime::new_with_nexus(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+        ActivityTimeoutScannerConfig::default(),
+        NexusTimeoutScannerConfig::default(),
+        seed_registry(vec![]),
+        Arc::new(MockNexusClient::new(
+            NexusStartResult::AsyncAccepted {
+                operation_token: "tok".to_string(),
+                links: Vec::new(),
+            },
+            true,
+        )),
+        NexusCompletionDeps {
+            client: client.clone(),
+            config: NexusCompletionRuntimeConfig {
+                retry_max_attempts: 1,
+                ..NexusCompletionRuntimeConfig::default()
+            },
+            scanner: CompletionCallbackScannerConfig {
+                scan_interval: tokio::time::Duration::from_millis(10),
+                max_per_scan: 100,
+            },
+        },
+    );
+
+    let token = NexusCompletionToken {
+        originator_run_key: RunKey(uuid::Uuid::from_u128(88)),
+        operation_id: "op-exhaust".to_string(),
+        scheduled_event_id: 6,
+        request_id: "op-exhaust".to_string(),
+    }
+    .encode()
+    .expect("encode token");
+
+    let run_key = close_workflow_with_callback(
+        &runtime,
+        namespace_id,
+        WorkflowId("handler-wf-exhaust".to_string()),
+        system_completion_callback(&token),
+        WorkflowCommand::CompleteWorkflow {
+            result: payloads("ok"),
+        },
+    )
+    .await?;
+
+    let failed = wait_for_run(&store, run_key, |state| {
+        state
+            .completion_callbacks
+            .first()
+            .map(|cb| cb.state.clone())
+            == Some(CallbackState::Failed)
+    })
+    .await?;
+    assert_eq!(failed.completion_callbacks[0].state, CallbackState::Failed);
+    Ok(())
 }

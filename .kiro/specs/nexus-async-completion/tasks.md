@@ -132,39 +132,75 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
       retryability divergence and the redundant inner `version` field).
     - _Requirements: 2.1, 5.5_
 
-- [ ] 4. Runtime — outbound attachment, firing, retry scanner
-  - [ ] 4.1 Outbound attachment in `publisher.rs` (`handle_schedule_nexus_operation`, Worker arm)
+- [x] 4. Runtime — outbound attachment, firing, retry scanner
+  - [x] 4.1 Outbound attachment in `publisher.rs` (`handle_schedule_nexus_operation`, Worker arm)
     - Generate a `NexusCompletionToken` from `(originator_run_key, operation_id, scheduled_event_id,
       request_id)`; attach `callback_url = SYSTEM_CALLBACK_URL` + `callback_token` to the published
       `NexusTask`. Add `callback_url`/`callback_token` to `NexusTaskRequest::StartOperation`.
+    - Landed: Worker arm mints + encodes the token (`request_id = operation_id`, the only key in scope —
+      documented deviation) and attaches `SYSTEM_CALLBACK_URL` + token; on encode error it dispatches
+      *without* a callback rather than aborting. External arm left unattached (multi-cluster). Fan-out:
+      the new `StartOperation` fields fixed at all construction/match sites.
     - _Requirements: 1.1, 1.2, 1.3_
-  - [ ] 4.2 Implement `DispatchCompletionCallback` handler (replace the no-op stub) in `publisher.rs`
+  - [x] 4.2 Implement `DispatchCompletionCallback` handler (replace the no-op stub) in `publisher.rs`
     - Decode `header[Temporal-Callback-Token]`; map `outcome`→Nexus completion (state + body); resolve
       `SYSTEM_CALLBACK_URL` to the configured local listener address; POST via `NexusCompletionClient`.
       On 2xx → submit `CompletionCallbackAttempted(Succeeded)`; retryable → `RetryableFailure`;
       non-retryable → `NonRetryableFailure`. (Delivery reaches the originator through the inbound
       endpoint, task 5.2.)
+    - Landed: `deliver_completion_callback` (spawned off the dispatch loop) maps the kernel
+      `CallbackCompletionOutcome` → `NexusCompletion`, **synthesizing** the `nexus.Failure` body for
+      failed/terminated/timed-out/canceled/continued-as-new via `failurepb` (Terminated/Canceled/Timeout
+      FailureInfo) ground-truthed to `GetNexusCompletion @ v1.31.0` (incl. timed-out =
+      "operation exceeded internal timeout" with empty `TimeoutFailureInfo`). Resolves
+      `temporal://system`→config; POSTs via the injected client; computes `next_attempt_at` from
+      `nexus_completion_backoff` (initial·coeff^(attempt-1), capped; `retry_max_attempts=0`=unbounded);
+      submits `CompletionCallbackAttempted` to the **closed** run; seeds/clears the tracking index
+      (re-seeds on a transient submit error). Does NOT itself resolve the originator (that is Wave 5).
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
-  - [ ] 4.3 Completion-callback retry scanner (mirror `scan_nexus_timeouts_once`)
+  - [x] 4.3 Completion-callback retry scanner (mirror `scan_nexus_timeouts_once`)
     - Volatile index of `(run_key, callback_index)` for `BackingOff` callbacks; per tick reload the run
       (history is authority), re-fire `DispatchCompletionCallback` for those past `next_attempt_at`,
       bounded by `max_per_scan`; rebuild on shard takeover. Wire scanner config + lifecycle into
       `TokeiraRuntime`.
+    - Landed: `CompletionCallbackTrackingState` + `scan_completion_callbacks_once` +
+      `run_completion_callback_scanner` (mirror the Nexus-timeout scanner), `outcome_for_closed_run`
+      re-derives the outcome from `WorkflowState`. **Recovery hardening (Wave-4 review B1):** the scanner
+      fires both `Scheduled` (first delivery lost to a crash) and `BackingOff` (past `next_attempt_at`)
+      callbacks, and the shard-takeover rebuild query
+      (`list_runs_with_pending_completion_callbacks_for_shard`, **real DSQL** + InMemory + `sweep_shard` +
+      clear-on-shard-loss) surfaces both — mirroring v1.31.0 `RegenerateTasks`. Scanner lifecycle +
+      shutdown wired into `TokeiraRuntime`.
     - _Requirements: 2.4, 2.5_
-  - [ ] 4.4 Property test P1 — outbound StartOperation carries a decodable, version-checked token
+  - [x] 4.4 Property test P1 — outbound StartOperation carries a decodable, version-checked token
+    - Landed: P1 folded into `property_dispatch_to_broker_field_preservation` — every Worker dispatch
+      carries `callback_url == SYSTEM_CALLBACK_URL` and a token decoding to the dispatched op's keys.
     - _Feature: nexus-async-completion, Property 1_
     - _Requirements: 1.1, 1.2, 1.4, 1.5_
-  - [ ] 4.5 Runtime tests — delivery + idempotency + cross-namespace
+  - [x] 4.5 Runtime tests — delivery + idempotency + cross-namespace
     - In-process delivery submits the matching `NexusOperationResolved`; re-delivery to an already-
       resolved op records no second event and leaves the callback `Succeeded`; a handler workflow in
       namespace B resolves an originator in namespace A. Synchronize on observable state, no sleeps.
+    - Landed (firing-side, recording mock client; no sleeps — poll on observable run state): delivered→
+      `Succeeded`, failed-close→`failed` state, retryable→`BackingOff`→scanner re-fire→`Succeeded`,
+      non-retryable→terminal `Failed`, max-attempts(=1) exhaustion→`Failed`, and the sweep query surfacing
+      Scheduled+BackingOff (storage unit test). The full POST→inbound→`NexusOperationResolved` round-trip
+      (true P3 idempotency via the kernel fence + P6 cross-namespace over the wire) lands with the inbound
+      endpoint in Wave 5 and the Wave 7 integration test; the resolution leg itself is already covered by
+      `cross_namespace_async_nexus_completes_back_to_originator`.
+    - Verified by a 3-reviewer adversarial workflow vs v1.31.0: fixed the `Scheduled`-recovery hole (B1)
+      and the timed-out failure shape (M1); cancel-details-on-retry (M2) deferred with a follow-up.
     - _Feature: nexus-async-completion, Property 3, Property 6_
     - _Requirements: 4.1, 5.1, 5.3, 7.1_
 
 - [ ] 5. Edge + HTTP server — wire translation, inbound endpoint, server
-  - [ ] 5.1 Emit callback fields in `start_operation_to_proto` (`translate/nexus.rs`)
+  - [x] 5.1 Emit callback fields in `start_operation_to_proto` (`translate/nexus.rs`)
     - Populate `callback`/`callback_header` from the task's `callback_url`/`callback_token` (replacing
       the empty synthesis from `edge-nexus-task-transport`).
+    - Landed early with Wave 4 (the outbound-attachment other half): `nexus_task_to_proto_request`
+      sets `StartOperationRequest.callback = callback_url` and `callback_header =
+      {Temporal-Callback-Token: callback_token}` when present; empty when absent (preserves the
+      no-callback contract for External-target dispatch).
     - _Requirements: 1.1, 1.2_
   - [ ] 5.2 Inbound `/nexus/callback` handler (`tokeira-edge`)
     - Parse `Temporal-Callback-Token` (decode + version), `Nexus-Operation-State`, and body (result

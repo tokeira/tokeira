@@ -130,6 +130,43 @@ impl DsqlRunRepository {
             }
         )
     }
+
+    pub(super) async fn do_list_runs_with_pending_completion_callbacks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<CompletionCallbackSweepEntry>> {
+        record_dsql_operation!(
+            self,
+            "list_runs_with_pending_completion_callbacks_for_shard",
+            Some(shard_id),
+            {
+                if limit == 0 {
+                    metrics::record_dsql_rows_read(
+                        "list_runs_with_pending_completion_callbacks_for_shard",
+                        0,
+                    );
+                    return Ok(Vec::new());
+                }
+
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+                    "SELECT run_key, state_data
+             FROM workflow_hot
+             WHERE shard_id = $1",
+                )
+                .bind(Self::shard_id_to_uuid(shard_id))
+                .fetch_all(permit.connection()?)
+                .await?;
+                metrics::record_dsql_rows_read(
+                    "list_runs_with_pending_completion_callbacks_for_shard",
+                    rows.len(),
+                );
+
+                collect_completion_callback_sweep_entries(rows, limit)
+            }
+        )
+    }
 }
 
 pub(super) fn collect_workflow_timeout_entries(
@@ -222,6 +259,40 @@ pub(super) fn collect_nexus_sweep_entries(
                 operation_id: operation.operation_id.clone(),
                 scheduled_event_id: operation.scheduled_event_id,
                 scheduled_at: operation.scheduled_at,
+            });
+            if entries.len() == limit {
+                return Ok(entries);
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Collect *pending* (`Scheduled` or `BackingOff`) completion callbacks from shard-local
+/// workflow rows. Completion callbacks live in the workflow snapshot, so (like the Nexus
+/// timeout sweep) this filters in Rust after shard-local row selection. Both non-terminal
+/// states are included so a `Scheduled` callback whose first attempt was lost to a crash
+/// is re-driven on takeover.
+pub(super) fn collect_completion_callback_sweep_entries(
+    rows: Vec<(Uuid, Vec<u8>)>,
+    limit: usize,
+) -> Result<Vec<CompletionCallbackSweepEntry>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for (run_key, state_data) in rows {
+        let state = codec::decode_workflow_state(&state_data)?;
+        for (callback_index, callback) in state.completion_callbacks.iter().enumerate() {
+            if !matches!(
+                callback.state,
+                CallbackState::Scheduled | CallbackState::BackingOff
+            ) {
+                continue;
+            }
+            entries.push(CompletionCallbackSweepEntry {
+                run_key: RunKey(run_key),
+                callback_index,
             });
             if entries.len() == limit {
                 return Ok(entries);

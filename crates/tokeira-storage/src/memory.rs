@@ -17,8 +17,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityOp, BasicKernel, DispatchOp, LoadedRun, ReplayContext, TimerOp, Transition,
-    WorkflowState,
+    ActivityOp, BasicKernel, CallbackState, DispatchOp, LoadedRun, ReplayContext, TimerOp,
+    Transition, WorkflowState,
 };
 use tokeira_types::{
     ArchetypeId, ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor,
@@ -30,13 +30,13 @@ use tokio::sync::Mutex;
 use crate::{
     api::{
         ActivitySweepEntry, BacklogEntry, BudgetAllocationResult, BundleLease, CommitResult,
-        ConflictToken, ConnectionDirector, ControlRepository, CurrentExecutionConflictPolicy,
-        DbClass, DbPermit, DeploymentCasResult, DeploymentKey, DeploymentName,
-        DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult,
-        LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch, ProjectionContext,
-        ProjectionLog, ProjectionRecord, RequestRecord, RunRepository, StoredWorkerDeployment,
-        TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentRepository,
-        WorkerDeploymentVersionKey, WorkflowTimeoutSweepEntry,
+        CompletionCallbackSweepEntry, ConflictToken, ConnectionDirector, ControlRepository,
+        CurrentExecutionConflictPolicy, DbClass, DbPermit, DeploymentCasResult, DeploymentKey,
+        DeploymentName, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
+        GenerationAdvanceResult, LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch,
+        ProjectionContext, ProjectionLog, ProjectionRecord, RequestRecord, RunRepository,
+        StoredWorkerDeployment, TransitionAuditRecord, WftTimeoutSweepEntry,
+        WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkflowTimeoutSweepEntry,
         workflow_is_open_and_pinned_to_version,
     },
     metrics as storage_metrics,
@@ -1109,6 +1109,40 @@ impl RunRepository for InMemoryStore {
         }
         Ok(out)
     }
+
+    async fn list_runs_with_pending_completion_callbacks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<CompletionCallbackSweepEntry>> {
+        let store = self.inner.lock().await;
+        let mut out = Vec::new();
+        for state in store.runs.values() {
+            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
+                continue;
+            }
+            // A callback is pending delivery once the run closes: `Scheduled` (fired,
+            // not yet attempted) or `BackingOff` (attempt failed, awaiting retry). Both
+            // must be re-watched so a `Scheduled` callback whose first attempt was lost
+            // to a crash is re-driven; terminal/Standby callbacks are not the scanner's.
+            for (callback_index, callback) in state.completion_callbacks.iter().enumerate() {
+                if !matches!(
+                    callback.state,
+                    CallbackState::Scheduled | CallbackState::BackingOff
+                ) {
+                    continue;
+                }
+                out.push(CompletionCallbackSweepEntry {
+                    run_key: state.run_key,
+                    callback_index,
+                });
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn projection_execution_duration(state: &WorkflowState) -> Option<i64> {
@@ -1971,6 +2005,57 @@ mod tests {
             dispatch_ops: Default::default(),
             projection_ops: Default::default(),
         }
+    }
+
+    // The completion-callback sweep query must surface BOTH `Scheduled` (first delivery
+    // lost to a crash) and `BackingOff` (awaiting retry) callbacks, and never a terminal
+    // one — so the scanner index is fully rebuilt on shard takeover.
+    #[tokio::test]
+    async fn list_pending_completion_callbacks_includes_scheduled_and_backing_off() {
+        use tokeira_kernel::{CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback};
+        let store = InMemoryStore::with_shard_count(1);
+        let run_key = RunKey::new();
+        let callback = |state: CallbackState| CompletionCallback {
+            spec: CallbackSpec::Nexus {
+                url: "temporal://system".into(),
+                header: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            trigger: CallbackTrigger::WorkflowClosed,
+            registration_time: None,
+            state,
+            attempt: 0,
+            last_attempt_failure: None,
+            next_attempt_at: None,
+        };
+        let mut transition = start_transition(run_key);
+        transition.next_state.status = ExecutionStatus::Completed;
+        transition.next_state.closed_at = Some(fixed_now());
+        transition.next_state.pending_workflow_task = None;
+        transition.next_state.completion_callbacks = vec![
+            callback(CallbackState::Scheduled),
+            callback(CallbackState::BackingOff),
+            callback(CallbackState::Succeeded),
+        ];
+        store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        let entries = store
+            .list_runs_with_pending_completion_callbacks_for_shard(ShardId(0), usize::MAX)
+            .await
+            .unwrap();
+        let indices: BTreeSet<usize> = entries
+            .iter()
+            .filter(|entry| entry.run_key == run_key)
+            .map(|entry| entry.callback_index)
+            .collect();
+        assert_eq!(
+            indices,
+            BTreeSet::from([0, 1]),
+            "Scheduled + BackingOff are pending; Succeeded is terminal"
+        );
     }
 
     fn activity_state(activity_id: &str) -> tokeira_kernel::ActivityState {

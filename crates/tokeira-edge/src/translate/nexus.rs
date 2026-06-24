@@ -152,6 +152,8 @@ pub fn nexus_task_to_proto_request(
             request_id,
             payload,
             scheduled_time,
+            callback_url,
+            callback_token,
         } => Ok(nexus_v1::Request {
             header: BTreeMap::new(),
             scheduled_time: scheduled_time.map(to_proto_timestamp),
@@ -164,9 +166,22 @@ pub fn nexus_task_to_proto_request(
                     service: service.clone(),
                     operation: operation.clone(),
                     request_id: request_id.clone(),
-                    callback: String::new(),
+                    // Emit the completion callback so the handler SDK's
+                    // WorkflowRunOperation reads `nexusOptions.CallbackURL` /
+                    // `CallbackHeader` and registers the callback on its backing
+                    // workflow (nexus-async-completion task 5.1). Absent when no
+                    // callback was attached (e.g. an External-target dispatch).
+                    callback: callback_url.clone().unwrap_or_default(),
                     payload: payload.as_ref().map(payload_from_domain),
-                    callback_header: BTreeMap::new(),
+                    callback_header: callback_token
+                        .as_ref()
+                        .map(|token| {
+                            BTreeMap::from([(
+                                tokeira_runtime::TEMPORAL_CALLBACK_TOKEN_HEADER.to_string(),
+                                token.clone(),
+                            )])
+                        })
+                        .unwrap_or_default(),
                     links: Vec::new(),
                 },
             )),
@@ -508,6 +523,8 @@ mod tests {
                 request_id: request_id.clone(),
                 payload: Some(payload_with_bytes(payload_bytes.clone())),
                 scheduled_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds)),
+                callback_url: None,
+                callback_token: None,
             };
 
             let proto = nexus_task_to_proto_request(&request).expect("translation should succeed");

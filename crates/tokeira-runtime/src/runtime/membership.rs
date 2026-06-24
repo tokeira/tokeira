@@ -96,6 +96,7 @@ where
             &self.wft_timeout_tracking,
             &self.activity_tracking,
             &self.nexus_timeout_tracking,
+            &self.completion_callback_tracking,
         )
         .await?;
 
@@ -109,6 +110,7 @@ where
         let wft_timeout_tracking = self.wft_timeout_tracking.clone();
         let activity_tracking = self.activity_tracking.clone();
         let nexus_timeout_tracking = self.nexus_timeout_tracking.clone();
+        let completion_callback_tracking = self.completion_callback_tracking.clone();
         // The renewer fires lost_rx when the lease is fenced. Move the shard to
         // Draining and drop all per-shard tracking so this node stops scanning
         // timeouts for runs whose ownership has moved elsewhere.
@@ -121,6 +123,7 @@ where
                 wft_timeout_tracking.remove_all_for_shard(shard_id);
                 activity_tracking.remove_all_for_shard(shard_id);
                 nexus_timeout_tracking.remove_all_for_shard(shard_id);
+                completion_callback_tracking.remove_all_for_shard(shard_id);
             }
         });
 
@@ -142,6 +145,8 @@ where
         self.wft_timeout_tracking.remove_all_for_shard(shard_id);
         self.activity_tracking.remove_all_for_shard(shard_id);
         self.nexus_timeout_tracking.remove_all_for_shard(shard_id);
+        self.completion_callback_tracking
+            .remove_all_for_shard(shard_id);
         self.shard_owner.write().unwrap().remove(shard_id);
     }
 }

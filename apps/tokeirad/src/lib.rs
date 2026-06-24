@@ -66,9 +66,9 @@ use tokeira_projection::{
 };
 use tokeira_runtime::{
     ConnectionBudgetApplier, HttpNexusClient, InMemoryNexusEndpointStore,
-    InMemoryTaskQueueConfigStore, MembershipConfig, NexusEndpointRegistry, NexusEndpointSpec,
-    NexusEndpointSpecTarget, NexusEndpointStore, RuntimeConfig, ScheduleEngineConfig,
-    ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
+    InMemoryTaskQueueConfigStore, MembershipConfig, NexusCompletionDeps, NexusEndpointRegistry,
+    NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore, RuntimeConfig,
+    ScheduleEngineConfig, ScheduleStore, TokeiraRuntime, VersioningRuleStore, run_schedule_engine,
 };
 use tokeira_storage::{
     InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
@@ -750,6 +750,11 @@ where
             runtime_config.nexus_timeout_scanner,
             nexus_registry,
             Arc::new(HttpNexusClient::new()),
+            // Wave 4: no completion delivery yet — the real `HttpNexusCompletionClient`
+            // and the inbound `/nexus/callback` listener are wired together in Wave 5, so
+            // a callback has somewhere to land. A `Noop` here avoids a real client POSTing
+            // to a listener that does not exist (which would back off forever).
+            NexusCompletionDeps::default(),
             effective_config.infrastructure.placement.shard_count,
             node_id.to_string(),
             node_endpoint.as_authority(),

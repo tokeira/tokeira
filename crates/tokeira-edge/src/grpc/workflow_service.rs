@@ -5556,6 +5556,8 @@ mod tests {
                         request_id: "req-1".to_string(),
                         payload: None,
                         scheduled_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        callback_url: None,
+                        callback_token: None,
                     },
                 },
             )

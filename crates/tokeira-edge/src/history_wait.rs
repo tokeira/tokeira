@@ -280,6 +280,16 @@ where
             .list_pending_nexus_operations_for_shard(shard_id, limit)
             .await
     }
+
+    async fn list_runs_with_pending_completion_callbacks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<tokeira_storage::CompletionCallbackSweepEntry>> {
+        self.inner
+            .list_runs_with_pending_completion_callbacks_for_shard(shard_id, limit)
+            .await
+    }
 }
 
 #[async_trait]

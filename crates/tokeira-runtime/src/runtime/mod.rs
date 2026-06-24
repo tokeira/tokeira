@@ -52,10 +52,11 @@ use crate::{
     membership::{ConnectionBudgetApplier, HeartbeatInputs, MembershipClient, MembershipConfig},
     metrics as runtime_metrics,
     nexus::{
-        NexusEndpointRegistry, NexusHttpClient, NexusTaskBroker, NexusTimeoutScannerConfig,
-        NexusTimeoutTrackingState, NoopNexusHttpClient, run_nexus_timeout_scanner,
+        CompletionCallbackTrackingState, NexusCompletionDeps, NexusEndpointRegistry,
+        NexusHttpClient, NexusTaskBroker, NexusTimeoutScannerConfig, NexusTimeoutTrackingState,
+        NoopNexusHttpClient, run_nexus_timeout_scanner,
     },
-    publisher::RuntimeDispatchPublisher,
+    publisher::{RuntimeDispatchPublisher, run_completion_callback_scanner},
     query::{QueryResult, QueryTask},
     recovery::{lease_rejected_error, run_lease_renewer, sweep_shard},
     retry::{RetryDecision, evaluate_activity_retry},
@@ -125,6 +126,8 @@ pub struct TokeiraRuntime<R> {
     wft_timeout_scanner_cancel: CancellationToken,
     /// Runtime-local Nexus timeout tracking.
     nexus_timeout_tracking: NexusTimeoutTrackingState,
+    /// Runtime-local index of `BackingOff` completion callbacks to re-fire.
+    completion_callback_tracking: CompletionCallbackTrackingState,
     /// In-memory Nexus worker-task broker.
     nexus_task_broker: NexusTaskBroker,
     /// In-memory update caller registry.
@@ -147,6 +150,10 @@ pub struct TokeiraRuntime<R> {
     nexus_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the Nexus-timeout scanner.
     nexus_timeout_scanner_cancel: CancellationToken,
+    /// Background completion-callback retry scanner task.
+    completion_callback_scanner_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation token for the completion-callback retry scanner.
+    completion_callback_scanner_cancel: CancellationToken,
     /// Background activity-timeout scanner task.
     activity_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the activity-timeout scanner.
@@ -337,6 +344,7 @@ where
             NexusTimeoutScannerConfig::default(),
             NexusEndpointRegistry::default(),
             Arc::new(NoopNexusHttpClient),
+            NexusCompletionDeps::default(),
             versioning_rule_store,
         )
     }
@@ -352,6 +360,7 @@ where
         nexus_timeout_config: NexusTimeoutScannerConfig,
         nexus_registry: NexusEndpointRegistry,
         nexus_client: Arc<dyn NexusHttpClient>,
+        nexus_completion: NexusCompletionDeps,
     ) -> Self {
         Self::new_with_nexus_and_versioning(
             repo,
@@ -364,6 +373,7 @@ where
             nexus_timeout_config,
             nexus_registry,
             nexus_client,
+            nexus_completion,
             Arc::new(VersioningRuleStore::default()),
         )
     }
@@ -379,6 +389,7 @@ where
         nexus_timeout_config: NexusTimeoutScannerConfig,
         nexus_registry: NexusEndpointRegistry,
         nexus_client: Arc<dyn NexusHttpClient>,
+        nexus_completion: NexusCompletionDeps,
         versioning_rule_store: Arc<VersioningRuleStore>,
     ) -> Self {
         Self::new_with_nexus_and_shards(
@@ -392,6 +403,7 @@ where
             nexus_timeout_config,
             nexus_registry,
             nexus_client,
+            nexus_completion,
             1,
             IncarnationId::new().to_string(),
             true,
@@ -404,6 +416,7 @@ where
         runtime_config: RuntimeConfig,
         nexus_registry: NexusEndpointRegistry,
         nexus_client: Arc<dyn NexusHttpClient>,
+        nexus_completion: NexusCompletionDeps,
         versioning_rule_store: Arc<VersioningRuleStore>,
     ) -> Self {
         Self::new_with_nexus_and_versioning(
@@ -417,6 +430,7 @@ where
             runtime_config.nexus_timeout_scanner,
             nexus_registry,
             nexus_client,
+            nexus_completion,
             versioning_rule_store,
         )
     }
@@ -432,6 +446,7 @@ where
         nexus_timeout_config: NexusTimeoutScannerConfig,
         nexus_registry: NexusEndpointRegistry,
         nexus_client: Arc<dyn NexusHttpClient>,
+        nexus_completion: NexusCompletionDeps,
         shard_count: u32,
         owner_identity: String,
         seed_default_shard: bool,
@@ -448,6 +463,7 @@ where
             nexus_timeout_config,
             nexus_registry,
             nexus_client,
+            nexus_completion,
             shard_count,
             owner_identity,
             "127.0.0.1:0".to_owned(),
@@ -467,6 +483,7 @@ where
         nexus_timeout_config: NexusTimeoutScannerConfig,
         nexus_registry: NexusEndpointRegistry,
         nexus_client: Arc<dyn NexusHttpClient>,
+        nexus_completion: NexusCompletionDeps,
         shard_count: u32,
         owner_identity: String,
         node_endpoint: String,
@@ -479,6 +496,12 @@ where
         let wft_timeout_tracking = WftTimeoutTrackingState::default();
         let activity_tracking = ActivityTrackingState::default();
         let nexus_timeout_tracking = NexusTimeoutTrackingState::default();
+        let completion_callback_tracking = CompletionCallbackTrackingState::default();
+        let NexusCompletionDeps {
+            client: nexus_completion_client,
+            config: nexus_completion_config,
+            scanner: completion_callback_scanner_config,
+        } = nexus_completion;
         let nexus_task_broker = NexusTaskBroker::default();
         let update_registry = UpdateRegistry::new();
         let buffered_queries = BufferedQueryRegistry::default();
@@ -505,9 +528,12 @@ where
                     lane_count,
                     shard_count,
                     nexus_client.clone(),
+                    nexus_completion_client.clone(),
+                    nexus_completion_config.clone(),
                     nexus_registry.clone(),
                     nexus_task_broker.clone(),
                     nexus_timeout_tracking.clone(),
+                    completion_callback_tracking.clone(),
                     activity_tracking.clone(),
                     delivery_metrics.clone(),
                     Some(versioning_rule_store.clone()),
@@ -614,6 +640,37 @@ where
             nexus_timeout_config,
             nexus_timeout_scanner_cancel.clone(),
         )));
+        // The completion-callback scanner re-fires `BackingOff` callbacks. It reuses the
+        // publisher's delivery path, so it gets its own publisher handle (mirrors how the
+        // lanes each hold one) wired to the same lanes + tracking index.
+        let completion_scanner_publisher = RuntimeDispatchPublisher::new(
+            broker.clone(),
+            activity_broker.clone(),
+            repo.clone(),
+            shared_lanes.clone(),
+            lane_count,
+            shard_count,
+            nexus_client.clone(),
+            nexus_completion_client.clone(),
+            nexus_completion_config.clone(),
+            nexus_registry.clone(),
+            nexus_task_broker.clone(),
+            nexus_timeout_tracking.clone(),
+            completion_callback_tracking.clone(),
+            activity_tracking.clone(),
+            delivery_metrics.clone(),
+            Some(versioning_rule_store.clone()),
+        );
+        let completion_callback_scanner_cancel = CancellationToken::new();
+        let completion_callback_scanner_handle =
+            Some(tokio::spawn(run_completion_callback_scanner(
+                repo.clone(),
+                completion_callback_tracking.clone(),
+                completion_scanner_publisher,
+                shard_owner.clone(),
+                completion_callback_scanner_config,
+                completion_callback_scanner_cancel.clone(),
+            )));
         Self {
             repo,
             broker,
@@ -630,6 +687,7 @@ where
             wft_timeout_scanner_handle,
             wft_timeout_scanner_cancel,
             nexus_timeout_tracking,
+            completion_callback_tracking,
             nexus_task_broker,
             update_registry,
             buffered_queries,
@@ -639,6 +697,8 @@ where
             fairness_state,
             nexus_timeout_scanner_handle,
             nexus_timeout_scanner_cancel,
+            completion_callback_scanner_handle,
+            completion_callback_scanner_cancel,
             activity_timeout_scanner_handle,
             activity_timeout_scanner_cancel,
             grace_scanner_handle,
@@ -710,6 +770,10 @@ where
 
     pub fn nexus_timeout_tracking(&self) -> NexusTimeoutTrackingState {
         self.nexus_timeout_tracking.clone()
+    }
+
+    pub fn completion_callback_tracking(&self) -> CompletionCallbackTrackingState {
+        self.completion_callback_tracking.clone()
     }
 
     pub fn nexus_task_broker(&self) -> NexusTaskBroker {
@@ -913,6 +977,17 @@ where
                 .await
                 .map_err(|_| anyhow!("nexus timeout scanner shutdown timed out"))?
                 .map_err(|error| anyhow!("nexus timeout scanner join failed: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown_completion_callback_scanner(&mut self) -> Result<()> {
+        self.completion_callback_scanner_cancel.cancel();
+        if let Some(handle) = self.completion_callback_scanner_handle.take() {
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), handle)
+                .await
+                .map_err(|_| anyhow!("completion callback scanner shutdown timed out"))?
+                .map_err(|error| anyhow!("completion callback scanner join failed: {error}"))?;
         }
         Ok(())
     }
@@ -1158,8 +1233,9 @@ mod tests {
         drain::RuntimeDrainState,
         lane::DispatchPublisher,
         nexus::{
-            EndpointTarget, NexusEndpointRegistry, NexusTaskBroker, NexusTimeoutScannerConfig,
-            NexusTimeoutTrackingState, NoopNexusHttpClient, evaluate_nexus_timeout,
+            EndpointTarget, NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusTaskBroker,
+            NexusTimeoutScannerConfig, NexusTimeoutTrackingState, NoopNexusCompletionClient,
+            NoopNexusHttpClient, evaluate_nexus_timeout,
         },
         publisher::RuntimeDispatchPublisher,
         retry::{RetryDecision, compute_retry_backoff, evaluate_activity_retry},
@@ -1437,6 +1513,7 @@ mod tests {
                 NexusTimeoutScannerConfig::default(),
                 NexusEndpointRegistry::default(),
                 Arc::new(NoopNexusHttpClient),
+                NexusCompletionDeps::default(),
                 8,
                 "test-owner".to_string(),
                 true,
@@ -1468,6 +1545,7 @@ mod tests {
                 NexusTimeoutScannerConfig::default(),
                 NexusEndpointRegistry::default(),
                 Arc::new(NoopNexusHttpClient),
+                NexusCompletionDeps::default(),
                 shard_count,
                 "test-owner".to_string(),
                 true,
@@ -1506,6 +1584,7 @@ mod tests {
                 NexusTimeoutScannerConfig::default(),
                 NexusEndpointRegistry::default(),
                 Arc::new(NoopNexusHttpClient),
+                NexusCompletionDeps::default(),
                 4,
                 node_id.to_string(),
                 "127.0.0.1:7233".to_owned(),
@@ -1644,9 +1723,12 @@ mod tests {
             1,
             1,
             Arc::new(NoopNexusHttpClient),
+            Arc::new(NoopNexusCompletionClient),
+            NexusCompletionRuntimeConfig::default(),
             NexusEndpointRegistry::default(),
             NexusTaskBroker::default(),
             NexusTimeoutTrackingState::default(),
+            CompletionCallbackTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
             None,
@@ -1723,9 +1805,12 @@ mod tests {
             1,
             1,
             Arc::new(NoopNexusHttpClient),
+            Arc::new(NoopNexusCompletionClient),
+            NexusCompletionRuntimeConfig::default(),
             NexusEndpointRegistry::default(),
             NexusTaskBroker::default(),
             NexusTimeoutTrackingState::default(),
+            CompletionCallbackTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
             Some(versioning),
@@ -1803,9 +1888,12 @@ mod tests {
             1,
             1,
             Arc::new(NoopNexusHttpClient),
+            Arc::new(NoopNexusCompletionClient),
+            NexusCompletionRuntimeConfig::default(),
             NexusEndpointRegistry::default(),
             NexusTaskBroker::default(),
             NexusTimeoutTrackingState::default(),
+            CompletionCallbackTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
             Some(versioning),
@@ -1889,9 +1977,12 @@ mod tests {
             1,
             1,
             Arc::new(NoopNexusHttpClient),
+            Arc::new(NoopNexusCompletionClient),
+            NexusCompletionRuntimeConfig::default(),
             NexusEndpointRegistry::default(),
             NexusTaskBroker::default(),
             NexusTimeoutTrackingState::default(),
+            CompletionCallbackTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
             Some(versioning),
@@ -2977,6 +3068,14 @@ mod tests {
             _shard_id: tokeira_types::ShardId,
             _limit: usize,
         ) -> Result<Vec<tokeira_storage::NexusSweepEntry>> {
+            panic!("unused in timer scanner tests")
+        }
+
+        async fn list_runs_with_pending_completion_callbacks_for_shard(
+            &self,
+            _shard_id: tokeira_types::ShardId,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::CompletionCallbackSweepEntry>> {
             panic!("unused in timer scanner tests")
         }
     }

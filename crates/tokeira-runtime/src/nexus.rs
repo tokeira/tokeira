@@ -606,6 +606,39 @@ impl NexusCompletion {
     }
 }
 
+/// The JSON body of a `failed`/`canceled` completion `POST`. Carries the human-readable
+/// message and the originating failure as a kernel [`Payload`] (a serialized
+/// `temporal.api.failure.v1.Failure`), so the inbound `/nexus/callback` handler (Wave 5)
+/// reconstructs the exact failure to record on the originator's terminal
+/// `NexusOperationFailed`/`Canceled` event.
+///
+/// This is tokeira's **single-cluster loopback** failure shape — it is encoded here
+/// (firing) and decoded by tokeira's own inbound endpoint. It deliberately differs from
+/// v1.31.0's external `nexus.Failure` JSON (`{message, metadata, details}` with `details`
+/// carrying an encoded payload); full external wire-parity is a `nexus-multi-cluster`
+/// concern (design "Out of Scope"). The `Content-Type` is still `application/json`, so a
+/// v1.31.0 peer's content-type check (Wave 5) is satisfied.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NexusCompletionFailureBody {
+    pub message: String,
+    pub failure: Payload,
+}
+
+impl NexusCompletionFailureBody {
+    /// Serialize to the JSON body bytes carried in a `NexusCompletion::Failed`/`Canceled`.
+    pub fn encode(&self) -> Vec<u8> {
+        // A plain struct of (String, Payload) cannot fail to serialize; fall back to an
+        // empty body rather than panicking on the off chance it does.
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Decode the JSON body bytes (used by the inbound `/nexus/callback` handler, Wave 5).
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes)
+            .map_err(|error| anyhow!("invalid nexus completion failure body: {error}"))
+    }
+}
+
 /// Outcome of a single completion-callback `POST`. The Wave 4 firing handler maps this
 /// to a kernel `CallbackAttemptOutcome` (`Delivered`→`Succeeded`,
 /// `RetryableError`→`RetryableFailure`, `NonRetryableError`→`NonRetryableFailure`).
@@ -659,6 +692,16 @@ pub enum NexusTaskRequest {
         request_id: String,
         payload: Option<Payload>,
         scheduled_time: Option<OffsetDateTime>,
+        /// Callback URL the handler attaches to its backing workflow so the eventual
+        /// async outcome is delivered back here. `Some(SYSTEM_CALLBACK_URL)` for a
+        /// Worker-target dispatch; `None` when no completion callback is attached
+        /// (e.g. the External arm, deferred to `nexus-multi-cluster`). The edge
+        /// poll-response translation emits this as `StartOperationRequest.callback`.
+        callback_url: Option<String>,
+        /// Encoded [`NexusCompletionToken`] sent in the `Temporal-Callback-Token`
+        /// header alongside `callback_url`, so the completion can be routed back to
+        /// this originator's pending operation. `Some` iff `callback_url` is.
+        callback_token: Option<String>,
     },
     CancelOperation {
         service: String,
@@ -881,6 +924,71 @@ impl NexusTimeoutTrackingState {
     }
 }
 
+/// Volatile index of which `BackingOff` completion callbacks the completion-callback
+/// scanner must re-fire.
+///
+/// Like [`NexusTimeoutTrackingState`] this is a derived index, not authority: it lists
+/// *which* `(run, callback_index)` pairs are backing off. The `next_attempt_at`
+/// deadline and current `CallbackState` are read from the durable `CompletionCallback`
+/// at scan time (history is authority, AGENTS §3). On shard takeover the index is
+/// rebuilt from durable state by [`crate::recovery::sweep_shard`]; losing it only
+/// delays a retry until the rebuild, never changes the outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionCallbackTrackingEntry {
+    pub run_key: RunKey,
+    pub shard_id: ShardId,
+    pub callback_index: usize,
+}
+
+#[derive(Clone, Default)]
+pub struct CompletionCallbackTrackingState {
+    inner: Arc<Mutex<HashMap<(RunKey, usize), CompletionCallbackTrackingEntry>>>,
+}
+
+impl CompletionCallbackTrackingState {
+    pub fn insert(&self, entry: CompletionCallbackTrackingEntry) {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert((entry.run_key, entry.callback_index), entry);
+    }
+
+    pub fn remove(&self, run_key: RunKey, callback_index: usize) {
+        self.inner
+            .lock()
+            .unwrap()
+            .remove(&(run_key, callback_index));
+    }
+
+    pub fn remove_all_for_run(&self, run_key: RunKey) {
+        self.inner
+            .lock()
+            .unwrap()
+            .retain(|(candidate, _), _| *candidate != run_key);
+    }
+
+    pub fn remove_all_for_shard(&self, shard_id: ShardId) {
+        self.inner
+            .lock()
+            .unwrap()
+            .retain(|_, entry| entry.shard_id != shard_id);
+    }
+
+    pub fn snapshot(&self) -> Vec<CompletionCallbackTrackingEntry> {
+        self.inner.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<CompletionCallbackTrackingEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.shard_id == shard_id)
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NexusTimeoutScannerConfig {
     pub scan_interval: tokio::time::Duration,
@@ -894,6 +1002,92 @@ impl Default for NexusTimeoutScannerConfig {
             max_timeouts_per_scan: 100,
         }
     }
+}
+
+/// Cadence + per-tick bound for the completion-callback retry scanner (mirrors
+/// [`NexusTimeoutScannerConfig`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionCallbackScannerConfig {
+    pub scan_interval: tokio::time::Duration,
+    pub max_per_scan: usize,
+}
+
+impl Default for CompletionCallbackScannerConfig {
+    fn default() -> Self {
+        Self {
+            scan_interval: tokio::time::Duration::from_secs(1),
+            max_per_scan: 100,
+        }
+    }
+}
+
+/// Runtime-side completion-delivery knobs (a runtime-local mirror of
+/// `tokeira_config::NexusCompletionConfig`; the kernel stays config-free and the
+/// runtime crate does not depend on `tokeira-config`). `tokeirad` copies the policy
+/// values into this when constructing the runtime; tests use [`Default`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct NexusCompletionRuntimeConfig {
+    /// The address `temporal://system` resolves to when a callback fires (the local
+    /// `/nexus/callback` listener).
+    pub system_callback_url: String,
+    /// First retry backoff interval.
+    pub retry_initial_interval: Duration,
+    /// Cap on the backoff interval.
+    pub retry_max_interval: Duration,
+    /// Per-attempt backoff multiplier.
+    pub retry_backoff_coefficient: f64,
+    /// Max delivery attempts; `0` = unbounded (v1.31.0 `NoInterval` semantics).
+    pub retry_max_attempts: u32,
+}
+
+impl Default for NexusCompletionRuntimeConfig {
+    fn default() -> Self {
+        // Mirrors tokeira_config::NexusCompletionConfig defaults (async-completion Wave 0):
+        // 1s initial / 1h max / 2.0 coefficient, unbounded attempts.
+        Self {
+            system_callback_url: "http://127.0.0.1:7253".to_string(),
+            retry_initial_interval: Duration::seconds(1),
+            retry_max_interval: Duration::hours(1),
+            retry_backoff_coefficient: 2.0,
+            retry_max_attempts: 0,
+        }
+    }
+}
+
+/// Bundle of the completion-delivery dependencies the runtime threads from its
+/// constructors to the publisher + the completion-callback scanner: the outbound
+/// client, the delivery/backoff config, and the scanner cadence. Defaults to a
+/// non-delivering [`NoopNexusCompletionClient`] so the many `TokeiraRuntime::new`
+/// call sites (and tests that don't exercise delivery) need no changes; `tokeirad`
+/// injects the real [`HttpNexusCompletionClient`](crate::nexus_http::HttpNexusCompletionClient).
+#[derive(Clone)]
+pub struct NexusCompletionDeps {
+    pub client: Arc<dyn NexusCompletionClient>,
+    pub config: NexusCompletionRuntimeConfig,
+    pub scanner: CompletionCallbackScannerConfig,
+}
+
+impl Default for NexusCompletionDeps {
+    fn default() -> Self {
+        Self {
+            client: Arc::new(NoopNexusCompletionClient),
+            config: NexusCompletionRuntimeConfig::default(),
+            scanner: CompletionCallbackScannerConfig::default(),
+        }
+    }
+}
+
+/// Next backoff delay for a completion-callback retry: `initial * coefficient^(attempt-1)`,
+/// capped at `max_interval`. `attempt` is the 1-based number of the attempt that just
+/// failed (so the first failure backs off by `initial`). The kernel performs no backoff
+/// math (`command.rs` `CallbackAttemptOutcome` doc); the runtime computes this and passes
+/// `next_attempt_at` into `CompletionCallbackAttempted`.
+pub fn nexus_completion_backoff(config: &NexusCompletionRuntimeConfig, attempt: u32) -> Duration {
+    let exp = attempt.saturating_sub(1) as f64;
+    let secs =
+        config.retry_initial_interval.as_seconds_f64() * config.retry_backoff_coefficient.powf(exp);
+    let capped = secs.min(config.retry_max_interval.as_seconds_f64());
+    Duration::seconds_f64(capped.max(0.0))
 }
 
 /// Decide which Nexus timeout, if any, the live operation has breached at `now`.

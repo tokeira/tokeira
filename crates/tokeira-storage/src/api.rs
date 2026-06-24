@@ -627,6 +627,19 @@ pub trait RunRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<NexusSweepEntry>>;
 
+    /// List the *pending* (`Scheduled` or `BackingOff`) completion callbacks of runs homed
+    /// on `shard_id`, so the completion-callback retry scanner can rebuild its volatile
+    /// index after a shard takeover (mirrors `list_pending_nexus_operations_for_shard`).
+    /// Both non-terminal states are included so a `Scheduled` callback whose first delivery
+    /// was lost to a crash is re-driven (see [`CompletionCallbackSweepEntry`]). Completion
+    /// callbacks live in the run blob, so backends enumerate the shard's runs and filter;
+    /// losing the index only delays a retry until the rebuild, never changes the outcome.
+    async fn list_runs_with_pending_completion_callbacks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<CompletionCallbackSweepEntry>>;
+
     // TODO(storage): add sweep methods for activity tasks, archival eligibility,
     // namespace-scoped pagination, and explicit current-execution conflict
     // policies (reuse, reject, allow-after-close, continue-as-new chains).
@@ -825,6 +838,24 @@ pub struct NexusSweepEntry {
     pub scheduled_event_id: i64,
     /// When the operation was scheduled.
     pub scheduled_at: OffsetDateTime,
+}
+
+/// A *pending* (`Scheduled` or `BackingOff`) completion callback that the
+/// completion-callback retry scanner must re-watch after a shard takeover. Produced by
+/// [`RunRepository::list_runs_with_pending_completion_callbacks_for_shard`]. Like
+/// [`NexusSweepEntry`] this is only an index seed: the durable `CompletionCallback`
+/// remains the authority for the callback's current state and `next_attempt_at`, re-read
+/// at scan time. Both non-terminal states are included so a callback whose first attempt
+/// was lost mid-flight (process crash after `Scheduled` committed but before the attempt
+/// was recorded) is re-driven on recovery — mirroring v1.31.0's `RegenerateTasks`, which
+/// re-issues an invocation task for `CALLBACK_STATE_SCHEDULED` and a backoff task for
+/// `CALLBACK_STATE_BACKING_OFF` (`components/callbacks/statemachine.go:76-96 @ v1.31.0`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompletionCallbackSweepEntry {
+    /// Durable storage key for the owning run.
+    pub run_key: RunKey,
+    /// Index into the run's `completion_callbacks`.
+    pub callback_index: usize,
 }
 
 pub fn workflow_is_open_and_pinned_to_version(
@@ -1336,6 +1367,16 @@ where
     ) -> Result<Vec<NexusSweepEntry>> {
         (**self)
             .list_pending_nexus_operations_for_shard(shard_id, limit)
+            .await
+    }
+
+    async fn list_runs_with_pending_completion_callbacks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<CompletionCallbackSweepEntry>> {
+        (**self)
+            .list_runs_with_pending_completion_callbacks_for_shard(shard_id, limit)
             .await
     }
 }

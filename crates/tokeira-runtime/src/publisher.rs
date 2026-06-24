@@ -5,7 +5,7 @@
 //! child-workflow orchestration, external signal/cancel delivery, and Nexus
 //! operation scheduling.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,34 +15,43 @@ use opentelemetry::{
 };
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    CancelRequest, ChildStartConfirmedRequest, ChildStartResult, Command, DispatchOp,
-    ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-    ExternalSignalResult, ExternalWorkflowExecution, LoadedRun, SignalRequest, StartRequest,
-    TerminateRequest,
+    CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState, CancelRequest,
+    ChildStartConfirmedRequest, ChildStartResult, Command, CompletionCallback,
+    CompletionCallbackAttemptedRequest, DispatchOp, ExternalCancelResolvedRequest,
+    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
+    ExternalWorkflowExecution, LoadedRun, SignalRequest, StartRequest, TerminateRequest,
+    WorkflowState,
 };
 use tokeira_proto::{
-    conversions::common::failure_to_payload, public::temporal::api::failure::v1 as failure_proto,
+    conversions::common::{failure_to_payload, payloads_from_domain},
+    public::temporal::api::failure::v1 as failure_proto,
 };
 use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, RunRepository,
 };
 use tokeira_types::{
-    BuildId, ExecutionRef, Memo, NamespaceId, Payloads, QueueKey, RequestContext, RequestId, RunId,
-    RunKey, SearchAttributes, TaskQueueName, WorkflowId,
+    BuildId, ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payload, Payloads, QueueKey,
+    RequestContext, RequestId, RunId, RunKey, SearchAttributes, ShardId, TaskQueueName, WorkflowId,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     activity_timeout::ActivityTrackingState,
     broker::{InMemoryActivityBroker, InMemoryBroker},
     fairness::DeliveryMetrics,
     lane::{DispatchPublisher, LaneHandle},
+    metrics as runtime_metrics,
     nexus::{
-        EndpointTarget, NexusEndpointRegistry, NexusHttpClient, NexusStartResult, NexusTask,
-        NexusTaskBroker, NexusTaskRequest, NexusTaskToken, NexusTimeoutEntry,
-        NexusTimeoutTrackingState,
+        CompletionCallbackScannerConfig, CompletionCallbackTrackingEntry,
+        CompletionCallbackTrackingState, CompletionDeliveryOutcome, EndpointTarget,
+        NexusCompletion, NexusCompletionClient, NexusCompletionFailureBody,
+        NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusHttpClient, NexusStartResult,
+        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken, NexusTimeoutEntry,
+        NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL, TEMPORAL_CALLBACK_TOKEN_HEADER,
+        nexus_completion_backoff,
     },
     scanner::pick_lane_for_run_key,
-    shard::shard_for,
+    shard::{ShardOwner, shard_for},
     versioning::VersioningRuleStore,
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -57,9 +66,12 @@ pub struct RuntimeDispatchPublisher<R> {
     lane_count: usize,
     shard_count: u32,
     nexus_client: Arc<dyn NexusHttpClient>,
+    nexus_completion_client: Arc<dyn NexusCompletionClient>,
+    nexus_completion_config: NexusCompletionRuntimeConfig,
     nexus_registry: NexusEndpointRegistry,
     nexus_broker: NexusTaskBroker,
     nexus_timeout_tracking: NexusTimeoutTrackingState,
+    completion_callback_tracking: CompletionCallbackTrackingState,
     activity_tracking: ActivityTrackingState,
     delivery_metrics: DeliveryMetrics,
     versioning_rule_store: Option<Arc<VersioningRuleStore>>,
@@ -75,9 +87,12 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             lane_count: self.lane_count,
             shard_count: self.shard_count,
             nexus_client: self.nexus_client.clone(),
+            nexus_completion_client: self.nexus_completion_client.clone(),
+            nexus_completion_config: self.nexus_completion_config.clone(),
             nexus_registry: self.nexus_registry.clone(),
             nexus_broker: self.nexus_broker.clone(),
             nexus_timeout_tracking: self.nexus_timeout_tracking.clone(),
+            completion_callback_tracking: self.completion_callback_tracking.clone(),
             activity_tracking: self.activity_tracking.clone(),
             delivery_metrics: self.delivery_metrics.clone(),
             versioning_rule_store: self.versioning_rule_store.clone(),
@@ -98,9 +113,12 @@ where
         lane_count: usize,
         shard_count: u32,
         nexus_client: Arc<dyn NexusHttpClient>,
+        nexus_completion_client: Arc<dyn NexusCompletionClient>,
+        nexus_completion_config: NexusCompletionRuntimeConfig,
         nexus_registry: NexusEndpointRegistry,
         nexus_broker: NexusTaskBroker,
         nexus_timeout_tracking: NexusTimeoutTrackingState,
+        completion_callback_tracking: CompletionCallbackTrackingState,
         activity_tracking: ActivityTrackingState,
         delivery_metrics: DeliveryMetrics,
         versioning_rule_store: Option<Arc<VersioningRuleStore>>,
@@ -113,9 +131,12 @@ where
             lane_count,
             shard_count,
             nexus_client,
+            nexus_completion_client,
+            nexus_completion_config,
             nexus_registry,
             nexus_broker,
             nexus_timeout_tracking,
+            completion_callback_tracking,
             activity_tracking,
             delivery_metrics,
             versioning_rule_store,
@@ -701,6 +722,39 @@ where
                     namespace_id,
                     task_queue,
                 } => {
+                    // Attach a completion callback so the handler's backing workflow
+                    // delivers the eventual async outcome back to this originator's
+                    // pending op. Worker (in-cluster) targets use the
+                    // `temporal://system` sentinel, resolved to our own listener when
+                    // the callback fires (design §2). `request_id` reuses
+                    // `operation_id` — the only routing key in scope here — matching
+                    // how `StartOperation.request_id` is already populated below (a
+                    // tokeira convention; v1.31.0's `NexusOperationCompletion.request_id`
+                    // is a distinct field, documented in nexus-async-completion 3.1).
+                    let token = crate::nexus::NexusCompletionToken {
+                        originator_run_key,
+                        operation_id: operation_id.clone(),
+                        scheduled_event_id,
+                        request_id: operation_id.clone(),
+                    };
+                    let (callback_url, callback_token) = match token.encode() {
+                        Ok(encoded) => (
+                            Some(crate::nexus::SYSTEM_CALLBACK_URL.to_string()),
+                            Some(encoded),
+                        ),
+                        Err(error) => {
+                            // Encoding a small struct cannot realistically fail; if it
+                            // somehow does, dispatch without a callback rather than
+                            // dropping the operation (the caller would then rely on its
+                            // schedule-to-close timeout). Never abort the dispatch.
+                            tracing::warn!(
+                                ?error,
+                                operation_id = %operation_id,
+                                "failed to encode nexus completion token; dispatching without callback"
+                            );
+                            (None, None)
+                        }
+                    };
                     let task = NexusTask {
                         token: NexusTaskToken {
                             run_key: originator_run_key,
@@ -713,6 +767,8 @@ where
                             request_id: operation_id.clone(),
                             payload: input.0.first().cloned(),
                             scheduled_time: Some(scheduled_at),
+                            callback_url,
+                            callback_token,
                         },
                     };
                     self.nexus_broker
@@ -902,6 +958,253 @@ where
             LoadedRun::Absent => Ok(None),
         }
     }
+
+    /// Fire one completion callback: build the Nexus completion from the terminal
+    /// `outcome`, POST it to the callback URL (resolving `temporal://system` to the
+    /// configured local listener), and record the attempt outcome on the closed run via
+    /// `CompletionCallbackAttempted`. Reused by the dispatch loop (first attempt) and the
+    /// retry scanner (re-fire). Mirrors v1.31.0's callbacks-component invocation
+    /// (`components/callbacks/nexus_invocation.go @ v1.31.0`).
+    pub(crate) async fn deliver_completion_callback(
+        &self,
+        run_key: RunKey,
+        callback_index: usize,
+        callback: &CompletionCallback,
+        outcome: &CallbackCompletionOutcome,
+    ) {
+        let CallbackSpec::Nexus { url, header } = &callback.spec;
+        let token = header
+            .get(TEMPORAL_CALLBACK_TOKEN_HEADER)
+            .cloned()
+            .unwrap_or_default();
+
+        // Map the kernel outcome onto the wire completion, synthesizing the Nexus
+        // failure body for the non-success kinds (the kernel forwards bare variants; the
+        // runtime owns failure synthesis — kernel `transition.rs` `CallbackCompletionOutcome`
+        // doc). Mirrors `GetNexusCompletion @ v1.31.0`.
+        let completion = match outcome {
+            CallbackCompletionOutcome::Success { result } => {
+                NexusCompletion::Succeeded(Payloads(result.iter().cloned().collect()))
+            }
+            CallbackCompletionOutcome::Failed { failure } => NexusCompletion::Failed(
+                completion_failure_body("operation failed", failure.clone()),
+            ),
+            CallbackCompletionOutcome::Canceled { details } => NexusCompletion::Canceled(
+                completion_failure_body("operation canceled", synth_canceled_failure(details)),
+            ),
+            CallbackCompletionOutcome::Terminated => NexusCompletion::Failed(
+                completion_failure_body("operation terminated", synth_terminated_failure()),
+            ),
+            CallbackCompletionOutcome::TimedOut => NexusCompletion::Failed(
+                completion_failure_body("operation timed out", synth_timed_out_failure()),
+            ),
+            CallbackCompletionOutcome::ContinuedAsNew => {
+                NexusCompletion::Failed(completion_failure_body(
+                    "operation continued as new",
+                    synth_continued_as_new_failure(),
+                ))
+            }
+        };
+
+        // Resolve the `temporal://system` sentinel to the configured local listener (the
+        // loopback v1.31.0 performs via `routeSystemCallbackRequest`); external URLs are
+        // posted as-is.
+        let target = if url == SYSTEM_CALLBACK_URL {
+            self.nexus_completion_config.system_callback_url.clone()
+        } else {
+            url.clone()
+        };
+
+        let delivery = self
+            .nexus_completion_client
+            .complete_operation(&target, &token, completion, &callback.links)
+            .await;
+
+        let now = OffsetDateTime::now_utc();
+        let attempt_outcome = match delivery {
+            Ok(CompletionDeliveryOutcome::Delivered) => {
+                self.completion_callback_tracking
+                    .remove(run_key, callback_index);
+                CallbackAttemptOutcome::Succeeded
+            }
+            Ok(CompletionDeliveryOutcome::NonRetryableError { detail }) => {
+                self.completion_callback_tracking
+                    .remove(run_key, callback_index);
+                CallbackAttemptOutcome::NonRetryableFailure {
+                    failure: attempt_failure_payload(&detail),
+                }
+            }
+            // A retryable status or a pre-flight `Err` (treated as a transient transport
+            // failure): back off, unless the attempt cap is reached.
+            other => {
+                let detail = match other {
+                    Ok(CompletionDeliveryOutcome::RetryableError { detail }) => detail,
+                    Err(error) => format!("nexus completion delivery error: {error}"),
+                    // Delivered / NonRetryableError already handled above.
+                    Ok(_) => unreachable!("delivered/non-retryable handled above"),
+                };
+                let next_attempt = callback.attempt + 1;
+                let max = self.nexus_completion_config.retry_max_attempts;
+                if max != 0 && next_attempt >= max {
+                    // Attempts exhausted → terminal Failed (design Error Handling).
+                    self.completion_callback_tracking
+                        .remove(run_key, callback_index);
+                    CallbackAttemptOutcome::NonRetryableFailure {
+                        failure: attempt_failure_payload(&detail),
+                    }
+                } else {
+                    let next_attempt_at =
+                        now + nexus_completion_backoff(&self.nexus_completion_config, next_attempt);
+                    self.completion_callback_tracking
+                        .insert(CompletionCallbackTrackingEntry {
+                            run_key,
+                            shard_id: shard_for(run_key, self.shard_count),
+                            callback_index,
+                        });
+                    CallbackAttemptOutcome::RetryableFailure {
+                        failure: attempt_failure_payload(&detail),
+                        next_attempt_at,
+                    }
+                }
+            }
+        };
+
+        let command = Command::CompletionCallbackAttempted(CompletionCallbackAttemptedRequest {
+            callback_index,
+            outcome: attempt_outcome,
+            now,
+        });
+        if let Err(error) = self.submit_to_run(run_key, command).await {
+            // A kernel rejection means the callback already advanced to a terminal state
+            // (another attempt won, or the callback index is gone): the index entry is
+            // stale, drop it. Any other error is transient and the attempt outcome was
+            // NOT recorded — re-seed the tracking index so the scanner re-drives this
+            // callback (it is still `Scheduled`/`BackingOff` on the closed run). Without
+            // this, a transient submit failure would strand the callback until a shard
+            // takeover rebuild.
+            if error.to_string().contains("kernel rejected") {
+                self.completion_callback_tracking
+                    .remove(run_key, callback_index);
+            } else {
+                self.completion_callback_tracking
+                    .insert(CompletionCallbackTrackingEntry {
+                        run_key,
+                        shard_id: shard_for(run_key, self.shard_count),
+                        callback_index,
+                    });
+                tracing::warn!(
+                    ?error,
+                    run_key = ?run_key,
+                    callback_index,
+                    "failed to submit completion callback attempt; re-queued for the scanner"
+                );
+            }
+        }
+    }
+}
+
+/// Wrap an originating failure `Payload` into the completion failure body bytes.
+fn completion_failure_body(message: &str, failure: Payload) -> Vec<u8> {
+    NexusCompletionFailureBody {
+        message: message.to_string(),
+        failure,
+    }
+    .encode()
+}
+
+/// A small application failure recording why a delivery attempt failed (carried on the
+/// callback's `last_attempt_failure` for the Describe surface; not the operation outcome).
+fn attempt_failure_payload(detail: &str) -> Payload {
+    failure_to_payload(&failure_proto::Failure {
+        message: detail.to_string(),
+        failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+            failure_proto::ApplicationFailureInfo {
+                r#type: "NexusCompletionDeliveryFailure".to_string(),
+                non_retryable: false,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    })
+}
+
+/// A neutral operation-failure payload (used only as the unreachable fallback when a
+/// failed run somehow has no recorded `close_failure`).
+fn synth_operation_failure(message: &str) -> Payload {
+    failure_to_payload(&failure_proto::Failure {
+        message: message.to_string(),
+        failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+            failure_proto::ApplicationFailureInfo {
+                r#type: "NexusOperationFailure".to_string(),
+                non_retryable: false,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    })
+}
+
+/// Synthesize the failure `Payload` for a canceled handler workflow
+/// (`CanceledFailureInfo` carrying the cancel details, `GetNexusCompletion` canceled arm
+/// @ v1.31.0).
+fn synth_canceled_failure(details: &Option<Payloads>) -> Payload {
+    failure_to_payload(&failure_proto::Failure {
+        message: "operation canceled".to_string(),
+        failure_info: Some(failure_proto::failure::FailureInfo::CanceledFailureInfo(
+            failure_proto::CanceledFailureInfo {
+                details: details.as_ref().map(payloads_from_domain),
+                identity: String::new(),
+            },
+        )),
+        ..Default::default()
+    })
+}
+
+/// Synthesize the failure `Payload` for a terminated handler workflow
+/// (`TerminatedFailureInfo`, `GetNexusCompletion` @ v1.31.0).
+fn synth_terminated_failure() -> Payload {
+    failure_to_payload(&failure_proto::Failure {
+        message: "operation terminated".to_string(),
+        failure_info: Some(failure_proto::failure::FailureInfo::TerminatedFailureInfo(
+            failure_proto::TerminatedFailureInfo {
+                identity: String::new(),
+            },
+        )),
+        ..Default::default()
+    })
+}
+
+/// Synthesize the failure `Payload` for a timed-out handler workflow. Verbatim from
+/// `GetNexusCompletion`'s timed-out arm (`service/history/workflow/mutable_state_impl.go:124-133
+/// @ v1.31.0`): message `"operation exceeded internal timeout"` with an **empty**
+/// `TimeoutFailureInfo` — v1.31.0 deliberately does not fill the timeout type ("it's not
+/// particularly interesting to a Nexus caller").
+fn synth_timed_out_failure() -> Payload {
+    failure_to_payload(&failure_proto::Failure {
+        message: "operation exceeded internal timeout".to_string(),
+        failure_info: Some(failure_proto::failure::FailureInfo::TimeoutFailureInfo(
+            failure_proto::TimeoutFailureInfo::default(),
+        )),
+        ..Default::default()
+    })
+}
+
+/// Synthesize the failure `Payload` for a continued-as-new handler workflow. v1.31.0's
+/// `GetNexusCompletion` returns an internal error here; tokeira deliberately maps it to a
+/// `failed` completion so the caller resolves rather than hanging (documented deviation,
+/// nexus-async-completion task 1.1).
+fn synth_continued_as_new_failure() -> Payload {
+    failure_to_payload(&failure_proto::Failure {
+        message: "operation completed by continue-as-new".to_string(),
+        failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+            failure_proto::ApplicationFailureInfo {
+                r#type: "NexusOperationContinuedAsNew".to_string(),
+                non_retryable: true,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    })
 }
 
 #[async_trait]
@@ -1211,16 +1514,22 @@ where
                     callback,
                     outcome,
                 } => {
-                    // Wave 1: the kernel now derives the terminal `outcome` and carries
-                    // it on the op, but real delivery (HTTP POST + lifecycle advance)
-                    // lands in Wave 4. Bind `outcome` so the match stays exhaustive.
-                    let _ = &outcome;
-                    tracing::info!(
-                        run_key = ?run_key,
-                        callback_index,
-                        callback = ?callback,
-                        "completion callback scheduled for dispatch"
-                    );
+                    // Fire the callback off the dispatch loop (it does HTTP I/O), mirror
+                    // the cancel-nexus arm above.
+                    let publisher = RuntimeDispatchPublisher::clone(self);
+                    let callback_index = *callback_index;
+                    let callback = callback.clone();
+                    let outcome = outcome.clone();
+                    tokio::spawn(async move {
+                        publisher
+                            .deliver_completion_callback(
+                                run_key,
+                                callback_index,
+                                &callback,
+                                &outcome,
+                            )
+                            .await;
+                    });
                 }
             }
         }
@@ -1229,5 +1538,155 @@ where
 
     async fn submit_to_run(&self, run_key: RunKey, command: Command) -> Result<CommitResult> {
         self.pick_lane(run_key).submit(run_key, command).await
+    }
+}
+
+/// Re-derive the terminal completion outcome from a closed run's durable state.
+///
+/// The kernel derives `CallbackCompletionOutcome` from the closing *event* at close time
+/// and carries it only on the (transient) dispatch op, not on the durable callback. The
+/// retry scanner therefore re-derives it from `WorkflowState` — mirroring the kernel's
+/// `callback_completion_outcome` but over the persisted close status/result/failure. A
+/// canceled run's cancel `details` are not preserved on `WorkflowState`, so a re-fire
+/// uses `Canceled { details: None }` (the synthesized "operation canceled" message is the
+/// load-bearing part); the first attempt off the dispatch op still carries full details.
+/// Returns `None` for a non-terminal run (defensive — a backing-off callback is always on
+/// a closed run).
+pub(crate) fn outcome_for_closed_run(state: &WorkflowState) -> Option<CallbackCompletionOutcome> {
+    match state.status {
+        ExecutionStatus::Completed => Some(CallbackCompletionOutcome::Success {
+            result: state
+                .close_result
+                .as_ref()
+                .and_then(|payloads| payloads.0.first().cloned()),
+        }),
+        ExecutionStatus::Failed => Some(CallbackCompletionOutcome::Failed {
+            // A failed run always carries its terminal failure; the fallback is a neutral
+            // operation-failure payload only for the unreachable `close_failure == None`
+            // case (NOT the delivery-failure type used for attempt bookkeeping).
+            failure: state
+                .close_failure
+                .clone()
+                .unwrap_or_else(|| synth_operation_failure("operation failed")),
+        }),
+        ExecutionStatus::Cancelled => Some(CallbackCompletionOutcome::Canceled { details: None }),
+        ExecutionStatus::Terminated => Some(CallbackCompletionOutcome::Terminated),
+        ExecutionStatus::TimedOut => Some(CallbackCompletionOutcome::TimedOut),
+        ExecutionStatus::ContinuedAsNew => Some(CallbackCompletionOutcome::ContinuedAsNew),
+        _ => None,
+    }
+}
+
+/// Re-fire `BackingOff` completion callbacks whose `next_attempt_at` has passed, capped at
+/// `max_per_scan`. Mirrors `scan_nexus_timeouts_once`: the durable `CompletionCallback` is
+/// the authority for the current lifecycle state and deadline, so each entry's run is
+/// reloaded; a stale entry (run absent, callback gone, or no longer backing off) is
+/// dropped. Delivery reuses [`RuntimeDispatchPublisher::deliver_completion_callback`],
+/// which re-seeds or clears the tracking index based on the new attempt outcome.
+pub(crate) async fn scan_completion_callbacks_once<R>(
+    repo: &R,
+    tracking: &CompletionCallbackTrackingState,
+    shard_id: Option<ShardId>,
+    publisher: &RuntimeDispatchPublisher<R>,
+    config: &CompletionCallbackScannerConfig,
+) where
+    R: RunRepository + 'static,
+{
+    let now = OffsetDateTime::now_utc();
+    let entries = match shard_id {
+        Some(shard_id) => tracking.snapshot_for_shard(shard_id),
+        None => tracking.snapshot(),
+    };
+    let mut fired = 0usize;
+
+    for entry in entries {
+        if fired >= config.max_per_scan {
+            break;
+        }
+        let state = match repo.load_run(entry.run_key).await {
+            Ok(LoadedRun::Existing(state)) => state,
+            Ok(LoadedRun::Absent) => {
+                tracking.remove(entry.run_key, entry.callback_index);
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    run_key = ?entry.run_key,
+                    callback_index = entry.callback_index,
+                    "completion callback scanner failed to load run"
+                );
+                continue;
+            }
+        };
+        let Some(callback) = state.completion_callbacks.get(entry.callback_index) else {
+            tracking.remove(entry.run_key, entry.callback_index);
+            continue;
+        };
+        match callback.state {
+            // `Scheduled` means the first delivery was lost (the firing task died, or its
+            // attempt-commit failed) — re-drive it immediately. This is what closes the
+            // crash-before-first-attempt recovery gap (mirrors v1.31.0 `RegenerateTasks`
+            // re-issuing an invocation task for a `SCHEDULED` callback,
+            // `components/callbacks/statemachine.go:76-96 @ v1.31.0`).
+            CallbackState::Scheduled => {}
+            // `BackingOff` is re-fired only once its backoff deadline has passed.
+            CallbackState::BackingOff => match callback.next_attempt_at {
+                Some(due) if now >= due => {}
+                _ => continue,
+            },
+            CallbackState::Succeeded | CallbackState::Failed => {
+                // Terminal: another attempt won or it failed out — drop the entry.
+                tracking.remove(entry.run_key, entry.callback_index);
+                continue;
+            }
+            // Standby (open run) / Blocked are not the scanner's to fire.
+            _ => continue,
+        }
+        let Some(outcome) = outcome_for_closed_run(&state) else {
+            continue;
+        };
+        runtime_metrics::record_scanner_dispatched(
+            "completion_callback",
+            shard_id.map(|s| s.0).unwrap_or(0),
+        );
+        let callback = callback.clone();
+        publisher
+            .deliver_completion_callback(entry.run_key, entry.callback_index, &callback, &outcome)
+            .await;
+        fired += 1;
+    }
+}
+
+/// Background loop that drives [`scan_completion_callbacks_once`] per active shard on a
+/// fixed cadence until cancelled (mirrors `run_nexus_timeout_scanner`).
+pub async fn run_completion_callback_scanner<R>(
+    repo: Arc<R>,
+    tracking: CompletionCallbackTrackingState,
+    publisher: RuntimeDispatchPublisher<R>,
+    shard_owner: Arc<RwLock<ShardOwner>>,
+    config: CompletionCallbackScannerConfig,
+    cancel: CancellationToken,
+) where
+    R: RunRepository + 'static,
+{
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(config.scan_interval) => {}
+        }
+
+        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        for shard_id in active_shards {
+            runtime_metrics::record_scanner_tick("completion_callback", shard_id.0);
+            scan_completion_callbacks_once(
+                repo.as_ref(),
+                &tracking,
+                Some(shard_id),
+                &publisher,
+                &config,
+            )
+            .await;
+        }
     }
 }

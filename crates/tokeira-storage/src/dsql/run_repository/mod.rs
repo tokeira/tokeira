@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use sqlx::Connection;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityOp, BasicKernel, DispatchOp, HistoryEvent, LoadedRun, ReplayContext, TimerOp,
-    Transition, WorkflowState,
+    ActivityOp, BasicKernel, CallbackState, DispatchOp, HistoryEvent, LoadedRun, ReplayContext,
+    TimerOp, Transition, WorkflowState,
 };
 use tokeira_types::{
     ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads,
@@ -25,11 +25,11 @@ use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::{
-    ActivitySweepEntry, BacklogEntry, CommitResult, CurrentExecutionConflictPolicy, DbClass,
-    DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
-    ProjectionContext, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-    WorkerDeploymentVersionKey, WorkflowTimeoutSweepEntry, metrics,
-    workflow_is_open_and_pinned_to_version,
+    ActivitySweepEntry, BacklogEntry, CommitResult, CompletionCallbackSweepEntry,
+    CurrentExecutionConflictPolicy, DbClass, DispatchableActivityTask, DispatchableWorkflowTask,
+    DueTimer, NexusSweepEntry, ProjectionContext, RequestRecord, RunRepository,
+    TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
+    WorkflowTimeoutSweepEntry, metrics, workflow_is_open_and_pinned_to_version,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -579,6 +579,15 @@ impl RunRepository for DsqlRunRepository {
         limit: usize,
     ) -> Result<Vec<NexusSweepEntry>> {
         self.do_list_pending_nexus_operations_for_shard(shard_id, limit)
+            .await
+    }
+
+    async fn list_runs_with_pending_completion_callbacks_for_shard(
+        &self,
+        shard_id: ShardId,
+        limit: usize,
+    ) -> Result<Vec<CompletionCallbackSweepEntry>> {
+        self.do_list_runs_with_pending_completion_callbacks_for_shard(shard_id, limit)
             .await
     }
 }

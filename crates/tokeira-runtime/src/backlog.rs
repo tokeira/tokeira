@@ -500,6 +500,14 @@ mod tests {
         ) -> Result<Vec<NexusSweepEntry>> {
             Ok(Vec::new())
         }
+
+        async fn list_runs_with_pending_completion_callbacks_for_shard(
+            &self,
+            _shard_id: ShardId,
+            _limit: usize,
+        ) -> Result<Vec<tokeira_storage::CompletionCallbackSweepEntry>> {
+            Ok(Vec::new())
+        }
     }
 
     fn workflow_queue() -> QueueKey {

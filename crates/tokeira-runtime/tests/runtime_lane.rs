@@ -11,9 +11,9 @@ use tokeira_kernel::{
     WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
-    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusEndpointRegistry,
-    NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig, TokeiraRuntime,
-    VersioningRuleStore, WorkflowTimeoutScannerConfig,
+    ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusCompletionDeps,
+    NexusEndpointRegistry, NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig,
+    TokeiraRuntime, VersioningRuleStore, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -502,11 +502,12 @@ async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Res
         .await?;
 
     let closed = wait_for_existing_run(&store, started.run_key).await?;
+    // The registered completion callback is preserved across restart and fired on close.
+    // Its post-close *delivery* state (now driven by the Wave 4 firing path) is exercised
+    // deterministically by the completion-delivery tests in `runtime_nexus.rs`; this test
+    // only asserts the callback survived the reload (it must not be dropped), since the
+    // async delivery makes the exact lifecycle state racy here.
     assert_eq!(closed.completion_callbacks.len(), 1);
-    assert_eq!(
-        closed.completion_callbacks[0].state,
-        CallbackState::Scheduled
-    );
 
     Ok(())
 }
@@ -781,6 +782,7 @@ fn recovering_runtime_with_store(store: Arc<InMemoryStore>) -> TokeiraRuntime<In
         NexusTimeoutScannerConfig::default(),
         NexusEndpointRegistry::default(),
         Arc::new(NoopNexusHttpClient),
+        NexusCompletionDeps::default(),
         1,
         "restart-test-owner".to_string(),
         false,

@@ -44,7 +44,10 @@ use crate::{
     activity_timeout::{ActivityTrackingEntry, ActivityTrackingState},
     broker::{InMemoryActivityBroker, InMemoryBroker},
     lane::LaneHandle,
-    nexus::{NexusTimeoutEntry, NexusTimeoutTrackingState},
+    nexus::{
+        CompletionCallbackTrackingEntry, CompletionCallbackTrackingState, NexusTimeoutEntry,
+        NexusTimeoutTrackingState,
+    },
     scanner::pick_lane_for_run_key,
     timeout::{WorkflowTimeoutEntry, WorkflowTimeoutTrackingState},
     wft_timeout::{WftTimeoutEntry, WftTimeoutTrackingState},
@@ -63,6 +66,7 @@ pub struct SweepResult {
     pub wft_timeout_entries_reconstructed: usize,
     pub activity_tracking_entries_reconstructed: usize,
     pub nexus_timeout_entries_reconstructed: usize,
+    pub completion_callback_entries_reconstructed: usize,
     pub expired_sticky_claims_cleared: usize,
 }
 
@@ -89,6 +93,7 @@ pub async fn sweep_shard<R>(
     wft_timeout_tracking: &WftTimeoutTrackingState,
     activity_tracking: &ActivityTrackingState,
     nexus_timeout_tracking: &NexusTimeoutTrackingState,
+    completion_callback_tracking: &CompletionCallbackTrackingState,
 ) -> Result<SweepResult>
 where
     R: RunRepository + ?Sized,
@@ -206,6 +211,18 @@ where
             scheduled_at: entry.scheduled_at,
         });
         result.nexus_timeout_entries_reconstructed += 1;
+    }
+
+    for entry in repo
+        .list_runs_with_pending_completion_callbacks_for_shard(shard_id, usize::MAX)
+        .await?
+    {
+        completion_callback_tracking.insert(CompletionCallbackTrackingEntry {
+            run_key: entry.run_key,
+            shard_id,
+            callback_index: entry.callback_index,
+        });
+        result.completion_callback_entries_reconstructed += 1;
     }
 
     Ok(result)
@@ -476,6 +493,7 @@ mod tests {
             &wfts,
             &ats,
             &nts,
+            &CompletionCallbackTrackingState::default(),
         )
         .await
         .unwrap();
@@ -562,6 +580,7 @@ mod tests {
                     &wfts,
                     &ats,
                     &nts,
+                    &CompletionCallbackTrackingState::default(),
                 )
                 .await
                 .unwrap();
@@ -695,6 +714,7 @@ mod tests {
                     &wfts,
                     &ats,
                     &nts,
+                    &CompletionCallbackTrackingState::default(),
                 )
                 .await
                 .unwrap();
@@ -809,6 +829,7 @@ mod tests {
                     &wfts,
                     &ats,
                     &nts,
+                    &CompletionCallbackTrackingState::default(),
                 )
                 .await
                 .unwrap();
@@ -894,6 +915,7 @@ mod tests {
                     &wfts,
                     &ats,
                     &nts,
+                    &CompletionCallbackTrackingState::default(),
                 )
                 .await
                 .unwrap();
@@ -1041,6 +1063,7 @@ mod tests {
                     &wfts,
                     &ats,
                     &nts,
+                    &CompletionCallbackTrackingState::default(),
                 )
                 .await
                 .unwrap();
@@ -1140,6 +1163,7 @@ mod tests {
                     &wfts,
                     &ats,
                     &nts,
+                    &CompletionCallbackTrackingState::default(),
                 )
                 .await
                 .unwrap();
@@ -1253,6 +1277,7 @@ mod tests {
                     &wfts,
                     &ats,
                     &nts,
+                    &CompletionCallbackTrackingState::default(),
                 )
                 .await
                 .unwrap();

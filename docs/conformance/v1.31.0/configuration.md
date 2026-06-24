@@ -38,6 +38,139 @@ per-key semantics live in the cited source — captured here is the **surface** 
 
 - **Static config:** ~14 top-level YAML sections (deployment/topology), below.
 
+## Working set — what we must absolutely support
+
+> **Scratch / triage area.** We develop the *minimal* set of config tokeira must absolutely support
+> here. Nothing below is decided — it is raw material being triaged down. Seeded with Nexus (pending
+> triage) and the temporal-dsql bench config (retained just in case).
+
+### Nexus config (to triage)
+
+Operation behaviour & limits (`component.nexusoperations.*`):
+
+```
+component.nexusoperations.request.timeout
+component.nexusoperations.limit.request.timeout.min
+component.nexusoperations.limit.dispatch.task.timeout.min
+component.nexusoperations.limit.operation.concurrency        # default 30 (per workflow)
+component.nexusoperations.limit.service.name.length          # default 1000
+component.nexusoperations.limit.operation.name.length        # default 1000
+component.nexusoperations.limit.operation.token.length       # default 4096
+component.nexusoperations.limit.header.size                  # default 8192
+component.nexusoperations.limit.scheduleToCloseTimeout       # default 0 (no cap)
+component.nexusoperations.retryPolicy.initialInterval        # default 1s
+component.nexusoperations.retryPolicy.maxInterval            # default 1h
+component.nexusoperations.disallowedHeaders
+component.nexusoperations.recordCancelRequestCompletionEvents # default true
+component.nexusoperations.metrics.tags
+component.nexusoperations.callback.endpoint.template         # default "unset"
+component.nexusoperations.useSystemCallbackURL               # default true (tokeira deviates — see below)
+```
+
+Callback limits & policy (`frontend.*` / `system.*` / `history.*`):
+
+```
+frontend.callbackURLMaxLength
+frontend.callbackHeaderMaxLength
+system.maxCallbacksPerWorkflow
+system.maxCHASMCallbacksPerWorkflow
+history.enableCHASMCallbacks
+```
+
+Endpoint admin limits (`limit.endpoint*`):
+
+```
+limit.endpointNameMaxLength
+limit.endpointDescriptionMaxSize
+limit.endpointExternalURLMaxLength
+limit.endpointListDefaultPageSize
+limit.endpointListMaxPageSize
+```
+
+Endpoint registry / cache / forwarding (`matching.*` / `system.*` / `frontend.*`):
+
+```
+matching.nexusEndpointsRefreshInterval
+matching.listNexusEndpointsLongPollTimeout
+system.nexusReadThroughCacheSize
+system.nexusReadThroughCacheTTL
+system.refreshNexusEndpointsLongPollTimeout
+system.refreshNexusEndpointsMinWait
+frontend.allowDeleteNamespaceIfNexusEndpointTarget
+frontend.nexusForwardRequestUseEndpointDispatch   # multi-cluster forwarding — likely out
+frontend.nexusRequestHeadersBlacklist             # multi-cluster forwarding — likely out
+```
+
+tokeira-owned (Wave 0 `PolicyConfig.nexus_completion`; not a Temporal key):
+
+```
+nexus_completion.http_addr            # inbound /nexus/callback listener bind (default 0.0.0.0:7253)
+nexus_completion.system_callback_url  # URL workers POST completions to (default http://127.0.0.1:7253)
+nexus_completion.retry_policy         # 1s initial / 1h max / 2.0 coeff; unbounded attempts
+```
+
+Two notes carried from triage discussion: `system_callback_url` is the one **operationally load-bearing**
+item — it must be an address Nexus workers can actually reach (the `127.0.0.1` default only works
+co-located). And `useSystemCallbackURL=true` is a **deliberate deviation**: tokeira does not implement the
+SDK worker-gRPC completion path, so it always resolves worker callbacks to a real HTTP URL.
+
+### Bench / DSQL config — from `temporal-dsql-deploy-ecs` (retained just in case)
+
+> Important DSQL-specific tuning from the temporal-dsql bench deployment
+> (`docker/config/dynamicconfig-bench.yaml`). Likely **not** needed — tokeira is DSQL-specialized and
+> auto-tunes its mechanical settings — but captured so the hard-won values are not lost.
+
+```yaml
+# System
+system.enableActivityEagerExecution: true
+system.enableNamespaceNotActiveAutoForwarding: true
+system.enableNexus: false
+system.forceSearchAttributesCacheRefreshOnRead: true
+system.transactionSizeLimit: 4000000
+
+# Persistence QPS (per service)
+history.persistenceMaxQPS: 15000
+matching.persistenceMaxQPS: 15000
+frontend.persistenceMaxQPS: 15000
+
+# History service
+history.timerProcessorMaxPollRPS: 200
+history.timerProcessorUpdateAckInterval: 5s
+history.transferProcessorMaxPollRPS: 400
+history.transferTaskBatchSize: 200
+history.rps: 10000
+history.defaultActivityRetryPolicy: {Initial 1s, Max 100s, Backoff 2.0, MaxAttempts 0}
+
+# History cache (critical for benchmark perf)
+history.cacheSizeBasedLimit: true
+history.hostLevelCacheMaxSizeBytes: 2147483648   # 2GB/host
+history.cacheTTL: 1h
+history.cacheNonUserContextLockTimeout: 500ms
+
+# Matching (high WPS)
+matching.rps: 10000
+matching.numTaskqueueWritePartitions: 8          # (also pinned for benchmark-tq-v2)
+matching.numTaskqueueReadPartitions: 8
+matching.maxTaskBatchSize: 200
+matching.getTasksBatchSize: 1000
+matching.longPollExpirationInterval: 60s
+matching.forwarderMaxOutstandingPolls: 2
+matching.forwarderMaxOutstandingTasks: 1000
+matching.forwarderMaxRatePerSecond: 2000
+matching.syncMatchWaitDuration: 500ms
+
+# Frontend
+frontend.rps: 30000
+frontend.namespaceRPS: 30000
+frontend.namespaceCount: 4000
+frontend.visibilityMaxPageSize: 1000
+```
+
+DSQL connection/rate-limit env knobs that accompanied the bench deployment (from temporal-dsql; not in
+the dynamic-config YAML): `TEMPORAL_SQL_MAX_CONNS=50`, `TEMPORAL_SQL_MAX_IDLE_CONNS=50` (must equal
+MaxConns), `TEMPORAL_SQL_MAX_CONN_LIFETIME=55m`, `TEMPORAL_SQL_CONNECTION_TIMEOUT`, plus the
+`DSQL_RESERVOIR_*`, `DSQL_TOKEN_BUCKET_*`, `DSQL_SLOT_BLOCK_*`, and `DSQL_*_RATE_LIMITER_*` families.
+
 ## Part 1 — Static (YAML) config sections
 
 The server YAML (`Config`) is deployment/topology configuration. Top-level sections:

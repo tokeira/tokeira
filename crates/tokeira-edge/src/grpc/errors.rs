@@ -47,9 +47,10 @@ impl From<EdgeError> for Status {
                 namespace,
                 workflow_id,
                 run_id,
-            } => Status::already_exists(format!(
-                "{namespace}/{workflow_id} already started as {run_id}"
-            )),
+            } => workflow_already_started_status(
+                format!("{namespace}/{workflow_id} already started as {run_id}"),
+                run_id,
+            ),
             EdgeError::BatchOperationAlreadyExists { namespace, job_id } => {
                 Status::already_exists(format!("{namespace}/{job_id}"))
             }
@@ -102,6 +103,48 @@ impl From<EdgeError> for Status {
             EdgeError::Internal(message) => Status::internal(message),
         }
     }
+}
+
+/// Build the typed `WorkflowExecutionAlreadyStarted` gRPC status.
+///
+/// v1.31.0 returns an id-conflict (`WORKFLOW_ID_CONFLICT_POLICY_FAIL` / a non-reusable
+/// id-reuse policy) as code `AlreadyExists` carrying a `WorkflowExecutionAlreadyStartedFailure`
+/// detail (`go.temporal.io/api serviceerror/workflow_execution_already_started.go`). The
+/// client reconstructs the typed `serviceerror.WorkflowExecutionAlreadyStarted` by reading the
+/// `google.rpc.Status` from the `grpc-status-details-bin` trailer and matching code ==
+/// AlreadyExists AND the first detail's type (`serviceerror/convert.go`). That typed error is
+/// what lets a Nexus `WorkflowRunOperation` handler surface a `WorkflowExecutionAlreadyStarted`
+/// application error to the caller (`TestNexusAsyncOperationWithMultipleCallers`); a bare
+/// `AlreadyExists` would reconstruct as a generic error and lose the type. See
+/// [`activity_already_started_status`] for the hand-encoded `Status`/`Any` wrapper rationale.
+///
+/// `start_request_id` is left empty: the `WorkflowAlreadyStarted` edge error does not carry
+/// it, and SDK type reconstruction keys on the detail's *type*, not its fields.
+fn workflow_already_started_status(message: String, run_id: String) -> Status {
+    use prost::Message as _;
+    use tokeira_proto::public::temporal::api::errordetails::v1::WorkflowExecutionAlreadyStartedFailure;
+
+    let failure = WorkflowExecutionAlreadyStartedFailure {
+        start_request_id: String::new(),
+        run_id,
+    };
+    let detail = ProtoAny {
+        type_url:
+            "type.googleapis.com/temporal.api.errordetails.v1.WorkflowExecutionAlreadyStartedFailure"
+                .to_owned(),
+        value: failure.encode_to_vec(),
+    };
+    let rpc_status = RpcStatus {
+        code: Code::AlreadyExists as i32,
+        message: message.clone(),
+        details: vec![detail],
+    };
+    Status::with_details_and_metadata(
+        Code::AlreadyExists,
+        message,
+        rpc_status.encode_to_vec().into(),
+        MetadataMap::new(),
+    )
 }
 
 /// Build the typed `ActivityExecutionAlreadyStarted` gRPC status.
@@ -337,5 +380,37 @@ mod tests {
             .expect("decode failure detail");
         assert_eq!(failure.run_id, "run-123");
         assert_eq!(failure.start_request_id, "req-abc");
+    }
+
+    #[test]
+    fn workflow_already_started_status_carries_typed_detail() {
+        use prost::Message as _;
+        use tokeira_proto::public::temporal::api::errordetails::v1::WorkflowExecutionAlreadyStartedFailure;
+
+        // A Nexus `WorkflowRunOperation` handler relies on the SDK reconstructing
+        // `serviceerror.WorkflowExecutionAlreadyStarted` from this status (code ==
+        // AlreadyExists AND the first google.rpc.Status detail being a
+        // WorkflowExecutionAlreadyStartedFailure) so the caller observes a
+        // `WorkflowExecutionAlreadyStarted` application error. A bare AlreadyExists would
+        // lose the type. Assert both round-trip on the wire.
+        let status: Status = EdgeError::WorkflowAlreadyStarted {
+            namespace: "ns".to_string(),
+            workflow_id: "wf-1".to_string(),
+            run_id: "run-xyz".to_string(),
+        }
+        .into();
+
+        assert_eq!(status.code(), Code::AlreadyExists);
+
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        assert_eq!(rpc_status.code, Code::AlreadyExists as i32);
+        let detail = &rpc_status.details[0];
+        assert_eq!(
+            detail.type_url,
+            "type.googleapis.com/temporal.api.errordetails.v1.WorkflowExecutionAlreadyStartedFailure"
+        );
+        let failure = WorkflowExecutionAlreadyStartedFailure::decode(detail.value.as_slice())
+            .expect("decode failure detail");
+        assert_eq!(failure.run_id, "run-xyz");
     }
 }

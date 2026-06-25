@@ -89,9 +89,13 @@ dependency then cost.
 | 38 | Nexus operation execution (`tests/nexus_api_test.go`) | Task transport + async completion (C4b). | `nexus-async-completion` |
 
 > The Nexus suites assert server metrics (`nexus_requests`, `nexus_latency`, `nexus_completion_requests`,
-> `nexus_task_requests`, `nexus_outbound_requests`, `nexus_request_preprocess_errors`). Those assertions
-> are gated on the scrape-backed `CaptureMetricsHandler` shim (see
-> [In-process metrics capture](#in-process-metrics-capture-for-the-functional-tests)).
+> `nexus_task_requests`, `nexus_outbound_requests`, `nexus_request_preprocess_errors`). **Not all are
+> bridge work.** A 2026-06-24 audit of the `TestNexusWorkflowTestSuite` metric-gated tests split them:
+> *Group A* (the 4 `nexus_outbound_requests` tests — driven by a real caller `StartOperation`) are flipped
+> by the shim, honestly; *Group B* (the 3 async-completion tests) assert `HandlerErrorType` behaviour and
+> require Temporal's internal callback-token wire format + `StateMachineRef` staleness, which tokeira
+> deliberately does not adopt — they stay **skipped, reclassified deliberate-deviation**, not bridge work.
+> See [In-process metrics capture](#in-process-metrics-capture-for-the-functional-tests).
 
 ### Tier 8 — Worker Deployments (GA)
 
@@ -210,6 +214,13 @@ A metric assertion passes **only where tokeira genuinely emits the equivalent si
 - No honest equivalent, or a pure Temporal server-internal with no behavioural meaning → **skip that
   assertion** via the skip registry with a cited reason. Never fabricate a value to turn a test green —
   "a wrong guess behind a green check bakes in non-conformance."
+- **A test that also asserts internal *representation* (not just a metric) → keep skipped, reclassify.**
+  Canonical case: the `TestNexusWorkflowTestSuite` async-completion tests (Group B) assert
+  `HandlerErrorType` behaviour reached only by adopting Temporal's `NexusOperationCompletion` proto token
+  wire format + `StateMachineRef` staleness — an internal representation tokeira deliberately does not
+  adopt (opaque versioned token + op-fencing, `nexus.rs:523`). The metric is incidental; the bridge
+  cannot and must not be used to "pass" them. Deliberate-deviation, covered by tokeira-owned behavioural
+  tests.
 
 The mapping therefore grows in lockstep with real Nexus implementation; green means earned. `TestMetricCaptureSuite`
 and `TestFunctionalTestBaseSuite` remain harness self-tests and stay out of scope regardless.

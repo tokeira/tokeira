@@ -18,19 +18,43 @@
 The corpus asserts server metrics via the **in-process** `metricstest.CaptureHandler`
 (`s.GetTestCluster().Host().CaptureMetricsHandler().StartCapture()` → act → `capture.Snapshot()[name]`).
 Against an out-of-process `tokeirad` that handler is nil/empty, so today these tests are **skipped** in
-`tests/testcore/tokeira_conformance_skip.go`. The purely metric-gated skips this work converts to
-**passing** (all in `TestNexusWorkflowTestSuite`):
+`tests/testcore/tokeira_conformance_skip.go`. A 2026-06-24 audit (see
+[`functional-test-order.md` → metrics capture](./readiness/functional-test-order.md#in-process-metrics-capture-for-the-functional-tests))
+split the metric-gated `TestNexusWorkflowTestSuite` skips into two groups — **only Group A is bridge
+work**:
 
-- `TestNexusOperationAsyncCompletion`, `…AsyncCompletionAfterReset`, `…AsyncFailure`,
-  `…AsyncCompletionErrors`
-- `TestNexusSyncOperationErrorRehydration`, `TestNexusAsyncOperationErrorRehydration`
+**Group A — flip via this bridge (4, honest, no contract change).** Driven by a real caller workflow
+doing a genuine `StartOperation`; assert `nexus_outbound_requests` with a tag shape the committed
+`record_nexus_outbound_request(...)` already matches:
+
 - `TestNexusOperationSyncNexusFailure`, `TestNexusCallbackAfterCallerComplete`
+- `TestNexusSyncOperationErrorRehydration`, `TestNexusAsyncOperationErrorRehydration`
 
-Stay skipped (different blockers, **do not** remove): `…AsyncCompletionAuthErrors` /
+**Group B — NOT bridge work; reclassify deliberate-deviation, keep skipped (3).** The async-completion
+tests (`TestNexusOperationAsyncCompletion`, `…AsyncFailure`, `…AsyncCompletionErrors`) assert
+`HandlerErrorType` **behaviour**, not just metrics, and require adopting Temporal's
+`NexusOperationCompletion` proto token wire format + `StateMachineRef.MachineInitialVersionedTransition`
+staleness — an internal representation tokeira deliberately does not adopt (opaque versioned token +
+op-fencing, `nexus.rs:523`). The callback token is opaque to real workers, so it is **not an observable
+contract**; only the corpus constructs/decodes it (`CallbackTokenGenerator`). The bridge cannot flip
+these, and reproducing the token format would be porting Temporal internals (the explicit non-goal) and
+tension with "no kernel additions". The observable contract is covered by tokeira-owned behavioural
+tests. **Update their skip-registry reason** to: *"asserts Temporal's internal callback-token wire format
+(`CallbackTokenGenerator` / `NexusOperationCompletion` proto) and `StateMachineRef` staleness — an
+internal representation tokeira deliberately does not adopt (`nexus.rs:523`); observable contract covered
+by tokeira-owned behavioural tests."* (`TestNexusOperationAsyncCompletionAfterReset` is in this
+completion family — classify it Group B too once confirmed.)
+
+Stay skipped (separate blockers, **do not** remove): `…AsyncCompletionAuthErrors` /
 `…AuthErrorsNoIdentifier` (also need the in-process `SetOnAuthorize` hook — auth is TBD,
 `decisions.md`); `…AsyncCompletionInternalAuth` (needs `OverrideDynamicConfig` — config-as-constant).
+
 The same bridge later unblocks metric assertions in `nexus_api_test.go`, `task_queue_test.go`,
 `http_api_test.go`.
+
+**Premise correction:** namespace is resolved from the **token's `NamespaceId`**, not the URL path; the
+namespaced path is only a cross-check (`handler.go:99/140`). An earlier note in `nexus-async-completion`
+design saying "validate the path namespace exists" was wrong on the mechanism — fix it where it landed.
 
 ## 2. Two-repo scope
 
@@ -93,11 +117,13 @@ distribution.
    the Shape-2 cluster (`tests/testcore/tokeira_conformance_cluster.go` / `tokeira_harness.go`), wired so
    `Host().CaptureMetricsHandler()` is backed by it. `tokeirad` must be started with metrics enabled and
    a known observability HTTP bind address that the bridge scrapes.
-4. **Skip registry (Go fork).** Remove the eight purely metric-gated entries listed in §1; **keep** the
-   auth-hook and dynamic-config ones with their cited reasons.
+4. **Skip registry (Go fork).** Remove the **four Group-A** entries listed in §1; **reclassify** the
+   **three Group-B** completion tests with the deliberate-deviation reason in §1 (do not remove — keep
+   skipped); **keep** the auth-hook and dynamic-config ones with their cited reasons.
 5. **Verify.** Against a running `tokeirad` (metrics enabled), `GOTOOLCHAIN=go1.26.2 go test -tags
-   test_dep -count=1 -run '^TestNexusWorkflowTestSuite$' ./tests/ -v` — the eight flip to pass. Then the
-   full run-all + ledger; the report must reclassify these from skip to required-pass.
+   test_dep -count=1 -run '^TestNexusWorkflowTestSuite$' ./tests/ -v` — the **four Group-A** tests flip to
+   pass. Then the full run-all + ledger; the report must reclassify Group A skip → required-pass and
+   Group B skip → deliberate-deviation.
 
 ## 6. Honesty boundary (non-negotiable)
 
@@ -122,8 +148,9 @@ branch per the fork's flow (separate repo).
 
 ## 8. Definition of done
 
-- The eight metric-gated `TestNexusWorkflowTestSuite` tests pass against an out-of-process `tokeirad`
-  (metrics enabled), and their skip-registry entries are removed.
+- The **four Group-A** `TestNexusWorkflowTestSuite` tests pass against an out-of-process `tokeirad`
+  (metrics enabled), and their skip-registry entries are removed; the **three Group-B** completion tests
+  are reclassified deliberate-deviation (kept skipped, accurate reason).
 - Any metrics added to tokeira are manifest-valid, documented, and cited; tokeira gates green.
 - The bridge is confined to the agreed fork seams; no corpus test body changed.
 - run-all + ledger reflects the flips (skip → required-pass); nothing fabricated; remaining skips

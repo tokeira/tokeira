@@ -2996,9 +2996,19 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn update_workflow_execution_options(
         &self,
-        _request: Request<workflowservice::UpdateWorkflowExecutionOptionsRequest>,
+        request: Request<workflowservice::UpdateWorkflowExecutionOptionsRequest>,
     ) -> Result<Response<workflowservice::UpdateWorkflowExecutionOptionsResponse>, Status> {
-        Err(Status::unimplemented("update_workflow_execution_options"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req =
+            translate::update_workflow_execution_options_request_to_edge(request.into_inner())
+                .map_err(proto_conversion_status)?;
+        let edge_resp = self
+            .inner
+            .update_workflow_execution_options(&headers, edge_req)
+            .await?;
+        Ok(Response::new(
+            translate::update_workflow_execution_options_response_to_proto(edge_resp),
+        ))
     }
     async fn pause_activity(
         &self,
@@ -3914,6 +3924,63 @@ mod tests {
         assert_eq!(resp.workflow_task_queue_partitions.len(), 1);
         assert_eq!(resp.activity_task_queue_partitions[0].key, "queue");
         assert_eq!(resp.workflow_task_queue_partitions[0].key, "queue");
+    }
+
+    /// api-conformance-workflow-options Property 3 (Expected Error Mapping): a malformed
+    /// run id is `INVALID_ARGUMENT`, a missing execution is `NOT_FOUND`, and an empty
+    /// `update_mask` is `INVALID_ARGUMENT` — all before any mutation.
+    #[tokio::test]
+    async fn update_workflow_execution_options_maps_expected_errors() {
+        use tokeira_proto::public::temporal::api::{
+            common::v1 as common, workflow::v1 as workflow,
+        };
+        let grpc = worker_deployment_test_service();
+        fn request(run_id: &str) -> workflowservice::UpdateWorkflowExecutionOptionsRequest {
+            workflowservice::UpdateWorkflowExecutionOptionsRequest {
+                namespace: "default".to_string(),
+                workflow_execution: Some(common::WorkflowExecution {
+                    workflow_id: "wf".to_string(),
+                    run_id: run_id.to_string(),
+                }),
+                workflow_execution_options: Some(workflow::WorkflowExecutionOptions::default()),
+                update_mask: Some(prost_types::FieldMask {
+                    paths: vec!["versioning_override".to_string()],
+                }),
+                identity: String::new(),
+            }
+        }
+
+        // Missing execution (empty store) → NOT_FOUND.
+        let not_found = grpc
+            .update_workflow_execution_options(Request::new(request("")))
+            .await
+            .unwrap_err();
+        assert_eq!(not_found.code(), tonic::Code::NotFound);
+
+        // Malformed run id → INVALID_ARGUMENT (validated before lookup).
+        let bad_run = grpc
+            .update_workflow_execution_options(Request::new(request("not-a-uuid")))
+            .await
+            .unwrap_err();
+        assert_eq!(bad_run.code(), tonic::Code::InvalidArgument);
+
+        // Empty mask → INVALID_ARGUMENT (rejected at the translation boundary).
+        let empty_mask = grpc
+            .update_workflow_execution_options(Request::new(
+                workflowservice::UpdateWorkflowExecutionOptionsRequest {
+                    namespace: "default".to_string(),
+                    workflow_execution: Some(common::WorkflowExecution {
+                        workflow_id: "wf".to_string(),
+                        run_id: String::new(),
+                    }),
+                    workflow_execution_options: None,
+                    update_mask: None,
+                    identity: String::new(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(empty_mask.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]

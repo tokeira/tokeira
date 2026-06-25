@@ -230,6 +230,20 @@ where
         commit_result_to_outcome(result)
     }
 
+    async fn update_workflow_execution_options(
+        &self,
+        run_key: tokeira_types::RunKey,
+        versioning_override: tokeira_kernel::FieldChange<tokeira_kernel::VersioningOverride>,
+        request: tokeira_types::RequestContext,
+    ) -> Result<WorkflowMutationOutcome> {
+        let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
+        let result = self
+            .runtime
+            .update_workflow_execution_options(execution, versioning_override, request)
+            .await?;
+        commit_result_to_outcome(result)
+    }
+
     async fn cancel_workflow(
         &self,
         run_key: tokeira_types::RunKey,

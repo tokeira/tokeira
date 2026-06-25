@@ -101,8 +101,12 @@ use crate::translate::{
     SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
     StartWorkflowExecutionResponse, SystemInfo, TaskQueueConfig,
     TaskQueuePartition as EdgeTaskQueuePartition,
-    UpdateNamespaceRequest as EdgeUpdateNamespaceRequest, UserMetadata, VersioningOverride,
-    WorkflowExecutionDescription, WorkflowExecutionSummary, to_internal::namespace_id_for,
+    UpdateNamespaceRequest as EdgeUpdateNamespaceRequest,
+    UpdateWorkflowExecutionOptionsRequest as EdgeUpdateWorkflowExecutionOptionsRequest,
+    UpdateWorkflowExecutionOptionsResponse as EdgeUpdateWorkflowExecutionOptionsResponse,
+    UserMetadata, VersioningOverride, VersioningOverrideChange, WorkflowExecutionDescription,
+    WorkflowExecutionSummary,
+    to_internal::{namespace_id_for, versioning_override_to_kernel},
 };
 use tokeira_kernel::state::ParentClosePolicy;
 
@@ -657,6 +661,88 @@ fn versioning_override_to_edge(
         }
         Some(enums::VersioningBehavior::AutoUpgrade) => Ok(Some(VersioningOverride::AutoUpgrade)),
         _ => Ok(None),
+    }
+}
+
+/// Validate + reduce an `UpdateWorkflowExecutionOptions` request to the supported change.
+///
+/// tokeira persists exactly one mutable execution option, `versioning_override`. The
+/// `update_mask` selects which options to apply (`mergeWorkflowExecutionOptions`,
+/// `service/history/api/updateworkflowoptions/api.go @ v1.31.0`); we recognize
+/// `versioning_override` and its deprecated `versioning_override.{behavior,deployment}`
+/// sub-paths (which v1.31.0 requires be masked together). An empty mask, or a mask naming
+/// any other option (e.g. `priority`, `time_skipping_config` — valid v1.31.0 fields tokeira
+/// does not yet model), is rejected with `INVALID_ARGUMENT` rather than silently dropped.
+pub fn update_workflow_execution_options_request_to_edge(
+    req: workflowservice::UpdateWorkflowExecutionOptionsRequest,
+) -> Result<EdgeUpdateWorkflowExecutionOptionsRequest, ProtoConversionError> {
+    let execution = req
+        .workflow_execution
+        .ok_or(ProtoConversionError::MissingField(
+            "UpdateWorkflowExecutionOptionsRequest.workflow_execution",
+        ))?;
+    if execution.workflow_id.trim().is_empty() {
+        return Err(ProtoConversionError::MissingField(
+            "UpdateWorkflowExecutionOptionsRequest.workflow_execution.workflow_id",
+        ));
+    }
+
+    let paths = req.update_mask.map(|mask| mask.paths).unwrap_or_default();
+    if paths.is_empty() {
+        return Err(ProtoConversionError::InvalidArgument(
+            "update_mask must name at least one option to update".to_string(),
+        ));
+    }
+    let (mut behavior_masked, mut deployment_masked) = (false, false);
+    for path in &paths {
+        match path.as_str() {
+            // The whole field, or both deprecated sub-fields together.
+            "versioning_override" => {}
+            "versioning_override.behavior" => behavior_masked = true,
+            "versioning_override.deployment" => deployment_masked = true,
+            other => {
+                return Err(ProtoConversionError::InvalidArgument(format!(
+                    "unsupported update_mask path: {other}"
+                )));
+            }
+        }
+    }
+    // Deprecated sub-fields must be masked together (v1.31.0 `mergeWorkflowExecutionOptions`).
+    if behavior_masked != deployment_masked {
+        return Err(ProtoConversionError::InvalidArgument(
+            "versioning_override fields must be updated together".to_string(),
+        ));
+    }
+
+    // The mask is guaranteed to touch `versioning_override`, so the change is Set-or-Clear:
+    // a recognized override present in the options is Set; an absent (or unrepresentable)
+    // override clears it (`mergedOpts.GetVersioningOverride() == nil → unset` @ v1.31.0).
+    let options = req.workflow_execution_options.unwrap_or_default();
+    let versioning_override = match versioning_override_to_edge(options.versioning_override)? {
+        Some(override_) => VersioningOverrideChange::Set(override_),
+        None => VersioningOverrideChange::Clear,
+    };
+
+    Ok(EdgeUpdateWorkflowExecutionOptionsRequest {
+        namespace: req.namespace,
+        workflow_id: execution.workflow_id,
+        run_id: (!execution.run_id.is_empty()).then_some(execution.run_id),
+        versioning_override,
+        identity: req.identity,
+    })
+}
+
+/// Project the post-update execution options back onto the wire response.
+pub fn update_workflow_execution_options_response_to_proto(
+    resp: EdgeUpdateWorkflowExecutionOptionsResponse,
+) -> workflowservice::UpdateWorkflowExecutionOptionsResponse {
+    workflowservice::UpdateWorkflowExecutionOptionsResponse {
+        workflow_execution_options: Some(workflow::WorkflowExecutionOptions {
+            versioning_override: resp.versioning_override.map(|override_| {
+                versioning_override_from_edge(&versioning_override_to_kernel(&override_))
+            }),
+            ..Default::default()
+        }),
     }
 }
 
@@ -5409,6 +5495,121 @@ mod tests {
                 Some(("q", enums::TaskQueueKind::Sticky as i32))
             ))
             .is_ok()
+        );
+    }
+
+    /// api-conformance-workflow-options: the `update_mask` is validated + reduced to the
+    /// supported `versioning_override` change (Property 1 / 3). Empty mask, unsupported
+    /// option (`priority`), a half-masked deprecated sub-field, and a missing execution all
+    /// reject; a masked Pinned override is `Set`, a masked-but-absent override is `Clear`.
+    #[test]
+    fn update_workflow_execution_options_request_validation() {
+        use tokeira_proto::public::temporal::api::{
+            common::v1 as common, deployment::v1 as deployment, workflow::v1 as workflow,
+        };
+        fn req(
+            options: Option<workflow::WorkflowExecutionOptions>,
+            paths: &[&str],
+            workflow_id: &str,
+        ) -> workflowservice::UpdateWorkflowExecutionOptionsRequest {
+            workflowservice::UpdateWorkflowExecutionOptionsRequest {
+                namespace: "ns".to_string(),
+                workflow_execution: (!workflow_id.is_empty()).then(|| common::WorkflowExecution {
+                    workflow_id: workflow_id.to_string(),
+                    run_id: String::new(),
+                }),
+                workflow_execution_options: options,
+                update_mask: Some(prost_types::FieldMask {
+                    paths: paths.iter().map(|p| p.to_string()).collect(),
+                }),
+                identity: "id".to_string(),
+            }
+        }
+
+        // Missing execution, empty mask, unsupported option, half-masked sub-field → reject.
+        assert!(
+            update_workflow_execution_options_request_to_edge(req(
+                None,
+                &["versioning_override"],
+                ""
+            ))
+            .is_err()
+        );
+        assert!(
+            update_workflow_execution_options_request_to_edge(
+                workflowservice::UpdateWorkflowExecutionOptionsRequest {
+                    namespace: "ns".to_string(),
+                    workflow_execution: Some(common::WorkflowExecution {
+                        workflow_id: "w".to_string(),
+                        run_id: String::new(),
+                    }),
+                    workflow_execution_options: None,
+                    update_mask: None,
+                    identity: String::new(),
+                }
+            )
+            .is_err(),
+            "empty mask is rejected"
+        );
+        assert!(
+            update_workflow_execution_options_request_to_edge(req(None, &["priority"], "w"))
+                .is_err(),
+            "an unsupported option field is rejected"
+        );
+        assert!(
+            update_workflow_execution_options_request_to_edge(req(
+                None,
+                &["versioning_override.behavior"],
+                "w"
+            ))
+            .is_err(),
+            "deprecated versioning_override sub-fields must be masked together"
+        );
+
+        // A masked Pinned override → Set; a masked-but-absent override → Clear.
+        let pinned = workflow::WorkflowExecutionOptions {
+            versioning_override: Some(workflow::VersioningOverride {
+                behavior: enums::VersioningBehavior::Pinned as i32,
+                deployment: Some(deployment::Deployment {
+                    series_name: "series".to_string(),
+                    build_id: "build".to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let edge = update_workflow_execution_options_request_to_edge(req(
+            Some(pinned),
+            &["versioning_override"],
+            "w",
+        ))
+        .expect("valid Pinned set");
+        assert_eq!(
+            edge.versioning_override,
+            VersioningOverrideChange::Set(VersioningOverride::Pinned {
+                deployment_series: "series".to_string(),
+                build_id: "build".to_string(),
+            })
+        );
+        let edge = update_workflow_execution_options_request_to_edge(req(
+            None,
+            &["versioning_override"],
+            "w",
+        ))
+        .expect("valid clear");
+        assert_eq!(edge.versioning_override, VersioningOverrideChange::Clear);
+
+        // Response projection echoes the post-update override.
+        let proto = update_workflow_execution_options_response_to_proto(
+            EdgeUpdateWorkflowExecutionOptionsResponse {
+                versioning_override: Some(VersioningOverride::AutoUpgrade),
+            },
+        );
+        assert!(
+            proto
+                .workflow_execution_options
+                .and_then(|options| options.versioning_override)
+                .is_some()
         );
     }
 

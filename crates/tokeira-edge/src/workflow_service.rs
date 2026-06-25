@@ -99,7 +99,8 @@ use crate::{
         TaskQueuePartition, TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
         UnpauseWorkflowExecutionRequest, UnpauseWorkflowExecutionResponse,
         UpdateActivityOptionsRequest, UpdateActivityOptionsResponse, UpdateNamespaceRequest,
-        UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse,
+        UpdateWorkflowExecutionOptionsRequest, UpdateWorkflowExecutionOptionsResponse,
+        UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse, VersioningOverrideChange,
         WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
     },
 };
@@ -377,6 +378,21 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         run_key: RunKey,
         req: TerminateRequest,
     ) -> Result<WorkflowMutationOutcome>;
+
+    /// Apply an `UpdateWorkflowExecutionOptions` change (currently the
+    /// `versioning_override`) to a running execution. Defaults to unimplemented so test
+    /// doubles need no change; the runtime adapter overrides it.
+    async fn update_workflow_execution_options(
+        &self,
+        run_key: RunKey,
+        versioning_override: FieldChange<tokeira_kernel::VersioningOverride>,
+        request: RequestContext,
+    ) -> Result<WorkflowMutationOutcome> {
+        let _ = (run_key, versioning_override, request);
+        Err(anyhow!(
+            "update_workflow_execution_options is not implemented"
+        ))
+    }
 
     async fn cancel_workflow(
         &self,
@@ -3382,6 +3398,75 @@ impl WorkflowService {
                 Ok(ListTaskQueuePartitionsResponse {
                     activity_partitions: vec![root.clone()],
                     workflow_partitions: vec![root],
+                })
+            },
+        )
+        .await
+    }
+
+    /// Update a running workflow's execution options (`versioning_override`).
+    ///
+    /// Validates the run id and resolves the target execution before mutating
+    /// (`NOT_FOUND` for an absent execution; `INVALID_ARGUMENT` for a malformed run id —
+    /// both surfaced by `resolve_execution_run_key`). The change has already been reduced
+    /// from the `update_mask` at the gRPC boundary, so here we only translate the override
+    /// to the kernel and submit the per-run command. The response echoes the post-update
+    /// options.
+    pub async fn update_workflow_execution_options(
+        &self,
+        headers: &HeaderMap,
+        req: UpdateWorkflowExecutionOptionsRequest,
+    ) -> EdgeResult<UpdateWorkflowExecutionOptionsResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "update_workflow_execution_options",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::UpdateWorkflowExecutionOptions,
+                        false,
+                    )
+                    .await?;
+
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
+
+                let versioning_override = match &req.versioning_override {
+                    VersioningOverrideChange::Set(override_) => {
+                        FieldChange::Set(to_internal::versioning_override_to_kernel(override_))
+                    }
+                    VersioningOverrideChange::Clear => FieldChange::Clear,
+                };
+                let request = RequestContext {
+                    request_id: RequestId(Uuid::new_v4().to_string()),
+                    caller_identity: (!req.identity.is_empty()).then(|| req.identity.clone()),
+                    received_at: OffsetDateTime::now_utc(),
+                };
+
+                self.runtime
+                    .update_workflow_execution_options(run_key, versioning_override, request)
+                    .await
+                    .map_err(EdgeError::from)?;
+
+                // The post-update value mirrors the applied change (the only mutable
+                // option tokeira models): `Some` after a Set, `None` after a Clear.
+                let versioning_override = match req.versioning_override {
+                    VersioningOverrideChange::Set(override_) => Some(override_),
+                    VersioningOverrideChange::Clear => None,
+                };
+                Ok(UpdateWorkflowExecutionOptionsResponse {
+                    versioning_override,
                 })
             },
         )

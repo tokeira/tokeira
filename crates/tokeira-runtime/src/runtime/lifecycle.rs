@@ -366,6 +366,35 @@ where
         self.submit(run_key, Command::Terminate(request)).await
     }
 
+    /// Apply an `UpdateWorkflowExecutionOptions` change to a running execution as a
+    /// per-run `UpdateExecutionOptions` transition (the same kernel command the
+    /// UseExisting-conflict attach path uses, but carrying only the `versioning_override`
+    /// change). The kernel emits `WorkflowExecutionOptionsUpdated` and persists the
+    /// override, so it survives restart and steers subsequent workflow-task dispatch.
+    pub async fn update_workflow_execution_options(
+        &self,
+        execution: ExecutionRef,
+        versioning_override: FieldChange<tokeira_kernel::VersioningOverride>,
+        request: RequestContext,
+    ) -> Result<CommitResult> {
+        let run_key = self
+            .repo
+            .resolve_execution(&execution)
+            .await?
+            .ok_or_else(|| anyhow!("execution not found"))?;
+        let update = UpdateExecutionOptionsRequest {
+            versioning_override,
+            completion_callbacks: FieldChange::Unchanged,
+            attached_completion_callbacks: Vec::new(),
+            attached_links: Vec::new(),
+            attached_request_id: None,
+            request,
+            now: OffsetDateTime::now_utc(),
+        };
+        self.submit(run_key, Command::UpdateExecutionOptions(update))
+            .await
+    }
+
     /// Request cooperative cancellation of a workflow.
     pub async fn cancel_workflow(
         &self,

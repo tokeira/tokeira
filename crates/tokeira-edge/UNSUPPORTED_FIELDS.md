@@ -83,8 +83,11 @@ does not support or cannot yet populate, along with rationale.
 
 ## History Event Attributes — WorkflowExecutionOptionsUpdated
 
-The proto has a `versioning_override` field. The kernel's `VersioningOverride` is
-a placeholder type, so this field cannot be meaningfully populated yet.
+| Field | Status | Rationale |
+|---|---|---|
+| `versioning_override` | Supported | Serialized from the kernel `VersioningOverride` (Set → value, Clear → `unset_versioning_override`) by `api-conformance-workflow-options`. |
+| `attached_completion_callbacks`, `attached_request_id` | Not populated | Authored by the UseExisting-conflict attach path; their proto projection is not yet serialized (the attach-path history fidelity is tracked separately). |
+| `priority`, `time_skipping_config` | Not modeled | tokeira does not model these as mutable execution options; `UpdateWorkflowExecutionOptions` rejects a mask targeting them with `INVALID_ARGUMENT`. |
 
 ## UpdateWorkflowExecutionResponse
 

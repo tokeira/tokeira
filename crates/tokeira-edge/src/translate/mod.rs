@@ -49,6 +49,36 @@ pub enum VersioningOverride {
     AutoUpgrade,
 }
 
+/// The `versioning_override` change an `UpdateWorkflowExecutionOptions` request applies,
+/// derived from the request's `update_mask` + `workflow_execution_options`. The mask must
+/// always touch `versioning_override` (it is tokeira's only supported mutable option), so
+/// the change is exactly Set-a-value or Clear — never "leave unchanged".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VersioningOverrideChange {
+    Set(VersioningOverride),
+    Clear,
+}
+
+/// Edge request for `UpdateWorkflowExecutionOptions`. Only the `versioning_override`
+/// option is modeled (the one mutable execution option tokeira persists, per
+/// `api-conformance-workflow-options`); the mask is validated and reduced to a
+/// [`VersioningOverrideChange`] at the gRPC boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateWorkflowExecutionOptionsRequest {
+    pub namespace: String,
+    pub workflow_id: String,
+    pub run_id: Option<String>,
+    pub versioning_override: VersioningOverrideChange,
+    pub identity: String,
+}
+
+/// The post-update execution options echoed back to the caller. `versioning_override` is
+/// `Some` after a Set and `None` after a Clear.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateWorkflowExecutionOptionsResponse {
+    pub versioning_override: Option<VersioningOverride>,
+}
+
 /// User-facing summary/details metadata authored when a workflow starts.
 ///
 /// Temporal stores this as SDK metadata, but the edge keeps it proto-free so

@@ -220,7 +220,9 @@ pub fn signal_with_start_request(
     }
 }
 
-fn versioning_override_to_kernel(override_: &VersioningOverride) -> KernelVersioningOverride {
+pub(crate) fn versioning_override_to_kernel(
+    override_: &VersioningOverride,
+) -> KernelVersioningOverride {
     match override_ {
         VersioningOverride::Pinned {
             deployment_series,

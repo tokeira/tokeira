@@ -17,8 +17,9 @@
 
 use prost::Message;
 use tokeira_kernel::{
+    command::FieldChange,
     event::{HistoryEvent, HistoryEventKind},
-    state::{VersioningBehavior, WorkerDeploymentVersionRef},
+    state::{VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef},
 };
 use tokeira_proto::{
     conversions::common::{
@@ -27,7 +28,10 @@ use tokeira_proto::{
         to_opt_proto_duration, to_proto_duration, to_proto_timestamp,
     },
     enums, history,
-    public::temporal::api::{deployment::v1 as deployment_proto, update::v1 as proto_update},
+    public::temporal::api::{
+        deployment::v1 as deployment_proto, update::v1 as proto_update,
+        workflow::v1 as workflow_proto,
+    },
 };
 
 /// Serialize a slice of kernel history events into
@@ -1409,12 +1413,18 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             attached_links,
             attached_request_id,
         } => {
-            // The upstream proto only has `versioning_override`. `completion_callbacks`
-            // plus on-conflict attachment fields are internal kernel fields with
-            // no proto representation. `VersioningOverride` is a placeholder type
-            // so we can't populate the proto field yet either.
+            // Serialize the versioning override — the option `UpdateWorkflowExecutionOptions`
+            // mutates. `Set` carries the value; `Clear` records `unset_versioning_override`
+            // (matching v1.31.0's `AddWorkflowExecutionOptionsUpdatedEvent(override, unset…)`).
+            let (versioning_override, unset_versioning_override) = match versioning_override {
+                FieldChange::Set(value) => (Some(versioning_override_from_kernel(value)), false),
+                FieldChange::Clear => (None, true),
+                FieldChange::Unchanged => (None, false),
+            };
+            // The on-conflict attachment fields are authored by the UseExisting-conflict
+            // path; their proto projection (`attached_completion_callbacks`,
+            // `attached_request_id`) is tracked separately in UNSUPPORTED_FIELDS.md.
             let _ = (
-                versioning_override,
                 completion_callbacks,
                 attached_completion_callbacks,
                 attached_links,
@@ -1422,10 +1432,38 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             );
             Attributes::WorkflowExecutionOptionsUpdatedEventAttributes(
                 history::WorkflowExecutionOptionsUpdatedEventAttributes {
+                    versioning_override,
+                    unset_versioning_override,
                     ..Default::default()
                 },
             )
         }
+    }
+}
+
+/// Project a kernel `VersioningOverride` onto the proto `VersioningOverride`, mirroring the
+/// gRPC start/describe projection but using this module's deployment-version helper to keep
+/// the serializer self-contained.
+fn versioning_override_from_kernel(
+    value: &VersioningOverride,
+) -> workflow_proto::VersioningOverride {
+    match value {
+        VersioningOverride::Pinned { version } => workflow_proto::VersioningOverride {
+            r#override: Some(workflow_proto::versioning_override::Override::Pinned(
+                workflow_proto::versioning_override::PinnedOverride {
+                    behavior: workflow_proto::versioning_override::PinnedOverrideBehavior::Pinned
+                        as i32,
+                    version: Some(deployment_version_to_proto(version)),
+                },
+            )),
+            ..Default::default()
+        },
+        VersioningOverride::AutoUpgrade => workflow_proto::VersioningOverride {
+            r#override: Some(workflow_proto::versioning_override::Override::AutoUpgrade(
+                true,
+            )),
+            ..Default::default()
+        },
     }
 }
 

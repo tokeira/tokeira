@@ -45,10 +45,10 @@ use crate::{
         CompletionCallbackScannerConfig, CompletionCallbackTrackingEntry,
         CompletionCallbackTrackingState, CompletionDeliveryOutcome, EndpointTarget,
         NexusCompletion, NexusCompletionClient, NexusCompletionFailureBody,
-        NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusHttpClient, NexusStartResult,
-        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken, NexusTimeoutEntry,
-        NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL, TEMPORAL_CALLBACK_TOKEN_HEADER,
-        nexus_completion_backoff,
+        NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusHttpClient,
+        NexusNamespaceResolver, NexusStartResult, NexusTask, NexusTaskBroker, NexusTaskRequest,
+        NexusTaskToken, NexusTimeoutEntry, NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL,
+        TEMPORAL_CALLBACK_TOKEN_HEADER, nexus_completion_backoff,
     },
     scanner::pick_lane_for_run_key,
     shard::{ShardOwner, shard_for},
@@ -75,6 +75,9 @@ pub struct RuntimeDispatchPublisher<R> {
     activity_tracking: ActivityTrackingState,
     delivery_metrics: DeliveryMetrics,
     versioning_rule_store: Option<Arc<VersioningRuleStore>>,
+    /// Resolves the originator namespace name for the External-endpoint outbound metric.
+    /// `None` outside the full server (unit harnesses), where the metric is then omitted.
+    namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
 }
 
 impl<R> Clone for RuntimeDispatchPublisher<R> {
@@ -96,6 +99,7 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             activity_tracking: self.activity_tracking.clone(),
             delivery_metrics: self.delivery_metrics.clone(),
             versioning_rule_store: self.versioning_rule_store.clone(),
+            namespace_resolver: self.namespace_resolver.clone(),
         }
     }
 }
@@ -140,7 +144,18 @@ where
             activity_tracking,
             delivery_metrics,
             versioning_rule_store,
+            namespace_resolver: None,
         }
+    }
+
+    /// Attach the namespace-name resolver used to tag the External-endpoint outbound metric.
+    /// Set by the server bootstrap; left unset (and the metric omitted) in unit harnesses.
+    pub fn with_namespace_resolver(
+        mut self,
+        resolver: Option<Arc<dyn NexusNamespaceResolver>>,
+    ) -> Self {
+        self.namespace_resolver = resolver;
+        self
     }
 
     fn pick_lane(&self, run_key: RunKey) -> LaneHandle {
@@ -163,6 +178,39 @@ where
         opentelemetry_sdk::propagation::TraceContextPropagator::new()
             .inject_context(&tracing::Span::current().context(), &mut injector);
         injector.values
+    }
+
+    /// Record the External-endpoint outbound StartOperation metric
+    /// (`nexus_outbound_requests` + `_latency`), resolving the originator namespace *name*
+    /// via the injected resolver (the publisher holds only the [`RunKey`]/[`NamespaceId`]).
+    /// A no-op when no resolver is wired (unit harnesses) or the namespace cannot be
+    /// resolved — the metric is observability and never blocks the operation. Runs in the
+    /// schedule dispatch's spawned task, off the commit path.
+    async fn record_external_outbound_metric(
+        &self,
+        originator_run_key: RunKey,
+        outcome: &str,
+        latency: std::time::Duration,
+    ) {
+        let Some(resolver) = self.namespace_resolver.as_ref() else {
+            return;
+        };
+        let namespace_id = match self.repo.load_run(originator_run_key).await {
+            Ok(LoadedRun::Existing(state)) => state.namespace_id,
+            // Absent run or load error: skip rather than tag with an unresolved namespace.
+            _ => return,
+        };
+        let Some(namespace) = resolver.name_for_id(namespace_id).await else {
+            return;
+        };
+        // External endpoints are not worker-via-frontend, so the failure source is unset.
+        runtime_metrics::record_nexus_outbound_request(
+            &namespace,
+            "StartOperation",
+            "_unknown_",
+            outcome,
+        );
+        runtime_metrics::record_nexus_outbound_latency(&namespace, "StartOperation", latency);
     }
 
     fn redirected_queue(&self, queue: &QueueKey) -> QueueKey {
@@ -661,7 +709,8 @@ where
             Some(config) => match &config.target {
                 EndpointTarget::External { address } => {
                     let trace_headers = self.nexus_trace_headers();
-                    match self
+                    let started_at = std::time::Instant::now();
+                    let start_result = self
                         .nexus_client
                         .start_operation(
                             address,
@@ -672,38 +721,34 @@ where
                             schedule_to_close_timeout,
                             &trace_headers,
                         )
-                        .await
-                    {
-                        Ok(NexusStartResult::SyncCompleted { result, links }) => {
-                            tokeira_kernel::NexusResolution::Completed { result, links }
+                        .await;
+                    let latency = started_at.elapsed();
+                    // Record the outbound StartOperation outcome (`startCallOutcomeTag @
+                    // v1.31.0`). External calls do not flow through tokeira's own frontend,
+                    // so the failure source stays unset → `_unknown_`
+                    // (`SetFailureSourceOnContext` is worker-path only,
+                    // `components/nexusoperations/fx.go @ v1.31.0`).
+                    let outcome = match &start_result {
+                        Ok(NexusStartResult::SyncCompleted { .. }) => "successful".to_string(),
+                        Ok(NexusStartResult::AsyncAccepted { .. }) => "pending".to_string(),
+                        Ok(NexusStartResult::SyncFailed { .. }) => {
+                            "operation-unsuccessful:failed".to_string()
                         }
-                        Ok(NexusStartResult::SyncFailed { message }) => {
-                            tokeira_kernel::NexusResolution::Failed {
-                                failure: failure_to_payload(&failure_proto::Failure {
-                                    message,
-                                    failure_info: Some(
-                                        failure_proto::failure::FailureInfo::ApplicationFailureInfo(
-                                            failure_proto::ApplicationFailureInfo {
-                                                r#type: "NexusOperationFailure".to_string(),
-                                                non_retryable: false,
-                                                ..Default::default()
-                                            },
-                                        ),
-                                    ),
-                                    ..Default::default()
-                                }),
-                            }
+                        Ok(NexusStartResult::HandlerError { error_type, .. }) => {
+                            format!("handler-error:{error_type}")
                         }
-                        Ok(NexusStartResult::AsyncAccepted {
-                            operation_token,
-                            links,
-                        }) => tokeira_kernel::NexusResolution::Started {
-                            operation_token,
-                            links,
-                        },
-                        Err(error) => tokeira_kernel::NexusResolution::Failed {
+                        Err(_) => "unknown-error".to_string(),
+                    };
+                    self.record_external_outbound_metric(originator_run_key, &outcome, latency)
+                        .await;
+
+                    // SyncFailed (operation-unsuccessful), HandlerError, and a transport
+                    // Err all resolve the caller's operation as failed; only the metric
+                    // outcome distinguishes them (single attempt, no retry — Req 5.3).
+                    let failed_from_message =
+                        |message: String| tokeira_kernel::NexusResolution::Failed {
                             failure: failure_to_payload(&failure_proto::Failure {
-                                message: error.to_string(),
+                                message,
                                 failure_info: Some(
                                     failure_proto::failure::FailureInfo::ApplicationFailureInfo(
                                         failure_proto::ApplicationFailureInfo {
@@ -715,7 +760,25 @@ where
                                 ),
                                 ..Default::default()
                             }),
+                        };
+                    match start_result {
+                        Ok(NexusStartResult::SyncCompleted { result, links }) => {
+                            tokeira_kernel::NexusResolution::Completed { result, links }
+                        }
+                        Ok(NexusStartResult::AsyncAccepted {
+                            operation_token,
+                            links,
+                        }) => tokeira_kernel::NexusResolution::Started {
+                            operation_token,
+                            links,
                         },
+                        Ok(NexusStartResult::SyncFailed { message }) => {
+                            failed_from_message(message)
+                        }
+                        Ok(NexusStartResult::HandlerError { message, .. }) => {
+                            failed_from_message(message)
+                        }
+                        Err(error) => failed_from_message(error.to_string()),
                     }
                 }
                 EndpointTarget::Worker {

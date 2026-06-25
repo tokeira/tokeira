@@ -215,12 +215,17 @@ impl NexusHttpClient for HttpNexusClient {
                 })
             }
             other => {
-                // Any other status is a handler/transport error; surface the body
-                // so the publisher's Failed mapping carries a useful cause. A
-                // single attempt only — no retry classification here (Req 5.3).
+                // A non-2xx, non-424 status is a Nexus *handler* error (e.g. 400
+                // BAD_REQUEST). Surface its type + body so the publisher resolves the
+                // caller's operation as failed AND tags `nexus_outbound_requests` with
+                // `handler-error:<TYPE>` (`startCallOutcomeTag @ v1.31.0`). A single
+                // attempt only — no retry classification here (Req 5.3).
                 let bytes = response.bytes().await.unwrap_or_default();
                 let detail = String::from_utf8_lossy(&bytes);
-                bail!("nexus start: unexpected status {other}: {detail}")
+                Ok(NexusStartResult::HandlerError {
+                    error_type: handler_error_type_for_status(other).to_string(),
+                    message: format!("nexus start: unexpected status {other}: {detail}"),
+                })
             }
         }
     }
@@ -314,6 +319,28 @@ impl HttpNexusCompletionClient {
 /// lives in the external `github.com/nexus-rpc/sdk-go v0.6.0` (not in the v1.31.0
 /// checkout); the `409`/`501` terminal classification follows the SDK's conventional
 /// permanent-error set and is flagged for reconfirmation in the Wave 8 conformance pass.
+/// Map an HTTP status code to the Nexus `HandlerErrorType` string the SDK uses, mirroring
+/// `httpStatusCodeToHandlerErrorType` (`common/nexus/nexusrpc/client.go @ v1.31.0`; the
+/// per-status table itself lives in the external `github.com/nexus-rpc/sdk-go`, like the
+/// retry-default note on [`mapped_handler_error_retryable`]). An unmapped status reports
+/// `INTERNAL`, matching the SDK surfacing an `UnexpectedResponseError` as an internal
+/// handler error. The non-`400` rows follow the SDK's conventional status↔type set and are
+/// flagged for reconfirmation alongside the Wave 8 conformance pass.
+fn handler_error_type_for_status(status: u16) -> &'static str {
+    match status {
+        400 => "BAD_REQUEST",
+        401 => "UNAUTHENTICATED",
+        403 => "UNAUTHORIZED",
+        404 => "NOT_FOUND",
+        429 => "RESOURCE_EXHAUSTED",
+        500 => "INTERNAL",
+        501 => "NOT_IMPLEMENTED",
+        503 => "UNAVAILABLE",
+        504 => "UPSTREAM_TIMEOUT",
+        _ => "INTERNAL",
+    }
+}
+
 fn mapped_handler_error_retryable(status: u16) -> Option<bool> {
     match status {
         408 | 429 => Some(true),

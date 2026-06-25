@@ -79,9 +79,9 @@ use tokeira_runtime::{
     HttpNexusCompletionClient, InMemoryNexusEndpointStore, InMemoryTaskQueueConfigStore,
     MembershipConfig, NEXUS_CALLBACK_PATH, NEXUS_OPERATION_STATE_HEADER, NexusCompletionDeps,
     NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusEndpointSpec,
-    NexusEndpointSpecTarget, NexusEndpointStore, RuntimeConfig, ScheduleEngineConfig,
-    ScheduleStore, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime, VersioningRuleStore,
-    run_schedule_engine,
+    NexusEndpointSpecTarget, NexusEndpointStore, NexusNamespaceResolver, RuntimeConfig,
+    ScheduleEngineConfig, ScheduleStore, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime,
+    VersioningRuleStore, run_schedule_engine,
 };
 use tokeira_storage::{
     InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
@@ -89,8 +89,8 @@ use tokeira_storage::{
     dsql::{DsqlAuthConfig, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore},
 };
 use tokeira_types::{
-    ExecutionRef, IncarnationId, NodeEndpoint, PlacementConfig, ProjectionCursor, ShardId,
-    WorkflowId,
+    ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,
+    ShardId, WorkflowId,
 };
 
 /// Nexus-endpoint bootstrap target used by the dev startup path. Kept in the
@@ -172,6 +172,31 @@ where
             namespace_id_for(namespace),
         )
         .await
+    }
+}
+
+/// [`NexusNamespaceResolver`] backed by the edge namespace cache.
+///
+/// The runtime publisher tags the External-endpoint outbound Nexus metric with the
+/// originator's namespace *name*, but holds only its [`NamespaceId`]. tokeira namespace ids
+/// are a non-invertible function of the name, so resolution scans the (small) registered set
+/// and matches `namespace_id_for(name)` — the inverse the runtime needs. Returns `None` when
+/// no registered namespace hashes to the id, leaving the metric unrecorded rather than
+/// mistagged.
+struct CacheNexusNamespaceResolver {
+    namespaces: Arc<dyn NamespaceCache>,
+}
+
+#[async_trait]
+impl NexusNamespaceResolver for CacheNexusNamespaceResolver {
+    async fn name_for_id(&self, namespace_id: NamespaceId) -> Option<String> {
+        self.namespaces
+            .list_all()
+            .await
+            .ok()?
+            .into_iter()
+            .map(|namespace| namespace.name)
+            .find(|name| namespace_id_for(name) == namespace_id)
     }
 }
 
@@ -822,6 +847,11 @@ where
             node_endpoint.as_authority(),
             seed_default_shard,
             versioning_rule_store.clone(),
+            // Tag the External-endpoint outbound Nexus metric with the originator's
+            // namespace name, resolved through the shared edge namespace cache.
+            Some(Arc::new(CacheNexusNamespaceResolver {
+                namespaces: namespaces.clone(),
+            }) as Arc<dyn NexusNamespaceResolver>),
         )
         // The edge always exposes Worker Deployment v2 RPCs. Wiring the
         // repository here keeps their registry durable for both in-memory and

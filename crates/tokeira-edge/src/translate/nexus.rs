@@ -296,6 +296,126 @@ pub fn proto_handler_error_to_resolution(
     })
 }
 
+/// `failure_source` metric-tag values for an outbound Nexus request. `worker` marks a
+/// failure the handler/worker reported; otherwise the tag defaults to `_unknown_`
+/// (`common/nexus/failure.go:25-26`, `common/metrics/tags.go:66,264-268 @ v1.31.0`).
+pub const FAILURE_SOURCE_WORKER: &str = "worker";
+pub const FAILURE_SOURCE_UNKNOWN: &str = "_unknown_";
+
+/// The `nexus_outbound_requests` / `nexus_outbound_latency` tag triple for one caller-side
+/// Nexus request, mirroring v1.31.0's `metrics.NexusMethodTag` + `startCallOutcomeTag` +
+/// `metrics.FailureSourceTag` (`components/nexusoperations/executors.go:320-331,899-933 @
+/// v1.31.0`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NexusOutboundTags {
+    /// `StartOperation` or `CancelOperation`.
+    pub method: &'static str,
+    /// `startCallOutcomeTag` value: `successful` / `pending` / `operation-unsuccessful:<state>`
+    /// / `handler-error:<TYPE>`.
+    pub outcome: String,
+    /// [`FAILURE_SOURCE_WORKER`] when the worker reported the failure, else
+    /// [`FAILURE_SOURCE_UNKNOWN`].
+    pub failure_source: &'static str,
+}
+
+/// Derive the outbound-metric tags for a worker's `RespondNexusTaskCompleted` response —
+/// the terminal outcome of a dispatched StartOperation/CancelOperation. `None` when the
+/// response variant is absent (the handler rejects that as `BadRequest` before resolving,
+/// so no outbound outcome is recorded). Mirrors `startCallOutcomeTag`'s non-error arms plus
+/// the `OperationError` → `operation-unsuccessful:<state>` mapping (`executors.go:920-922,
+/// 930-933 @ v1.31.0`).
+pub fn nexus_completed_outbound_tags(response: &nexus_v1::Response) -> Option<NexusOutboundTags> {
+    match response.variant.as_ref()? {
+        nexus_v1::response::Variant::CancelOperation(_) => Some(NexusOutboundTags {
+            method: "CancelOperation",
+            outcome: "successful".to_string(),
+            failure_source: FAILURE_SOURCE_UNKNOWN,
+        }),
+        nexus_v1::response::Variant::StartOperation(start) => {
+            let tags = match start.variant.as_ref()? {
+                nexus_v1::start_operation_response::Variant::SyncSuccess(_) => NexusOutboundTags {
+                    method: "StartOperation",
+                    outcome: "successful".to_string(),
+                    failure_source: FAILURE_SOURCE_UNKNOWN,
+                },
+                nexus_v1::start_operation_response::Variant::AsyncSuccess(_) => NexusOutboundTags {
+                    method: "StartOperation",
+                    outcome: "pending".to_string(),
+                    failure_source: FAILURE_SOURCE_UNKNOWN,
+                },
+                nexus_v1::start_operation_response::Variant::OperationError(error) => {
+                    NexusOutboundTags {
+                        method: "StartOperation",
+                        outcome: format!(
+                            "operation-unsuccessful:{}",
+                            outbound_operation_state(&error.operation_state)
+                        ),
+                        failure_source: FAILURE_SOURCE_WORKER,
+                    }
+                }
+                // A bare `Failure` start response (no Nexus operation state) is still an
+                // unsuccessful operation; v1.31.0's `nexus.OperationError` carries a state,
+                // so default to `failed` when none is present.
+                nexus_v1::start_operation_response::Variant::Failure(_) => NexusOutboundTags {
+                    method: "StartOperation",
+                    outcome: "operation-unsuccessful:failed".to_string(),
+                    failure_source: FAILURE_SOURCE_WORKER,
+                },
+            };
+            Some(tags)
+        }
+    }
+}
+
+/// Derive the outbound-metric tags for a worker's `RespondNexusTaskFailed` — always a
+/// handler error (`handler-error:<TYPE>`, `executors.go:925-927 @ v1.31.0`), with the
+/// failure attributed to the `worker`. The type comes from the modern `failure`'s
+/// `NexusHandlerFailureInfo` or the deprecated `error.error_type`.
+///
+/// The dispatched task's method (Start vs Cancel) is not carried on the task token, and a
+/// worker failure response is a StartOperation in every path the corpus exercises; a
+/// CancelOperation handler-failure (untested) would be tagged `StartOperation` until the
+/// task kind is threaded onto the token.
+pub fn nexus_failed_outbound_tags(
+    failure: Option<&failure_proto::Failure>,
+    error: Option<&nexus_v1::HandlerError>,
+) -> NexusOutboundTags {
+    NexusOutboundTags {
+        method: "StartOperation",
+        outcome: format!("handler-error:{}", handler_error_type(failure, error)),
+        failure_source: FAILURE_SOURCE_WORKER,
+    }
+}
+
+/// The Nexus operation state for an `operation-unsuccessful:<state>` outcome, defaulting to
+/// `failed` when the worker left it empty (the only terminal-unsuccessful state the corpus
+/// asserts).
+fn outbound_operation_state(state: &str) -> &str {
+    if state.is_empty() { "failed" } else { state }
+}
+
+/// The handler-error type string for an outbound `handler-error:<TYPE>` outcome, read from
+/// the modern `failure`'s `NexusHandlerFailureInfo.type` first, then the deprecated
+/// `HandlerError.error_type`, defaulting to `INTERNAL` (v1.31.0 treats an unclassified
+/// handler failure as internal).
+fn handler_error_type(
+    failure: Option<&failure_proto::Failure>,
+    error: Option<&nexus_v1::HandlerError>,
+) -> String {
+    if let Some(failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(info)) =
+        failure.and_then(|failure| failure.failure_info.as_ref())
+        && !info.r#type.is_empty()
+    {
+        return info.r#type.clone();
+    }
+    if let Some(error) = error
+        && !error.error_type.is_empty()
+    {
+        return error.error_type.clone();
+    }
+    "INTERNAL".to_string()
+}
+
 /// True when a `temporal.api.failure.v1.Failure` carries a `NexusHandlerFailureInfo`.
 ///
 /// v1.31.0's frontend rejects a `RespondNexusTaskFailedRequest.failure` that does
@@ -438,6 +558,97 @@ mod tests {
             ..Default::default()
         };
         assert!(!failure_has_nexus_handler_info(&without));
+    }
+
+    #[test]
+    fn outbound_tags_map_v1_31_0_outcome_taxonomy() {
+        // RespondNexusTaskCompleted: async start → `pending`, no failure source.
+        let async_started = nexus_v1::Response {
+            variant: Some(nexus_v1::response::Variant::StartOperation(
+                nexus_v1::StartOperationResponse {
+                    variant: Some(nexus_v1::start_operation_response::Variant::AsyncSuccess(
+                        nexus_v1::start_operation_response::Async {
+                            operation_id: "op".to_string(),
+                            operation_token: "op".to_string(),
+                            links: Vec::new(),
+                        },
+                    )),
+                },
+            )),
+        };
+        let tags = nexus_completed_outbound_tags(&async_started).expect("variant present");
+        assert_eq!(tags.method, "StartOperation");
+        assert_eq!(tags.outcome, "pending");
+        assert_eq!(tags.failure_source, FAILURE_SOURCE_UNKNOWN);
+
+        // A sync operation failure → `operation-unsuccessful:<state>`, attributed to the worker.
+        let op_error = nexus_v1::Response {
+            variant: Some(nexus_v1::response::Variant::StartOperation(
+                nexus_v1::StartOperationResponse {
+                    variant: Some(nexus_v1::start_operation_response::Variant::OperationError(
+                        nexus_v1::UnsuccessfulOperationError {
+                            operation_state: "failed".to_string(),
+                            failure: None,
+                        },
+                    )),
+                },
+            )),
+        };
+        let tags = nexus_completed_outbound_tags(&op_error).expect("variant present");
+        assert_eq!(tags.method, "StartOperation");
+        assert_eq!(tags.outcome, "operation-unsuccessful:failed");
+        assert_eq!(tags.failure_source, FAILURE_SOURCE_WORKER);
+
+        // CancelOperation completes successfully.
+        let cancel = nexus_v1::Response {
+            variant: Some(nexus_v1::response::Variant::CancelOperation(
+                nexus_v1::CancelOperationResponse {},
+            )),
+        };
+        let tags = nexus_completed_outbound_tags(&cancel).expect("variant present");
+        assert_eq!(tags.method, "CancelOperation");
+        assert_eq!(tags.outcome, "successful");
+        assert_eq!(tags.failure_source, FAILURE_SOURCE_UNKNOWN);
+
+        // A missing response variant carries no outbound outcome (rejected as BadRequest
+        // before resolution, so nothing is recorded).
+        assert!(nexus_completed_outbound_tags(&nexus_v1::Response { variant: None }).is_none());
+
+        // RespondNexusTaskFailed: handler-error:<TYPE> from the modern failure's
+        // NexusHandlerFailureInfo, attributed to the worker.
+        let failure = failure_proto::Failure {
+            failure_info: Some(
+                failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(
+                    failure_proto::NexusHandlerFailureInfo {
+                        r#type: "BAD_REQUEST".to_string(),
+                        retry_behavior: 0,
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        let tags = nexus_failed_outbound_tags(Some(&failure), None);
+        assert_eq!(tags.method, "StartOperation");
+        assert_eq!(tags.outcome, "handler-error:BAD_REQUEST");
+        assert_eq!(tags.failure_source, FAILURE_SOURCE_WORKER);
+
+        // The deprecated `error` field is the fallback type source.
+        let handler_error = nexus_v1::HandlerError {
+            error_type: "NOT_FOUND".to_string(),
+            failure: None,
+            retry_behavior: 0,
+        };
+        assert_eq!(
+            nexus_failed_outbound_tags(None, Some(&handler_error)).outcome,
+            "handler-error:NOT_FOUND"
+        );
+
+        // Neither present → defaults to INTERNAL (v1.31.0 treats an unclassified handler
+        // failure as internal).
+        assert_eq!(
+            nexus_failed_outbound_tags(None, None).outcome,
+            "handler-error:INTERNAL"
+        );
     }
 
     #[test]

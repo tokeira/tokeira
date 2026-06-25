@@ -53,8 +53,8 @@ use crate::{
     metrics as runtime_metrics,
     nexus::{
         CompletionCallbackTrackingState, NexusCompletionDeps, NexusEndpointRegistry,
-        NexusHttpClient, NexusTaskBroker, NexusTimeoutScannerConfig, NexusTimeoutTrackingState,
-        NoopNexusHttpClient, run_nexus_timeout_scanner,
+        NexusHttpClient, NexusNamespaceResolver, NexusTaskBroker, NexusTimeoutScannerConfig,
+        NexusTimeoutTrackingState, NoopNexusHttpClient, run_nexus_timeout_scanner,
     },
     publisher::{RuntimeDispatchPublisher, run_completion_callback_scanner},
     query::{QueryResult, QueryTask},
@@ -469,6 +469,7 @@ where
             "127.0.0.1:0".to_owned(),
             seed_default_shard,
             versioning_rule_store,
+            None,
         )
     }
 
@@ -489,6 +490,9 @@ where
         node_endpoint: String,
         seed_default_shard: bool,
         versioning_rule_store: Arc<VersioningRuleStore>,
+        // Resolves originator namespace names for the External-endpoint outbound metric;
+        // wired by the server bootstrap, `None` for the simpler constructors and tests.
+        namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
     ) -> Self {
         let broker = InMemoryBroker::default();
         let activity_broker = InMemoryActivityBroker::default();
@@ -537,7 +541,8 @@ where
                     activity_tracking.clone(),
                     delivery_metrics.clone(),
                     Some(versioning_rule_store.clone()),
-                );
+                )
+                .with_namespace_resolver(namespace_resolver.clone());
                 spawn_lane_with_id(
                     lane_id,
                     BasicKernel,
@@ -660,7 +665,8 @@ where
             activity_tracking.clone(),
             delivery_metrics.clone(),
             Some(versioning_rule_store.clone()),
-        );
+        )
+        .with_namespace_resolver(namespace_resolver.clone());
         let completion_callback_scanner_cancel = CancellationToken::new();
         let completion_callback_scanner_handle =
             Some(tokio::spawn(run_completion_callback_scanner(
@@ -1590,6 +1596,7 @@ mod tests {
                 "127.0.0.1:7233".to_owned(),
                 true,
                 Arc::new(VersioningRuleStore::default()),
+                None,
             );
 
             assert_eq!(runtime.owner_identity(), node_id.to_string());

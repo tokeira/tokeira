@@ -42,6 +42,17 @@ pub const WORKERS_TOTAL: &str = "tokeira_worker_heartbeat_entries_total";
 pub const WORKER_HEARTBEAT_ACTIVE: &str = "tokeira_worker_heartbeat_active_state";
 pub const WORKER_LAST_HEARTBEAT_AGE_SECONDS: &str = "tokeira_worker_last_heartbeat_age_seconds";
 
+// Outbound Nexus requests the runtime (history-service analogue) makes on a caller's
+// behalf. v1.31.0 records these in the history service (`OutboundRequestCounter`,
+// `components/nexusoperations/executors.go:320-331 @ v1.31.0`); tokeira observes them at two
+// sites that both record this one metric — the External-endpoint HTTP `start_operation` in
+// the publisher, and the worker-endpoint StartOperation resolved by a worker's
+// `RespondNexusTask{Completed,Failed}` at the edge (which calls these helpers across the
+// edge→runtime dependency). The conformance metrics bridge renames them to Temporal's
+// `nexus_outbound_requests` / `nexus_outbound_latency`.
+pub const NEXUS_OUTBOUND_REQUESTS_TOTAL: &str = "tokeira_runtime_nexus_outbound_requests_total";
+pub const NEXUS_OUTBOUND_LATENCY_SECONDS: &str = "tokeira_runtime_nexus_outbound_latency_seconds";
+
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (BROKER_PUBLISH_TOTAL, MetricType::Counter),
     (BROKER_SYNC_MATCH_TOTAL, MetricType::Counter),
@@ -80,6 +91,11 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
         WORKER_LAST_HEARTBEAT_AGE_SECONDS,
         MetricType::DurationHistogram,
     ),
+    (NEXUS_OUTBOUND_REQUESTS_TOTAL, MetricType::Counter),
+    (
+        NEXUS_OUTBOUND_LATENCY_SECONDS,
+        MetricType::DurationHistogram,
+    ),
 ];
 
 fn task_type_name(kind: TaskKind) -> &'static str {
@@ -98,6 +114,39 @@ pub fn record_broker_publish(queue: &QueueKey) {
         "task_type" => task_type_name(queue.task_kind),
     )
     .increment(1);
+}
+
+/// Record one outbound Nexus request, tagged by the originator `namespace` (name), the
+/// Nexus `method` (`StartOperation` / `CancelOperation`), the `failure_source` (`worker`
+/// when the worker reported the failure, else `_unknown_`), and the `outcome`
+/// (`startCallOutcomeTag` taxonomy: `successful` / `pending` / `operation-unsuccessful:<state>`
+/// / `handler-error:<TYPE>` / `unknown-error`). Mirrors `OutboundRequestCounter`
+/// (`components/nexusoperations/executors.go:330 @ v1.31.0`).
+pub fn record_nexus_outbound_request(
+    namespace: &str,
+    method: &str,
+    failure_source: &str,
+    outcome: &str,
+) {
+    counter!(
+        NEXUS_OUTBOUND_REQUESTS_TOTAL,
+        "namespace" => namespace.to_string(),
+        "method" => method.to_string(),
+        "failure_source" => failure_source.to_string(),
+        "outcome" => outcome.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record the wall-clock latency of one outbound Nexus request (`OutboundRequestLatency`,
+/// `executors.go:331 @ v1.31.0`).
+pub fn record_nexus_outbound_latency(namespace: &str, method: &str, duration: std::time::Duration) {
+    histogram!(
+        NEXUS_OUTBOUND_LATENCY_SECONDS,
+        "namespace" => namespace.to_string(),
+        "method" => method.to_string(),
+    )
+    .record(duration.as_secs_f64());
 }
 
 /// Record a sync-match delivery where a waiter was already present.
@@ -336,6 +385,41 @@ mod tests {
         for (name, kind) in METRIC_NAMES {
             validate_metric_name(name, *kind).unwrap();
         }
+    }
+
+    #[test]
+    fn nexus_outbound_helpers_emit_expected_metrics_and_labels() {
+        let recorder = DebuggingRecorder::new();
+
+        with_local_recorder(&recorder, || {
+            record_nexus_outbound_request(
+                "default",
+                "StartOperation",
+                "_unknown_",
+                "handler-error:BAD_REQUEST",
+            );
+            record_nexus_outbound_latency(
+                "default",
+                "StartOperation",
+                std::time::Duration::from_millis(4),
+            );
+        });
+
+        let snapshot = snapshot_map(&recorder);
+
+        let (labels, value) = snapshot.get(NEXUS_OUTBOUND_REQUESTS_TOTAL).unwrap();
+        assert_eq!(labels.get("namespace"), Some(&"default".to_string()));
+        assert_eq!(labels.get("method"), Some(&"StartOperation".to_string()));
+        assert_eq!(labels.get("failure_source"), Some(&"_unknown_".to_string()));
+        assert_eq!(
+            labels.get("outcome"),
+            Some(&"handler-error:BAD_REQUEST".to_string())
+        );
+        assert!(!labels.contains_key("workflow_id"));
+        assert!(!labels.contains_key("run_id"));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        assert!(snapshot.contains_key(NEXUS_OUTBOUND_LATENCY_SECONDS));
     }
 
     #[test]

@@ -86,6 +86,33 @@ pub enum NexusStartResult {
         /// Links the handler returned on the async-start response.
         links: Vec<Link>,
     },
+    /// A Nexus *handler* error response (a non-2xx HTTP status the handler returned, e.g.
+    /// `400 BAD_REQUEST`), as opposed to [`SyncFailed`](NexusStartResult::SyncFailed) (an
+    /// unsuccessful *operation*, HTTP 424). Both resolve the caller's operation as failed;
+    /// the distinction drives the `nexus_outbound_requests` outcome tag
+    /// (`handler-error:<TYPE>` vs `operation-unsuccessful:<state>`,
+    /// `startCallOutcomeTag @ v1.31.0`).
+    HandlerError {
+        /// The Nexus `HandlerErrorType` (e.g. `BAD_REQUEST`, `INTERNAL`), mapped from the
+        /// HTTP status.
+        error_type: String,
+        /// Diagnostic detail from the response body, carried onto the failure resolution.
+        message: String,
+    },
+}
+
+/// Resolves a namespace id to its human-readable name for outbound-metric tagging.
+///
+/// The caller-side StartOperation against an *External* endpoint is dispatched from the
+/// runtime publisher, which holds only the originator's [`RunKey`]/[`NamespaceId`] — never
+/// the namespace *name* (tokeira namespace ids are a non-invertible function of the name).
+/// The edge owns the name registry, so the bootstrap injects an implementation backed by
+/// the namespace cache; when absent (e.g. unit harnesses) the outbound metric simply omits
+/// the request rather than tagging it with an unresolved namespace.
+#[async_trait]
+pub trait NexusNamespaceResolver: Send + Sync {
+    /// The namespace name for `namespace_id`, or `None` when it is unknown.
+    async fn name_for_id(&self, namespace_id: NamespaceId) -> Option<String>;
 }
 
 #[async_trait]

@@ -1147,6 +1147,22 @@ impl WorkflowService {
                 let response = req
                     .response
                     .ok_or_else(|| EdgeError::BadRequest("response is required".to_string()))?;
+                // The worker's response is the terminal result of a caller-side outbound
+                // StartOperation/CancelOperation; record the `nexus_outbound_requests`
+                // outcome from it. Latency is not recorded at this resolution point — the
+                // dispatch wall-clock is not carried on the task token, so an honest duration
+                // is unavailable here; the External-endpoint arm records both counter and
+                // latency where it can measure the round trip directly.
+                if let Some(tags) =
+                    crate::translate::nexus::nexus_completed_outbound_tags(&response)
+                {
+                    tokeira_runtime::metrics::record_nexus_outbound_request(
+                        &req.namespace,
+                        tags.method,
+                        tags.failure_source,
+                        &tags.outcome,
+                    );
+                }
                 let resolution = crate::translate::nexus::proto_response_to_resolution(
                     response,
                     &token.operation_id,
@@ -1204,6 +1220,14 @@ impl WorkflowService {
                 }
                 let token = NexusTaskToken::decode(&req.task_token)
                     .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+                // A failed worker response is the terminal result of an outbound
+                // StartOperation (a worker-reported handler error); capture its
+                // `nexus_outbound_requests` outcome before the failure is consumed into the
+                // resolution below.
+                let outbound_tags = crate::translate::nexus::nexus_failed_outbound_tags(
+                    req.failure.as_ref(),
+                    req.error.as_ref(),
+                );
                 // Prefer the v1.62 structured `failure` (field 5) modern SDKs send;
                 // fall back to the deprecated `error` (field 4). v1.31.0 requires
                 // one of them, and a `failure` must carry a NexusHandlerFailureInfo
@@ -1252,6 +1276,12 @@ impl WorkflowService {
                     crate::translate::nexus::proto_handler_error_to_resolution(error)
                         .map_err(|error| EdgeError::BadRequest(error.to_string()))?
                 };
+                tokeira_runtime::metrics::record_nexus_outbound_request(
+                    &req.namespace,
+                    outbound_tags.method,
+                    outbound_tags.failure_source,
+                    &outbound_tags.outcome,
+                );
 
                 let applied = self
                     .runtime

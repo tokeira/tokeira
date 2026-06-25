@@ -1098,11 +1098,19 @@ impl WorkflowService {
                     .await;
 
                 match task {
-                    Some(task) => Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
-                        task_token: task.token.encode().map_err(EdgeError::from)?,
-                        request: task.request,
-                    })),
-                    None => Ok(None),
+                    Some(task) => {
+                        // A Nexus task handed to a worker — the dispatch equivalent of
+                        // v1.31.0's matching `nexus_task_requests`.
+                        crate::metrics::record_nexus_task_request(&req.namespace, "dispatched");
+                        Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
+                            task_token: task.token.encode().map_err(EdgeError::from)?,
+                            request: task.request,
+                        }))
+                    }
+                    None => {
+                        crate::metrics::record_nexus_task_request(&req.namespace, "timeout");
+                        Ok(None)
+                    }
                 }
             },
         )

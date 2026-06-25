@@ -16,11 +16,56 @@ pub const GRPC_ERROR_TOTAL: &str = "tokeira_edge_grpc_error_total";
 pub const GRPC_ACTIVE_REQUESTS: &str = "tokeira_edge_grpc_active_requests";
 const EDGE_SERVICE_LABEL: &str = "edge";
 
+// Nexus operational metrics. Names are tokeira-prefixed; the conformance metrics bridge
+// renames them to Temporal's (`nexus_completion_requests`, `nexus_outbound_requests`,
+// `nexus_task_requests`, …) and passes the labels through. These mirror v1.31.0's Nexus
+// metric surface (`common/metrics/metric_defs.go`, `chasm/lib/nexusoperation/metrics.go`):
+//
+// - completion (inbound `/nexus/callback` handler) → `nexus_completion_*`
+// - outbound (caller-side StartOperation resolution) → `nexus_outbound_*`
+// - task dispatch (`PollNexusTaskQueue`) → `nexus_task_requests`
+//
+// `outcome` is a bounded enum (success / error_bad_request / error_not_found /
+// error_internal for completion; pending / handler-error:* / operation-unsuccessful:* for
+// outbound). `namespace` is the only otherwise-dynamic label and is a sanctioned key.
+
+/// Inbound Nexus completion requests, by `outcome` (maps to `nexus_completion_requests`).
+pub const NEXUS_COMPLETION_REQUESTS_TOTAL: &str = "tokeira_edge_nexus_completion_requests_total";
+/// Inbound Nexus completion handler latency (maps to `nexus_completion_latency`).
+pub const NEXUS_COMPLETION_LATENCY_SECONDS: &str = "tokeira_edge_nexus_completion_latency_seconds";
+/// Inbound Nexus completion requests rejected during pre-processing (maps to
+/// `nexus_completion_request_preprocess_errors`): a malformed token/state/body rejected
+/// before the operation is resolved.
+pub const NEXUS_COMPLETION_PREPROCESS_ERRORS_TOTAL: &str =
+    "tokeira_edge_nexus_completion_request_preprocess_errors_total";
+/// Caller-side outbound Nexus requests, by `method`/`failure_source`/`outcome` (maps to
+/// `nexus_outbound_requests`).
+pub const NEXUS_OUTBOUND_REQUESTS_TOTAL: &str = "tokeira_edge_nexus_outbound_requests_total";
+/// Caller-side outbound Nexus request latency (maps to `nexus_outbound_latency`).
+pub const NEXUS_OUTBOUND_LATENCY_SECONDS: &str = "tokeira_edge_nexus_outbound_latency_seconds";
+/// Nexus task dispatch requests served to workers (maps to `nexus_task_requests`).
+pub const NEXUS_TASK_REQUESTS_TOTAL: &str = "tokeira_edge_nexus_task_requests_total";
+
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (GRPC_REQUEST_TOTAL, MetricType::Counter),
     (GRPC_REQUEST_DURATION_SECONDS, MetricType::DurationHistogram),
     (GRPC_ERROR_TOTAL, MetricType::Counter),
     (GRPC_ACTIVE_REQUESTS, MetricType::Gauge),
+    (NEXUS_COMPLETION_REQUESTS_TOTAL, MetricType::Counter),
+    (
+        NEXUS_COMPLETION_LATENCY_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (
+        NEXUS_COMPLETION_PREPROCESS_ERRORS_TOTAL,
+        MetricType::Counter,
+    ),
+    (NEXUS_OUTBOUND_REQUESTS_TOTAL, MetricType::Counter),
+    (
+        NEXUS_OUTBOUND_LATENCY_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (NEXUS_TASK_REQUESTS_TOTAL, MetricType::Counter),
 ];
 
 static ACTIVE_REQUESTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
@@ -62,6 +107,71 @@ pub fn record_grpc_error(method: &str, namespace: &str, error_code: &str) {
 
 pub fn set_grpc_active_requests(method: &str, value: f64) {
     gauge!(GRPC_ACTIVE_REQUESTS, "method" => method.to_string()).set(value);
+}
+
+/// Record one inbound Nexus completion request, tagged by the originator `namespace` and
+/// the handler `outcome` (`success` / `error_bad_request` / `error_not_found` /
+/// `error_internal`).
+pub fn record_nexus_completion_request(namespace: &str, outcome: &str) {
+    counter!(
+        NEXUS_COMPLETION_REQUESTS_TOTAL,
+        "namespace" => namespace.to_string(),
+        "outcome" => outcome.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record the wall-clock latency of an inbound Nexus completion request.
+pub fn record_nexus_completion_latency(namespace: &str, duration: std::time::Duration) {
+    histogram!(NEXUS_COMPLETION_LATENCY_SECONDS, "namespace" => namespace.to_string())
+        .record(duration.as_secs_f64());
+}
+
+/// Record a Nexus completion request rejected during pre-processing (malformed
+/// token/state/body, before the operation is resolved).
+pub fn record_nexus_completion_preprocess_error(namespace: &str) {
+    counter!(NEXUS_COMPLETION_PREPROCESS_ERRORS_TOTAL, "namespace" => namespace.to_string())
+        .increment(1);
+}
+
+/// Record one caller-side outbound Nexus request, tagged by `namespace`, the Nexus `method`
+/// (`StartOperation` / `CancelOperation`), the `failure_source` (`worker` / `_unknown_`),
+/// and the `outcome` (`pending` / `handler-error:*` / `operation-unsuccessful:*`).
+pub fn record_nexus_outbound_request(
+    namespace: &str,
+    method: &str,
+    failure_source: &str,
+    outcome: &str,
+) {
+    counter!(
+        NEXUS_OUTBOUND_REQUESTS_TOTAL,
+        "namespace" => namespace.to_string(),
+        "method" => method.to_string(),
+        "failure_source" => failure_source.to_string(),
+        "outcome" => outcome.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record the wall-clock latency of a caller-side outbound Nexus request.
+pub fn record_nexus_outbound_latency(namespace: &str, method: &str, duration: std::time::Duration) {
+    histogram!(
+        NEXUS_OUTBOUND_LATENCY_SECONDS,
+        "namespace" => namespace.to_string(),
+        "method" => method.to_string(),
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record one Nexus task dispatched to a worker via `PollNexusTaskQueue`, tagged by
+/// `namespace` and `outcome` (`dispatched` / `timeout`).
+pub fn record_nexus_task_request(namespace: &str, outcome: &str) {
+    counter!(
+        NEXUS_TASK_REQUESTS_TOTAL,
+        "namespace" => namespace.to_string(),
+        "outcome" => outcome.to_string(),
+    )
+    .increment(1);
 }
 
 pub struct GrpcActiveRequestGuard {
@@ -190,5 +300,61 @@ mod tests {
             Some(&"StartWorkflowExecution".to_string())
         );
         assert_eq!(value, &DebugValue::Gauge(3.0.into()));
+    }
+
+    #[test]
+    fn nexus_helpers_emit_expected_metrics_and_labels() {
+        let recorder = DebuggingRecorder::new();
+
+        with_local_recorder(&recorder, || {
+            record_nexus_completion_request("default", "success");
+            record_nexus_completion_latency("default", std::time::Duration::from_millis(7));
+            record_nexus_completion_preprocess_error("default");
+            record_nexus_outbound_request(
+                "default",
+                "StartOperation",
+                "worker",
+                "handler-error:INTERNAL",
+            );
+            record_nexus_outbound_latency(
+                "default",
+                "StartOperation",
+                std::time::Duration::from_millis(3),
+            );
+            record_nexus_task_request("default", "dispatched");
+        });
+
+        let snapshot = snapshot_map(&recorder);
+
+        let (labels, value) = snapshot.get(NEXUS_COMPLETION_REQUESTS_TOTAL).unwrap();
+        assert_eq!(labels.get("namespace"), Some(&"default".to_string()));
+        assert_eq!(labels.get("outcome"), Some(&"success".to_string()));
+        assert!(!labels.contains_key("workflow_id"));
+        assert!(!labels.contains_key("run_id"));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        assert!(snapshot.contains_key(NEXUS_COMPLETION_LATENCY_SECONDS));
+
+        let (_, value) = snapshot
+            .get(NEXUS_COMPLETION_PREPROCESS_ERRORS_TOTAL)
+            .unwrap();
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(NEXUS_OUTBOUND_REQUESTS_TOTAL).unwrap();
+        assert_eq!(labels.get("namespace"), Some(&"default".to_string()));
+        assert_eq!(labels.get("method"), Some(&"StartOperation".to_string()));
+        assert_eq!(labels.get("failure_source"), Some(&"worker".to_string()));
+        assert_eq!(
+            labels.get("outcome"),
+            Some(&"handler-error:INTERNAL".to_string())
+        );
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        assert!(snapshot.contains_key(NEXUS_OUTBOUND_LATENCY_SECONDS));
+
+        let (labels, value) = snapshot.get(NEXUS_TASK_REQUESTS_TOTAL).unwrap();
+        assert_eq!(labels.get("namespace"), Some(&"default".to_string()));
+        assert_eq!(labels.get("outcome"), Some(&"dispatched".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
     }
 }

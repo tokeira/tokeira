@@ -189,7 +189,7 @@ round-trip (the *poll/respond* token) is unchanged.
 
 ### 4. Inbound completion HTTP endpoint + outbound completion client (`tokeira-edge`, `tokeira-runtime`, `apps/tokeirad`)
 
-- **Inbound `POST /nexus/callback`** (`tokeira-edge`): a Nexus completion HTTP handler mirroring
+- **Inbound completion HTTP handler** (`tokeira-edge`): a Nexus completion handler mirroring
   `completionHandler.CompleteOperation @ v1.31.0`. It reads the `Temporal-Callback-Token` header
   (decode + version-check → `NexusCompletionToken`), the `Nexus-Operation-State` header, and the body
   (result payload for `succeeded`; Nexus failure for `failed`/`canceled`), maps to a `NexusResolution`,
@@ -199,6 +199,33 @@ round-trip (the *poll/respond* token) is unchanged.
   undecodable token or invalid state. A bad/forged token that decodes but addresses no live pending op
   is rejected by the kernel fencing (`StaleNexusResolution`/`UnknownNexusOperation`) → mapped to the
   not-found handler result.
+
+  **Route set (conformance correction).** v1.31.0 serves **two** completion-callback routes
+  (`common/nexus/routes.go @ v1.31.0`), and tokeira serves **both**:
+  - `PathCompletionCallbackNoIdentifier` = `/nexus/callback` — identity carried only by the callback
+    token in the headers; this is the `temporal://system` loopback path.
+  - `RouteCompletionCallback` = `/namespaces/{namespace}/nexus/callback` — namespace identified in the
+    URL path. The handler **validates the path namespace exists** (absent → `NOT_FOUND`, matching
+    `CompleteOperation`'s `GetNamespaceByID` → `HandlerErrorTypeNotFound, "namespace %q not found"`,
+    `components/nexusoperations/frontend/handler.go:98-104 @ v1.31.0`) and tags metrics with it.
+  Consequently the worker-callback URL tokeira mints for a Worker handler uses the **namespaced**
+  template (`{base}/namespaces/{ns}/nexus/callback`), matching v1.31.0's `CallbackURLTemplate`
+  interpolation of `{{.NamespaceName}}`/`{{.NamespaceID}}`; the bare `/nexus/callback` remains the
+  loopback firing target for `temporal://system`.
+
+  **Outcome taxonomy + metrics.** Each request records `nexus_completion_requests` once, tagged
+  `namespace` + `outcome`, mirroring the completion handler's tag derivation
+  (`handler.go:364-380 @ v1.31.0`): `success`; a specific pre-process outcome when set
+  (`unsupported_client`); else `error_<lowercase(HandlerError.Type)>` (so NotFound → `error_not_found`,
+  BadRequest → `error_bad_request`); else `error_internal`. Pre-process rejections (malformed
+  token/state/body, before resolution) additionally record `nexus_completion_request_preprocess_errors`,
+  and the handler records `nexus_completion_latency`.
+
+  **Client-version gate (`unsupported_client`).** tokeira adopts v1.31.0's supported-client policy
+  (`common/headers/version_checker.go:52 @ v1.31.0`: `SupportedClients["Nexus-go-sdk"] = "<2.0.0"`):
+  the completion handler rejects a Nexus SDK client whose `user-agent` version is outside the supported
+  range with a `BAD_REQUEST` handler error tagged `outcome=unsupported_client`. This is the adoption of
+  Temporal's claimed compatibility surface (a forward-compat safety cap), not a capability gate.
 - **HTTP server wiring** (`apps/tokeirad`): stand up an HTTP/1.1 listener for the Nexus completion
   route alongside the gRPC server (a `hyper`/`axum` service on a configured `nexus_http` address;
   `tonic` already depends on `hyper`). The runtime's completion client resolves `temporal://system`

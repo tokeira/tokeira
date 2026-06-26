@@ -45,7 +45,7 @@ use crate::{
         CompletionCallbackScannerConfig, CompletionCallbackTrackingEntry,
         CompletionCallbackTrackingState, CompletionDeliveryOutcome, EndpointTarget,
         NexusCompletion, NexusCompletionClient, NexusCompletionFailureBody,
-        NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusHttpClient,
+        NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusHttpClient, NexusHttpFailureBody,
         NexusNamespaceResolver, NexusStartResult, NexusTask, NexusTaskBroker, NexusTaskRequest,
         NexusTaskToken, NexusTimeoutEntry, NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL,
         TEMPORAL_CALLBACK_TOKEN_HEADER, nexus_completion_backoff,
@@ -775,9 +775,17 @@ where
                         Ok(NexusStartResult::SyncFailed { message }) => {
                             failed_from_message(message)
                         }
-                        Ok(NexusStartResult::HandlerError { message, .. }) => {
-                            failed_from_message(message)
-                        }
+                        Ok(NexusStartResult::HandlerError {
+                            error_type,
+                            failure,
+                        }) => external_handler_error_resolution(
+                            &error_type,
+                            failure.as_ref(),
+                            &endpoint_name,
+                            &service,
+                            &operation,
+                            scheduled_event_id,
+                        ),
                         Err(error) => failed_from_message(error.to_string()),
                     }
                 }
@@ -1191,6 +1199,107 @@ where
                 );
             }
         }
+    }
+}
+
+/// Rehydrate an External-endpoint Nexus *handler* error (a non-2xx HTTP response) into the
+/// caller's failure chain so the SDK decodes it as `NexusOperationError -> HandlerError ->
+/// ApplicationError(+details)`.
+///
+/// Mirrors v1.31.0's history-service conversion (`NexusFailureToTemporalFailure`,
+/// `common/nexus/failure.go:181-305 @ v1.31.0`) and the worker-path
+/// `wrap_handler_failure_as_resolution`: an outer `NexusOperationFailureInfo` (the operation
+/// failed) wraps a `NexusHandlerFailureInfo{type}` whose cause is a generic
+/// `ApplicationFailureInfo{type:"NexusFailure"}` carrying the handler's `nexus.Failure`
+/// (`{metadata, details}`, message cleared) as a `json/plain` details payload — so the SDK's
+/// `appErr.Details(&nexus.Failure)` recovers the original metadata and details.
+fn external_handler_error_resolution(
+    error_type: &str,
+    failure: Option<&NexusHttpFailureBody>,
+    endpoint: &str,
+    service: &str,
+    operation: &str,
+    scheduled_event_id: i64,
+) -> tokeira_kernel::NexusResolution {
+    let app_cause = failure.map(|body| {
+        let details = if body.metadata.is_empty() && body.details.is_null() {
+            None
+        } else {
+            // `json.Marshal(nexus.Failure{Metadata,Details})` with message/stacktrace cleared
+            // (`nexusFailureMetadataToApplicationFailureInfo @ v1.31.0`).
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "message".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+            if !body.metadata.is_empty() {
+                obj.insert(
+                    "metadata".to_string(),
+                    serde_json::to_value(&body.metadata).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            if !body.details.is_null() {
+                obj.insert("details".to_string(), body.details.clone());
+            }
+            let data = serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_default();
+            let payload = Payload {
+                data,
+                metadata: std::collections::BTreeMap::from([(
+                    "encoding".to_string(),
+                    "json/plain".to_string(),
+                )]),
+            };
+            Some(payloads_from_domain(&Payloads(vec![payload])))
+        };
+        failure_proto::Failure {
+            message: body.message.clone(),
+            failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                failure_proto::ApplicationFailureInfo {
+                    r#type: "NexusFailure".to_string(),
+                    details,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    });
+
+    let handler_failure = failure_proto::Failure {
+        message: failure.map(|body| body.message.clone()).unwrap_or_default(),
+        failure_info: Some(
+            failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(
+                failure_proto::NexusHandlerFailureInfo {
+                    r#type: error_type.to_string(),
+                    // UNSPECIFIED: the per-attempt retryability is decided by status, not echoed here.
+                    retry_behavior: 0,
+                },
+            ),
+        ),
+        cause: app_cause.map(Box::new),
+        ..Default::default()
+    };
+
+    let wrapped = failure_proto::Failure {
+        message: "nexus operation completed unsuccessfully".to_string(),
+        failure_info: Some(
+            failure_proto::failure::FailureInfo::NexusOperationExecutionFailureInfo(
+                failure_proto::NexusOperationFailureInfo {
+                    scheduled_event_id,
+                    endpoint: endpoint.to_string(),
+                    service: service.to_string(),
+                    operation: operation.to_string(),
+                    // operation_id / operation_token are deprecated wire fields; leave them
+                    // defaulted (empty) rather than naming the deprecated fields.
+                    ..Default::default()
+                },
+            ),
+        ),
+        cause: Some(Box::new(handler_failure)),
+        ..Default::default()
+    };
+
+    tokeira_kernel::NexusResolution::Failed {
+        failure: failure_to_payload(&wrapped),
     }
 }
 

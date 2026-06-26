@@ -96,9 +96,28 @@ pub enum NexusStartResult {
         /// The Nexus `HandlerErrorType` (e.g. `BAD_REQUEST`, `INTERNAL`), mapped from the
         /// HTTP status.
         error_type: String,
-        /// Diagnostic detail from the response body, carried onto the failure resolution.
-        message: String,
+        /// The decoded `nexus.Failure` body, when the handler returned one. Used to
+        /// rehydrate the caller's `NexusOperationError -> HandlerError -> ApplicationError`
+        /// chain; `None` when the body was absent or not a JSON Nexus failure.
+        failure: Option<NexusHttpFailureBody>,
     },
+}
+
+/// A Nexus failure decoded from an External handler's HTTP error response body (the JSON
+/// `nexus.Failure` shape: message + metadata + raw JSON details). Carries enough to rebuild
+/// the caller's `NexusOperationError -> HandlerError -> ApplicationError` chain faithfully,
+/// mirroring `NexusFailureToTemporalFailure` (`common/nexus/failure.go @ v1.31.0`): the
+/// non-typed body becomes an `ApplicationFailureInfo{type:"NexusFailure"}` whose details
+/// payload is the JSON `{metadata, details}` (message cleared), so the SDK's
+/// `appErr.Details(&nexus.Failure)` recovers the original metadata and details.
+#[derive(Clone, Debug, PartialEq, Default, Deserialize)]
+pub struct NexusHttpFailureBody {
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub details: serde_json::Value,
 }
 
 /// Resolves a namespace id to its human-readable name for outbound-metric tagging.

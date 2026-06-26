@@ -43,7 +43,8 @@ use url::Url;
 
 use crate::nexus::{
     CompletionDeliveryOutcome, NEXUS_OPERATION_STATE_HEADER, NexusCompletion,
-    NexusCompletionClient, NexusHttpClient, NexusStartResult, TEMPORAL_CALLBACK_TOKEN_HEADER,
+    NexusCompletionClient, NexusHttpClient, NexusHttpFailureBody, NexusStartResult,
+    TEMPORAL_CALLBACK_TOKEN_HEADER,
 };
 
 // Header names and the operation-unsuccessful status are lower-cased wire
@@ -52,7 +53,19 @@ use crate::nexus::{
 const HEADER_REQUEST_ID: &str = "nexus-request-id";
 const HEADER_LINK: &str = "nexus-link";
 const HEADER_OPERATION_TOKEN: &str = "nexus-operation-token";
-const HEADER_OPERATION_TIMEOUT: &str = "operation-timeout";
+/// The Nexus per-request deadline header (`nexus.HeaderRequestTimeout`,
+/// `common/nexus/nexusrpc/api.go:134 @ v1.31.0`), carrying the timeout for THIS single
+/// start/cancel request (not the whole-operation schedule-to-close). Value is
+/// `FormatDuration` = "<ms>ms".
+const HEADER_REQUEST_TIMEOUT: &str = "Request-Timeout";
+
+/// Timeout for a single Nexus start/cancel request, pinned to v1.31.0's
+/// `component.nexusoperations.request.timeout` default (`components/nexusoperations/config.go:15-18
+/// @ v1.31.0`). Config-as-constant: promoted to real config only if it becomes deployment policy.
+const NEXUS_REQUEST_TIMEOUT: Duration = Duration::seconds(10);
+/// Minimum remaining budget below which a request is not made: a non-retryable timeout is
+/// returned instead of dispatching (v1.31.0 `MinRequestTimeout`, `config.go:20-24 @ v1.31.0`).
+const NEXUS_MIN_REQUEST_TIMEOUT: Duration = Duration::milliseconds(1500);
 /// `nexus-operation-state` header on a completion `POST` (`headerOperationState`,
 /// `common/nexus/nexusrpc/api.go:23 @ v1.31.0`). Aliases the public protocol const so
 /// the firing client and the inbound `/nexus/callback` server share one source of truth.
@@ -138,13 +151,35 @@ impl NexusHttpClient for HttpNexusClient {
         if let Some(ct) = &request_content_type {
             request = request.header(reqwest::header::CONTENT_TYPE, ct);
         }
-        // The operation-level deadline doubles as the request timeout so a hung
-        // handler cannot pin the dispatch task (Error Handling, design.md).
-        if let Some(timeout) = schedule_to_close_timeout {
-            request = request.header(HEADER_OPERATION_TIMEOUT, format_duration_ms(timeout));
-            if let Ok(std) = timeout.try_into() {
-                request = request.timeout(std);
-            }
+        // Per-request timeout, DECOUPLED from the operation deadline. A single Nexus request
+        // gets RequestTimeout (10s), capped by the remaining schedule-to-close, mirroring
+        // v1.31.0's executor (`components/nexusoperations/executors.go:222-275 @ v1.31.0`).
+        // Conflating it with schedule-to-close (the whole-operation deadline, which bounds the
+        // operation across retries via the nexus_timeout scanner) under-times a single connect:
+        // on a dual-stack `localhost` a sub-second budget fires before happy-eyeballs falls back
+        // from a dead `::1` to `127.0.0.1`. (Dispatch is prompt, so the remaining deadline is
+        // approximated by the full schedule-to-close rather than subtracting elapsed time.)
+        // A zero (or absent) schedule-to-close means "unbounded" in Temporal, not a 0ms
+        // deadline — cap by it only when positive (v1.31.0 `if scheduleToCloseTimeout > 0`,
+        // `executors.go:229-231 @ v1.31.0`); otherwise the full RequestTimeout applies.
+        let call_timeout = match schedule_to_close_timeout {
+            Some(stc) if stc.is_positive() => stc.min(NEXUS_REQUEST_TIMEOUT),
+            _ => NEXUS_REQUEST_TIMEOUT,
+        };
+        // Below MinRequestTimeout there is not enough budget to make the call; v1.31.0 returns a
+        // non-retryable timeout (`operationTimeoutBelowMinError`) without dispatching. (The
+        // outbound metric tags this as `unknown-error` rather than `operation-timeout` for now —
+        // a narrow metric-fidelity gap on an untested below-floor path, not a behaviour gap.)
+        if call_timeout < NEXUS_MIN_REQUEST_TIMEOUT {
+            bail!(
+                "nexus start: remaining operation timeout {} is below the minimum request timeout {}",
+                format_duration_ms(call_timeout),
+                format_duration_ms(NEXUS_MIN_REQUEST_TIMEOUT)
+            );
+        }
+        request = request.header(HEADER_REQUEST_TIMEOUT, format_duration_ms(call_timeout));
+        if let Ok(std) = call_timeout.try_into() {
+            request = request.timeout(std);
         }
         for kv in trace_headers {
             request = request.header(kv.key.as_str(), kv.value.as_str().as_ref());
@@ -154,7 +189,7 @@ impl NexusHttpClient for HttpNexusClient {
         let response = request
             .send()
             .await
-            .map_err(|e| anyhow!("nexus start request failed: {e}"))?;
+            .map_err(|e| anyhow!("nexus start request failed: {}", error_chain(&e)))?;
 
         let status = response.status();
         // Links are read from response headers up front (mirrors v1.31.0, which
@@ -221,10 +256,13 @@ impl NexusHttpClient for HttpNexusClient {
                 // `handler-error:<TYPE>` (`startCallOutcomeTag @ v1.31.0`). A single
                 // attempt only — no retry classification here (Req 5.3).
                 let bytes = response.bytes().await.unwrap_or_default();
-                let detail = String::from_utf8_lossy(&bytes);
+                // The body is a JSON `nexus.Failure` ({message, metadata, details}) when the
+                // handler returned one; decode it (best-effort) so the caller's error chain
+                // can be rehydrated. A non-JSON body just yields None.
+                let failure = serde_json::from_slice::<NexusHttpFailureBody>(&bytes).ok();
                 Ok(NexusStartResult::HandlerError {
                     error_type: handler_error_type_for_status(other).to_string(),
-                    message: format!("nexus start: unexpected status {other}: {detail}"),
+                    failure,
                 })
             }
         }
@@ -319,6 +357,20 @@ impl HttpNexusCompletionClient {
 /// lives in the external `github.com/nexus-rpc/sdk-go v0.6.0` (not in the v1.31.0
 /// checkout); the `409`/`501` terminal classification follows the SDK's conventional
 /// permanent-error set and is flagged for reconfirmation in the Wave 8 conformance pass.
+/// Render an error plus its full `source` chain, so a transport failure surfaces its root
+/// cause (e.g. `... -> tcp connect error -> Connection refused (os error 61)` on a specific
+/// address) rather than reqwest's opaque "error sending request for url (...)".
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut src = err.source();
+    while let Some(s) = src {
+        out.push_str(" -> ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
+}
+
 /// Map an HTTP status code to the Nexus `HandlerErrorType` string the SDK uses, mirroring
 /// `httpStatusCodeToHandlerErrorType` (`common/nexus/nexusrpc/client.go @ v1.31.0`; the
 /// per-status table itself lives in the external `github.com/nexus-rpc/sdk-go`, like the

@@ -1,8 +1,8 @@
 //! Stateless infrastructure lifecycle engine.
 //!
 //! [`Engine`] coordinates plan/apply/destroy operations over a set of
-//! [`Resource`] objects. It is stateless — the caller (typically the
-//! orchestrator) owns persistence. The engine reads and mutates state
+//! [`Resource`] objects. It is stateless — the caller owns persistence. The
+//! engine reads and mutates state
 //! through [`ProvisionContext`].
 //!
 //! The engine distinguishes two resource sets:
@@ -22,7 +22,7 @@
 //!
 //! The engine does not own a state store. Instead, callers may supply an
 //! optional [`StateSaver`] callback that is invoked after each individual
-//! create/update/delete operation. This gives the orchestrator incremental
+//! create/update/delete operation. This gives the caller incremental
 //! crash-safety without coupling the engine to a specific store type.
 
 use std::{
@@ -41,7 +41,7 @@ use crate::{
     types::{Change, ChangeKind, FieldDiff, InfraComposition},
 };
 
-/// Callback invoked after each mutating operation so the orchestrator can
+/// Callback invoked after each mutating operation so the caller can
 /// persist state incrementally. Receives the current state snapshot.
 ///
 /// If not provided, state is only mutated in memory and the caller is
@@ -56,7 +56,7 @@ pub type StateSaver = Box<
 
 /// Stateless IaC engine.
 ///
-/// The orchestrator manages state persistence. This engine computes plans
+/// The caller manages state persistence. This engine computes plans
 /// and applies changes using the `known` vs `desired` resource model to
 /// ensure removed resources are properly deleted through their `Resource`
 /// implementation rather than silently dropped from state.

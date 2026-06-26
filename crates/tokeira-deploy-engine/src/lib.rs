@@ -31,7 +31,7 @@ pub use image::{
 pub use platform::Platform;
 pub use service::{Service, ServiceContext};
 
-/// Alias matching the orchestrator's expected name.
+/// Public error alias for [`RuntimeError`].
 pub type DeployError = RuntimeError;
 
 /// Re-export RuntimeState from iac for convenience.

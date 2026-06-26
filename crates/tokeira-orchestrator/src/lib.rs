@@ -14,7 +14,7 @@
 //! - [`Deployment::infra_modules`] returns provider-specific
 //!   [`iac::Module`] objects.
 //! - [`Deployment::images`] and [`Deployment::services`] describe runtime
-//!   artifacts and workloads for the deploy engine.
+//!   artifacts and workloads for the deploy/apply phase.
 //! - [`Deployment::register_infra_extensions`] and
 //!   [`Deployment::register_deploy_extensions`] attach clients, platforms, and
 //!   other provider handles to the execution contexts.
@@ -186,8 +186,8 @@ pub trait Deployment: Send + Sync {
 
     /// Return config-file updates derived from the applied infrastructure state.
     ///
-    /// The CLI layer can pass these `(dotted_key, value)` pairs to the config
-    /// writer when an apply should persist discovered values.
+    /// The host application can pass these `(dotted_key, value)` pairs to the
+    /// config writer when an apply should persist discovered values.
     fn collect_writeback(
         &self,
         config: &Self::Config,

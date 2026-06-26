@@ -4,8 +4,8 @@ use crate::StateError;
 
 /// Object-safe storage backend for [`crate::StateStore`].
 ///
-/// Implement this trait when a deployment wants the orchestrator facade to
-/// persist state through a custom medium. The backend owns all storage-specific
+/// Implement this trait to persist state through a custom medium. The backend
+/// owns all storage-specific
 /// details: paths, object keys, version tags, encryption, and retry behavior.
 /// The facade only relies on the manifest version returned by
 /// [`read_manifest`](Self::read_manifest) and passed back to

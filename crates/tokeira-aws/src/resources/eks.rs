@@ -19,7 +19,7 @@ pub struct EksClusterResource {
     module: String,
 }
 
-/// EKS-specific configuration passed by the project crate.
+/// EKS-specific configuration passed by the caller.
 #[derive(Debug, Clone)]
 pub struct EksConfig {
     pub version: String,

@@ -2,7 +2,7 @@
 //!
 //! The engine uses this trait to apply manifests without knowing the
 //! concrete platform. Implementations (e.g. a Kubernetes platform) are
-//! registered on [`ServiceContext`] by the CLI at runtime.
+//! registered on [`ServiceContext`] by the host application at runtime.
 
 use crate::RuntimeError;
 

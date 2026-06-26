@@ -1,7 +1,7 @@
 //! Stateless service lifecycle engine.
 //!
 //! [`ServiceEngine`] coordinates service plan/apply operations and image
-//! state recording. It is stateless — the orchestrator manages persistence.
+//! state recording. It is stateless — the caller manages persistence.
 //!
 //! Services are topologically sorted by [`Service::dependencies()`] before
 //! planning and applying, ensuring dependent services are processed after
@@ -46,7 +46,7 @@ pub struct PlannedServiceManifest {
 
 /// Stateless service engine.
 ///
-/// The orchestrator manages state persistence. This engine sorts services
+/// The caller manages state persistence. This engine sorts services
 /// by declared dependencies, computes plans, and delegates manifest
 /// application to the supplied [`Platform`].
 pub struct ServiceEngine;

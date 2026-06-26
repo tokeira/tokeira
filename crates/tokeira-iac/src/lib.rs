@@ -73,7 +73,7 @@ impl ResourceType {
 /// This identifier is the stable key in [`InfraState`]. It must not depend on
 /// provider-assigned physical IDs that are unknown before creation. A custom
 /// deployment should derive it from the deployment model, for example
-/// `vpc/main`, `compose/tokeirad`, or `namespace/default`.
+/// `vpc/main`, `service/api`, or `namespace/default`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct ResourceId(pub String);
 
@@ -106,7 +106,7 @@ pub struct DestroyMode;
 
 /// A change detected by the internal diff engine.
 ///
-/// Used by the low-level engine; the orchestrator-facing API uses
+/// Used by the low-level engine; the higher-level API uses
 /// [`types::Change`] (a flat struct) instead.
 #[derive(Debug, Clone)]
 pub enum InternalChange {

@@ -16,7 +16,7 @@ pub struct VpcResource {
     module: String,
 }
 
-/// VPC-specific configuration passed by the project crate.
+/// VPC-specific configuration passed by the caller.
 #[derive(Debug, Clone)]
 pub struct VpcConfig {
     pub cidr: String,

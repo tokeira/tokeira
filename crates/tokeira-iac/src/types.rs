@@ -1,4 +1,4 @@
-//! Orchestrator-facing types for plan output and module selection.
+//! Public types for plan output and module selection.
 
 use crate::Module;
 

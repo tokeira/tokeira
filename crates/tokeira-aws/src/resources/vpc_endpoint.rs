@@ -30,8 +30,8 @@ pub struct VpcEndpointConfig {
 
 /// Generic provider resource that provisions exactly one VPC endpoint.
 ///
-/// Each instance manages a single endpoint. The CLI composition layer
-/// creates one `VpcEndpoint` per AWS service that needs a VPC endpoint.
+/// Each instance manages a single endpoint. The composition layer creates
+/// one `VpcEndpoint` per AWS service that needs a VPC endpoint.
 #[derive(Debug)]
 pub struct VpcEndpoint {
     /// Short name used for ResourceId (e.g., "s3", "ecr-api", "ecr-dkr").

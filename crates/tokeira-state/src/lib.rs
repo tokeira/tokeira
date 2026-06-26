@@ -8,8 +8,8 @@
 //! There are two store implementations:
 //!
 //! - [`CasStore<T>`] is a single-document compare-and-swap store that
-//!   delegates I/O to a [`StateBackend`] trait object. The orchestrator uses
-//!   this with [`LocalBackend`] or any future backend adapter. It writes the
+//!   delegates I/O to a [`StateBackend`] trait object. Callers pair it with
+//!   [`LocalBackend`] or any backend adapter. It writes the
 //!   full serialized document directly — no manifest/snapshot indirection.
 //!
 //! - [`S3StateStore<T>`] is the S3-native implementation with a manifest

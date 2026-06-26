@@ -27,7 +27,7 @@ pub struct DsqlClusterConfig {
     pub preexisting_endpoint: Option<String>,
     pub preexisting_arn: Option<String>,
     /// Fallback cluster identifier when not available from state.
-    /// Extracted from config ARN/endpoint by the project crate.
+    /// Extracted from config ARN/endpoint by the host application.
     pub fallback_identifier: Option<String>,
     pub resource_id: Option<ResourceId>,
     pub module: String,

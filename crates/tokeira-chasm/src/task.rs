@@ -23,7 +23,7 @@
 //!
 //! - The [`Task`] trait (its [`KIND`](Task::KIND) and [`fire_at`](Task::fire_at))
 //!   and the [`TaskValidator`] gate are what a component library *writes*, generic
-//!   over a concrete [`Component`](crate::component::Component) and task type.
+//!   over a concrete [`Component`] and task type.
 //! - [`ScheduledTask`] is the serialized form that actually lives in a node's
 //!   [`TaskOutbox`]: a `kind`, a `task_type_id` naming which validator/executor
 //!   applies, the serialized `payload`, the pure-task `fire_at`, and the
@@ -221,7 +221,7 @@ pub trait TaskValidator<C: Component, T: Task> {
     fn validate(&self, component: &C, task: &T, ctx: &dyn Context) -> TaskValidity;
 }
 
-/// A type-erased re-validation hook the pure [`close_transaction`] calls for each
+/// A type-erased re-validation hook the pure [`close_transaction`](crate::node::NodeTree::close_transaction) calls for each
 /// persisted task (Requirement 7.3).
 ///
 /// The pure node tree cannot run a typed [`TaskValidator`] — at close it holds

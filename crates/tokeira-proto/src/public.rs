@@ -113,6 +113,12 @@ pub mod temporal {
         }
         pub mod schedule {
             pub mod v1 {
+                // The vendored Temporal `IntervalSpec` doc comments contain literal
+                // `<interval>`, `<phase>`, and `<timezone>` placeholders that rustdoc
+                // parses as unclosed HTML tags. The text is upstream proto documentation
+                // we mirror verbatim (proto/upstream/), not authored here, so we silence
+                // the lint for this generated module rather than rewrite vendored docs.
+                #![allow(rustdoc::invalid_html_tags)]
                 tonic::include_proto!("temporal.api.schedule.v1");
             }
         }

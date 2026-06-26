@@ -3417,7 +3417,7 @@ pub fn describe_task_queue_request_to_edge(
 /// Validate a `ListTaskQueuePartitions` request before any runtime lookup
 /// (api-conformance-task-queue Property 3): the namespace and task queue must be
 /// present and the task-queue kind must be a recognized enum. All failures surface as
-/// `INVALID_ARGUMENT` (via [`proto_conversion_status`]).
+/// `INVALID_ARGUMENT` (via [`proto_conversion_status`](crate::grpc::errors::proto_conversion_status)).
 pub fn list_task_queue_partitions_request_to_edge(
     req: workflowservice::ListTaskQueuePartitionsRequest,
 ) -> Result<EdgeListTaskQueuePartitionsRequest, ProtoConversionError> {

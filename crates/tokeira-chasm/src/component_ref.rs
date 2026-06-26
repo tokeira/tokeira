@@ -26,7 +26,7 @@
 //!   ref is reported stale ([`ChasmError::StaleReference`]) rather than followed.
 //!
 //! The wire form round-trips losslessly (Requirement 8.5). It is a tokeira-owned
-//! encoding (it reuses [`VersionedTransition`] and [`path`](crate::path) for its
+//! encoding (it reuses [`VersionedTransition`] and [`path`] for its
 //! sub-encodings); byte-compatibility with Temporal's `ChasmComponentRef` is not
 //! required because the token is internal to tokeira, but the round-trip and
 //! staleness semantics match `ref.go @ v1.31.0`.

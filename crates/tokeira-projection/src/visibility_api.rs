@@ -158,7 +158,7 @@ pub trait VisibilityApi: Send + Sync + 'static {
     /// The default is permissive — a deployment without a search-attribute registry
     /// validates nothing — so only the store-backed query service enforces it. Note
     /// this admits *registered* keys regardless of category; rejecting a user-set
-    /// *system* SA ("<name> attribute can't be set in SearchAttributes") is a
+    /// *system* SA ("`<name>` attribute can't be set in SearchAttributes") is a
     /// separate v1.31.0 rule not yet modelled here.
     async fn unknown_search_attribute(
         &self,

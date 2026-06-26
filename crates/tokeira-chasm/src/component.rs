@@ -34,7 +34,7 @@
 //! Lifecycle is **derived, not stored**: [`LifecycleState::is_closed`] is true
 //! exactly for `Completed`/`Failed`, and a closing root closes the Execution
 //! (enforced by the engine, Requirement 2.3, 2.4). Component code never panics for
-//! framework errors — it returns [`ChasmError`](crate::ChasmError).
+//! framework errors — it returns [`ChasmError`].
 
 use serde::{Deserialize, Serialize};
 

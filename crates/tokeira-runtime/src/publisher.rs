@@ -1836,7 +1836,7 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
     }
 }
 
-/// Background loop that drives [`scan_completion_callbacks_once`] per active shard on a
+/// Background loop that drives `scan_completion_callbacks_once` per active shard on a
 /// fixed cadence until cancelled (mirrors `run_nexus_timeout_scanner`).
 pub async fn run_completion_callback_scanner<R>(
     repo: Arc<R>,

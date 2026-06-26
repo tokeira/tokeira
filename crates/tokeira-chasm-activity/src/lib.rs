@@ -18,25 +18,25 @@
 //!
 //! The runtime engine materializes a component from a single root data node (Layer
 //! 2 boundary), so the activity is modelled as **one `#[chasm(data)]` field**
-//! carrying the whole [`ActivityState`](state::ActivityState) proto, rather than
+//! carrying the whole [`ActivityState`] proto, rather than
 //! the several `Field` children the design's low-level sketch shows. The full
 //! multi-node field tree is a substrate enhancement deferred until a component
 //! needs it; the activity's state fits one proto.
 //!
 //! ## Module map
 //!
-//! - [`state`] — the [`ActivityState`](state::ActivityState) proto, the
-//!   [`ActivityStatus`](state::ActivityStatus) enum, and the lifecycle mapping.
+//! - [`state`] — the [`ActivityState`] proto, the
+//!   [`ActivityStatus`] enum, and the lifecycle mapping.
 //! - [`statemachine`] — the legal transition table and stamp-fenced `apply`.
 //! - [`backoff`] — exponential retry-interval computation (pure, proto-free).
-//! - [`retry`] — the [`retry_decision`](retry::retry_decision) (`shouldRetry` +
+//! - [`retry`] — the [`retry_decision`] (`shouldRetry` +
 //!   `hasEnoughTimeForRetry`).
 //! - [`timeouts`] — pure derivation of the due/next timeout from `ActivityState`.
 //! - [`tasks`] — the `dispatch` side-effect task and the pure timer tasks, with
 //!   their validators.
 //! - [`validator`] — request validation and timeout normalization.
 //! - [`config`] — the config-as-constant activity configuration.
-//! - [`component`] — the [`ActivityExecution`](component::ActivityExecution) root
+//! - [`component`] — the [`ActivityExecution`] root
 //!   component and the `activity` library registration.
 
 pub mod backoff;

@@ -18,7 +18,7 @@
 //! `&self`/`&mut self` and no generic type parameters — so component code receives
 //! them as `&dyn Context` / `&mut dyn MutableContext`, exactly as the engine's
 //! typed wrappers hand them out. Fallible operations return
-//! [`ChasmError`](crate::ChasmError) rather than panicking (`AGENTS §1`).
+//! [`ChasmError`] rather than panicking (`AGENTS §1`).
 
 use crate::{
     error::ChasmError,

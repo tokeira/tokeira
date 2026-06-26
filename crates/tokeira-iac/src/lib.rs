@@ -1,7 +1,7 @@
 //! Generic infrastructure lifecycle engine.
 //!
 //! Provides the [`Resource`] and [`Module`] trait abstractions, the plan/apply/
-//! destroy [`Engine`](engine::Engine), dependency ordering, and typed state
+//! destroy [`Engine`], dependency ordering, and typed state
 //! documents. Provider-agnostic — concrete resource types and module names
 //! are defined by consumer crates.
 //!

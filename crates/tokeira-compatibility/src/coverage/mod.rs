@@ -96,7 +96,7 @@ pub enum RpcClassification {
 ///
 /// This is the one call a coverage consumer makes per observed RPC: it composes the three
 /// submodule pieces — [`normalize::wire_path_to_rpc_id`] to turn the wire path into the matrix's
-/// dotted id, [`index::feature_and_rpc_for`] to find the owning [`FeatureEntry`], and
+/// dotted id, [`index::feature_and_rpc_for`] to find the owning [`FeatureEntry`](crate::FeatureEntry), and
 /// [`expected::expected_outcome`] to project that entry's state to the wire outcome it implies —
 /// into the single [`RpcClassification`] verdict a report row needs.
 ///

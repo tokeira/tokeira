@@ -1,6 +1,6 @@
 //! DSQL-backed CHASM node store (Requirement 9).
 //!
-//! The production backend for [`ChasmNodeRepository`](crate::ChasmNodeRepository),
+//! The production backend for [`ChasmNodeRepository`],
 //! persisting one row per node in the `chasm_node` table (migration `V049`). It is
 //! the DSQL counterpart of the [`InMemoryChasmNodeStore`](crate::InMemoryChasmNodeStore):
 //! identical semantics (write-only-dirty nodes, all-or-nothing CAS fencing on each

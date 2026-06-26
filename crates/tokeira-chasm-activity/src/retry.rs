@@ -38,7 +38,7 @@ pub enum RetryOutcome {
 ///
 /// `override_nanos > 0` (the failure's `NextRetryDelay`) replaces the exponential
 /// interval; otherwise the interval is
-/// [`exponential_retry_interval`](crate::backoff::exponential_retry_interval) over
+/// [`exponential_retry_interval`] over
 /// the current `attempt` count, exactly as `hasEnoughTimeForRetry` computes it.
 pub fn retry_decision(state: &ActivityState, now: i64, override_nanos: i64) -> RetryOutcome {
     // (1) Reschedule is only possible from STARTED (the v1.31.0 transition source

@@ -1,7 +1,7 @@
 //! Expected-outcome projection over the `dispatch_rpc` policy.
 //!
 //! This submodule owns the projection from a `FeatureEntry` (plus a dynamic-config reader) to the
-//! [`ExpectedOutcome`](super::ExpectedOutcome) its state implies, so a coverage consumer can judge
+//! [`ExpectedOutcome`] its state implies, so a coverage consumer can judge
 //! an observed status code as agreeing with or contradicting the matrix claim. It is a thin view
 //! over the existing `dispatch.rs` policy — one policy, two views — so the expected outcome and
 //! the runtime dispatch decision can never silently diverge.

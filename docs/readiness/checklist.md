@@ -27,6 +27,7 @@
 ## Release / Infra
 
 - [ ] `tkr compat bump` engine + provenance / version-monotonicity gate ([infra](./infra.md))
+- [ ] Platform-provisioner binary — `tkp` lifecycle binary, provenance/binding/integrity, `tkr` launcher + deployment lock + upgrade rollback ([spec](../../.kiro/specs/platform-provisioner-binary/requirements.md))
 - [ ] Dagger CI substrate (`pipeline-foundation`)
 
 

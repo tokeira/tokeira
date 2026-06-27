@@ -81,6 +81,8 @@ pub enum Command {
     ExternalCancelResolved(ExternalCancelResolvedRequest),
     /// A Nexus operation reached a terminal or started state.
     NexusOperationResolved(NexusOperationResolvedRequest),
+    /// A backing-off Nexus operation's next-attempt time arrived; re-dispatch it.
+    NexusOperationRetry(NexusOperationRetryRequest),
     /// A timer's deadline was reached.
     TimerDue(TimerDueRequest),
     /// The internal first-workflow-task delay elapsed.
@@ -915,8 +917,23 @@ pub enum NexusResolution {
         /// Links the handler returned on the completion response.
         links: Vec<Link>,
     },
-    /// The operation failed.
+    /// The operation failed terminally (non-retryable handler error, operation
+    /// error, or schedule-to-close exhausted). `failure` is the caller-facing
+    /// `NexusOperationFailureInfo`-wrapped chain recorded on `NexusOperationFailed`.
     Failed { failure: Payload },
+    /// A retryable invocation attempt failed; the operation stays pending and backs
+    /// off. Mirrors v1.31.0's `EventAttemptFailed` (`SCHEDULED → BACKING_OFF`,
+    /// `components/nexusoperations/statemachine.go:268-289`): records the attempt
+    /// failure and the next-attempt time, emits **no** history event, and schedules
+    /// **no** workflow task. `failure` is the handler's own failure
+    /// (NexusHandlerFailureInfo + cause), surfaced on
+    /// `PendingNexusOperations[].LastAttemptFailure` — NOT the terminal
+    /// `NexusOperationFailureInfo` wrapper. `next_attempt_at` is the runtime-computed
+    /// backoff deadline (the kernel does no backoff math).
+    AttemptFailed {
+        failure: Payload,
+        next_attempt_at: OffsetDateTime,
+    },
     /// The operation was canceled.
     Canceled,
     /// The operation exceeded one of its timeouts.
@@ -937,6 +954,21 @@ pub struct NexusOperationResolvedRequest {
     pub scheduled_event_id: i64,
     /// How the operation was resolved.
     pub resolution: NexusResolution,
+    /// Wall-clock time the command was accepted.
+    pub now: OffsetDateTime,
+}
+
+/// Request from the retry scanner when a backing-off Nexus operation's
+/// `next_attempt_at` has arrived. The kernel re-dispatches the operation
+/// (a fresh StartOperation attempt) and clears the backoff state, so long as
+/// the op is still backing off and the scheduled-event fence matches.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NexusOperationRetryRequest {
+    /// Operation ID of the backing-off Nexus operation.
+    pub operation_id: String,
+    /// Event ID of the `NexusOperationScheduled` event — the fencing key (a
+    /// stale re-dispatch from a superseded attempt is rejected).
+    pub scheduled_event_id: i64,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }

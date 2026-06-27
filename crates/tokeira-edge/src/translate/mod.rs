@@ -428,6 +428,15 @@ pub struct PendingNexusOperationDescription {
     pub start_to_close_timeout: Option<time::Duration>,
     pub started: bool,
     pub operation_token: Option<String>,
+    /// Failed invocation attempts so far (`PendingNexusOperationInfo.attempt`).
+    pub attempt: u32,
+    /// The most recent retryable attempt's handler failure, surfaced on
+    /// `PendingNexusOperationInfo.last_attempt_failure`. `Some` iff backing off.
+    pub last_attempt_failure: Option<tokeira_types::Payload>,
+    /// When a backing-off op is next eligible for re-dispatch
+    /// (`PendingNexusOperationInfo.next_attempt_schedule_time`); drives the
+    /// `BACKING_OFF` state. `None` unless backing off.
+    pub next_attempt_at: Option<OffsetDateTime>,
 }
 
 // Visibility types re-exported from tokeira-projection (the authoritative owner).

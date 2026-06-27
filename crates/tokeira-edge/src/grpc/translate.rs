@@ -2967,6 +2967,16 @@ fn pending_nexus_operation_to_proto(
     op: &crate::translate::PendingNexusOperationDescription,
 ) -> workflow::PendingNexusOperationInfo {
     let operation_token = op.operation_token.clone().unwrap_or_default();
+    // State precedence: a started async op is Started; otherwise a backing-off op
+    // (next_attempt_at set) is BackingOff; otherwise Scheduled. `last_attempt_failure`
+    // is surfaced only while backing off, matching v1.31.0's BACKING_OFF op data.
+    let state = if op.started {
+        enums::PendingNexusOperationState::Started
+    } else if op.next_attempt_at.is_some() {
+        enums::PendingNexusOperationState::BackingOff
+    } else {
+        enums::PendingNexusOperationState::Scheduled
+    };
     workflow::PendingNexusOperationInfo {
         endpoint: op.endpoint.clone(),
         service: op.service.clone(),
@@ -2974,11 +2984,10 @@ fn pending_nexus_operation_to_proto(
         operation_id: operation_token.clone(),
         schedule_to_close_timeout: op.schedule_to_close_timeout.map(to_proto_duration),
         scheduled_time: Some(to_proto_timestamp(op.scheduled_time)),
-        state: if op.started {
-            enums::PendingNexusOperationState::Started as i32
-        } else {
-            enums::PendingNexusOperationState::Scheduled as i32
-        },
+        state: state as i32,
+        attempt: op.attempt as i32,
+        last_attempt_failure: op.last_attempt_failure.as_ref().map(payload_to_failure),
+        next_attempt_schedule_time: op.next_attempt_at.map(to_proto_timestamp),
         scheduled_event_id: op.scheduled_event_id,
         schedule_to_start_timeout: op.schedule_to_start_timeout.map(to_proto_duration),
         start_to_close_timeout: op.start_to_close_timeout.map(to_proto_duration),

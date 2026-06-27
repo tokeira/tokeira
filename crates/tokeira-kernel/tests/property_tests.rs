@@ -361,6 +361,11 @@ fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) ->
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
             started: false,
             started_at: None,
+            attempt: 0,
+            last_attempt_failure: None,
+            next_attempt_at: None,
+            operation_token: String::new(),
+            input: Default::default(),
         },
     );
     state

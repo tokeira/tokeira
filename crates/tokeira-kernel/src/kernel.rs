@@ -23,12 +23,13 @@ use crate::{
         ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, Command,
         CompletionCallbackAttemptedRequest, ContinueAsNewInitiator, CronContinuation,
         ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-        ExternalSignalResult, FieldChange, NexusOperationResolvedRequest, NexusResolution,
-        PauseActivityRequest, PauseWorkflowRequest, ResetActivityRequest, ResetRequest, RetryState,
-        ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartRequest,
-        StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, UnpauseActivityRequest,
-        UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
-        UpdateProtocolBody, UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        ExternalSignalResult, FieldChange, NexusOperationResolvedRequest,
+        NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
+        ResetActivityRequest, ResetRequest, RetryState, ScheduleQueryTaskRequest, SignalRequest,
+        SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+        TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
+        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
+        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
         WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
         WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
@@ -197,6 +198,7 @@ impl Kernel for BasicKernel {
             Command::NexusOperationResolved(req) => {
                 self.apply_nexus_operation_resolved(loaded, req)
             }
+            Command::NexusOperationRetry(req) => self.apply_nexus_operation_retry(loaded, req),
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
             Command::WorkflowStartDelayElapsed(req) => {
                 self.apply_workflow_start_delay_elapsed(loaded, req)
@@ -1943,6 +1945,27 @@ impl BasicKernel {
                     builder.schedule_workflow_task();
                 }
             }
+            NexusResolution::AttemptFailed {
+                failure,
+                next_attempt_at,
+            } => {
+                // Retryable attempt failure: the operation stays pending and backs
+                // off (v1.31.0 `SCHEDULED -> BACKING_OFF`, `statemachine.go:268-289`).
+                // Record the handler failure + next-attempt time and bump the attempt
+                // count, but emit NO history event and schedule NO workflow task — this
+                // is internal backoff state the retry scanner reads, not a caller-visible
+                // outcome (Invariant 1). `last_attempt_failure` is the handler's own
+                // failure for Describe, NOT the terminal NexusOperationFailureInfo wrap.
+                if let Some(current) = builder
+                    .state
+                    .pending_nexus_operations
+                    .get_mut(&pending.operation_id)
+                {
+                    current.attempt = current.attempt.saturating_add(1);
+                    current.last_attempt_failure = Some(failure);
+                    current.next_attempt_at = Some(next_attempt_at);
+                }
+            }
             NexusResolution::Canceled => {
                 builder.emit(HistoryEventKind::NexusOperationCanceled {
                     operation_id: pending.operation_id.clone(),
@@ -1982,6 +2005,68 @@ impl BasicKernel {
             }
         }
 
+        Ok(builder.finish())
+    }
+
+    /// Re-dispatch a backing-off Nexus operation whose `next_attempt_at` has
+    /// arrived (the retry scanner fired). Clears the backoff state (a fresh attempt
+    /// is now in flight) and re-emits the `ScheduleNexusOperation` dispatch op from
+    /// the pending op's retained fields — no history event (the original
+    /// `NexusOperationScheduled` still stands, matching v1.31.0's
+    /// `EventRescheduled`/InvocationTask which records none). Fenced: a stale
+    /// scheduled-event id or an op that is not backing off (already re-dispatched by
+    /// a concurrent tick, started, or resolved) is rejected, so there is no double
+    /// re-dispatch.
+    fn apply_nexus_operation_retry(
+        &self,
+        loaded: LoadedRun,
+        req: NexusOperationRetryRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let pending = state
+            .pending_nexus_operations
+            .get(&req.operation_id)
+            .cloned()
+            .ok_or_else(|| Reject::UnknownNexusOperation(req.operation_id.clone()))?;
+        if pending.scheduled_event_id != req.scheduled_event_id {
+            return Err(Reject::StaleNexusResolution {
+                operation_id: req.operation_id,
+                expected_scheduled_event_id: pending.scheduled_event_id,
+            });
+        }
+        if pending.next_attempt_at.is_none() {
+            return Err(Reject::NexusOperationNotBackingOff(req.operation_id));
+        }
+
+        let run_key = state.run_key;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        // Clear the backoff state (Invariant 4: cleared on re-dispatch, so Describe
+        // shows nothing while the new attempt is in flight). The attempt count is not
+        // bumped here — it was already incremented by the AttemptFailed that backed
+        // the operation off.
+        if let Some(current) = builder
+            .state
+            .pending_nexus_operations
+            .get_mut(&pending.operation_id)
+        {
+            current.last_attempt_failure = None;
+            current.next_attempt_at = None;
+        }
+        builder
+            .dispatch_ops
+            .push(DispatchOp::ScheduleNexusOperation {
+                operation_id: pending.operation_id.clone(),
+                endpoint: pending.endpoint.clone(),
+                service: pending.service.clone(),
+                operation: pending.operation.clone(),
+                input: pending.input.clone(),
+                schedule_to_close_timeout: pending.schedule_to_close_timeout,
+                schedule_to_start_timeout: pending.schedule_to_start_timeout,
+                start_to_close_timeout: pending.start_to_close_timeout,
+                originator_run_key: run_key,
+                scheduled_event_id: pending.scheduled_event_id,
+                scheduled_at: pending.scheduled_at,
+            });
         Ok(builder.finish())
     }
 
@@ -2591,6 +2676,7 @@ impl BasicKernel {
                 endpoint,
                 service,
                 operation,
+                input,
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
@@ -2610,6 +2696,17 @@ impl BasicKernel {
                         scheduled_at: event.happened_at,
                         started: false,
                         started_at: None,
+                        // Backoff state is not carried on any history event
+                        // (v1.31.0 records none for an attempt failure), so a
+                        // replay-from-history op starts un-backed-off; the live
+                        // persisted projection is the authority while running.
+                        attempt: 0,
+                        last_attempt_failure: None,
+                        next_attempt_at: None,
+                        operation_token: String::new(),
+                        // Rebuilt from the scheduled event so a replayed op can still
+                        // be re-dispatched on retry.
+                        input: input.clone(),
                     },
                 );
             }
@@ -3294,6 +3391,11 @@ fn apply_workflow_command(
                     scheduled_at: builder.now,
                     started: false,
                     started_at: None,
+                    attempt: 0,
+                    last_attempt_failure: None,
+                    next_attempt_at: None,
+                    operation_token: String::new(),
+                    input: input.clone(),
                 },
             );
             builder
@@ -3788,6 +3890,11 @@ pub enum Reject {
     /// A Nexus operation was already marked as started.
     #[error("nexus operation already started: {0}")]
     NexusOperationAlreadyStarted(String),
+    /// A Nexus retry referenced an operation that is not backing off (already
+    /// re-dispatched by a concurrent scanner tick, started, or resolved). The
+    /// fence that prevents a double re-dispatch.
+    #[error("nexus operation not backing off: {0}")]
+    NexusOperationNotBackingOff(String),
     /// A `CompletionCallbackAttempted` referenced a callback index that is not in
     /// the run's `completion_callbacks`.
     #[error("unknown completion callback index: {0}")]

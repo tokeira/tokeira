@@ -212,14 +212,67 @@ pub fn nexus_task_to_proto_request(
 pub fn proto_response_to_resolution(
     response: nexus_v1::Response,
     expected_operation_id: &str,
+    op: &NexusOperationContext,
 ) -> Result<NexusResolution, NexusTranslateError> {
     match response.variant {
         Some(nexus_v1::response::Variant::StartOperation(start)) => {
-            proto_start_response_to_resolution(start, expected_operation_id)
+            proto_start_response_to_resolution(start, expected_operation_id, op)
         }
         Some(nexus_v1::response::Variant::CancelOperation(_)) => Ok(NexusResolution::Canceled),
         None => Err(NexusTranslateError::MissingField("response.variant")),
     }
+}
+
+/// The caller's pending Nexus operation identity, needed to wrap a worker-reported
+/// operation failure in a `NexusOperationFailureInfo` (so the SDK decodes a
+/// `NexusOperationError`). Empty fields are tolerated (a missing/raced pending op) — the
+/// inner cause chain still decodes.
+#[derive(Clone, Debug, Default)]
+pub struct NexusOperationContext {
+    pub endpoint: String,
+    pub service: String,
+    pub operation: String,
+    pub scheduled_event_id: i64,
+}
+
+/// Build a terminal `NexusResolution::Failed` for a worker operation-unsuccessful response,
+/// wrapping the operation failure in `NexusOperationFailureInfo` exactly as
+/// `wrap_handler_failure_as_resolution` does for handler errors, so the caller decodes a
+/// `NexusOperationError`. Mirrors v1.31.0's `createNexusOperationFailure` +
+/// `NexusFailureToTemporalFailure` `nexus.OperationError` case (`common/nexus/failure.go @
+/// v1.31.0`): a failed operation becomes a non-retryable `ApplicationFailureInfo{Type:
+/// "OperationError"}` carrying the failure message; a canceled one becomes a
+/// `CanceledFailureInfo`.
+fn operation_error_to_resolution(
+    operation_state: &str,
+    failure: Option<&nexus_v1::Failure>,
+    op: &NexusOperationContext,
+) -> NexusResolution {
+    let cause_info = if operation_state == "canceled" {
+        failure_proto::failure::FailureInfo::CanceledFailureInfo(
+            failure_proto::CanceledFailureInfo::default(),
+        )
+    } else {
+        failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+            failure_proto::ApplicationFailureInfo {
+                r#type: "OperationError".to_string(),
+                non_retryable: true,
+                ..Default::default()
+            },
+        )
+    };
+    let cause = failure_proto::Failure {
+        message: failure.map(|f| f.message.clone()).unwrap_or_default(),
+        failure_info: Some(cause_info),
+        ..Default::default()
+    };
+    wrap_handler_failure_as_resolution(
+        cause,
+        op.endpoint.clone(),
+        op.service.clone(),
+        op.operation.clone(),
+        op.scheduled_event_id,
+    )
 }
 
 // v1.62-sync: reads deprecated `start_operation_response::Async::operation_id`
@@ -231,6 +284,7 @@ pub fn proto_response_to_resolution(
 pub fn proto_start_response_to_resolution(
     response: nexus_v1::StartOperationResponse,
     expected_operation_id: &str,
+    op: &NexusOperationContext,
 ) -> Result<NexusResolution, NexusTranslateError> {
     match response.variant {
         Some(nexus_v1::start_operation_response::Variant::SyncSuccess(sync)) => {
@@ -270,17 +324,29 @@ pub fn proto_start_response_to_resolution(
             })
         }
         Some(nexus_v1::start_operation_response::Variant::OperationError(error)) => {
-            Ok(NexusResolution::Failed {
-                failure: nexus_failure_to_kernel_payload(
-                    error.operation_state,
-                    error.failure.as_ref(),
-                )?,
-            })
+            // Operation-unsuccessful: wrap in NexusOperationFailureInfo so the caller
+            // decodes a NexusOperationError (v1.31.0 handleOperationError /
+            // createNexusOperationFailure), rather than the bare json envelope.
+            Ok(operation_error_to_resolution(
+                &error.operation_state,
+                error.failure.as_ref(),
+                op,
+            ))
         }
         Some(nexus_v1::start_operation_response::Variant::Failure(failure)) => {
-            Ok(NexusResolution::Failed {
-                failure: failure_to_payload(&failure),
-            })
+            // A bare `Failure` start response is an operation-unsuccessful outcome carrying
+            // the handler's already-built temporal failure as the cause (e.g. an SDK that
+            // sends `nexus.NewOperationFailedError` as an ApplicationFailure here rather than
+            // via the OperationError variant). Wrap it in NexusOperationFailureInfo so the
+            // caller decodes a NexusOperationError, exactly like the OperationError arm and
+            // the worker handler-error path; storing it raw would surface only the cause.
+            Ok(wrap_handler_failure_as_resolution(
+                failure,
+                op.endpoint.clone(),
+                op.service.clone(),
+                op.operation.clone(),
+                op.scheduled_event_id,
+            ))
         }
         None => Err(NexusTranslateError::MissingField(
             "start_operation_response.variant",
@@ -425,6 +491,36 @@ pub fn failure_has_nexus_handler_info(failure: &failure_proto::Failure) -> bool 
         failure.failure_info,
         Some(failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(_))
     )
+}
+
+/// Whether a worker-reported handler failure is retryable, mirroring v1.31.0
+/// `HandlerError.Retryable()` (`github.com/nexus-rpc/sdk-go@v0.6.0/nexus/errors.go:255-279`,
+/// pinned at `v1.31.0:go.mod:40`): an explicit `retry_behavior` overrides, else the per-type
+/// default — `BAD_REQUEST / UNAUTHENTICATED / UNAUTHORIZED / NOT_FOUND / NOT_IMPLEMENTED /
+/// CONFLICT` are terminal, everything else retryable. This drives `BACKING_OFF` vs terminal on
+/// `StartOperation` (`components/nexusoperations/executors.go:499-532 @ v1.31.0`). A failure
+/// without a `NexusHandlerFailureInfo` is treated as retryable (v1.31.0's non-`HandlerError`
+/// default).
+pub fn nexus_handler_failure_retryable(failure: &failure_proto::Failure) -> bool {
+    use tokeira_proto::public::temporal::api::enums::v1::NexusHandlerErrorRetryBehavior;
+    let Some(failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(info)) =
+        failure.failure_info.as_ref()
+    else {
+        return true;
+    };
+    match info.retry_behavior() {
+        NexusHandlerErrorRetryBehavior::Retryable => true,
+        NexusHandlerErrorRetryBehavior::NonRetryable => false,
+        NexusHandlerErrorRetryBehavior::Unspecified => !matches!(
+            info.r#type.as_str(),
+            "BAD_REQUEST"
+                | "UNAUTHENTICATED"
+                | "UNAUTHORIZED"
+                | "NOT_FOUND"
+                | "NOT_IMPLEMENTED"
+                | "CONFLICT"
+        ),
+    }
 }
 
 /// Build the caller-facing `NexusResolution::Failed` for a worker handler failure,
@@ -807,7 +903,7 @@ mod tests {
                     },
                 )),
             };
-            match proto_response_to_resolution(sync, &operation_id).expect("sync success") {
+            match proto_response_to_resolution(sync, &operation_id, &NexusOperationContext::default()).expect("sync success") {
                 NexusResolution::Completed { result, .. } => {
                     prop_assert_eq!(result.0.len(), 1);
                     prop_assert_eq!(result.0[0].data.clone(), payload_bytes.clone());
@@ -829,7 +925,7 @@ mod tests {
                 )),
             };
             prop_assert_eq!(
-                proto_response_to_resolution(async_response, &operation_id).expect("async success"),
+                proto_response_to_resolution(async_response, &operation_id, &NexusOperationContext::default()).expect("async success"),
                 NexusResolution::Started {
                     operation_token: operation_id.clone(),
                     links: Vec::new()
@@ -842,7 +938,7 @@ mod tests {
                 )),
             };
             prop_assert_eq!(
-                proto_response_to_resolution(cancel, &operation_id).expect("cancel"),
+                proto_response_to_resolution(cancel, &operation_id, &NexusOperationContext::default()).expect("cancel"),
                 NexusResolution::Canceled
             );
 

@@ -195,6 +195,9 @@ impl StoreExecutionResolver {
                             operation_token: operation
                                 .started
                                 .then(|| operation.operation_id.clone()),
+                            attempt: operation.attempt,
+                            last_attempt_failure: operation.last_attempt_failure.clone(),
+                            next_attempt_at: operation.next_attempt_at,
                         },
                     )
                     .collect(),

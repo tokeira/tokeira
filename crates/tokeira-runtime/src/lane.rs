@@ -606,6 +606,27 @@ where
                         {
                             nexus_timeout_tracking.remove(message.run_key, &request.operation_id);
                         }
+                        // A retryable attempt failure leaves the op pending and backing off:
+                        // ensure it is tracked so the nexus timeout/retry scanner re-fires the
+                        // next attempt at `next_attempt_at` (an op with no schedule-to-close was
+                        // not otherwise tracked). Terminal resolutions above already removed it.
+                        if let Command::NexusOperationResolved(request) = &committed_command
+                            && matches!(
+                                request.resolution,
+                                tokeira_kernel::NexusResolution::AttemptFailed { .. }
+                            )
+                            && let Some(op) = new_state
+                                .pending_nexus_operations
+                                .get(&request.operation_id)
+                        {
+                            nexus_timeout_tracking.insert(crate::nexus::NexusTimeoutEntry {
+                                run_key: message.run_key,
+                                shard_id,
+                                operation_id: request.operation_id.clone(),
+                                scheduled_event_id: request.scheduled_event_id,
+                                scheduled_at: op.scheduled_at,
+                            });
+                        }
                         if new_state.closed_at.is_some() {
                             // A child run closing must notify its parent so the
                             // parent can resolve the pending child future. Skip
@@ -1248,6 +1269,7 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::ExternalSignalResolved(_) => "ExternalSignalResolved",
         Command::ExternalCancelResolved(_) => "ExternalCancelResolved",
         Command::NexusOperationResolved(_) => "NexusOperationResolved",
+        Command::NexusOperationRetry(_) => "NexusOperationRetry",
         Command::TimerDue(_) => "TimerDue",
         Command::WorkflowStartDelayElapsed(_) => "WorkflowStartDelayElapsed",
         Command::ScheduleQueryTask(_) => "ScheduleQueryTask",

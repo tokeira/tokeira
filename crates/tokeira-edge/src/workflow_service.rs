@@ -1163,9 +1163,32 @@ impl WorkflowService {
                         &tags.outcome,
                     );
                 }
+                // Load the pending op so an operation-unsuccessful response can be wrapped
+                // in NexusOperationFailureInfo (endpoint/service/operation), exactly as the
+                // worker handler-error path does. A missing/raced pending op leaves them
+                // empty — the inner cause chain the SDK decodes is still intact.
+                let op_ctx = match self
+                    .repo
+                    .load_run(token.run_key)
+                    .await
+                    .map_err(EdgeError::from)?
+                {
+                    LoadedRun::Existing(state) => state
+                        .pending_nexus_operations
+                        .get(&token.operation_id)
+                        .map(|op| crate::translate::nexus::NexusOperationContext {
+                            endpoint: op.endpoint.clone(),
+                            service: op.service.clone(),
+                            operation: op.operation.clone(),
+                            scheduled_event_id: token.scheduled_event_id,
+                        })
+                        .unwrap_or_default(),
+                    LoadedRun::Absent => Default::default(),
+                };
                 let resolution = crate::translate::nexus::proto_response_to_resolution(
                     response,
                     &token.operation_id,
+                    &op_ctx,
                 )
                 .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
 
@@ -1239,33 +1262,62 @@ impl WorkflowService {
                                 .to_string(),
                         ));
                     }
-                    // The caller's NexusOperationFailed event wraps the handler
-                    // failure in a NexusOperationFailureInfo carrying the operation's
-                    // endpoint/service/operation; load the pending op for them. A
-                    // missing pending op (already resolved/raced) leaves them empty —
-                    // the cause chain the SDK decodes is still intact.
-                    let (endpoint, service, operation) = match self
+                    // Load the pending op once: it supplies both the NexusOperationFailureInfo
+                    // wrap context (endpoint/service/operation) for a terminal failure AND the
+                    // backoff inputs (attempt/scheduled_at/schedule-to-close) for a retryable
+                    // one. A missing pending op (already resolved/raced) forces a terminal
+                    // resolution — there is nothing to back off.
+                    let pending = match self
                         .repo
                         .load_run(token.run_key)
                         .await
                         .map_err(EdgeError::from)?
                     {
-                        LoadedRun::Existing(state) => state
-                            .pending_nexus_operations
-                            .get(&token.operation_id)
-                            .map(|op| {
-                                (op.endpoint.clone(), op.service.clone(), op.operation.clone())
-                            })
-                            .unwrap_or_default(),
-                        LoadedRun::Absent => Default::default(),
+                        LoadedRun::Existing(state) => {
+                            state.pending_nexus_operations.get(&token.operation_id).cloned()
+                        }
+                        LoadedRun::Absent => None,
                     };
-                    crate::translate::nexus::wrap_handler_failure_as_resolution(
-                        failure,
-                        endpoint,
-                        service,
-                        operation,
-                        token.scheduled_event_id,
-                    )
+                    // v1.31.0 (`components/nexusoperations/executors.go:499-532`): a *retryable*
+                    // handler error backs the operation off (BACKING_OFF) — it stays pending
+                    // with the failure on LastAttemptFailure — while a non-retryable one (or a
+                    // retry past schedule-to-close) fails the operation terminally.
+                    let next_attempt_at = if crate::translate::nexus::nexus_handler_failure_retryable(
+                        &failure,
+                    ) {
+                        pending.as_ref().and_then(|op| {
+                            tokeira_runtime::nexus::nexus_operation_next_attempt_at(
+                                op.attempt,
+                                op.scheduled_at,
+                                op.schedule_to_close_timeout,
+                                OffsetDateTime::now_utc(),
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    match next_attempt_at {
+                        Some(next_attempt_at) => NexusResolution::AttemptFailed {
+                            // LastAttemptFailure is the handler's own failure (the Describe
+                            // surface), NOT the terminal NexusOperationFailureInfo wrapper.
+                            failure: tokeira_proto::conversions::common::failure_to_payload(
+                                &failure,
+                            ),
+                            next_attempt_at,
+                        },
+                        None => {
+                            let (endpoint, service, operation) = pending
+                                .map(|op| (op.endpoint, op.service, op.operation))
+                                .unwrap_or_default();
+                            crate::translate::nexus::wrap_handler_failure_as_resolution(
+                                failure,
+                                endpoint,
+                                service,
+                                operation,
+                                token.scheduled_event_id,
+                            )
+                        }
+                    }
                 } else {
                     let error = req.error.ok_or_else(|| {
                         EdgeError::BadRequest(

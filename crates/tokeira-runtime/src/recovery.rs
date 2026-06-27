@@ -1233,6 +1233,11 @@ mod tests {
                     scheduled_at: fixed_now(),
                     started: false,
                     started_at: None,
+                    attempt: 0,
+                    last_attempt_failure: None,
+                    next_attempt_at: None,
+                    operation_token: String::new(),
+                    input: Default::default(),
                 };
                 t.next_state
                     .pending_nexus_operations

@@ -9,18 +9,18 @@ use tokeira_kernel::{
     CompletionCallbackAttemptedRequest, DispatchOp, ExternalCancelResolvedRequest,
     ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
     ExternalWorkflowExecution, FieldChange, LoadedRun, NexusOperationResolvedRequest,
-    NexusResolution, NexusTimeoutType, ParentClosePolicy, PauseActivityRequest, PauseInfo,
-    PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
-    PendingUpdate, PendingWorkflowTask, ProjectionOp, Reject, ReplayContext, ResetActivityRequest,
-    ResetRequest, RetryState, SignalRequest, SignalWithStartRequest,
-    StartDeploymentTransitionRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
-    TimerDueRequest, TimerState, Transition, UnpauseActivityRequest, UnpauseWorkflowRequest,
-    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
-    VersioningBehavior, VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID,
-    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-    WorkflowStartDelayElapsedRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    NexusOperationRetryRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
+    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
+    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp,
+    Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
+    SignalWithStartRequest, StartDeploymentTransitionRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState, Transition,
+    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningBehavior,
+    VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -857,6 +857,11 @@ fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) ->
             scheduled_at: OffsetDateTime::UNIX_EPOCH,
             started: false,
             started_at: None,
+            attempt: 0,
+            last_attempt_failure: None,
+            next_attempt_at: None,
+            operation_token: String::new(),
+            input: Default::default(),
         },
     );
     state
@@ -6110,6 +6115,118 @@ fn nexus_operation_resolved_failed() {
         }
     ));
     assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn nexus_operation_resolved_attempt_failed_stays_pending() {
+    // A retryable attempt failure backs the op off: it stays pending, records the
+    // handler failure + next-attempt time + bumps the attempt count, and emits NO
+    // history event and NO workflow task (v1.31.0 EventAttemptFailed is internal HSM
+    // state — Invariant 1).
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let next_attempt_at = now() + time::Duration::seconds(1);
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationResolved(NexusOperationResolvedRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                resolution: NexusResolution::AttemptFailed {
+                    failure: payload("intentional internal error"),
+                    next_attempt_at,
+                },
+                now: now(),
+            }),
+        )
+        .unwrap();
+    // No history event, no workflow task scheduled.
+    assert!(transition.history_events.is_empty());
+    assert!(transition.next_state.pending_workflow_task.is_none());
+    // The operation is still pending, now carrying the recorded attempt state.
+    let pending = transition
+        .next_state
+        .pending_nexus_operations
+        .get("op-1")
+        .expect("op stays pending after a retryable attempt failure");
+    assert_eq!(pending.attempt, 1);
+    assert_eq!(
+        pending.last_attempt_failure,
+        Some(payload("intentional internal error"))
+    );
+    assert_eq!(pending.next_attempt_at, Some(next_attempt_at));
+}
+
+#[test]
+fn nexus_operation_resolved_attempt_failed_stale_rejected() {
+    // A stale AttemptFailed (wrong scheduled_event_id) is rejected like any other
+    // resolution — the shared fencing check guards re-dispatch races.
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let result = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::NexusOperationResolved(NexusOperationResolvedRequest {
+            operation_id: "op-1".into(),
+            scheduled_event_id: 999,
+            resolution: NexusResolution::AttemptFailed {
+                failure: payload("nope"),
+                next_attempt_at: now(),
+            },
+            now: now(),
+        }),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn nexus_operation_retry_redispatches_and_clears_backoff() {
+    // A backing-off op (as AttemptFailed leaves it) whose next attempt is due
+    // re-dispatches: one ScheduleNexusOperation dispatch op, NO history event, and the
+    // backoff state cleared (Invariant 4) while the attempt count is preserved.
+    let mut state = with_pending_nexus_operation(make_open_state(), "op-1");
+    if let Some(op) = state.pending_nexus_operations.get_mut("op-1") {
+        op.attempt = 1;
+        op.last_attempt_failure = Some(payload("intentional internal error"));
+        op.next_attempt_at = Some(now());
+    }
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::NexusOperationRetry(NexusOperationRetryRequest {
+                operation_id: "op-1".into(),
+                scheduled_event_id: 12,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(transition.history_events.is_empty());
+    assert_eq!(transition.dispatch_ops.len(), 1);
+    assert!(matches!(
+        transition.dispatch_ops[0],
+        DispatchOp::ScheduleNexusOperation { .. }
+    ));
+    let op = transition
+        .next_state
+        .pending_nexus_operations
+        .get("op-1")
+        .expect("op stays pending across a re-dispatch");
+    assert!(op.last_attempt_failure.is_none());
+    assert!(op.next_attempt_at.is_none());
+    assert_eq!(op.attempt, 1);
+}
+
+#[test]
+fn nexus_operation_retry_not_backing_off_rejected() {
+    // A pending op that is not backing off (next_attempt_at None) rejects the retry —
+    // the fence against a double re-dispatch from a concurrent scanner tick.
+    let state = with_pending_nexus_operation(make_open_state(), "op-1");
+    let result = kernel().apply(
+        LoadedRun::Existing(state),
+        Command::NexusOperationRetry(NexusOperationRetryRequest {
+            operation_id: "op-1".into(),
+            scheduled_event_id: 12,
+            now: now(),
+        }),
+    );
+    assert!(result.is_err());
 }
 
 #[test]

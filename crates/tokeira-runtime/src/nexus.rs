@@ -15,8 +15,8 @@ use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    Command, Link, LoadedRun, NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType,
-    PendingNexusOperation,
+    Command, Link, LoadedRun, NexusOperationResolvedRequest, NexusOperationRetryRequest,
+    NexusResolution, NexusTimeoutType, PendingNexusOperation,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{NamespaceId, Payload, Payloads, RunKey, ShardId, TaskQueueName};
@@ -59,6 +59,50 @@ pub const SYSTEM_CALLBACK_URL: &str = "temporal://system";
 /// (`routeSystemCallbackRequest @ v1.31.0`); the single-cluster loopback uses one fixed
 /// path. External callback URLs already encode their own path and are POSTed verbatim.
 pub const NEXUS_CALLBACK_PATH: &str = "/nexus/callback";
+
+/// Default Nexus-operation invocation retry policy (config-as-constant), mirroring
+/// v1.31.0's component default `RetryPolicy`
+/// (`components/nexusoperations/config.go:134-210 @ v1.31.0`):
+/// `NewExponentialRetryPolicy(initialInterval=1s).WithMaximumInterval(1h)
+/// .WithExpirationInterval(NoInterval)`. The standard exponential coefficient is 2.0.
+/// Retries are bounded only by schedule-to-close (the timeout scanner owns that cap),
+/// not by an expiration interval.
+pub const NEXUS_RETRY_INITIAL_INTERVAL: Duration = Duration::seconds(1);
+/// Maximum backoff between Nexus StartOperation/CancelOperation attempts.
+pub const NEXUS_RETRY_MAXIMUM_INTERVAL: Duration = Duration::hours(1);
+/// Exponential backoff coefficient for Nexus operation retries.
+pub const NEXUS_RETRY_BACKOFF_COEFFICIENT: f64 = 2.0;
+
+/// Next-attempt time for a retryable Nexus `StartOperation` failure, or `None` when the
+/// retry would fall at/after schedule-to-close — in which case the operation must resolve
+/// terminally rather than back off (Invariant 3: the schedule-to-close timeout scanner is
+/// the terminal authority). The kernel performs no backoff math; this is the runtime's
+/// computation, fed into `NexusResolution::AttemptFailed`.
+///
+/// `failed_attempts` is the count of attempts that have already failed *before* this one
+/// (0 for the first failure), matching v1.31.0's `recordAttempt`-then-`ComputeNextDelay`
+/// order (`statemachine.go:91-94,280-285`): the next delay for the first retry is the
+/// initial interval (`coefficient^0`).
+pub fn nexus_operation_next_attempt_at(
+    failed_attempts: u32,
+    scheduled_at: OffsetDateTime,
+    schedule_to_close_timeout: Option<Duration>,
+    now: OffsetDateTime,
+) -> Option<OffsetDateTime> {
+    let factor = NEXUS_RETRY_BACKOFF_COEFFICIENT.powi(failed_attempts as i32);
+    let delay_secs = (NEXUS_RETRY_INITIAL_INTERVAL.as_seconds_f64() * factor)
+        .min(NEXUS_RETRY_MAXIMUM_INTERVAL.as_seconds_f64());
+    let next = now + Duration::seconds_f64(delay_secs);
+    // Only cap when schedule-to-close is set and positive (zero/absent = unbounded,
+    // matching the request-timeout treatment); a retry at/after the deadline is terminal.
+    if let Some(stc) = schedule_to_close_timeout
+        && stc.is_positive()
+        && next >= scheduled_at + stc
+    {
+        return None;
+    }
+    Some(next)
+}
 
 /// The HTTP URL an async Nexus completion is `POST`ed to: the configured listener base
 /// (`NexusCompletionConfig.system_callback_url`) joined with [`NEXUS_CALLBACK_PATH`]. Used
@@ -1295,6 +1339,29 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
         };
 
         let Some(timeout_type) = evaluate_nexus_timeout(operation, now) else {
+            // Not timed out. If the operation is backing off and its next attempt is
+            // due, re-dispatch it. Schedule-to-close (checked just above) dominates: had
+            // it fired we would have taken the timeout branch instead (Invariant 3). The
+            // kernel fences against a double re-dispatch, so this is fire-and-forget and
+            // the entry stays tracked (the op is still pending until a terminal outcome).
+            if operation.next_attempt_at.is_some_and(|next| now >= next) {
+                runtime_metrics::record_scanner_dispatched(
+                    "nexus_retry",
+                    shard_id.map(|s| s.0).unwrap_or(0),
+                );
+                let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
+                let _ = lane
+                    .submit(
+                        entry.run_key,
+                        Command::NexusOperationRetry(NexusOperationRetryRequest {
+                            operation_id: entry.operation_id.clone(),
+                            scheduled_event_id: entry.scheduled_event_id,
+                            now,
+                        }),
+                    )
+                    .await;
+                submitted += 1;
+            }
             continue;
         };
 

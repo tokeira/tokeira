@@ -616,6 +616,42 @@ pub struct PendingNexusOperation {
     /// authority the timeout scanner reads to fire start-to-close even across a
     /// shard takeover (the derived tracking index is rebuilt from this state).
     pub started_at: Option<OffsetDateTime>,
+    /// Failed invocation attempts so far (0 until the first failure). Bumped by a
+    /// retryable `NexusResolution::AttemptFailed`; the runtime reads it to compute
+    /// the next backoff. Mirrors v1.31.0 `recordAttempt`
+    /// (`components/nexusoperations/statemachine.go:91-94`). Derived backoff state,
+    /// not replayed from history (no `EventAttemptFailed` event exists).
+    #[serde(default)]
+    pub attempt: u32,
+    /// Failure of the most recent failed-but-retryable attempt — the handler's own
+    /// failure (NexusHandlerFailureInfo + cause), *not* the NexusOperationFailureInfo
+    /// wrapper used for the terminal `NexusOperationFailed` event. Surfaced on
+    /// `DescribeWorkflowExecution.PendingNexusOperations[].LastAttemptFailure`. `None`
+    /// while no attempt has failed and **cleared on re-dispatch** so Describe shows
+    /// nothing while an attempt is in flight (v1.31.0 `recordAttempt`).
+    #[serde(default)]
+    pub last_attempt_failure: Option<Payload>,
+    /// When a backing-off operation is next eligible for re-dispatch. `Some` iff the
+    /// op is `BACKING_OFF`; set by the retryable-failure transition from a
+    /// runtime-computed backoff (the kernel stays free of backoff math/config, like
+    /// the `CompletionCallback` path). The Nexus-op retry scanner re-fires only once
+    /// `now >= next_attempt_at`; the schedule-to-close timeout scanner dominates.
+    #[serde(default)]
+    pub next_attempt_at: Option<OffsetDateTime>,
+    /// Handler-issued async operation token (from the `NexusOperationStarted`
+    /// response), retained so cancel/get re-send it verbatim. v1.31.0 keeps this in
+    /// the NexusOperation mutable-state data (not only on the event); tokeira must
+    /// too, because the runtime cancel path works off this projection, which carries
+    /// no history. Empty until the operation transitions to async-started.
+    #[serde(default)]
+    pub operation_token: String,
+    /// The StartOperation input, retained so a backing-off operation can be
+    /// re-dispatched without re-reading history: the retry transition reconstructs
+    /// the `ScheduleNexusOperation` dispatch op from this projection (the runtime
+    /// retry scanner works off committed state, which carries no events). Populated
+    /// at schedule and rebuilt from the `NexusOperationScheduled` event on replay.
+    #[serde(default)]
+    pub input: Payloads,
 }
 
 /// Stored form of `WorkflowExecutionVersioningInfo` for one run.

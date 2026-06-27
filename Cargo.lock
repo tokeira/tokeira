@@ -6329,6 +6329,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-compose-dsl"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokeira-compose",
+ "tokeira-platform-dsl",
+]
+
+[[package]]
 name = "tokeira-config"
 version = "0.1.0"
 dependencies = [

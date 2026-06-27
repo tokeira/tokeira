@@ -25,12 +25,22 @@
 
 pub mod ast;
 pub mod diagnostic;
+pub mod eval;
+pub mod kind;
 pub mod parser;
+pub mod resolve;
 pub mod token;
+pub mod typeck;
+pub mod value;
 
 pub use diagnostic::{Diag, Severity};
+pub use eval::{evaluate, evaluate_with_inputs};
+pub use kind::{KindCategory, KindLibrary, KindSchema};
 pub use parser::parse;
+pub use resolve::resolve;
 pub use token::{Span, Token};
+pub use typeck::typeck;
+pub use value::{Composition, ItemRole, RuntimeContext, Value};
 
 use logos::Logos;
 

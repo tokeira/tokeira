@@ -30,6 +30,7 @@ members = [
     "crates/tokeira-edge",
     "platforms/local",
     "platforms/compose",
+    "platforms/compose-dsl",
     "platforms/ecs",
     "apps/tkr",
     "apps/tokeirad",

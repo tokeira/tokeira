@@ -14,6 +14,7 @@ members = [
     "crates/tokeira-chasm-activity",
     "crates/tokeira-state",
     "crates/tokeira-iac",
+    "crates/tokeira-platform-dsl",
     "crates/tokeira-deploy-engine",
     "crates/tokeira-config",
     "crates/tokeira-aws",

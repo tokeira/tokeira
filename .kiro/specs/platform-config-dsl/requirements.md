@@ -27,6 +27,22 @@ engine identity that the provisioner binds against collapses to **the resource-k
 language/compiler version** compiled into `tkp`; the DSL program is the deployment-married
 configuration the provisioner records and retains.
 
+### Authoring and ownership model
+
+The `.platform` definition is a **platform-author artifact**, checked into each platform crate
+(`platforms/{local,compose,ecs,…}`) and built on the reusable `tokeira-platform-dsl`. It is authored
+**once, when a platform is created** (for example, future `eks` support) — the DSL analog of today's
+`config.rs`/`modules.rs`/`services.rs` — not hand-written per deployment. The everyday **operator**
+**selects a platform and supplies input values**; they do not author the structural definition (though,
+because it is now data and not compiled Rust, an operator *may* evolve a deployment's persisted
+definition — structurally or by value — as an ordinary `apply`, which is the coupling this spec
+removes). `tkr deployment create` **persists the authored definition** (the file set) into the
+deployment alongside its other state; every subsequent `plan`/`apply` compiles that **persisted copy**,
+never the live repo file. There is therefore **no "starter generator."** This spec owns the language,
+the compiler, a platform's use of the DSL, and the authored definition itself; the **persistence and
+retention contract** (storage, versioning against the compiling `tkp`, re-materialization, rollback) is
+owned by the `platform-provisioner-binary` (`tkp`) spec, which consumes this one.
+
 ### Scope boundary
 
 - **In scope:** the DSL's surface and semantics; the typed resource-kind library contract; static
@@ -56,8 +72,16 @@ lower without loss.
   (modules, resources, services, wiring) is written.
 - **Program** — the compilation unit: the composed source of one **deployment definition** (one or
   more `.platform` files) that the compiler processes.
-- **Deployment definition** — the rooted set of `.platform` files describing one deployment; the
-  deployment-married configuration artifact the provisioner retains and digests.
+- **Deployment definition** — the rooted set of `.platform` files describing one deployment; a
+  **platform-author artifact** authored in the owning platform crate and, at `tkr deployment create`,
+  persisted into the deployment as the deployment-married configuration the provisioner retains and
+  digests.
+- **Platform author** — the engineer who authors a platform's `.platform` definition (checked into the
+  platform crate, e.g. `platforms/compose`) on the reusable `tokeira-platform-dsl`, analogous to writing
+  today's `config.rs`/`modules.rs`/`services.rs`. Distinct from the operator.
+- **Operator** — the user who instantiates a deployment by **selecting a platform and supplying input
+  values**; they do not author the structural definition (but may evolve a deployment's persisted
+  definition as an ordinary `apply`, since it is data rather than compiled Rust).
 - **Deployment root** — the boundary directory containing a deployment definition; imports never
   resolve outside it.
 - **Import (`use`)** — a relative, downward-only include of another `.platform` file within the
@@ -76,6 +100,11 @@ lower without loss.
   `{ env }`; new providers arrive only by engine upgrade.
 - **Secret taint** — the typing rule that a `Secret<…>` value never appears in a diagnostic and flows
   only into resource parameters typed to accept secrets.
+- **Recorded (identity-bearing) context** — a `RuntimeContext` value persisted with the deployment at
+  creation (e.g. `region`, later `account`); authoritative, and a differing ambient source is a
+  *retarget* requiring confirmation.
+- **Ambient (machine-local) context** — a `RuntimeContext` value supplied by the host per invocation
+  (e.g. `deployment_dir`, `home`); not persisted, re-derived per host, no confirmation needed.
 - **Resource kind** — a compiled Rust `Resource` implementation (executable provider lifecycle:
   `create`/`update`/`delete`/`describe`/`diff`). The DSL references kinds; it does not define them.
 - **Kind library** — the fixed set of resource kinds (and service kinds) compiled into a given `tkp`,
@@ -105,7 +134,9 @@ lower without loss.
 
 ## Target State
 
-- A deployment's platform is authored as a **DSL program**, not a compiled Rust struct + TOML values.
+- A deployment's platform is authored as a **DSL program** by the platform author in the platform
+  crate (not a compiled Rust struct + TOML values); the operator selects that platform and supplies
+  input values, and `tkr deployment create` persists the authored definition into the deployment.
 - `tkp` is **generic**: engine + fixed kind library + embedded compiler. It is no longer
   deployment-specific by source.
 - The compiler **type-checks and validates** a program fully before any lowering, and **lowers**
@@ -175,8 +206,10 @@ rebuilding a binary.
    modules, resources, services, their typed parameters, and their inter-resource dependencies — such
    that no part of a supported platform's structure requires compiled Rust beyond the resource-kind
    library.
-2. WHEN a deployment is created, THEN its platform SHALL be represented by exactly one DSL program as
-   the authoritative source of its infra+services definition.
+2. WHEN a deployment is created, THEN its platform SHALL be represented by exactly one DSL program —
+   the definition authored in the selected platform crate, persisted into the deployment at create —
+   as the authoritative source of its infra+services definition, AND every subsequent `plan`/`apply`
+   SHALL compile that persisted copy rather than the live platform-crate file.
 3. THE DSL program SHALL be the artifact the provisioner records and retains for the deployment
    (`platform-provisioner-binary`), not a compiled per-deployment struct.
 4. THE DSL SHALL NOT carry the running server's runtime configuration (`TokeiraConfig`); that remains
@@ -426,6 +459,14 @@ wire the host data it needs without the DSL gaining ambient authority.
    concerns: AWS Secrets Manager secrets (a resource kind consumed by a container `value_from`
    reference), the provisioner's own credential chain and STS caller-identity check (host-runtime auth),
    and `region` (an operator input).
+8. WHERE a `RuntimeContext` value is **recorded** with the deployment (an identity-bearing input such as
+   `region`, or `account`), THE recorded value SHALL be authoritative; IF an ambient host source (e.g. an
+   environment variable) supplies a differing value, THE provisioner SHALL surface it as a retarget and
+   SHALL require explicit operator confirmation before using the differing value, never silently
+   overriding the recorded one.
+9. WHERE a `RuntimeContext` value is **machine-local ambient** (e.g. `deployment_dir`, `home`), THE host
+   SHALL supply it without confirmation, AND it SHALL NOT be persisted with the deployment — it is
+   re-derived per host, consistent with the ambient-never-retained rule.
 
 ### Requirement 15: Resource output references
 
@@ -451,3 +492,40 @@ correctly without hard-coding values that only exist after provisioning.
    consumed via `value_from`), THE secret value SHALL be resolved by the runtime (e.g. ECS) at
    materialization and SHALL NOT enter the program or the `RuntimeContext` (reinforcing Requirement
    14.7).
+
+### Requirement 16: Authored-in-crate definition; operator selects and supplies inputs
+
+**User Story:** As a platform author, I want a platform's `.platform` definition to live in the platform
+crate as the authored structural artifact, while operators merely select the platform and supply input
+values, so that platform structure is owned and reviewed once where it is built — not hand-written per
+deployment — and a deployment still pins its own persisted copy.
+
+#### Acceptance Criteria
+
+1. THE `.platform` definition for a platform SHALL be a platform-author artifact authored in that
+   platform's crate (`platforms/{local,compose,ecs,…}`) on the reusable `tokeira-platform-dsl`, the DSL
+   analog of today's `config.rs`/`modules.rs`/`services.rs`; it SHALL NOT be generated as an operator
+   starter, and there SHALL be no starter-generator for it.
+2. WHEN an operator instantiates a deployment, THEN their inputs SHALL be the selected platform plus
+   that platform's typed input values (Requirement 8); the operator SHALL NOT be required to author the
+   structural definition.
+3. WHEN `tkr deployment create` runs, THEN it SHALL persist the selected platform's authored definition
+   (the complete `.platform` file set) into the deployment as the deployment-married configuration, and
+   subsequent `plan`/`apply` SHALL compile that persisted copy, never the live platform-crate file
+   (Requirement 1.2).
+4. THE persistence and retention mechanics of the persisted definition — its storage location,
+   versioning against the compiling `tkp`'s `(language, kind-library)` version, re-materialization, and
+   rollback — SHALL be owned by the `platform-provisioner-binary` (`tkp`) spec; this spec owns only the
+   language, the compiler, a platform's use of the DSL, the authored definition, and the create-time
+   hand-off.
+5. WHERE an operator subsequently edits a deployment's persisted definition (structural or value), THE
+   change SHALL be an ordinary `apply` on the same `tkp` (no rebuild), consistent with Requirement 8.2;
+   editing the live platform-crate file SHALL NOT alter an existing deployment whose definition is
+   already persisted.
+6. THE envelope of such evolution SHALL be the running `tkp`'s `(language, kind-library)` version: an
+   edited definition that stays within it (any composition of the kinds/constructs that `tkp` provides)
+   SHALL be an ordinary `apply`; an edit that references a kind, field, provider, or language construct
+   the running `tkp` does not provide SHALL be rejected by the compiler (Requirements 2.2, 9.2) and SHALL
+   become possible only through an engine upgrade to a `tkp` that provides it (Requirement 9.3) — never
+   by a program-declared version. Evolution is therefore unbounded in composition but bounded by the
+   engine version, and the boundary is enforced by the compiler, not by policy.

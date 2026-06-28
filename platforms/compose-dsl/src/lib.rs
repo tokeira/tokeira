@@ -18,19 +18,24 @@
 //! `Deployment`/`Ops` trait wiring and `tkr` registration build on this core in
 //! the next slice.
 //!
-//! Multi-file `use` import assembly (Requirement 13) is not yet wired here: a
-//! definition is the single `compose.platform` root for now; import containment
-//! lands with the assembly step.
+//! Multi-file `use` import assembly (Requirement 13) is wired through
+//! [`compile_deployment`]: the deployment directory is assembled into a
+//! path-sorted, digest-bearing [`SourceSet`] (with fail-closed import
+//! containment) and composed into one program before the resolve→type-check→
+//! evaluate phases run. [`compile_source`] keeps the single-source path for
+//! tests and callers that already hold the text.
 
 use std::{collections::HashMap, path::Path};
 
 use thiserror::Error;
 use tokeira_compose::ComposeService;
 use tokeira_platform_dsl::{
-    Composition, Diag, ItemRole, KindLibrary, RuntimeContext, Value, evaluate, lex, parse, resolve,
-    typeck,
-    value::{LoweredItem, LoweredModule},
+    Composition, Diag, ItemRole, KindLibrary, RuntimeContext, SourceSet, Value, assemble,
+    compose_program, evaluate, lex, parse, resolve, typeck, value::LoweredItem,
 };
+
+pub mod authored;
+pub mod deployment;
 
 /// The root definition file within a deployment directory.
 pub const ROOT_DEFINITION: &str = "compose.platform";
@@ -38,15 +43,9 @@ pub const ROOT_DEFINITION: &str = "compose.platform";
 /// Errors from compiling or translating a compose-dsl deployment definition.
 #[derive(Debug, Error)]
 pub enum DslError {
-    /// The definition file could not be read.
-    #[error("could not read deployment definition at {path}: {source}")]
-    Read {
-        /// The path that failed to read.
-        path: String,
-        /// The underlying I/O error.
-        source: std::io::Error,
-    },
-    /// Compilation produced one or more error diagnostics.
+    /// Compilation produced one or more error diagnostics. Import/read failures
+    /// surface here too: assembly reports an unreadable or out-of-bounds file as
+    /// a located diagnostic rather than a distinct I/O error.
     #[error("deployment definition failed to compile:\n{0}")]
     Compile(String),
     /// The compiled composition could not be translated to compose services.
@@ -54,30 +53,46 @@ pub enum DslError {
     Translate(String),
 }
 
-/// Compile the deployment definition at `<deployment_dir>/compose.platform`
-/// into the neutral [`Composition`] IR, against `ctx`.
+/// Compile the deployment definition under `deployment_dir` into the neutral
+/// [`Composition`] IR, against `ctx`.
 ///
-/// Runs the whole compile pipeline and stops at the first phase that produces
-/// error diagnostics, so no partial composition is returned (Property 6). The
-/// returned `Composition` is deterministic given the program and `ctx`
-/// (Property 2).
+/// Assembles the full `.platform` file set — the `compose.platform` root plus
+/// every file reachable by contained `use` imports — into a path-sorted
+/// [`SourceSet`], composes it into one program, and runs the resolve→type-check
+/// →evaluate phases. Stops at the first phase that produces error diagnostics,
+/// so no partial composition is returned (Property 6). The result is
+/// deterministic given the file set and `ctx` (Property 2 / Property 19).
 pub fn compile_deployment(
     deployment_dir: &Path,
     ctx: &RuntimeContext,
 ) -> Result<Composition, DslError> {
-    let path = deployment_dir.join(ROOT_DEFINITION);
-    let source = std::fs::read_to_string(&path).map_err(|source| DslError::Read {
-        path: path.display().to_string(),
-        source,
+    // Import assembly is the only filesystem access and is fail-closed: a
+    // containment, cycle, or bound violation aborts here with located
+    // diagnostics rendered against the partial composed source (Requirement 13).
+    let set = assemble(deployment_dir, ROOT_DEFINITION).map_err(|err| {
+        DslError::Compile(render_diagnostics(&err.composed_source, &err.diagnostics))
     })?;
-    compile_source(&source, ctx)
+    compile_set(&set, ctx)
 }
 
-/// Compile a definition from an in-memory source string (used by tests and,
-/// later, by import assembly that has already concatenated the file set).
-pub fn compile_source(source: &str, ctx: &RuntimeContext) -> Result<Composition, DslError> {
-    let kinds = KindLibrary::compose();
+/// Compile an already-assembled [`SourceSet`] into the [`Composition`] IR.
+///
+/// Composes the path-sorted file set into one program, then runs
+/// resolve→type-check→evaluate against the composed virtual source so every
+/// diagnostic locates correctly across files.
+pub fn compile_set(set: &SourceSet, ctx: &RuntimeContext) -> Result<Composition, DslError> {
+    let source = set.composed_source();
+    let (program, compose_diags) = compose_program(set);
+    fail_if_errors(source, &compose_diags)?;
+    let program = program.ok_or_else(|| {
+        DslError::Compile("not a deployment definition (missing `platform` header)".into())
+    })?;
+    compile_checked(source, program, ctx)
+}
 
+/// Compile a definition from an in-memory single source string (used by tests
+/// and callers that hold one file's text rather than a deployment directory).
+pub fn compile_source(source: &str, ctx: &RuntimeContext) -> Result<Composition, DslError> {
     let (tokens, lex_diags) = lex(source);
     fail_if_errors(source, &lex_diags)?;
 
@@ -87,9 +102,20 @@ pub fn compile_source(source: &str, ctx: &RuntimeContext) -> Result<Composition,
         DslError::Compile("not a deployment definition (missing `platform` header)".into())
     })?;
 
+    compile_checked(source, program, ctx)
+}
+
+/// Run the resolve→type-check→evaluate phases over a parsed program, rendering
+/// any diagnostic against `source`. Shared by the single-source and assembled
+/// paths so both report identically.
+fn compile_checked(
+    source: &str,
+    program: tokeira_platform_dsl::ast::Program,
+    ctx: &RuntimeContext,
+) -> Result<Composition, DslError> {
+    let kinds = KindLibrary::compose();
     fail_if_errors(source, &resolve(&program, &kinds))?;
     fail_if_errors(source, &typeck(&program, &kinds))?;
-
     evaluate(&program, ctx).map_err(|diags| DslError::Compile(render_diagnostics(source, &diags)))
 }
 
@@ -105,18 +131,16 @@ pub fn translate_services(composition: &Composition) -> Result<Vec<ComposeServic
     for module in &composition.modules {
         for item in &module.items {
             if item.role == ItemRole::Service && item.kind == "ComposeService" {
-                services.push(translate_compose_service(module, item)?);
+                services.push(compose_service_from(item)?);
             }
         }
     }
     Ok(services)
 }
 
-fn translate_compose_service(
-    module: &LoweredModule,
-    item: &LoweredItem,
-) -> Result<ComposeService, DslError> {
-    let where_ = || format!("service `{}` in module `{}`", item.id, module.name);
+/// Build a [`ComposeService`] from a service-kind [`LoweredItem`].
+pub(crate) fn compose_service_from(item: &LoweredItem) -> Result<ComposeService, DslError> {
+    let where_ = || format!("service `{}`", item.id);
     Ok(ComposeService {
         name: item.id.clone(),
         image: required_str(item, "image").map_err(|e| translate(&where_(), e))?,
@@ -127,6 +151,42 @@ fn translate_compose_service(
         depends_on: item.depends_on.clone(),
         healthcheck: None,
     })
+}
+
+/// A required string field, surfaced as a translation [`DslError`].
+pub(crate) fn required_str_field(item: &LoweredItem, field: &str) -> Result<String, DslError> {
+    required_str(item, field).map_err(|e| translate(&format!("`{}`", item.id), e))
+}
+
+/// An optional string field (absent → `None`).
+pub(crate) fn optional_str_field(item: &LoweredItem, field: &str) -> Option<String> {
+    match item.fields.get(field) {
+        Some(Value::Str(s)) | Some(Value::Path(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// A required `u16` field (e.g. a port), surfaced as a translation [`DslError`].
+pub(crate) fn required_u16_field(item: &LoweredItem, field: &str) -> Result<u16, DslError> {
+    match item.fields.get(field) {
+        Some(Value::Int(n)) if (0..=u16::MAX as i64).contains(n) => Ok(*n as u16),
+        Some(_) => Err(translate(
+            &format!("`{}`", item.id),
+            format!("field `{field}` must be a port (0..=65535)"),
+        )),
+        None => Err(translate(
+            &format!("`{}`", item.id),
+            format!("missing required field `{field}`"),
+        )),
+    }
+}
+
+/// The `replicas` field of a service item, defaulting to 1.
+pub(crate) fn replicas_of(item: &LoweredItem) -> u32 {
+    match item.fields.get("replicas") {
+        Some(Value::Int(n)) if *n >= 0 => *n as u32,
+        _ => 1,
+    }
 }
 
 // ── Value extraction ──────────────────────────────────────────────────
@@ -319,5 +379,72 @@ mod tests {
         let composition = compile_deployment(dir.path(), &ctx()).expect("compiles from dir");
         let services = translate_services(&composition).expect("translates");
         assert_eq!(services.len(), 3);
+    }
+
+    #[test]
+    fn composes_a_multi_file_definition_across_imports() {
+        // The same deployment split across files: the root holds inputs + shared
+        // lets + `use`s; each module lives in its own file. Whole-program name
+        // resolution lets `runtime` depend on `observability` and reference the
+        // root's `state_dir` (Requirement 13).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(ROOT_DEFINITION),
+            r#"platform compose {
+                use "observability.platform"
+                use "runtime.platform"
+                let state_dir = ctx.deployment_dir / ".tokeira-state"
+                module local_state { resource state_dir_res = LocalStateDir { } }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("observability.platform"),
+            r#"platform compose {
+                module observability {
+                    depends_on [ local_state ]
+                    service mimir = ComposeService {
+                        image: "grafana/mimir:3.0.6",
+                        volumes: [ bind(state_dir / "mimir", "/data", rw) ],
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("runtime.platform"),
+            r#"platform compose {
+                module runtime {
+                    depends_on [ observability ]
+                    service tokeirad = ComposeService {
+                        image: "tokeirad:latest",
+                        ports: [ port(7233) ],
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let composition = compile_deployment(dir.path(), &ctx()).expect("compiles multi-file");
+        let services = translate_services(&composition).expect("translates");
+        let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["mimir", "tokeirad"]);
+        let mimir = services.iter().find(|s| s.name == "mimir").unwrap();
+        assert_eq!(mimir.volumes, vec!["/dep/.tokeira-state/mimir:/data"]);
+    }
+
+    #[test]
+    fn import_containment_violation_fails_compilation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(ROOT_DEFINITION),
+            r#"platform compose { use "../escape.platform" }"#,
+        )
+        .unwrap();
+        let err = compile_deployment(dir.path(), &ctx()).expect_err("must fail closed");
+        let DslError::Compile(message) = err else {
+            panic!("expected a compile error, got {err:?}");
+        };
+        assert!(message.contains("must not contain `..`"), "got: {message}");
     }
 }

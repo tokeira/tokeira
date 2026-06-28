@@ -28,6 +28,22 @@ the host (effects at the edge).
 root* — the boundary directory; nothing resolves outside it. *Program* — the in-memory compiled form
 the compiler builds from a definition.
 
+**Authoring origin (Req 16).** A `.platform` definition is a **platform-author artifact** authored in
+the owning platform crate (`platforms/{local,compose,ecs,…}`) — the DSL analog of today's
+`config.rs`/`modules.rs`/`services.rs` it replaces. It is **not** generated for the operator and there
+is no starter-generator. The operator's interaction is **select a platform + supply input values**
+(Req 8); `tkr deployment create` then **persists** the authored file set into the deployment, and every
+subsequent `plan`/`apply` compiles that **persisted copy**, never the live crate file — so a deployment
+pins its definition independently of later crate edits. The persistence/retention mechanics belong to
+`platform-provisioner-binary`; this spec owns the language, compiler, and the authored definition.
+
+**Evolution envelope (Req 16.6).** Once persisted, a definition is freely **evolvable** — structurally
+or by value — as ordinary `apply`s, because it is data, not compiled Rust. The boundary is the running
+`tkp`'s `(language, kind-library)` version, enforced by the compiler: any composition of the kinds and
+constructs `tkp` provides applies directly; a reference to a kind/field/provider/construct the running
+`tkp` lacks is a compile rejection (Properties 3, 12) that becomes possible only via an engine upgrade
+to a `tkp` that provides it (Req 9.3). Evolution is unbounded in composition, bounded by engine version.
+
 This design is scoped to the **compose platform** as the worked example. ECS and Local parity follow on
 the same machinery (Requirement 10).
 
@@ -424,6 +440,15 @@ secret value enters the program (Req 14.5).
 language stays deterministic *given* the resolved `RuntimeContext`, which `tkp` resolves once and injects
 (Property 2). The variability lives at the `tkp` edge.
 
+**Precedence (recorded vs ambient).** `RuntimeContext` fields split by meaning. **Recorded
+identity-bearing** values (`region`, later `account`) are persisted with the deployment at creation and
+are authoritative: a differing ambient/host source is a *retarget* that `tkp` surfaces and that requires
+explicit operator confirmation — never a silent override (mirroring the deployment-lock mis-apply guard).
+**Machine-local ambient** values (`deployment_dir`, `home`) are supplied by the host per invocation, need
+no confirmation, and are not persisted (re-derived per host — the ambient-never-retained rule). So
+precedence is *recorded identity > ambient host > defaults*, with confirmation required only on a
+conflict against a recorded identity value (Req 14.8, 14.9).
+
 ## Components and Interfaces
 
 New crate `tokeira-platform-dsl` (engine surface; part of `source_tree_hash`):
@@ -665,6 +690,27 @@ reference to a resource absent from the composition or to an output the kind doe
 diagnostic.
 
 **Validates: Requirements 15.2, 15.3**
+
+### Property 22: Recorded identity context is authoritative over ambient sources
+
+*For any* recorded identity-bearing `RuntimeContext` value (e.g. `region`), evaluation SHALL use the
+recorded value; *for any* ambient host source that supplies a differing value, the provisioner SHALL
+require explicit operator confirmation and SHALL NOT silently override the recorded value; *for any*
+machine-local ambient value (`deployment_dir`, `home`), the host value SHALL be used without confirmation
+and SHALL NOT be persisted.
+
+**Validates: Requirements 14.8, 14.9**
+
+### Property 23: The authored definition is the persisted copy; applies never read the live crate file
+
+*For any* deployment created from a platform, the definition compiled by every `plan`/`apply` SHALL be
+the file set persisted at create, byte-for-byte — not the platform-crate file; *for any* subsequent edit
+to the live platform-crate `.platform` file, an already-created deployment's lowered Composition SHALL be
+unchanged until its persisted definition is itself edited. (The persistence mechanics are owned by
+`platform-provisioner-binary`; this property fixes the contract this spec depends on: compilation reads
+the persisted copy.)
+
+**Validates: Requirements 16.1, 16.3, 16.5**
 
 ## Error Handling
 

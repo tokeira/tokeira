@@ -8,6 +8,14 @@ authors.workspace = true
 [dependencies]
 tokeira-platform-dsl = { path = "../../crates/tokeira-platform-dsl" }
 tokeira-compose = { path = "../../crates/tokeira-compose" }
+tokeira-compose-deployment = { path = "../compose" }
+tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
+tokeira-iac = { workspace = true }
+tokeira-deploy-engine = { workspace = true }
+tokeira-state = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

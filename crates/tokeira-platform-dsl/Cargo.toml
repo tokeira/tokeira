@@ -8,6 +8,14 @@ authors.workspace = true
 [dependencies]
 logos = "0.14"
 thiserror = { workspace = true }
+# Content-addressed definition integrity (Requirement 13.6): the digest over the
+# sorted (relative_path, sha256) file set. Same pin/convention as tokeira-state
+# and tokeira-aws (`Sha256::digest` + `hex::encode`).
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -16,13 +16,15 @@
 //! access; the only files read are those inside the deployment root, and import
 //! resolution is fail-closed (Requirements 4, 12, 13).
 //!
-//! ## Build status
+//! ## Phases present
 //!
-//! This is the foundation slice: the [`token`] lexer, the untyped [`ast`], and
-//! [`diagnostic`] reporting. The `chumsky` parser, the resolver/type-checker,
-//! the kind library, and lowering land in subsequent slices and are not yet
-//! present.
+//! [`assemble`] (multi-file `use` import assembly with containment), the
+//! [`token`] lexer, the recursive-descent [`parser`], the [`resolve`]r, the
+//! [`typeck`] checker, the [`eval`]uator, and the neutral [`value::Composition`]
+//! IR. [`compose_program`] composes an assembled [`SourceSet`] into one program
+//! for the resolve→type-check→evaluate phases.
 
+pub mod assemble;
 pub mod ast;
 pub mod diagnostic;
 pub mod eval;
@@ -33,6 +35,7 @@ pub mod token;
 pub mod typeck;
 pub mod value;
 
+pub use assemble::{AssemblyError, Bounds, SourceFile, SourceSet, assemble, compose_program};
 pub use diagnostic::{Diag, Severity};
 pub use eval::{evaluate, evaluate_with_inputs};
 pub use kind::{KindCategory, KindLibrary, KindSchema};

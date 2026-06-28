@@ -47,6 +47,13 @@ to a `tkp` that provides it (Req 9.3). Evolution is unbounded in composition, bo
 This design is scoped to the **compose platform** as the worked example. ECS and Local parity follow on
 the same machinery (Requirement 10).
 
+> **Adopted refinement (governing):** This design adopts
+> `proposals/001-platform-framework-and-realizer.md` **in full** — the generic `tokeira-platform`
+> framework crate and its `Realizer` seam, the generic `ConfigurationRevision` config type, the
+> `Composition*` IR naming, compile-time `FieldSpec` defaults, `RealizeContext`, and the `platform/` +
+> `inputs.toml` on-disk layout. Where this document and Proposal 001 differ, **Proposal 001 governs**;
+> tasks 10–13 are its realization.
+
 ## Dependencies and Non-Goals
 
 - **Consumed by** `.kiro/specs/platform-provisioner-binary/`: the engine identity it binds against is

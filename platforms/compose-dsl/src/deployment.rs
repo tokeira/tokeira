@@ -40,7 +40,7 @@ use tokeira_iac::{
 use tokeira_orchestrator::{Deployment, Ops, PortMapping, Result, ServiceReplicas};
 use tokeira_platform_dsl::{
     Composition, ItemRole, RuntimeContext,
-    value::{LoweredImage, LoweredItem, LoweredWriteback, OutputRef, Value},
+    value::{CompositionImage, CompositionItem, CompositionWriteback, OutputRef, Value},
 };
 use tokeira_state::{LocalBackend, StateBackend};
 
@@ -121,7 +121,7 @@ pub struct ComposeDslConfig {
     dsql_region: Option<String>,
     /// Declarative writeback targets (dotted config key → resource output) the
     /// composition produced; resolved from provisioned state in `collect_writeback`.
-    writeback: Vec<LoweredWriteback>,
+    writeback: Vec<CompositionWriteback>,
     /// Declared images (Build/Mirror), realized into deploy-engine images.
     images: Vec<DslImagePlan>,
 }
@@ -927,7 +927,7 @@ fn image_tag(upstream: &str) -> String {
 }
 
 /// A required string field on a top-level image declaration.
-fn image_str_field(image: &LoweredImage, field: &str) -> Option<String> {
+fn image_str_field(image: &CompositionImage, field: &str) -> Option<String> {
     match image.fields.get(field) {
         Some(Value::Str(s)) | Some(Value::Path(s)) => Some(s.clone()),
         _ => None,
@@ -1032,7 +1032,7 @@ fn dynamodb_table_resource(
 /// transport URLs/ports/retention to the compose conventions (matching the
 /// compose platform's `ObservabilityParams::from_config`).
 fn observability_params_from(
-    item: &LoweredItem,
+    item: &CompositionItem,
     project_name: &str,
 ) -> std::result::Result<ObservabilityParams, DslError> {
     Ok(ObservabilityParams {

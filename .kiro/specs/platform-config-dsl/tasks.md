@@ -65,23 +65,40 @@ unit tests are example-based; the property-based tests the design mandates are t
   - [x] 9.3 Images: `Build`/`Mirror` → deploy-engine `Image`s _Requirements: 10.1_
   - [x] 9.4 Writeback resolution: `collect_writeback` from provisioned state _Requirements: 10.2_
   - [x] 9.5 `Ops` scale/logs/port_mappings for compose-dsl
-- [ ] 10. RuntimeContext precedence (recorded vs ambient)
-  - [ ] 10.1 Identity-bearing recorded values authoritative; ambient conflict → confirm _Requirements: 14.8_
-  - [ ] 10.2 Machine-local ambient values host-supplied, never persisted _Requirements: 14.9_
-- [ ] 11. `tkr` wiring
-  - [ ] 11.1 `PlatformKind::ComposeDsl` (orchestrator) + `CliPlatformKind` variant _Requirements: 1.2_
-  - [ ] 11.2 `tkr deployment create`: persist the authored `.platform` definition — the complete file set
-        from the selected platform crate — into deployment state. Not generation: the definition is the
-        platform author's artifact (7.3). The persistence/retention contract (storage, versioning against
-        the compiling `tkp`, re-materialization) is owned by the `platform-provisioner-binary` (tkp) spec;
-        this task is only the create-time hand-off _Requirements: 11.1, 16.3_
-  - [ ] 11.3 `deployment_dir.rs`: load + compile a compose-dsl deployment into `ComposeDslConfig`
-  - [ ] 11.4 Checkpoint: `tkr deployment create / infra apply / deploy apply` drive a compose-dsl deployment
-- [ ] 12. Extract the reusable DSL-platform runtime (after a 2nd platform exists)
-  - [ ] 12.1 Extract generic plan/`Deployment`/`Ops` scaffolding + `Owned*Resource` + `RuntimeContext` _Requirements: 10.1_
-  - [ ] 12.2 Define the per-platform realizer trait (executable companion to `KindSchema::lower`) _Requirements: 7.3_
-  - [ ] 12.3 Re-express `compose-dsl` as "compose kind library + realizer"
-- [ ] 13. ECS-dsl realizer (second instance that justifies the abstraction) _Requirements: 10.1_
+- [ ] 10. `tokeira-platform` framework crate + `Realizer` seam (adopts Proposal 001)
+  - [ ] 10.1 New crate `crates/tokeira-platform`; define `Realizer`, `RealizeContext`,
+        `PlatformOpsBackend`, `RealizeError` — the run-time half of a kind, paired to `KindSchema` by name _Requirements: 7.3, 10.1_
+  - [ ] 10.2 Generic `DslPlatform<R>` implementing `Deployment` + `Ops`: the plan, `DslOwnedResource`,
+        the local-state bootstrap, generic writeback resolution (OutputRef → state) _Requirements: 7.1, 7.2, 10.2_
+  - [ ] 10.3 Generic `ConfigurationRevision` (compiled `Composition` + `RealizeContext` + writeback) as
+        `Deployment::Config` — one config type for every DSL platform _Requirements: 8.2, 11.1_
+  - [ ] 10.4 `RuntimeContext` resolution + precedence in the framework: recorded-identity inputs
+        authoritative; ambient `deployment_dir`/`home` host-supplied and never persisted; an ambient
+        value conflicting with a recorded identity → retarget confirmation (folds the former task 10) _Requirements: 14.8, 14.9_
+  - [ ] 10.5 create-persist (materialize the authored set) + loader (compile the persisted `platform/` +
+        `inputs.toml`); the `platform/` definition root and the `inputs.toml` input-bindings snapshot _Requirements: 11.1, 11.3, 13.1, 13.3, 16.3_
+- [ ] 11. Slim `compose-dsl` to a realizer over the framework
+  - [ ] 11.1 Move `KindLibrary::compose()` out of `tokeira-platform-dsl` into `compose-dsl`; the compiler
+        keeps only the schema *types* (no platform specifics) _Requirements: 2.1, 9.1_
+  - [ ] 11.2 `FieldSpec` compile-time defaults; push observability/DSQL conventions (URLs, ports,
+        retention, table/cluster names) into kind defaults + the `.platform`, so the realizer reads typed
+        fields instead of embedding constants _Requirements: 5.1, 8.1_
+  - [ ] 11.3 `ComposeRealizer` (`realize_resource`/`realize_service`/`realize_image`,
+        `register_infra_extensions`) + `ComposeOps` (`PlatformOpsBackend`), reusing `tokeira-compose`/`-aws` _Requirements: 10.1, 10.2_
+  - [ ] 11.4 Re-express `compose-dsl` as `DslPlatform<ComposeRealizer>` + the authored set + `platform()`;
+        the crate drops to ~150 lines; compose parity tests stay green _Requirements: 10.1, 10.3_
+- [ ] 12. `ecs-dsl` realizer — the second instance that validates the seam (before finalizing 10/11)
+  - [ ] 12.1 ECS kind library: `KindSchema`s + output schemas (type/secrecy/availability) for the ECS kinds _Requirements: 10.1, 15.3_
+  - [ ] 12.2 Thin `EcsRealizer` against the framework; confirm `register_*`/`PlatformOpsBackend`/output-ref
+        shapes generalise (Docker vs AWS); adjust the `Realizer` trait if the seam needs it _Requirements: 7.3, 10.1_
+- [ ] 13. `tkr` wiring against the generic framework (`DslPlatform<R>` / `ConfigurationRevision`)
+  - [ ] 13.1 `PlatformKind::ComposeDsl` (orchestrator) + `CliPlatformKind` variant _Requirements: 1.2_
+  - [ ] 13.2 `tkr deployment create`: persist the authored `platform/` set + write `inputs.toml`; seed
+        `tokeirad.toml`. Retention/versioning is owned by the `platform-provisioner-binary` (tkp) spec _Requirements: 11.1, 16.3_
+  - [ ] 13.3 `deployment_dir.rs`: `PlatformDeploymentConfig::ComposeDsl(Box<ConfigurationRevision>)`; the
+        loader compiles the persisted `platform/` + `inputs.toml` — no per-platform config type _Requirements: 1.2, 16.3_
+  - [ ] 13.4 Dispatch arms for the generic platform across infra/deploy/image/observability + `PlatformOps` _Requirements: 1.1_
+  - [ ] 13.5 Checkpoint: `tkr deployment create / infra apply / deploy apply` drive a compose-dsl deployment end-to-end (in-memory) _Requirements: 10.2_
 - [ ] 14. Property-based tests (proptest), tagged `// Feature: platform-config-dsl, Property N`
   - [ ] 14.1 P1 compilation pure/total _Requirements: 4.1, 4.3_
   - [ ] 14.2 P2 deterministic execution given context _Requirements: 4.2_
@@ -127,9 +144,9 @@ unit tests are example-based; the property-based tests the design mandates are t
     { "wave": 5, "tasks": ["7", "7.1", "7.2", "15", "15.1", "15.2", "15.3"] },
     { "wave": 6, "tasks": ["8", "8.1", "8.2", "8.3", "8.4", "8.5"] },
     { "wave": 7, "tasks": ["6", "6.1", "6.2", "6.3", "6.4", "9", "9.1", "9.2", "9.3", "9.4", "9.5", "10", "10.1", "10.2"] },
-    { "wave": 8, "tasks": ["7.3", "11", "11.1", "11.2", "11.3", "11.4"] },
-    { "wave": 9, "tasks": ["13"] },
-    { "wave": 10, "tasks": ["12", "12.1", "12.2", "12.3"] },
+    { "wave": 8, "tasks": ["7.3", "10", "10.1", "10.2", "10.3", "10.4", "10.5"] },
+    { "wave": 9, "tasks": ["11", "11.1", "11.2", "11.3", "11.4", "12", "12.1", "12.2"] },
+    { "wave": 10, "tasks": ["13", "13.1", "13.2", "13.3", "13.4", "13.5"] },
     { "wave": 11, "tasks": ["14", "14.1", "14.2", "14.3", "14.4", "14.5", "14.6", "14.7", "14.8", "14.9", "14.10", "14.11", "14.12", "14.13", "14.14", "14.15", "14.16", "14.17", "14.18", "14.19", "14.20", "14.21", "14.22", "14.23"] }
   ]
 }
@@ -140,7 +157,7 @@ unit tests are example-based; the property-based tests the design mandates are t
 - **The `.platform` files are introduced across several tasks, not one.** The read path
   (`ROOT_DEFINITION = "compose.platform"`) landed in 7.1; the canonical definition is authored in the
   platform crate (7.3); the multi-file `use` set is task 6; `tkr deployment create` persists the authored
-  definition (11.2); the loader compiles the persisted file set (11.3).
+  definition (13.2); the loader compiles the persisted file set (13.3).
 - **`.platform` authoring & persistence model.** A `.platform` definition is a platform-author artifact
   checked into the owning platform crate (e.g. `platforms/compose-dsl/`), not an operator starter generated
   at create time. At `tkr deployment create` the operator selects a platform and supplies inputs; create
@@ -149,7 +166,7 @@ unit tests are example-based; the property-based tests the design mandates are t
   deployment pin its platform definition independently of later edits to the crate. The persistence and
   retention contract itself — storage location, versioning against the compiling `tkp`, re-materialization
   onto a deployment root — is owned by the `platform-provisioner-binary` (tkp) spec; this spec defines only
-  the artifact (task 15) and the create-time hand-off (11.2).
+  the artifact (task 15) and the create-time hand-off (13.2).
   Task 15 pins the previously-implicit on-disk *layout contract* those tasks all rely on — the
   root-definition filename, the depth-≤-1 rule, and the retained `(relative_path, sha256)` file set —
   so the contract has one authoritative home rather than being inferred from the read/loader code.
@@ -162,9 +179,13 @@ unit tests are example-based; the property-based tests the design mandates are t
   (`region`, `account`) are authoritative; ambient machine-local values (`deployment_dir`, `home`) are
   host-supplied and unpersisted; a host value conflicting with a recorded identity value requires explicit
   operator confirmation (mirrors the deployment-lock mis-apply guard).
-- **Realizer abstraction (task 12) is deferred until ECS-dsl (task 13)** gives a second instance to
-  generalise against — extract from two examples, not one. The first cut intentionally built the mapping
-  concretely in `compose-dsl` to discover the boundary against real types.
+- **Proposal 001 is adopted in full** (`proposals/001-platform-framework-and-realizer.md`; see design.md's
+  governing adoption note). Tasks 10–13 above are its realization: task 10 extracts the generic
+  `tokeira-platform` framework (the `Realizer` seam, `DslPlatform<R>`, `ConfigurationRevision`, ctx
+  precedence, create-persist/loader); task 11 slims `compose-dsl` to a kind library + `ComposeRealizer` +
+  authored `.platform`; task 12 is the `ecs-dsl` realizer that validates the seam against a second
+  (AWS) platform before the compose move is finalized; task 13 points `tkr` at the generic
+  `DslPlatform<R>`/`ConfigurationRevision`, so a future DSL platform needs no new `tkr` dispatch type.
 - **Open owner decision:** whether the reusable runtime lands in `tokeira-platform-dsl` itself or a new
   `tokeira-platform-dsl-runtime` crate (compiler-vs-runtime separation) — settle at task 12.
 - The hand-rolled parser (vs `chumsky`) remains revisitable if the grammar grows; `ariadne` rendering can

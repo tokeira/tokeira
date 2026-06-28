@@ -92,29 +92,29 @@ pub enum ItemRole {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Composition {
     /// Present modules (those whose `when` guard held), in declaration order.
-    pub modules: Vec<LoweredModule>,
+    pub modules: Vec<CompositionModule>,
     /// Declared images.
-    pub images: Vec<LoweredImage>,
+    pub images: Vec<CompositionImage>,
     /// Required namespaces.
     pub namespaces: Vec<String>,
     /// Writeback targets whose `when` guard held.
-    pub writeback: Vec<LoweredWriteback>,
+    pub writeback: Vec<CompositionWriteback>,
 }
 
 /// A present module with its resolved items and dependency edges.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LoweredModule {
+pub struct CompositionModule {
     /// Module name (ownership for its items).
     pub name: String,
     /// Module-level dependency edges (other module names).
     pub depends_on: Vec<String>,
     /// Resources and services contributed by the module.
-    pub items: Vec<LoweredItem>,
+    pub items: Vec<CompositionItem>,
 }
 
 /// A resolved resource or service instance.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LoweredItem {
+pub struct CompositionItem {
     /// Stable id (the declaration name; becomes a `ResourceId`).
     pub id: String,
     /// The kind name (resolved against the kind library downstream).
@@ -122,7 +122,7 @@ pub struct LoweredItem {
     /// Whether this is a resource or a service.
     pub role: ItemRole,
     /// Resolved field values (the `depends_on` field is lifted out into
-    /// [`LoweredItem::depends_on`], not kept here).
+    /// [`CompositionItem::depends_on`], not kept here).
     pub fields: BTreeMap<String, Value>,
     /// Dependency edges (other resource/service ids) from the `depends_on`
     /// field.
@@ -131,7 +131,7 @@ pub struct LoweredItem {
 
 /// A resolved image declaration.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LoweredImage {
+pub struct CompositionImage {
     /// Image name.
     pub name: String,
     /// Image kind (`Build` | `Mirror`).
@@ -143,7 +143,7 @@ pub struct LoweredImage {
 /// A resolved writeback target: a dotted config key sourced from a resource
 /// output that `tkp` resolves and writes after apply.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LoweredWriteback {
+pub struct CompositionWriteback {
     /// Dotted config key (e.g. `infrastructure.dsql.endpoint`).
     pub key: String,
     /// The output reference supplying the value.

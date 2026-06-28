@@ -31,7 +31,7 @@ use thiserror::Error;
 use tokeira_compose::ComposeService;
 use tokeira_platform_dsl::{
     Composition, Diag, ItemRole, KindLibrary, RuntimeContext, SourceSet, Value, assemble,
-    compose_program, evaluate, lex, parse, resolve, typeck, value::LoweredItem,
+    compose_program, evaluate, lex, parse, resolve, typeck, value::CompositionItem,
 };
 
 pub mod authored;
@@ -138,8 +138,8 @@ pub fn translate_services(composition: &Composition) -> Result<Vec<ComposeServic
     Ok(services)
 }
 
-/// Build a [`ComposeService`] from a service-kind [`LoweredItem`].
-pub(crate) fn compose_service_from(item: &LoweredItem) -> Result<ComposeService, DslError> {
+/// Build a [`ComposeService`] from a service-kind [`CompositionItem`].
+pub(crate) fn compose_service_from(item: &CompositionItem) -> Result<ComposeService, DslError> {
     let where_ = || format!("service `{}`", item.id);
     Ok(ComposeService {
         name: item.id.clone(),
@@ -154,12 +154,12 @@ pub(crate) fn compose_service_from(item: &LoweredItem) -> Result<ComposeService,
 }
 
 /// A required string field, surfaced as a translation [`DslError`].
-pub(crate) fn required_str_field(item: &LoweredItem, field: &str) -> Result<String, DslError> {
+pub(crate) fn required_str_field(item: &CompositionItem, field: &str) -> Result<String, DslError> {
     required_str(item, field).map_err(|e| translate(&format!("`{}`", item.id), e))
 }
 
 /// An optional string field (absent → `None`).
-pub(crate) fn optional_str_field(item: &LoweredItem, field: &str) -> Option<String> {
+pub(crate) fn optional_str_field(item: &CompositionItem, field: &str) -> Option<String> {
     match item.fields.get(field) {
         Some(Value::Str(s)) | Some(Value::Path(s)) => Some(s.clone()),
         _ => None,
@@ -167,7 +167,7 @@ pub(crate) fn optional_str_field(item: &LoweredItem, field: &str) -> Option<Stri
 }
 
 /// A required `u16` field (e.g. a port), surfaced as a translation [`DslError`].
-pub(crate) fn required_u16_field(item: &LoweredItem, field: &str) -> Result<u16, DslError> {
+pub(crate) fn required_u16_field(item: &CompositionItem, field: &str) -> Result<u16, DslError> {
     match item.fields.get(field) {
         Some(Value::Int(n)) if (0..=u16::MAX as i64).contains(n) => Ok(*n as u16),
         Some(_) => Err(translate(
@@ -182,7 +182,7 @@ pub(crate) fn required_u16_field(item: &LoweredItem, field: &str) -> Result<u16,
 }
 
 /// The `replicas` field of a service item, defaulting to 1.
-pub(crate) fn replicas_of(item: &LoweredItem) -> u32 {
+pub(crate) fn replicas_of(item: &CompositionItem) -> u32 {
     match item.fields.get("replicas") {
         Some(Value::Int(n)) if *n >= 0 => *n as u32,
         _ => 1,
@@ -191,14 +191,14 @@ pub(crate) fn replicas_of(item: &LoweredItem) -> u32 {
 
 // ── Value extraction ──────────────────────────────────────────────────
 
-fn required_str(item: &LoweredItem, field: &str) -> Result<String, String> {
+fn required_str(item: &CompositionItem, field: &str) -> Result<String, String> {
     match item.fields.get(field) {
         Some(value) => as_str(value, field),
         None => Err(format!("missing required field `{field}`")),
     }
 }
 
-fn optional_str_list(item: &LoweredItem, field: &str) -> Result<Vec<String>, String> {
+fn optional_str_list(item: &CompositionItem, field: &str) -> Result<Vec<String>, String> {
     match item.fields.get(field) {
         None | Some(Value::Absent) => Ok(Vec::new()),
         Some(Value::List(items)) => items.iter().map(|v| as_str(v, field)).collect(),
@@ -206,7 +206,7 @@ fn optional_str_list(item: &LoweredItem, field: &str) -> Result<Vec<String>, Str
     }
 }
 
-fn optional_str_map(item: &LoweredItem, field: &str) -> Result<HashMap<String, String>, String> {
+fn optional_str_map(item: &CompositionItem, field: &str) -> Result<HashMap<String, String>, String> {
     match item.fields.get(field) {
         None | Some(Value::Absent) => Ok(HashMap::new()),
         Some(Value::Record(map)) => map

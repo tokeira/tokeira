@@ -23,7 +23,7 @@ use crate::{
     },
     diagnostic::Diag,
     value::{
-        Composition, ItemRole, LoweredImage, LoweredItem, LoweredModule, LoweredWriteback,
+        Composition, ItemRole, CompositionImage, CompositionItem, CompositionModule, CompositionWriteback,
         OutputRef, RuntimeContext, Value,
     },
 };
@@ -119,7 +119,7 @@ impl Evaluator<'_> {
                     if active {
                         for target in &decl.targets {
                             if let Some(source) = self.eval_output_ref(&target.value) {
-                                composition.writeback.push(LoweredWriteback {
+                                composition.writeback.push(CompositionWriteback {
                                     key: target.key.node.clone(),
                                     source,
                                 });
@@ -135,7 +135,7 @@ impl Evaluator<'_> {
 
     // ── Modules and items ─────────────────────────────────────────────
 
-    fn eval_module(&mut self, module: &ModuleDecl) -> Option<LoweredModule> {
+    fn eval_module(&mut self, module: &ModuleDecl) -> Option<CompositionModule> {
         if let Some(when) = &module.when
             && !self.eval_bool(when)
         {
@@ -150,14 +150,14 @@ impl Evaluator<'_> {
         for item in &module.items {
             self.eval_module_item(item, &mut items);
         }
-        Some(LoweredModule {
+        Some(CompositionModule {
             name: module.name.node.clone(),
             depends_on,
             items,
         })
     }
 
-    fn eval_module_item(&mut self, item: &ModuleItem, out: &mut Vec<LoweredItem>) {
+    fn eval_module_item(&mut self, item: &ModuleItem, out: &mut Vec<CompositionItem>) {
         match item {
             ModuleItem::Resource(instance) => {
                 out.push(self.eval_item(instance, ItemRole::Resource))
@@ -183,7 +183,7 @@ impl Evaluator<'_> {
         }
     }
 
-    fn eval_item(&mut self, instance: &KindInstance, role: ItemRole) -> LoweredItem {
+    fn eval_item(&mut self, instance: &KindInstance, role: ItemRole) -> CompositionItem {
         let mut fields = std::collections::BTreeMap::new();
         let mut depends_on = Vec::new();
         for field in &instance.fields {
@@ -193,7 +193,7 @@ impl Evaluator<'_> {
                 fields.insert(field.key.node.clone(), self.eval_expr(&field.value));
             }
         }
-        LoweredItem {
+        CompositionItem {
             id: instance.name.node.clone(),
             kind: instance.kind.node.clone(),
             role,
@@ -202,12 +202,12 @@ impl Evaluator<'_> {
         }
     }
 
-    fn eval_image(&mut self, instance: &KindInstance) -> LoweredImage {
+    fn eval_image(&mut self, instance: &KindInstance) -> CompositionImage {
         let mut fields = std::collections::BTreeMap::new();
         for field in &instance.fields {
             fields.insert(field.key.node.clone(), self.eval_expr(&field.value));
         }
-        LoweredImage {
+        CompositionImage {
             name: instance.name.node.clone(),
             kind: instance.kind.node.clone(),
             fields,
@@ -646,11 +646,11 @@ mod tests {
         program.expect("program")
     }
 
-    fn module<'a>(composition: &'a Composition, name: &str) -> Option<&'a LoweredModule> {
+    fn module<'a>(composition: &'a Composition, name: &str) -> Option<&'a CompositionModule> {
         composition.modules.iter().find(|m| m.name == name)
     }
 
-    fn item<'a>(module: &'a LoweredModule, id: &str) -> &'a LoweredItem {
+    fn item<'a>(module: &'a CompositionModule, id: &str) -> &'a CompositionItem {
         module.items.iter().find(|i| i.id == id).expect("item")
     }
 

@@ -1192,6 +1192,13 @@ impl WorkflowService {
                 )
                 .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
 
+                // A cancel-ack (None) does not resolve the operation — the operation resolves
+                // only via its completion when the backing workflow closes (v1.31.0 decouples
+                // EventCancelationSucceeded from operation resolution, statemachine.go:671).
+                let Some(resolution) = resolution else {
+                    return Ok(());
+                };
+
                 let applied = self
                     .runtime
                     .resolve_nexus_operation(

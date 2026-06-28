@@ -1283,10 +1283,44 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::NexusOperationCanceled {
             operation_id,
             scheduled_event_id,
+            endpoint,
+            service,
+            operation,
+            operation_token,
         } => Attributes::NexusOperationCanceledEventAttributes(
             history::NexusOperationCanceledEventAttributes {
                 request_id: operation_id.clone(),
                 scheduled_event_id: *scheduled_event_id,
+                // v1.31.0 wraps a CanceledFailureInfo cause inside the outer
+                // NexusOperationExecutionFailureInfo (`createNexusOperationFailure` +
+                // the OperationStateCanceled branch, `completion.go:88-104 @ v1.31.0`);
+                // the caller's `fut.Get` reads it to produce a NexusOperationError
+                // wrapping a CanceledError.
+                failure: Some(proto_failure::Failure {
+                    message: "nexus operation completed unsuccessfully".to_string(),
+                    failure_info: Some(
+                        proto_failure::failure::FailureInfo::NexusOperationExecutionFailureInfo(
+                            proto_failure::NexusOperationFailureInfo {
+                                scheduled_event_id: *scheduled_event_id,
+                                endpoint: endpoint.clone(),
+                                service: service.clone(),
+                                operation: operation.clone(),
+                                operation_id: operation_token.clone(),
+                                operation_token: operation_token.clone(),
+                            },
+                        ),
+                    ),
+                    cause: Some(Box::new(proto_failure::Failure {
+                        message: "operation canceled".to_string(),
+                        failure_info: Some(
+                            proto_failure::failure::FailureInfo::CanceledFailureInfo(
+                                proto_failure::CanceledFailureInfo::default(),
+                            ),
+                        ),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ),

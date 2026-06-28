@@ -1894,7 +1894,7 @@ impl BasicKernel {
                 builder.emit(HistoryEventKind::NexusOperationStarted {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
-                    operation_token,
+                    operation_token: operation_token.clone(),
                     links,
                 });
                 if let Some(current) = builder
@@ -1906,6 +1906,10 @@ impl BasicKernel {
                     // Anchor start-to-close at acceptance time; the scanner reads
                     // this to fire start-to-close (`statemachine.go:159-167 @ v1.31.0`).
                     current.started_at = Some(builder.now);
+                    // Retain the handler's async token so cancel/get re-send it verbatim
+                    // (v1.31.0 keeps it in the NexusOperation mutable state, not only the
+                    // event); the runtime cancel path reads it off this projection.
+                    current.operation_token = operation_token;
                 }
                 // NexusOperationStarted is a workflow-task trigger
                 // (`StartedEventDefinition.IsWorkflowTaskTrigger() -> true`,
@@ -1970,6 +1974,14 @@ impl BasicKernel {
                 builder.emit(HistoryEventKind::NexusOperationCanceled {
                     operation_id: pending.operation_id.clone(),
                     scheduled_event_id: pending.scheduled_event_id,
+                    // Carry the operation identity so the edge wraps the canceled event in a
+                    // NexusOperationFailureInfo (cause: CanceledFailureInfo) — without it the
+                    // caller decodes no failure (`createNexusOperationFailure`,
+                    // `completion.go:88-104 @ v1.31.0`).
+                    endpoint: pending.endpoint.clone(),
+                    service: pending.service.clone(),
+                    operation: pending.operation.clone(),
+                    operation_token: pending.operation_token.clone(),
                 });
                 builder
                     .state
@@ -2710,13 +2722,20 @@ impl BasicKernel {
                     },
                 );
             }
-            HistoryEventKind::NexusOperationStarted { operation_id, .. } => {
+            HistoryEventKind::NexusOperationStarted {
+                operation_id,
+                operation_token,
+                ..
+            } => {
                 if let Some(operation) = state.pending_nexus_operations.get_mut(operation_id) {
                     operation.started = true;
                     // Anchor the start-to-close deadline at the started event's
                     // time so replay reconstructs the same deadline the live
                     // path set (`statemachine.go:159-167 @ v1.31.0`).
                     operation.started_at = Some(event.happened_at);
+                    // Rebuild the handler async token from the event so a replayed op can
+                    // still round-trip it on cancel.
+                    operation.operation_token = operation_token.clone();
                 }
             }
             HistoryEventKind::NexusOperationCompleted { operation_id, .. }

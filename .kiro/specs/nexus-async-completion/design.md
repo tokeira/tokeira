@@ -461,3 +461,101 @@ dependency to confirm, or hand-rolled `hyper` to avoid it); a kernel command
 listener address, callback retry policy); and a Describe surface. Reuses the existing
 `NexusOperationResolved` resolution path and `CompletionCallback` model. The token-not-signed and
 HTTP-endpoint-included decisions are recorded under "Requirement refinements."
+
+## Async error rehydration (LANDED 2026-06)
+
+`TestNexusWorkflowTestSuite/TestNexusAsyncOperationErrorRehydration` (corpus, v1.31.0
+`tests/nexus_workflow_test.go:2218`) was run out-of-process against `tokeirad` during the
+functional-conformance loop. The async completion delivery built by this spec works (the
+`StartOperation` reaches "pending"), but all four sub-cases failed on error rehydration. Three
+distinct gaps (A + B + C below), now all fixed; the leaf passes all four sub-cases (3× stress)
+and is unskipped. Gaps A/B are as originally raised; Gap C is the deeper finding instrumentation
+surfaced once the B token fix landed.
+
+### Gap A — completion failure not wrapped in `NexusOperationFailureInfo` (runtime/edge, no kernel)
+
+For `fail` / `wait-terminate` / `timeout`, the caller workflow fails with the **inner** error
+(`ApplicationError` / `TerminatedError` / `TimeoutError`) but it is **not** wrapped in a
+`NexusOperationError`. Root cause: the inbound completion handler
+`tokeira-edge/src/nexus_callback.rs` (the `failed` arm) resolves
+`NexusResolution::Failed { failure: failure_body.failure }` with the handler failure **raw**,
+unlike every sibling path — `wrap_handler_failure_as_resolution`
+(`translate/nexus.rs:441-468`) and `external_handler_error_resolution`
+(`publisher.rs` `1267-1304`) — which wrap the cause in
+`NexusOperationFailureInfo{endpoint,service,operation,scheduled_event_id}` (outer message
+"nexus operation completed unsuccessfully"). The sending side already synthesizes the inner
+failure only (`deliver_completion_callback`, `publisher.rs:1079-1091`:
+`synth_terminated_failure` / `synth_timed_out_failure` / app-error payload), so the receiver
+must wrap.
+
+**Fix (no kernel):** in `nexus_callback.rs`, wrap the decoded completion failure exactly as
+`wrap_handler_failure_as_resolution` does. The wrap needs the caller's
+endpoint/service/operation, which `handle_nexus_callback` does not currently have
+(`runtime: &dyn WorkflowRuntimeApi` only, no `repo`). Cleanest source: carry
+endpoint/service/operation on tokeira's own opaque `NexusCompletionToken` (minted at schedule
+time in `handle_schedule_nexus_operation` where all three are in scope; `publisher.rs:811`) —
+avoids widening `WorkflowRuntimeApi` or loading the run. Decode the failure `Payload` →
+`failure_proto::Failure` via `payload_to_failure` (`tokeira-proto/src/conversions/common.rs:50`),
+wrap, re-encode. Verified scope: this flips the `fail`/`wait-terminate`/`timeout` sub-cases.
+
+**Token stays opaque/integrity-bound.** The added routing fields are read exactly like the rest
+of the `NexusCompletionToken` (decode + version check); they are never operator-forgeable inputs
+that could redirect a completion to a different operation. The token remains tokeira's own
+opaque blob — this enriches it, it does not adopt Temporal's wire token format.
+
+### Gap B — handler `operation_token` not round-tripped on cancel (kernel field; stop-and-raise)
+
+`wait-cancel` fails with `handler error (BAD_REQUEST): invalid operation token` →
+`failed to unmarshal workflow run operation token`. When the caller cancels an async op,
+tokeira dispatches `CancelOperation` to the handler but sends **its own `operation_id`** in
+place of the handler-issued token (`publisher.rs:916-920`, which explicitly defers "faithful
+handler-token persistence" on the false assumption the conformance handler does not gate
+cancel on the token). A `temporalnexus.NewWorkflowRunOperation` handler unmarshals the token as
+JSON and rejects tokeira's substitute. The handler's token arrives on the `StartOperation`
+async response and is emitted to the `NexusOperationStarted` **history event**
+(`translate/nexus.rs:261-268`, `kernel.rs:1883-1897`) but is **not** stored on the kernel
+`PendingNexusOperation` (`state.rs:590-619` has no `operation_token` field), and the runtime's
+projected run state carries no history events — so the cancel dispatch cannot recover it.
+
+**Fix (LANDED):** added `operation_token: String` to `PendingNexusOperation`, set in the
+`NexusResolution::Started` arm + the replay `NexusOperationStarted` handler, threaded through
+`NexusTaskRequest::CancelOperation` and the External `cancel_operation`, and emitted as the wire
+`operation_token` (deprecated `operation_id` field keeps tokeira's id). The handler now accepts
+the cancel — but that only changed the symptom (no more `BAD_REQUEST`), surfacing Gap C.
+
+### Gap C — tokeira resolved the caller op on cancel-ack; v1.31.0 decouples it (LANDED)
+
+After Gap B, `wait-cancel` still failed: `fut.Get()` returned **nil** (the op resolved as a
+*success*). Temporary tracing showed the caller op was resolved twice — first `Canceled` from
+the **cancel-ack** (`respond_nexus_task_completed` → `proto_response_to_resolution`'s
+`CancelOperation` arm), then `Canceled` again from the genuine completion when the backing
+workflow closed canceled. Two ground-truthed divergences from v1.31.0:
+
+1. **Cancel-ack must not resolve the operation.** v1.31.0 `EventCancelationSucceeded`
+   (`components/nexusoperations/statemachine.go:671 @ v1.31.0`) only advances the *cancelation*
+   sub-machine; the operation resolves solely via its completion (`GetNexusCompletion`), and a
+   completion that already resolved the op wins over a later cancel (`statemachine.go:424`).
+   Fix: `proto_response_to_resolution` returns `Option<NexusResolution>` and yields `None` for a
+   `CancelOperation` response (ack only); the External cancel path likewise no longer submits
+   `NexusResolution::Canceled` (`publisher.rs`). The op resolves only when the backing workflow
+   closes.
+2. **The `NexusOperationCanceled` event must carry a failure.** Even resolved via the completion,
+   tokeira's canceled event had no `failure`, so the SDK's `fut.Get` saw no error and returned
+   nil. v1.31.0 records `NexusOperationCanceledEventAttributes.Failure =
+   createNexusOperationFailure(op, eventID, CanceledFailureInfo)`
+   (`components/nexusoperations/completion.go:88-104 @ v1.31.0`). Fix: carry
+   endpoint/service/operation/operation_token on the `NexusOperationCanceled` kernel event (as
+   `NexusOperationTimedOut` already does) and have the history serializer build the outer
+   `NexusOperationFailureInfo` with a `CanceledFailureInfo` cause. `fut.Get` then returns a
+   `NexusOperationError` wrapping a `CanceledError`.
+
+(See the sibling kernel work for `StartOperation` retry state in `.kiro/specs/nexus-retry-policy`.)
+
+**This is contract-matching, not a tokeira invention.** v1.31.0 persists the handler's
+operation token in the NexusOperation **mutable-state machine data**, not only on the
+`NexusOperationStarted` event — so cancel/get read it from state. tokeira must store it on the
+`PendingNexusOperation` for the same reason: the runtime cancel path works off the projected run
+state, which carries no history events. `operation_token` is `#[serde(default)]` (additive
+read-compat). Note: tokeira already uses the operation id as the async token for the
+`TimedOut`/`Canceled` events when the handler issued none (`kernel.rs:1966-1971`); storing the
+real handler token makes those faithful too.

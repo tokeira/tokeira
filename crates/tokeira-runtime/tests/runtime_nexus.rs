@@ -766,6 +766,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             service,
             operation,
             operation_id,
+            ..
         } => {
             assert_eq!(service, "charge");
             assert_eq!(operation, "authorize");
@@ -974,6 +975,7 @@ proptest! {
                     service: actual_service,
                     operation: actual_operation,
                     operation_id: actual_operation_id,
+                    ..
                 } => {
                     prop_assert_eq!(actual_service, expected_service);
                     prop_assert_eq!(actual_operation, expected_operation);
@@ -1396,6 +1398,9 @@ proptest! {
             operation_id,
             scheduled_event_id,
             request_id,
+            endpoint: String::new(),
+            service: String::new(),
+            operation: String::new(),
         };
         let encoded = token.encode().expect("encode succeeds");
         // The wire envelope is a `{v,d}` JSON object (mirrors callback_token.go @ v1.31.0).
@@ -1417,6 +1422,9 @@ fn completion_token_decode_rejects_wrong_version() {
         operation_id: "op".into(),
         scheduled_event_id: 12,
         request_id: "req".into(),
+        endpoint: String::new(),
+        service: String::new(),
+        operation: String::new(),
     };
     // Hand-roll an envelope with a bumped version but valid data.
     let inner = serde_json::to_vec(&token).expect("serialize inner");
@@ -1647,6 +1655,9 @@ async fn completion_callback_delivered_on_close_succeeds() -> Result<()> {
         operation_id: "op-async".to_string(),
         scheduled_event_id: 7,
         request_id: "op-async".to_string(),
+        endpoint: String::new(),
+        service: String::new(),
+        operation: String::new(),
     }
     .encode()
     .expect("encode token");
@@ -1713,6 +1724,9 @@ async fn completion_callback_fires_with_lowercased_token_header() -> Result<()> 
         operation_id: "op-lower".to_string(),
         scheduled_event_id: 11,
         request_id: "op-lower".to_string(),
+        endpoint: String::new(),
+        service: String::new(),
+        operation: String::new(),
     }
     .encode()
     .expect("encode token");
@@ -1784,6 +1798,9 @@ async fn completion_callback_failed_close_delivers_failed_state() -> Result<()> 
         operation_id: "op-fail".to_string(),
         scheduled_event_id: 9,
         request_id: "op-fail".to_string(),
+        endpoint: String::new(),
+        service: String::new(),
+        operation: String::new(),
     }
     .encode()
     .expect("encode token");
@@ -1834,6 +1851,9 @@ async fn completion_callback_retryable_backs_off_then_scanner_refires() -> Resul
         operation_id: "op-retry".to_string(),
         scheduled_event_id: 5,
         request_id: "op-retry".to_string(),
+        endpoint: String::new(),
+        service: String::new(),
+        operation: String::new(),
     }
     .encode()
     .expect("encode token");
@@ -1898,6 +1918,9 @@ async fn sweep_rebuilds_backing_off_completion_callbacks() -> Result<()> {
         operation_id: "op-sweep".to_string(),
         scheduled_event_id: 3,
         request_id: "op-sweep".to_string(),
+        endpoint: String::new(),
+        service: String::new(),
+        operation: String::new(),
     }
     .encode()
     .expect("encode token");
@@ -1957,6 +1980,9 @@ async fn completion_callback_non_retryable_delivery_fails_terminally() -> Result
         operation_id: "op-nonretry".to_string(),
         scheduled_event_id: 4,
         request_id: "op-nonretry".to_string(),
+        endpoint: String::new(),
+        service: String::new(),
+        operation: String::new(),
     }
     .encode()
     .expect("encode token");
@@ -2036,6 +2062,9 @@ async fn completion_callback_exhausts_max_attempts_to_failed() -> Result<()> {
         operation_id: "op-exhaust".to_string(),
         scheduled_event_id: 6,
         request_id: "op-exhaust".to_string(),
+        endpoint: String::new(),
+        service: String::new(),
+        operation: String::new(),
     }
     .encode()
     .expect("encode token");

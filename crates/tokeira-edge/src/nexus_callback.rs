@@ -134,9 +134,21 @@ pub async fn handle_nexus_callback(
                 }
             };
             if state == "failed" {
-                NexusResolution::Failed {
-                    failure: failure_body.failure,
-                }
+                // Wrap the handler's failure (the cause) in a NexusOperationFailureInfo so
+                // the caller decodes a NexusOperationError, exactly as the worker
+                // handler-error and External start paths do — storing it raw would surface
+                // only the inner ApplicationError/Terminated/Timeout. The operation target
+                // rides on the (opaque, version-checked) completion token, so no run load is
+                // needed here. v1.31.0 createNexusOperationFailure.
+                let cause =
+                    tokeira_proto::conversions::common::payload_to_failure(&failure_body.failure);
+                crate::translate::nexus::wrap_handler_failure_as_resolution(
+                    cause,
+                    token.endpoint.clone(),
+                    token.service.clone(),
+                    token.operation.clone(),
+                    token.scheduled_event_id,
+                )
             } else {
                 NexusResolution::Canceled
             }

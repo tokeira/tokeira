@@ -813,6 +813,11 @@ where
                         operation_id: operation_id.clone(),
                         scheduled_event_id,
                         request_id: operation_id.clone(),
+                        // Carried so the inbound completion handler can wrap a failed
+                        // completion in NexusOperationFailureInfo without loading the run.
+                        endpoint: endpoint_name.clone(),
+                        service: service.clone(),
+                        operation: operation.clone(),
                     };
                     let (callback_url, callback_token) = match token.encode() {
                         Ok(encoded) => (
@@ -913,16 +918,15 @@ where
 
         match &config.target {
             EndpointTarget::External { address } => {
-                // The cancel URL needs the operation *name* (not tokeira's
-                // operation id); resolve it from the pending operation. The token
-                // sent is tokeira's operation id — faithful handler-token
-                // persistence is a follow-up; the v1.31.0 conformance handler does
-                // not gate cancel on the token value.
-                let operation = match self
-                    .lookup_nexus_operation_name(originator_run_key, &operation_id)
+                // The cancel needs the operation *name* (not tokeira's operation id) and the
+                // handler-issued async token, both resolved from the pending op. The handler
+                // unmarshals the token (e.g. a WorkflowRunOperation token); fall back to
+                // tokeira's operation id only when the op never started (no handler token).
+                let (operation, operation_token) = match self
+                    .lookup_nexus_operation_cancel_target(originator_run_key, &operation_id)
                     .await
                 {
-                    Ok(Some(operation)) => operation,
+                    Ok(Some((operation, token))) => (operation, token),
                     Ok(None) => {
                         tracing::warn!(
                             originator_run_key = ?originator_run_key,
@@ -940,33 +944,30 @@ where
                         return;
                     }
                 };
+                let cancel_token = if operation_token.is_empty() {
+                    operation_id.clone()
+                } else {
+                    operation_token
+                };
                 let trace_headers = self.nexus_trace_headers();
                 match self
                     .nexus_client
-                    .cancel_operation(address, &service, &operation, &operation_id, &trace_headers)
+                    .cancel_operation(address, &service, &operation, &cancel_token, &trace_headers)
                     .await
                 {
                     Ok(()) => {
-                        let command = Command::NexusOperationResolved(
-                            tokeira_kernel::NexusOperationResolvedRequest {
-                                operation_id,
-                                scheduled_event_id,
-                                resolution: tokeira_kernel::NexusResolution::Canceled,
-                                now: OffsetDateTime::now_utc(),
-                            },
+                        // A successful cancel request is only an ack; it must NOT resolve the
+                        // operation. v1.31.0 decouples cancel-ack from resolution — the
+                        // operation resolves via its completion when the handler closes it
+                        // (EventCancelationSucceeded only advances the cancelation sub-machine,
+                        // statemachine.go:671; a completion that already resolved the op wins,
+                        // statemachine.go:424). The inbound /nexus/callback delivers that
+                        // completion.
+                        tracing::debug!(
+                            originator_run_key = ?originator_run_key,
+                            scheduled_event_id,
+                            "nexus cancel request acked; awaiting completion to resolve the operation"
                         );
-                        if let Err(error) = self
-                            .pick_lane(originator_run_key)
-                            .submit(originator_run_key, command)
-                            .await
-                        {
-                            tracing::warn!(
-                                ?error,
-                                originator_run_key = ?originator_run_key,
-                                scheduled_event_id,
-                                "failed to deliver NexusOperationResolved(Canceled) to originator"
-                            );
-                        }
                     }
                     Err(error) => {
                         tracing::debug!(
@@ -982,11 +983,11 @@ where
                 namespace_id,
                 task_queue,
             } => {
-                let operation = match self
-                    .lookup_nexus_operation_name(originator_run_key, &operation_id)
+                let (operation, operation_token) = match self
+                    .lookup_nexus_operation_cancel_target(originator_run_key, &operation_id)
                     .await
                 {
-                    Ok(Some(operation)) => operation,
+                    Ok(Some((operation, token))) => (operation, token),
                     Ok(None) => {
                         tracing::warn!(
                             originator_run_key = ?originator_run_key,
@@ -1005,6 +1006,13 @@ where
                         return;
                     }
                 };
+                // The handler unmarshals the async token (e.g. a WorkflowRunOperation
+                // token); fall back to tokeira's operation id only for a not-yet-started op.
+                let cancel_token = if operation_token.is_empty() {
+                    operation_id.clone()
+                } else {
+                    operation_token
+                };
                 let task = NexusTask {
                     token: NexusTaskToken {
                         run_key: originator_run_key,
@@ -1015,6 +1023,7 @@ where
                         service,
                         operation_id,
                         operation,
+                        operation_token: cancel_token,
                     },
                 };
                 self.nexus_broker
@@ -1024,16 +1033,19 @@ where
         }
     }
 
-    async fn lookup_nexus_operation_name(
+    /// The pending op's (operation name, handler async token) for a cancel dispatch. The
+    /// token is what a WorkflowRunOperation handler unmarshals; it is empty until the op
+    /// started, so callers fall back to tokeira's operation id.
+    async fn lookup_nexus_operation_cancel_target(
         &self,
         run_key: RunKey,
         operation_id: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, String)>> {
         match self.repo.load_run(run_key).await? {
             LoadedRun::Existing(state) => Ok(state
                 .pending_nexus_operations
                 .get(operation_id)
-                .map(|pending| pending.operation.clone())),
+                .map(|pending| (pending.operation.clone(), pending.operation_token.clone()))),
             LoadedRun::Absent => Ok(None),
         }
     }

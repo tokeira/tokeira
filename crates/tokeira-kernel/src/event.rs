@@ -477,6 +477,18 @@ pub enum HistoryEventKind {
     NexusOperationCanceled {
         operation_id: String,
         scheduled_event_id: i64,
+        /// Endpoint/service/operation identity, carried so the edge can build the
+        /// outer `NexusOperationExecutionFailureInfo` whose cause is a
+        /// `CanceledFailureInfo` (`createNexusOperationFailure` + the
+        /// `OperationStateCanceled` branch, `components/nexusoperations/completion.go:88-104
+        /// @ v1.31.0`). Without this wrapper the caller's `fut.Get` sees no failure and
+        /// returns nil instead of a `NexusOperationError` wrapping `CanceledError`.
+        endpoint: String,
+        service: String,
+        operation: String,
+        /// Async operation token if the operation had started; empty otherwise,
+        /// matching v1.31.0's `op.OperationToken`.
+        operation_token: String,
     },
     /// The Nexus operation exceeded its timeout.
     NexusOperationTimedOut {

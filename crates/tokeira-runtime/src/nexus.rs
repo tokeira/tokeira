@@ -627,6 +627,18 @@ pub struct NexusCompletionToken {
     pub scheduled_event_id: i64,
     /// Originating request ID (wire-parity with `NexusOperationCompletion.request_id`).
     pub request_id: String,
+    /// Caller-side operation target, carried so the inbound `/nexus/callback` handler can
+    /// wrap a failed completion in a `NexusOperationFailureInfo` (so the caller decodes a
+    /// `NexusOperationError`) without loading the run — it works off `runtime` only. Opaque
+    /// and integrity-bound: read like the rest of the token (decode + version check), never
+    /// an operator-forgeable input. `#[serde(default)]` keeps decode tolerant of tokens
+    /// minted before this field existed.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub service: String,
+    #[serde(default)]
+    pub operation: String,
 }
 
 /// Outer `{v,d}` envelope. Mirrors `CallbackToken { Version int json:"v"; Data string
@@ -821,6 +833,10 @@ pub enum NexusTaskRequest {
         service: String,
         operation: String,
         operation_id: String,
+        /// Handler-issued async operation token, sent as the wire `operation_token` so a
+        /// WorkflowRunOperation handler can unmarshal it. Falls back to `operation_id` when
+        /// the op never started (no handler token).
+        operation_token: String,
     },
 }
 
@@ -1541,6 +1557,7 @@ mod tests {
                         service: "svc".to_string(),
                         operation: "cancel".to_string(),
                         operation_id: first_operation.clone(),
+                        operation_token: String::new(),
                     },
                 };
                 let second = NexusTask {
@@ -1553,6 +1570,7 @@ mod tests {
                         service: "svc".to_string(),
                         operation: "cancel".to_string(),
                         operation_id: second_operation.clone(),
+                        operation_token: String::new(),
                     },
                 };
                 let third = NexusTask {
@@ -1565,6 +1583,7 @@ mod tests {
                         service: "svc".to_string(),
                         operation: "cancel".to_string(),
                         operation_id: third_operation.clone(),
+                        operation_token: String::new(),
                     },
                 };
 

@@ -5753,8 +5753,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn respond_nexus_task_completed_kernel_rejection_returns_success() {
-        let runtime = Arc::new(NexusRecordingRuntime::new(false));
+    async fn respond_nexus_task_completed_cancel_ack_does_not_resolve() {
+        // v1.31.0 decouples cancel-ack from operation resolution: EventCancelationSucceeded
+        // (components/nexusoperations/statemachine.go:671) only advances the cancelation
+        // sub-machine. A CancelOperation response is acked but resolves NO operation — the op
+        // resolves solely via its completion when the backing workflow closes. (The
+        // kernel-rejection-is-swallowed behaviour is covered for the failed path by
+        // respond_nexus_task_failed_kernel_rejection_returns_success.)
+        let runtime = Arc::new(NexusRecordingRuntime::new(true));
         let (grpc, _broker) = nexus_test_service(runtime.clone());
 
         let token = NexusTaskToken {
@@ -5777,9 +5783,13 @@ mod tests {
             },
         ))
         .await
-        .expect("kernel rejection should be swallowed");
+        .expect("cancel-ack is acked");
 
-        assert_eq!(runtime.recorded().len(), 1);
+        assert_eq!(
+            runtime.recorded().len(),
+            0,
+            "cancel-ack must not resolve the operation"
+        );
     }
 
     #[tokio::test]

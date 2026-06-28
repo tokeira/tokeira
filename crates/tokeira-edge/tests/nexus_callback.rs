@@ -234,6 +234,9 @@ fn encoded_token(run_key: RunKey, operation_id: &str, scheduled_event_id: i64) -
         operation_id: operation_id.to_string(),
         scheduled_event_id,
         request_id: "req-1".to_string(),
+        endpoint: "endpoint".to_string(),
+        service: "service".to_string(),
+        operation: "operation".to_string(),
     }
     .encode()
     .expect("token encodes")
@@ -283,7 +286,7 @@ async fn succeeded_completion_resolves_and_returns_200() {
 }
 
 #[tokio::test]
-async fn failed_completion_forwards_failure_payload_and_returns_200() {
+async fn failed_completion_wraps_failure_and_returns_200() {
     let runtime = FakeRuntime::new(Behavior::Accepted);
     let token = encoded_token(RunKey::new(), "op-2", 11);
 
@@ -301,7 +304,21 @@ async fn failed_completion_forwards_failure_payload_and_returns_200() {
     assert_eq!(calls.len(), 1);
     match &calls[0].3 {
         NexusResolution::Failed { failure } => {
-            assert_eq!(failure.data, b"failure-detail");
+            // Gap A: the handler failure is wrapped in a NexusOperationFailureInfo (so the
+            // caller decodes a NexusOperationError) and re-encoded as temporal/failure+proto
+            // — NOT forwarded as the raw json/plain completion payload. The wrapper's
+            // structure is asserted in translate::nexus tests and end-to-end by the
+            // TestNexusAsyncOperationErrorRehydration conformance leaf.
+            assert_eq!(
+                failure.metadata.get("encoding").map(String::as_str),
+                Some("temporal/failure+proto"),
+                "completion failure must be wrapped as a temporal failure, got {:?}",
+                failure.metadata
+            );
+            assert_ne!(
+                failure.data, b"failure-detail",
+                "failure must be wrapped, not the raw forwarded payload"
+            );
         }
         other => panic!("failed → Failed, got {other:?}"),
     }

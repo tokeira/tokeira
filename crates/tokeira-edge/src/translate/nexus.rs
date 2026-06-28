@@ -190,6 +190,7 @@ pub fn nexus_task_to_proto_request(
             service,
             operation,
             operation_id,
+            operation_token,
         } => Ok(nexus_v1::Request {
             header: BTreeMap::new(),
             scheduled_time: None,
@@ -201,24 +202,36 @@ pub fn nexus_task_to_proto_request(
                 nexus_v1::CancelOperationRequest {
                     service: service.clone(),
                     operation: operation.clone(),
+                    // Deprecated wire field keeps tokeira's operation id; the modern
+                    // operation_token carries the handler-issued async token so a
+                    // WorkflowRunOperation handler can unmarshal it.
                     operation_id: operation_id.clone(),
-                    operation_token: operation_id.clone(),
+                    operation_token: operation_token.clone(),
                 },
             )),
         }),
     }
 }
 
+/// Translate a worker's `RespondNexusTaskCompleted` response into a caller-op resolution.
+///
+/// Returns `None` for a `CancelOperation` response: a cancel-ack does NOT resolve the
+/// operation. v1.31.0 decouples the two — `EventCancelationSucceeded`
+/// (`components/nexusoperations/statemachine.go:671 @ v1.31.0`) only advances the cancelation
+/// sub-machine; the operation resolves solely via its completion when the backing workflow
+/// closes (`GetNexusCompletion`), and a completion that already resolved the op wins over a
+/// later cancel (`statemachine.go:424`). Resolving on cancel-ack would race the completion
+/// and emit a caller resolution the SDK does not expect.
 pub fn proto_response_to_resolution(
     response: nexus_v1::Response,
     expected_operation_id: &str,
     op: &NexusOperationContext,
-) -> Result<NexusResolution, NexusTranslateError> {
+) -> Result<Option<NexusResolution>, NexusTranslateError> {
     match response.variant {
         Some(nexus_v1::response::Variant::StartOperation(start)) => {
-            proto_start_response_to_resolution(start, expected_operation_id, op)
+            proto_start_response_to_resolution(start, expected_operation_id, op).map(Some)
         }
-        Some(nexus_v1::response::Variant::CancelOperation(_)) => Ok(NexusResolution::Canceled),
+        Some(nexus_v1::response::Variant::CancelOperation(_)) => Ok(None),
         None => Err(NexusTranslateError::MissingField("response.variant")),
     }
 }
@@ -861,6 +874,7 @@ mod tests {
                 service: service.clone(),
                 operation: operation.clone(),
                 operation_id: operation_id.clone(),
+                operation_token: operation_id.clone(),
             };
 
             let proto = nexus_task_to_proto_request(&request).expect("translation should succeed");
@@ -903,7 +917,10 @@ mod tests {
                     },
                 )),
             };
-            match proto_response_to_resolution(sync, &operation_id, &NexusOperationContext::default()).expect("sync success") {
+            match proto_response_to_resolution(sync, &operation_id, &NexusOperationContext::default())
+                .expect("sync success")
+                .expect("sync success resolves the op")
+            {
                 NexusResolution::Completed { result, .. } => {
                     prop_assert_eq!(result.0.len(), 1);
                     prop_assert_eq!(result.0[0].data.clone(), payload_bytes.clone());
@@ -926,10 +943,10 @@ mod tests {
             };
             prop_assert_eq!(
                 proto_response_to_resolution(async_response, &operation_id, &NexusOperationContext::default()).expect("async success"),
-                NexusResolution::Started {
+                Some(NexusResolution::Started {
                     operation_token: operation_id.clone(),
                     links: Vec::new()
-                }
+                })
             );
 
             let cancel = nexus_v1::Response {
@@ -937,9 +954,11 @@ mod tests {
                     nexus_v1::CancelOperationResponse {},
                 )),
             };
+            // A cancel-ack does not resolve the operation (v1.31.0 decouples cancel-ack from
+            // resolution; the op resolves via its completion).
             prop_assert_eq!(
                 proto_response_to_resolution(cancel, &operation_id, &NexusOperationContext::default()).expect("cancel"),
-                NexusResolution::Canceled
+                None
             );
 
             let handler_error = nexus_v1::HandlerError {

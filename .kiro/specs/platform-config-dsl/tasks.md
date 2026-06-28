@@ -33,9 +33,9 @@ unit tests are example-based; the property-based tests the design mandates are t
 - [x] 4. Type checker (core); follow-ups extend it
   - [x] 4.1 Sum-variant validation (input defaults + match arms) _Requirements: 5.1, 5.2_
   - [x] 4.2 Output-reference validation (`<resource>.<output>`, `<module>.<resource>.<output>`) _Requirements: 15.3_
-  - [ ] 4.3 Per-field value typing against kind field types _Requirements: 3.2, 5.1_
-  - [ ] 4.4 `Secret<T>` taint flow (no diagnostic leak; only into secret-accepting params) _Requirements: 12.3_
-  - [ ] 4.5 Validation-parity constraints (canonical ports, cpu/memory pairing) _Requirements: 5.1_
+  - [x] 4.3 Per-field value typing against kind field types _Requirements: 3.2, 5.1_
+  - [x] 4.4 `Secret<T>` taint flow (no diagnostic leak; only into secret-accepting params) _Requirements: 12.3_
+  - [x] 4.5 Validation-parity constraints (canonical ports, cpu/memory pairing) _Requirements: 5.1_
 - [x] 5. Evaluator → neutral `Composition` IR
   - [x] 5.1 Inputs (defaults/overrides; required-unbound error), lets _Requirements: 8.3_
   - [x] 5.2 Conditional module presence (`when`), `match` with payload binding _Requirements: 5.2_
@@ -52,14 +52,14 @@ unit tests are example-based; the property-based tests the design mandates are t
   - [x] 7.3 Author the canonical compose `.platform` definition shipped in `platforms/compose-dsl` — the
         platform author's structural artifact (parity with the current `ComposeConfig`-driven compose),
         using the modular `use` layout (task 6). Not a generated starter; checked into the platform crate _Requirements: 10.1, 10.2, 16.1_
-- [ ] 8. `compose-dsl` `Deployment`/`Ops` impl (in-memory compose case)
-  - [~] 8.1 `ComposeDslConfig` plan (translate at load); `Deployment` reads it infallibly
-  - [~] 8.2 `infra_modules`/`services` from the plan; bootstrap local-state module
-  - [~] 8.3 `register_infra_extensions` connects `ComposePlatform`; local state backends
-  - [~] 8.4 `Ops` valid_services + desired_replicas from the plan
-  - [ ] 8.5 Verify build + tests; remove the unused `StorageKind` import + silencer (cleanup)
+- [x] 8. `compose-dsl` `Deployment`/`Ops` impl (in-memory compose case)
+  - [x] 8.1 `ComposeDslConfig` plan (translate at load); `Deployment` reads it infallibly
+  - [x] 8.2 `infra_modules`/`services` from the plan; bootstrap local-state module
+  - [x] 8.3 `register_infra_extensions` connects `ComposePlatform`; local state backends
+  - [x] 8.4 `Ops` valid_services + desired_replicas from the plan
+  - [x] 8.5 Verify build + tests; remove the unused `StorageKind` import + silencer (cleanup)
 - [ ] 9. Deferred kind→resource realization
-  - [ ] 9.1 `ObservabilityConfigFiles` → config-files resource (REAL GAP: observability services currently
+  - [x] 9.1 `ObservabilityConfigFiles` → config-files resource (REAL GAP: observability services currently
         mount config files that are never generated) _Requirements: 10.1, 10.2_
   - [ ] 9.2 DSQL infra: `DsqlCluster` + two `DynamoDbTable` coordination tables (storage=dsql) _Requirements: 10.1_
   - [ ] 9.3 Images: `Build`/`Mirror` → deploy-engine `Image`s _Requirements: 10.1_
@@ -153,10 +153,11 @@ unit tests are example-based; the property-based tests the design mandates are t
   Task 15 pins the previously-implicit on-disk *layout contract* those tasks all rely on — the
   root-definition filename, the depth-≤-1 rule, and the retained `(relative_path, sha256)` file set —
   so the contract has one authoritative home rather than being inferred from the read/loader code.
-- **The real gap in task 8 is 9.1.** `deployment.rs` skips every non-`ComposeService` item, so
-  `ObservabilityConfigFiles` is not realized and observability services mount config files that were never
-  generated. "In-memory compose works" currently means bare services + `tokeirad`, not a full
-  observability stack. Prioritise 9.1.
+- **Task 8 + 9.1 are complete and verified** (12 passing tests, clippy + nightly-fmt clean). Earlier this
+  note flagged 9.1 as the real gap in task 8 — `deployment.rs` now realizes `ObservabilityConfigFiles`
+  via `DslOwnedResource`, so in-memory compose stands up the full observability stack, not just bare
+  services + `tokeirad`. The remaining realization gaps are 9.2 (DSQL infra), 9.3 (images), 9.4
+  (writeback), and 9.5 (Ops verbs).
 - **RuntimeContext precedence (Req 14.8/14.9) is settled in the spec:** recorded identity values
   (`region`, `account`) are authoritative; ambient machine-local values (`deployment_dir`, `home`) are
   host-supplied and unpersisted; a host value conflicting with a recorded identity value requires explicit

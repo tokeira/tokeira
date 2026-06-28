@@ -1,0 +1,36 @@
+{
+  "name": "tokeira-platform-dsl",
+  "displayName": "Tokeira Platform DSL",
+  "description": "Syntax highlighting and editing support for tokeira .platform deployment definition files.",
+  "version": "0.1.0",
+  "publisher": "tokeira",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "platform",
+        "aliases": [
+          "Tokeira Platform DSL",
+          "platform"
+        ],
+        "extensions": [
+          ".platform"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "platform",
+        "scopeName": "source.platform",
+        "path": "./syntaxes/platform.tmLanguage.json"
+      }
+    ]
+  }
+}

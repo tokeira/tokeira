@@ -13,6 +13,8 @@ tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokeira-iac = { workspace = true }
 tokeira-deploy-engine = { workspace = true }
 tokeira-state = { workspace = true }
+tokeira-aws = { workspace = true }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }

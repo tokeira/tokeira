@@ -58,13 +58,13 @@ unit tests are example-based; the property-based tests the design mandates are t
   - [x] 8.3 `register_infra_extensions` connects `ComposePlatform`; local state backends
   - [x] 8.4 `Ops` valid_services + desired_replicas from the plan
   - [x] 8.5 Verify build + tests; remove the unused `StorageKind` import + silencer (cleanup)
-- [ ] 9. Deferred kind→resource realization
+- [x] 9. Deferred kind→resource realization
   - [x] 9.1 `ObservabilityConfigFiles` → config-files resource (REAL GAP: observability services currently
         mount config files that are never generated) _Requirements: 10.1, 10.2_
-  - [ ] 9.2 DSQL infra: `DsqlCluster` + two `DynamoDbTable` coordination tables (storage=dsql) _Requirements: 10.1_
-  - [ ] 9.3 Images: `Build`/`Mirror` → deploy-engine `Image`s _Requirements: 10.1_
-  - [ ] 9.4 Writeback resolution: `collect_writeback` from provisioned state _Requirements: 10.2_
-  - [ ] 9.5 `Ops` scale/logs/port_mappings for compose-dsl
+  - [x] 9.2 DSQL infra: `DsqlCluster` + two `DynamoDbTable` coordination tables (storage=dsql) _Requirements: 10.1_
+  - [x] 9.3 Images: `Build`/`Mirror` → deploy-engine `Image`s _Requirements: 10.1_
+  - [x] 9.4 Writeback resolution: `collect_writeback` from provisioned state _Requirements: 10.2_
+  - [x] 9.5 `Ops` scale/logs/port_mappings for compose-dsl
 - [ ] 10. RuntimeContext precedence (recorded vs ambient)
   - [ ] 10.1 Identity-bearing recorded values authoritative; ambient conflict → confirm _Requirements: 14.8_
   - [ ] 10.2 Machine-local ambient values host-supplied, never persisted _Requirements: 14.9_

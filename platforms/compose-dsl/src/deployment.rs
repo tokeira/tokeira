@@ -15,17 +15,33 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
+use tokeira_aws::{
+    AwsClients, ResourceContext,
+    resources::{
+        dsql_cluster::{DsqlCluster, DsqlClusterConfig, DsqlClusterMode},
+        dynamodb_table::{
+            AttributeType, BillingMode, DynamoDbTable, DynamoDbTableConfig, KeyAttribute, KeyType,
+        },
+    },
+};
 use tokeira_compose::{ComposePlatform, ComposeService};
 use tokeira_compose_deployment::observability_config::{
     ObservabilityConfigFilesResource, ObservabilityParams,
 };
-use tokeira_deploy_engine::{self as deploy_engine, DeployError};
+use tokeira_deploy_engine::{
+    self as deploy_engine, DeployError, DesiredImageRef, ImageContext, ImageSourceType,
+    RuntimeError,
+};
 use tokeira_iac::{
-    self as iac, IacError, ProvisionContext, ResourceId, ResourceState, ResourceType,
+    self as iac, IacError, InfraState, ProvisionContext, ResourceId, ResourceState, ResourceType,
 };
 use tokeira_orchestrator::{Deployment, Ops, PortMapping, Result, ServiceReplicas};
-use tokeira_platform_dsl::{Composition, ItemRole, RuntimeContext, value::LoweredItem};
+use tokeira_platform_dsl::{
+    Composition, ItemRole, RuntimeContext,
+    value::{LoweredImage, LoweredItem, LoweredWriteback, OutputRef, Value},
+};
 use tokeira_state::{LocalBackend, StateBackend};
 
 use crate::{
@@ -40,9 +56,10 @@ const LOCAL_STATE_MODULE: &str = "local_state";
 /// One realized item in a module's plan.
 ///
 /// Built once at config load (where translation errors surface), then rebuilt
-/// into concrete `iac` resources by the trait methods. `ObservabilityParams`
-/// and `ComposeService` are both `Clone`, so the plan is `Clone` as the
-/// `Deployment::Config` bound requires.
+/// into concrete `iac` resources by the trait methods. Every payload is `Clone`
+/// and `Debug`, so the plan is `Clone` as the `Deployment::Config` bound needs;
+/// the concrete `iac` resources (which are not `Clone`) are reconstructed from
+/// these primitives in `resources()`, not stored.
 #[derive(Debug, Clone)]
 enum ItemPlan {
     /// A compose service (→ infra resource + deploy-engine service).
@@ -56,6 +73,26 @@ enum ItemPlan {
     Observability {
         id: String,
         params: ObservabilityParams,
+        depends_on: Vec<String>,
+    },
+    /// An Aurora DSQL cluster, realized via the compiled `tokeira-aws`
+    /// `DsqlCluster` resource — the DSL declares intent, not provider behaviour
+    /// (Req 2). Fields carry the evaluated DSL values.
+    DsqlCluster {
+        id: String,
+        region: String,
+        mode: String,
+        endpoint: Option<String>,
+        arn: Option<String>,
+        depends_on: Vec<String>,
+    },
+    /// A DynamoDB coordination table (rate-limiter or connection-lease), realized
+    /// via the compiled `tokeira-aws` `DynamoDbTable` resource.
+    DynamoDbTable {
+        id: String,
+        table_name: String,
+        hash_key: String,
+        ttl: Option<String>,
         depends_on: Vec<String>,
     },
 }
@@ -78,6 +115,26 @@ pub struct ComposeDslConfig {
     /// The compose project name (container/label prefix).
     pub project_name: String,
     modules: Vec<ModulePlan>,
+    /// The AWS region for DSQL, when the composition selected DSQL storage
+    /// (taken from the `DsqlCluster` item). `None` for in-memory deployments;
+    /// gates AWS client registration.
+    dsql_region: Option<String>,
+    /// Declarative writeback targets (dotted config key → resource output) the
+    /// composition produced; resolved from provisioned state in `collect_writeback`.
+    writeback: Vec<LoweredWriteback>,
+    /// Declared images (Build/Mirror), realized into deploy-engine images.
+    images: Vec<DslImagePlan>,
+}
+
+/// A realized image declaration: name, how it is produced, and the refs.
+#[derive(Debug, Clone)]
+struct DslImagePlan {
+    name: String,
+    /// `Build` or `Mirror` (the DSL image kind).
+    build: bool,
+    repository: String,
+    /// Upstream ref for a mirror; `None` for a local build.
+    upstream: Option<String>,
 }
 
 impl ComposeDslConfig {
@@ -103,6 +160,7 @@ impl ComposeDslConfig {
     ) -> std::result::Result<Self, DslError> {
         let project_name = project_name.into();
         let mut modules = Vec::new();
+        let mut dsql_region = None;
         for module in &composition.modules {
             // The bootstrap local-state module is provided by the engine; skip a
             // same-named module from the definition to keep module names unique.
@@ -123,7 +181,37 @@ impl ComposeDslConfig {
                             depends_on: item.depends_on.clone(),
                         });
                     }
-                    // DSQL / DynamoDB / image kinds are not yet realized (tasks 9.2–9.3).
+                    (ItemRole::Resource, "DsqlCluster") => {
+                        let region = required_str_field(item, "region")?;
+                        // The region the cluster declares is also the region the
+                        // AWS clients authenticate against (register_infra_extensions).
+                        dsql_region = Some(region.clone());
+                        items.push(ItemPlan::DsqlCluster {
+                            id: item.id.clone(),
+                            region,
+                            mode: optional_str_field(item, "mode")
+                                .unwrap_or_else(|| "Managed".to_string()),
+                            endpoint: optional_str_field(item, "endpoint"),
+                            arn: optional_str_field(item, "arn"),
+                            depends_on: item.depends_on.clone(),
+                        });
+                    }
+                    (ItemRole::Resource, "DynamoDbTable") => {
+                        // Table name mirrors the compose convention
+                        // `<project>-dsql-<id>` (dashes), so a DSQL deployment's
+                        // coordination tables are named consistently.
+                        items.push(ItemPlan::DynamoDbTable {
+                            table_name: format!(
+                                "{project_name}-dsql-{}",
+                                item.id.replace('_', "-")
+                            ),
+                            id: item.id.clone(),
+                            hash_key: required_str_field(item, "hash_key")?,
+                            ttl: optional_str_field(item, "ttl"),
+                            depends_on: item.depends_on.clone(),
+                        });
+                    }
+                    // Image kinds are realized in `images()`, not as module resources.
                     _ => {}
                 }
             }
@@ -137,6 +225,18 @@ impl ComposeDslConfig {
             deployment_dir: deployment_dir.to_path_buf(),
             project_name,
             modules,
+            dsql_region,
+            writeback: composition.writeback.clone(),
+            images: composition
+                .images
+                .iter()
+                .map(|image| DslImagePlan {
+                    name: image.name.clone(),
+                    build: image.kind == "Build",
+                    repository: image_str_field(image, "repository").unwrap_or_default(),
+                    upstream: image_str_field(image, "upstream"),
+                })
+                .collect(),
         })
     }
 
@@ -149,6 +249,28 @@ impl ComposeDslConfig {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Find a declared compose service by name (used by `Ops`).
+    fn service(&self, name: &str) -> Option<&ComposeService> {
+        self.modules
+            .iter()
+            .flat_map(|m| m.items.iter())
+            .find_map(|item| match item {
+                ItemPlan::Service { service, .. } if service.name == name => Some(service),
+                _ => None,
+            })
+    }
+
+    /// Connect a [`ComposePlatform`] against this deployment's compose file.
+    ///
+    /// Unlike the base compose platform — whose `Ops` trait lacks the deployment
+    /// directory and so needs `*_with_dir` helpers — the DSL config carries
+    /// `deployment_dir`, so the `Ops` verbs resolve the compose file directly.
+    fn compose_platform(&self) -> Result<ComposePlatform> {
+        let compose_file = self.deployment_dir.join("docker-compose.yml");
+        ComposePlatform::connect(&compose_file, &self.project_name)
+            .map_err(|err| anyhow::anyhow!("failed to connect compose platform: {err}").into())
     }
 }
 
@@ -198,6 +320,8 @@ impl Deployment for ComposeDslDeployment {
                     name: module.name.clone(),
                     depends_on: leak_strs(module.depends_on.clone()),
                     deployment_dir: config.deployment_dir.clone(),
+                    project_name: config.project_name.clone(),
+                    region: config.dsql_region.clone(),
                     items: module.items.clone(),
                 }) as Box<dyn iac::Module>
             })
@@ -216,15 +340,27 @@ impl Deployment for ComposeDslDeployment {
                         deps: leak_strs(service.depends_on.clone()),
                     })
                         as Box<dyn deploy_engine::Service>),
-                    ItemPlan::Observability { .. } => None,
+                    // Only services become deploy-engine workloads; infra
+                    // resources (observability config, DSQL, tables) do not.
+                    _ => None,
                 })
             })
             .collect()
     }
 
-    fn images(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>> {
-        // Image declarations (Build/Mirror) are not yet realized — follow-up.
-        Vec::new()
+    fn images(&self, config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>> {
+        config
+            .images
+            .iter()
+            .map(|image| {
+                Box::new(DslImage {
+                    name: image.name.clone(),
+                    build: image.build,
+                    repository: image.repository.clone(),
+                    upstream: image.upstream.clone(),
+                }) as Box<dyn deploy_engine::Image>
+            })
+            .collect()
     }
 
     fn required_namespaces(&self, _config: &Self::Config) -> Vec<String> {
@@ -243,6 +379,25 @@ impl Deployment for ComposeDslDeployment {
             .map_err(|err| anyhow::anyhow!("failed to connect compose platform: {err}"))?;
         ctx.project_name = config.project_name.clone();
         ctx.set_extension(platform);
+
+        // Under DSQL storage the AWS resources read an `AwsClients` handle from
+        // the context. Verifying caller identity here fails fast with a clear
+        // remediation rather than deep inside a resource create (mirrors the
+        // compose platform's behaviour).
+        if let Some(region) = &config.dsql_region {
+            let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new(region.clone()))
+                .load()
+                .await;
+            let clients = AwsClients::new(&aws_config);
+            clients
+                .sts
+                .get_caller_identity()
+                .send()
+                .await
+                .context("AWS credentials required for DSQL storage; check `aws configure` or environment variables")?;
+            ctx.set_extension(clients);
+        }
         Ok(())
     }
 
@@ -278,12 +433,32 @@ impl Deployment for ComposeDslDeployment {
 
     fn collect_writeback(
         &self,
-        _config: &Self::Config,
-        _state: &iac::InfraState,
+        config: &Self::Config,
+        state: &iac::InfraState,
     ) -> Vec<(String, String)> {
-        // Writeback resolution from provisioned state is a follow-up.
-        Vec::new()
+        // Resolve each declarative writeback target from provisioned state. The
+        // realized resource is keyed `compose/<declared-id>` (DslOwnedResource
+        // imposes that id), so the output reference's resource name maps there
+        // regardless of its owning module. A target whose resource or output is
+        // not yet present is skipped (it has nothing to write).
+        config
+            .writeback
+            .iter()
+            .filter_map(|wb| resolve_output(state, &wb.source).map(|value| (wb.key.clone(), value)))
+            .collect()
     }
+}
+
+/// Resolve a writeback output reference to a concrete string from infra state.
+fn resolve_output(state: &InfraState, source: &OutputRef) -> Option<String> {
+    let id = ResourceId(format!("compose/{}", source.resource));
+    state
+        .resources
+        .get(&id)?
+        .properties
+        .get(&source.output)?
+        .as_str()
+        .map(str::to_string)
 }
 
 #[async_trait]
@@ -304,34 +479,77 @@ impl Ops for ComposeDslDeployment {
                     service: service.name.clone(),
                     replicas: *replicas,
                 }),
-                ItemPlan::Observability { .. } => None,
+                _ => None,
             })
             .collect()
     }
 
-    async fn scale_up(&self, _service: &str, _replicas: u32, _config: &Self::Config) -> Result<()> {
-        Err(anyhow::anyhow!("scale is not yet implemented for compose-dsl").into())
+    async fn scale_up(&self, service: &str, replicas: u32, config: &Self::Config) -> Result<()> {
+        let desired = config
+            .service(service)
+            .ok_or_else(|| anyhow::anyhow!(invalid_service_message(&self.valid_services, service)))?
+            .clone();
+        config
+            .compose_platform()?
+            .scale_service(&desired, replicas)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(())
     }
 
-    async fn scale_down(
-        &self,
-        _service: &str,
-        _replicas: u32,
-        _config: &Self::Config,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!("scale is not yet implemented for compose-dsl").into())
+    async fn scale_down(&self, service: &str, replicas: u32, config: &Self::Config) -> Result<()> {
+        let platform = config.compose_platform()?;
+        // Replicas are numbered containers `<service>-<n>` (the compose
+        // platform's scale convention); remove each in turn.
+        for replica in 0..replicas {
+            platform
+                .delete_service(&format!("{service}-{replica}"))
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
+        Ok(())
     }
 
-    async fn logs(&self, _service: &str, _config: &Self::Config) -> Result<Vec<String>> {
-        Err(anyhow::anyhow!("logs are not yet implemented for compose-dsl").into())
+    async fn logs(&self, service: &str, config: &Self::Config) -> Result<Vec<String>> {
+        if config.service(service).is_none() {
+            return Err(
+                anyhow::anyhow!(invalid_service_message(&self.valid_services, service)).into(),
+            );
+        }
+        config
+            .compose_platform()?
+            .logs(service)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(Into::into)
     }
 
     async fn port_mappings(
         &self,
-        _service: &str,
-        _config: &Self::Config,
+        service: &str,
+        config: &Self::Config,
     ) -> Result<Vec<PortMapping>> {
-        Err(anyhow::anyhow!("port mappings are not yet implemented for compose-dsl").into())
+        if config.service(service).is_none() {
+            return Err(
+                anyhow::anyhow!(invalid_service_message(&self.valid_services, service)).into(),
+            );
+        }
+        let mappings = config
+            .compose_platform()?
+            .port_mappings(service)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(mappings
+            .into_iter()
+            .map(
+                |(host_addr, host_port, container_port, protocol)| PortMapping {
+                    host_addr,
+                    host_port,
+                    container_port,
+                    protocol,
+                },
+            )
+            .collect())
     }
 }
 
@@ -369,6 +587,11 @@ struct DslModule {
     name: String,
     depends_on: Vec<&'static str>,
     deployment_dir: PathBuf,
+    /// Compose project name — the AWS resource tag/identity prefix for DSQL.
+    project_name: String,
+    /// The DSQL region (when this module realizes AWS resources); the AWS
+    /// `ResourceContext` requires it for both the cluster and its tables.
+    region: Option<String>,
     items: Vec<ItemPlan>,
 }
 
@@ -403,6 +626,43 @@ impl iac::Module for DslModule {
                         Box::new(ObservabilityConfigFilesResource::new(
                             self.deployment_dir.clone(),
                             params.clone(),
+                        )),
+                        id.clone(),
+                        depends_on.clone(),
+                    ),
+                    ItemPlan::DsqlCluster {
+                        id,
+                        region,
+                        mode,
+                        endpoint,
+                        arn,
+                        depends_on,
+                    } => (
+                        Box::new(dsql_cluster_resource(
+                            &self.project_name,
+                            &self.name,
+                            region,
+                            mode,
+                            endpoint.clone(),
+                            arn.clone(),
+                        )),
+                        id.clone(),
+                        depends_on.clone(),
+                    ),
+                    ItemPlan::DynamoDbTable {
+                        id,
+                        table_name,
+                        hash_key,
+                        ttl,
+                        depends_on,
+                    } => (
+                        Box::new(dynamodb_table_resource(
+                            &self.project_name,
+                            self.region.as_deref().unwrap_or("us-east-1"),
+                            &self.name,
+                            table_name,
+                            hash_key,
+                            ttl.clone(),
                         )),
                         id.clone(),
                         depends_on.clone(),
@@ -604,6 +864,76 @@ impl deploy_engine::Service for DslComposeWorkload {
     }
 }
 
+// ── deploy-engine image ───────────────────────────────────────────────
+
+/// A DSL image declaration (`Build`/`Mirror`) as a deploy-engine image.
+///
+/// `desired_ref` is computed from the DSL fields (repository + upstream), so the
+/// image refs are DSL-native and do not read a `ComposeConfig` extension the way
+/// the compiled compose images do. Writeback of a built ref into config is a
+/// host-runtime concern not modelled by the DSL image kinds, so
+/// `writeback_targets` is empty (the default).
+#[derive(Debug)]
+struct DslImage {
+    name: String,
+    build: bool,
+    repository: String,
+    upstream: Option<String>,
+}
+
+impl deploy_engine::Image for DslImage {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn source_type(&self) -> ImageSourceType {
+        if self.build {
+            ImageSourceType::Build
+        } else {
+            ImageSourceType::Mirror
+        }
+    }
+
+    fn desired_ref(
+        &self,
+        _ctx: &ImageContext,
+    ) -> std::result::Result<DesiredImageRef, RuntimeError> {
+        Ok(DesiredImageRef {
+            repository: self.repository.clone(),
+            // A build resolves to `latest`; a mirror takes the upstream's tag.
+            tag: self
+                .upstream
+                .as_deref()
+                .map(image_tag)
+                .unwrap_or_else(|| "latest".to_owned()),
+            upstream_ref: self.upstream.clone(),
+        })
+    }
+}
+
+/// Derive the tag from an upstream image ref, mirroring the compose platform's
+/// `image_tag`: strip any `@digest`, then take the segment after the last `:`
+/// unless that colon belongs to a registry-host port (before the last `/`).
+fn image_tag(upstream: &str) -> String {
+    let without_digest = upstream.split('@').next().unwrap_or(upstream);
+    let last_slash = without_digest.rfind('/');
+    let last_colon = without_digest.rfind(':');
+    match last_colon {
+        Some(colon) if last_slash.is_none_or(|slash| colon > slash) => {
+            without_digest[colon + 1..].to_owned()
+        }
+        _ => "latest".to_owned(),
+    }
+}
+
+/// A required string field on a top-level image declaration.
+fn image_str_field(image: &LoweredImage, field: &str) -> Option<String> {
+    match image.fields.get(field) {
+        Some(Value::Str(s)) | Some(Value::Path(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────
 
 /// Leak a string to `'static`. The `iac::Module`/`deploy_engine::Service`
@@ -619,6 +949,82 @@ fn leak_strs(values: Vec<String>) -> Vec<&'static str> {
         .into_iter()
         .map(|value| &*Box::leak(value.into_boxed_str()))
         .collect()
+}
+
+/// An "unknown service" message listing the valid alternatives, for `Ops`.
+fn invalid_service_message(valid: &[&str], actual: &str) -> String {
+    format!(
+        "unknown service '{actual}'. valid services: {}",
+        valid.join(", ")
+    )
+}
+
+/// Build the AWS `ResourceContext` shared by the DSQL resources in a module.
+fn aws_resource_context(project_name: &str, region: &str) -> ResourceContext {
+    ResourceContext {
+        project: project_name.to_owned(),
+        region: region.to_owned(),
+        tags: std::collections::HashMap::from([("ManagedBy".to_owned(), "tkr".to_owned())]),
+    }
+}
+
+/// Realize a DSL `DsqlCluster` item as the compiled `tokeira-aws` resource.
+///
+/// The cluster identity mirrors the compose convention (`<project>-compose`) so
+/// a DSQL deployment authored via the DSL and one via `ComposeConfig` name the
+/// same physical cluster. `mode` is the evaluated DSL string; an unrecognised
+/// value defaults to `Managed` (the type checker constrains the surface form).
+fn dsql_cluster_resource(
+    project_name: &str,
+    module: &str,
+    region: &str,
+    mode: &str,
+    endpoint: Option<String>,
+    arn: Option<String>,
+) -> DsqlCluster {
+    let mode = match mode {
+        "Preexisting" | "preexisting" => DsqlClusterMode::Preexisting,
+        _ => DsqlClusterMode::Managed,
+    };
+    DsqlCluster::new(
+        format!("{project_name}-compose"),
+        DsqlClusterConfig {
+            mode,
+            preexisting_endpoint: endpoint,
+            preexisting_arn: arn,
+            fallback_identifier: None,
+            resource_id: None,
+            module: module.to_owned(),
+        },
+        &aws_resource_context(project_name, region),
+    )
+}
+
+/// Realize a DSL `DynamoDbTable` item as the compiled `tokeira-aws` resource,
+/// matching the on-demand, TTL-enabled coordination-table shape the DSQL
+/// connection management expects.
+fn dynamodb_table_resource(
+    project_name: &str,
+    region: &str,
+    module: &str,
+    table_name: &str,
+    hash_key: &str,
+    ttl: Option<String>,
+) -> DynamoDbTable {
+    DynamoDbTable::new(
+        table_name.to_owned(),
+        DynamoDbTableConfig {
+            key_schema: vec![KeyAttribute {
+                name: hash_key.to_owned(),
+                key_type: KeyType::Hash,
+                attribute_type: AttributeType::String,
+            }],
+            billing_mode: BillingMode::OnDemand,
+            ttl_attribute: ttl,
+            module: module.to_owned(),
+        },
+        &aws_resource_context(project_name, region),
+    )
 }
 
 /// Build [`ObservabilityParams`] from an `ObservabilityConfigFiles` item's
@@ -775,5 +1181,166 @@ mod tests {
                 .any(|d| d.0 == "compose/observability_config"),
             "mimir should depend on the observability config resource"
         );
+    }
+
+    /// Build a DSQL composition by evaluating a definition with a `storage =
+    /// Dsql{..}` input override (compile_source uses defaults, so drive the dsl
+    /// pipeline directly for the Dsql arm).
+    fn dsql_config() -> ComposeDslConfig {
+        use tokeira_platform_dsl::{
+            KindLibrary, Value, evaluate_with_inputs, lex, parse, resolve, typeck,
+        };
+
+        let src = r#"platform compose {
+            input storage: Storage = InMemory
+            module local_state { resource state = LocalStateDir { } }
+            module dsql when storage is Dsql {
+                depends_on [ local_state ]
+                match storage {
+                    Dsql(d) => {
+                        resource cluster = DsqlCluster { mode: d.mode, region: d.region }
+                        resource rate_limiter = DynamoDbTable { hash_key: "pk", ttl: "ttl_epoch" }
+                        resource conn_lease = DynamoDbTable { hash_key: "pk", ttl: "ttl_epoch" }
+                    }
+                    _ => { }
+                }
+            }
+            writeback when storage is Dsql {
+                "infrastructure.dsql.endpoint" : dsql.cluster.cluster_endpoint,
+                "infrastructure.dsql.rate_limiter_table" : dsql.rate_limiter.table_name,
+            }
+        }"#;
+        let (tokens, _) = lex(src);
+        let (program, _) = parse(&tokens, src.len());
+        let program = program.expect("program");
+        let kinds = KindLibrary::compose();
+        assert!(resolve(&program, &kinds).is_empty());
+        assert!(typeck(&program, &kinds).is_empty());
+
+        let mut payload = std::collections::BTreeMap::new();
+        payload.insert("mode".to_string(), Value::Str("Managed".into()));
+        payload.insert("region".to_string(), Value::Str("eu-west-2".into()));
+        let mut inputs = std::collections::HashMap::new();
+        inputs.insert(
+            "storage".to_string(),
+            Value::Variant {
+                name: "Dsql".into(),
+                payload: Some(Box::new(Value::Record(payload))),
+            },
+        );
+        let composition = evaluate_with_inputs(&program, &ctx(), &inputs).expect("composition");
+        ComposeDslConfig::from_composition(Path::new("/dep"), "tokeira", &composition)
+            .expect("plan")
+    }
+
+    #[test]
+    fn dsql_module_realizes_aws_resources_with_dsl_ids() {
+        let config = dsql_config();
+        assert_eq!(config.dsql_region.as_deref(), Some("eu-west-2"));
+
+        let deployment = ComposeDslDeployment::new(&config);
+        let modules = deployment.infra_modules(&config, &ModuleSelection::All);
+        let dsql = modules
+            .iter()
+            .find(|m| m.name() == "dsql")
+            .expect("dsql module");
+        assert_eq!(dsql.dependencies(), &["local_state"]);
+
+        let state = InfraState::default();
+        let extensions = std::collections::HashMap::new();
+        let mctx = ModuleContext::new(&state, &extensions);
+        let ids: Vec<String> = dsql
+            .resources(&mctx)
+            .expect("resources")
+            .iter()
+            .map(|r| r.resource_id().0.clone())
+            .collect();
+        // The DSL ids carry through to the realized AWS resources, so writeback
+        // output references resolve against them (Req 15 / task 9.4).
+        assert!(ids.contains(&"compose/cluster".to_string()), "got: {ids:?}");
+        assert!(
+            ids.contains(&"compose/rate_limiter".to_string()),
+            "got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"compose/conn_lease".to_string()),
+            "got: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn collect_writeback_resolves_dsql_outputs_from_state() {
+        let config = dsql_config();
+        let deployment = ComposeDslDeployment::new(&config);
+
+        // Synthesize the provisioned state the engine would produce.
+        let mut state = InfraState::default();
+        state.resources.insert(
+            ResourceId("compose/cluster".into()),
+            ResourceState {
+                resource_type: ResourceType::new("dsql_cluster"),
+                physical_id: "cluster-xyz".into(),
+                properties: serde_json::json!({ "cluster_endpoint": "abc.dsql.eu-west-2.on.aws" }),
+                dependencies: Vec::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                module: "dsql".into(),
+            },
+        );
+        state.resources.insert(
+            ResourceId("compose/rate_limiter".into()),
+            ResourceState {
+                resource_type: ResourceType::new("dynamodb_table"),
+                physical_id: "tokeira-dsql-rate-limiter".into(),
+                properties: serde_json::json!({ "table_name": "tokeira-dsql-rate-limiter" }),
+                dependencies: Vec::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                module: "dsql".into(),
+            },
+        );
+
+        let writeback = deployment.collect_writeback(&config, &state);
+        assert!(writeback.contains(&(
+            "infrastructure.dsql.endpoint".into(),
+            "abc.dsql.eu-west-2.on.aws".into()
+        )));
+        assert!(writeback.contains(&(
+            "infrastructure.dsql.rate_limiter_table".into(),
+            "tokeira-dsql-rate-limiter".into()
+        )));
+    }
+
+    #[test]
+    fn images_are_realized_from_declarations() {
+        use tokeira_deploy_engine::ImageContext;
+
+        let src = r#"platform compose {
+            image tokeirad = Build { repository: "tokeira/tokeirad" }
+            image mimir = Mirror { repository: "tokeira/grafana-mimir", upstream: "grafana/mimir:3.0.6" }
+        }"#;
+        let composition = crate::compile_source(src, &ctx()).expect("compiles");
+        let config = ComposeDslConfig::from_composition(Path::new("/dep"), "tokeira", &composition)
+            .expect("plan");
+        let deployment = ComposeDslDeployment::new(&config);
+        let images = deployment.images(&config);
+        let names: Vec<&str> = images.iter().map(|i| i.name()).collect();
+        assert_eq!(names, vec!["tokeirad", "mimir"]);
+
+        let image_ctx = ImageContext::default();
+        let mimir = images.iter().find(|i| i.name() == "mimir").unwrap();
+        assert_eq!(mimir.source_type(), ImageSourceType::Mirror);
+        let mirror_ref = mimir.desired_ref(&image_ctx).unwrap();
+        assert_eq!(mirror_ref.tag, "3.0.6");
+        assert_eq!(
+            mirror_ref.upstream_ref.as_deref(),
+            Some("grafana/mimir:3.0.6")
+        );
+
+        let tokeirad = images.iter().find(|i| i.name() == "tokeirad").unwrap();
+        assert_eq!(tokeirad.source_type(), ImageSourceType::Build);
+        let build_ref = tokeirad.desired_ref(&image_ctx).unwrap();
+        assert_eq!(build_ref.tag, "latest");
+        assert_eq!(build_ref.upstream_ref, None);
     }
 }

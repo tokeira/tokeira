@@ -65,31 +65,31 @@ unit tests are example-based; the property-based tests the design mandates are t
   - [x] 9.3 Images: `Build`/`Mirror` → deploy-engine `Image`s _Requirements: 10.1_
   - [x] 9.4 Writeback resolution: `collect_writeback` from provisioned state _Requirements: 10.2_
   - [x] 9.5 `Ops` scale/logs/port_mappings for compose-dsl
-- [ ] 10. `tokeira-platform` framework crate + `Realizer` seam (adopts Proposal 001)
-  - [ ] 10.1 New crate `crates/tokeira-platform`; define `Realizer`, `RealizeContext`,
+- [x] 10. `tokeira-platform` framework crate + `Realizer` seam (adopts Proposal 001)
+  - [x] 10.1 New crate `crates/tokeira-platform`; define `Realizer`, `RealizeContext`,
         `PlatformOpsBackend`, `RealizeError` — the run-time half of a kind, paired to `KindSchema` by name _Requirements: 7.3, 10.1_
-  - [ ] 10.2 Generic `DslPlatform<R>` implementing `Deployment` + `Ops`: the plan, `DslOwnedResource`,
+  - [x] 10.2 Generic `DslPlatform<R>` implementing `Deployment` + `Ops`: the plan, `DslOwnedResource`,
         the local-state bootstrap, generic writeback resolution (OutputRef → state) _Requirements: 7.1, 7.2, 10.2_
-  - [ ] 10.3 Generic `ConfigurationRevision` (compiled `Composition` + `RealizeContext` + writeback) as
+  - [x] 10.3 Generic `ConfigurationRevision` (compiled `Composition` + `RealizeContext` + writeback) as
         `Deployment::Config` — one config type for every DSL platform _Requirements: 8.2, 11.1_
-  - [ ] 10.4 `RuntimeContext` resolution + precedence in the framework: recorded-identity inputs
+  - [x] 10.4 `RuntimeContext` resolution + precedence in the framework: recorded-identity inputs
         authoritative; ambient `deployment_dir`/`home` host-supplied and never persisted; an ambient
         value conflicting with a recorded identity → retarget confirmation (folds the former task 10) _Requirements: 14.8, 14.9_
-  - [ ] 10.5 create-persist (materialize the authored set) + loader (compile the persisted `platform/` +
+  - [x] 10.5 create-persist (materialize the authored set) + loader (compile the persisted `platform/` +
         `inputs.toml`); the `platform/` definition root and the `inputs.toml` input-bindings snapshot _Requirements: 11.1, 11.3, 13.1, 13.3, 16.3_
-- [ ] 11. Slim `compose-dsl` to a realizer over the framework
-  - [ ] 11.1 Move `KindLibrary::compose()` out of `tokeira-platform-dsl` into `compose-dsl`; the compiler
+- [x] 11. Slim `compose-dsl` to a realizer over the framework
+  - [x] 11.1 Move `KindLibrary::compose()` out of `tokeira-platform-dsl` into `compose-dsl`; the compiler
         keeps only the schema *types* (no platform specifics) _Requirements: 2.1, 9.1_
-  - [ ] 11.2 `FieldSpec` compile-time defaults; push observability/DSQL conventions (URLs, ports,
+  - [x] 11.2 `FieldSpec` compile-time defaults; push observability/DSQL conventions (URLs, ports,
         retention, table/cluster names) into kind defaults + the `.platform`, so the realizer reads typed
         fields instead of embedding constants _Requirements: 5.1, 8.1_
-  - [ ] 11.3 `ComposeRealizer` (`realize_resource`/`realize_service`/`realize_image`,
+  - [x] 11.3 `ComposeRealizer` (`realize_resource`/`realize_service`/`realize_image`,
         `register_infra_extensions`) + `ComposeOps` (`PlatformOpsBackend`), reusing `tokeira-compose`/`-aws` _Requirements: 10.1, 10.2_
-  - [ ] 11.4 Re-express `compose-dsl` as `DslPlatform<ComposeRealizer>` + the authored set + `platform()`;
+  - [x] 11.4 Re-express `compose-dsl` as `DslPlatform<ComposeRealizer>` + the authored set + `platform()`;
         the crate drops to ~150 lines; compose parity tests stay green _Requirements: 10.1, 10.3_
-- [ ] 12. `ecs-dsl` realizer — the second instance that validates the seam (before finalizing 10/11)
-  - [ ] 12.1 ECS kind library: `KindSchema`s + output schemas (type/secrecy/availability) for the ECS kinds _Requirements: 10.1, 15.3_
-  - [ ] 12.2 Thin `EcsRealizer` against the framework; confirm `register_*`/`PlatformOpsBackend`/output-ref
+- [x] 12. `ecs-dsl` realizer — the second instance that validates the seam (before finalizing 10/11)
+  - [x] 12.1 ECS kind library: `KindSchema`s + output schemas (type/secrecy/availability) for the ECS kinds _Requirements: 10.1, 15.3_
+  - [x] 12.2 Thin `EcsRealizer` against the framework; confirm `register_*`/`PlatformOpsBackend`/output-ref
         shapes generalise (Docker vs AWS); adjust the `Realizer` trait if the seam needs it _Requirements: 7.3, 10.1_
 - [ ] 13. `tkr` wiring against the generic framework (`DslPlatform<R>` / `ConfigurationRevision`)
   - [ ] 13.1 `PlatformKind::ComposeDsl` (orchestrator) + `CliPlatformKind` variant _Requirements: 1.2_
@@ -188,5 +188,44 @@ unit tests are example-based; the property-based tests the design mandates are t
   `DslPlatform<R>`/`ConfigurationRevision`, so a future DSL platform needs no new `tkr` dispatch type.
 - **Open owner decision:** whether the reusable runtime lands in `tokeira-platform-dsl` itself or a new
   `tokeira-platform-dsl-runtime` crate (compiler-vs-runtime separation) — settle at task 12.
+- **Task 12 seam-validation findings (`platforms/ecs-dsl`, the thin AWS realizer):** the `Realizer`
+  seam generalised from Docker to AWS with **one** trait change and **two** recorded conventions:
+  1. **State substrate is platform-specific** (local dir vs S3). Resolved by adding three hooks to
+     `Realizer` — `remote_state_module`, `create_infra_store`, `create_deploy_store` — with local-state
+     defaults (compose unaffected) that `EcsRealizer` overrides with S3. This is the only trait change
+     the pressure-test forced; `DslPlatform`'s `Deployment` impl now delegates these to the realizer.
+  2. **`replicas` is a DSL-level field name, not a provider term.** `Ops::desired_replicas` reads a
+     `replicas` field; ECS's provider term is `desiredCount`. The seam holds if the DSL standardises on
+     `replicas` and each realizer maps it to its provider term (no framework change) — a convention for
+     task 11/the authored files to honour.
+  3. **No change needed** for `register_infra_extensions` (AWS clients via the realizer hook + shared
+     `Arc<OnceLock<AwsClients>>`), `PlatformOpsBackend` (AWS verbs source identity from the
+     `RealizeContext`/`Composition` already passed), output-refs, or `collect_writeback`.
+  - **Deferred (recorded, not done here):** the task-12.1 output-schema *enrichment*
+     (type/secrecy/availability) is a shared-compiler change (`KindSchema::outputs` → an `OutputSpec`)
+     that benefits compose equally; `ecs-dsl` uses name-only outputs and flags it rather than widening
+     the compiler surface mid-validation. The `ecs-dsl` realizer arms realise to validation **stubs**
+     (not the full `platforms/ecs` resource set) — a real `ecs-dsl` is future work; the seam proof is
+     about shapes.
+- **Task 11 completion notes (`compose-dsl` slimmed onto the framework):**
+  - 11.1/11.3/11.4 are complete: `compose-dsl` carries no `Deployment`/`Ops` impl, no plan type, and no
+    compile pipeline — only `compose_kind_library()` (`kinds.rs`), `ComposeRealizer` + `ComposeOps`
+    (`realizer.rs`), the authored set (`authored.rs`), and `platform()` (`lib.rs`). `KindLibrary::compose()`
+    moved out of the compiler (now a `#[cfg(test)] test_library()` fixture there); the loader-based
+    `tokeira-platform` path replaced the old `compile_deployment`/`translate_services`/`deployment.rs`.
+    Compose parity is preserved (compile-parity in `authored.rs`, realize-parity in `realizer.rs`).
+  - 11.2 is **partially delivered**: the mechanism (`FieldSpec::optional_default` + the loader's
+    `apply_field_defaults` pass) is done and verified, and the **observability** conventions (transport
+    URLs, ports, retention) are pushed into kind defaults so the realizer reads typed fields. The **DSQL
+    table/cluster naming** portion is **deferred**: those names are project-derived
+    (`{project}-dsql-<id>`, `{project}-compose`) and stay in the realizer (`cx.project_name`) because
+    expressing them in the `.platform` needs `ctx.project_name` exposed in the DSL — bundled with the
+    parked **naming decision** (operator found the derivation too implicit).
+- **Generic field accessors hoisted (`tokeira_platform::FieldAccess`).** The `Value` → typed extraction
+  (`required_str`/`optional_str`/`str_list`/`str_map`/`required_u16`/`required_u32`) lives once in the
+  framework (`fields.rs`), implemented for `CompositionItem`/`CompositionImage`, rather than being
+  re-authored per realizer. `compose-dsl`'s bespoke helpers were deleted; the realizer arms call
+  `item.required_str(...)` etc. Errors are uniformly located and value-free (no `Secret` echo,
+  Property 16). Behaviour-preserving; parity tests stay green.
 - The hand-rolled parser (vs `chumsky`) remains revisitable if the grammar grows; `ariadne` rendering can
   replace the `line:col` renderer without changing the contract.

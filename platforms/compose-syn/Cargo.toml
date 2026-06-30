@@ -1,0 +1,41 @@
+[package]
+name = "tokeira-compose-syn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokeira-compose = { path = "../../crates/tokeira-compose" }
+tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
+tokeira-iac = { workspace = true }
+tokeira-deploy-engine = { workspace = true }
+tokeira-state = { path = "../../crates/tokeira-state" }
+tokeira-config = { path = "../../crates/tokeira-config" }
+tokeira-aws = { workspace = true }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+# Observability config rendering (owned by compose-syn — alerts + dashboards +
+# the askama templates live in this crate).
+askama = "0.12"
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+# The `.tkd` interpreter front-end: `syn` parses the definition (Rust syntax),
+# the interpreter walks it. `full` is mandatory — default features are
+# derive-input-only and lack ItemFn/Block/Stmt/statement-Expr nodes. We parse +
+# walk, never emit tokens, so `quote` is not needed. Hand-pinned (not `cargo add`)
+# to reuse the version already locked transitively.
+syn = { version = "2", features = ["full", "extra-traits"] }
+proc-macro2 = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The engine compose platform — the fidelity oracle the tests compare against.
+tokeira-compose-deployment = { path = "../compose" }
+
+[lints]
+workspace = true

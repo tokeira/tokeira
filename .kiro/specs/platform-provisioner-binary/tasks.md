@@ -64,11 +64,20 @@ multi-consumer decision) are out of scope.
   - [ ] 5.1 Add the `MigrationRegistry` keyed by **state-schema transition** (`from_schema → to_schema`)
         and the version-transition entry point; run forward migration before mutation on upgrade only when
         the schema changes (a new `source_tree_hash` at the same schema is a re-stamp). Forward-only.
-  - [ ] 5.2 Refuse downgrade (ordering by monotonic version/build id, never by hash); refuse a same-semver
+  - [~] 5.2 Refuse downgrade (ordering by monotonic version/build id, never by hash); refuse a same-semver
         /different-hash apply; refuse a missing migration for a required schema transition. Property 4.
-  - [ ] 5.3 On upgrade, the first act is one atomic commit: flip the binding to B, capture the [A final]
+        DONE (version/mode refusals) — `tokeira_provisioner::evaluate_upgrade` refuses downgrade,
+        same-semver/different-hash, and re-stamp-to-dev (via a shared numeric `version::compare_versions`,
+        never by hash); allows a versioned advance or a dev→versioned promotion. 6 tests. *The
+        missing-migration refusal is pending the `MigrationRegistry` (5.1).*
+  - [x] 5.3 On upgrade, the first act is one atomic commit: flip the binding to B, capture the [A final]
         `RollbackCheckpoint` (prior snapshot + stamp + **full integrity manifest** + config ref), and open
-        the operation marker — *before* any provider mutation (Req 4.5, 9.1).
+        the operation marker — *before* any provider mutation (Req 4.5, 9.1). DONE.
+        `DeploymentStateEnvelope::begin_upgrade(to, operation_id, recorded_at)` captures [A final]
+        (from_provenance = A / from_integrity / from_infra_head + from_runtime_head / from_config_ref), flips
+        the binding to B, and opens the `UpgradeInFlight` marker — mutating the envelope for the caller to
+        persist in one CAS commit; `close_operation` clears the marker (keeping the flipped binding +
+        checkpoint). Test `begin_upgrade_captures_checkpoint_and_flips_binding`.
 
 - [ ] 6. S3 binary retention (optional path)
   - [ ] 6.1 In the S3 state store, optionally persist the binary blob keyed by `version`+`target`
@@ -108,9 +117,16 @@ multi-consumer decision) are out of scope.
         `apply_refuses_an_unstamped_deployment`, `apply_proceeds_on_dev_iterate_and_restamps`; CLI
         smoke-verified. *Remaining: multi-platform dispatch (compose/ecs), the service/runtime apply, and
         the other applying verbs (`destroy`/`scale`/`schema`/`image`), plus `plan`-surfaces-verdict.*
-  - [ ] 8.4 `upgrade`: atomic ownership transfer first (task 5.3) — flip binding → B, capture [A final]
+  - [~] 8.4 `upgrade`: atomic ownership transfer first (task 5.3) — flip binding → B, capture [A final]
         (incl. A's prior configuration-revision ref), open the marker, before any mutation; then run
-        state-schema migrations, apply B's plan. MAY record an **ids-only audit change log** (`id + op`,
+        state-schema migrations, apply B's plan. DONE (first increment): `tkp upgrade` (`tkp/src/upgrade.rs`)
+        loads the envelope, requires a recorded A (refuses unstamped), `evaluate_upgrade(A, B)` (refuse or
+        VersionedAdvance/Promotion), then the **atomic ownership transfer** (`begin_upgrade` + one CAS save,
+        before any mutation), then applies B's plan (local infra apply — shared with `apply`), then
+        `close_operation` + save. Tests: `upgrade_refuses_an_unstamped_deployment`,
+        `upgrade_refuses_versioned_to_dev_restamp`. *Remaining: state-schema migrations (task 5.1),
+        multi-platform apply, the audit change log, the advisory baseline drift gate, and `resume` of an
+        interrupted transfer.* MAY record an **ids-only audit change log** (`id + op`,
         no before-images) for observability; rollback needs no before-images (Proposal 002). Close the
         marker. Handles the versioned advance and the dev → versioned promotion; refuses downgrade,
         same-semver/different-hash, and re-stamp back to `dev`; the only verb that authoritatively advances

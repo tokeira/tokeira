@@ -50,16 +50,8 @@ pub async fn apply(deployment_dir: &Path) -> Result<()> {
     }
 
     // ── Engine apply ──
-    let config = load_local_config(deployment_dir)?;
-    let mut engine = InfraEngine::new(LocalDeployment, &config, deployment_dir)
-        .await
-        .context("failed to open the infrastructure engine")?;
-    let composition = engine.compose(ModuleSelection::All)?;
-    let changes = engine
-        .apply(&composition, ModuleSelection::All)
-        .await
-        .context("infrastructure apply failed")?;
-    println!("infra apply: {} change(s)", changes.len());
+    let (change_count, config) = run_local_infra_apply(deployment_dir).await?;
+    println!("infra apply: {change_count} change(s)");
 
     // ── Re-stamp the envelope ──
     // A config apply keeps the engine identity and advances the revision.
@@ -74,6 +66,25 @@ pub async fn apply(deployment_dir: &Path) -> Result<()> {
         .context("failed to persist the deployment envelope after apply")?;
     println!("envelope: config_revision now {}", envelope.config_revision);
     Ok(())
+}
+
+/// Run the local platform's infrastructure apply and return `(change_count,
+/// config)`. Local has no infra modules, so this is an empty plan that still
+/// exercises the real `InfraEngine` and the `DeploymentStore` state seam. Shared
+/// by `apply` and `upgrade`.
+pub(crate) async fn run_local_infra_apply(
+    deployment_dir: &Path,
+) -> Result<(usize, LocalConfig)> {
+    let config = load_local_config(deployment_dir)?;
+    let mut engine = InfraEngine::new(LocalDeployment, &config, deployment_dir)
+        .await
+        .context("failed to open the infrastructure engine")?;
+    let composition = engine.compose(ModuleSelection::All)?;
+    let changes = engine
+        .apply(&composition, ModuleSelection::All)
+        .await
+        .context("infrastructure apply failed")?;
+    Ok((changes.len(), config))
 }
 
 fn load_local_config(deployment_dir: &Path) -> Result<LocalConfig> {

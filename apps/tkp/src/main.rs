@@ -23,6 +23,7 @@ use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 mod apply;
 mod gate;
+mod upgrade;
 
 #[derive(Parser)]
 #[command(
@@ -72,9 +73,10 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Describe(args) => describe(args).await,
         Command::Apply(args) => apply::apply(&args.deployment_dir).await,
-        Command::Upgrade(_) | Command::Rollback(_) | Command::Resume(_) => anyhow::bail!(
-            "not yet implemented: upgrade/rollback/resume land with the operation orchestration \
-             (tasks 8.4/8.5) — `tkp describe` and `tkp apply` are available today"
+        Command::Upgrade(args) => upgrade::upgrade(&args.deployment_dir).await,
+        Command::Rollback(_) | Command::Resume(_) => anyhow::bail!(
+            "not yet implemented: rollback/resume land with the definition-driven rollback \
+             orchestration (task 8.5) — describe/apply/upgrade are available today"
         ),
     }
 }

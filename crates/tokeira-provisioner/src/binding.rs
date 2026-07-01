@@ -8,7 +8,7 @@
 //! bump). A `dev` stamp is advisory and never yields the authoritative
 //! [`Match`](BindingVerdict::Match).
 
-use crate::{BuildMode, ProvenanceStamp};
+use crate::{BuildMode, ProvenanceStamp, version::is_older};
 
 /// The outcome of comparing recorded vs running provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub fn check_binding(
             BuildMode::Versioned => {
                 if running.source_tree_hash == recorded.source_tree_hash {
                     BindingVerdict::Match
-                } else if version_is_older(&running.version, &recorded.version) {
+                } else if is_older(&running.version, &recorded.version) {
                     BindingVerdict::Downgrade
                 } else {
                     // Different hash, same-or-newer version: forgotten bump or a
@@ -83,24 +83,6 @@ pub fn check_binding(
                 }
             }
         },
-    }
-}
-
-/// Parse a `major.minor.patch[…]` version into numeric components, ignoring any
-/// pre-release/build suffix. Returns `None` if any core component is non-numeric.
-fn parse_version(version: &str) -> Option<Vec<u64>> {
-    let core = version.split(['-', '+']).next().unwrap_or(version);
-    core.split('.').map(|part| part.parse::<u64>().ok()).collect()
-}
-
-/// Whether `a` is strictly older than `b`. When either version cannot be parsed,
-/// order is undeterminable, so this returns `false` (the caller then treats the
-/// hash difference as a [`Mismatch`](BindingVerdict::Mismatch), never a spurious
-/// downgrade).
-fn version_is_older(a: &str, b: &str) -> bool {
-    match (parse_version(a), parse_version(b)) {
-        (Some(a), Some(b)) => a < b,
-        _ => false,
     }
 }
 

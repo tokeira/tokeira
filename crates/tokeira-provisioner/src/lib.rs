@@ -25,8 +25,11 @@ use tokeira_state::{SnapshotRef, StateError, Validate};
 
 pub mod binding;
 pub mod integrity;
+pub mod upgrade;
+mod version;
 pub use binding::{BindingVerdict, check_binding};
 pub use integrity::{IntegrityError, sha256_hex};
+pub use upgrade::{UpgradeDecision, evaluate_upgrade};
 
 /// Current `DeploymentStateEnvelope` schema version.
 pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
@@ -262,6 +265,45 @@ impl Validate for DeploymentStateEnvelope {
     }
 }
 
+impl DeploymentStateEnvelope {
+    /// The atomic ownership transfer that opens an `upgrade` (task 5.3): capture
+    /// the current state as the **[A final]** [`RollbackCheckpoint`], flip the
+    /// binding to `to` (`B`), and open the `UpgradeInFlight` operation marker. The
+    /// caller persists the mutated envelope in **one CAS commit before any
+    /// provider mutation**, so a crash always recovers as `B` with an open marker
+    /// (never an ambiguous "pending" state).
+    pub fn begin_upgrade(
+        &mut self,
+        to: ProvenanceStamp,
+        operation_id: impl Into<String>,
+        recorded_at: DateTime<Utc>,
+    ) {
+        // Capture [A final] before flipping the binding. `from` is A's recorded
+        // stamp (the caller guarantees the deployment is stamped before upgrade).
+        let from = self.binding.clone().unwrap_or_else(|| to.clone());
+        self.checkpoint = Some(RollbackCheckpoint {
+            from_provenance: from,
+            from_integrity: self.integrity.clone().unwrap_or_default(),
+            from_infra_head: self.infra_head.clone(),
+            from_runtime_head: self.runtime_head.clone(),
+            from_config_ref: self.effective_config_ref.clone(),
+            recorded_at,
+        });
+        self.binding = Some(to);
+        self.operation = Some(Operation {
+            operation_id: operation_id.into(),
+            kind: OperationKind::UpgradeInFlight,
+            phase: "ownership-transferred".to_string(),
+            audit_log: None,
+        });
+    }
+
+    /// Close the in-flight operation marker (the upgrade or rollback completed).
+    pub fn close_operation(&mut self) {
+        self.operation = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +382,45 @@ mod tests {
         let back: DeploymentStateEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(env, back);
         back.validate().expect("round-tripped envelope validates");
+    }
+
+    #[test]
+    fn begin_upgrade_captures_checkpoint_and_flips_binding() {
+        let a = ProvenanceStamp {
+            version: "1.0.0".into(),
+            git_sha: "shaA".into(),
+            source_tree_hash: "hA".into(),
+            build_mode: BuildMode::Versioned,
+            recorded_at: Utc::now(),
+        };
+        let b = ProvenanceStamp {
+            source_tree_hash: "hB".into(),
+            version: "2.0.0".into(),
+            ..a.clone()
+        };
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(a.clone()),
+            config_revision: 5,
+            effective_config_ref: Some("cfg-A".into()),
+            ..Default::default()
+        };
+
+        env.begin_upgrade(b.clone(), "op-1", Utc::now());
+
+        // Binding flipped to B, [A final] captured in the checkpoint.
+        assert_eq!(env.binding.as_ref(), Some(&b));
+        let cp = env.checkpoint.as_ref().expect("checkpoint captured");
+        assert_eq!(cp.from_provenance, a);
+        assert_eq!(cp.from_config_ref.as_deref(), Some("cfg-A"));
+        // Operation marker open.
+        let op = env.operation.as_ref().expect("marker open");
+        assert_eq!(op.kind, OperationKind::UpgradeInFlight);
+
+        // Closing the marker leaves the flipped binding + checkpoint in place.
+        env.close_operation();
+        assert!(env.operation.is_none());
+        assert_eq!(env.binding.as_ref(), Some(&b));
+        assert!(env.checkpoint.is_some());
     }
 
     #[test]

@@ -294,7 +294,7 @@ async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
 }
 
 #[tokio::test]
-async fn nexus_cancel_success_delivers_canceled_resolution() -> Result<()> {
+async fn nexus_cancel_requests_without_resolving() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());
     let client = Arc::new(MockNexusClient::new(
         NexusStartResult::AsyncAccepted {
@@ -409,18 +409,49 @@ async fn nexus_cancel_success_delivers_canceled_resolution() -> Result<()> {
         })
         .await?;
 
+    // v1.31.0 decouples cancel-ack from operation resolution: CancelNexusOperation
+    // records a NexusOperationCancelRequested event and dispatches the cancel to the
+    // handler, but does NOT resolve the operation. The operation resolves solely from
+    // its completion when the backing workflow closes
+    // (components/nexusoperations/statemachine.go:424,668 @ v1.31.0; Gap C of commit
+    // 31b50953 "decouple cancel from resolution"). So we assert the cancel-request is
+    // recorded and the cancel is dispatched exactly once — never a Canceled resolution.
     wait_for_history(&store, run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
-                HistoryEventKind::NexusOperationCanceled { operation_id, .. }
-                if operation_id == "op-1"
+                HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id: id }
+                if *id == scheduled_event_id
             )
         })
     })
     .await?;
 
-    assert_eq!(client.snapshot(), (1, 1));
+    // The cancel is delivered to the handler exactly once (1 start, 1 cancel). Dispatch
+    // runs after the WFT commit, so wait for it rather than assume synchronous delivery.
+    wait_for_client(&client, (1, 1)).await?;
+
+    // The cancel-ack must not resolve the operation: no NexusOperationCanceled is
+    // emitted, and the operation stays pending awaiting its completion.
+    let history = store.read_history(run_key, 0, 256).await?;
+    assert!(
+        !history
+            .iter()
+            .any(|event| matches!(&event.kind, HistoryEventKind::NexusOperationCanceled { .. })),
+        "cancel-ack must not emit NexusOperationCanceled (v1.31.0 decoupling)"
+    );
+    let state = match store.load_run(run_key).await? {
+        tokeira_kernel::LoadedRun::Existing(state) => state,
+        tokeira_kernel::LoadedRun::Absent => panic!("run should still exist"),
+    };
+    assert!(
+        state
+            .pending_nexus_operations
+            .values()
+            .any(|pending| pending.scheduled_event_id == scheduled_event_id),
+        "operation stays pending after cancel-ack"
+    );
+
     runtime.shutdown_timer_scanner().await?;
     runtime.shutdown_workflow_timeout_scanner().await?;
     runtime.shutdown_nexus_timeout_scanner().await?;
@@ -1315,6 +1346,23 @@ fn applied_state(result: &CommitResult) -> tokeira_kernel::WorkflowState {
     match result {
         CommitResult::Applied { new_state } => new_state.clone(),
         other => panic!("expected applied result, got {other:?}"),
+    }
+}
+
+/// Poll the mock Nexus client until its `(start_calls, cancel_calls)` snapshot reaches
+/// `want` (bounded), mirroring [`wait_for_history`]. A `DispatchOp::CancelNexusOperation`
+/// is delivered after the WFT commit, so callers wait for the dispatch to land rather
+/// than assume it is synchronous with `complete_workflow_task`.
+async fn wait_for_client(client: &MockNexusClient, want: (usize, usize)) -> Result<()> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if client.snapshot() == want {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for nexus client snapshot {want:?}");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
 }
 

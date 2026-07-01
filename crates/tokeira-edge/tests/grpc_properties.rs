@@ -119,7 +119,7 @@ proptest! {
 
     #[test]
     fn property_start_response_projection(edge in arb_start_response()) {
-        let proto = start_response_to_proto(edge.clone());
+        let proto = start_response_to_proto(edge.clone(), "ns".to_string(), "wf".to_string());
         prop_assert_eq!(proto.run_id, edge.run_id.0.to_string());
         prop_assert_eq!(proto.started, edge.started);
         prop_assert_eq!(
@@ -276,8 +276,21 @@ proptest! {
     #[test]
     fn property_workflow_command_roundtrip(cmd in arb_workflow_command()) {
         match &cmd {
-            WorkflowCommand::ScheduleActivity { .. }
-            | WorkflowCommand::StartTimer { .. }
+            WorkflowCommand::ScheduleActivity { .. } => {
+                let proto = workflow_command_to_proto(&cmd).unwrap();
+                let roundtrip = proto_command_to_workflow_command(proto).unwrap();
+                // v1.31.0 ensure-defaults the activity retry policy on decode —
+                // activities always carry one (`EnsureDefaults`; see
+                // `grpc/translate.rs` `activity_retry_policy_with_defaults`). The
+                // generator authors `retry_policy: None`, so the round-trip is
+                // identity on every field except the now-ensured retry policy.
+                let mut expected = cmd.clone();
+                if let WorkflowCommand::ScheduleActivity { retry_policy, .. } = &mut expected {
+                    *retry_policy = Some(ensured_activity_retry_policy());
+                }
+                prop_assert_eq!(roundtrip, expected);
+            }
+            WorkflowCommand::StartTimer { .. }
             | WorkflowCommand::UpsertMemo(_)
             | WorkflowCommand::UpsertSearchAttributes(_)
             | WorkflowCommand::CompleteWorkflow { .. }
@@ -378,7 +391,14 @@ proptest! {
     ) {
         let proto = workflow_command_to_proto(&cmd).unwrap();
         let roundtrip = proto_command_to_workflow_command(proto).unwrap();
-        prop_assert_eq!(roundtrip, cmd);
+        // The eager-execution flag must survive the round-trip. The retry policy
+        // is ensure-defaulted on decode (v1.31.0: activities always carry one),
+        // so compare against the authored command with that default filled in.
+        let mut expected = cmd.clone();
+        if let WorkflowCommand::ScheduleActivity { retry_policy, .. } = &mut expected {
+            *retry_policy = Some(ensured_activity_retry_policy());
+        }
+        prop_assert_eq!(roundtrip, expected);
     }
 }
 
@@ -782,6 +802,8 @@ fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse>
                     transition_seq,
                     last_event_id,
                     started,
+                    status: ExecutionStatus::Running,
+                    attached_request_id: None,
                     eager_workflow_task,
                 }
             },
@@ -1255,6 +1277,20 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
             },
         }),
     ]
+}
+
+fn ensured_activity_retry_policy() -> tokeira_types::RetryPolicy {
+    // v1.31.0 `EnsureDefaults` for an omitted activity retry policy
+    // (`common/retrypolicy/retry_policy.go`): InitialInterval 1s,
+    // BackoffCoefficient 2.0, MaximumInterval 100×InitialInterval, MaximumAttempts
+    // 0 (unlimited). Mirrors `grpc/translate.rs` `activity_retry_policy_with_defaults(None)`.
+    tokeira_types::RetryPolicy {
+        initial_interval: time::Duration::seconds(1),
+        backoff_coefficient: 2.0,
+        maximum_interval: Some(time::Duration::seconds(100)),
+        maximum_attempts: 0,
+        non_retryable_error_types: Vec::new(),
+    }
 }
 
 fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {

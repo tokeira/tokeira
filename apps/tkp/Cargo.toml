@@ -16,6 +16,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokeira-provisioner = { workspace = true }
 tokeira-state = { workspace = true }
 tokeira-build-info = { workspace = true }
+tokeira-config = { workspace = true }
+tokeira-iac = { path = "../../crates/tokeira-iac" }
+tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
+tokeira-local-deployment = { path = "../../platforms/local" }
 
 [dev-dependencies]
 tempfile.workspace = true

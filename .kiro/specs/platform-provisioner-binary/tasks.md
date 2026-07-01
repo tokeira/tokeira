@@ -95,10 +95,19 @@ multi-consumer decision) are out of scope.
         `check_binding` verdict + whether it proceeds / is authoritative, the integrity manifest summary,
         state-head presence, and operation/lock status. Tests: uninitialized→Unknown-refuses,
         recorded-Match, dev-binary-on-versioned→ModeRegression. Smoke-verified.
-  - [ ] 8.3 Embed the binding gate (task 3) in the applying verbs `apply`, `destroy`, `scale`,
+  - [~] 8.3 Embed the binding gate (task 3) in the applying verbs `apply`, `destroy`, `scale`,
         `schema setup`, `image push|mirror`: versioned deployments refuse on non-`Match` (no override);
         dev deployments take the `DevIterate` re-stamp+warn path (Req 6.2). `plan` surfaces the verdict
-        and annotates without refusing (Req 2.5).
+        and annotates without refusing (Req 2.5). DONE (first increment — `apply`): `tkp/src/gate.rs`
+        `evaluate_gate` → `GateOutcome::{Proceed{authoritative}, Refuse{verdict, reason}}` implements the
+        3.2/3.3 policy; `tkp apply` (`tkp/src/apply.rs`) evaluates the gate **before any mutation**
+        (versioned refuses non-`Match`; dev warns + proceeds on `DevIterate`; unstamped → `Unknown` refuses
+        — Day-0 stamping is `create`'s job, task 2.2), then runs the real `InfraEngine` apply (wired to the
+        **local** platform — empty plan, exercising the `DeploymentStore` seam) and **re-stamps** the
+        envelope (records the running binding, advances `config_revision` — task 14.2). Tests: 5 gate cases +
+        `apply_refuses_an_unstamped_deployment`, `apply_proceeds_on_dev_iterate_and_restamps`; CLI
+        smoke-verified. *Remaining: multi-platform dispatch (compose/ecs), the service/runtime apply, and
+        the other applying verbs (`destroy`/`scale`/`schema`/`image`), plus `plan`-surfaces-verdict.*
   - [ ] 8.4 `upgrade`: atomic ownership transfer first (task 5.3) — flip binding → B, capture [A final]
         (incl. A's prior configuration-revision ref), open the marker, before any mutation; then run
         state-schema migrations, apply B's plan. MAY record an **ids-only audit change log** (`id + op`,

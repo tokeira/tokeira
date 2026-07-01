@@ -21,6 +21,9 @@ use tokeira_provisioner::{
 };
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
+mod apply;
+mod gate;
+
 #[derive(Parser)]
 #[command(
     name = "tkp",
@@ -68,12 +71,10 @@ struct LifecycleArgs {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Describe(args) => describe(args).await,
-        Command::Apply(_)
-        | Command::Upgrade(_)
-        | Command::Rollback(_)
-        | Command::Resume(_) => anyhow::bail!(
-            "not yet implemented: the applying verbs (apply/upgrade/rollback/resume) land with the \
-             engine wiring — `tkp describe` is available today"
+        Command::Apply(args) => apply::apply(&args.deployment_dir).await,
+        Command::Upgrade(_) | Command::Rollback(_) | Command::Resume(_) => anyhow::bail!(
+            "not yet implemented: upgrade/rollback/resume land with the operation orchestration \
+             (tasks 8.4/8.5) — `tkp describe` and `tkp apply` are available today"
         ),
     }
 }

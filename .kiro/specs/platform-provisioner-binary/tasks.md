@@ -50,9 +50,15 @@ multi-consumer decision) are out of scope.
 
 - [ ] 4. Integrity manifest + verification
   - [ ] 4.1 Record version + per-target `sha256` (+ optional `retrieval_ref`) in the CAS-guarded manifest
-        at stamp time.
-  - [ ] 4.2 Verify a retrieved binary's checksum against the manifest before execution; abort on
-        mismatch. Property 3.
+        at stamp time. *The `IntegrityManifest`/`BinaryArtifactDescriptor` models exist (13.1); recording
+        them at stamp time is the envelope write path (tasks 8/12).*
+  - [x] 4.2 Verify a retrieved binary's checksum against the manifest before execution; abort on
+        mismatch. Property 3. DONE — `IntegrityManifest::verify_artifact(bytes, target)` (and
+        `BinaryArtifactDescriptor::verify(bytes)`) compute the SHA-256 and abort with
+        `IntegrityError::ChecksumMismatch`, or `TargetNotFound` when the manifest has no entry for the
+        target. `descriptor_for(target)` looks up by target; `sha256_hex` exported. Tests:
+        `matching_bytes_verify`, `tampered_bytes_abort`, `unknown_target_is_not_found`,
+        `sha256_hex_is_stable_and_lowercase`. (The launcher wiring — verify before exec — is `tkr`, task 9.)
 
 - [ ] 5. Upgrade/migration boundary
   - [ ] 5.1 Add the `MigrationRegistry` keyed by **state-schema transition** (`from_schema → to_schema`)

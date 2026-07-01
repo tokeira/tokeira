@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use tokeira_state::{SnapshotRef, StateError, Validate};
 
 pub mod binding;
+pub mod integrity;
 pub use binding::{BindingVerdict, check_binding};
+pub use integrity::{IntegrityError, sha256_hex};
 
 /// Current `DeploymentStateEnvelope` schema version.
 pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;

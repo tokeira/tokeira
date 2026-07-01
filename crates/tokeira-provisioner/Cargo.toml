@@ -12,5 +12,7 @@ thiserror = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 tokeira-state = { workspace = true }
 tokeira-build-info = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]

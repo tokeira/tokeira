@@ -67,16 +67,24 @@ multi-consumer decision) are out of scope.
         `matching_bytes_verify`, `tampered_bytes_abort`, `unknown_target_is_not_found`,
         `sha256_hex_is_stable_and_lowercase`. (The launcher wiring — verify before exec — is `tkr`, task 9.)
 
-- [ ] 5. Upgrade/migration boundary
-  - [ ] 5.1 Add the `MigrationRegistry` keyed by **state-schema transition** (`from_schema → to_schema`)
+- [x] 5. Upgrade/migration boundary
+  - [x] 5.1 Add the `MigrationRegistry` keyed by **state-schema transition** (`from_schema → to_schema`)
         and the version-transition entry point; run forward migration before mutation on upgrade only when
-        the schema changes (a new `source_tree_hash` at the same schema is a re-stamp). Forward-only.
-  - [~] 5.2 Refuse downgrade (ordering by monotonic version/build id, never by hash); refuse a same-semver
+        the schema changes (a new `source_tree_hash` at the same schema is a re-stamp). Forward-only. DONE —
+        `tokeira_provisioner::MigrationRegistry` (`register(from, to, apply)`, forward-only, one migration
+        per `from_schema`) with `check_path` (verify a bridge without applying — the boundary gate),
+        `migrate(doc, from, to)` (apply the forward chain over a raw `serde_json::Value`), and
+        `needs_migration(from, to)` (same schema ⇒ re-stamp, no migration). Wired into `tkp upgrade`: it
+        `check_path(envelope.schema_version, ENVELOPE_SCHEMA_VERSION)` **before the atomic transfer**, and
+        advances the schema when a migration is needed. 6 tests (same-schema no-op, linear chain, unbridged
+        → NoPath, missing first step, backward refused, failing step surfaces its reason).
+  - [x] 5.2 Refuse downgrade (ordering by monotonic version/build id, never by hash); refuse a same-semver
         /different-hash apply; refuse a missing migration for a required schema transition. Property 4.
-        DONE (version/mode refusals) — `tokeira_provisioner::evaluate_upgrade` refuses downgrade,
-        same-semver/different-hash, and re-stamp-to-dev (via a shared numeric `version::compare_versions`,
-        never by hash); allows a versioned advance or a dev→versioned promotion. 6 tests. *The
-        missing-migration refusal is pending the `MigrationRegistry` (5.1).*
+        DONE — `tokeira_provisioner::evaluate_upgrade` refuses downgrade, same-semver/different-hash, and
+        re-stamp-to-dev (via a shared numeric `version::compare_versions`, never by hash); allows a
+        versioned advance or a dev→versioned promotion (6 tests). The **missing-migration** refusal is
+        `MigrationRegistry::check_path` at the upgrade boundary (`MigrationError::NoPath` → `tkp upgrade`
+        refuses before any mutation).
   - [x] 5.3 On upgrade, the first act is one atomic commit: flip the binding to B, capture the [A final]
         `RollbackCheckpoint` (prior snapshot + stamp + **full integrity manifest** + config ref), and open
         the operation marker — *before* any provider mutation (Req 4.5, 9.1). DONE.

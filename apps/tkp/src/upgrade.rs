@@ -15,7 +15,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tokeira_provisioner::{ProvenanceStamp, UpgradeDecision, evaluate_upgrade};
+use tokeira_provisioner::{
+    ENVELOPE_SCHEMA_VERSION, MigrationRegistry, ProvenanceStamp, UpgradeDecision, evaluate_upgrade,
+};
 
 use crate::apply::run_local_infra_apply;
 use crate::envelope_store;
@@ -46,6 +48,22 @@ pub async fn upgrade(deployment_dir: &Path) -> Result<()> {
             "upgrade: dev → versioned promotion (now version {})",
             running.version
         ),
+    }
+
+    // ── State-schema migration boundary (before any mutation) ──
+    // Refuse an unbridged schema migration up front; run the forward migration
+    // only when the schema changes (a new source_tree_hash at the same schema is
+    // a re-stamp, not a migration).
+    let migrations = MigrationRegistry::new();
+    let from_schema = envelope.schema_version;
+    let to_schema = ENVELOPE_SCHEMA_VERSION;
+    migrations
+        .check_path(from_schema, to_schema)
+        .map_err(|e| anyhow::anyhow!("`upgrade` refused: {e}"))?;
+    if MigrationRegistry::needs_migration(from_schema, to_schema) {
+        println!("state-schema migration {from_schema} → {to_schema}");
+        // (Envelope + state-doc migrations run here when transitions are registered.)
+        envelope.schema_version = to_schema;
     }
 
     // ── Atomic ownership transfer — one CAS commit, BEFORE any provider mutation ──

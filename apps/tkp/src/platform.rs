@@ -154,8 +154,15 @@ async fn open_compose_syn_engine(
         .await
         .context("failed to open the infrastructure engine")?;
 
-    let compose_file = dir.join("docker-compose.yml");
-    let platform = match ComposePlatform::connect(compose_file, &config.cx.project_name) {
+    // compose-syn assembles containers through the Docker API (Bollard) in the
+    // `tokeira-compose` crate — there is no user-authored `docker-compose.yml`; a
+    // deployment is defined by its `definition.tkd`, and the InfraEngine's own
+    // state store is authoritative. `ComposePlatform::connect` still takes a path
+    // for its internal service-state ledger, so point it inside the deployment's
+    // state directory rather than a root compose file that would misrepresent the
+    // model. (`describe` reads live Docker, not this ledger.)
+    let compose_state_ledger = dir.join("state").join("compose-services.yaml");
+    let platform = match ComposePlatform::connect(compose_state_ledger, &config.cx.project_name) {
         Ok(platform) => match platform.ensure_reachable().await {
             Ok(()) => Some(platform),
             Err(err) => docker_or_skip(err, require_docker)?,

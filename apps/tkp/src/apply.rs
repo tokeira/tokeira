@@ -87,7 +87,7 @@ pub(crate) async fn run_local_infra_apply(
     Ok((changes.len(), config))
 }
 
-fn load_local_config(deployment_dir: &Path) -> Result<LocalConfig> {
+pub(crate) fn load_local_config(deployment_dir: &Path) -> Result<LocalConfig> {
     let path = deployment_dir.join("deployment.toml");
     if path.exists() {
         tokeira_config::load_config(&path, None)

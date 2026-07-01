@@ -23,16 +23,21 @@ multi-consumer decision) are out of scope.
         13.1 note): the envelope is defined + storable; persisting it into the deployment store is pending
         tasks 8/12.*
 
-- [ ] 2. Provenance stamping
+- [x] 2. Provenance stamping
   - [x] 2.1 Stamp the running provisioner from `tokeira-build-info` (`TOKEIRA_VERSION`, `TOKEIRA_GIT_SHA`,
         `SOURCE_TREE_HASH`, `BUILD_MODE`); `source_tree_hash` is the authoritative drift key (Property 6).
         DONE — `ProvenanceStamp::current(recorded_at)` reads build-info; `BuildMode::from_build_info` maps
         the `BUILD_MODE` string (unknown → advisory `Dev`). Tests `current_stamp_reads_build_info`,
         `build_mode_parses_build_info_strings`. *The "on every state-document write" wiring is follow-on
         with the envelope persistence (tasks 8/12).*
-  - [ ] 2.2 On remote-state init (`tkr deployment create`), write the stamp before any resource create —
-        Day-0 mandatory versioning; there is no create path that leaves state unstamped (Req 1.2). *Needs
-        `tkr deployment create` / the envelope write path.*
+  - [x] 2.2 On remote-state init, write the stamp before any resource create — Day-0 mandatory versioning;
+        there is no create path that leaves state unstamped (Req 1.2). DONE — `tkp init` (`tkp/src/init.rs`)
+        writes the Day-0 envelope (binding = the running `ProvenanceStamp::current`, integrity manifest,
+        `config_revision` 0, `deployment_id` from config) via a CAS create; refuses an already-initialized
+        deployment. This closes the bootstrap: every applying verb previously refused an unstamped
+        deployment (`Unknown`), and `init` is the entry point that stamps it (invoked by `tkr deployment
+        create`, task 9.2). Tests `init_stamps_the_envelope_with_binding_and_integrity`,
+        `init_refuses_an_already_initialized_deployment`; end-to-end init → apply → describe smoke-verified.
 
 - [ ] 3. Binding gate (regime by build mode)
   - [x] 3.1 `check_binding(recorded, running) -> Match | DevIterate | Mismatch | Downgrade | ModeRegression
@@ -48,10 +53,12 @@ multi-consumer decision) are out of scope.
         `dev` stamp never yields authoritative `Match`. Property 7. DONE (verdict) — `DevIterate` proceeds
         but is not authoritative. *The re-stamp + warn happen in the verb wiring (task 8.3, `tkp`).*
 
-- [ ] 4. Integrity manifest + verification
-  - [ ] 4.1 Record version + per-target `sha256` (+ optional `retrieval_ref`) in the CAS-guarded manifest
-        at stamp time. *The `IntegrityManifest`/`BinaryArtifactDescriptor` models exist (13.1); recording
-        them at stamp time is the envelope write path (tasks 8/12).*
+- [x] 4. Integrity manifest + verification
+  - [x] 4.1 Record version + per-target `sha256` (+ optional `retrieval_ref`) in the CAS-guarded manifest
+        at stamp time. DONE — `tkp/src/init.rs::running_integrity_manifest` reads `current_exe`, SHA-256s
+        it, and records a `BinaryArtifactDescriptor { version, target, sha256, size_bytes }` (target triple
+        captured via `apps/tkp/build.rs` → `env!("TKP_TARGET")`) in the envelope's `IntegrityManifest` at
+        `init` (stamp) time. Verified by the `init` test (integrity present, non-empty sha256).
   - [x] 4.2 Verify a retrieved binary's checksum against the manifest before execution; abort on
         mismatch. Property 3. DONE — `IntegrityManifest::verify_artifact(bytes, target)` (and
         `BinaryArtifactDescriptor::verify(bytes)`) compute the SHA-256 and abort with
@@ -173,7 +180,7 @@ multi-consumer decision) are out of scope.
         deployment; read verbs are never blocked; a stale (missing) lock and a changed identity
         fingerprint both fail closed (Req 8.2, 8.3, 8.4). Property 8.
 
-- [ ] 11. IaC framework hardening in `tokeira-iac` (Requirements 10, 12; underpins rollback)
+- [x] 11. IaC framework hardening in `tokeira-iac` (Requirements 10, 12; underpins rollback)
   - [x] 11.1 Fail-closed delete: in `apply_changes` / `destroy_changes`, a Delete whose `ResourceId` is
         absent from `known` returns an error (`IacError::UnknownResourceDelete`) instead of removing it from
         state without deleting the live resource. Property 10 — done + test
@@ -198,7 +205,7 @@ multi-consumer decision) are out of scope.
         Residual (separate enhancement, not blocking): the 5 stub `describe` impls (`s3_object`,
         `ssm_parameter`, the 3 `ecs_service` resources) return `Unsupported` as a fail-safe — they should
         eventually gain real provider-querying `describe` so refresh can confirm presence/absence.
-  - [ ] 11.3 Forward-engine capabilities that make definition-driven rollback correct (Proposal 002 —
+  - [x] 11.3 Forward-engine capabilities that make definition-driven rollback correct (Proposal 002 —
         supersedes the `apply_inverse_delta` / `StateDrivenRestore` approach; **do not** build
         `AppliedDelta` before-images, a restore trait, `restore_to_state`/`recreate_from_state`, or
         `apply_inverse_delta`). Two general apply features (they benefit *every* apply, not just rollback):
@@ -272,7 +279,7 @@ multi-consumer decision) are out of scope.
         A forward-reconcile) so no writer interleaves at the handoff (Req 11.3). *Needs `tkp` (the
         rollback orchestration) — deferred until the binary exists; the 12.1 primitive is ready.*
 
-- [ ] 13. Deployment state envelope + the authoritative remote store (foundational; decided)
+- [x] 13. Deployment state envelope + the authoritative remote store (foundational; decided)
   - [x] 13.1 Define the deployment-level `DeploymentStateEnvelope` — DONE. New crate
         `crates/tokeira-provisioner` (depends on `tokeira-state` for `SnapshotRef`) holds the whole
         provisioner Data-Models set: `BuildMode`, `Target`, `ProvenanceStamp`, `BinaryArtifactDescriptor`,
@@ -310,9 +317,17 @@ multi-consumer decision) are out of scope.
         local), exactly as `create_infra_store` already fixes the backend per platform today.
 
 - [ ] 14. Engine identity vs configuration revision (Requirement 13)
-  - [ ] 14.1 Scope the binding `source_tree_hash` to the engine/resource-implementation surface, excluding
+  - [x] 14.1 Scope the binding `source_tree_hash` to the engine/resource-implementation surface, excluding
         desired-state configuration; a config change must not change the engine identity (Req 13.1).
-        Property 14.
+        Property 14. DONE — the invariant is structural: `source_tree_hash` is `tokeira-build-info`'s digest
+        of the workspace **code**, while a deployment's desired-state config is operator **data** (its
+        `deployment.toml` / `.tkd` in the deployment dir), never part of the workspace source — so a config
+        change cannot change the engine identity and cannot gate. The binding keys only on
+        `source_tree_hash`; config is tracked by the separate `config_revision`. Property 14 test
+        `config_refinement_keeps_the_engine_binding_and_advances_revision` (repeated same-engine applies keep
+        the recorded `source_tree_hash` and advance `config_revision`). *Narrowing the digest to only the
+        engine crates (vs the whole workspace) is a build-system refinement — 14.4 direction — but Property
+        14 holds regardless because config is already excluded.*
   - [ ] 14.2 On `apply`, advance `config_revision` and record `effective_config_ref`; `describe` reports
         engine stamp + `config_revision` (Req 13.2).
   - [ ] 14.3 Add config-revision revert: a same-engine `apply` of a prior recorded config revision — not an
@@ -326,7 +341,7 @@ multi-consumer decision) are out of scope.
 ```json
 {
   "waves": [
-    { "wave": 1, "tasks": ["13", "13.1", "11", "11.1", "11.2", "11.3", "11.4", "11.5", "1", "1.1", "1.2"] },
+    { "wave": 1, "tasks": ["13", "13.1", "13.2", "11", "11.1", "11.2", "11.3", "11.4", "11.5", "1", "1.1", "1.2"] },
     { "wave": 2, "tasks": ["2", "2.1", "2.2", "4", "4.1", "12", "12.1", "14", "14.1"] },
     { "wave": 3, "tasks": ["3", "3.1", "3.2", "3.3", "4.2"] },
     { "wave": 4, "tasks": ["5", "5.1", "5.2", "5.3"] },

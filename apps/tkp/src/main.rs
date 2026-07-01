@@ -23,6 +23,7 @@ use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 mod apply;
 mod gate;
+mod init;
 mod rollback;
 mod upgrade;
 
@@ -39,10 +40,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Day-0 mandatory versioning: write the first provenance stamp + integrity
+    /// manifest before any resource create.
+    Init(LifecycleArgs),
     /// Read-only report of identity, recorded provenance, binding verdict, and
     /// state facts. Never gates.
     Describe(DescribeArgs),
-    /// Plan and apply the deployment. (Not yet implemented.)
+    /// Plan and apply the deployment, gated on the binding.
     Apply(LifecycleArgs),
     /// Upgrade to a new engine identity. (Not yet implemented.)
     Upgrade(LifecycleArgs),
@@ -72,6 +76,7 @@ struct LifecycleArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Init(args) => init::init(&args.deployment_dir).await,
         Command::Describe(args) => describe(args).await,
         Command::Apply(args) => apply::apply(&args.deployment_dir).await,
         Command::Upgrade(args) => upgrade::upgrade(&args.deployment_dir).await,

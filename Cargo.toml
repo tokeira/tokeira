@@ -33,6 +33,7 @@ members = [
     "platforms/compose-syn",
     "platforms/ecs",
     "apps/tkr",
+    "apps/tkp",
     "apps/tokeirad",
     "apps/tokeira-autoscaler",
     "apps/tokeira-controller",

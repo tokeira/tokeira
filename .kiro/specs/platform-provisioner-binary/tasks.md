@@ -80,13 +80,21 @@ multi-consumer decision) are out of scope.
         client set; note the trim/`opt-level`/UPX levers in the design's size section.
 
 - [ ] 8. Provisioner binary + specialized CLI (`apps/tkp`, binary `tkp`) (Requirements 6, 7)
-  - [ ] 8.1 Create the `apps/tkp` binary crate linking `tokeira-iac`,
-        `tokeira-deploy-engine`, `tokeira-orchestrator`, `tokeira-aws`, the platform crates, and
-        `tokeira-state`; its own clap surface scoped to the deployment lifecycle (no operator/global
-        verbs) (Req 7.3).
-  - [ ] 8.2 `describe`: read-only report of identity, recorded provenance (or `unknown`), binding
-        verdict, integrity manifest, and state-format/CAS facts; human + `--json`; never gates (Req 6.1,
-        6.5).
+  - [~] 8.1 Create the `apps/tkp` binary crate + its own clap surface scoped to the deployment lifecycle
+        (no operator/global verbs). DONE (scaffold): `apps/tkp` created with a clap surface —
+        `describe` (implemented) plus `apply`/`upgrade`/`rollback`/`resume` stubs that report
+        "not yet implemented". Links `tokeira-provisioner` + `tokeira-state` (what `describe` needs); the
+        full engine/platform/`tokeira-aws` linkage lands with the applying verbs (8.3+). A minimal
+        deployment-level **envelope store** (`Box<dyn DeploymentStore<DeploymentStateEnvelope>>`, a local
+        `CasStore` under `{dir}/state/envelope`) is the first slice of the 13.1 envelope wiring; cloud will
+        select `S3StateStore` via the platform seam.
+  - [x] 8.2 `describe`: read-only report of identity, recorded provenance (or `unknown`), binding
+        verdict, integrity manifest, and state facts; human + `--json`; never gates (Req 6.1, 6.5). DONE.
+        Reports the running provisioner (`ProvenanceStamp::current` from build-info), the deployment
+        envelope (id / schema / config_revision), the recorded binding (or `unstamped (Unknown)`), the
+        `check_binding` verdict + whether it proceeds / is authoritative, the integrity manifest summary,
+        state-head presence, and operation/lock status. Tests: uninitialized→Unknown-refuses,
+        recorded-Match, dev-binary-on-versioned→ModeRegression. Smoke-verified.
   - [ ] 8.3 Embed the binding gate (task 3) in the applying verbs `apply`, `destroy`, `scale`,
         `schema setup`, `image push|mirror`: versioned deployments refuse on non-`Match` (no override);
         dev deployments take the `DevIterate` re-stamp+warn path (Req 6.2). `plan` surfaces the verdict

@@ -750,12 +750,19 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let edge_req = translate::start_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
         debug!(workflow_id = %edge_req.workflow_id, workflow_type = %edge_req.workflow_type, "start_workflow_execution");
+        // Retained for the response self-link (the request is consumed by the call below).
+        let namespace = edge_req.namespace.clone();
+        let workflow_id = edge_req.workflow_id.clone();
         let edge_resp = self
             .inner
             .start_workflow_execution(&headers, edge_req)
             .await?;
         debug!(run_id = ?edge_resp.run_id, "start_workflow_execution success");
-        Ok(Response::new(translate::start_response_to_proto(edge_resp)))
+        Ok(Response::new(translate::start_response_to_proto(
+            edge_resp,
+            namespace,
+            workflow_id,
+        )))
     }
 
     async fn signal_workflow_execution(
@@ -5367,21 +5374,27 @@ mod tests {
 
         let history = response.history.expect("history");
         assert_eq!(history.events.len(), 2);
-        assert_eq!(response.next_page_token, 2i64.to_be_bytes());
+        // v1.31.0: a non-long-poll read that returns all currently-available events emits an
+        // empty next_page_token ("you have everything") so the client's paginate-until-empty
+        // loop terminates. (getworkflowexecutionhistory/api.go:488)
+        assert!(
+            response.next_page_token.is_empty(),
+            "snapshot read of a caught-up workflow must return an empty page token"
+        );
     }
 
     #[tokio::test]
     async fn history_long_poll_wakes_when_event_arrives() {
         let (grpc, repo, run_key, run_id) = history_test_service().await;
+        // A long-poll (wait=true) read retains a continuation token even when caught up, so the
+        // follow client can resume; a non-long-poll baseline would now (correctly) return an empty
+        // token. v1.31.0: getworkflowexecutionhistory/api.go:488.
         let baseline = grpc
-            .get_workflow_execution_history(Request::new(history_request(
-                run_id,
-                false,
-                Vec::new(),
-            )))
+            .get_workflow_execution_history(Request::new(history_request(run_id, true, Vec::new())))
             .await
             .expect("baseline history call should succeed")
             .into_inner();
+        assert_eq!(baseline.next_page_token, 2i64.to_be_bytes());
 
         let task = tokio::spawn({
             let grpc = grpc.clone();
@@ -5410,12 +5423,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn history_long_poll_times_out_without_new_event() {
         let (grpc, _repo, _run_key, run_id) = history_test_service().await;
+        // Long-poll baseline (wait=true) yields a retained continuation token; the follow-up call
+        // then blocks for new events and times out. v1.31.0: api.go:488.
         let baseline = grpc
-            .get_workflow_execution_history(Request::new(history_request(
-                run_id,
-                false,
-                Vec::new(),
-            )))
+            .get_workflow_execution_history(Request::new(history_request(run_id, true, Vec::new())))
             .await
             .expect("baseline history call should succeed")
             .into_inner();
@@ -5445,47 +5456,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_next_page_token_tracks_position_across_calls() {
+    async fn history_next_page_token_tracks_position_across_pages() {
         let (grpc, repo, run_key, run_id) = history_test_service().await;
+        append_signal_event(repo, run_key).await; // history now has 3 events (1, 2, 3)
+
+        // Genuine pagination: MaximumPageSize=2 over a 3-event history. A full page means more
+        // events remain (non-empty token); a partial final page means the client has everything
+        // (empty token), matching v1.31.0's continuation contract.
+        let paged = |token: Vec<u8>| {
+            let mut req = history_request(run_id, false, token);
+            req.maximum_page_size = 2;
+            req
+        };
 
         let first = grpc
-            .get_workflow_execution_history(Request::new(history_request(
-                run_id,
-                false,
-                Vec::new(),
-            )))
+            .get_workflow_execution_history(Request::new(paged(Vec::new())))
             .await
             .expect("first history call should succeed")
             .into_inner();
+        let first_history = first.history.expect("history");
+        assert_eq!(first_history.events.len(), 2);
         assert_eq!(first.next_page_token, 2i64.to_be_bytes());
 
         let second = grpc
-            .get_workflow_execution_history(Request::new(history_request(
-                run_id,
-                false,
-                first.next_page_token.clone(),
-            )))
+            .get_workflow_execution_history(Request::new(paged(first.next_page_token)))
             .await
             .expect("second history call should succeed")
             .into_inner();
         let second_history = second.history.expect("history");
-        assert!(second_history.events.is_empty());
-        assert_eq!(second.next_page_token, 2i64.to_be_bytes());
-
-        append_signal_event(repo, run_key).await;
-
-        let third = grpc
-            .get_workflow_execution_history(Request::new(history_request(
-                run_id,
-                false,
-                second.next_page_token,
-            )))
-            .await
-            .expect("third history call should succeed")
-            .into_inner();
-        let third_history = third.history.expect("history");
-        assert_eq!(third_history.events.len(), 1);
-        assert_eq!(third.next_page_token, 3i64.to_be_bytes());
+        assert_eq!(second_history.events.len(), 1);
+        assert!(
+            second.next_page_token.is_empty(),
+            "final page must return an empty token so the client stops paginating"
+        );
     }
 
     #[tokio::test]

@@ -2016,6 +2016,19 @@ impl WorkflowService {
                 }),
                 start_workflow_status: WorkflowExecutionStatus::Running,
             },
+            StartWorkflowResult::Deduped {
+                run_key, run_id, ..
+            } => ScheduleActionResult {
+                schedule_time: nominal_time,
+                actual_time,
+                start_workflow_result: Some(WorkflowExecution {
+                    namespace_id,
+                    workflow_id,
+                    run_id,
+                    run_key,
+                }),
+                start_workflow_status: WorkflowExecutionStatus::Running,
+            },
             StartWorkflowResult::UsedExisting { run_key, run_id }
             | StartWorkflowResult::Rejected { run_key, run_id } => ScheduleActionResult {
                 schedule_time: nominal_time,
@@ -2413,6 +2426,39 @@ impl WorkflowService {
                             transition_seq: 0,
                             last_event_id: 0,
                             started: false,
+                            // Attached to a running incumbent → RUNNING (api.go:343 returns the
+                            // incumbent's status, which for UseExisting-on-running is RUNNING).
+                            status: ExecutionStatus::Running,
+                            // When the attach recorded a WorkflowExecutionOptionsUpdated event
+                            // (OnConflictOptions{AttachRequestId}), v1.31.0 returns a RequestIdRef
+                            // link to it rather than the EventRef-to-start link
+                            // (generateRequestIdRefLink, startworkflow/api.go:660-668/833).
+                            attached_request_id: internal
+                                .on_conflict_options
+                                .as_ref()
+                                .filter(|options| options.attach_request_id)
+                                .map(|_| internal.request.request_id.0.clone()),
+                            eager_workflow_task: None,
+                        })
+                    }
+                    StartWorkflowResult::Deduped {
+                        run_key,
+                        run_id,
+                        execution_status,
+                    } => {
+                        // A retried start whose RequestId already authored this run's
+                        // WorkflowExecutionStarted: v1.31.0 respondToRetriedRequest returns the
+                        // existing run with Started=true and the incumbent's Status
+                        // (startworkflow/api.go:332-336, 563/567). The EventRef self-link to
+                        // event 1 is synthesised by the proto layer from run_id.
+                        Ok(StartWorkflowExecutionResponse {
+                            run_key,
+                            run_id,
+                            transition_seq: 0,
+                            last_event_id: 0,
+                            started: true,
+                            status: execution_status,
+                            attached_request_id: None,
                             eager_workflow_task: None,
                         })
                     }
@@ -2891,7 +2937,7 @@ impl WorkflowService {
                                 deployment: state.deployment.clone(),
                                 build_id: state.build_id.clone(),
                             };
-                            if let Some(started) = self
+                            if let Some(mut started) = self
                                 .runtime
                                 .try_claim_workflow_task(
                                     queue,
@@ -2901,6 +2947,13 @@ impl WorkflowService {
                                 .await
                                 .map_err(EdgeError::from)?
                             {
+                                // A new WFT returned inline from RespondWorkflowTaskCompleted is
+                                // delivered to the same worker and carries incremental history from
+                                // the previous started event — v1.31.0 treats it as sticky
+                                // (respondworkflowtaskcompleted/api.go:759-760), so the SDK receives
+                                // only the events after PreviousStartedEventId rather than the full
+                                // history.
+                                started.is_sticky_match = true;
                                 let mut workflow_task = from_internal::poll_response(
                                     started.clone(),
                                     self.repo.as_ref(),
@@ -4776,9 +4829,26 @@ impl WorkflowService {
                     );
 
                     if !filtered.is_empty() || !req.wait_new_event {
+                        // v1.31.0 emits an empty next_page_token once there is no more history to
+                        // return AND (the workflow is closed OR this is not a long-poll); a
+                        // non-empty token tells the client to keep paging / following, an empty
+                        // token tells it to stop. tokeira previously always encoded a token, so
+                        // the Go `GetHistory` helper (loops until len(token)==0) span-looped
+                        // forever against finished workflows — the source of the apparent suite
+                        // hang. service/history/api/getworkflowexecutionhistory/api.go:488 (v1.31.0).
+                        let more_events = history.len() >= limit;
+                        let reached_close = history
+                            .iter()
+                            .any(|event| is_close_history_event(&event.kind));
+                        let next_page_token =
+                            if more_events || (req.wait_new_event && !reached_close) {
+                                encode_history_page_token(current_last_event_id)
+                            } else {
+                                Vec::new()
+                            };
                         return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
                             history: filtered.into_iter().take(limit).collect(),
-                            next_page_token: encode_history_page_token(current_last_event_id),
+                            next_page_token,
                         });
                     }
 

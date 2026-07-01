@@ -518,6 +518,38 @@ fn retry_policy_from_domain(value: &RetryPolicy) -> tokeira_proto::common::Retry
     }
 }
 
+/// Materialize v1.31.0's default activity retry policy and fill unset subfields
+/// (`common/retrypolicy/retry_policy.go` `DefaultDefaultRetrySettings` + `EnsureDefaults`:
+/// InitialInterval 1s, BackoffCoefficient 2.0, MaximumInterval 100×InitialInterval,
+/// MaximumAttempts 0 = unlimited). Activities always carry a retry policy in v1.31.0, so the
+/// ScheduleActivity command records this even when the SDK omits one — unlike the generic
+/// `retry_policy_to_domain`, which defaults BackoffCoefficient to 1.0.
+fn activity_retry_policy_with_defaults(
+    proto: Option<&tokeira_proto::common::RetryPolicy>,
+) -> RetryPolicy {
+    let initial_interval = proto
+        .and_then(|p| proto_duration_to_time(p.initial_interval.as_ref()))
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or(time::Duration::seconds(1));
+    let backoff_coefficient = proto
+        .map(|p| p.backoff_coefficient)
+        .filter(|coefficient| *coefficient > 0.0)
+        .unwrap_or(2.0);
+    let maximum_interval = proto
+        .and_then(|p| proto_duration_to_time(p.maximum_interval.as_ref()))
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or(initial_interval * 100);
+    RetryPolicy {
+        initial_interval,
+        backoff_coefficient,
+        maximum_interval: Some(maximum_interval),
+        maximum_attempts: proto.map(|p| p.maximum_attempts.max(0) as u32).unwrap_or(0),
+        non_retryable_error_types: proto
+            .map(|p| p.non_retryable_error_types.clone())
+            .unwrap_or_default(),
+    }
+}
+
 fn parent_close_policy_to_domain(value: i32) -> ParentClosePolicy {
     match value {
         2 => ParentClosePolicy::Abandon,
@@ -746,6 +778,24 @@ pub fn update_workflow_execution_options_response_to_proto(
     }
 }
 
+/// The engine's reserved internal per-namespace worker task queue
+/// (`primitives.PerNSWorkerTaskQueue @ v1.31.0 common/primitives/task_queues.go:12`).
+const PER_NS_WORKER_TASK_QUEUE: &str = "temporal-sys-per-ns-tq";
+
+/// Reject a user-issued Start / SignalWithStart targeting the reserved internal
+/// per-namespace worker task queue. Mirrors `CheckInternalPerNsTaskQueueAllowed`
+/// (task_queues.go:24-43 @ v1.31.0): with no internal parent component, scheduling
+/// onto the per-ns task queue is illegal and surfaces as InvalidArgument with the
+/// verbatim message the SDK conformance suite asserts on.
+fn reject_internal_per_ns_task_queue(task_queue: &str) -> Result<(), ProtoConversionError> {
+    if task_queue == PER_NS_WORKER_TASK_QUEUE {
+        return Err(ProtoConversionError::InvalidArgument(format!(
+            "cannot use internal per-namespace task queue:{task_queue}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn start_request_to_edge(
     req: workflowservice::StartWorkflowExecutionRequest,
 ) -> Result<StartWorkflowExecutionRequest, ProtoConversionError> {
@@ -775,6 +825,7 @@ pub fn start_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "StartWorkflowExecutionRequest.task_queue",
         ))?;
+    reject_internal_per_ns_task_queue(&task_queue.name)?;
 
     let mut conflict_policy = extract_conflict_policy(req.workflow_id_conflict_policy);
     let mut reuse_policy = extract_reuse_policy(req.workflow_id_reuse_policy);
@@ -2577,10 +2628,43 @@ pub fn update_namespace_response_to_proto(
 
 pub fn start_response_to_proto(
     resp: StartWorkflowExecutionResponse,
+    namespace: String,
+    workflow_id: String,
 ) -> workflowservice::StartWorkflowExecutionResponse {
+    use proto_common::link::{
+        Variant, WorkflowEvent,
+        workflow_event::{EventReference, Reference, RequestIdReference},
+    };
+    let run_id = resp.run_id.0.to_string();
+    // v1.31.0 returns a self-referential response link. For an OnConflictOptions attach that
+    // recorded a WorkflowExecutionOptionsUpdated event, it is a RequestIdRef to that event keyed
+    // by the attaching request id (generateRequestIdRefLink, startworkflow/api.go:833). Otherwise
+    // — a fresh start, a dedup that maps to the original start request, or a plain UseExisting
+    // attach — it is an EventRef to event 1 / WORKFLOW_EXECUTION_STARTED
+    // (generateStartedEventRefLink, startworkflow/api.go:811).
+    let reference = match resp.attached_request_id {
+        Some(request_id) => Reference::RequestIdRef(RequestIdReference {
+            request_id,
+            event_type: tokeira_proto::enums::EventType::WorkflowExecutionOptionsUpdated as i32,
+        }),
+        None => Reference::EventRef(EventReference {
+            event_id: 1,
+            event_type: tokeira_proto::enums::EventType::WorkflowExecutionStarted as i32,
+        }),
+    };
+    let link = proto_common::Link {
+        variant: Some(Variant::WorkflowEvent(WorkflowEvent {
+            namespace,
+            workflow_id,
+            run_id: run_id.clone(),
+            reference: Some(reference),
+        })),
+    };
     workflowservice::StartWorkflowExecutionResponse {
-        run_id: resp.run_id.0.to_string(),
+        run_id,
         started: resp.started,
+        status: execution_status_to_proto(resp.status),
+        link: Some(link),
         eager_workflow_task: resp.eager_workflow_task.map(poll_response_to_proto),
         ..Default::default()
     }
@@ -3676,6 +3760,7 @@ pub fn signal_with_start_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "SignalWithStartWorkflowExecutionRequest.task_queue",
         ))?;
+    reject_internal_per_ns_task_queue(&task_queue.name)?;
     validate_links(&req.links)?;
 
     if matches!(
@@ -4009,7 +4094,10 @@ pub fn proto_command_to_workflow_command(
                     .unwrap_or_default(),
                 header: attrs.header.as_ref().map(headers_to_domain),
                 request_eager_execution: attrs.request_eager_execution,
-                retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
+                // Activities always carry a retry policy in v1.31.0; default/ensure it here.
+                retry_policy: Some(activity_retry_policy_with_defaults(
+                    attrs.retry_policy.as_ref(),
+                )),
                 deployment: None,
                 build_id: None,
                 schedule_to_close_timeout: proto_duration_to_time(

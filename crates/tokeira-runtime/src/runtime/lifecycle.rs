@@ -102,6 +102,7 @@ where
                 .resolve_conflict(
                     request.namespace_id,
                     &request.workflow_id,
+                    &request.request.request_id.0,
                     request.conflict_policy,
                     request.reuse_policy,
                 )
@@ -166,6 +167,17 @@ where
                 }
                 ConflictResolution::Rejected { run_key, run_id } => {
                     return Ok(StartWorkflowResult::Rejected { run_key, run_id });
+                }
+                ConflictResolution::DedupRetried {
+                    run_key,
+                    run_id,
+                    execution_status,
+                } => {
+                    return Ok(StartWorkflowResult::Deduped {
+                        run_key,
+                        run_id,
+                        execution_status,
+                    });
                 }
             }
         }
@@ -247,6 +259,7 @@ where
             .resolve_conflict(
                 request.namespace_id,
                 &request.workflow_id,
+                &request.request.request_id.0,
                 request.conflict_policy,
                 request.reuse_policy,
             )
@@ -335,6 +348,11 @@ where
             ConflictResolution::Rejected { run_key, run_id } => {
                 Ok(SignalWithStartResult::Rejected { run_key, run_id })
             }
+            // A retried signal-with-start whose RequestId authored the incumbent's start is
+            // idempotent: return the existing run (mirrors the start dedup path, api.go:332).
+            ConflictResolution::DedupRetried {
+                run_key, run_id, ..
+            } => Ok(SignalWithStartResult::Started { run_key, run_id }),
         }
     }
 
@@ -498,6 +516,7 @@ where
         &self,
         namespace_id: NamespaceId,
         workflow_id: &tokeira_types::WorkflowId,
+        request_id: &str,
         conflict_policy: WorkflowIdConflictPolicy,
         reuse_policy: WorkflowIdReusePolicy,
     ) -> Result<ConflictResolution> {
@@ -511,6 +530,18 @@ where
                 return Ok(ConflictResolution::Absent);
             };
             if state.status.is_open() {
+                // v1.31.0 handleConflict (startworkflow/api.go:328-336): a retried start whose
+                // RequestId already authored this run's WorkflowExecutionStarted is deduped to the
+                // incumbent BEFORE any conflict policy applies.
+                if let Some(info) = state.request_id_infos.get(request_id)
+                    && info.event_type == tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
+                {
+                    return Ok(ConflictResolution::DedupRetried {
+                        run_key,
+                        run_id: state.run_id,
+                        execution_status: state.status,
+                    });
+                }
                 return Ok(match conflict_policy {
                     WorkflowIdConflictPolicy::Fail => ConflictResolution::Rejected {
                         run_key,
@@ -534,6 +565,15 @@ where
             return Ok(ConflictResolution::Absent);
         };
         if state.status.is_open() {
+            if let Some(info) = state.request_id_infos.get(request_id)
+                && info.event_type == tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
+            {
+                return Ok(ConflictResolution::DedupRetried {
+                    run_key,
+                    run_id: state.run_id,
+                    execution_status: state.status,
+                });
+            }
             return Ok(match conflict_policy {
                 WorkflowIdConflictPolicy::Fail => ConflictResolution::Rejected {
                     run_key,
@@ -607,7 +647,19 @@ where
                         .clone()
                         .unwrap_or_else(|| "workflow-id-conflict-policy".to_string()),
                     request: RequestContext {
-                        request_id: request.request_id,
+                        // v1.31.0's internal conflict-terminate (workflow_id_dedup.go:202
+                        // terminateWorkflowAction) runs under IdentityHistoryService and does NOT
+                        // consume the start's RequestId — that id is reserved for the new run's
+                        // WorkflowExecutionStarted. tokeira records a request-dedupe op for every
+                        // terminate (kernel.rs apply_terminate), so reusing the start's request_id
+                        // here would poison the (namespace, workflow_id, request_id) dedupe slot and
+                        // make the subsequent replacement-start commit return CommitResult::Duplicate.
+                        // Derive a distinct, deterministic id keyed on the displaced run so retries
+                        // of the same terminate stay idempotent while the start's id stays free.
+                        request_id: tokeira_types::RequestId(format!(
+                            "conflict-terminate:{}:{}",
+                            request.request_id.0, state.run_id.0
+                        )),
                         caller_identity: request.caller_identity,
                         received_at: request.received_at,
                     },

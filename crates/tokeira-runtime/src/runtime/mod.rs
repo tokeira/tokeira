@@ -208,6 +208,15 @@ pub enum StartWorkflowResult {
         run_key: RunKey,
         run_id: RunId,
     },
+    /// A retried start whose RequestId already authored the open incumbent's
+    /// `WorkflowExecutionStarted` is deduped to that run. v1.31.0 returns this as
+    /// `Started: true` with the incumbent's status (startworkflow/api.go:332-336,
+    /// respondToRetriedRequest). No new run is created.
+    Deduped {
+        run_key: RunKey,
+        run_id: RunId,
+        execution_status: ExecutionStatus,
+    },
     Rejected {
         run_key: RunKey,
         run_id: RunId,
@@ -254,10 +263,27 @@ impl Default for RuntimeConfig {
 #[derive(Clone, Debug, PartialEq)]
 enum ConflictResolution {
     Absent,
-    UseExisting { run_key: RunKey, run_id: RunId },
-    TerminateAndStart { run_key: RunKey },
+    UseExisting {
+        run_key: RunKey,
+        run_id: RunId,
+    },
+    TerminateAndStart {
+        run_key: RunKey,
+    },
     ClosedAllowReuse,
-    Rejected { run_key: RunKey, run_id: RunId },
+    Rejected {
+        run_key: RunKey,
+        run_id: RunId,
+    },
+    /// The incoming RequestId already authored the open incumbent's
+    /// `WorkflowExecutionStarted`: this is a retry of the original start and is
+    /// deduped to the incumbent before any conflict policy applies (v1.31.0
+    /// handleConflict, startworkflow/api.go:328-336).
+    DedupRetried {
+        run_key: RunKey,
+        run_id: RunId,
+        execution_status: ExecutionStatus,
+    },
 }
 
 struct BufferedQueryCleanup {

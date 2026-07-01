@@ -205,6 +205,15 @@ pub struct StartWorkflowExecutionResponse {
     pub transition_seq: u64,
     pub last_event_id: i64,
     pub started: bool,
+    /// Status of the workflow execution identified by `run_id` after the start. v1.31.0 sets
+    /// this to RUNNING for a fresh start and to the incumbent run's status when attaching to an
+    /// existing run (service/history/api/startworkflow/api.go @ v1.31.0).
+    pub status: ExecutionStatus,
+    /// Request id that authored a `WorkflowExecutionOptionsUpdated` event when this start attached
+    /// to a running incumbent via `OnConflictOptions{AttachRequestId}`. `Some` selects the
+    /// RequestIdRef response link (`generateRequestIdRefLink`, startworkflow/api.go:833); `None`
+    /// keeps the default EventRef-to-WorkflowExecutionStarted link.
+    pub attached_request_id: Option<String>,
     pub eager_workflow_task: Option<PollWorkflowTaskQueueResponse>,
 }
 

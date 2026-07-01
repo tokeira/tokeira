@@ -22,6 +22,8 @@ pub fn start_response(
         transition_seq: outcome.transition_seq,
         last_event_id: outcome.last_event_id,
         started: true,
+        status: outcome.execution_status,
+        attached_request_id: None,
         eager_workflow_task: None,
     }
 }

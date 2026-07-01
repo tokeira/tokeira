@@ -1210,6 +1210,20 @@ where
                 start_workflow_status: WorkflowExecutionStatus::Running,
             }
         }
+        // A retried start deduped to the running incumbent: idempotent success (Running).
+        Ok(StartWorkflowResult::Deduped {
+            run_key, run_id, ..
+        }) => ScheduleActionResult {
+            schedule_time: nominal_time,
+            actual_time,
+            start_workflow_result: Some(WorkflowExecution {
+                namespace_id,
+                workflow_id,
+                run_id,
+                run_key,
+            }),
+            start_workflow_status: WorkflowExecutionStatus::Running,
+        },
         Ok(StartWorkflowResult::UsedExisting { run_key, run_id })
         | Ok(StartWorkflowResult::Rejected { run_key, run_id }) => ScheduleActionResult {
             schedule_time: nominal_time,

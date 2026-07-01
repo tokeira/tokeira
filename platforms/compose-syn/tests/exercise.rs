@@ -9,12 +9,14 @@
 //! observability artifact rendering (dashboards + alerts), local state, and the
 //! deploy-engine service manifests — runs here.
 
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
-use tokeira_compose_syn::adapter::{TkdConfig, TkdDeployment};
-use tokeira_compose_syn::context::Cx;
-use tokeira_compose_syn::{interp, DEFAULT_TKD};
+use tokeira_compose_syn::{
+    DEFAULT_TKD,
+    adapter::{TkdConfig, TkdDeployment},
+    context::Cx,
+    interp,
+};
 use tokeira_deploy_engine::ServiceContext;
 use tokeira_iac::{ChangeKind, ModuleSelection, ProvisionContext};
 use tokeira_orchestrator::{Deployment, InfraEngine};
@@ -31,13 +33,23 @@ fn cx(dir: PathBuf) -> Cx {
 async fn exercise_compose_syn_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
-    let cfg = TkdConfig { source: DEFAULT_TKD.to_string(), cx: cx(dir.clone()) };
+    let cfg = TkdConfig {
+        source: DEFAULT_TKD.to_string(),
+        cx: cx(dir.clone()),
+    };
 
     // ── 1. Drive the real InfraEngine: interpret → compose → plan ────────────
     let mut infra = InfraEngine::new(TkdDeployment, &cfg, &dir).await.unwrap();
     let composition = infra.compose(ModuleSelection::All).unwrap();
-    let module_names: Vec<&str> = composition.desired_modules.iter().map(|m| m.name()).collect();
-    let changes = infra.plan(&composition, ModuleSelection::All).await.unwrap();
+    let module_names: Vec<&str> = composition
+        .desired_modules
+        .iter()
+        .map(|m| m.name())
+        .collect();
+    let changes = infra
+        .plan(&composition, ModuleSelection::All)
+        .await
+        .unwrap();
 
     // From an empty state, every desired resource plans as a Create.
     assert!(!changes.is_empty(), "infra plan should propose creates");
@@ -59,7 +71,10 @@ async fn exercise_compose_syn_end_to_end() {
 
     let local_state = dep.realize_module("local_state", &cfg.cx).unwrap();
     local_state[0].create(&pctx).await.unwrap();
-    assert!(dir.join("state").exists(), "local-state apply creates the state dir");
+    assert!(
+        dir.join("state").exists(),
+        "local-state apply creates the state dir"
+    );
 
     let observability = dep.realize_module("observability", &cfg.cx).unwrap();
     observability[0].create(&pctx).await.unwrap();
@@ -70,10 +85,21 @@ async fn exercise_compose_syn_end_to_end() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(rendered.len(), 10, "all 10 dashboards rendered: {rendered:?}");
-    assert!(dir.join("config/mimir/rules/observability-alerts.yaml").exists(), "alert rules");
+    assert_eq!(
+        rendered.len(),
+        10,
+        "all 10 dashboards rendered: {rendered:?}"
+    );
+    assert!(
+        dir.join("config/mimir/rules/observability-alerts.yaml")
+            .exists(),
+        "alert rules"
+    );
     assert!(dir.join("config/mimir.yaml").exists(), "mimir config");
-    assert!(dir.join("config/grafana/provisioning/datasources/datasources.yaml").exists());
+    assert!(
+        dir.join("config/grafana/provisioning/datasources/datasources.yaml")
+            .exists()
+    );
     println!(
         "observability rendered: {} dashboards + alert rules + base configs under {}",
         rendered.len(),
@@ -85,10 +111,17 @@ async fn exercise_compose_syn_end_to_end() {
     assert_eq!(services.len(), 5, "5 compose services");
     let sctx = ServiceContext::default();
     for s in &services {
-        assert!(!s.manifests(&sctx).unwrap().is_empty(), "{} has a manifest", s.name());
+        assert!(
+            !s.manifests(&sctx).unwrap().is_empty(),
+            "{} has a manifest",
+            s.name()
+        );
     }
     let names: Vec<&str> = services.iter().map(|s| s.name()).collect();
-    println!("deploy plan: {} service manifest(s): {names:?}", services.len());
+    println!(
+        "deploy plan: {} service manifest(s): {names:?}",
+        services.len()
+    );
 }
 
 #[tokio::test]
@@ -101,14 +134,31 @@ async fn exercise_dsql_variant_plans_the_cluster_and_writeback() {
         "storage: Storage::InMemory,",
         "storage: Storage::Dsql { region: \"us-east-1\".into(), mode: DsqlMode::Managed, endpoint: None, arn: None },",
     );
-    let cfg = TkdConfig { source, cx: cx(dir.clone()) };
+    let cfg = TkdConfig {
+        source,
+        cx: cx(dir.clone()),
+    };
 
     let infra = InfraEngine::new(TkdDeployment, &cfg, &dir).await.unwrap();
     let composition = infra.compose(ModuleSelection::All).unwrap();
-    let names: Vec<&str> = composition.desired_modules.iter().map(|m| m.name()).collect();
-    assert!(names.contains(&"dsql"), "DSQL config composes the dsql module: {names:?}");
+    let names: Vec<&str> = composition
+        .desired_modules
+        .iter()
+        .map(|m| m.name())
+        .collect();
+    assert!(
+        names.contains(&"dsql"),
+        "DSQL config composes the dsql module: {names:?}"
+    );
 
     let (dep, _) = interp::interpret(&cfg.source, &cfg.cx).unwrap();
-    assert_eq!(dep.writeback_entries().len(), 5, "5 writeback keys under DSQL");
-    println!("dsql variant: modules {names:?}, {} writeback keys", dep.writeback_entries().len());
+    assert_eq!(
+        dep.writeback_entries().len(),
+        5,
+        "5 writeback keys under DSQL"
+    );
+    println!(
+        "dsql variant: modules {names:?}, {} writeback keys",
+        dep.writeback_entries().len()
+    );
 }

@@ -3,8 +3,7 @@ use std::{collections::HashMap, time::Duration};
 use aws_sdk_dsql::client::Waiters as DsqlWaiters;
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 /// Lifecycle mode for a single DSQL cluster resource.

@@ -32,12 +32,18 @@ impl Cx {
     /// A state-anchored volume: `<state_dir>/<sub>` mounted at `at`. The operator
     /// names only the logical anchor; the host path is resolved at realize time.
     pub fn state(&self, sub: &str, at: &str) -> Vol {
-        Vol::State { sub: sub.into(), at: at.into() }
+        Vol::State {
+            sub: sub.into(),
+            at: at.into(),
+        }
     }
 
     /// A config-anchored volume: `<config_dir>/<sub>` mounted at `at`.
     pub fn config(&self, sub: &str, at: &str) -> Vol {
-        Vol::Config { sub: sub.into(), at: at.into() }
+        Vol::Config {
+            sub: sub.into(),
+            at: at.into(),
+        }
     }
 
     /// The Docker socket bind mount — the one vetted raw `host:container` constant,

@@ -808,7 +808,8 @@ mod tests {
         assert!(matches!(no_change, iac::InternalChange::NoChange { .. }));
 
         fs::write(temp.path().join(ALLOY_CONFIG), "changed").unwrap();
-        let iac::DescribeResult::Present(live_state) = resource.describe(&ctx).await.unwrap() else {
+        let iac::DescribeResult::Present(live_state) = resource.describe(&ctx).await.unwrap()
+        else {
             panic!("expected live config to be Present");
         };
         let change = resource.diff(&live_state, &ctx);

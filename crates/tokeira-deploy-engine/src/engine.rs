@@ -415,13 +415,9 @@ mod tests {
         let engine = ServiceEngine::new();
         let mut ctx = ServiceContext::default();
         let mut state = tokeira_iac::RuntimeState::default();
-        let err = block_on_ready(engine.destroy_services(
-            &services,
-            &platform,
-            &mut ctx,
-            &mut state,
-        ))
-        .expect_err("fail-closed when platform can't delete");
+        let err =
+            block_on_ready(engine.destroy_services(&services, &platform, &mut ctx, &mut state))
+                .expect_err("fail-closed when platform can't delete");
         assert!(matches!(err, RuntimeError::Platform(_)));
     }
 
@@ -453,13 +449,9 @@ mod tests {
             seed_service_state(&mut state, name);
         }
 
-        let changes = block_on_ready(engine.destroy_services(
-            &services,
-            &platform,
-            &mut ctx,
-            &mut state,
-        ))
-        .expect("destroy succeeds");
+        let changes =
+            block_on_ready(engine.destroy_services(&services, &platform, &mut ctx, &mut state))
+                .expect("destroy succeeds");
 
         assert!(changes.iter().all(|c| c.kind == ServiceChangeKind::Delete));
         assert!(state.services.is_empty(), "all services removed from state");

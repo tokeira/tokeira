@@ -7,15 +7,15 @@
 
 use std::collections::HashMap;
 
-use syn::punctuated::Punctuated;
-use syn::token::Comma;
-use syn::{Expr, Pat};
+use syn::{Expr, Pat, punctuated::Punctuated, token::Comma};
 
 use crate::context::Cx;
 
-use super::registry::{self, Registry};
-use super::schema::{fn_param_names, FnTable, TypeTable};
-use super::value::{EnumPath, EvalError, FieldMap, HostObj, Value, VariantBody};
+use super::{
+    registry::{self, Registry},
+    schema::{FnTable, TypeTable, fn_param_names},
+    value::{EnumPath, EvalError, FieldMap, HostObj, Value, VariantBody},
+};
 
 /// Lexical scopes. `child()` snapshots the parent (cheap; host handles share via
 /// `Rc`, so builder mutations stay shared while new bindings don't leak outward).
@@ -25,7 +25,9 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
-        Self { scopes: vec![HashMap::new()] }
+        Self {
+            scopes: vec![HashMap::new()],
+        }
     }
 
     fn child(&self) -> Self {
@@ -39,7 +41,10 @@ impl Env {
     }
 
     fn insert(&mut self, name: String, v: Value) {
-        self.scopes.last_mut().expect("at least one scope").insert(name, v);
+        self.scopes
+            .last_mut()
+            .expect("at least one scope")
+            .insert(name, v);
     }
 }
 
@@ -97,10 +102,16 @@ impl Interp<'_> {
                 }
                 syn::Stmt::Macro(sm) => {
                     let v = self.eval_macro(&sm.mac, env)?;
-                    last = if sm.semi_token.is_some() { Value::Unit } else { v };
+                    last = if sm.semi_token.is_some() {
+                        Value::Unit
+                    } else {
+                        v
+                    };
                 }
                 syn::Stmt::Item(_) => {
-                    return Err(EvalError::new("nested items are not supported in a function body"));
+                    return Err(EvalError::new(
+                        "nested items are not supported in a function body",
+                    ));
                 }
             }
         }
@@ -159,7 +170,10 @@ impl Interp<'_> {
             // a block expression (a block-bodied match arm, or `let x = { .. }`)
             // — eval its statements in a child scope, like the subset descends.
             Expr::Block(eb) => self.eval_block(&eb.block, &mut env.child()),
-            other => Err(EvalError::new(format!("unsupported expression `{}`", expr_kind(other)))),
+            other => Err(EvalError::new(format!(
+                "unsupported expression `{}`",
+                expr_kind(other)
+            ))),
         }
     }
 
@@ -175,7 +189,10 @@ impl Interp<'_> {
                     return Ok(Value::Opt(None));
                 }
                 if self.reg.is_kind(name) {
-                    return self.reg.construct_kind(name, FieldMap::new(), self.cx).map(Value::Host);
+                    return self
+                        .reg
+                        .construct_kind(name, FieldMap::new(), self.cx)
+                        .map(Value::Host);
                 }
                 Err(EvalError::new(format!("unbound name `{name}`")))
             }
@@ -184,16 +201,27 @@ impl Interp<'_> {
                 if self.types.is_enum(ty) {
                     if self.types.enum_has_unit_variant(ty, variant) {
                         return Ok(Value::Enum {
-                            path: EnumPath { ty: ty.clone(), segments: segs.clone() },
+                            path: EnumPath {
+                                ty: ty.clone(),
+                                segments: segs.clone(),
+                            },
                             variant: variant.clone(),
                             body: VariantBody::Unit,
                         });
                     }
-                    return Err(EvalError::new(format!("`{ty}` has no unit variant `{variant}`")));
+                    return Err(EvalError::new(format!(
+                        "`{ty}` has no unit variant `{variant}`"
+                    )));
                 }
-                Err(EvalError::new(format!("unresolved path `{}`", segs.join("::"))))
+                Err(EvalError::new(format!(
+                    "unresolved path `{}`",
+                    segs.join("::")
+                )))
             }
-            _ => Err(EvalError::new(format!("unresolved path `{}`", segs.join("::")))),
+            _ => Err(EvalError::new(format!(
+                "unresolved path `{}`",
+                segs.join("::")
+            ))),
         }
     }
 
@@ -205,14 +233,19 @@ impl Interp<'_> {
         if segs.len() == 2 && self.types.is_enum(&head) {
             let variant = segs[1].clone();
             if !self.types.enum_has_variant(&head, &variant) {
-                return Err(EvalError::new(format!("`{head}` has no variant `{variant}`")));
+                return Err(EvalError::new(format!(
+                    "`{head}` has no variant `{variant}`"
+                )));
             }
             let mut fields = FieldMap::new();
             for fv in &es.fields {
                 fields.insert(member_name(&fv.member)?, self.eval_expr(&fv.expr, env)?);
             }
             return Ok(Value::Enum {
-                path: EnumPath { ty: head, segments: segs },
+                path: EnumPath {
+                    ty: head,
+                    segments: segs,
+                },
                 variant,
                 body: VariantBody::Struct(fields),
             });
@@ -256,10 +289,16 @@ impl Interp<'_> {
             for fv in &es.fields {
                 fields.insert(member_name(&fv.member)?, self.eval_expr(&fv.expr, env)?);
             }
-            return self.reg.construct_kind(&head, fields, self.cx).map(Value::Host);
+            return self
+                .reg
+                .construct_kind(&head, fields, self.cx)
+                .map(Value::Host);
         }
 
-        Err(EvalError::new(format!("unknown struct type `{}`", segs.join("::"))))
+        Err(EvalError::new(format!(
+            "unknown struct type `{}`",
+            segs.join("::")
+        )))
     }
 
     fn eval_call(&self, ec: &syn::ExprCall, env: &mut Env) -> Result<Value, EvalError> {
@@ -270,7 +309,10 @@ impl Interp<'_> {
 
         // Some(x)
         if segs.len() == 1 && segs[0] == "Some" {
-            let arg = ec.args.first().ok_or_else(|| EvalError::new("`Some` needs an argument"))?;
+            let arg = ec
+                .args
+                .first()
+                .ok_or_else(|| EvalError::new("`Some` needs an argument"))?;
             let inner = self.eval_expr(arg, env)?;
             return Ok(Value::Opt(Some(Box::new(inner))));
         }
@@ -285,11 +327,17 @@ impl Interp<'_> {
         // enum tuple-variant: `Ty::Variant(..)`
         if segs.len() == 2 && self.types.is_enum(&segs[0]) {
             if !self.types.enum_has_variant(&segs[0], &segs[1]) {
-                return Err(EvalError::new(format!("`{}` has no variant `{}`", segs[0], segs[1])));
+                return Err(EvalError::new(format!(
+                    "`{}` has no variant `{}`",
+                    segs[0], segs[1]
+                )));
             }
             let args = self.eval_args(&ec.args, env)?;
             return Ok(Value::Enum {
-                path: EnumPath { ty: segs[0].clone(), segments: segs.clone() },
+                path: EnumPath {
+                    ty: segs[0].clone(),
+                    segments: segs.clone(),
+                },
                 variant: segs[1].clone(),
                 body: VariantBody::Tuple(args),
             });
@@ -311,7 +359,9 @@ impl Interp<'_> {
             "as_str" | "as_deref" => {
                 return match recv {
                     Value::Str(_) | Value::Opt(_) => Ok(recv),
-                    other => Err(EvalError::new(format!("`{method}` expects a string value, got {other:?}"))),
+                    other => Err(EvalError::new(format!(
+                        "`{method}` expects a string value, got {other:?}"
+                    ))),
                 };
             }
             "is_some" => return Ok(Value::Bool(matches!(recv, Value::Opt(Some(_))))),
@@ -324,9 +374,14 @@ impl Interp<'_> {
                 let args = self.eval_args(&em.args, env)?;
                 return m(host, args, self.cx);
             }
-            return Err(EvalError::new(format!("`{:?}` has no method `{method}`", host.kind())));
+            return Err(EvalError::new(format!(
+                "`{:?}` has no method `{method}`",
+                host.kind()
+            )));
         }
-        Err(EvalError::new(format!("method `{method}` on a non-host value")))
+        Err(EvalError::new(format!(
+            "method `{method}` on a non-host value"
+        )))
     }
 
     fn eval_field(&self, ef: &syn::ExprField, env: &mut Env) -> Result<Value, EvalError> {
@@ -338,7 +393,9 @@ impl Interp<'_> {
                 .cloned()
                 .ok_or_else(|| EvalError::new(format!("no field `{name}`"))),
             Value::Host(HostObj::Cx(cx)) => registry::cx_field(&cx, &name),
-            other => Err(EvalError::new(format!("cannot read field `{name}` of {other:?}"))),
+            other => Err(EvalError::new(format!(
+                "cannot read field `{name}` of {other:?}"
+            ))),
         }
     }
 
@@ -411,7 +468,12 @@ impl Interp<'_> {
             Pat::Struct(ps) => {
                 let segs = path_segs(&ps.path);
                 let want = segs.last().cloned().unwrap_or_default();
-                let Value::Enum { path, variant, body: VariantBody::Struct(fields) } = val else {
+                let Value::Enum {
+                    path,
+                    variant,
+                    body: VariantBody::Struct(fields),
+                } = val
+                else {
                     return Ok(false);
                 };
                 check_pat_enum_ty(&segs, &path.ty)?;
@@ -420,9 +482,9 @@ impl Interp<'_> {
                 }
                 for fp in &ps.fields {
                     let name = member_name(&fp.member)?;
-                    let sub = fields
-                        .get(&name)
-                        .ok_or_else(|| EvalError::new(format!("pattern names unknown field `{name}`")))?;
+                    let sub = fields.get(&name).ok_or_else(|| {
+                        EvalError::new(format!("pattern names unknown field `{name}`"))
+                    })?;
                     if !self.match_pattern(&fp.pat, sub, env)? {
                         return Ok(false);
                     }
@@ -432,7 +494,12 @@ impl Interp<'_> {
             Pat::TupleStruct(pts) => {
                 let segs = path_segs(&pts.path);
                 let want = segs.last().cloned().unwrap_or_default();
-                let Value::Enum { path, variant, body: VariantBody::Tuple(items) } = val else {
+                let Value::Enum {
+                    path,
+                    variant,
+                    body: VariantBody::Tuple(items),
+                } = val
+                else {
                     return Ok(false);
                 };
                 check_pat_enum_ty(&segs, &path.ty)?;
@@ -469,7 +536,10 @@ impl Interp<'_> {
             }
             return Ok(true);
         };
-        if pats[rest_idx + 1..].iter().any(|p| matches!(p, Pat::Rest(_))) {
+        if pats[rest_idx + 1..]
+            .iter()
+            .any(|p| matches!(p, Pat::Rest(_)))
+        {
             return Err(EvalError::new("at most one `..` is allowed in a pattern"));
         }
         let head = &pats[..rest_idx];
@@ -520,7 +590,9 @@ impl Interp<'_> {
             .parse_body_with(Punctuated::<Expr, Comma>::parse_terminated)
             .map_err(|e| EvalError::new(format!("format! parse error: {e}")))?;
         let mut it = args.iter();
-        let tmpl_expr = it.next().ok_or_else(|| EvalError::new("format! needs a template"))?;
+        let tmpl_expr = it
+            .next()
+            .ok_or_else(|| EvalError::new("format! needs a template"))?;
         let tmpl = match self.eval_expr(tmpl_expr, env)? {
             Value::Str(s) => s,
             _ => return Err(EvalError::new("format! template must be a string literal")),
@@ -564,7 +636,8 @@ impl Interp<'_> {
         let r = self.eval_expr(&eb.right, env)?;
         // Host handles are not value-comparable; reject rather than reach the
         // `PartialEq` tripwire (which would panic in debug / be wrong in release).
-        if matches!(eb.op, BinOp::Eq(_) | BinOp::Ne(_)) && (l.contains_host() || r.contains_host()) {
+        if matches!(eb.op, BinOp::Eq(_) | BinOp::Ne(_)) && (l.contains_host() || r.contains_host())
+        {
             return Err(EvalError::new("cannot compare host handles with `==`/`!=`"));
         }
         let b = match eb.op {
@@ -587,7 +660,11 @@ impl Interp<'_> {
         }
     }
 
-    fn eval_args(&self, args: &Punctuated<Expr, Comma>, env: &mut Env) -> Result<Vec<Value>, EvalError> {
+    fn eval_args(
+        &self,
+        args: &Punctuated<Expr, Comma>,
+        env: &mut Env,
+    ) -> Result<Vec<Value>, EvalError> {
         let mut out = Vec::with_capacity(args.len());
         for a in args {
             out.push(self.eval_expr(a, env)?);
@@ -632,7 +709,9 @@ fn check_empty_spread(rest: &Expr, ty: &str) -> Result<(), EvalError> {
             return Ok(());
         }
     }
-    Err(EvalError::new(format!("struct spread must be `..{ty}::EMPTY`")))
+    Err(EvalError::new(format!(
+        "struct spread must be `..{ty}::EMPTY`"
+    )))
 }
 
 fn eval_lit(lit: &syn::Lit) -> Result<Value, EvalError> {
@@ -657,7 +736,9 @@ fn as_bool(v: &Value) -> Result<bool, EvalError> {
 fn int_of(v: &Value) -> Result<i128, EvalError> {
     match v {
         Value::Int(n) => Ok(*n),
-        other => Err(EvalError::new(format!("expected an integer, got {other:?}"))),
+        other => Err(EvalError::new(format!(
+            "expected an integer, got {other:?}"
+        ))),
     }
 }
 

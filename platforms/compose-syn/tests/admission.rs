@@ -3,8 +3,10 @@
 
 use std::path::PathBuf;
 
-use tokeira_compose_syn::context::Cx;
-use tokeira_compose_syn::interp::{interpret, retarget_check};
+use tokeira_compose_syn::{
+    context::Cx,
+    interp::{interpret, retarget_check},
+};
 
 const SRC: &str = include_str!("../definition.tkd");
 
@@ -33,7 +35,11 @@ fn changing_create_time_storage_is_a_retarget() {
 
     // storage is `#[create]` — flipping InMemory -> Dsql is a retarget, refused.
     let err = retarget_check(SRC, &in_memory, &dsql).expect_err("storage change must be refused");
-    assert!(err.iter().any(|m| m.contains("storage") && m.contains("retarget")), "{err:?}");
+    assert!(
+        err.iter()
+            .any(|m| m.contains("storage") && m.contains("retarget")),
+        "{err:?}"
+    );
 
     // identity is fine
     assert!(retarget_check(SRC, &in_memory, &in_memory).is_ok());
@@ -45,11 +51,17 @@ fn changing_a_non_create_field_reconciles() {
     let (_, base) = interpret(SRC, &cx).unwrap();
 
     // tokeirad.replicas is NOT `#[create]` — bumping it is an ordinary apply.
-    let bumped_src = SRC.replace("            replicas: 1,\n            grpc_port", "            replicas: 3,\n            grpc_port");
+    let bumped_src = SRC.replace(
+        "            replicas: 1,\n            grpc_port",
+        "            replicas: 3,\n            grpc_port",
+    );
     assert_ne!(bumped_src, SRC, "the replicas substitution must apply");
     let (_, bumped) = interpret(&bumped_src, &cx).unwrap();
 
-    assert!(retarget_check(SRC, &base, &bumped).is_ok(), "replicas should reconcile");
+    assert!(
+        retarget_check(SRC, &base, &bumped).is_ok(),
+        "replicas should reconcile"
+    );
 }
 
 const REQUIRE_OK: &str = r#"

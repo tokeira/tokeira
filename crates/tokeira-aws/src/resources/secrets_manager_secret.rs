@@ -2,8 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 /// Configuration for a single Secrets Manager secret provider resource.

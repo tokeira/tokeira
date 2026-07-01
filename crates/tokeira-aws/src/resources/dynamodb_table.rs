@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 /// DynamoDB key type.

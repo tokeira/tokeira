@@ -652,4 +652,3 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), iac::IacError> {
         ))
     })
 }
-

@@ -8,16 +8,18 @@
 //! the hermetic refactor that relocated the volume/AWS/config-mount mechanics
 //! author-side (Proposal 004 Phase 1).
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde_json::Value;
-use tokeira_compose_deployment::ComposeConfig;
-use tokeira_compose_deployment::ComposeDeployment;
-use tokeira_compose_deployment::config::{ComposeDsqlConfig, DsqlMode as CfgDsqlMode};
-use tokeira_compose_deployment::modules::dsql_resource_id;
-use tokeira_compose_syn::context::Cx;
-use tokeira_compose_syn::definition::{self, DsqlMode, Storage};
+use tokeira_compose_deployment::{
+    ComposeConfig, ComposeDeployment,
+    config::{ComposeDsqlConfig, DsqlMode as CfgDsqlMode},
+    modules::dsql_resource_id,
+};
+use tokeira_compose_syn::{
+    context::Cx,
+    definition::{self, DsqlMode, Storage},
+};
 use tokeira_deploy_engine::{Service, ServiceContext};
 use tokeira_iac::{InfraState, ResourceId, ResourceState, ResourceType};
 use tokeira_orchestrator::{Deployment as _, StorageKind};
@@ -35,7 +37,10 @@ fn shape(services: &[Box<dyn Service>]) -> ServiceShape {
         .map(|s| {
             let deps = s.dependencies().iter().map(|d| d.to_string()).collect();
             let manifests = s.manifests(&ctx).expect("manifests render");
-            (s.name().to_string(), (s.module().to_string(), deps, manifests))
+            (
+                s.name().to_string(),
+                (s.module().to_string(), deps, manifests),
+            )
         })
         .collect()
 }
@@ -157,11 +162,18 @@ fn dsql_with_server_config_present_matches() {
     // The toml mount + TOKEIRA_CONFIG env are present (and, per ordering, the toml
     // mount precedes the ~/.aws mount).
     let vols = play["tokeirad"].2[0]["volumes"].as_array().unwrap();
-    let toml_idx = vols.iter().position(|v| v.as_str().unwrap().contains("tokeirad.toml"));
-    let aws_idx = vols.iter().position(|v| v.as_str().unwrap().contains("/.aws:"));
+    let toml_idx = vols
+        .iter()
+        .position(|v| v.as_str().unwrap().contains("tokeirad.toml"));
+    let aws_idx = vols
+        .iter()
+        .position(|v| v.as_str().unwrap().contains("/.aws:"));
     assert!(toml_idx.is_some(), "expected tokeirad.toml mount");
     assert!(aws_idx.is_some(), "expected ~/.aws mount under DSQL");
-    assert!(toml_idx < aws_idx, "server_config mount must precede the aws mount");
+    assert!(
+        toml_idx < aws_idx,
+        "server_config mount must precede the aws mount"
+    );
     assert_eq!(
         play["tokeirad"].2[0]["environment"]["TOKEIRA_CONFIG"],
         Value::from("/etc/tokeira/tokeirad.toml")
@@ -182,11 +194,17 @@ fn dsql_writeback_keys_match_compose_deployment() {
         resource_state("cluster_endpoint", "tokeira.dsql.us-east-1.on.aws"),
     );
     state.resources.insert(
-        ResourceId(format!("dynamodb-{}-dsql-rate-limiter", reference.project_name)),
+        ResourceId(format!(
+            "dynamodb-{}-dsql-rate-limiter",
+            reference.project_name
+        )),
         resource_state("table_name", "tokeira-dsql-rate-limiter"),
     );
     state.resources.insert(
-        ResourceId(format!("dynamodb-{}-dsql-conn-lease", reference.project_name)),
+        ResourceId(format!(
+            "dynamodb-{}-dsql-conn-lease",
+            reference.project_name
+        )),
         resource_state("table_name", "tokeira-dsql-conn-lease"),
     );
     let ref_writeback = ComposeDeployment.collect_writeback(&reference, &state);

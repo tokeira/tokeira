@@ -9,13 +9,9 @@
 //! time.
 
 use proc_macro2::Span;
-use syn::punctuated::Punctuated;
-use syn::spanned::Spanned;
-use syn::token::Comma;
-use syn::{Expr, File, Item, Pat, Stmt};
+use syn::{Expr, File, Item, Pat, Stmt, punctuated::Punctuated, spanned::Spanned, token::Comma};
 
-use super::registry::Registry;
-use super::schema::TypeTable;
+use super::{registry::Registry, schema::TypeTable};
 
 /// One subset violation.
 pub struct Diagnostic {
@@ -47,7 +43,11 @@ impl std::fmt::Display for Diagnostics {
 
 /// Validate that `file` is within the interpreted subset.
 pub fn check(file: &File, reg: &Registry, types: &TypeTable) -> Result<(), Diagnostics> {
-    let mut c = Checker { reg, types, diags: Vec::new() };
+    let mut c = Checker {
+        reg,
+        types,
+        diags: Vec::new(),
+    };
     for item in &file.items {
         c.item(item);
     }
@@ -66,7 +66,10 @@ struct Checker<'a> {
 
 impl Checker<'_> {
     fn reject(&mut self, span: Span, msg: impl Into<String>) {
-        self.diags.push(Diagnostic { msg: msg.into(), span });
+        self.diags.push(Diagnostic {
+            msg: msg.into(),
+            span,
+        });
     }
 
     fn item(&mut self, item: &Item) {
@@ -90,7 +93,9 @@ impl Checker<'_> {
             if a.path().is_ident("require") {
                 match a.parse_args::<Expr>() {
                     Ok(e) => self.expr(&e),
-                    Err(_) => self.reject(a.span(), "#[require(...)] must contain a single expression"),
+                    Err(_) => {
+                        self.reject(a.span(), "#[require(...)] must contain a single expression")
+                    }
                 }
             }
         }
@@ -117,12 +122,16 @@ impl Checker<'_> {
                         self.reject_unplaced_kind(&init.expr);
                         self.expr(&init.expr);
                     }
-                    None => self.reject(local.span(), "`let` without an initializer is not allowed"),
+                    None => {
+                        self.reject(local.span(), "`let` without an initializer is not allowed")
+                    }
                 }
             }
             Stmt::Expr(e, _) => self.expr(e),
             Stmt::Macro(m) => self.macro_call(&m.mac),
-            Stmt::Item(it) => self.reject(it.span(), "nested items are not allowed in a function body"),
+            Stmt::Item(it) => {
+                self.reject(it.span(), "nested items are not allowed in a function body")
+            }
         }
     }
 
@@ -209,7 +218,10 @@ impl Checker<'_> {
             Expr::Macro(em) => self.macro_call(&em.mac),
             Expr::Binary(eb) => {
                 use syn::BinOp::{And, Eq, Ge, Gt, Le, Lt, Ne, Or};
-                if !matches!(eb.op, Eq(_) | Ne(_) | Lt(_) | Le(_) | Gt(_) | Ge(_) | And(_) | Or(_)) {
+                if !matches!(
+                    eb.op,
+                    Eq(_) | Ne(_) | Lt(_) | Le(_) | Gt(_) | Ge(_) | And(_) | Or(_)
+                ) {
                     self.reject(eb.span(), "binary operator not allowed");
                 }
                 self.expr(&eb.left);
@@ -222,7 +234,10 @@ impl Checker<'_> {
                 self.expr(&eu.expr);
             }
             Expr::Block(eb) => self.block(&eb.block),
-            other => self.reject(other.span(), format!("expression not allowed: `{}`", expr_kind(other))),
+            other => self.reject(
+                other.span(),
+                format!("expression not allowed: `{}`", expr_kind(other)),
+            ),
         }
     }
 
@@ -257,7 +272,8 @@ impl Checker<'_> {
             .unwrap_or_default();
         match name.as_str() {
             "vec" | "format" => {
-                if let Ok(exprs) = mac.parse_body_with(Punctuated::<Expr, Comma>::parse_terminated) {
+                if let Ok(exprs) = mac.parse_body_with(Punctuated::<Expr, Comma>::parse_terminated)
+                {
                     self.exprs(&exprs);
                 }
             }

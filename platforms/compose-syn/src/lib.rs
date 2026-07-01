@@ -66,7 +66,10 @@ mod tests {
             },
         );
 
-        assert_eq!(d.module_deps("dsql"), Some(&["local_state".to_string()][..]));
+        assert_eq!(
+            d.module_deps("dsql"),
+            Some(&["local_state".to_string()][..])
+        );
         assert_eq!(d.resource_ids("dsql"), ["cluster", "rate_limiter"]);
         assert_eq!(cluster.output("endpoint").resource, "cluster");
 
@@ -212,17 +215,35 @@ mod tests {
             image: "img".into(),
             replicas: 1,
             publish: vec![1],
-            volumes: vec![Vol::State { sub: "base".into(), at: "/base".into() }],
+            volumes: vec![Vol::State {
+                sub: "base".into(),
+                at: "/base".into(),
+            }],
             server_config: true,
             aws: Some("eu-west-2".into()),
             ..Service::EMPTY
         };
         let cs = svc.to_compose_service("tokeirad", &cx);
 
-        assert!(cs.volumes[0].ends_with(":/base"), "base first: {:?}", cs.volumes);
-        assert!(cs.volumes[1].contains("tokeirad.toml"), "server_config second: {:?}", cs.volumes);
-        assert!(cs.volumes[2].contains("/.aws:"), "aws last: {:?}", cs.volumes);
-        assert_eq!(cs.environment["TOKEIRA_CONFIG"], "/etc/tokeira/tokeirad.toml");
+        assert!(
+            cs.volumes[0].ends_with(":/base"),
+            "base first: {:?}",
+            cs.volumes
+        );
+        assert!(
+            cs.volumes[1].contains("tokeirad.toml"),
+            "server_config second: {:?}",
+            cs.volumes
+        );
+        assert!(
+            cs.volumes[2].contains("/.aws:"),
+            "aws last: {:?}",
+            cs.volumes
+        );
+        assert_eq!(
+            cs.environment["TOKEIRA_CONFIG"],
+            "/etc/tokeira/tokeirad.toml"
+        );
         assert_eq!(cs.environment["AWS_REGION"], "eu-west-2");
     }
 }

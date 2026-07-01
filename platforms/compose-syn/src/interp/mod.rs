@@ -14,11 +14,9 @@ pub mod schema;
 pub mod subset;
 pub mod value;
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
-use crate::builder::Deployment;
-use crate::context::Cx;
+use crate::{builder::Deployment, context::Cx};
 
 pub use value::{EvalError, Value};
 
@@ -30,9 +28,17 @@ pub fn interpret(src: &str, cx: &Cx) -> Result<(Deployment, Value), EvalError> {
     let file = syn::parse_file(src).map_err(|e| EvalError::new(format!("parse error: {e}")))?;
     let (types, fns) = schema::collect(&file)?;
     let reg = registry::Registry::compose();
-    subset::check(&file, &reg, &types)
-        .map_err(|d| EvalError::new(format!("definition is outside the interpreted subset:\n{d}")))?;
-    let interp = eval::Interp { reg: &reg, types: &types, fns: &fns, cx };
+    subset::check(&file, &reg, &types).map_err(|d| {
+        EvalError::new(format!(
+            "definition is outside the interpreted subset:\n{d}"
+        ))
+    })?;
+    let interp = eval::Interp {
+        reg: &reg,
+        types: &types,
+        fns: &fns,
+        cx,
+    };
 
     let cfg = interp.eval_fn("config", vec![])?;
     // config() is the operator surface and must stay host-free: a kind/builder

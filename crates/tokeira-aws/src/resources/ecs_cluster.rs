@@ -1,8 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 /// ECS cluster with ECS Exec configured for private Session Manager access.
@@ -493,11 +492,13 @@ impl Resource for AsgResource {
             .auto_scaling_groups()
             .first()
             .map(|asg| {
-                DescribeResult::Present(self.state(
-                    asg.auto_scaling_group_arn()
-                        .unwrap_or(&self.name)
-                        .to_owned(),
-                ))
+                DescribeResult::Present(
+                    self.state(
+                        asg.auto_scaling_group_arn()
+                            .unwrap_or(&self.name)
+                            .to_owned(),
+                    ),
+                )
             })
             .unwrap_or(DescribeResult::Absent))
     }

@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 /// VPC resource: creates VPC, private subnets, and route tables.

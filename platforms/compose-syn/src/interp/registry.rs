@@ -7,18 +7,22 @@
 //! objects; **assoc** covers `Deployment::new`. This module + [`super::value`] are
 //! the only interpreter modules that name `crate::builder`/`crate::kinds`.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
-use crate::builder::{self, Vol, WbValue};
-use crate::context::Cx;
-use crate::kinds::{
-    DsqlCluster, DsqlMode, DynamoDbTable, LocalStateDir, ObservabilityConfigFiles, Service,
+use crate::{
+    builder::{self, Vol, WbValue},
+    context::Cx,
+    kinds::{
+        DsqlCluster, DsqlMode, DynamoDbTable, LocalStateDir, ObservabilityConfigFiles, Service,
+    },
 };
 
 use super::value::{
-    host_boxed, host_service, EvalError, FieldMap, FieldMapExt, HostKind, HostObj, Value,
+    EvalError, FieldMap, FieldMapExt, HostKind, HostObj, Value, host_boxed, host_service,
 };
 
 // ── concrete kind builders (testable; comparable via the kinds' PartialEq) ──
@@ -28,12 +32,21 @@ pub fn build_dsql_cluster(f: &mut FieldMap, _cx: &Cx) -> Result<DsqlCluster, Eva
     let mode = match f.take_enum("mode", "DsqlMode")?.as_str() {
         "Managed" => DsqlMode::Managed,
         "Preexisting" => DsqlMode::Preexisting,
-        other => return Err(EvalError::new(format!("`DsqlMode` has no variant `{other}`"))),
+        other => {
+            return Err(EvalError::new(format!(
+                "`DsqlMode` has no variant `{other}`"
+            )));
+        }
     };
     let endpoint = f.take_opt_str("endpoint")?;
     let arn = f.take_opt_str("arn")?;
     f.expect_empty()?;
-    Ok(DsqlCluster { region, mode, endpoint, arn })
+    Ok(DsqlCluster {
+        region,
+        mode,
+        endpoint,
+        arn,
+    })
 }
 
 pub fn build_dynamodb_table(f: &mut FieldMap, _cx: &Cx) -> Result<DynamoDbTable, EvalError> {
@@ -41,7 +54,11 @@ pub fn build_dynamodb_table(f: &mut FieldMap, _cx: &Cx) -> Result<DynamoDbTable,
     let hash_key = f.take_str("hash_key")?;
     let ttl = f.take_opt_str("ttl")?;
     f.expect_empty()?;
-    Ok(DynamoDbTable { table, hash_key, ttl })
+    Ok(DynamoDbTable {
+        table,
+        hash_key,
+        ttl,
+    })
 }
 
 pub fn build_observability_config_files(
@@ -79,7 +96,17 @@ pub fn build_service(f: &mut FieldMap, _cx: &Cx) -> Result<Service, EvalError> {
     let server_config = f.take_bool("server_config")?;
     let aws = f.take_opt_str("aws")?;
     f.expect_empty()?;
-    Ok(Service { image, replicas, publish, volumes, env, command, needs, server_config, aws })
+    Ok(Service {
+        image,
+        replicas,
+        publish,
+        volumes,
+        env,
+        command,
+        needs,
+        server_config,
+        aws,
+    })
 }
 
 /// The interpreter image of `kinds::Service::EMPTY` — the `..Service::EMPTY`
@@ -108,7 +135,9 @@ fn ctor_dynamodb_table(mut f: FieldMap, cx: &Cx) -> Result<HostObj, EvalError> {
     Ok(host_boxed(Box::new(build_dynamodb_table(&mut f, cx)?)))
 }
 fn ctor_observability_config_files(mut f: FieldMap, cx: &Cx) -> Result<HostObj, EvalError> {
-    Ok(host_boxed(Box::new(build_observability_config_files(&mut f, cx)?)))
+    Ok(host_boxed(Box::new(build_observability_config_files(
+        &mut f, cx,
+    )?)))
 }
 fn ctor_local_state_dir(mut f: FieldMap, cx: &Cx) -> Result<HostObj, EvalError> {
     Ok(host_boxed(Box::new(build_local_state_dir(&mut f, cx)?)))
@@ -125,7 +154,9 @@ fn arg<'a>(args: &'a [Value], i: usize, m: &str) -> Result<&'a Value, EvalError>
 }
 
 fn m_deployment_module(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<Value, EvalError> {
-    let HostObj::Deployment(d) = recv else { unreachable!("subset proved Deployment receiver") };
+    let HostObj::Deployment(d) = recv else {
+        unreachable!("subset proved Deployment receiver")
+    };
     let name = arg(&args, 0, "module")?.as_str()?.to_string();
     let needs = arg(&args, 1, "module")?.as_str_vec()?;
     let needs_ref: Vec<&str> = needs.iter().map(String::as_str).collect();
@@ -134,7 +165,9 @@ fn m_deployment_module(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<Val
 }
 
 fn m_deployment_resource(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<Value, EvalError> {
-    let HostObj::Deployment(d) = recv else { unreachable!("subset proved Deployment receiver") };
+    let HostObj::Deployment(d) = recv else {
+        unreachable!("subset proved Deployment receiver")
+    };
     let module = arg(&args, 0, "resource")?.as_host_module()?;
     let id = arg(&args, 1, "resource")?.as_str()?.to_string();
     let kind = arg(&args, 2, "resource")?.take_boxed_kind()?;
@@ -143,7 +176,9 @@ fn m_deployment_resource(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<V
 }
 
 fn m_deployment_service(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<Value, EvalError> {
-    let HostObj::Deployment(d) = recv else { unreachable!("subset proved Deployment receiver") };
+    let HostObj::Deployment(d) = recv else {
+        unreachable!("subset proved Deployment receiver")
+    };
     let module = arg(&args, 0, "service")?.as_host_module()?;
     let name = arg(&args, 1, "service")?.as_str()?.to_string();
     let svc = arg(&args, 2, "service")?.take_service()?;
@@ -152,7 +187,9 @@ fn m_deployment_service(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<Va
 }
 
 fn m_deployment_writeback(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<Value, EvalError> {
-    let HostObj::Deployment(d) = recv else { unreachable!("subset proved Deployment receiver") };
+    let HostObj::Deployment(d) = recv else {
+        unreachable!("subset proved Deployment receiver")
+    };
     let key = arg(&args, 0, "writeback")?.as_str()?.to_string();
     let wb = match arg(&args, 1, "writeback")? {
         Value::Str(s) => WbValue::Const(s.clone()),
@@ -160,7 +197,7 @@ fn m_deployment_writeback(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<
         other => {
             return Err(EvalError::new(format!(
                 "writeback value must be a string or a resource output, got {other:?}"
-            )))
+            )));
         }
     };
     d.borrow_mut().writeback(&key, wb);
@@ -168,7 +205,9 @@ fn m_deployment_writeback(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<
 }
 
 fn m_resource_output(recv: &HostObj, args: Vec<Value>, _cx: &Cx) -> Result<Value, EvalError> {
-    let HostObj::Resource(r) = recv else { unreachable!("subset proved Resource receiver") };
+    let HostObj::Resource(r) = recv else {
+        unreachable!("subset proved Resource receiver")
+    };
     let name = arg(&args, 0, "output")?.as_str()?;
     Ok(Value::Host(HostObj::Output(r.output(name))))
 }
@@ -194,15 +233,21 @@ fn m_cx_docker_sock(_recv: &HostObj, _args: Vec<Value>, _cx: &Cx) -> Result<Valu
 fn a_deployment_new(args: Vec<Value>, _cx: &Cx) -> Result<HostObj, EvalError> {
     let ns = arg(&args, 0, "Deployment::new")?.as_str_vec()?;
     let ns_ref: Vec<&str> = ns.iter().map(String::as_str).collect();
-    Ok(HostObj::Deployment(Rc::new(RefCell::new(builder::Deployment::new(&ns_ref)))))
+    Ok(HostObj::Deployment(Rc::new(RefCell::new(
+        builder::Deployment::new(&ns_ref),
+    ))))
 }
 
 /// Read a whitelisted field of the injected `Cx` (field syntax `cx.project_name`).
 pub fn cx_field(cx: &Cx, field: &str) -> Result<Value, EvalError> {
     match field {
         "project_name" => Ok(Value::Str(cx.project_name.clone())),
-        "region" => Ok(Value::Opt(cx.region.clone().map(|s| Box::new(Value::Str(s))))),
-        other => Err(EvalError::new(format!("`Cx` has no readable field `{other}`"))),
+        "region" => Ok(Value::Opt(
+            cx.region.clone().map(|s| Box::new(Value::Str(s))),
+        )),
+        other => Err(EvalError::new(format!(
+            "`Cx` has no readable field `{other}`"
+        ))),
     }
 }
 
@@ -249,7 +294,13 @@ impl Registry {
 
         let method_names = methods.keys().map(|(_, n)| *n).collect();
 
-        Self { kinds, defaults, methods, assoc, method_names }
+        Self {
+            kinds,
+            defaults,
+            methods,
+            assoc,
+            method_names,
+        }
     }
 
     pub fn is_kind(&self, name: &str) -> bool {
@@ -261,7 +312,12 @@ impl Registry {
     }
 
     /// Construct a kind from its evaluated field map.
-    pub fn construct_kind(&self, name: &str, fields: FieldMap, cx: &Cx) -> Result<HostObj, EvalError> {
+    pub fn construct_kind(
+        &self,
+        name: &str,
+        fields: FieldMap,
+        cx: &Cx,
+    ) -> Result<HostObj, EvalError> {
         let ctor = self
             .kinds
             .get(name)
@@ -302,7 +358,10 @@ mod tests {
 
     fn enum_v(ty: &str, variant: &str) -> Value {
         Value::Enum {
-            path: EnumPath { ty: ty.into(), segments: vec![ty.into(), variant.into()] },
+            path: EnumPath {
+                ty: ty.into(),
+                segments: vec![ty.into(), variant.into()],
+            },
             variant: variant.into(),
             body: VariantBody::Unit,
         }
@@ -334,7 +393,7 @@ mod tests {
             ("region".into(), s("eu-west-2")),
             ("mode".into(), enum_v("DsqlMode", "Preexisting")),
             ("endpoint".into(), Value::Opt(Some(Box::new(s("x.on.aws"))))),
-            ("arn".into(), Value::Opt(Some(Box::new(s("arn:...")))),),
+            ("arn".into(), Value::Opt(Some(Box::new(s("arn:..."))))),
         ]);
         let built = build_dsql_cluster(&mut f, &cx()).unwrap();
         assert_eq!(built.mode, DsqlMode::Preexisting);
@@ -348,7 +407,10 @@ mod tests {
             ("scrape_port".into(), Value::Int(9090)),
             ("cluster".into(), s("tokeira")),
             ("deployment".into(), s("tokeira")),
-            ("mimir_remote_write".into(), s("http://mimir:9009/api/v1/push")),
+            (
+                "mimir_remote_write".into(),
+                s("http://mimir:9009/api/v1/push"),
+            ),
             ("loki_push".into(), s("http://loki:3100/loki/api/v1/push")),
             ("mimir_http_port".into(), Value::Int(9009)),
             ("loki_http_port".into(), Value::Int(3100)),
@@ -409,7 +471,13 @@ mod tests {
         let built = build_service(&mut f, &cx()).unwrap();
         assert_eq!(built.image, "grafana/mimir:3.0.6");
         assert_eq!(built.publish, [9009]);
-        assert_eq!(built.volumes, [Vol::State { sub: "mimir".into(), at: "/data".into() }]);
+        assert_eq!(
+            built.volumes,
+            [Vol::State {
+                sub: "mimir".into(),
+                at: "/data".into()
+            }]
+        );
         assert_eq!(built.env, [("K".to_string(), "V".to_string())]);
     }
 
@@ -457,7 +525,9 @@ mod tests {
         )
         .unwrap();
 
-        let HostObj::Deployment(d) = &dep else { panic!("expected deployment") };
+        let HostObj::Deployment(d) = &dep else {
+            panic!("expected deployment")
+        };
         assert_eq!(d.borrow().resource_ids("dsql"), ["cluster"]);
     }
 
@@ -478,22 +548,31 @@ mod tests {
             region: cx.region.clone(),
             deployment_dir: cx.deployment_dir.clone(),
         }));
-        let v = reg.method(HostKind::Cx, "state").unwrap()(
-            &cx_host,
-            vec![s("mimir"), s("/data")],
-            &cx,
-        )
-        .unwrap();
-        assert_eq!(v.as_vol().unwrap(), Vol::State { sub: "mimir".into(), at: "/data".into() });
+        let v =
+            reg.method(HostKind::Cx, "state").unwrap()(&cx_host, vec![s("mimir"), s("/data")], &cx)
+                .unwrap();
+        assert_eq!(
+            v.as_vol().unwrap(),
+            Vol::State {
+                sub: "mimir".into(),
+                at: "/data".into()
+            }
+        );
 
         let sock = reg.method(HostKind::Cx, "docker_sock").unwrap()(&cx_host, vec![], &cx).unwrap();
-        assert_eq!(sock.as_vol().unwrap(), Vol::Raw("/var/run/docker.sock:/var/run/docker.sock".into()));
+        assert_eq!(
+            sock.as_vol().unwrap(),
+            Vol::Raw("/var/run/docker.sock:/var/run/docker.sock".into())
+        );
     }
 
     #[test]
     fn cx_field_reads_whitelisted_only() {
         let cx = cx();
-        assert_eq!(cx_field(&cx, "project_name").unwrap(), Value::Str("tokeira".into()));
+        assert_eq!(
+            cx_field(&cx, "project_name").unwrap(),
+            Value::Str("tokeira".into())
+        );
         assert!(cx_field(&cx, "deployment_dir").is_err());
     }
 }

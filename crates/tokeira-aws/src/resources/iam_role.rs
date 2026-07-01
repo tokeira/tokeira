@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 // ── Config and resource structs ──────────────────────────────────────────────

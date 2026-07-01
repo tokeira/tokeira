@@ -9,13 +9,13 @@
 //! This module + `registry` are the *host adapter* — the only interpreter modules
 //! permitted to name `crate::builder`/`crate::kinds`.
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
-use crate::builder::{self, Kind, ModuleRef, Output, ResourceRef, Vol};
-use crate::context::Cx;
-use crate::kinds;
+use crate::{
+    builder::{self, Kind, ModuleRef, Output, ResourceRef, Vol},
+    context::Cx,
+    kinds,
+};
 
 /// A field map — the generic image of a struct literal's evaluated fields.
 pub type FieldMap = BTreeMap<String, Value>;
@@ -36,9 +36,16 @@ pub enum Value {
     /// `Some(x)` / `None`.
     Opt(Option<Box<Value>>),
     /// A config struct defined in the `.tkd`.
-    Struct { ty: String, fields: FieldMap },
+    Struct {
+        ty: String,
+        fields: FieldMap,
+    },
     /// A config enum value defined in the `.tkd`.
-    Enum { path: EnumPath, variant: String, body: VariantBody },
+    Enum {
+        path: EnumPath,
+        variant: String,
+        body: VariantBody,
+    },
     /// An opaque author handle (builder/kind/cx/vol).
     Host(HostObj),
 }
@@ -131,9 +138,18 @@ impl PartialEq for Value {
             (Tuple(a), Tuple(b)) => a == b,
             (Opt(a), Opt(b)) => a == b,
             (Struct { ty: t1, fields: f1 }, Struct { ty: t2, fields: f2 }) => t1 == t2 && f1 == f2,
-            (Enum { path: p1, variant: v1, body: b1 }, Enum { path: p2, variant: v2, body: b2 }) => {
-                p1 == p2 && v1 == v2 && b1 == b2
-            }
+            (
+                Enum {
+                    path: p1,
+                    variant: v1,
+                    body: b1,
+                },
+                Enum {
+                    path: p2,
+                    variant: v2,
+                    body: b2,
+                },
+            ) => p1 == p2 && v1 == v2 && b1 == b2,
             (Host(_), Host(_)) => {
                 debug_assert!(false, "Host values are not comparable");
                 false
@@ -175,11 +191,17 @@ pub struct EvalError {
 
 impl EvalError {
     pub fn new(msg: impl Into<String>) -> Self {
-        Self { msg: msg.into(), span: None }
+        Self {
+            msg: msg.into(),
+            span: None,
+        }
     }
 
     pub fn at(msg: impl Into<String>, span: proc_macro2::Span) -> Self {
-        Self { msg: msg.into(), span: Some(span) }
+        Self {
+            msg: msg.into(),
+            span: Some(span),
+        }
     }
 }
 
@@ -221,14 +243,18 @@ impl FieldMapExt for FieldMap {
     fn take_str(&mut self, key: &str) -> Result<String, EvalError> {
         match self.take(key)? {
             Value::Str(s) => Ok(s),
-            v => Err(EvalError::new(format!("field `{key}`: expected string, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "field `{key}`: expected string, got {v:?}"
+            ))),
         }
     }
 
     fn take_bool(&mut self, key: &str) -> Result<bool, EvalError> {
         match self.take(key)? {
             Value::Bool(b) => Ok(b),
-            v => Err(EvalError::new(format!("field `{key}`: expected bool, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "field `{key}`: expected bool, got {v:?}"
+            ))),
         }
     }
 
@@ -247,9 +273,13 @@ impl FieldMapExt for FieldMap {
             Value::Opt(None) => Ok(None),
             Value::Opt(Some(b)) => match *b {
                 Value::Str(s) => Ok(Some(s)),
-                v => Err(EvalError::new(format!("field `{key}`: expected Option<string>, got Some({v:?})"))),
+                v => Err(EvalError::new(format!(
+                    "field `{key}`: expected Option<string>, got Some({v:?})"
+                ))),
             },
-            v => Err(EvalError::new(format!("field `{key}`: expected Option<string>, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "field `{key}`: expected Option<string>, got {v:?}"
+            ))),
         }
     }
 
@@ -259,10 +289,14 @@ impl FieldMapExt for FieldMap {
                 .into_iter()
                 .map(|v| match v {
                     Value::Str(s) => Ok(s),
-                    other => Err(EvalError::new(format!("field `{key}`: expected [string], got element {other:?}"))),
+                    other => Err(EvalError::new(format!(
+                        "field `{key}`: expected [string], got element {other:?}"
+                    ))),
                 })
                 .collect(),
-            v => Err(EvalError::new(format!("field `{key}`: expected an array, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "field `{key}`: expected an array, got {v:?}"
+            ))),
         }
     }
 
@@ -271,12 +305,17 @@ impl FieldMapExt for FieldMap {
             Value::Vec(items) => items
                 .into_iter()
                 .map(|v| match v {
-                    Value::Int(n) => u16::try_from(n)
-                        .map_err(|_| EvalError::new(format!("field `{key}`: {n} out of u16 range"))),
-                    other => Err(EvalError::new(format!("field `{key}`: expected [u16], got element {other:?}"))),
+                    Value::Int(n) => u16::try_from(n).map_err(|_| {
+                        EvalError::new(format!("field `{key}`: {n} out of u16 range"))
+                    }),
+                    other => Err(EvalError::new(format!(
+                        "field `{key}`: expected [u16], got element {other:?}"
+                    ))),
                 })
                 .collect(),
-            v => Err(EvalError::new(format!("field `{key}`: expected an array, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "field `{key}`: expected an array, got {v:?}"
+            ))),
         }
     }
 
@@ -291,10 +330,14 @@ impl FieldMapExt for FieldMap {
                         let val = expect_str(it.next().unwrap(), key)?;
                         Ok((k, val))
                     }
-                    other => Err(EvalError::new(format!("field `{key}`: expected [(string, string)], got element {other:?}"))),
+                    other => Err(EvalError::new(format!(
+                        "field `{key}`: expected [(string, string)], got element {other:?}"
+                    ))),
                 })
                 .collect(),
-            v => Err(EvalError::new(format!("field `{key}`: expected an array, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "field `{key}`: expected an array, got {v:?}"
+            ))),
         }
     }
 
@@ -304,10 +347,14 @@ impl FieldMapExt for FieldMap {
                 .into_iter()
                 .map(|v| match v {
                     Value::Host(HostObj::Vol(vol)) => Ok(vol),
-                    other => Err(EvalError::new(format!("field `{key}`: expected [Vol], got element {other:?}"))),
+                    other => Err(EvalError::new(format!(
+                        "field `{key}`: expected [Vol], got element {other:?}"
+                    ))),
                 })
                 .collect(),
-            v => Err(EvalError::new(format!("field `{key}`: expected an array, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "field `{key}`: expected an array, got {v:?}"
+            ))),
         }
     }
 
@@ -322,7 +369,9 @@ impl FieldMapExt for FieldMap {
                 }
                 Ok(variant)
             }
-            v => Err(EvalError::new(format!("field `{key}`: expected enum `{expect_ty}`, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "field `{key}`: expected enum `{expect_ty}`, got {v:?}"
+            ))),
         }
     }
 
@@ -337,14 +386,18 @@ impl FieldMapExt for FieldMap {
 fn take_int(f: &mut FieldMap, key: &str) -> Result<i128, EvalError> {
     match f.take(key)? {
         Value::Int(n) => Ok(n),
-        v => Err(EvalError::new(format!("field `{key}`: expected integer, got {v:?}"))),
+        v => Err(EvalError::new(format!(
+            "field `{key}`: expected integer, got {v:?}"
+        ))),
     }
 }
 
 fn expect_str(v: Value, key: &str) -> Result<String, EvalError> {
     match v {
         Value::Str(s) => Ok(s),
-        other => Err(EvalError::new(format!("field `{key}`: expected string, got {other:?}"))),
+        other => Err(EvalError::new(format!(
+            "field `{key}`: expected string, got {other:?}"
+        ))),
     }
 }
 
@@ -365,21 +418,27 @@ impl Value {
                 .iter()
                 .map(|v| v.as_str().map(str::to_string))
                 .collect(),
-            v => Err(EvalError::new(format!("expected an array of strings, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "expected an array of strings, got {v:?}"
+            ))),
         }
     }
 
     pub fn as_host_module(&self) -> Result<ModuleRef, EvalError> {
         match self {
             Value::Host(HostObj::Module(m)) => Ok(m.clone()),
-            v => Err(EvalError::new(format!("expected a module handle, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "expected a module handle, got {v:?}"
+            ))),
         }
     }
 
     pub fn as_host_output(&self) -> Result<Output, EvalError> {
         match self {
             Value::Host(HostObj::Output(o)) => Ok(o.clone()),
-            v => Err(EvalError::new(format!("expected an output handle, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "expected an output handle, got {v:?}"
+            ))),
         }
     }
 
@@ -414,7 +473,9 @@ impl Value {
                 }
                 None => Err(EvalError::new("service handle already consumed")),
             },
-            v => Err(EvalError::new(format!("expected a service handle, got {v:?}"))),
+            v => Err(EvalError::new(format!(
+                "expected a service handle, got {v:?}"
+            ))),
         }
     }
 }

@@ -82,15 +82,24 @@ pub fn config() -> Compose {
             metrics_port: 9090,
         },
         observability: Observability {
-            mimir: Backend { image: "grafana/mimir:3.0.6".into(), replicas: 1 },
-            loki: Backend { image: "grafana/loki:3.7.1".into(), replicas: 1 },
+            mimir: Backend {
+                image: "grafana/mimir:3.0.6".into(),
+                replicas: 1,
+            },
+            loki: Backend {
+                image: "grafana/loki:3.7.1".into(),
+                replicas: 1,
+            },
             grafana: Grafana {
                 image: "grafana/grafana-oss:12.4.3".into(),
                 replicas: 1,
                 port: 3000,
                 admin_password: "admin".into(),
             },
-            alloy: Backend { image: "grafana/alloy:v1.16.0".into(), replicas: 1 },
+            alloy: Backend {
+                image: "grafana/alloy:v1.16.0".into(),
+                replicas: 1,
+            },
         },
     }
 }
@@ -116,7 +125,13 @@ pub fn deployment(cfg: &Compose, cx: &Cx) -> Deployment {
     d.resource(&local_state, "dir", LocalStateDir);
 
     // dsql — only under persistent storage
-    if let Storage::Dsql { region, mode, endpoint, arn } = &cfg.storage {
+    if let Storage::Dsql {
+        region,
+        mode,
+        endpoint,
+        arn,
+    } = &cfg.storage
+    {
         let dsql = d.module("dsql", &["local_state"]);
         let cluster = d.resource(
             &dsql,
@@ -149,10 +164,19 @@ pub fn deployment(cfg: &Compose, cx: &Cx) -> Deployment {
 
         // writeback into the server config (collect_writeback analog)
         d.writeback("infrastructure.storage", "dsql");
-        d.writeback("infrastructure.dsql.endpoint", cluster.output("cluster_endpoint"));
+        d.writeback(
+            "infrastructure.dsql.endpoint",
+            cluster.output("cluster_endpoint"),
+        );
         d.writeback("infrastructure.dsql.region", region.clone());
-        d.writeback("infrastructure.dsql.rate_limiter_table", rate_limiter.output("table_name"));
-        d.writeback("infrastructure.dsql.conn_lease_table", conn_lease.output("table_name"));
+        d.writeback(
+            "infrastructure.dsql.rate_limiter_table",
+            rate_limiter.output("table_name"),
+        );
+        d.writeback(
+            "infrastructure.dsql.conn_lease_table",
+            conn_lease.output("table_name"),
+        );
     }
 
     // observability — config files + the four backend services
@@ -219,7 +243,10 @@ pub fn deployment(cfg: &Compose, cx: &Cx) -> Deployment {
             ],
             env: vec![
                 ("GF_SECURITY_ADMIN_USER".into(), "admin".into()),
-                ("GF_SECURITY_ADMIN_PASSWORD".into(), o.grafana.admin_password.clone()),
+                (
+                    "GF_SECURITY_ADMIN_PASSWORD".into(),
+                    o.grafana.admin_password.clone(),
+                ),
                 ("GF_METRICS_ENABLED".into(), "true".into()),
             ],
             needs: vec!["mimir".into(), "loki".into()],

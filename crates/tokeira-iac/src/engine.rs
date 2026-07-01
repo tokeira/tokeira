@@ -798,7 +798,9 @@ async fn apply_changes(
             // object with. Dropping the state entry without deleting would orphan
             // the live resource (Property 10).
             let Some(resource) = resource_map.get(rid) else {
-                return Err(IacError::UnknownResourceDelete { resource_id: rid.0.clone() });
+                return Err(IacError::UnknownResourceDelete {
+                    resource_id: rid.0.clone(),
+                });
             };
             operation_index += 1;
             ctx.emit_apply_progress(
@@ -860,7 +862,9 @@ async fn destroy_changes(
         // Fail-closed: a Delete must have a known `Resource` to delete the live
         // object with (Property 10).
         let Some(resource) = resource_map.get(rid) else {
-            return Err(IacError::UnknownResourceDelete { resource_id: rid.0.clone() });
+            return Err(IacError::UnknownResourceDelete {
+                resource_id: rid.0.clone(),
+            });
         };
         // Re-describe to get live state before deleting
         match resource.describe(ctx).await.map_err(|err| {
@@ -890,10 +894,18 @@ async fn destroy_changes(
                     );
                     return Err(err);
                 }
-                ctx.emit_complete_progress("delete", rid, &live_state.resource_type, started.elapsed());
+                ctx.emit_complete_progress(
+                    "delete",
+                    rid,
+                    &live_state.resource_type,
+                    started.elapsed(),
+                );
             }
             DescribeResult::Absent => {
-                warn!(?rid, "resource already absent from provider, pruning from state");
+                warn!(
+                    ?rid,
+                    "resource already absent from provider, pruning from state"
+                );
                 ctx.emit_note_progress(
                     rid,
                     &current.resource_type,
@@ -928,7 +940,12 @@ async fn destroy_changes(
                     );
                     return Err(err);
                 }
-                ctx.emit_complete_progress("delete", rid, &current.resource_type, started.elapsed());
+                ctx.emit_complete_progress(
+                    "delete",
+                    rid,
+                    &current.resource_type,
+                    started.elapsed(),
+                );
             }
         }
         ctx.state.resources.remove(rid);
@@ -1313,10 +1330,7 @@ mod tests {
             Ok(())
         }
 
-        async fn describe(
-            &self,
-            _ctx: &ProvisionContext,
-        ) -> Result<DescribeResult, IacError> {
+        async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
             if self.describe_unsupported {
                 return Ok(DescribeResult::Unsupported);
             }
@@ -1455,7 +1469,9 @@ mod tests {
             "expected fail-closed delete error, got {err:?}"
         );
         assert!(
-            ctx.state.resources.contains_key(&ResourceId("orphan".into())),
+            ctx.state
+                .resources
+                .contains_key(&ResourceId("orphan".into())),
             "fail-closed must NOT drop the orphan from state"
         );
     }
@@ -1493,12 +1509,24 @@ mod tests {
         let mut ctx = ProvisionContext::default();
         let composition = InfraComposition {
             known_modules: vec![
-                Box::new(ResourceModule { name: "a", ids: &["dup"] }),
-                Box::new(ResourceModule { name: "b", ids: &["dup"] }),
+                Box::new(ResourceModule {
+                    name: "a",
+                    ids: &["dup"],
+                }),
+                Box::new(ResourceModule {
+                    name: "b",
+                    ids: &["dup"],
+                }),
             ],
             desired_modules: vec![
-                Box::new(ResourceModule { name: "a", ids: &["dup"] }),
-                Box::new(ResourceModule { name: "b", ids: &["dup"] }),
+                Box::new(ResourceModule {
+                    name: "a",
+                    ids: &["dup"],
+                }),
+                Box::new(ResourceModule {
+                    name: "b",
+                    ids: &["dup"],
+                }),
             ],
             active_modules: vec!["a".into(), "b".into()],
         };
@@ -1514,8 +1542,14 @@ mod tests {
         let engine = Engine::new();
         let mut ctx = ProvisionContext::default();
         let composition = InfraComposition {
-            known_modules: vec![Box::new(StubModule { name: "a", deps: &[] })],
-            desired_modules: vec![Box::new(StubModule { name: "ghost", deps: &[] })],
+            known_modules: vec![Box::new(StubModule {
+                name: "a",
+                deps: &[],
+            })],
+            desired_modules: vec![Box::new(StubModule {
+                name: "ghost",
+                deps: &[],
+            })],
             active_modules: vec!["ghost".into()],
         };
         let err = engine.plan(&composition, &mut ctx).await.unwrap_err();

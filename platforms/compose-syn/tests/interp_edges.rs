@@ -5,9 +5,11 @@
 
 use std::path::PathBuf;
 
-use tokeira_compose_syn::builder::WbValue;
-use tokeira_compose_syn::context::Cx;
-use tokeira_compose_syn::interp::{interpret, retarget_check, validate};
+use tokeira_compose_syn::{
+    builder::WbValue,
+    context::Cx,
+    interp::{interpret, retarget_check, validate},
+};
 
 fn cx() -> Cx {
     Cx {

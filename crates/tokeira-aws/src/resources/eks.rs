@@ -3,8 +3,7 @@ use std::time::Duration;
 use aws_sdk_eks::client::Waiters as EksWaiters;
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 /// EKS cluster with Auto Mode.

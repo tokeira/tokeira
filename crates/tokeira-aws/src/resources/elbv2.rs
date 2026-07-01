@@ -6,8 +6,7 @@ use aws_sdk_elasticloadbalancingv2::types::{
 };
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 /// Listener mode for the internal edge ALB.

@@ -25,9 +25,11 @@ use tokeira_orchestrator::{
 };
 use tokeira_state::{LocalBackend, StateBackend};
 
-use crate::builder::{Deployment as TkdBuilt, WbValue};
-use crate::context::Cx;
-use crate::interp;
+use crate::{
+    builder::{Deployment as TkdBuilt, WbValue},
+    context::Cx,
+    interp,
+};
 
 /// The bootstrap module — the engine surfaces it as `remote_state_module`, not an
 /// ordinary infra module, so the adapter excludes it from `infra_modules`.
@@ -61,7 +63,11 @@ impl TkdDeployment {
             .iter()
             .map(|d| &*Box::leak(d.clone().into_boxed_str()))
             .collect();
-        Box::new(TkdModule { cfg: cfg.clone(), name: name.to_string(), deps })
+        Box::new(TkdModule {
+            cfg: cfg.clone(),
+            name: name.to_string(),
+            deps,
+        })
     }
 }
 
@@ -69,7 +75,11 @@ impl TkdDeployment {
 impl orchestrator::Deployment for TkdDeployment {
     type Config = TkdConfig;
 
-    fn remote_state_module(&self, config: &Self::Config, _deployment_dir: &Path) -> Box<dyn iac::Module> {
+    fn remote_state_module(
+        &self,
+        config: &Self::Config,
+        _deployment_dir: &Path,
+    ) -> Box<dyn iac::Module> {
         Self::module_box(config, BOOTSTRAP_MODULE, &[])
     }
 
@@ -84,7 +94,10 @@ impl orchestrator::Deployment for TkdDeployment {
             .filter(|m| *m != BOOTSTRAP_MODULE)
             .filter(|m| selection.includes(m))
             .map(|m| {
-                let deps = dep.module_deps(m).map(<[String]>::to_vec).unwrap_or_default();
+                let deps = dep
+                    .module_deps(m)
+                    .map(<[String]>::to_vec)
+                    .unwrap_or_default();
                 Self::module_box(config, m, &deps)
             })
             .collect()
@@ -123,11 +136,19 @@ impl orchestrator::Deployment for TkdDeployment {
         Ok(())
     }
 
-    fn create_infra_store(&self, _config: &Self::Config, deployment_dir: &Path) -> Box<dyn StateBackend> {
+    fn create_infra_store(
+        &self,
+        _config: &Self::Config,
+        deployment_dir: &Path,
+    ) -> Box<dyn StateBackend> {
         Box::new(LocalBackend::new(deployment_dir.join("state/infra")))
     }
 
-    fn create_deploy_store(&self, _config: &Self::Config, deployment_dir: &Path) -> Box<dyn StateBackend> {
+    fn create_deploy_store(
+        &self,
+        _config: &Self::Config,
+        deployment_dir: &Path,
+    ) -> Box<dyn StateBackend> {
         Box::new(LocalBackend::new(deployment_dir.join("state/deploy")))
     }
 
@@ -149,7 +170,8 @@ impl orchestrator::Deployment for TkdDeployment {
                     WbValue::Output(out) => {
                         // Resolve the deferred handle: logical (module, resource)
                         // → physical ResourceId → the named state property.
-                        let rid = dep.realize_resource_id(&out.module, &out.resource, &config.cx)?;
+                        let rid =
+                            dep.realize_resource_id(&out.module, &out.resource, &config.cx)?;
                         state
                             .resources
                             .get(&rid)?
@@ -186,11 +208,21 @@ impl orchestrator::Ops for TkdDeployment {
             .collect()
     }
 
-    async fn scale_up(&self, _service: &str, _replicas: u32, _config: &Self::Config) -> OrchResult<()> {
+    async fn scale_up(
+        &self,
+        _service: &str,
+        _replicas: u32,
+        _config: &Self::Config,
+    ) -> OrchResult<()> {
         Err(unsupported_day2("scale"))
     }
 
-    async fn scale_down(&self, _service: &str, _replicas: u32, _config: &Self::Config) -> OrchResult<()> {
+    async fn scale_down(
+        &self,
+        _service: &str,
+        _replicas: u32,
+        _config: &Self::Config,
+    ) -> OrchResult<()> {
         Err(unsupported_day2("scale"))
     }
 
@@ -198,7 +230,11 @@ impl orchestrator::Ops for TkdDeployment {
         Err(unsupported_day2("logs"))
     }
 
-    async fn port_mappings(&self, _service: &str, _config: &Self::Config) -> OrchResult<Vec<PortMapping>> {
+    async fn port_mappings(
+        &self,
+        _service: &str,
+        _config: &Self::Config,
+    ) -> OrchResult<Vec<PortMapping>> {
         Err(unsupported_day2("port mappings"))
     }
 }
@@ -246,7 +282,10 @@ impl iac::Module for TkdModule {
         &self.deps
     }
 
-    fn resources(&self, _ctx: &iac::ModuleContext) -> Result<Vec<Box<dyn iac::Resource>>, iac::IacError> {
+    fn resources(
+        &self,
+        _ctx: &iac::ModuleContext,
+    ) -> Result<Vec<Box<dyn iac::Resource>>, iac::IacError> {
         Ok(TkdDeployment::realize(&self.cfg)
             .realize_module(&self.name, &self.cfg.cx)
             .unwrap_or_default())

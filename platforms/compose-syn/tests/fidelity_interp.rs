@@ -3,16 +3,17 @@
 //! `ComposeDeployment`. The three-way lock proves the `syn` interpreter realizes
 //! the operator definition with full fidelity (Proposal 004 Phase 5).
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use serde_json::Value as Json;
-use tokeira_compose_deployment::config::{ComposeDsqlConfig, DsqlMode as CfgDsqlMode};
-use tokeira_compose_deployment::{ComposeConfig, ComposeDeployment};
-use tokeira_compose_syn::builder::Deployment;
-use tokeira_compose_syn::context::Cx;
-use tokeira_compose_syn::definition;
-use tokeira_compose_syn::interp::interpret;
+use tokeira_compose_deployment::{
+    ComposeConfig, ComposeDeployment,
+    config::{ComposeDsqlConfig, DsqlMode as CfgDsqlMode},
+};
+use tokeira_compose_syn::{builder::Deployment, context::Cx, definition, interp::interpret};
 use tokeira_deploy_engine::{Service, ServiceContext};
 use tokeira_orchestrator::{Deployment as _, StorageKind};
 
@@ -76,7 +77,10 @@ fn shape(services: &[Box<dyn Service>]) -> ServiceShape {
         .map(|s| {
             let deps = s.dependencies().iter().map(|d| d.to_string()).collect();
             let manifests = s.manifests(&ctx).expect("manifests render");
-            (s.name().to_string(), (s.module().to_string(), deps, manifests))
+            (
+                s.name().to_string(),
+                (s.module().to_string(), deps, manifests),
+            )
         })
         .collect()
 }

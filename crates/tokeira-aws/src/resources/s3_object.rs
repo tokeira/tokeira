@@ -2,8 +2,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use sha2::{Digest, Sha256};
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 /// Provider resource for generated observability artifacts stored in S3.

@@ -412,10 +412,7 @@ pub trait Resource: Send + Sync {
         current: &ResourceState,
         ctx: &ProvisionContext,
     ) -> Result<(), error::IacError>;
-    async fn describe(
-        &self,
-        ctx: &ProvisionContext,
-    ) -> Result<DescribeResult, error::IacError>;
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, error::IacError>;
     fn diff(&self, current: &ResourceState, ctx: &ProvisionContext) -> InternalChange;
 }
 

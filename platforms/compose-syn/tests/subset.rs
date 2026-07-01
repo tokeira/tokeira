@@ -5,8 +5,10 @@
 
 use std::path::PathBuf;
 
-use tokeira_compose_syn::context::Cx;
-use tokeira_compose_syn::interp::{interpret, validate};
+use tokeira_compose_syn::{
+    context::Cx,
+    interp::{interpret, validate},
+};
 
 const SRC: &str = include_str!("../definition.tkd");
 
@@ -43,7 +45,10 @@ fn closure_is_rejected() {
 
 #[test]
 fn std_env_call_is_rejected() {
-    rejects(r#"fn deployment() { let h = std::env::var("HOME"); }"#, "std::env::var");
+    rejects(
+        r#"fn deployment() { let h = std::env::var("HOME"); }"#,
+        "std::env::var",
+    );
 }
 
 #[test]

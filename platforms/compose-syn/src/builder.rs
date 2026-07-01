@@ -139,14 +139,24 @@ impl Deployment {
     }
 
     /// Add a resource of the given kind to a module; returns a handle for outputs.
-    pub fn resource(&mut self, module: &ModuleRef, id: &str, kind: impl Kind + 'static) -> ResourceRef {
+    pub fn resource(
+        &mut self,
+        module: &ModuleRef,
+        id: &str,
+        kind: impl Kind + 'static,
+    ) -> ResourceRef {
         self.resource_dyn(module, id, Box::new(kind))
     }
 
     /// Add an already-boxed kind to a module. The interpreter bridge constructs
     /// kinds as `Box<dyn Kind>` (it cannot name the concrete type), so it needs
     /// this object-safe entry point; [`resource`](Self::resource) delegates here.
-    pub fn resource_dyn(&mut self, module: &ModuleRef, id: &str, kind: Box<dyn Kind>) -> ResourceRef {
+    pub fn resource_dyn(
+        &mut self,
+        module: &ModuleRef,
+        id: &str,
+        kind: Box<dyn Kind>,
+    ) -> ResourceRef {
         let m = self
             .modules
             .iter_mut()
@@ -225,8 +235,11 @@ impl Deployment {
     /// member services (each a compose-service infra resource).
     pub fn realize_module(&self, name: &str, cx: &Cx) -> Option<Vec<Box<dyn iac::Resource>>> {
         let module = self.modules.iter().find(|m| m.name == name)?;
-        let mut resources: Vec<Box<dyn iac::Resource>> =
-            module.resources.iter().map(|r| r.kind.realize(cx)).collect();
+        let mut resources: Vec<Box<dyn iac::Resource>> = module
+            .resources
+            .iter()
+            .map(|r| r.kind.realize(cx))
+            .collect();
         for s in self.services.iter().filter(|s| s.module == name) {
             resources.push(Box::new(s.svc.to_compose_service(&s.name, cx)));
         }
@@ -245,7 +258,12 @@ impl Deployment {
     /// The physical engine `ResourceId` of a declared resource, obtained by
     /// realizing its kind. The adapter uses this to resolve writeback `Output`
     /// handles (logical `module.resource`) against `InfraState`.
-    pub fn realize_resource_id(&self, module: &str, resource: &str, cx: &Cx) -> Option<iac::ResourceId> {
+    pub fn realize_resource_id(
+        &self,
+        module: &str,
+        resource: &str,
+        cx: &Cx,
+    ) -> Option<iac::ResourceId> {
         let m = self.modules.iter().find(|m| m.name == module)?;
         let entry = m.resources.iter().find(|r| r.id == resource)?;
         Some(entry.kind.realize(cx).resource_id())
@@ -306,10 +324,7 @@ impl deploy_engine::Service for ComposeWorkload {
         &self.deps
     }
 
-    fn manifests(
-        &self,
-        _ctx: &ServiceContext,
-    ) -> Result<Vec<serde_json::Value>, RuntimeError> {
+    fn manifests(&self, _ctx: &ServiceContext) -> Result<Vec<serde_json::Value>, RuntimeError> {
         Ok(vec![self.service.to_manifest()])
     }
 }

@@ -4,18 +4,26 @@
 //! `ComposeDeployment` — proven through the engine TRAIT surface (the methods the
 //! bound `tkp` would call), not just the raw builder artifacts.
 
-use std::any::{Any, TypeId};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::{
+    any::{Any, TypeId},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value as Json;
-use tokeira_compose_deployment::config::{ComposeDsqlConfig, DsqlMode as CfgDsqlMode};
-use tokeira_compose_deployment::modules::dsql_resource_id;
-use tokeira_compose_deployment::{ComposeConfig, ComposeDeployment};
-use tokeira_compose_syn::adapter::{TkdConfig, TkdDeployment};
-use tokeira_compose_syn::context::Cx;
+use tokeira_compose_deployment::{
+    ComposeConfig, ComposeDeployment,
+    config::{ComposeDsqlConfig, DsqlMode as CfgDsqlMode},
+    modules::dsql_resource_id,
+};
+use tokeira_compose_syn::{
+    adapter::{TkdConfig, TkdDeployment},
+    context::Cx,
+};
 use tokeira_deploy_engine::{Service, ServiceContext};
-use tokeira_iac::{InfraState, ModuleContext, ModuleSelection, ResourceId, ResourceState, ResourceType};
+use tokeira_iac::{
+    InfraState, ModuleContext, ModuleSelection, ResourceId, ResourceState, ResourceType,
+};
 use tokeira_orchestrator::{Deployment, StorageKind};
 
 const SRC: &str = include_str!("../definition.tkd");
@@ -58,7 +66,10 @@ fn tkd_config(dir: PathBuf, storage: StorageKind, region: &str) -> TkdConfig {
         StorageKind::Dsql => dsql_src(region),
         _ => SRC.to_string(),
     };
-    TkdConfig { source, cx: cx(dir, region) }
+    TkdConfig {
+        source,
+        cx: cx(dir, region),
+    }
 }
 
 type ServiceShape = BTreeMap<String, (String, Vec<String>, Vec<Json>)>;
@@ -70,7 +81,10 @@ fn shape(services: &[Box<dyn Service>]) -> ServiceShape {
         .map(|s| {
             let deps = s.dependencies().iter().map(|d| d.to_string()).collect();
             let manifests = s.manifests(&ctx).expect("manifests render");
-            (s.name().to_string(), (s.module().to_string(), deps, manifests))
+            (
+                s.name().to_string(),
+                (s.module().to_string(), deps, manifests),
+            )
         })
         .collect()
 }
@@ -165,7 +179,11 @@ fn adapter_collect_writeback_matches_engine() {
     // The adapter resolves the deferred Output handles against InfraState into the
     // exact (dotted-key, value) pairs the engine's collect_writeback produces.
     assert_eq!(adapter_wb, engine_wb);
-    assert_eq!(adapter_wb.len(), 5, "5 writeback keys under fully-applied DSQL");
+    assert_eq!(
+        adapter_wb.len(),
+        5,
+        "5 writeback keys under fully-applied DSQL"
+    );
 }
 
 fn rs(prop: &str, value: &str) -> ResourceState {

@@ -15,8 +15,7 @@ use aws_sdk_ec2::{
 };
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 use crate::ResourceContext;

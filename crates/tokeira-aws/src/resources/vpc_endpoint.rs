@@ -2,8 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 /// Whether a VPC endpoint uses the Gateway or Interface type.

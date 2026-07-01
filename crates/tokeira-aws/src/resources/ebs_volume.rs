@@ -8,8 +8,7 @@ use std::{collections::HashMap, time::Duration};
 use aws_sdk_ec2::client::Waiters as Ec2Waiters;
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 use crate::ResourceContext;

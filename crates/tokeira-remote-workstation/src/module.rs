@@ -410,18 +410,20 @@ impl Resource for WorkstationSecurityGroup {
                 if resp.security_groups().is_empty() {
                     Ok(tokeira_iac::DescribeResult::Absent)
                 } else {
-                    Ok(tokeira_iac::DescribeResult::Present(tokeira_iac::ResourceState {
-                        resource_type: self.resource_type(),
-                        physical_id: sg_id,
-                        properties: serde_json::json!({
-                            "vpc_id": self.vpc_id,
-                            "ingress_rules": 0,
-                        }),
-                        dependencies: self.dependencies(),
-                        module: self.module.clone(),
-                        created_at: String::new(),
-                        updated_at: chrono::Utc::now().to_rfc3339(),
-                    }))
+                    Ok(tokeira_iac::DescribeResult::Present(
+                        tokeira_iac::ResourceState {
+                            resource_type: self.resource_type(),
+                            physical_id: sg_id,
+                            properties: serde_json::json!({
+                                "vpc_id": self.vpc_id,
+                                "ingress_rules": 0,
+                            }),
+                            dependencies: self.dependencies(),
+                            module: self.module.clone(),
+                            created_at: String::new(),
+                            updated_at: chrono::Utc::now().to_rfc3339(),
+                        },
+                    ))
                 }
             }
             Err(e) => {

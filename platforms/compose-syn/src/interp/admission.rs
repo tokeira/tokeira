@@ -3,8 +3,10 @@
 //! neither is visible to the structure. Engine-agnostic — names only `syn`, the
 //! value model, and the evaluator.
 
-use super::eval::Interp;
-use super::value::{EvalError, FieldMap, Value, VariantBody};
+use super::{
+    eval::Interp,
+    value::{EvalError, FieldMap, Value, VariantBody},
+};
 
 /// A `#[require(expr)]` clause attached to a config type.
 pub struct RequireClause {
@@ -62,7 +64,10 @@ fn push_requires(attrs: &[syn::Attribute], scope: &str, out: &mut Vec<RequireCla
         if a.path().is_ident("require")
             && let Ok(expr) = a.parse_args::<syn::Expr>()
         {
-            out.push(RequireClause { scope: scope.to_string(), expr });
+            out.push(RequireClause {
+                scope: scope.to_string(),
+                expr,
+            });
         }
     }
 }
@@ -87,7 +92,9 @@ pub fn check_retarget(adm: &Admission, old: &Value, new: &Value) -> Result<(), E
 /// nested inside an enum variant / Option / Vec is not missed.
 fn diff(creates: &[(String, String)], old: &Value, new: &Value) -> Result<(), EvalError> {
     match (old, new) {
-        (Value::Struct { ty: t1, fields: f1 }, Value::Struct { ty: t2, fields: f2 }) if t1 == t2 => {
+        (Value::Struct { ty: t1, fields: f1 }, Value::Struct { ty: t2, fields: f2 })
+            if t1 == t2 =>
+        {
             for (ty, field) in creates.iter().filter(|(ty, _)| ty == t1) {
                 if f1.get(field) != f2.get(field) {
                     return Err(EvalError::new(format!(
@@ -101,25 +108,32 @@ fn diff(creates: &[(String, String)], old: &Value, new: &Value) -> Result<(), Ev
                 }
             }
         }
-        (Value::Enum { variant: v1, body: b1, .. }, Value::Enum { variant: v2, body: b2, .. })
-            if v1 == v2 =>
-        {
-            match (b1, b2) {
-                (VariantBody::Struct(f1), VariantBody::Struct(f2)) => {
-                    for (k, av) in f1 {
-                        if let Some(bv) = f2.get(k) {
-                            diff(creates, av, bv)?;
-                        }
-                    }
-                }
-                (VariantBody::Tuple(x1), VariantBody::Tuple(x2)) => {
-                    for (av, bv) in x1.iter().zip(x2) {
+        (
+            Value::Enum {
+                variant: v1,
+                body: b1,
+                ..
+            },
+            Value::Enum {
+                variant: v2,
+                body: b2,
+                ..
+            },
+        ) if v1 == v2 => match (b1, b2) {
+            (VariantBody::Struct(f1), VariantBody::Struct(f2)) => {
+                for (k, av) in f1 {
+                    if let Some(bv) = f2.get(k) {
                         diff(creates, av, bv)?;
                     }
                 }
-                _ => {}
             }
-        }
+            (VariantBody::Tuple(x1), VariantBody::Tuple(x2)) => {
+                for (av, bv) in x1.iter().zip(x2) {
+                    diff(creates, av, bv)?;
+                }
+            }
+            _ => {}
+        },
         (Value::Opt(Some(a)), Value::Opt(Some(b))) => diff(creates, a, b)?,
         (Value::Vec(x1), Value::Vec(x2)) | (Value::Tuple(x1), Value::Tuple(x2)) => {
             for (av, bv) in x1.iter().zip(x2) {
@@ -151,7 +165,7 @@ pub fn check_requires(interp: &Interp, adm: &Admission, cfg: &Value) -> Result<(
                     return Err(EvalError::new(format!(
                         "config constraint failed: #[require] on `{}`",
                         clause.scope
-                    )))
+                    )));
                 }
             }
         }

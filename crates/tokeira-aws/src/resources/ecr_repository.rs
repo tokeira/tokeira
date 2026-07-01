@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokeira_iac::{
     DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType,
-    error::IacError,
+    ResourceType, error::IacError,
 };
 
 use crate::{EcrError, ImageTagMutability, RepositoryDescription, clients::ecr::ecr_client};

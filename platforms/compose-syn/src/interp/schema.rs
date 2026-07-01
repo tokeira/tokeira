@@ -99,7 +99,7 @@ pub fn fn_param_names(f: &ItemFn) -> Result<Vec<String>, EvalError> {
                 _ => return Err(EvalError::new("unsupported function parameter pattern")),
             },
             syn::FnArg::Receiver(_) => {
-                return Err(EvalError::new("`self` parameters are not allowed"))
+                return Err(EvalError::new("`self` parameters are not allowed"));
             }
         }
     }

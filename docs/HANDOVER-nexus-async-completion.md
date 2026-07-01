@@ -174,3 +174,101 @@ Wave 0 is **done and committed** (`7d4e24cc`). Wave 1 edits are **uncommitted** 
 (the `TestNexusWorkflowTestSuite` blockers). `dbfcd43c`/`755df85c` reconciled the Nexus spec tracking
 (C4a done; C4b round-trip verified). `aae8ae24` async-completion spec. `7d4e24cc` Wave 0 config.
 The big-picture conformance state is in `.kiro/specs/temporal-functional-conformance/reference/FINDINGS.md`.
+
+---
+
+## 8. Investigation directive — `wait-cancel` (the one remaining leaf)
+
+**Status:** Gap A (completion error-chain wrapping) and Gap B (cancel-token round-trip) are landed and
+verified — `fail`, `wait-terminate`, `timeout` pass 3× stress. The lone failing leaf is
+`TestNexusAsyncOperationErrorRehydration/wait-cancel`: the canceled async op resolves as **success**
+(`fut.Get()` returns `nil`, ~0.1s) instead of **canceled**. This section is the directed next pass.
+
+### 8.1 What the test actually exercises (ground-truthed, do not re-guess)
+
+Source: `tests/nexus_workflow_test.go:2218` (`TestNexusAsyncOperationErrorRehydration`) @ v1.31.0.
+
+- Endpoint is a **Worker target** (`EndpointTarget_Worker`), so cancel flows through the runtime
+  **Worker** arm (publishes a `CancelOperation` `NexusTask`), **not** the HTTP `EndpointTarget` arm.
+- Handler (`handlerWF` for `outcome="wait"`) is `workflow.Await(ctx, func() bool { return false })` —
+  it **never completes on its own**; it closes **only** when the caller's cancel reaches and cancels
+  the backing handler workflow.
+- Caller (`action="cancel"`): starts op, waits for `GetNexusOperationExecution()` (op is async-started),
+  calls `cancel()`, then `fut.Get()` — expects a `NexusOperationError` wrapping a `CanceledError`.
+
+So the correct end-to-end is a 5-hop round-trip: caller cancels → engine dispatches `CancelOperation`
+to the handler worker → worker cancels the **backing** handler workflow → backing WF closes
+**Canceled** → its completion callback fires with a **Canceled** outcome → caller's op resolves
+`NexusOperationCanceled`.
+
+### 8.2 v1.31.0 contract — cancel-ack does NOT resolve the operation
+
+Verified against `components/nexusoperations/statemachine.go @ v1.31.0`:
+
+- `TransitionCancelationSucceeded` (statemachine.go:668) moves **only** the *Cancelation* sub-machine
+  `SCHEDULED → SUCCEEDED` and records the attempt. It does **not** touch the Operation machine and does
+  **not** resolve the op.
+- The Operation resolves **exclusively** via its completion event (the backing WF's terminal close,
+  routed through the registered completion callback). The cancel-ack and the op-resolution are
+  **decoupled** by design.
+
+### 8.3 Where tokeira diverges (both sites confirmed by reading)
+
+tokeira resolves the caller op **on the cancel-ack**, which v1.31.0 never does:
+
+1. `crates/tokeira-edge/src/translate/nexus.rs:~225` — `proto_response_to_resolution` maps a worker
+   `CancelOperation` response → `NexusResolution::Canceled`. For the Worker-target test this is the
+   **live** divergence: the worker acking "cancel delivered" is turned into an op resolution.
+2. `crates/tokeira-runtime/src/publisher.rs:~962` — the HTTP `EndpointTarget` cancel arm submits
+   `NexusOperationResolved(Canceled)` on `cancel_operation` `Ok(())`. (Not on the test path, but the
+   same category of bug; fix both for consistency with §8.2.)
+
+**Honest limit (do not paper over):** both divergences predict a **Canceled** resolution. The observed
+symptom is **Success**. So either (a) a *different* path resolves the op as success **before** the
+cancel path runs, or (b) the cancel never reaches the backing WF (runtime notes cancel dispatch is
+"deferred, best-effort" in `crates/tokeira-runtime/src/nexus.rs`) and something else closes the op
+success. §8.3's two sites are necessary fixes but are **not proven sufficient** for `wait-cancel`.
+Confirm the Success source before claiming a fix.
+
+### 8.4 Instrument first — capture two facts, then decide
+
+Do **not** edit resolution logic until these two are captured from a real `wait-cancel` run (add
+temporary `tracing::info!` at the named sites; strip before commit):
+
+1. **Backing handler WF terminal event kind.** At the kernel close path
+   (`crates/tokeira-kernel/src/kernel.rs`, where the backing run records its terminal
+   `HistoryEventKind`), log `run_key` + terminal kind. Question: does the backing WF close at all, and
+   if so is it `WorkflowExecutionCanceled`? If it never closes → cancel isn't propagating (path b).
+2. **Which `NexusResolution` + which site resolves the caller op.** Log at *every* producer of
+   `Command::NexusOperationResolved` for the caller `run_key`: the edge `proto_response_to_resolution`
+   site (§8.3.1), the publisher HTTP arm (§8.3.2), and the completion-callback inbound path
+   (`apply_nexus_operation_resolved`, kernel.rs:~1864 / `nexus_callback.rs`). Capture the
+   `NexusResolution` variant and the wall-clock order.
+
+### 8.5 Decision tree
+
+- **If the caller op resolves `Success` via the edge cancel-ack path** (§8.3.1 returning the wrong
+  variant, or a `StartOperation`/completion race landing success): the worker's `CancelOperation`
+  response is being mis-decoded, **or** a success completion is arriving first. Fix = **stop resolving
+  the op on cancel-ack entirely** (align to §8.2): the cancel-ack transitions cancelation state only;
+  the op waits for the completion callback. Remove/neuter §8.3.1 and §8.3.2 as op-resolvers.
+- **If the backing WF never closes** (no terminal event in §8.4.1): the cancel is not reaching the
+  backing WF — the "deferred, best-effort" dispatch in `runtime/nexus.rs` is the gap. Fix = make the
+  `CancelOperation` worker task actually drive a cancel of the backing handler workflow, so it closes
+  `Canceled` and its completion callback fires. Then §8.2 resolution (via callback) yields `Canceled`
+  naturally.
+- **If the backing WF closes `Canceled` but the op still resolved `Success`**: the
+  canceled-close → completion-outcome mapping is being bypassed or overwritten by an earlier success.
+  Re-check `callback_completion_outcome` (kernel.rs:66 — verified `WorkflowExecutionCanceled →
+  Canceled`, ground-truthed vs `GetNexusCompletion`, `service/history/workflow/mutable_state_impl.go:723
+  @ v1.31.0`) **and** ordering: the completion callback must win over any cancel-ack resolution.
+
+### 8.6 Correct target state (what "fixed" looks like)
+
+Align tokeira to the v1.31.0 decoupling: **cancel-ack updates cancelation state only; the operation
+resolves solely from the backing run's terminal completion callback.** For `wait-cancel` that means
+the backing WF closes `Canceled` → completion callback delivers a `Canceled` outcome → caller resolves
+`NexusOperationCanceled` → SDK surfaces `NexusOperationError` wrapping `CanceledError`. Cite
+`statemachine.go:671` (cancel-ack scope) and `GetNexusCompletion` (outcome derivation) in the fix
+comments. Re-run the full `TestNexusAsyncOperationErrorRehydration` matrix (all four leaves) 3× before
+calling it done — the cancel decoupling must not regress `fail`/`wait-terminate`/`timeout`.

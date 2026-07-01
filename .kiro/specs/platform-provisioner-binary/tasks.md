@@ -132,8 +132,19 @@ multi-consumer decision) are out of scope.
         same-semver/different-hash, and re-stamp back to `dev`; the only verb that authoritatively advances
         the recorded version (Req 4.5, 4.6, 6.3, 6.5). Optional advisory baseline gate: refuse-and-surface
         live drift from [A final] (Req 4.7). No `adopt` verb. Property 15.
-  - [ ] 8.5 `rollback`: **definition-driven — B delete-only → re-pin → A forward-reconcile** (Req 9,
-        Proposal 002). Preconditions (exhaustive, before any destructive work): acquire the remote
+  - [~] 8.5 `rollback`: **definition-driven — B delete-only → re-pin → A forward-reconcile** (Req 9,
+        Proposal 002). DONE (first increment): `tkp rollback` (`tkp/src/rollback.rs`) fail-closes if there is
+        no `[A final]` checkpoint, runs the B delete-only pass (empty for local; `destroy_selected` wires
+        here for real platforms), commits the **re-pin to A** in one CAS save
+        (`DeploymentStateEnvelope::begin_rollback` restores A's binding + state heads + retained
+        configuration-revision ref and opens the `RollbackInFlight` marker), then A reconciles (local infra
+        apply of the retained revision), then `complete_rollback` clears the marker and consumes the
+        checkpoint. Tests: `begin_rollback_repins_to_checkpoint_and_completes`,
+        `begin_rollback_without_checkpoint_errors`, `rollback_refuses_without_a_checkpoint`,
+        `rollback_repins_to_the_checkpoint_engine`. *Remaining: the two-binary orchestration (`tkr` relaunches
+        A for the reconcile), the real `destroy_selected` delete-only over live resources, both-binary
+        checksum verification, and holding the operation lock across the sequence (12.2).* Preconditions
+        (exhaustive, before any destructive work): acquire the remote
         operation lock (task 12), verify **both** binaries' checksums, confirm the checkpoint + retained
         prior configuration revision exist, persist the operation marker. Undo (B): `destroy_selected`
         (task 11.3) over the ids B created (`keys(S_B) − keys(S_A)`) — reverse-dep order, fail-closed,

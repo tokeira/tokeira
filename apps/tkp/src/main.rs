@@ -23,6 +23,7 @@ use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 mod apply;
 mod gate;
+mod rollback;
 mod upgrade;
 
 #[derive(Parser)]
@@ -74,9 +75,10 @@ async fn main() -> Result<()> {
         Command::Describe(args) => describe(args).await,
         Command::Apply(args) => apply::apply(&args.deployment_dir).await,
         Command::Upgrade(args) => upgrade::upgrade(&args.deployment_dir).await,
-        Command::Rollback(_) | Command::Resume(_) => anyhow::bail!(
-            "not yet implemented: rollback/resume land with the definition-driven rollback \
-             orchestration (task 8.5) — describe/apply/upgrade are available today"
+        Command::Rollback(args) => rollback::rollback(&args.deployment_dir).await,
+        Command::Resume(_) => anyhow::bail!(
+            "not yet implemented: `resume` (continuing an interrupted operation from the marker) \
+             is a follow-on — describe/apply/upgrade/rollback are available today"
         ),
     }
 }

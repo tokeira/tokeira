@@ -298,6 +298,45 @@ impl DeploymentStateEnvelope {
         });
     }
 
+    /// Begin a **definition-driven rollback** (Proposal 002, task 8.5): re-pin the
+    /// binding to the checkpoint's recorded engine `A`, restore `A`'s state heads
+    /// and configuration-revision ref from the checkpoint, and open the
+    /// `RollbackInFlight` marker. `A` then forward-reconciles toward its retained
+    /// prior configuration revision (`effective_config_ref`). Returns `Err` when
+    /// there is no checkpoint to roll back to.
+    ///
+    /// The superseded binary `B` deletes what it created *before* this re-pin (a
+    /// delete-only pass over `keys(S_B) − keys(S_A)`); this method performs the
+    /// re-pin the caller persists in one CAS commit.
+    pub fn begin_rollback(
+        &mut self,
+        operation_id: impl Into<String>,
+        _recorded_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let checkpoint = self
+            .checkpoint
+            .clone()
+            .ok_or_else(|| "no rollback checkpoint — nothing to roll back to".to_string())?;
+        self.binding = Some(checkpoint.from_provenance);
+        self.infra_head = checkpoint.from_infra_head;
+        self.runtime_head = checkpoint.from_runtime_head;
+        self.effective_config_ref = checkpoint.from_config_ref;
+        self.operation = Some(Operation {
+            operation_id: operation_id.into(),
+            kind: OperationKind::RollbackInFlight,
+            phase: "re-pinned-to-A".to_string(),
+            audit_log: None,
+        });
+        Ok(())
+    }
+
+    /// Complete a rollback: clear the in-flight marker **and** consume the
+    /// checkpoint (the [A final] state it pinned is now the live state).
+    pub fn complete_rollback(&mut self) {
+        self.operation = None;
+        self.checkpoint = None;
+    }
+
     /// Close the in-flight operation marker (the upgrade or rollback completed).
     pub fn close_operation(&mut self) {
         self.operation = None;
@@ -421,6 +460,57 @@ mod tests {
         assert!(env.operation.is_none());
         assert_eq!(env.binding.as_ref(), Some(&b));
         assert!(env.checkpoint.is_some());
+    }
+
+    #[test]
+    fn begin_rollback_repins_to_checkpoint_and_completes() {
+        let a = ProvenanceStamp {
+            version: "1.0.0".into(),
+            git_sha: "shaA".into(),
+            source_tree_hash: "hA".into(),
+            build_mode: BuildMode::Versioned,
+            recorded_at: Utc::now(),
+        };
+        let b = ProvenanceStamp {
+            source_tree_hash: "hB".into(),
+            version: "2.0.0".into(),
+            ..a.clone()
+        };
+        // Post-upgrade envelope: bound to B, checkpoint holds [A final].
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(a.clone()),
+            effective_config_ref: Some("cfg-A".into()),
+            ..Default::default()
+        };
+        env.begin_upgrade(b.clone(), "op-up", Utc::now());
+        env.close_operation();
+        assert_eq!(env.binding.as_ref(), Some(&b));
+
+        // Rollback: re-pin to A from the checkpoint.
+        env.begin_rollback("op-rb", Utc::now())
+            .expect("checkpoint present");
+        assert_eq!(env.binding.as_ref(), Some(&a), "re-pinned to A");
+        assert_eq!(
+            env.effective_config_ref.as_deref(),
+            Some("cfg-A"),
+            "A's retained config ref restored"
+        );
+        assert_eq!(
+            env.operation.as_ref().unwrap().kind,
+            OperationKind::RollbackInFlight
+        );
+
+        // Complete: marker cleared, checkpoint consumed, binding stays A.
+        env.complete_rollback();
+        assert!(env.operation.is_none());
+        assert!(env.checkpoint.is_none());
+        assert_eq!(env.binding.as_ref(), Some(&a));
+    }
+
+    #[test]
+    fn begin_rollback_without_checkpoint_errors() {
+        let mut env = DeploymentStateEnvelope::default();
+        assert!(env.begin_rollback("op", Utc::now()).is_err());
     }
 
     #[test]

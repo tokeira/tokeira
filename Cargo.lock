@@ -6645,9 +6645,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokeira-build-info",
  "tokeira-state",
+ "tokio",
 ]
 
 [[package]]

@@ -94,10 +94,18 @@ multi-consumer decision) are out of scope.
         persist in one CAS commit; `close_operation` clears the marker (keeping the flipped binding +
         checkpoint). Test `begin_upgrade_captures_checkpoint_and_flips_binding`.
 
-- [ ] 6. S3 binary retention (optional path)
-  - [ ] 6.1 In the S3 state store, optionally persist the binary blob keyed by `version`+`target`
-        alongside state documents.
-  - [ ] 6.2 Retrieve + checksum-verify before execution (reuses 4.2). Property 3 (5.3).
+- [x] 6. S3 binary retention (optional path)
+  - [x] 6.1 In the S3 state store, optionally persist the binary blob keyed by `version`+`target`
+        alongside state documents. DONE — `tokeira_provisioner::BinaryStore` (over any `StateBackend`'s
+        immutable snapshot I/O, so one store serves both `S3Backend` and `LocalBackend`) — `persist(version,
+        target, bytes)` writes the blob at `{prefix}/{version}-{target}` (idempotent) and returns the
+        retrieval key for a `BinaryArtifactDescriptor::retrieval_ref`.
+  - [x] 6.2 Retrieve + checksum-verify before execution (reuses 4.2). Property 3 (5.3). DONE —
+        `BinaryStore::retrieve_verified(version, target, manifest)` retrieves the blob and verifies it via
+        `IntegrityManifest::verify_artifact`; a `sha256` mismatch (or a target absent from the manifest) is
+        a `BinaryError`, so the caller never executes it. Tests: persist/retrieve round-trip, verified-ok,
+        checksum-mismatch refused, missing-blob errors. *The verify-**before-exec** wiring in the launcher
+        is task 9.1; the retrieve+verify capability is complete here.*
 
 - [ ] 7. Measure and record the optimized binary size
   - [ ] 7.1 `cargo build --release` the provisioner; record the stripped size and the linked AWS SDK

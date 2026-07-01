@@ -23,11 +23,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokeira_state::{SnapshotRef, StateError, Validate};
 
+pub mod binary_store;
 pub mod binding;
 pub mod integrity;
 pub mod migration;
 pub mod upgrade;
 mod version;
+pub use binary_store::{BinaryError, BinaryStore};
 pub use binding::{BindingVerdict, check_binding};
 pub use integrity::{IntegrityError, sha256_hex};
 pub use migration::{MigrationError, MigrationRegistry};

@@ -278,7 +278,7 @@ multi-consumer decision) are out of scope.
         explicit scoped `destroy` of the removed module as the correct remediation. No regression; 8.5
         precondition satisfied.
 
-- [ ] 12. Remote operation lock (Requirement 11)
+- [x] 12. Remote operation lock (Requirement 11)
   - [x] 12.1 Add a renewable remote operation lock to `tokeira-state` (S3 lease / explicit record; local
         fs lock); acquire→renew→release around every mutating `tkp` command. Property 11. DONE.
         `tokeira_state::OperationLock` is built over `Box<dyn StateBackend>`, so **one** primitive serves
@@ -291,9 +291,14 @@ multi-consumer decision) are out of scope.
         idempotent. Distinct from the short per-save lease inside `S3StateStore`. Tests:
         `acquire_renew_release_cycle`, `second_acquire_refused_while_held`, `release_lets_next_acquire_succeed`,
         `expired_lease_is_taken_over`, `renew_after_takeover_fails_lock_lost`.
-  - [ ] 12.2 Hold one continuous lock across the whole `rollback` sequence (B delete-only → re-pin →
-        A forward-reconcile) so no writer interleaves at the handoff (Req 11.3). *Needs `tkp` (the
-        rollback orchestration) — deferred until the binary exists; the 12.1 primitive is ready.*
+  - [x] 12.2 Hold one continuous lock across the whole `rollback` sequence (B delete-only → re-pin →
+        A forward-reconcile) so no writer interleaves at the handoff (Req 11.3). DONE —
+        `tkp/src/lock.rs::with_operation_lock` acquires the deployment's `OperationLock` (12.1, over a
+        dedicated `{dir}/state/lock` object) before any work and releases it after; the `main` dispatch
+        wraps **every** mutating verb (`init`/`apply`/`upgrade`/`rollback`) in it (Req 11.1), so `rollback`
+        runs its whole B-delete → re-pin → A-reconcile sequence under **one continuous** lock and a second
+        provisioner refuses. `describe` is read-only and never locks. Tests
+        `runs_body_under_the_lock_and_releases`, `refuses_when_the_lock_is_already_held`.
 
 - [x] 13. Deployment state envelope + the authoritative remote store (foundational; decided)
   - [x] 13.1 Define the deployment-level `DeploymentStateEnvelope` — DONE. New crate
@@ -344,8 +349,12 @@ multi-consumer decision) are out of scope.
         the recorded `source_tree_hash` and advance `config_revision`). *Narrowing the digest to only the
         engine crates (vs the whole workspace) is a build-system refinement — 14.4 direction — but Property
         14 holds regardless because config is already excluded.*
-  - [ ] 14.2 On `apply`, advance `config_revision` and record `effective_config_ref`; `describe` reports
-        engine stamp + `config_revision` (Req 13.2).
+  - [x] 14.2 On `apply`, advance `config_revision` and record `effective_config_ref`; `describe` reports
+        engine stamp + `config_revision` (Req 13.2). DONE — `tkp apply` bumps `config_revision` and records
+        `effective_config_ref` (a `sha256:` content ref of the deployment's config file, `"default"` when
+        absent — so a revision is identifiable and revertable-to, task 14.3); `tkp describe` reports the
+        engine stamp, `config_revision`, and `effective_config` (human + `--json`). Property-14 test asserts
+        the config ref is recorded; smoke-verified.
   - [ ] 14.3 Add config-revision revert: a same-engine `apply` of a prior recorded config revision — not an
         `upgrade`, not a two-binary rollback (Req 13.3).
   - [ ] 14.4 Architectural direction (note, not a single task): express platform desired-state definition

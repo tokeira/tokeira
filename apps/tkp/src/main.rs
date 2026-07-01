@@ -24,6 +24,7 @@ use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 mod apply;
 mod gate;
 mod init;
+mod lock;
 mod rollback;
 mod upgrade;
 
@@ -76,11 +77,26 @@ struct LifecycleArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Init(args) => init::init(&args.deployment_dir).await,
+        // Read-only: never gates, never locks.
         Command::Describe(args) => describe(args).await,
-        Command::Apply(args) => apply::apply(&args.deployment_dir).await,
-        Command::Upgrade(args) => upgrade::upgrade(&args.deployment_dir).await,
-        Command::Rollback(args) => rollback::rollback(&args.deployment_dir).await,
+        // Mutating verbs run under the deployment's operation lock (Req 11).
+        // `rollback` holds one continuous lock across its whole sequence (12.2).
+        Command::Init(args) => {
+            let dir = args.deployment_dir;
+            lock::with_operation_lock(&dir, "init", || init::init(&dir)).await
+        }
+        Command::Apply(args) => {
+            let dir = args.deployment_dir;
+            lock::with_operation_lock(&dir, "apply", || apply::apply(&dir)).await
+        }
+        Command::Upgrade(args) => {
+            let dir = args.deployment_dir;
+            lock::with_operation_lock(&dir, "upgrade", || upgrade::upgrade(&dir)).await
+        }
+        Command::Rollback(args) => {
+            let dir = args.deployment_dir;
+            lock::with_operation_lock(&dir, "rollback", || rollback::rollback(&dir)).await
+        }
         Command::Resume(_) => anyhow::bail!(
             "not yet implemented: `resume` (continuing an interrupted operation from the marker) \
              is a follow-on — describe/apply/upgrade/rollback are available today"
@@ -155,6 +171,7 @@ struct DescribeReport {
     deployment_id: String,
     schema_version: u32,
     config_revision: u64,
+    effective_config_ref: Option<String>,
     binding: BindingView,
     integrity: Option<IntegrityView>,
     infra_head_present: bool,
@@ -171,6 +188,7 @@ impl DescribeReport {
             deployment_id: envelope.deployment_id.clone(),
             schema_version: envelope.schema_version,
             config_revision: envelope.config_revision,
+            effective_config_ref: envelope.effective_config_ref.clone(),
             binding: BindingView {
                 recorded: envelope.binding.as_ref().map(StampView::of),
                 verdict: verdict_label(verdict),
@@ -211,7 +229,11 @@ impl DescribeReport {
         };
         println!("  deployment_id     {id}");
         println!("  schema_version    {}", self.schema_version);
-        println!("  config_revision   {}\n", self.config_revision);
+        println!("  config_revision   {}", self.config_revision);
+        println!(
+            "  effective_config  {}\n",
+            self.effective_config_ref.as_deref().unwrap_or("(none)")
+        );
 
         println!("Binding");
         match &self.binding.recorded {

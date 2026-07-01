@@ -54,18 +54,34 @@ pub async fn apply(deployment_dir: &Path) -> Result<()> {
     println!("infra apply: {change_count} change(s)");
 
     // ── Re-stamp the envelope ──
-    // A config apply keeps the engine identity and advances the revision.
+    // A config apply keeps the engine identity and advances the config revision
+    // (task 14.2): record the effective config ref and bump `config_revision`.
     if envelope.deployment_id.is_empty() {
         envelope.deployment_id = config.project_name.clone();
     }
     envelope.binding = Some(running);
     envelope.config_revision += 1;
+    envelope.effective_config_ref = Some(config_ref(deployment_dir));
     store
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after apply")?;
-    println!("envelope: config_revision now {}", envelope.config_revision);
+    println!(
+        "envelope: config_revision now {} (config {})",
+        envelope.config_revision,
+        envelope.effective_config_ref.as_deref().unwrap_or("default")
+    );
     Ok(())
+}
+
+/// A content ref for the effective configuration — a SHA-256 of the deployment's
+/// config file, so a given config revision is identifiable (and revertable to;
+/// task 14.3). Absent config falls back to `"default"`.
+pub(crate) fn config_ref(deployment_dir: &Path) -> String {
+    match std::fs::read(deployment_dir.join("deployment.toml")) {
+        Ok(bytes) => format!("sha256:{}", tokeira_provisioner::sha256_hex(&bytes)),
+        Err(_) => "default".to_string(),
+    }
 }
 
 /// Run the local platform's infrastructure apply and return `(change_count,

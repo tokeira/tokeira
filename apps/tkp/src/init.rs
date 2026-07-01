@@ -135,5 +135,9 @@ mod tests {
             "the engine source_tree_hash is unchanged by config refinement"
         );
         assert_eq!(after.config_revision, 2, "config_revision advanced per apply");
+        assert!(
+            after.effective_config_ref.is_some(),
+            "apply records the effective config ref (task 14.2)"
+        );
     }
 }

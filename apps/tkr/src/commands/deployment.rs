@@ -15,12 +15,18 @@ use anyhow::Result;
 
 use crate::{
     cli::DeploymentAction,
-    deployment_dir::{DeploymentResolver, normalize_name},
+    deployment_dir::{DeploymentResolver, load_context, normalize_name},
+    deployment_lock, launcher,
     metadata::DeploymentMetadata,
     output::OutputFormatter,
 };
 
-pub fn run(action: DeploymentAction, deployments: &DeploymentResolver, json: bool) -> Result<()> {
+pub async fn run(
+    action: DeploymentAction,
+    deployments: &DeploymentResolver,
+    selected: Option<&str>,
+    json: bool,
+) -> Result<()> {
     match action {
         DeploymentAction::Create {
             name,
@@ -75,6 +81,41 @@ pub fn run(action: DeploymentAction, deployments: &DeploymentResolver, json: boo
             let name = normalize_name(&name);
             deployments.remove(&name)?;
             println!("destroyed deployment {name}");
+        }
+        DeploymentAction::Lock { name } => {
+            let lock = deployment_lock::lock(deployments, name.as_deref())?;
+            println!("locked deployment '{}' ({})", lock.name, lock.fingerprint);
+            println!(
+                "mutating commands now refuse any other deployment; `tkr deployment unlock --yes` to clear"
+            );
+        }
+        DeploymentAction::Unlock { yes } => {
+            super::require_confirmation(yes, "deployment unlock")?;
+            match deployment_lock::unlock(deployments)? {
+                Some(lock) => println!("unlocked deployment '{}'", lock.name),
+                None => println!("no deployment lock was set"),
+            }
+        }
+        DeploymentAction::Describe => {
+            let ctx = load_context(deployments, selected)?;
+            let extra = if json {
+                vec!["--json".to_string()]
+            } else {
+                Vec::new()
+            };
+            launcher::launch(&ctx, "describe", &extra).await?;
+        }
+        DeploymentAction::Apply => {
+            let ctx = load_context(deployments, selected)?;
+            launcher::launch_apply(&ctx).await?;
+        }
+        DeploymentAction::Upgrade => {
+            let ctx = load_context(deployments, selected)?;
+            launcher::launch(&ctx, "upgrade", &[]).await?;
+        }
+        DeploymentAction::Rollback => {
+            let ctx = load_context(deployments, selected)?;
+            launcher::launch(&ctx, "rollback", &[]).await?;
         }
     }
     Ok(())

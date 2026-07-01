@@ -40,6 +40,8 @@ tokeira-local-deployment = { path = "../../platforms/local" }
 tokeira-compose-deployment = { path = "../../platforms/compose" }
 tokeira-ecs-deployment = { path = "../../platforms/ecs" }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
+tokeira-provisioner = { workspace = true }
+tokeira-state = { workspace = true }
 tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
 tracing.workspace = true

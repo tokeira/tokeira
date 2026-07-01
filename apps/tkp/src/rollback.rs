@@ -79,6 +79,12 @@ pub async fn rollback(deployment_dir: &Path) -> Result<()> {
     envelope
         .begin_rollback(operation_id, Utc::now())
         .map_err(|e| anyhow::anyhow!(e))?;
+    // Restore A's integrity manifest alongside A's binding — the manifest must
+    // always describe the engine the binding names (the launcher's bound-class
+    // verification checks the installed binary against it), and `upgrade`
+    // re-recorded it for B. (Belongs inside `begin_rollback` itself; kept here
+    // while the integrity module is being reworked.)
+    envelope.integrity = Some(checkpoint.from_integrity.clone());
     version = store
         .save(&envelope, &version)
         .await
@@ -173,10 +179,26 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_repins_to_the_checkpoint_engine() {
+        use tokeira_provisioner::{BinaryArtifactDescriptor, IntegrityManifest, Target};
+
+        fn manifest(sha: &str) -> IntegrityManifest {
+            IntegrityManifest {
+                provisioner_version: "1.0.0".to_string(),
+                artifacts: vec![BinaryArtifactDescriptor {
+                    version: "1.0.0".to_string(),
+                    target: Target("x".to_string()),
+                    sha256: sha.to_string(),
+                    retrieval_ref: None,
+                    size_bytes: 1,
+                }],
+            }
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         let store = envelope_store(tmp.path());
 
-        // Build a post-upgrade envelope: A captured in the checkpoint, bound to B.
+        // Build a post-upgrade envelope: A (binding + integrity) captured in the
+        // checkpoint, bound to B with B's re-recorded manifest.
         let a = ProvenanceStamp::current(Utc::now());
         let b = ProvenanceStamp {
             source_tree_hash: "hB".to_string(),
@@ -184,10 +206,12 @@ mod tests {
         };
         let mut env = DeploymentStateEnvelope {
             binding: Some(a.clone()),
+            integrity: Some(manifest("sha-of-A")),
             config_revision: 2,
             ..Default::default()
         };
         env.begin_upgrade(b, "op-up", Utc::now());
+        env.integrity = Some(manifest("sha-of-B")); // what `upgrade` re-records
         env.close_operation();
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
@@ -199,6 +223,11 @@ mod tests {
             after.binding.as_ref().unwrap().source_tree_hash,
             a.source_tree_hash,
             "re-pinned to A"
+        );
+        assert_eq!(
+            after.integrity.as_ref().unwrap().artifacts[0].sha256,
+            "sha-of-A",
+            "A's integrity manifest restored with A's binding"
         );
         assert!(after.checkpoint.is_none(), "checkpoint consumed");
         assert!(after.operation.is_none(), "marker closed");

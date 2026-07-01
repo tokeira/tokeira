@@ -157,6 +157,27 @@ pub enum DeploymentAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Lock every mutating command to one deployment (the mis-apply guard).
+    /// Defaults to the currently-selected deployment.
+    Lock {
+        name: Option<String>,
+    },
+    /// Clear the deployment lock (requires confirmation).
+    Unlock {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Report the deployment's provisioner identity + binding (forwards to `tkp
+    /// describe`; read-only, never gates).
+    Describe,
+    /// Apply the deployment via its bound provisioner (forwards to `tkp apply`,
+    /// initializing it first if needed).
+    Apply,
+    /// Upgrade the deployment's engine identity (forwards to `tkp upgrade`).
+    Upgrade,
+    /// Roll back the deployment to its retained prior revision (forwards to `tkp
+    /// rollback`).
+    Rollback,
 }
 
 #[derive(Args)]

@@ -187,22 +187,60 @@ multi-consumer decision) are out of scope.
         Resumable from the marker; whole sequence under the operation lock; no reverse migration
         (Req 9.2–9.7). Property 9. Depends on tasks 11, 12.
 
-- [ ] 9. `tkr` launcher + surface separation (Requirement 7)
-  - [ ] 9.1 Add the `tkr` launcher seam with the four **launch classes**: **bound** (recorded binary,
+- [~] 9. `tkr` launcher + surface separation (Requirement 7)
+  - [x] 9.1 Add the `tkr` launcher seam with the four **launch classes**: **bound** (recorded binary,
         verified against the recorded integrity manifest), **candidate-upgrade** (operator/release-resolved
         B, verified against external build/release metadata), **dev-candidate** (current local dev build),
         **rollback** (bound B then retained A) — resolve, checksum-verify, re-exec (reusing the
         Dagger-style re-exec in `apps/tkr/src/commands/image/mod.rs`); abort on mismatch (Req 7.1, 7.2).
-  - [ ] 9.2 Relocate the deployment-lifecycle verbs to forward to `tkp` (build phase: move, don't shim);
+        DONE (first increment): `tkr/src/launcher.rs` — `LaunchClass::{Bound, CandidateUpgrade,
+        DevCandidate, Rollback, ReadOnly}`, `resolve_class(verb, envelope)` (describe/plan/status →
+        **read-only, never gated** — diagnostics must work precisely when the mutating classes refuse;
+        upgrade → candidate-upgrade; rollback → rollback; versioned binding → bound; dev/unstamped →
+        dev-candidate), tkp resolution (installed on `PATH`, else a `cargo run` dev build), **bound-class
+        checksum verification** against the recorded integrity manifest (`verify_against_manifest`; abort
+        on mismatch, and a bound deployment refuses a `cargo run` dev build outright), then spawn
+        `tkp <verb> --deployment-dir <dir>` (the same spawn/inherit shape as the Dagger re-exec),
+        propagating tkp's actual exit status. `launch_apply` forwards `init` first for a never-stamped
+        deployment. To keep the bound verification sound across engine transitions, `tkp upgrade` now
+        **re-records the integrity manifest for B** in the same CAS commit as the ownership transfer (A's
+        stays in the checkpoint) and `tkp rollback` restores A's manifest alongside A's binding — the
+        manifest always describes the engine the binding names. *Remaining (follow-ons): candidate-upgrade
+        verification against external release metadata; the two-binary rollback re-exec (B undo, retained A
+        reconcile).*
+  - [~] 9.2 Relocate the deployment-lifecycle verbs to forward to `tkp` (build phase: move, don't shim);
         keep `tkr deployment create|list|use|lock|unlock|destroy`, dev/ci/compat/workstation, `version`,
         `config`, and `image build` owned by `tkr`; `image push|mirror` forward to `tkp` (Req 7.3, 7.4).
+        PARTIAL (ECS-safe increment, by explicit scope decision): added `tkr deployment
+        describe|apply|upgrade|rollback` forwarding through the launcher to the bound `tkp`. The
+        pre-existing in-process verbs (`infra`, `deploy`, `scale`, `schema`, `image push|mirror`) are
+        deliberately UNCHANGED: `tkp` does not yet carry `scale`/`schema`/`image` (deferred with ECS), and
+        `tkr`'s `compose` platform is the legacy `ComposeDeployment` (`deployment.toml`), not `tkp`'s
+        compose-syn (`definition.tkd`) — only `local` deployments forward transparently today. *The full
+        move-don't-shim relocation lands with ECS + tkp verb parity.*
 
-- [ ] 10. Deployment lock (Requirement 8)
-  - [ ] 10.1 Add `tkr deployment lock [<name>]` / `unlock`: write/clear a durable `lock.toml` (name +
+- [x] 10. Deployment lock (Requirement 8)
+  - [x] 10.1 Add `tkr deployment lock [<name>]` / `unlock`: write/clear a durable `lock.toml` (name +
         identity fingerprint) in the deployments registry root; `unlock` requires `--yes` (Req 8.1, 8.5).
-  - [ ] 10.2 Enforce the lock before the launcher: mutating commands refuse against any non-locked
+        DONE: `tkr/src/deployment_lock.rs` — `lock.toml` at the registry root; the fingerprint is
+        `sha256(id | platform | storage)`, deliberately excluding `source_tree_hash` so the lock survives a
+        versioned upgrade (Property 13) while a destroy+recreate under the same name (fresh id) changes it.
+        `lock` also aligns the soft `.latest` selection; `unlock` requires `--yes`; re-locking to another
+        deployment explicitly is allowed (Req 8.5).
+  - [x] 10.2 Enforce the lock before the launcher: mutating commands refuse against any non-locked
         deployment; read verbs are never blocked; a stale (missing) lock and a changed identity
-        fingerprint both fail closed (Req 8.2, 8.3, 8.4). Property 8.
+        fingerprint both fail closed (Req 8.2, 8.3, 8.4). Property 8. DONE: `main.rs` classifies every
+        command via `mutation_target` (guarded: `infra apply|destroy`, `deploy apply`, `schema setup`,
+        `scale up|down`, `image push|mirror`, `admin`, `exec` (arbitrary in-container commands mutate,
+        like `admin`), `deployment destroy|apply|upgrade|rollback`; never guarded:
+        plans/statuses/`describe`/`list`/`version`/`image list|build`/registry+selection verbs) and runs
+        `deployment_lock::enforce_mutation` **before dispatch** (so before `load_context` and the
+        launcher). When a lock is active the validated target is **pinned** for dispatch, so a concurrent
+        `.latest` flip between the check and the mutation cannot retarget the command. A vanished locked
+        deployment, a changed fingerprint, and a corrupt `lock.toml` all refuse with the discrepancy
+        surfaced (fail closed; no transfer, no override) — while `unlock --yes` deliberately still clears a
+        corrupt record (the documented recovery). Tests: 7 lock + 2 classifier/parse; CLI smoke-verified
+        (lock prod → staging apply/destroy/exec refuse, reads + describe pass, unlock needs `--yes`).
 
 - [x] 11. IaC framework hardening in `tokeira-iac` (Requirements 10, 12; underpins rollback)
   - [x] 11.1 Fail-closed delete: in `apply_changes` / `destroy_changes`, a Delete whose `ResourceId` is

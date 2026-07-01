@@ -45,19 +45,41 @@ use clap::Parser;
 mod cli;
 mod commands;
 mod deployment_dir;
+mod deployment_lock;
+mod launcher;
 mod metadata;
 mod output;
 mod process;
 mod prototypical;
 mod tui;
 
-use cli::{Cli, Command, ConfigAction};
+use cli::{
+    Cli, Command, ConfigAction, DeployAction, DeploymentAction, ImageCommand, InfraAction,
+    ScaleAction, SchemaAction,
+};
 use deployment_dir::{DeploymentResolver, load_context};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let deployments = DeploymentResolver::default()?;
+
+    // Deployment lock (mis-apply guard, task 10.2): before dispatching, a mutating
+    // command must target the locked deployment (if any). Read-only commands and
+    // registry/global commands are never blocked. Fail closed on a vanished lock
+    // or a changed identity fingerprint. When the lock validated a target, that
+    // *pinned* name is what dispatch uses — the handler must not independently
+    // re-read the `.latest` sentinel (which could change between the check and
+    // the mutation).
+    let mut selected = cli.deployment.clone();
+    if let Some(target) = mutation_target(&cli.command, selected.as_deref()) {
+        if let Some(pinned) =
+            deployment_lock::enforce_mutation(&deployments, target.as_deref())?
+        {
+            selected = Some(pinned);
+        }
+    }
+    let selected = selected.as_deref();
 
     // Each arm resolves the deployment context it needs before dispatching.
     // `Image` is the odd one out: `image build` works without any deployment
@@ -67,11 +89,13 @@ async fn main() -> Result<()> {
     // opportunistically load a context when one could apply.
     match cli.command {
         Command::Dev { action } => commands::dev::run(action),
-        Command::Deployment { action } => commands::deployment::run(action, &deployments, cli.json),
+        Command::Deployment { action } => {
+            commands::deployment::run(action, &deployments, selected, cli.json).await
+        }
         Command::Image(args) => {
             let deployment = match args.command {
                 cli::ImageCommand::Build { .. } => None,
-                _ => Some(load_context(&deployments, cli.deployment.as_deref())?),
+                _ => Some(load_context(&deployments, selected)?),
             };
             let format = if cli.json {
                 tui::OutputFormat::Json
@@ -81,7 +105,7 @@ async fn main() -> Result<()> {
             commands::image::run(args.command, deployment, format).await
         }
         Command::Infra { action } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             let format = if cli.json {
                 tui::OutputFormat::Json
             } else {
@@ -90,15 +114,15 @@ async fn main() -> Result<()> {
             commands::infra::run(action, &deployments, ctx, format).await
         }
         Command::Deploy { action } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             commands::deploy::run(action, &deployments, ctx).await
         }
         Command::Schema { action } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             commands::schema::run(action, ctx).await
         }
         Command::Scale { action } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             commands::scale::run(action, &deployments, ctx).await
         }
         Command::Logs {
@@ -106,14 +130,14 @@ async fn main() -> Result<()> {
             follow,
             tail,
         } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             commands::logs::run(&service, follow, tail, ctx).await
         }
         Command::PortForward {
             service,
             local_port,
         } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             commands::port_forward::run(&service, local_port, ctx).await
         }
         Command::Exec {
@@ -121,30 +145,75 @@ async fn main() -> Result<()> {
             container,
             cmd,
         } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             commands::exec::run(&service, container.as_deref(), &cmd, ctx).await
         }
         Command::Config {
             action: ConfigAction::Show,
         } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             commands::config::run_show(ctx)
         }
         Command::Compat(args) => commands::compat::run(args.command, cli.json),
         Command::Ci(args) => commands::ci::run(args.command, cli.json).await,
         Command::Observability { action } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             commands::observability::run(action, ctx)
         }
         Command::Workstation { action } => commands::workstation::run(action, cli.json).await,
         Command::Admin { command } => {
-            let ctx = load_context(&deployments, cli.deployment.as_deref())?;
+            let ctx = load_context(&deployments, selected)?;
             commands::admin::run(command, ctx).await
         }
         Command::Version { verbose, json } => {
             commands::version::run(verbose, cli.json || json);
             Ok(())
         }
+    }
+}
+
+/// Classify a command for the deployment lock (task 10.2). Returns `Some(target)`
+/// for a *mutating* deployment-scoped command — `target` is its resolved
+/// deployment name, or `None` to fall back to the soft selection — and `None`
+/// for read-only, registry, or global commands (which the lock never blocks).
+///
+/// The guarded set is the lifecycle mutations that change a deployment's
+/// infrastructure/services or its registry entry: `infra apply|destroy`,
+/// `deploy apply`, `schema setup`, `scale up|down`, `image push|mirror`,
+/// `admin`, `exec` (arbitrary in-container commands can mutate the deployment,
+/// exactly like `admin`), `deployment destroy`, and the forwarded `deployment
+/// apply|upgrade|rollback`. Plans, statuses, `describe`, `list`, `version`,
+/// `image list|build`, and registry/selection verbs (`create`/`use`/`lock`/
+/// `unlock`) are never blocked.
+fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<String>> {
+    let selected = || selected.map(str::to_string);
+    match command {
+        Command::Infra {
+            action: InfraAction::Apply { .. } | InfraAction::Destroy { .. },
+        }
+        | Command::Deploy {
+            action: DeployAction::Apply { .. },
+        }
+        | Command::Schema {
+            action: SchemaAction::Setup { .. },
+        }
+        | Command::Scale {
+            action: ScaleAction::Up { .. } | ScaleAction::Down { .. },
+        }
+        | Command::Admin { .. }
+        | Command::Exec { .. } => Some(selected()),
+        Command::Image(args) => match &args.command {
+            ImageCommand::Push { .. } | ImageCommand::Mirror { .. } => Some(selected()),
+            ImageCommand::List { .. } | ImageCommand::Build { .. } => None,
+        },
+        Command::Deployment { action } => match action {
+            DeploymentAction::Destroy { name, .. } => Some(Some(name.clone())),
+            DeploymentAction::Apply
+            | DeploymentAction::Upgrade
+            | DeploymentAction::Rollback => Some(selected()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -255,6 +324,103 @@ mod tests {
                 action: DeploymentAction::Destroy { name, yes: true }
             } if name == "dev"
         ));
+    }
+
+    #[test]
+    fn parses_lock_and_forwarded_verbs() {
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "deployment", "lock"])
+                .unwrap()
+                .command,
+            Command::Deployment {
+                action: DeploymentAction::Lock { name: None }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "deployment", "lock", "prod"])
+                .unwrap()
+                .command,
+            Command::Deployment {
+                action: DeploymentAction::Lock { name: Some(n) }
+            } if n == "prod"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "deployment", "unlock", "--yes"])
+                .unwrap()
+                .command,
+            Command::Deployment {
+                action: DeploymentAction::Unlock { yes: true }
+            }
+        ));
+        for (args, ok) in [
+            (["tkr", "deployment", "describe"], DeploymentAction::Describe),
+            (["tkr", "deployment", "apply"], DeploymentAction::Apply),
+            (["tkr", "deployment", "upgrade"], DeploymentAction::Upgrade),
+            (["tkr", "deployment", "rollback"], DeploymentAction::Rollback),
+        ] {
+            let parsed = Cli::try_parse_from(args).unwrap().command;
+            assert!(
+                matches!(parsed, Command::Deployment { action } if std::mem::discriminant(&action) == std::mem::discriminant(&ok)),
+                "unexpected parse for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_target_classifies_mutating_vs_readonly() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+
+        // Mutating, deployment-scoped → guarded.
+        for args in [
+            vec!["tkr", "infra", "apply", "--yes"],
+            vec!["tkr", "infra", "destroy", "--yes"],
+            vec!["tkr", "deploy", "apply", "--yes"],
+            vec!["tkr", "schema", "setup", "--yes"],
+            vec!["tkr", "scale", "up"],
+            vec!["tkr", "scale", "down"],
+            vec!["tkr", "image", "push"],
+            vec!["tkr", "image", "mirror"],
+            vec!["tkr", "admin", "schema", "setup"],
+            vec!["tkr", "exec", "runtime", "--", "sh"],
+            vec!["tkr", "deployment", "apply"],
+            vec!["tkr", "deployment", "upgrade"],
+            vec!["tkr", "deployment", "rollback"],
+        ] {
+            assert!(
+                mutation_target(&parse(&args), Some("prod")).is_some(),
+                "{args:?} should be guarded"
+            );
+        }
+
+        // `deployment destroy` guards its explicit positional target.
+        assert_eq!(
+            mutation_target(
+                &parse(&["tkr", "deployment", "destroy", "staging", "--yes"]),
+                Some("prod")
+            ),
+            Some(Some("staging".to_string()))
+        );
+
+        // Read-only / registry / global → never guarded.
+        for args in [
+            vec!["tkr", "infra", "plan"],
+            vec!["tkr", "infra", "status"],
+            vec!["tkr", "deploy", "status"],
+            vec!["tkr", "scale", "status"],
+            vec!["tkr", "schema", "status"],
+            vec!["tkr", "image", "list"],
+            vec!["tkr", "image", "build"],
+            vec!["tkr", "deployment", "describe"],
+            vec!["tkr", "deployment", "list"],
+            vec!["tkr", "deployment", "lock"],
+            vec!["tkr", "deployment", "unlock", "--yes"],
+            vec!["tkr", "version"],
+        ] {
+            assert!(
+                mutation_target(&parse(&args), None).is_none(),
+                "{args:?} should never be guarded"
+            );
+        }
     }
 
     #[test]

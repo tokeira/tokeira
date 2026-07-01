@@ -35,7 +35,10 @@ pub use document::{
 pub use engine::{Engine, StateSaver};
 pub use error::IacError;
 pub use module::{Module, ModuleContext};
-pub use types::{Change, ChangeKind, FieldDiff, InfraComposition, ModuleSelection, ResourceDiff};
+pub use types::{
+    Change, ChangeKind, FieldDiff, InfraComposition, ModuleSelection, ResourceDiff,
+    destructive_changes, plan_is_destructive,
+};
 pub use writeback::{WritebackError, write_config_values};
 
 use std::{
@@ -149,6 +152,15 @@ pub enum InternalChange {
         resource_type: ResourceType,
         details: String,
     },
+    /// An immutable-field change that `update` cannot apply in place: the engine
+    /// deletes the current resource and re-creates it. A resource returns this
+    /// from [`Resource::diff`] when it detects a changed field it declares
+    /// immutable. Destructive — the live resource (and its data) is replaced.
+    Replace {
+        resource_id: ResourceId,
+        resource_type: ResourceType,
+        details: String,
+    },
     Delete {
         resource_id: ResourceId,
         resource_type: ResourceType,
@@ -163,6 +175,7 @@ impl InternalChange {
         match self {
             InternalChange::Create { resource_id, .. }
             | InternalChange::Update { resource_id, .. }
+            | InternalChange::Replace { resource_id, .. }
             | InternalChange::Delete { resource_id, .. }
             | InternalChange::NoChange { resource_id } => resource_id,
         }

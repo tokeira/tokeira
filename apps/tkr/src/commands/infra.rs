@@ -220,6 +220,7 @@ fn print_plan(changes: &[Change]) {
         let marker = match change.kind {
             ChangeKind::Create => "+",
             ChangeKind::Update => "~",
+            ChangeKind::Replace => "±",
             ChangeKind::Delete => "-",
             ChangeKind::NoChange => "=",
         };

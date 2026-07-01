@@ -41,8 +41,19 @@ pub struct InfraComposition {
 pub enum ChangeKind {
     Create,
     Update,
+    /// Delete-then-recreate: an immutable-field change that `update` cannot apply
+    /// in place. Destructive — it replaces the live resource (and its data).
+    Replace,
     Delete,
     NoChange,
+}
+
+impl ChangeKind {
+    /// A change that destroys live infrastructure (and any data it holds).
+    /// `plan` surfaces these and `apply` requires explicit confirmation.
+    pub fn is_destructive(&self) -> bool {
+        matches!(self, ChangeKind::Delete | ChangeKind::Replace)
+    }
 }
 
 /// A flat change record suitable for display and reporting.
@@ -53,6 +64,26 @@ pub struct Change {
     pub module: String,
     pub resource: String,
     pub details: Vec<FieldDiff>,
+}
+
+impl Change {
+    /// Whether this change destroys live infrastructure (Delete or Replace).
+    pub fn is_destructive(&self) -> bool {
+        self.kind.is_destructive()
+    }
+}
+
+/// The destructive changes in a plan (Delete and Replace) — the changes `apply`
+/// must surface and confirm (`--yes`) before enacting. The engine classifies;
+/// the CLI / provisioner (`tkp`) enforces the confirmation, since the engine
+/// cannot prompt. Proposal 002 destructive-change gating.
+pub fn destructive_changes(changes: &[Change]) -> Vec<&Change> {
+    changes.iter().filter(|c| c.is_destructive()).collect()
+}
+
+/// Whether a plan contains any destructive change (Delete or Replace).
+pub fn plan_is_destructive(changes: &[Change]) -> bool {
+    changes.iter().any(Change::is_destructive)
 }
 
 /// A single field-level difference within a resource change.
@@ -68,4 +99,50 @@ pub struct FieldDiff {
 pub struct ResourceDiff {
     pub kind: ChangeKind,
     pub details: Vec<FieldDiff>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(kind: ChangeKind) -> Change {
+        Change {
+            kind,
+            resource_type: "T".to_string(),
+            module: "m".to_string(),
+            resource: "r".to_string(),
+            details: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn destructive_changes_selects_delete_and_replace() {
+        // 11.3b: Delete and Replace are destructive; Create/Update/NoChange are not.
+        let changes = vec![
+            change(ChangeKind::Create),
+            change(ChangeKind::Update),
+            change(ChangeKind::Replace),
+            change(ChangeKind::Delete),
+            change(ChangeKind::NoChange),
+        ];
+        assert!(plan_is_destructive(&changes));
+        let destructive = destructive_changes(&changes);
+        assert_eq!(destructive.len(), 2);
+        assert!(
+            destructive
+                .iter()
+                .all(|c| matches!(c.kind, ChangeKind::Replace | ChangeKind::Delete))
+        );
+    }
+
+    #[test]
+    fn non_destructive_plan_is_not_flagged() {
+        let changes = vec![
+            change(ChangeKind::Create),
+            change(ChangeKind::Update),
+            change(ChangeKind::NoChange),
+        ];
+        assert!(!plan_is_destructive(&changes));
+        assert!(destructive_changes(&changes).is_empty());
+    }
 }

@@ -240,6 +240,39 @@ impl Engine {
         destroy_changes(known, ctx, changes, saver).await
     }
 
+    /// Delete exactly the resources named in `ids`, over the current
+    /// `ctx.state`, leaving every other resource untouched.
+    ///
+    /// This is the delete-only primitive used by definition-driven rollback
+    /// (Proposal 002): the superseded binary B removes the resources it created
+    /// (`keys(S_B) − keys(S_A)`) before the binding re-pins to A. It runs the
+    /// shared fail-closed, reverse-dependency-ordered delete path — an id in
+    /// `ids` but absent from `known` errors ([`IacError::UnknownResourceDelete`],
+    /// Property 10) rather than orphaning the live resource, and an id absent
+    /// from state is skipped (idempotent). Unlike [`destroy_known`], it does
+    /// **not** refresh or reconcile the full known set — only the named ids.
+    pub async fn destroy_selected(
+        &self,
+        known: &[&dyn Resource],
+        ids: &HashSet<ResourceId>,
+        ctx: &mut ProvisionContext,
+        saver: Option<&StateSaver>,
+    ) -> Result<Vec<Change>, IacError> {
+        let changes: Vec<Change> = ids
+            .iter()
+            .filter_map(|rid| {
+                ctx.state.resources.get(rid).map(|rs| Change {
+                    kind: ChangeKind::Delete,
+                    resource_type: rs.resource_type.0.clone(),
+                    module: rs.module.clone(),
+                    resource: rid.0.clone(),
+                    details: Vec::new(),
+                })
+            })
+            .collect();
+        destroy_changes(known, ctx, changes, saver).await
+    }
+
     /// Destroy restricted to the active modules in the composition.
     pub async fn destroy_for_modules(
         &self,
@@ -669,6 +702,79 @@ async fn apply_changes(
                     save(&ctx.state).await?;
                 }
             }
+            Some(c) if c.kind == ChangeKind::Replace => {
+                // Immutable-field change: delete the current resource, then
+                // re-create it from config — ordered at the resource's forward
+                // topo slot, so its dependencies already exist and its dependents
+                // (later in the order) reconcile against the new resource.
+                let resource = resource_map.get(rid).ok_or_else(|| {
+                    IacError::DependencyResolution(format!(
+                        "resource {rid:?} not found in known set"
+                    ))
+                })?;
+                let current = ctx
+                    .state
+                    .resources
+                    .get(rid)
+                    .ok_or_else(|| {
+                        IacError::StateNotFound(format!(
+                            "resource {rid:?} missing from state during replace"
+                        ))
+                    })?
+                    .clone();
+                operation_index += 1;
+                ctx.emit_apply_progress(
+                    "replace",
+                    rid,
+                    &resource.resource_type(),
+                    operation_index,
+                    total_operations,
+                );
+                info!(?rid, "replacing resource (delete + recreate)");
+                let started = Instant::now();
+                if let Err(err) = resource.delete(&current, ctx).await {
+                    ctx.emit_failed_progress(
+                        "replace",
+                        rid,
+                        &resource.resource_type(),
+                        started.elapsed(),
+                        &err,
+                    );
+                    return Err(err);
+                }
+                // Old resource is gone; reflect that before the recreate so an
+                // interrupted replace re-creates rather than trying to update a
+                // resource that no longer exists.
+                ctx.state.resources.remove(rid);
+                if let Some(save) = saver {
+                    save(&ctx.state).await?;
+                }
+                let rs = match resource.create(ctx).await {
+                    Ok(rs) => {
+                        ctx.emit_complete_progress(
+                            "replace",
+                            rid,
+                            &resource.resource_type(),
+                            started.elapsed(),
+                        );
+                        rs
+                    }
+                    Err(err) => {
+                        ctx.emit_failed_progress(
+                            "replace",
+                            rid,
+                            &resource.resource_type(),
+                            started.elapsed(),
+                            &err,
+                        );
+                        return Err(err);
+                    }
+                };
+                ctx.state.resources.insert(rid.clone(), rs);
+                if let Some(save) = saver {
+                    save(&ctx.state).await?;
+                }
+            }
             _ => {}
         }
     }
@@ -1011,6 +1117,21 @@ fn internal_change_to_flat(
                 after: Some(details.clone()),
             }],
         },
+        InternalChange::Replace {
+            resource_id,
+            resource_type: rt,
+            details,
+        } => Change {
+            kind: ChangeKind::Replace,
+            resource_type: rt.0.clone(),
+            module: module.to_string(),
+            resource: resource_id.0.clone(),
+            details: vec![FieldDiff {
+                field: "immutable".to_string(),
+                before: None,
+                after: Some(details.clone()),
+            }],
+        },
         InternalChange::Delete {
             resource_id,
             resource_type: rt,
@@ -1071,6 +1192,9 @@ mod tests {
         /// regardless of `describe_state` — models a resource whose existence
         /// cannot be confirmed from the provider.
         describe_unsupported: bool,
+        /// When true, `diff` returns [`InternalChange::Replace`] — models an
+        /// immutable-field change requiring delete-then-recreate.
+        diff_replace: bool,
         create_fails: bool,
         delete_counter: Option<Arc<AtomicUsize>>,
         delete_capture: Option<Arc<Mutex<Vec<String>>>>,
@@ -1083,6 +1207,7 @@ mod tests {
                 module,
                 describe_state: None,
                 describe_unsupported: false,
+                diff_replace: false,
                 create_fails: false,
                 delete_counter: None,
                 delete_capture: None,
@@ -1095,6 +1220,7 @@ mod tests {
                 module,
                 describe_state: Some(stub_state(id, module)),
                 describe_unsupported: false,
+                diff_replace: false,
                 create_fails: false,
                 delete_counter: None,
                 delete_capture: None,
@@ -1107,6 +1233,7 @@ mod tests {
                 module,
                 describe_state: None,
                 describe_unsupported: false,
+                diff_replace: false,
                 create_fails: true,
                 delete_counter: None,
                 delete_capture: None,
@@ -1116,6 +1243,12 @@ mod tests {
         /// `describe` cannot confirm existence ([`DescribeResult::Unsupported`]).
         fn with_describe_unsupported(mut self) -> Self {
             self.describe_unsupported = true;
+            self
+        }
+
+        /// `diff` reports an immutable-field change ([`InternalChange::Replace`]).
+        fn with_replace(mut self) -> Self {
+            self.diff_replace = true;
             self
         }
 
@@ -1194,6 +1327,13 @@ mod tests {
         }
 
         fn diff(&self, _current: &crate::ResourceState, _ctx: &ProvisionContext) -> InternalChange {
+            if self.diff_replace {
+                return InternalChange::Replace {
+                    resource_id: self.resource_id(),
+                    resource_type: self.resource_type(),
+                    details: "immutable field changed".to_string(),
+                };
+            }
             InternalChange::NoChange {
                 resource_id: self.resource_id(),
             }
@@ -1628,6 +1768,7 @@ mod tests {
             module: "module",
             describe_state: Some(live_state),
             describe_unsupported: false,
+            diff_replace: false,
             create_fails: false,
             delete_counter: None,
             delete_capture: None,
@@ -1715,6 +1856,96 @@ mod tests {
             !ctx.state.resources.contains_key(&prune),
             "absent describe prunes managed state"
         );
+    }
+
+    #[tokio::test]
+    async fn replace_deletes_then_recreates() {
+        // 11.3a: an immutable-field change (diff -> Replace) deletes the current
+        // resource and re-creates it at the resource's forward-topo slot.
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        let id = ResourceId("resource".to_string());
+        ctx.state
+            .resources
+            .insert(id.clone(), stub_state(&id.0, "module"));
+        let delete_count = Arc::new(AtomicUsize::new(0));
+        let resource = StubResource::live(&id.0, "module")
+            .with_replace()
+            .with_delete_counter(Arc::clone(&delete_count));
+        let resources = boxed_resources(vec![resource]);
+        let resource_refs = refs(&resources);
+
+        let changes = engine
+            .apply_with_known(&resource_refs, &resource_refs, &mut ctx, None)
+            .await
+            .expect("apply succeeds");
+
+        assert!(
+            changes.iter().any(|c| c.kind == ChangeKind::Replace),
+            "plan classifies the change as Replace"
+        );
+        assert_eq!(
+            delete_count.load(Ordering::Relaxed),
+            1,
+            "replace deletes the current resource once"
+        );
+        assert!(
+            ctx.state.resources.contains_key(&id),
+            "replace recreates the resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_selected_deletes_only_named_ids() {
+        // 11.3c: delete only the named ids over the current state; others kept.
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        let keep = ResourceId("keep".to_string());
+        let drop_id = ResourceId("drop".to_string());
+        ctx.state
+            .resources
+            .insert(keep.clone(), stub_state(&keep.0, "m"));
+        ctx.state
+            .resources
+            .insert(drop_id.clone(), stub_state(&drop_id.0, "m"));
+        let resources = boxed_resources(vec![
+            StubResource::live(&keep.0, "m"),
+            StubResource::live(&drop_id.0, "m"),
+        ]);
+        let resource_refs = refs(&resources);
+        let ids: std::collections::HashSet<ResourceId> = [drop_id.clone()].into_iter().collect();
+
+        engine
+            .destroy_selected(&resource_refs, &ids, &mut ctx, None)
+            .await
+            .expect("destroy_selected succeeds");
+
+        assert!(ctx.state.resources.contains_key(&keep), "unnamed id kept");
+        assert!(
+            !ctx.state.resources.contains_key(&drop_id),
+            "named id deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_selected_fails_closed_on_unknown_id() {
+        // 11.3c: an id to delete that is absent from `known` refuses to drop the
+        // state entry rather than orphaning the live resource (Property 10).
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        let id = ResourceId("orphan".to_string());
+        ctx.state
+            .resources
+            .insert(id.clone(), stub_state(&id.0, "m"));
+        let resources: Vec<Box<dyn Resource>> = Vec::new();
+        let resource_refs = refs(&resources);
+        let ids: std::collections::HashSet<ResourceId> = [id.clone()].into_iter().collect();
+
+        let err = engine
+            .destroy_selected(&resource_refs, &ids, &mut ctx, None)
+            .await
+            .expect_err("unknown id refuses");
+        assert!(matches!(err, IacError::UnknownResourceDelete { .. }));
     }
 
     #[tokio::test]

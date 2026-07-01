@@ -141,19 +141,28 @@ multi-consumer decision) are out of scope.
         supersedes the `apply_inverse_delta` / `StateDrivenRestore` approach; **do not** build
         `AppliedDelta` before-images, a restore trait, `restore_to_state`/`recreate_from_state`, or
         `apply_inverse_delta`). Two general apply features (they benefit *every* apply, not just rollback):
-        - **11.3a Replacement.** The diff/apply gains `ChangeKind::Replace` (delete-then-recreate) for an
-          **immutable-field** change that `update` cannot apply in place. Immutability is declared per
-          field/kind and detected in `diff`; apply orders the delete before the recreate in dependency
-          order; state mutated only after each op succeeds. Needed by any forward apply and by A's reconcile.
-        - **11.3b Destructive-change confirmation in `plan`.** `plan` classifies and surfaces destructive
-          changes (Delete, Replace) and `apply` requires explicit `--yes` to enact them; a fail-closed
-          gate, not rollback-only.
-        - **11.3c `Engine::destroy_selected(known, ids, ctx, saver)`** — the delete-only primitive (refs /
-          id-set delete over the full state, reverse-dep order, fail-closed, idempotent) that B's rollback
-          undo uses to remove its creations. This is all that survives of the old inverse-delta engine work.
-        Runtime half: the deploy-engine `Platform` gains a **service delete** (for B's delete-only undo of
-        services/images it created); A's reconcile re-applies `R_a`'s services through the existing forward
-        `apply_manifests` — no `Service` restore capability, no runtime before-images (Proposal 002).
+        - [x] **11.3a Replacement.** DONE. `ChangeKind::Replace` + `InternalChange::Replace` (delete-then-
+          recreate) for an **immutable-field** change; a resource opts in by returning `Replace` from
+          `diff` (backward-compatible — a resource that never does behaves as today). `apply_changes`
+          handles it at the resource's forward-topo slot (delete `current`, remove+save, then `create`,
+          insert+save), so dependencies exist and dependents reconcile against the new resource. `tkr`
+          plan display shows `±`. Test `replace_deletes_then_recreates`.
+        - [x] **11.3b Destructive-change classification.** DONE (engine layer). `ChangeKind::is_destructive`
+          (Delete | Replace), `Change::is_destructive`, and `destructive_changes()` / `plan_is_destructive()`
+          helpers (re-exported). Tests `destructive_changes_selects_delete_and_replace`,
+          `non_destructive_plan_is_not_flagged`. The `--yes` **enforcement** is deferred to the CLI/`tkp`
+          (plan → classify → confirm → apply) since the engine cannot prompt.
+        - [x] **11.3c `Engine::destroy_selected(known, ids, ctx, saver)`.** DONE. Delete-only over a named
+          id-set on the current state (no refresh), reusing the shared `destroy_changes` path: reverse-dep
+          order, fail-closed (`UnknownResourceDelete` for an id ∉ `known`), idempotent (id ∉ state skipped),
+          others untouched. Tests `destroy_selected_deletes_only_named_ids`,
+          `destroy_selected_fails_closed_on_unknown_id`.
+        - [ ] **11.3d Runtime half.** The deploy-engine `Platform` gains a **service delete** (for B's
+          delete-only undo of services/images it created); A's reconcile re-applies `R_a`'s services
+          through the existing forward `apply_manifests` — no `Service` restore capability, no runtime
+          before-images (Proposal 002). *Remaining.*
+        (Infra forward-engine trio 11.3a/b/c done + tested; iac green, workspace build clean. Do **not**
+        build `AppliedDelta` before-images, a restore trait, or `apply_inverse_delta` — superseded by 002.)
   - [x] 11.4 Composition validation: unique module/resource ids, `desired ⊆ known`, delete ids ∈ known,
         deps present unless external, no cycles — refuse before any plan/apply/destroy/rollback Delta.
         Property 12. Done: `IacError::CompositionInvalid` + `validate_composition()` hooked into all 7

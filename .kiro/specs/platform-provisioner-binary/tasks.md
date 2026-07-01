@@ -195,10 +195,21 @@ multi-consumer decision) are out of scope.
         precondition satisfied.
 
 - [ ] 12. Remote operation lock (Requirement 11)
-  - [ ] 12.1 Add a renewable remote operation lock to `tokeira-state` (S3 lease / explicit record; local
-        fs lock); acquire→renew→release around every mutating `tkp` command. Property 11.
+  - [x] 12.1 Add a renewable remote operation lock to `tokeira-state` (S3 lease / explicit record; local
+        fs lock); acquire→renew→release around every mutating `tkp` command. Property 11. DONE.
+        `tokeira_state::OperationLock` is built over `Box<dyn StateBackend>`, so **one** primitive serves
+        both the cloud (S3 lock object via `S3Backend`) and local dev (a filesystem lock file via
+        `LocalBackend`): the `OperationLease` record (holder / token / acquired_at / renewed_at /
+        expires_at / released) is stored under a dedicated key with the backend's CAS `read_manifest` /
+        `write_manifest`, and mutual exclusion is that CAS plus a time lease a superseded holder cannot
+        renew. `acquire` **refuses** (`StateError::Locked`) while a lease is active and takes over an
+        absent/expired/released one; `renew` returns `StateError::LockLost` on takeover; `release` is
+        idempotent. Distinct from the short per-save lease inside `S3StateStore`. Tests:
+        `acquire_renew_release_cycle`, `second_acquire_refused_while_held`, `release_lets_next_acquire_succeed`,
+        `expired_lease_is_taken_over`, `renew_after_takeover_fails_lock_lost`.
   - [ ] 12.2 Hold one continuous lock across the whole `rollback` sequence (B delete-only → re-pin →
-        A forward-reconcile) so no writer interleaves at the handoff (Req 11.3).
+        A forward-reconcile) so no writer interleaves at the handoff (Req 11.3). *Needs `tkp` (the
+        rollback orchestration) — deferred until the binary exists; the 12.1 primitive is ready.*
 
 - [ ] 13. Deployment state envelope + the authoritative remote store (foundational; decided)
   - [x] 13.1 Define the deployment-level `DeploymentStateEnvelope` — DONE. New crate

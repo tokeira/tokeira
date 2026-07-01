@@ -201,15 +201,23 @@ multi-consumer decision) are out of scope.
         A forward-reconcile) so no writer interleaves at the handoff (Req 11.3).
 
 - [ ] 13. Deployment state envelope + the authoritative remote store (foundational; decided)
-  - [ ] 13.1 Define the deployment-level `DeploymentStateEnvelope` — the two-valued `binding` (engine
-        identity) + integrity + `config_revision` + `checkpoint` ([A final], incl. the prior
-        configuration-revision ref) + `operation` marker (in-flight upgrade/rollback: phase + resumable
-        progress, optionally an ids-only audit change log — no before-images, Proposal 002) + lock +
-        infra/runtime snapshot refs + effective-config ref under one revision — as the **manifest of
-        `S3StateStore`**, the **authoritative** store.
-        `S3StateStore`'s snapshot/lease model natively backs the envelope's `SnapshotRef` heads, the
-        immutable [A final] checkpoint, and the `OperationLock` lease — primitives `CasStore`'s single-doc
-        model structurally cannot hold. The envelope rides on the store; it is not bolted onto a single doc.
+  - [x] 13.1 Define the deployment-level `DeploymentStateEnvelope` — DONE. New crate
+        `crates/tokeira-provisioner` (depends on `tokeira-state` for `SnapshotRef`) holds the whole
+        provisioner Data-Models set: `BuildMode`, `Target`, `ProvenanceStamp`, `BinaryArtifactDescriptor`,
+        `IntegrityManifest`, `ChangeOp`/`ChangeLogEntry`/`ChangeLog` (ids-only audit, no before-images),
+        `RollbackCheckpoint` (spans both `from_infra_head`/`from_runtime_head` + the load-bearing
+        `from_config_ref`), `OperationKind`/`Operation` (phase + resumable progress + optional audit log),
+        `OperationLock`, and `DeploymentStateEnvelope { schema_version, deployment_id, binding
+        (Option = Unknown, never coerced), integrity, config_revision, checkpoint, operation, lock,
+        infra_head, runtime_head, effective_config_ref }`. The envelope implements `Default` + `Validate`
+        and is proven storable via `S3StateStore` (bounds test `envelope_is_storable`) — it **rides on the
+        store**, which natively backs the `SnapshotRef` heads, the immutable checkpoint, and the lease.
+        `SnapshotRef` gained `PartialEq/Eq`. Tests: default-is-valid-and-unbound, serde round-trip,
+        schema-version rejection (0 / too-new), storable-bounds. (This front-runs tasks 2/3, which add the
+        *logic* that populates `ProvenanceStamp`/`IntegrityManifest`; this task defines the shared models.)
+        NOTE: the envelope is defined and storable; **wiring the engines/`tkp` to actually persist it** (so
+        `infra_head`/`runtime_head` point at the infra/runtime `S3StateStore` snapshots) is follow-on work
+        with the operation lock (task 12) and upgrade/rollback orchestration (task 8).
   - [x] 13.2 Abstract the engine state seam over two stores: `CasStore` over `LocalBackend` (local/compose
         dev) and `S3StateStore` (remote, snapshot/lease, authoritative). DONE. New
         `tokeira_state::DeploymentStore<T>` trait (`load() -> (T, version)`, `save(doc, expected) -> version`)

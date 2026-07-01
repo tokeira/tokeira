@@ -28,7 +28,7 @@ impl StateManifest {
 }
 
 /// Immutable snapshot metadata referenced by the manifest head.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRef {
     pub snapshot_key: String,
     pub snapshot_version_id: Option<String>,

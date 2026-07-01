@@ -6617,6 +6617,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-provisioner"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokeira-state",
+]
+
+[[package]]
 name = "tokeira-remote-workstation"
 version = "0.1.0"
 dependencies = [

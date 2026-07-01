@@ -397,11 +397,13 @@ S3 binary + config retention is what makes it self-contained.
   `plan`/`describe` output; it is **never** the rollback mechanism (Proposal 002, Decision 4). Rollback is
   driven by the retained prior configuration revision, not by inverting a recorded delta.
 - **RollbackCheckpoint** — the cloned **[A final]**: `{ from_provenance: ProvenanceStamp,
-  from_integrity: IntegrityManifest, from_snapshot: SnapshotRef, from_config_ref: Option<String>,
-  recorded_at }`. Captured atomically at the start of `upgrade`. Carries the full prior integrity manifest
-  (all targets — rollback may run from a different operator platform) and A's config ref — which is now
-  **load-bearing**: rollback restores A's prior configuration revision from `from_config_ref` and
-  forward-reconciles toward it (Proposal 002).
+  from_integrity: IntegrityManifest, from_infra_head: Option<SnapshotRef>, from_runtime_head:
+  Option<SnapshotRef>, from_config_ref: Option<String>, recorded_at }`. Captured atomically at the start of
+  `upgrade`. The `from_*_head` snapshots pin [A final]'s infra and runtime state (rollback spans both
+  engines). Carries the full prior integrity manifest (all targets — rollback may run from a different
+  operator platform) and A's config ref — which is now **load-bearing**: rollback restores A's prior
+  configuration revision from `from_config_ref` and forward-reconciles toward it (Proposal 002). Defined in
+  `crates/tokeira-provisioner`.
 - **Operation** — the in-flight marker: `{ operation_id, kind: UpgradeInFlight | RollbackInFlight,
   phase, progress }` (resumable step markers; optionally an ids-only `ChangeLog`, never before-images).
   While present it gates the deployment to

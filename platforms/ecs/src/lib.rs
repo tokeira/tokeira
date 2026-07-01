@@ -22,7 +22,9 @@ use tokeira_iac as iac;
 use tokeira_orchestrator::{
     Ops, PlatformConfig, PortMapping, Result, ServiceReplicas, StorageKind,
 };
-use tokeira_state::{S3Backend, StateBackend, StateError};
+use tokeira_state::{
+    CasStore, DeploymentStore, S3StateStore, StateBackend, StateError, Validate,
+};
 
 pub use config::EcsConfig;
 
@@ -185,17 +187,17 @@ impl tokeira_orchestrator::Deployment for EcsDeployment {
     fn create_infra_store(
         &self,
         config: &Self::Config,
-        deployment_dir: &Path,
-    ) -> Box<dyn StateBackend> {
-        self.s3_state_backend(config, deployment_dir, "infra")
+        _deployment_dir: &Path,
+    ) -> Box<dyn DeploymentStore<iac::InfraState>> {
+        self.s3_state_store(config, "infra")
     }
 
     fn create_deploy_store(
         &self,
         config: &Self::Config,
-        deployment_dir: &Path,
-    ) -> Box<dyn StateBackend> {
-        self.s3_state_backend(config, deployment_dir, "deploy")
+        _deployment_dir: &Path,
+    ) -> Box<dyn DeploymentStore<iac::RuntimeState>> {
+        self.s3_state_store(config, "deploy")
     }
 
     fn hydrate_config(&self, config: &Self::Config, state: &iac::InfraState) -> Self::Config {
@@ -265,16 +267,28 @@ impl tokeira_orchestrator::Deployment for EcsDeployment {
 }
 
 impl EcsDeployment {
-    fn s3_state_backend(
-        &self,
-        config: &EcsConfig,
-        _deployment_dir: &Path,
-        state_kind: &str,
-    ) -> Box<dyn StateBackend> {
+    /// Select the S3-native snapshot/lease [`S3StateStore`] for a state kind
+    /// (`infra` / `deploy`) — the authoritative remote store for the cloud
+    /// platform (task 13.2). Before AWS clients are registered, returns a store
+    /// over an erroring backend so state operations fail loudly rather than
+    /// silently persisting nowhere.
+    fn s3_state_store<T>(&self, config: &EcsConfig, state_kind: &str) -> Box<dyn DeploymentStore<T>>
+    where
+        T: serde::Serialize
+            + serde::de::DeserializeOwned
+            + Default
+            + Validate
+            + Send
+            + Sync
+            + 'static,
+    {
         let Some(clients) = self.aws_clients.get() else {
-            return Box::new(MissingAwsClientsBackend);
+            return Box::new(CasStore::new(
+                Box::new(MissingAwsClientsBackend),
+                state_kind.to_string(),
+            ));
         };
-        Box::new(S3Backend::new(
+        Box::new(S3StateStore::new(
             clients.s3.clone(),
             state_bucket_name(config),
             format!("{}/{state_kind}", state_key_prefix(config)),

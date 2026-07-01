@@ -210,11 +210,21 @@ multi-consumer decision) are out of scope.
         `S3StateStore`'s snapshot/lease model natively backs the envelope's `SnapshotRef` heads, the
         immutable [A final] checkpoint, and the `OperationLock` lease — primitives `CasStore`'s single-doc
         model structurally cannot hold. The envelope rides on the store; it is not bolted onto a single doc.
-  - [ ] 13.2 Abstract the engine state seam over two stores: `CasStore` over `LocalBackend` (local/compose
-        dev) and `S3StateStore` (remote, snapshot/lease, authoritative). Today `InfraEngine`/`DeployEngine`
-        hardcode `StateStore` = `CasStore` and the platform seam returns only a `StateBackend`; the seam must
-        let a platform select its **store**, not just the backend. **ECS employs remote-state**
-        (`S3StateStore`), replacing the current `CasStore`-over-`S3Backend` single-doc stopgap.
+  - [x] 13.2 Abstract the engine state seam over two stores: `CasStore` over `LocalBackend` (local/compose
+        dev) and `S3StateStore` (remote, snapshot/lease, authoritative). DONE. New
+        `tokeira_state::DeploymentStore<T>` trait (`load() -> (T, version)`, `save(doc, expected) -> version`)
+        impl'd for both stores — `CasStore` matches natively; `S3StateStore` self-manages CAS via its lease
+        (version = manifest ETag, `expected` advisory) via a new `S3StateStore::load_with_version`. The
+        `Deployment` seam now returns `Box<dyn DeploymentStore<InfraState|RuntimeState>>` (was
+        `Box<dyn StateBackend>`); `InfraEngine`/`DeployEngine` hold `Arc/Box<dyn DeploymentStore<…>>` and no
+        longer wrap in `StateStore`. Local/compose/compose-syn/remote-workstation wrap `CasStore`-over-
+        `LocalBackend` (byte-identical layout preserved); **ECS employs `S3StateStore`** (a generic
+        `s3_state_store<T>`; missing-clients fallback errors loudly), replacing the `CasStore`-over-`S3Backend`
+        single-doc stopgap. Tests `cas_store_as_deployment_store_round_trips`,
+        `cas_store_as_deployment_store_rejects_stale_version`. Full workspace build clean; all affected crates
+        green (tokeira-state 9, orchestrator 4, ecs 59, + platforms). The dead `InfraStateStore`/
+        `RuntimeStateStore = S3StateStore<…>` aliases in `document.rs` are now superseded by the seam (left
+        in place; the engines use `dyn DeploymentStore`, not the aliases).
   - Note: the operator-facing **`tkr remote-state` option (let an arbitrary deployment opt into remote
         state) is HELD/deferred** — store choice stays platform-determined (ECS → remote; local/compose →
         local), exactly as `create_infra_store` already fixes the backend per platform today.

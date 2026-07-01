@@ -120,6 +120,21 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         }
     }
 
+    /// Like [`load`](Self::load) but also returns the manifest ETag as an opaque
+    /// version tag (empty when no manifest exists yet). Used by the
+    /// [`DeploymentStore`](crate::DeploymentStore) seam so a caller that threads a
+    /// version between load and save can treat this store like the CAS store.
+    pub async fn load_with_version(&self) -> Result<(T, String), StateError> {
+        match self.get_manifest().await? {
+            Some(manifest_state) => {
+                let state = self.load_snapshot(&manifest_state).await?;
+                state.validate()?;
+                Ok((state, manifest_state.etag))
+            }
+            None => Ok((T::default(), String::new())),
+        }
+    }
+
     /// Load the manifest without loading the snapshot.
     pub async fn load_manifest(&self) -> Result<Option<ManifestState>, StateError> {
         self.get_manifest().await

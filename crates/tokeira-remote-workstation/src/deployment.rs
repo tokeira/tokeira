@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use tokeira_aws::AwsClients;
 use tokeira_iac::{self as iac, Module, ModuleContext, Resource};
 use tokeira_orchestrator::Deployment;
-use tokeira_state::{LocalBackend, StateBackend};
+use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 use crate::module::WorkstationModuleConfig;
 
@@ -138,16 +138,22 @@ impl Deployment for WorkstationDeployment {
         &self,
         _config: &Self::Config,
         deployment_dir: &Path,
-    ) -> Box<dyn StateBackend> {
-        Box::new(LocalBackend::new(deployment_dir.join("state/infra")))
+    ) -> Box<dyn DeploymentStore<iac::InfraState>> {
+        Box::new(CasStore::new(
+            Box::new(LocalBackend::new(deployment_dir.join("state/infra"))),
+            "infra".to_string(),
+        ))
     }
 
     fn create_deploy_store(
         &self,
         _config: &Self::Config,
         deployment_dir: &Path,
-    ) -> Box<dyn StateBackend> {
-        Box::new(LocalBackend::new(deployment_dir.join("state/deploy")))
+    ) -> Box<dyn DeploymentStore<iac::RuntimeState>> {
+        Box::new(CasStore::new(
+            Box::new(LocalBackend::new(deployment_dir.join("state/deploy"))),
+            "deploy".to_string(),
+        ))
     }
 
     fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {

@@ -23,7 +23,7 @@ use tokeira_orchestrator::{
     self as orchestrator, OrchestratorError, PlatformConfig, PortMapping, Result as OrchResult,
     ServiceReplicas, StorageKind,
 };
-use tokeira_state::{LocalBackend, StateBackend};
+use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 use crate::{
     builder::{Deployment as TkdBuilt, WbValue},
@@ -140,16 +140,22 @@ impl orchestrator::Deployment for TkdDeployment {
         &self,
         _config: &Self::Config,
         deployment_dir: &Path,
-    ) -> Box<dyn StateBackend> {
-        Box::new(LocalBackend::new(deployment_dir.join("state/infra")))
+    ) -> Box<dyn DeploymentStore<iac::InfraState>> {
+        Box::new(CasStore::new(
+            Box::new(LocalBackend::new(deployment_dir.join("state/infra"))),
+            "infra".to_string(),
+        ))
     }
 
     fn create_deploy_store(
         &self,
         _config: &Self::Config,
         deployment_dir: &Path,
-    ) -> Box<dyn StateBackend> {
-        Box::new(LocalBackend::new(deployment_dir.join("state/deploy")))
+    ) -> Box<dyn DeploymentStore<iac::RuntimeState>> {
+        Box::new(CasStore::new(
+            Box::new(LocalBackend::new(deployment_dir.join("state/deploy"))),
+            "deploy".to_string(),
+        ))
     }
 
     fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {

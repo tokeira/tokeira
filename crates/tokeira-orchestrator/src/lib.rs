@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac as iac;
-use tokeira_state::{StateBackend, StateError, StateStore};
+use tokeira_state::{DeploymentStore, StateError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -165,18 +165,25 @@ pub trait Deployment: Send + Sync {
     /// and returns `InfraState::default()`. For the local backend, `load()`
     /// returns default when the directory doesn't exist, and `save()` creates
     /// the directory on first write.
+    /// Select the **store** (not just a backend) for infrastructure state.
+    ///
+    /// A platform returns the concrete store it wants: `CasStore` over a
+    /// `LocalBackend` for local/compose dev, or the S3-native `S3StateStore`
+    /// (snapshot/lease) for cloud platforms. The engine holds it as a
+    /// `Box<dyn DeploymentStore<InfraState>>`.
     fn create_infra_store(
         &self,
         config: &Self::Config,
         deployment_dir: &Path,
-    ) -> Box<dyn StateBackend>;
+    ) -> Box<dyn DeploymentStore<iac::InfraState>>;
 
-    /// Create the backend used for runtime deployment state.
+    /// Select the store used for runtime deployment state (see
+    /// [`create_infra_store`](Self::create_infra_store)).
     fn create_deploy_store(
         &self,
         config: &Self::Config,
         deployment_dir: &Path,
-    ) -> Box<dyn StateBackend>;
+    ) -> Box<dyn DeploymentStore<iac::RuntimeState>>;
 
     /// Project infrastructure outputs back into deployment config.
     ///
@@ -225,7 +232,7 @@ pub struct InfraEngine<D: Deployment> {
     ctx: iac::ProvisionContext,
     config: D::Config,
     deployment_dir: PathBuf,
-    state_store: Arc<StateStore<iac::InfraState>>,
+    state_store: Arc<dyn DeploymentStore<iac::InfraState>>,
 }
 
 impl<D: Deployment> InfraEngine<D> {
@@ -240,10 +247,8 @@ impl<D: Deployment> InfraEngine<D> {
         deployment
             .register_infra_extensions(config, &mut ctx)
             .await?;
-        let state_store = Arc::new(StateStore::new(
-            deployment.create_infra_store(config, deployment_dir),
-            "infra".to_string(),
-        ));
+        let state_store: Arc<dyn DeploymentStore<iac::InfraState>> =
+            Arc::from(deployment.create_infra_store(config, deployment_dir));
         let (state, _) = state_store.load().await?;
         ctx.state = state;
         Ok(Self {
@@ -431,7 +436,7 @@ pub struct DeployEngine<D: Deployment> {
     service_ctx: deploy_engine::ServiceContext,
     image_ctx: deploy_engine::ImageContext,
     config: D::Config,
-    state_store: StateStore<iac::RuntimeState>,
+    state_store: Box<dyn DeploymentStore<iac::RuntimeState>>,
 }
 
 impl<D: Deployment> DeployEngine<D> {
@@ -448,10 +453,7 @@ impl<D: Deployment> DeployEngine<D> {
         deployment
             .register_image_extensions(config, &mut image_ctx)
             .await?;
-        let state_store = StateStore::new(
-            deployment.create_deploy_store(config, deployment_dir),
-            "deploy".to_string(),
-        );
+        let state_store = deployment.create_deploy_store(config, deployment_dir);
         Ok(Self {
             deployment,
             engine: deploy_engine::ServiceEngine::new(),
@@ -506,7 +508,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
-    use tokeira_state::{LocalBackend, StateError};
+    use tokeira_state::{CasStore, LocalBackend, StateBackend, StateError};
 
     #[derive(Clone)]
     struct TestConfig;
@@ -745,16 +747,22 @@ mod tests {
             &self,
             _config: &Self::Config,
             deployment_dir: &Path,
-        ) -> Box<dyn StateBackend> {
-            Box::new(LocalBackend::new(deployment_dir.join("state/infra")))
+        ) -> Box<dyn DeploymentStore<iac::InfraState>> {
+            Box::new(CasStore::new(
+                Box::new(LocalBackend::new(deployment_dir.join("state/infra"))),
+                "infra".to_string(),
+            ))
         }
 
         fn create_deploy_store(
             &self,
             _config: &Self::Config,
             deployment_dir: &Path,
-        ) -> Box<dyn StateBackend> {
-            Box::new(LocalBackend::new(deployment_dir.join("state/deploy")))
+        ) -> Box<dyn DeploymentStore<iac::RuntimeState>> {
+            Box::new(CasStore::new(
+                Box::new(LocalBackend::new(deployment_dir.join("state/deploy"))),
+                "deploy".to_string(),
+            ))
         }
 
         fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {
@@ -827,16 +835,22 @@ mod tests {
             &self,
             _config: &Self::Config,
             _deployment_dir: &Path,
-        ) -> Box<dyn StateBackend> {
-            Box::new(SharedBackend(Arc::clone(&self.backend)))
+        ) -> Box<dyn DeploymentStore<iac::InfraState>> {
+            Box::new(CasStore::new(
+                Box::new(SharedBackend(Arc::clone(&self.backend))),
+                "infra".to_string(),
+            ))
         }
 
         fn create_deploy_store(
             &self,
             _config: &Self::Config,
             _deployment_dir: &Path,
-        ) -> Box<dyn StateBackend> {
-            Box::new(SharedBackend(Arc::clone(&self.backend)))
+        ) -> Box<dyn DeploymentStore<iac::RuntimeState>> {
+            Box::new(CasStore::new(
+                Box::new(SharedBackend(Arc::clone(&self.backend))),
+                "deploy".to_string(),
+            ))
         }
 
         fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {

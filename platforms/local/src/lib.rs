@@ -8,7 +8,7 @@ use tokeira_iac as iac;
 use tokeira_orchestrator::{
     Ops, PlatformConfig, PortMapping, Result, ServiceReplicas, StorageKind,
 };
-use tokeira_state::{LocalBackend, StateBackend};
+use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 /// Minimal config for bare-process local execution.
 /// No compose file, no observability images, no replicas.
@@ -210,16 +210,22 @@ impl tokeira_orchestrator::Deployment for LocalDeployment {
         &self,
         _config: &Self::Config,
         deployment_dir: &Path,
-    ) -> Box<dyn StateBackend> {
-        Box::new(LocalBackend::new(deployment_dir.join("state/infra")))
+    ) -> Box<dyn DeploymentStore<iac::InfraState>> {
+        Box::new(CasStore::new(
+            Box::new(LocalBackend::new(deployment_dir.join("state/infra"))),
+            "infra".to_string(),
+        ))
     }
 
     fn create_deploy_store(
         &self,
         _config: &Self::Config,
         deployment_dir: &Path,
-    ) -> Box<dyn StateBackend> {
-        Box::new(LocalBackend::new(deployment_dir.join("state/deploy")))
+    ) -> Box<dyn DeploymentStore<iac::RuntimeState>> {
+        Box::new(CasStore::new(
+            Box::new(LocalBackend::new(deployment_dir.join("state/deploy"))),
+            "deploy".to_string(),
+        ))
     }
 
     fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {

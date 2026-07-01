@@ -157,12 +157,20 @@ multi-consumer decision) are out of scope.
           order, fail-closed (`UnknownResourceDelete` for an id ∉ `known`), idempotent (id ∉ state skipped),
           others untouched. Tests `destroy_selected_deletes_only_named_ids`,
           `destroy_selected_fails_closed_on_unknown_id`.
-        - [ ] **11.3d Runtime half.** The deploy-engine `Platform` gains a **service delete** (for B's
-          delete-only undo of services/images it created); A's reconcile re-applies `R_a`'s services
-          through the existing forward `apply_manifests` — no `Service` restore capability, no runtime
-          before-images (Proposal 002). *Remaining.*
-        (Infra forward-engine trio 11.3a/b/c done + tested; iac green, workspace build clean. Do **not**
-        build `AppliedDelta` before-images, a restore trait, or `apply_inverse_delta` — superseded by 002.)
+        - [x] **11.3d Runtime half.** DONE. `Platform` gains `supports_delete()` (default `false`) and
+          `delete_service(name, manifests)` (default **fail-closes** with `RuntimeError::Platform`); the
+          compose Platform implements both (delegating to the renamed inherent `remove_service`, which is
+          idempotent). `ServiceEngine::destroy_services(services, platform, ctx, state)` is the runtime
+          counterpart of `destroy_selected`: fail-closed pre-flight (refuse the whole pass if the platform
+          can't delete), reverse-dependency-order teardown, removes each from `RuntimeState`. A's reconcile
+          re-applies `R_a`'s services through the existing forward `apply_manifests` — no `Service` restore
+          capability, no runtime before-images (Proposal 002). Tests
+          `destroy_services_fails_closed_when_platform_cannot_delete`,
+          `destroy_services_deletes_in_reverse_dependency_order`.
+  - [x] **Task 11.3 COMPLETE** (a/b/c/d): infra forward-engine replacement + destructive classification +
+        `destroy_selected`, and the runtime-half `Platform` service delete + `ServiceEngine::destroy_services`.
+        All tested; full workspace build clean. Do **not** build `AppliedDelta` before-images, a restore
+        trait, or `apply_inverse_delta` — superseded by Proposal 002.
   - [x] 11.4 Composition validation: unique module/resource ids, `desired ⊆ known`, delete ids ∈ known,
         deps present unless external, no cycles — refuse before any plan/apply/destroy/rollback Delta.
         Property 12. Done: `IacError::CompositionInvalid` + `validate_composition()` hooked into all 7

@@ -190,7 +190,7 @@ impl iac::Resource for ComposeService {
         let platform = ctx.extension::<ComposePlatform>().ok_or_else(|| {
             iac::IacError::Other(anyhow::anyhow!("ComposePlatform not registered"))
         })?;
-        platform.delete_service(&self.name).await?;
+        platform.remove_service(&self.name).await?;
         Ok(())
     }
 
@@ -482,7 +482,9 @@ impl ComposePlatform {
     /// This is intentionally service-scoped. It does not run project-wide
     /// `docker compose down`, because infrastructure delete may target a single
     /// resource while leaving the rest of the local stack intact.
-    pub async fn delete_service(&self, service: &str) -> Result<(), ComposeError> {
+    /// Tear down a single service: remove it from compose state and force-remove
+    /// its container. Idempotent — an already-absent container is success.
+    pub async fn remove_service(&self, service: &str) -> Result<(), ComposeError> {
         self.ensure_reachable().await?;
         let mut state = self.load_compose_state()?;
         state.services.remove(service);
@@ -755,6 +757,20 @@ impl deploy_engine::Platform for ComposePlatform {
             return true;
         };
         container_image_id == local_image_id
+    }
+
+    fn supports_delete(&self) -> bool {
+        true
+    }
+
+    async fn delete_service(
+        &self,
+        service_name: &str,
+        _manifests: &[serde_json::Value],
+    ) -> Result<(), deploy_engine::DeployError> {
+        self.remove_service(service_name)
+            .await
+            .map_err(|error| deploy_engine::DeployError::Other(anyhow::anyhow!(error)))
     }
 }
 

@@ -10,6 +10,8 @@ pub enum RuntimeError {
     Image(String),
     #[error("Service error: {0}")]
     Service(String),
+    #[error("Platform error: {0}")]
+    Platform(String),
     #[error("State error: {0}")]
     State(#[from] StateError),
     #[error("Kubernetes error: {0}")]

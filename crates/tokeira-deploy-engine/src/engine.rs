@@ -31,6 +31,9 @@ pub struct ServiceChange {
 pub enum ServiceChangeKind {
     Create,
     Update,
+    /// The service's running workload was torn down (delete-only pass —
+    /// definition-driven rollback, Proposal 002).
+    Delete,
     NoChange,
 }
 
@@ -143,6 +146,50 @@ impl ServiceEngine {
 
             changes.push(ServiceChange {
                 kind,
+                service: service.name().to_string(),
+                module: service.module().to_string(),
+            });
+        }
+        Ok(changes)
+    }
+
+    /// Tear down the given services' running workloads (delete-only), removing
+    /// them from runtime state.
+    ///
+    /// This is the runtime counterpart of `Engine::destroy_selected`: the
+    /// superseded binary B deletes the services it created before the binding
+    /// re-pins to A (definition-driven rollback, Proposal 002). Deletes run in
+    /// reverse dependency order (dependents before dependencies). Fail-closed —
+    /// if the platform cannot delete (`supports_delete() == false`) the whole
+    /// pass refuses up front, before touching any workload. Idempotent to the
+    /// extent the platform's `delete_service` treats an absent workload as
+    /// success. `ServiceState` stores no manifest bodies, so the manifests to
+    /// tear down are recomputed from each `Service`.
+    pub async fn destroy_services(
+        &self,
+        services: &[Box<dyn Service>],
+        platform: &dyn Platform,
+        ctx: &mut ServiceContext,
+        state: &mut tokeira_iac::RuntimeState,
+    ) -> Result<Vec<ServiceChange>, RuntimeError> {
+        if !services.is_empty() && !platform.supports_delete() {
+            return Err(RuntimeError::Platform(
+                "platform does not support service deletion; refusing delete-only pass".to_string(),
+            ));
+        }
+        let ordered = ordered_services(services)?;
+        let mut changes = Vec::new();
+        for service in ordered.into_iter().rev() {
+            let manifests = service.manifests(ctx)?;
+            platform.delete_service(service.name(), &manifests).await?;
+            state.services.remove(service.name());
+            info!(
+                service = service.name(),
+                module = service.module(),
+                "deleted service"
+            );
+            changes.push(ServiceChange {
+                kind: ServiceChangeKind::Delete,
                 service: service.name().to_string(),
                 module: service.module().to_string(),
             });
@@ -314,6 +361,110 @@ mod tests {
         fn manifests(&self, _ctx: &ServiceContext) -> Result<Vec<serde_json::Value>, RuntimeError> {
             Ok(vec![])
         }
+    }
+
+    #[derive(Default)]
+    struct MockPlatform {
+        deleted: std::sync::Mutex<Vec<String>>,
+        supports_delete: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Platform for MockPlatform {
+        async fn apply_manifests(
+            &self,
+            manifests: &[serde_json::Value],
+        ) -> Result<usize, RuntimeError> {
+            Ok(manifests.len())
+        }
+        fn supports_delete(&self) -> bool {
+            self.supports_delete
+        }
+        async fn delete_service(
+            &self,
+            service_name: &str,
+            _manifests: &[serde_json::Value],
+        ) -> Result<(), RuntimeError> {
+            self.deleted.lock().unwrap().push(service_name.to_string());
+            Ok(())
+        }
+    }
+
+    fn seed_service_state(state: &mut tokeira_iac::RuntimeState, name: &str) {
+        state.services.insert(
+            name.to_string(),
+            tokeira_iac::ServiceState {
+                name: name.to_string(),
+                module: "test".to_string(),
+                manifest_count: 0,
+                desired_hash: String::new(),
+                last_applied: String::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn destroy_services_fails_closed_when_platform_cannot_delete() {
+        // 11.3d: a platform that cannot delete refuses the whole delete-only
+        // pass up front, before touching any workload.
+        let platform = MockPlatform::default(); // supports_delete = false
+        let services: Vec<Box<dyn Service>> = vec![Box::new(MockService {
+            name: "a",
+            deps: &[],
+        })];
+        let engine = ServiceEngine::new();
+        let mut ctx = ServiceContext::default();
+        let mut state = tokeira_iac::RuntimeState::default();
+        let err = block_on_ready(engine.destroy_services(
+            &services,
+            &platform,
+            &mut ctx,
+            &mut state,
+        ))
+        .expect_err("fail-closed when platform can't delete");
+        assert!(matches!(err, RuntimeError::Platform(_)));
+    }
+
+    #[test]
+    fn destroy_services_deletes_in_reverse_dependency_order() {
+        // 11.3d: delete dependents before dependencies, removing each from state.
+        let platform = MockPlatform {
+            deleted: std::sync::Mutex::new(Vec::new()),
+            supports_delete: true,
+        };
+        let services: Vec<Box<dyn Service>> = vec![
+            Box::new(MockService {
+                name: "history",
+                deps: &[],
+            }),
+            Box::new(MockService {
+                name: "matching",
+                deps: &["history"],
+            }),
+            Box::new(MockService {
+                name: "frontend",
+                deps: &["matching"],
+            }),
+        ];
+        let engine = ServiceEngine::new();
+        let mut ctx = ServiceContext::default();
+        let mut state = tokeira_iac::RuntimeState::default();
+        for name in ["history", "matching", "frontend"] {
+            seed_service_state(&mut state, name);
+        }
+
+        let changes = block_on_ready(engine.destroy_services(
+            &services,
+            &platform,
+            &mut ctx,
+            &mut state,
+        ))
+        .expect("destroy succeeds");
+
+        assert!(changes.iter().all(|c| c.kind == ServiceChangeKind::Delete));
+        assert!(state.services.is_empty(), "all services removed from state");
+        let deleted = platform.deleted.lock().unwrap().clone();
+        assert_eq!(deleted, vec!["frontend", "matching", "history"]);
     }
 
     #[test]

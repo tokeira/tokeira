@@ -403,7 +403,7 @@ impl ComposeDeployment {
             Self::compose_platform(&compose_file_for(deployment_dir), &config.project_name)?;
         for replica in 0..replicas {
             compose
-                .delete_service(&format!("{service}-{replica}"))
+                .remove_service(&format!("{service}-{replica}"))
                 .await
                 .map_err(anyhow::Error::from)?;
         }

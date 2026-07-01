@@ -35,4 +35,30 @@ pub trait Platform: Send + Sync {
     ) -> bool {
         true
     }
+
+    /// Whether this platform can tear down a running service workload.
+    ///
+    /// The engine checks this before a delete-only pass so it can refuse the
+    /// whole operation up front rather than fail partway. Default `false`.
+    fn supports_delete(&self) -> bool {
+        false
+    }
+
+    /// Tear down a service's running workload — the inverse of an apply. Used by
+    /// definition-driven rollback (Proposal 002): the superseded binary B deletes
+    /// the services it created before the binding re-pins to A. `manifests` are
+    /// the service's last-applied manifests, so the platform knows what to remove.
+    ///
+    /// Must be idempotent: an already-absent workload is success. The default
+    /// **fail-closes** — a platform that cannot delete refuses rollback rather
+    /// than leaving a workload running.
+    async fn delete_service(
+        &self,
+        service_name: &str,
+        _manifests: &[serde_json::Value],
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Platform(format!(
+            "fail-closed: platform does not support service deletion; refusing to tear down '{service_name}'"
+        )))
+    }
 }

@@ -11,5 +11,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 tokeira-state = { workspace = true }
+tokeira-build-info = { workspace = true }
 
 [dev-dependencies]

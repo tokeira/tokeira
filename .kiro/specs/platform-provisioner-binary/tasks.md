@@ -13,29 +13,40 @@ multi-consumer decision) are out of scope.
 ## Tasks
 
 - [ ] 1. Data models in `tokeira-state`
-  - [ ] 1.1 Add `ProvenanceStamp`, `BuildMode`, `Target`, `BinaryArtifactDescriptor`, `IntegrityManifest`
-        to the state manifest model; `ProvenanceStamp` carries `version` + `git_sha` + `source_tree_hash`
-        + `build_mode` and distinguishes `Unknown` from a concrete version.
+  - [x] 1.1 Add `ProvenanceStamp`, `BuildMode`, `Target`, `BinaryArtifactDescriptor`, `IntegrityManifest`;
+        `ProvenanceStamp` carries `version` + `git_sha` + `source_tree_hash` + `build_mode` and distinguishes
+        `Unknown` from a concrete version. DONE via task 13.1 — defined in the new `crates/tokeira-provisioner`
+        (not `tokeira-state`'s manifest, to keep generic state free of provisioner concepts); `Unknown` is
+        `binding: Option<ProvenanceStamp> = None`, never coerced. Round-trips (Property 1).
   - [ ] 1.2 Wire them into the existing manifest write/read path, preserving the distinct state-format
-        `schema_version`. Property: provenance round-trips (Property 1).
+        `schema_version`. Property: provenance round-trips (Property 1). *Envelope wiring is follow-on (see
+        13.1 note): the envelope is defined + storable; persisting it into the deployment store is pending
+        tasks 8/12.*
 
 - [ ] 2. Provenance stamping
-  - [ ] 2.1 On every state-document write, stamp the running provisioner version from `tokeira-build-info`
-        (`TOKEIRA_VERSION`, `TOKEIRA_GIT_SHA`, `SOURCE_TREE_HASH`, `BUILD_MODE`); `source_tree_hash` is the
-        authoritative drift key (Property 6).
+  - [x] 2.1 Stamp the running provisioner from `tokeira-build-info` (`TOKEIRA_VERSION`, `TOKEIRA_GIT_SHA`,
+        `SOURCE_TREE_HASH`, `BUILD_MODE`); `source_tree_hash` is the authoritative drift key (Property 6).
+        DONE — `ProvenanceStamp::current(recorded_at)` reads build-info; `BuildMode::from_build_info` maps
+        the `BUILD_MODE` string (unknown → advisory `Dev`). Tests `current_stamp_reads_build_info`,
+        `build_mode_parses_build_info_strings`. *The "on every state-document write" wiring is follow-on
+        with the envelope persistence (tasks 8/12).*
   - [ ] 2.2 On remote-state init (`tkr deployment create`), write the stamp before any resource create —
-        Day-0 mandatory versioning; there is no create path that leaves state unstamped (Req 1.2).
+        Day-0 mandatory versioning; there is no create path that leaves state unstamped (Req 1.2). *Needs
+        `tkr deployment create` / the envelope write path.*
 
 - [ ] 3. Binding gate (regime by build mode)
-  - [ ] 3.1 Add `check_binding` in `tokeira-orchestrator` / `tokeira-iac` returning
-        `Match | DevIterate | Mismatch | Downgrade | ModeRegression | Unknown`; computed for every
-        binding-aware verb (plan surfaces it, applying verbs gate on it).
-  - [ ] 3.2 Versioned deployment: proceed on `Match`; refuse `Mismatch`/`Downgrade`/`Unknown` with no
-        override (resolve via matching binary or `upgrade`); refuse `ModeRegression` (dev binary on a
-        versioned deployment). Properties 2, 5.
-  - [ ] 3.3 Dev deployment + dev binary → `DevIterate`: apply permissively, re-stamp the advisory dev
-        stamp, emit a non-authoritative warning (the bring-up loop). A `dev` stamp never yields the
-        authoritative `Match`. Property 7.
+  - [x] 3.1 `check_binding(recorded, running) -> Match | DevIterate | Mismatch | Downgrade | ModeRegression
+        | Unknown`; computed for every binding-aware verb (plan surfaces it, applying verbs gate on it).
+        DONE — in `crates/tokeira-provisioner` (natural home now that `ProvenanceStamp` lives there, rather
+        than orchestrator/iac). `source_tree_hash` is the authoritative key; version ordering only
+        distinguishes `Downgrade` from `Mismatch` (both refuse). 9 tests covering every regime.
+  - [x] 3.2 Versioned deployment: proceed on `Match`; refuse `Mismatch`/`Downgrade`/`Unknown`; refuse
+        `ModeRegression`. Properties 2, 5. DONE (verdict semantics) — `BindingVerdict::proceeds()` returns
+        true only for `Match`/`DevIterate`; `is_authoritative()` only for `Match`. *Gating these verdicts
+        inside the applying verbs is task 8.3 (needs `tkp`).*
+  - [x] 3.3 Dev deployment + dev binary → `DevIterate`: permissive, re-stamp advisory dev stamp, warn; a
+        `dev` stamp never yields authoritative `Match`. Property 7. DONE (verdict) — `DevIterate` proceeds
+        but is not authoritative. *The re-stamp + warn happen in the verb wiring (task 8.3, `tkp`).*
 
 - [ ] 4. Integrity manifest + verification
   - [ ] 4.1 Record version + per-target `sha256` (+ optional `retrieval_ref`) in the CAS-guarded manifest

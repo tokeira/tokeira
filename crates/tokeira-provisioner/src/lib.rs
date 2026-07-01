@@ -23,6 +23,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokeira_state::{SnapshotRef, StateError, Validate};
 
+pub mod binding;
+pub use binding::{BindingVerdict, check_binding};
+
 /// Current `DeploymentStateEnvelope` schema version.
 pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
 
@@ -35,6 +38,18 @@ pub enum BuildMode {
     /// A local development build. Never authoritative.
     #[default]
     Dev,
+}
+
+impl BuildMode {
+    /// Parse the `tokeira-build-info` `BUILD_MODE` string (`"versioned"` /
+    /// `"dev"`). Anything unrecognized is the advisory [`Dev`](Self::Dev) — the
+    /// safe, non-authoritative default.
+    pub fn from_build_info(mode: &str) -> Self {
+        match mode {
+            "versioned" => BuildMode::Versioned,
+            _ => BuildMode::Dev,
+        }
+    }
 }
 
 /// A Rust target triple (`aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, …).
@@ -56,6 +71,23 @@ pub struct ProvenanceStamp {
     pub source_tree_hash: String,
     pub build_mode: BuildMode,
     pub recorded_at: DateTime<Utc>,
+}
+
+impl ProvenanceStamp {
+    /// Stamp the running provisioner from `tokeira-build-info` (task 2.1).
+    ///
+    /// `source_tree_hash` is the **authoritative drift key** — a whole-workspace
+    /// digest a developer cannot forget to bump (unlike the semver). `recorded_at`
+    /// is supplied by the caller so the stamp is deterministic in tests.
+    pub fn current(recorded_at: DateTime<Utc>) -> Self {
+        Self {
+            version: tokeira_build_info::TOKEIRA_VERSION.to_string(),
+            git_sha: tokeira_build_info::TOKEIRA_GIT_SHA.to_string(),
+            source_tree_hash: tokeira_build_info::SOURCE_TREE_HASH.to_string(),
+            build_mode: BuildMode::from_build_info(tokeira_build_info::BUILD_MODE),
+            recorded_at,
+        }
+    }
 }
 
 /// One binary artifact for one target, addressed by content hash.
@@ -231,6 +263,28 @@ impl Validate for DeploymentStateEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_mode_parses_build_info_strings() {
+        assert_eq!(BuildMode::from_build_info("versioned"), BuildMode::Versioned);
+        assert_eq!(BuildMode::from_build_info("dev"), BuildMode::Dev);
+        // Anything unrecognized is the safe, non-authoritative Dev default.
+        assert_eq!(BuildMode::from_build_info("garbage"), BuildMode::Dev);
+    }
+
+    #[test]
+    fn current_stamp_reads_build_info() {
+        let now = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let stamp = ProvenanceStamp::current(now);
+        assert_eq!(stamp.version, tokeira_build_info::TOKEIRA_VERSION);
+        assert_eq!(stamp.git_sha, tokeira_build_info::TOKEIRA_GIT_SHA);
+        assert_eq!(stamp.source_tree_hash, tokeira_build_info::SOURCE_TREE_HASH);
+        assert_eq!(
+            stamp.build_mode,
+            BuildMode::from_build_info(tokeira_build_info::BUILD_MODE)
+        );
+        assert_eq!(stamp.recorded_at, now);
+    }
 
     #[test]
     fn default_envelope_is_valid_and_unbound() {

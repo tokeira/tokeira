@@ -9,7 +9,9 @@ use std::cmp::Ordering;
 
 fn parse_version(version: &str) -> Option<Vec<u64>> {
     let core = version.split(['-', '+']).next().unwrap_or(version);
-    core.split('.').map(|part| part.parse::<u64>().ok()).collect()
+    core.split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect()
 }
 
 /// Compare two versions numerically. `None` when either is unparseable.

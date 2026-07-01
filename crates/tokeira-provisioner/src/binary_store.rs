@@ -105,7 +105,10 @@ mod tests {
         let store = store(tmp.path());
         let target = Target("aarch64-unknown-linux-musl".to_string());
 
-        let key = store.persist("1.0.0", &target, b"binary-bytes").await.unwrap();
+        let key = store
+            .persist("1.0.0", &target, b"binary-bytes")
+            .await
+            .unwrap();
         assert!(key.starts_with("binaries/1.0.0-"));
         let back = store.retrieve("1.0.0", &target).await.unwrap();
         assert_eq!(back, b"binary-bytes");
@@ -134,13 +137,19 @@ mod tests {
         let store = store(tmp.path());
         let target = Target("aarch64-apple-darwin".to_string());
 
-        store.persist("1.0.0", &target, b"tampered-bytes").await.unwrap();
+        store
+            .persist("1.0.0", &target, b"the-tampered-bytes")
+            .await
+            .unwrap();
         let manifest = manifest_for(b"the-expected-bytes", &target);
         let err = store
             .retrieve_verified("1.0.0", &target, &manifest)
             .await
             .expect_err("checksum mismatch is refused");
-        assert!(matches!(err, BinaryError::Integrity(IntegrityError::ChecksumMismatch { .. })));
+        assert!(matches!(
+            err,
+            BinaryError::Integrity(IntegrityError::ChecksumMismatch { .. })
+        ));
     }
 
     #[tokio::test]

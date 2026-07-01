@@ -13,16 +13,18 @@
 //! | **Rollback** | `rollback` | bound B (undo), then retained A (reconcile) | B from the manifest; A from the checkpoint |
 //!
 //! This first increment resolves `tkp` (an installed binary on `PATH`, else a
-//! `cargo run --bin tkp` dev build), enforces the **Bound** class's checksum
-//! against the recorded manifest (abort on mismatch, Req 7.2), and execs
-//! `tkp <verb> --deployment-dir <dir>`. The candidate-upgrade external-metadata
-//! verification and the two-binary rollback re-exec are follow-ons.
+//! `cargo run --bin tkp` dev build), enforces the **Bound** and **Rollback**
+//! classes' checksum against the recorded manifest (abort on mismatch, Req 7.2 —
+//! rollback launches `B`, which the envelope's manifest still records at launch
+//! time), and execs `tkp <verb> --deployment-dir <dir>`. The candidate-upgrade
+//! external-metadata verification and the two-binary rollback re-exec (the
+//! retained-`A` reconcile phase) are follow-ons.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
-use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, sha256_hex};
+use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, Target};
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 use crate::deployment_dir::DeploymentContext;
@@ -119,8 +121,33 @@ async fn load_envelope(deployment_dir: &Path) -> Result<DeploymentStateEnvelope>
     Ok(envelope)
 }
 
-/// Verify a concrete `tkp` binary against the recorded integrity manifest: its
-/// SHA-256 must match one of the recorded artifacts. Abort otherwise (Req 7.2).
+/// Whether this launch must run a concrete installed binary that
+/// checksum-matches the recorded integrity manifest.
+///
+/// **Bound** launches the recorded binary by definition. **Rollback** launches
+/// `B` for its undo phase — and at launch time the envelope still records `B`'s
+/// manifest (`upgrade` re-recorded it at the ownership transfer; `A`'s is only
+/// restored later, inside the re-pin) — so the resolved binary is verifiable
+/// against the manifest *today*, and an unverified byte-substituted `tkp` must
+/// not perform the destructive undo + re-pin. tkp's own binding gate compares
+/// provenance *strings* (compile-time build-info), never bytes; this is the only
+/// byte check in the chain. Candidate-upgrade genuinely cannot verify against
+/// the manifest (B is not recorded yet — external release metadata is the
+/// follow-on); read-only and dev launches stay permissive. A dev/unstamped
+/// binding skips verification even for rollback — dev iteration rebuilds change
+/// the hash on every build, and tkp's gate handles dev semantics downstream.
+fn requires_manifest_verification(class: LaunchClass, envelope: &DeploymentStateEnvelope) -> bool {
+    let versioned = matches!(
+        envelope.binding.as_ref().map(|b| b.build_mode),
+        Some(BuildMode::Versioned)
+    );
+    versioned && matches!(class, LaunchClass::Bound | LaunchClass::Rollback)
+}
+
+/// Verify a concrete `tkp` binary against the recorded integrity manifest's
+/// descriptor for **this host's target** (task 4.2's verify path): parsed-digest
+/// comparison, size fast-fail, and a duplicate-target manifest refused as
+/// ambiguous. Abort on any failure (Req 7.2).
 fn verify_against_manifest(path: &Path, envelope: &DeploymentStateEnvelope) -> Result<()> {
     let manifest = envelope.integrity.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -129,16 +156,16 @@ fn verify_against_manifest(path: &Path, envelope: &DeploymentStateEnvelope) -> R
         )
     })?;
     let bytes = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let actual = sha256_hex(&bytes);
-    if !manifest.artifacts.iter().any(|a| a.sha256 == actual) {
-        bail!(
-            "integrity check failed: the `tkp` at {} (sha256 {}) matches no recorded artifact — \
-             refusing to launch the bound binary (Req 7.2)",
-            path.display(),
-            actual
-        );
-    }
-    Ok(())
+    // tkr and the tkp it launches run on the same host, so the launcher's own
+    // compile target names the descriptor the installed tkp must match.
+    let target = Target(env!("TKR_TARGET").to_string());
+    manifest.verify_artifact(&bytes, &target).with_context(|| {
+        format!(
+            "integrity check failed for the `tkp` at {} — refusing to launch the bound binary \
+             (Req 7.2)",
+            path.display()
+        )
+    })
 }
 
 /// Forward a lifecycle `verb` to the deployment's bound `tkp`: resolve the launch
@@ -150,15 +177,13 @@ pub async fn launch(ctx: &DeploymentContext, verb: &str, extra_args: &[String]) 
     let class = resolve_class(verb, &envelope);
     let binary = TkpBinary::resolve();
 
-    // The bound class must run the exact recorded binary — a concrete path that
-    // checksum-matches the manifest. Dev/candidate/rollback verify differently
-    // (dev = the current build; candidate/rollback = follow-ons).
-    if class == LaunchClass::Bound {
+    if requires_manifest_verification(class, &envelope) {
         match &binary {
             TkpBinary::Installed(path) => verify_against_manifest(path, &envelope)?,
             TkpBinary::Cargo => bail!(
-                "deployment is bound to a versioned engine but no installed `tkp` was found on PATH; \
-                 refusing to drive it with a `cargo run` dev build — install the recorded `tkp`"
+                "deployment is bound to a versioned engine but no installed `tkp` was found on \
+                 PATH; refusing to drive `{verb}` with a `cargo run` dev build — install the \
+                 recorded `tkp`"
             ),
         }
     }
@@ -239,12 +264,32 @@ mod tests {
         }
     }
 
-    fn manifest_with(sha: &str) -> IntegrityManifest {
+    #[test]
+    fn manifest_verification_covers_bound_and_rollback_on_versioned_bindings() {
+        let versioned = envelope_with(Some(BuildMode::Versioned));
+        let dev = envelope_with(Some(BuildMode::Dev));
+        let unstamped = envelope_with(None);
+
+        // Bound + Rollback both launch the manifest-recorded binary → verified.
+        assert!(requires_manifest_verification(LaunchClass::Bound, &versioned));
+        assert!(requires_manifest_verification(LaunchClass::Rollback, &versioned));
+        // Candidate-upgrade cannot verify against the manifest (B unrecorded);
+        // read-only never gates; dev launches are permissive.
+        assert!(!requires_manifest_verification(LaunchClass::CandidateUpgrade, &versioned));
+        assert!(!requires_manifest_verification(LaunchClass::ReadOnly, &versioned));
+        assert!(!requires_manifest_verification(LaunchClass::DevCandidate, &dev));
+        // Dev/unstamped bindings skip verification even for rollback — dev
+        // rebuilds change the hash every build; tkp's gate governs downstream.
+        assert!(!requires_manifest_verification(LaunchClass::Rollback, &dev));
+        assert!(!requires_manifest_verification(LaunchClass::Rollback, &unstamped));
+    }
+
+    fn manifest_for(sha: &str, target: &str) -> IntegrityManifest {
         IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![BinaryArtifactDescriptor {
                 version: "1.0.0".to_string(),
-                target: Target("x".to_string()),
+                target: Target(target.to_string()),
                 sha256: sha.to_string(),
                 retrieval_ref: None,
                 size_bytes: 0,
@@ -254,17 +299,30 @@ mod tests {
 
     #[test]
     fn verify_matches_recorded_checksum_and_rejects_mismatch() {
+        use tokeira_provisioner::sha256_hex;
+
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("tkp");
         std::fs::write(&bin, b"the-binary-bytes").unwrap();
-        let sha = sha256_hex(b"the-binary-bytes");
+        let host_target = env!("TKR_TARGET");
 
+        // The descriptor for this host's target, matching digest → passes.
         let mut env = envelope_with(Some(BuildMode::Versioned));
-        env.integrity = Some(manifest_with(&sha));
+        env.integrity = Some(manifest_for(&sha256_hex(b"the-binary-bytes"), host_target));
         verify_against_manifest(&bin, &env).expect("matching checksum passes");
 
-        env.integrity = Some(manifest_with("deadbeef"));
+        // Same target, different digest → aborts.
+        env.integrity = Some(manifest_for(&sha256_hex(b"other-bytes"), host_target));
         let err = verify_against_manifest(&bin, &env).expect_err("mismatch aborts");
+        assert!(err.to_string().contains("integrity check failed"), "unexpected: {err}");
+
+        // A matching digest recorded under a DIFFERENT target does not vouch for
+        // this host's binary — target-scoped, not any-artifact (Req 7.2).
+        env.integrity = Some(manifest_for(
+            &sha256_hex(b"the-binary-bytes"),
+            "some-other-triple",
+        ));
+        let err = verify_against_manifest(&bin, &env).expect_err("wrong target aborts");
         assert!(err.to_string().contains("integrity check failed"), "unexpected: {err}");
     }
 

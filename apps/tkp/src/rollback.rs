@@ -75,16 +75,12 @@ pub async fn rollback(deployment_dir: &Path) -> Result<()> {
     println!("B delete-only: 0 resource(s) (local platform has no infra resources)");
 
     // ── Re-pin to A — one CAS commit ──
+    // `begin_rollback` restores A's binding, integrity manifest (it must always
+    // describe the engine the binding names), state heads, and config ref.
     let operation_id = format!("rollback-{}", Utc::now().timestamp_millis());
     envelope
         .begin_rollback(operation_id, Utc::now())
         .map_err(|e| anyhow::anyhow!(e))?;
-    // Restore A's integrity manifest alongside A's binding — the manifest must
-    // always describe the engine the binding names (the launcher's bound-class
-    // verification checks the installed binary against it), and `upgrade`
-    // re-recorded it for B. (Belongs inside `begin_rollback` itself; kept here
-    // while the integrity module is being reworked.)
-    envelope.integrity = Some(checkpoint.from_integrity.clone());
     version = store
         .save(&envelope, &version)
         .await

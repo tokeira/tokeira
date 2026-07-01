@@ -103,26 +103,38 @@ mod tests {
     fn older_version_is_refused_downgrade() {
         let a = stamp(BuildMode::Versioned, "1.3.0", "hA");
         let b = stamp(BuildMode::Versioned, "1.2.0", "hB");
-        assert!(matches!(evaluate_upgrade(&a, &b), UpgradeDecision::Refuse(_)));
+        assert!(matches!(
+            evaluate_upgrade(&a, &b),
+            UpgradeDecision::Refuse(_)
+        ));
     }
 
     #[test]
     fn same_version_different_hash_is_refused() {
         let a = stamp(BuildMode::Versioned, "1.2.0", "hA");
         let b = stamp(BuildMode::Versioned, "1.2.0", "hB");
-        assert!(matches!(evaluate_upgrade(&a, &b), UpgradeDecision::Refuse(_)));
+        assert!(matches!(
+            evaluate_upgrade(&a, &b),
+            UpgradeDecision::Refuse(_)
+        ));
     }
 
     #[test]
     fn same_engine_is_refused_nothing_to_upgrade() {
         let a = stamp(BuildMode::Versioned, "1.2.0", "hA");
-        assert!(matches!(evaluate_upgrade(&a, &a), UpgradeDecision::Refuse(_)));
+        assert!(matches!(
+            evaluate_upgrade(&a, &a),
+            UpgradeDecision::Refuse(_)
+        ));
     }
 
     #[test]
     fn versioned_to_dev_restamp_is_refused() {
         let a = stamp(BuildMode::Versioned, "1.2.0", "hA");
         let b = stamp(BuildMode::Dev, "1.2.0", "hA");
-        assert!(matches!(evaluate_upgrade(&a, &b), UpgradeDecision::Refuse(_)));
+        assert!(matches!(
+            evaluate_upgrade(&a, &b),
+            UpgradeDecision::Refuse(_)
+        ));
     }
 }

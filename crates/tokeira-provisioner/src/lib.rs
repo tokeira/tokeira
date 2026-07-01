@@ -31,7 +31,7 @@ pub mod upgrade;
 mod version;
 pub use binary_store::{BinaryError, BinaryStore};
 pub use binding::{BindingVerdict, check_binding};
-pub use integrity::{IntegrityError, sha256_hex};
+pub use integrity::{ChecksumFormatError, IntegrityError, Sha256Digest, sha256_hex};
 pub use migration::{MigrationError, MigrationRegistry};
 pub use upgrade::{UpgradeDecision, evaluate_upgrade};
 
@@ -303,11 +303,16 @@ impl DeploymentStateEnvelope {
     }
 
     /// Begin a **definition-driven rollback** (Proposal 002, task 8.5): re-pin the
-    /// binding to the checkpoint's recorded engine `A`, restore `A`'s state heads
-    /// and configuration-revision ref from the checkpoint, and open the
-    /// `RollbackInFlight` marker. `A` then forward-reconciles toward its retained
-    /// prior configuration revision (`effective_config_ref`). Returns `Err` when
-    /// there is no checkpoint to roll back to.
+    /// binding to the checkpoint's recorded engine `A`, restore `A`'s integrity
+    /// manifest, state heads, and configuration-revision ref from the checkpoint,
+    /// and open the `RollbackInFlight` marker. `A` then forward-reconciles toward
+    /// its retained prior configuration revision (`effective_config_ref`). Returns
+    /// `Err` when there is no checkpoint to roll back to.
+    ///
+    /// The integrity manifest travels with the binding: it must always describe
+    /// the engine the binding names (the launcher's bound-class verification
+    /// checks the installed binary against it), and `upgrade` re-records it for
+    /// `B` at the ownership transfer — so the re-pin to `A` restores `A`'s.
     ///
     /// The superseded binary `B` deletes what it created *before* this re-pin (a
     /// delete-only pass over `keys(S_B) − keys(S_A)`); this method performs the
@@ -322,6 +327,7 @@ impl DeploymentStateEnvelope {
             .clone()
             .ok_or_else(|| "no rollback checkpoint — nothing to roll back to".to_string())?;
         self.binding = Some(checkpoint.from_provenance);
+        self.integrity = Some(checkpoint.from_integrity);
         self.infra_head = checkpoint.from_infra_head;
         self.runtime_head = checkpoint.from_runtime_head;
         self.effective_config_ref = checkpoint.from_config_ref;
@@ -353,7 +359,10 @@ mod tests {
 
     #[test]
     fn build_mode_parses_build_info_strings() {
-        assert_eq!(BuildMode::from_build_info("versioned"), BuildMode::Versioned);
+        assert_eq!(
+            BuildMode::from_build_info("versioned"),
+            BuildMode::Versioned
+        );
         assert_eq!(BuildMode::from_build_info("dev"), BuildMode::Dev);
         // Anything unrecognized is the safe, non-authoritative Dev default.
         assert_eq!(BuildMode::from_build_info("garbage"), BuildMode::Dev);
@@ -377,7 +386,10 @@ mod tests {
     fn default_envelope_is_valid_and_unbound() {
         let env = DeploymentStateEnvelope::default();
         assert_eq!(env.schema_version, ENVELOPE_SCHEMA_VERSION);
-        assert!(env.binding.is_none(), "an unstamped envelope is Unknown, not coerced");
+        assert!(
+            env.binding.is_none(),
+            "an unstamped envelope is Unknown, not coerced"
+        );
         assert!(env.operation.is_none());
         assert_eq!(env.config_revision, 0);
         env.validate().expect("default envelope validates");
@@ -480,13 +492,24 @@ mod tests {
             version: "2.0.0".into(),
             ..a.clone()
         };
-        // Post-upgrade envelope: bound to B, checkpoint holds [A final].
+        let manifest_a = IntegrityManifest {
+            provisioner_version: "1.0.0".into(),
+            artifacts: vec![],
+        };
+        let manifest_b = IntegrityManifest {
+            provisioner_version: "2.0.0".into(),
+            artifacts: vec![],
+        };
+        // Post-upgrade envelope: bound to B (with B's re-recorded integrity
+        // manifest), checkpoint holds [A final].
         let mut env = DeploymentStateEnvelope {
             binding: Some(a.clone()),
+            integrity: Some(manifest_a.clone()),
             effective_config_ref: Some("cfg-A".into()),
             ..Default::default()
         };
         env.begin_upgrade(b.clone(), "op-up", Utc::now());
+        env.integrity = Some(manifest_b); // what `upgrade` re-records for B
         env.close_operation();
         assert_eq!(env.binding.as_ref(), Some(&b));
 
@@ -494,6 +517,11 @@ mod tests {
         env.begin_rollback("op-rb", Utc::now())
             .expect("checkpoint present");
         assert_eq!(env.binding.as_ref(), Some(&a), "re-pinned to A");
+        assert_eq!(
+            env.integrity.as_ref().map(|m| m.provisioner_version.as_str()),
+            Some("1.0.0"),
+            "A's integrity manifest restored with A's binding"
+        );
         assert_eq!(
             env.effective_config_ref.as_deref(),
             Some("cfg-A"),

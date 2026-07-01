@@ -124,7 +124,9 @@ mod tests {
     use serde_json::json;
 
     fn set_flag(mut doc: serde_json::Value, key: &str) -> serde_json::Value {
-        doc.as_object_mut().unwrap().insert(key.to_string(), json!(true));
+        doc.as_object_mut()
+            .unwrap()
+            .insert(key.to_string(), json!(true));
         doc
     }
 
@@ -149,20 +151,32 @@ mod tests {
     #[test]
     fn unbridged_transition_is_no_path() {
         let reg = MigrationRegistry::new().register(1, 2, Ok);
-        assert_eq!(reg.check_path(1, 3), Err(MigrationError::NoPath { from: 1, to: 3 }));
-        assert_eq!(reg.migrate(json!({}), 1, 3), Err(MigrationError::NoPath { from: 1, to: 3 }));
+        assert_eq!(
+            reg.check_path(1, 3),
+            Err(MigrationError::NoPath { from: 1, to: 3 })
+        );
+        assert_eq!(
+            reg.migrate(json!({}), 1, 3),
+            Err(MigrationError::NoPath { from: 1, to: 3 })
+        );
     }
 
     #[test]
     fn missing_first_step_is_no_path() {
         let reg = MigrationRegistry::new().register(2, 3, Ok);
-        assert_eq!(reg.check_path(1, 3), Err(MigrationError::NoPath { from: 1, to: 3 }));
+        assert_eq!(
+            reg.check_path(1, 3),
+            Err(MigrationError::NoPath { from: 1, to: 3 })
+        );
     }
 
     #[test]
     fn backward_transition_is_refused() {
         let reg = MigrationRegistry::new();
-        assert_eq!(reg.check_path(3, 1), Err(MigrationError::Backward { from: 3, to: 1 }));
+        assert_eq!(
+            reg.check_path(3, 1),
+            Err(MigrationError::Backward { from: 3, to: 1 })
+        );
     }
 
     #[test]

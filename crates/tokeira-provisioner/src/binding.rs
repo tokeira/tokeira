@@ -158,7 +158,10 @@ mod tests {
         let verdict = check_binding(Some(&recorded), &running);
         assert_eq!(verdict, BindingVerdict::DevIterate);
         assert!(verdict.proceeds(), "dev iteration is permissive");
-        assert!(!verdict.is_authoritative(), "a dev stamp is never authoritative");
+        assert!(
+            !verdict.is_authoritative(),
+            "a dev stamp is never authoritative"
+        );
     }
 
     #[test]

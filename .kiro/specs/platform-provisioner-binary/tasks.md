@@ -66,6 +66,14 @@ multi-consumer decision) are out of scope.
         target. `descriptor_for(target)` looks up by target; `sha256_hex` exported. Tests:
         `matching_bytes_verify`, `tampered_bytes_abort`, `unknown_target_is_not_found`,
         `sha256_hex_is_stable_and_lowercase`. (The launcher wiring — verify before exec — is `tkr`, task 9.)
+        HARDENED (2026-07-02): checksums are **parsed** (`Sha256Digest`, canonical lowercase 64-hex; a
+        malformed manifest is `InvalidChecksumFormat`, distinct from a mismatch), sizes fast-fail before
+        hashing (`size_bytes` 0 = unrecorded), a duplicate manifest target is refused as ambiguous both in
+        `IntegrityManifest::validate()` (well-formedness, not authenticity) and — self-defendingly — inside
+        `verify_artifact` itself. The digest compare is deliberately **not** constant-time (module doc
+        explains: public expected value + attacker-controlled input = preimage problem, not a timing
+        oracle). The manifest travels with the binding: `upgrade` re-records it for `B` at the ownership
+        transfer, `begin_rollback` restores `A`'s from the checkpoint.
 
 - [x] 5. Upgrade/migration boundary
   - [x] 5.1 Add the `MigrationRegistry` keyed by **state-schema transition** (`from_schema → to_schema`)
@@ -197,9 +205,12 @@ multi-consumer decision) are out of scope.
         DevCandidate, Rollback, ReadOnly}`, `resolve_class(verb, envelope)` (describe/plan/status →
         **read-only, never gated** — diagnostics must work precisely when the mutating classes refuse;
         upgrade → candidate-upgrade; rollback → rollback; versioned binding → bound; dev/unstamped →
-        dev-candidate), tkp resolution (installed on `PATH`, else a `cargo run` dev build), **bound-class
-        checksum verification** against the recorded integrity manifest (`verify_against_manifest`; abort
-        on mismatch, and a bound deployment refuses a `cargo run` dev build outright), then spawn
+        dev-candidate), tkp resolution (installed on `PATH`, else a `cargo run` dev build), **bound- and
+        rollback-class checksum verification** against the recorded integrity manifest — target-scoped
+        `verify_artifact` for this host's triple (`TKR_TARGET` via `apps/tkr/build.rs`); rollback launches
+        `B`, which the envelope's manifest still records at launch time, so its undo phase is verifiable
+        today (abort on mismatch, and a versioned deployment refuses a `cargo run` dev build outright for
+        both classes), then spawn
         `tkp <verb> --deployment-dir <dir>` (the same spawn/inherit shape as the Dagger re-exec),
         propagating tkp's actual exit status. `launch_apply` forwards `init` first for a never-stamped
         deployment. To keep the bound verification sound across engine transitions, `tkp upgrade` now

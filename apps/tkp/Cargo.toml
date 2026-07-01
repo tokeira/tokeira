@@ -19,7 +19,10 @@ tokeira-build-info = { workspace = true }
 tokeira-config = { workspace = true }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
+tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-local-deployment = { path = "../../platforms/local" }
+tokeira-compose-syn = { path = "../../platforms/compose-syn" }
+tokeira-compose = { path = "../../crates/tokeira-compose" }
 
 [dev-dependencies]
 tempfile.workspace = true

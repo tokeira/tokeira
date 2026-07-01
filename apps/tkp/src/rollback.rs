@@ -17,8 +17,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use crate::apply::run_local_infra_apply;
+use crate::apply::deployment_identity;
 use crate::envelope_store;
+use crate::platform;
 
 pub async fn rollback(deployment_dir: &Path) -> Result<()> {
     let store = envelope_store(deployment_dir);
@@ -56,7 +57,8 @@ pub async fn rollback(deployment_dir: &Path) -> Result<()> {
     println!("re-pinned to A (version {}); rollback marker open", to_a.version);
 
     // ── A forward-reconciles toward its retained prior configuration revision ──
-    let (change_count, _) = run_local_infra_apply(deployment_dir).await?;
+    let project_name = deployment_identity(&envelope.deployment_id);
+    let change_count = platform::infra_apply(deployment_dir, &project_name).await?;
     println!("A reconcile (re-apply retained revision): {change_count} change(s)");
 
     // ── Complete: clear the marker and consume the checkpoint ──

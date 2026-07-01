@@ -25,6 +25,8 @@ mod apply;
 mod gate;
 mod init;
 mod lock;
+mod plan;
+mod platform;
 mod rollback;
 mod upgrade;
 
@@ -47,6 +49,8 @@ enum Command {
     /// Read-only report of identity, recorded provenance, binding verdict, and
     /// state facts. Never gates.
     Describe(DescribeArgs),
+    /// Show the binding verdict + the infrastructure plan. Read-only; never gates.
+    Plan(LifecycleArgs),
     /// Plan and apply the deployment, gated on the binding.
     Apply(LifecycleArgs),
     /// Upgrade to a new engine identity. (Not yet implemented.)
@@ -79,6 +83,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         // Read-only: never gates, never locks.
         Command::Describe(args) => describe(args).await,
+        Command::Plan(args) => plan::plan(&args.deployment_dir).await,
         // Mutating verbs run under the deployment's operation lock (Req 11).
         // `rollback` holds one continuous lock across its whole sequence (12.2).
         Command::Init(args) => {

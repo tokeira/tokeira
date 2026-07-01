@@ -14,13 +14,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tokeira_iac::ModuleSelection;
-use tokeira_local_deployment::{LocalConfig, LocalDeployment};
-use tokeira_orchestrator::InfraEngine;
+use tokeira_local_deployment::LocalConfig;
 use tokeira_provisioner::ProvenanceStamp;
 
 use crate::envelope_store;
 use crate::gate::{GateOutcome, evaluate_gate};
+use crate::platform;
 
 pub async fn apply(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -49,15 +48,18 @@ pub async fn apply(deployment_dir: &Path) -> Result<()> {
         }
     }
 
-    // ── Engine apply ──
-    let (change_count, config) = run_local_infra_apply(deployment_dir).await?;
-    println!("infra apply: {change_count} change(s)");
+    // ── Engine apply (dispatched by platform: local | compose-syn) ──
+    let resolved = platform::detect(deployment_dir);
+    // The deployment identity seeds the compose-syn `Cx`; it was set at `init`.
+    let project_name = deployment_identity(&envelope.deployment_id);
+    let change_count = platform::infra_apply(deployment_dir, &project_name).await?;
+    println!("[{}] infra apply: {change_count} change(s)", resolved.label());
 
     // ── Re-stamp the envelope ──
     // A config apply keeps the engine identity and advances the config revision
     // (task 14.2): record the effective config ref and bump `config_revision`.
     if envelope.deployment_id.is_empty() {
-        envelope.deployment_id = config.project_name.clone();
+        envelope.deployment_id = project_name;
     }
     envelope.binding = Some(running);
     envelope.config_revision += 1;
@@ -74,33 +76,29 @@ pub async fn apply(deployment_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A content ref for the effective configuration — a SHA-256 of the deployment's
-/// config file, so a given config revision is identifiable (and revertable to;
-/// task 14.3). Absent config falls back to `"default"`.
-pub(crate) fn config_ref(deployment_dir: &Path) -> String {
-    match std::fs::read(deployment_dir.join("deployment.toml")) {
-        Ok(bytes) => format!("sha256:{}", tokeira_provisioner::sha256_hex(&bytes)),
-        Err(_) => "default".to_string(),
+/// The deployment identity used to seed the compose-syn `Cx`, defaulting when the
+/// envelope has not recorded one yet.
+pub(crate) fn deployment_identity(recorded: &str) -> String {
+    if recorded.is_empty() {
+        "tokeira".to_string()
+    } else {
+        recorded.to_string()
     }
 }
 
-/// Run the local platform's infrastructure apply and return `(change_count,
-/// config)`. Local has no infra modules, so this is an empty plan that still
-/// exercises the real `InfraEngine` and the `DeploymentStore` state seam. Shared
-/// by `apply` and `upgrade`.
-pub(crate) async fn run_local_infra_apply(
-    deployment_dir: &Path,
-) -> Result<(usize, LocalConfig)> {
-    let config = load_local_config(deployment_dir)?;
-    let mut engine = InfraEngine::new(LocalDeployment, &config, deployment_dir)
-        .await
-        .context("failed to open the infrastructure engine")?;
-    let composition = engine.compose(ModuleSelection::All)?;
-    let changes = engine
-        .apply(&composition, ModuleSelection::All)
-        .await
-        .context("infrastructure apply failed")?;
-    Ok((changes.len(), config))
+/// A content ref for the effective configuration — a SHA-256 of the deployment's
+/// config source (the `.tkd` for compose-syn, `deployment.toml` for local), so a
+/// given config revision is identifiable (and revertable to; task 14.3). Absent
+/// config falls back to `"default"`.
+pub(crate) fn config_ref(deployment_dir: &Path) -> String {
+    let config_file = match platform::detect(deployment_dir) {
+        platform::Platform::ComposeSyn => deployment_dir.join("definition.tkd"),
+        platform::Platform::Local => deployment_dir.join("deployment.toml"),
+    };
+    match std::fs::read(&config_file) {
+        Ok(bytes) => format!("sha256:{}", tokeira_provisioner::sha256_hex(&bytes)),
+        Err(_) => "default".to_string(),
+    }
 }
 
 pub(crate) fn load_local_config(deployment_dir: &Path) -> Result<LocalConfig> {

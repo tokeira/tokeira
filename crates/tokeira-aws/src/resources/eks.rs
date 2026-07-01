@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use aws_sdk_eks::client::Waiters as EksWaiters;
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -631,7 +632,7 @@ impl Resource for EksClusterResource {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let cluster_name = self.cluster_name();
 
         match ctx
@@ -669,7 +670,7 @@ impl Resource for EksClusterResource {
                     .unwrap_or_default()
                     .to_string();
 
-                Ok(Some(ResourceState {
+                Ok(DescribeResult::Present(ResourceState {
                     resource_type: ResourceType::new("EksCluster"),
                     physical_id: cluster_name.clone(),
                     properties: serde_json::json!({
@@ -689,7 +690,7 @@ impl Resource for EksClusterResource {
             Err(e) => {
                 let svc_err = e.into_service_error();
                 if svc_err.is_resource_not_found_exception() {
-                    Ok(None)
+                    Ok(DescribeResult::Absent)
                 } else {
                     Err(IacError::AwsSdk(format!("eks:DescribeCluster: {svc_err}")))
                 }

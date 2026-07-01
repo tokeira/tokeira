@@ -498,11 +498,13 @@ impl iac::Resource for ObservabilityConfigFilesResource {
     async fn describe(
         &self,
         _ctx: &iac::ProvisionContext,
-    ) -> Result<Option<iac::ResourceState>, iac::IacError> {
+    ) -> Result<iac::DescribeResult, iac::IacError> {
+        // `read_live_files` reads the managed config files from disk; their
+        // absence is a confirmed Absent, not an unknown.
         let Some(properties) = self.read_live_files()? else {
-            return Ok(None);
+            return Ok(iac::DescribeResult::Absent);
         };
-        Ok(Some(iac::ResourceState {
+        Ok(iac::DescribeResult::Present(iac::ResourceState {
             resource_type: self.resource_type(),
             physical_id: self.deployment_dir.join(CONFIG_DIR).display().to_string(),
             properties: json!({
@@ -786,11 +788,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn describe_returns_none_when_all_files_are_missing() {
+    async fn describe_returns_absent_when_all_files_are_missing() {
         let temp = TempDir::new().unwrap();
         let resource = resource(&temp);
         let ctx = iac::ProvisionContext::default();
-        assert!(resource.describe(&ctx).await.unwrap().is_none());
+        assert!(matches!(
+            resource.describe(&ctx).await.unwrap(),
+            iac::DescribeResult::Absent
+        ));
     }
 
     #[tokio::test]
@@ -803,7 +808,9 @@ mod tests {
         assert!(matches!(no_change, iac::InternalChange::NoChange { .. }));
 
         fs::write(temp.path().join(ALLOY_CONFIG), "changed").unwrap();
-        let live_state = resource.describe(&ctx).await.unwrap().unwrap();
+        let iac::DescribeResult::Present(live_state) = resource.describe(&ctx).await.unwrap() else {
+            panic!("expected live config to be Present");
+        };
         let change = resource.diff(&live_state, &ctx);
         assert!(matches!(change, iac::InternalChange::Update { .. }));
     }

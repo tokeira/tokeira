@@ -1,7 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -269,7 +270,7 @@ impl Resource for SecretsManagerSecret {
         self.wait_until_deleted(ctx).await
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let name = &self.secret_name;
 
         // secretsmanager:DescribeSecret for this single secret
@@ -284,7 +285,7 @@ impl Resource for SecretsManagerSecret {
         {
             Ok(output) => {
                 let now = chrono::Utc::now().to_rfc3339();
-                Ok(Some(ResourceState {
+                Ok(DescribeResult::Present(ResourceState {
                     resource_type: ResourceType::new("SecretsManagerSecret"),
                     physical_id: output.arn().unwrap_or_default().to_string(),
                     properties: serde_json::json!({
@@ -299,7 +300,7 @@ impl Resource for SecretsManagerSecret {
             Err(e) => {
                 let svc_err = e.into_service_error();
                 if svc_err.is_resource_not_found_exception() {
-                    Ok(None)
+                    Ok(DescribeResult::Absent)
                 } else {
                     Err(IacError::AwsSdk(format!(
                         "secretsmanager:DescribeSecret: {svc_err}"

@@ -68,13 +68,25 @@ rollback (reverting a deployment's recorded version + state to a retained checkp
   checksums and an optional retrieval reference.
 - **Migration boundary** — the deliberate version-transition point at which state is migrated forward.
   Migrations are forward-only.
-- **Rollback checkpoint** — the pre-upgrade record `upgrade` writes (prior snapshot, prior stamp, prior
-  full integrity manifest, prior config ref, and the recorded forward plan with before-images) so a later
-  `rollback` can invert the plan and restore the checkpoint.
-- **Rollback** — the deliberate two-operation revert of a deployment to its pre-upgrade checkpoint: the
-  superseded binary applies the **inverse of its recorded upgrade plan** (delete its creates, revert its
-  updates, re-create its deletes — only it can), then the checkpoint is re-pinned and the prior binary
-  re-asserts its own config; never a reverse migration.
+- **Rollback checkpoint ([A final])** — the prior state cloned atomically at the start of `upgrade`
+  (prior snapshot, provenance, full integrity manifest, config ref) so a later `rollback` can re-pin to
+  it and forward-reconcile toward its **configuration revision** (the `config ref`, now load-bearing).
+  Rollback restores by re-applying that retained revision, not by inverting recorded before-images
+  (Proposal 002).
+- **Applied delta** — an optional, ids-only **audit** record (`id + op`, no before/after images) of the
+  changes an apply/upgrade committed, kept for observability and richer `plan`/diff. Under Proposal 002
+  it is **not** the rollback mechanism (rollback re-applies the retained configuration revision) and does
+  not carry before-images.
+- **Binding / operation marker** — the binding names the single binary authorized to operate (`A` or `B`,
+  flipped atomically, never "pending"); the separate operation marker records an in-flight
+  upgrade/rollback (phase + resumable progress) and gates resume/rollback until it closes.
+- **Rollback** — the deliberate revert to [A final] by **forward reconciliation toward the retained
+  configuration revision**, never by inverting recorded before-images and never a reverse migration
+  (Proposal 002). For an engine-identity upgrade it is two operations: the superseded binary **deletes
+  what it created** (`keys(S_B) − keys(S_A)` — it alone can remove resources of kinds it introduced;
+  deletion is state-driven), the binding is atomically re-pinned to the prior binary, and that binary
+  observes live (`refresh_state`) and re-applies its own configuration revision to reconcile the
+  remainder. For a same-engine configuration change it is a single ordinary `apply` of the prior revision.
 - **Fail-closed deletion** — the framework rule that a Delete whose resource is absent from the `known`
   set errors rather than silently dropping it from state; closes a latent silent-orphan footgun, and is
   relied on by rollback's undo.
@@ -82,9 +94,10 @@ rollback (reverting a deployment's recorded version + state to a retained checkp
   (`Create | Update | Delete | NoChange`) computed by comparing a desired shape against a current state
   over a binary's `known` universe. `plan` previews a Delta; `apply` enacts it; `upgrade` and `rollback`
   are compositions of Deltas over different `(desired, state, binary)` triples.
-- **Authorship invariant** — no binary computes or applies a Delta over a state representation authored by
-  a different version; identity-key arithmetic (`keys(S_B) − keys(S_A)`) is the only permitted
-  cross-version comparison.
+- **Authorship invariant** — no binary computes or applies a Delta over a *state representation* authored
+  by a different version; a binary MAY observe shared **live** infrastructure via `describe`/`refresh_state`
+  and reconcile toward its own configuration revision (Proposal 002). Identity-key arithmetic
+  (`keys(S_B) − keys(S_A)`) bounds the resources the superseded binary must delete on rollback.
 - **Engine identity** — the binding `source_tree_hash`, computed over the engine/resource-implementation
   surface only; changes only on a behavioral code change, and is the sole thing requiring `upgrade`.
 - **Configuration revision** — the deployment's desired-state definition (modules, parameters, resource
@@ -186,6 +199,19 @@ migrates state forward, so that upgrades are controlled rather than implicit.
 4. WHERE the running binary has the same recorded version (semver) but a different `source_tree_hash`,
    THE provisioner SHALL refuse a normal apply (a forgotten version bump) rather than treat it as an
    ordered upgrade.
+5. WHEN `upgrade` begins, THEN its first act SHALL be a single atomic commit that transfers the binding to
+   the candidate binary B, captures the prior **[A final]** as the rollback checkpoint, and opens an
+   operation marker — *before* any provider mutation — so that the recorded binding always names the
+   binary performing work and a crash recovers under B, never A. The binding SHALL be two-valued (the
+   bound binary, A or B), never a third "pending" value; whether an operation is in flight is the separate
+   operation marker.
+6. AS B applies its plan, THEN it MAY record an **applied delta** — an ids-only audit log (`id + op`, no
+   before/after images) of the changes it commits, for observability and `plan`/diff. Rollback does not
+   consume it: rollback re-applies the retained prior **configuration revision** (Requirement 9,
+   Proposal 002), not an inverse of recorded before-images.
+7. WHERE the running binary, before upgrading, finds live state materially diverged from the recorded
+   [A final], THE provisioner MAY refuse-and-surface the drift (an advisory baseline gate); it SHALL NOT
+   authoritatively reconcile another version's drift.
 
 ### Requirement 5: Binary retention for S3 remote state
 
@@ -287,27 +313,29 @@ without reverse migrations.
 
 #### Acceptance Criteria
 
-1. WHEN `tkr deployment upgrade` runs, THEN it SHALL record a rollback checkpoint (prior snapshot ref,
-   prior provenance stamp, prior **full integrity manifest** for all targets, and prior effective-config
-   ref) before migrating state forward.
+1. WHEN `tkr deployment upgrade` runs, THEN it SHALL capture the rollback checkpoint ([A final]: prior
+   snapshot ref, prior provenance stamp, prior **full integrity manifest** for all targets, and prior
+   effective-config ref) in the same atomic commit that transfers the binding to B (Requirement 4.5),
+   before any provider mutation.
 2. WHEN the operator runs `tkr deployment rollback`, THEN it SHALL apply **two operations**: (a) the
-   superseded (B) binary applies the **inverse of its recorded upgrade plan** — deleting what it created,
-   reverting what it updated to the checkpoint state, and re-creating what it deleted from the checkpoint
-   state — restoring live infrastructure and state to the checkpoint, because only the binary that made a
-   change has the implementation and dependency versions to reverse it; then (b) the checkpoint is
-   re-pinned; then (c) the prior (A) binary runs its ordinary apply to re-assert A's own config over the
-   restored checkpoint. Neither binary SHALL reverse a change it did not make.
+   superseded (B) binary **deletes the resources it created** (`keys(S_B) − keys(S_A)`), which it alone
+   can remove (they may be of kinds only B knows) — deletion is state-driven, so no before-images are
+   read; then (b) a single atomic commit re-pins the binding to A and closes the operation marker; then
+   (c) the prior (A) binary observes live infrastructure (`refresh_state`) and **runs its ordinary apply
+   of the retained prior configuration revision**, reconciling B's remaining updates and re-creations
+   from A's own config. Neither binary SHALL reverse a change it did not make nor reinterpret the other
+   binary's recorded state representation (Proposal 002).
 3. WHEN `tkr deployment rollback` runs, THEN it SHALL verify the checksum of **both** binaries it will
    execute against their integrity manifests before executing either, AND it SHALL refuse if no checkpoint
-   exists, either binary is unavailable or checksum-mismatched, or a resource in the recorded plan is no
-   longer instantiable by the superseded binary.
+   exists, either binary is unavailable or checksum-mismatched, or the retained prior **configuration
+   revision** is missing or does not compile under the prior (A) binary (Proposal 002).
 4. THE rollback SHALL NOT run a reverse migration; migrations remain forward-only, and rollback restores
    the retained pre-upgrade checkpoint instead.
 5. WHEN rollback reverts to the checkpoint, THEN it SHALL surface that state recorded after the upgrade is
    not represented, AND that resources recorded in no snapshot (created out-of-band) are not reconciled.
-6. THE upgrade SHALL record its applied plan with before-images sufficient to invert it (full prior state
-   for updated and deleted resources), so B's undo can revert updates and re-create deletes — not only
-   delete its additions.
+6. THE upgrade SHALL retain the prior **configuration revision** (Requirement 9.1's config ref) as the
+   authoritative before-state for rollback; rollback reconciles forward toward that revision rather than
+   inverting a recorded delta, so recorded before-images are NOT required (Proposal 002).
 7. WHEN rollback performs destructive work, THEN preconditions SHALL be exhaustively checked first, the
    whole B-undo → re-pin → A-reconcile sequence SHALL hold the remote operation lock (Requirement 11), and
    progress SHALL be recorded in a durable marker so an interrupted rollback is resumable.

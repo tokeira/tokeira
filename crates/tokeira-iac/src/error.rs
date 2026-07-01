@@ -30,6 +30,20 @@ pub enum IacError {
         resource_id: String,
         details: String,
     },
+    /// A Delete targets a resource that is recorded in state but absent from the
+    /// `known` managed set, so the engine has no `Resource` to delete the live
+    /// object with. Failing closed here prevents dropping the state entry while
+    /// leaving the live resource orphaned. (Property 10.)
+    #[error(
+        "fail-closed delete: resource '{resource_id}' is in state but not in the known managed set — \
+         refusing to remove it from state without deleting the live resource"
+    )]
+    UnknownResourceDelete { resource_id: String },
+    /// The composition failed pre-flight validation (duplicate module/resource id,
+    /// a desired module absent from `known`, or a dependency cycle). Refusing
+    /// before any Delta keeps the resource map unambiguous. (Property 12.)
+    #[error("invalid composition: {0}")]
+    CompositionInvalid(String),
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

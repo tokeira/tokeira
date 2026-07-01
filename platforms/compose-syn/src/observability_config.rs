@@ -483,11 +483,13 @@ impl iac::Resource for ObservabilityConfigFilesResource {
     async fn describe(
         &self,
         _ctx: &iac::ProvisionContext,
-    ) -> Result<Option<iac::ResourceState>, iac::IacError> {
+    ) -> Result<iac::DescribeResult, iac::IacError> {
+        // `read_live_files` reads the managed config files from disk; their
+        // absence is a confirmed Absent, not an unknown.
         let Some(properties) = self.read_live_files()? else {
-            return Ok(None);
+            return Ok(iac::DescribeResult::Absent);
         };
-        Ok(Some(iac::ResourceState {
+        Ok(iac::DescribeResult::Present(iac::ResourceState {
             resource_type: self.resource_type(),
             physical_id: self.deployment_dir.join(CONFIG_DIR).display().to_string(),
             properties: json!({

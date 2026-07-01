@@ -1,7 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -175,7 +176,7 @@ impl Resource for VpcEndpoint {
 
         // Idempotency/adoption path: if an endpoint for this service already
         // exists in the target VPC, adopt it instead of attempting create.
-        if let Some(existing) = self.describe(ctx).await? {
+        if let DescribeResult::Present(existing) = self.describe(ctx).await? {
             tracing::warn!(
                 service = %self.config.service_name,
                 endpoint = %existing.physical_id,
@@ -470,7 +471,7 @@ impl Resource for VpcEndpoint {
         }
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         // Read VPC state for vpc_id to filter endpoints.
         let vpc_state = ctx.get_resource_state(&self.config.vpc_dependency);
         let vpc_id = vpc_state.ok().and_then(|s| {
@@ -511,7 +512,7 @@ impl Resource for VpcEndpoint {
 
         let endpoints = desc_output.vpc_endpoints();
         if endpoints.is_empty() {
-            return Ok(None);
+            return Ok(DescribeResult::Absent);
         }
 
         let ep = endpoints
@@ -527,7 +528,7 @@ impl Resource for VpcEndpoint {
         let endpoint_id = ep.vpc_endpoint_id().unwrap_or_default().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
-        Ok(Some(ResourceState {
+        Ok(DescribeResult::Present(ResourceState {
             resource_type: ResourceType::new("VpcEndpoint"),
             physical_id: endpoint_id.clone(),
             properties: serde_json::json!({

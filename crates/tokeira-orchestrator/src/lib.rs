@@ -566,8 +566,8 @@ mod tests {
         async fn describe(
             &self,
             _ctx: &iac::ProvisionContext,
-        ) -> std::result::Result<Option<iac::ResourceState>, iac::IacError> {
-            Ok(None)
+        ) -> std::result::Result<iac::DescribeResult, iac::IacError> {
+            Ok(iac::DescribeResult::Absent)
         }
 
         fn diff(
@@ -921,8 +921,8 @@ mod tests {
         async fn describe(
             &self,
             _ctx: &iac::ProvisionContext,
-        ) -> std::result::Result<Option<iac::ResourceState>, iac::IacError> {
-            Ok(None)
+        ) -> std::result::Result<iac::DescribeResult, iac::IacError> {
+            Ok(iac::DescribeResult::Absent)
         }
 
         fn diff(

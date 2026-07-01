@@ -125,9 +125,9 @@ impl iac::Resource for LocalStateResource {
     async fn describe(
         &self,
         _ctx: &iac::ProvisionContext,
-    ) -> std::result::Result<Option<iac::ResourceState>, iac::IacError> {
+    ) -> std::result::Result<iac::DescribeResult, iac::IacError> {
         if self.state_dir.exists() {
-            Ok(Some(iac::ResourceState {
+            Ok(iac::DescribeResult::Present(iac::ResourceState {
                 resource_type: iac::ResourceType::new("local_state_dir"),
                 physical_id: self.state_dir.display().to_string(),
                 properties: serde_json::json!({ "path": self.state_dir }),
@@ -137,7 +137,8 @@ impl iac::Resource for LocalStateResource {
                 module: "remote-state".into(),
             }))
         } else {
-            Ok(None)
+            // `exists()` is a real check of the managed state dir → confirmed Absent.
+            Ok(iac::DescribeResult::Absent)
         }
     }
 

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -127,11 +128,11 @@ impl Resource for EcrRepository {
             .map_err(IacError::from)
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let ecr = ecr_client(ctx)?;
         let desc = match ecr.describe_repository(&self.name).await {
             Ok(desc) => desc,
-            Err(EcrError::NotFound { .. }) => return Ok(None),
+            Err(EcrError::NotFound { .. }) => return Ok(DescribeResult::Absent),
             Err(err) => return Err(IacError::from(err)),
         };
         let live_tags = ecr
@@ -142,7 +143,7 @@ impl Resource for EcrRepository {
             .get_lifecycle_policy(&self.name)
             .await
             .map_err(IacError::from)?;
-        Ok(Some(state_from_live(
+        Ok(DescribeResult::Present(state_from_live(
             &self.name,
             &desc,
             live_tags,

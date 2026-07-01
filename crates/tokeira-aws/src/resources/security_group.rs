@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -452,7 +453,7 @@ impl Resource for SecurityGroup {
         }
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let desc_output = ctx
             .extension::<crate::AwsClients>()
             .expect("AwsClients")
@@ -475,7 +476,7 @@ impl Resource for SecurityGroup {
 
         let groups = desc_output.security_groups();
         if groups.is_empty() {
-            return Ok(None);
+            return Ok(DescribeResult::Absent);
         }
 
         let sg = &groups[0];
@@ -484,7 +485,7 @@ impl Resource for SecurityGroup {
         let tags = collect_live_tags(sg);
         let now = chrono::Utc::now().to_rfc3339();
 
-        Ok(Some(ResourceState {
+        Ok(DescribeResult::Present(ResourceState {
             resource_type: ResourceType::new("SecurityGroup"),
             physical_id: sg_id.clone(),
             properties: serde_json::json!({

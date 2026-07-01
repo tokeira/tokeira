@@ -383,14 +383,16 @@ impl Resource for WorkstationSecurityGroup {
     async fn describe(
         &self,
         ctx: &tokeira_iac::ProvisionContext,
-    ) -> Result<Option<tokeira_iac::ResourceState>, IacError> {
+    ) -> Result<tokeira_iac::DescribeResult, IacError> {
         let physical_id = ctx
             .get_resource_state(&self.resource_id())
             .ok()
             .map(|s| s.physical_id.clone());
 
+        // No physical id in state: cannot query the provider, so existence is
+        // unknown rather than confirmed absent — never prune on this.
         let Some(sg_id) = physical_id else {
-            return Ok(None);
+            return Ok(tokeira_iac::DescribeResult::Unsupported);
         };
 
         let clients = ctx
@@ -406,9 +408,9 @@ impl Resource for WorkstationSecurityGroup {
         {
             Ok(resp) => {
                 if resp.security_groups().is_empty() {
-                    Ok(None)
+                    Ok(tokeira_iac::DescribeResult::Absent)
                 } else {
-                    Ok(Some(tokeira_iac::ResourceState {
+                    Ok(tokeira_iac::DescribeResult::Present(tokeira_iac::ResourceState {
                         resource_type: self.resource_type(),
                         physical_id: sg_id,
                         properties: serde_json::json!({
@@ -425,7 +427,7 @@ impl Resource for WorkstationSecurityGroup {
             Err(e) => {
                 let msg = format!("{}", e.into_service_error());
                 if msg.contains("InvalidGroup.NotFound") {
-                    Ok(None)
+                    Ok(tokeira_iac::DescribeResult::Absent)
                 } else {
                     Err(IacError::AwsSdk(format!(
                         "failed to describe security group {sg_id}: {msg}"

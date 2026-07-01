@@ -7,7 +7,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 use tokio::time::sleep;
@@ -206,7 +207,7 @@ impl Resource for IamInstanceProfile {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let clients = ctx.extension::<crate::AwsClients>().expect("AwsClients");
 
         match clients
@@ -222,7 +223,7 @@ impl Resource for IamInstanceProfile {
                     .and_then(|p| p.roles().first())
                     .map(|r| r.role_name().to_string())
                     .unwrap_or_default();
-                Ok(Some(ResourceState {
+                Ok(DescribeResult::Present(ResourceState {
                     resource_type: self.resource_type(),
                     physical_id: self.profile_name.clone(),
                     properties: serde_json::json!({ "role_name": role_name }),
@@ -235,7 +236,7 @@ impl Resource for IamInstanceProfile {
             Err(e) => {
                 let svc_err = e.into_service_error();
                 if svc_err.is_no_such_entity_exception() {
-                    Ok(None)
+                    Ok(DescribeResult::Absent)
                 } else {
                     Err(IacError::AwsSdk(format!(
                         "failed to describe instance profile {}: {svc_err}",

@@ -1,5 +1,6 @@
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -64,21 +65,32 @@ impl Resource for SsmParameterResource {
         _current: &ResourceState,
         ctx: &ProvisionContext,
     ) -> Result<(), IacError> {
-        ctx.extension::<crate::AwsClients>()
+        match ctx
+            .extension::<crate::AwsClients>()
             .expect("AwsClients")
             .ssm
             .delete_parameter()
             .name(&self.name)
             .send()
             .await
-            .map_err(|e| {
-                IacError::AwsSdk(format!("ssm:DeleteParameter: {}", e.into_service_error()))
-            })?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let svc_err = e.into_service_error();
+                // Idempotent delete: an already-absent parameter is success. The
+                // engine may drive this from persisted state when `describe` is
+                // Unsupported, so the live object may already be gone.
+                if svc_err.is_parameter_not_found() {
+                    Ok(())
+                } else {
+                    Err(IacError::AwsSdk(format!("ssm:DeleteParameter: {svc_err}")))
+                }
+            }
+        }
     }
 
-    async fn describe(&self, _ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
-        Ok(None)
+    async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
+        Ok(DescribeResult::Unsupported)
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {

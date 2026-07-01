@@ -35,7 +35,7 @@ use std::{
 use tracing::{info, warn};
 
 use crate::{
-    InternalChange, ProvisionContext, Resource, ResourceId,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId,
     error::IacError,
     module::ModuleContext,
     types::{Change, ChangeKind, FieldDiff, InfraComposition},
@@ -83,6 +83,7 @@ impl Engine {
         composition: &InfraComposition,
         ctx: &mut ProvisionContext,
     ) -> Result<Vec<Change>, IacError> {
+        validate_composition(composition, ctx)?;
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
@@ -108,6 +109,7 @@ impl Engine {
         composition: &InfraComposition,
         ctx: &mut ProvisionContext,
     ) -> Result<Vec<Change>, IacError> {
+        validate_composition(composition, ctx)?;
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
@@ -130,6 +132,7 @@ impl Engine {
         ctx: &mut ProvisionContext,
         saver: Option<&StateSaver>,
     ) -> Result<Vec<Change>, IacError> {
+        validate_composition(composition, ctx)?;
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
@@ -163,6 +166,7 @@ impl Engine {
         ctx: &mut ProvisionContext,
         saver: Option<&StateSaver>,
     ) -> Result<Vec<Change>, IacError> {
+        validate_composition(composition, ctx)?;
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
@@ -186,6 +190,7 @@ impl Engine {
         ctx: &mut ProvisionContext,
         saver: Option<&StateSaver>,
     ) -> Result<Vec<Change>, IacError> {
+        validate_composition(composition, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         self.destroy_known(&known_refs, ctx, saver).await
@@ -197,6 +202,7 @@ impl Engine {
         composition: &InfraComposition,
         ctx: &mut ProvisionContext,
     ) -> Result<Vec<Change>, IacError> {
+        validate_composition(composition, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         let desired: [&dyn Resource; 0] = [];
@@ -241,6 +247,7 @@ impl Engine {
         ctx: &mut ProvisionContext,
         saver: Option<&StateSaver>,
     ) -> Result<Vec<Change>, IacError> {
+        validate_composition(composition, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         let desired: [&dyn Resource; 0] = [];
@@ -361,6 +368,10 @@ enum RefreshStatus {
     /// Resource is known-managed (not desired) and absent from the provider.
     /// State should be pruned.
     ManagedMissing,
+    /// `describe` could not determine the resource's existence
+    /// ([`DescribeResult::Unsupported`]). State is left untouched — never
+    /// pruned on an unconfirmed describe.
+    Unknown,
 }
 
 #[derive(Debug)]
@@ -379,6 +390,46 @@ struct RefreshReport {
 /// potentially stale persisted state. Resources that exist in the provider
 /// but not in persisted state are added. Resources that are absent from the
 /// provider but present in persisted state are removed.
+/// Validate a composition before any Delta (Property 12): unique module ids,
+/// every desired module present in `known`, no module dependency cycle, and
+/// unique resource ids across the known set. A duplicate resource id would let
+/// the engine's resource map silently route a delete to the wrong resource.
+fn validate_composition(
+    composition: &InfraComposition,
+    ctx: &ProvisionContext,
+) -> Result<(), IacError> {
+    let mut known_module_names = HashSet::new();
+    for m in &composition.known_modules {
+        if !known_module_names.insert(m.name().to_string()) {
+            return Err(IacError::CompositionInvalid(format!(
+                "duplicate module id '{}'",
+                m.name()
+            )));
+        }
+    }
+    for m in &composition.desired_modules {
+        if !known_module_names.contains(m.name()) {
+            return Err(IacError::CompositionInvalid(format!(
+                "desired module '{}' is not in the known managed set",
+                m.name()
+            )));
+        }
+    }
+    // Collecting also validates the module dependency graph (cycle → error).
+    let resources = collect_resources_from(&composition.known_modules, ctx)?;
+    let mut seen = HashSet::new();
+    for r in &resources {
+        let id = r.resource_id();
+        if !seen.insert(id.clone()) {
+            return Err(IacError::CompositionInvalid(format!(
+                "duplicate resource id '{}'",
+                id.0
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn refresh_state(
     known: &[&dyn Resource],
     desired: &[&dyn Resource],
@@ -408,7 +459,7 @@ async fn refresh_state(
                 resource_id.0
             ))
         })? {
-            Some(live_state) => {
+            DescribeResult::Present(live_state) => {
                 refreshed
                     .resources
                     .insert(resource_id.clone(), live_state.clone());
@@ -422,7 +473,7 @@ async fn refresh_state(
                     },
                 );
             }
-            None => {
+            DescribeResult::Absent => {
                 refreshed.resources.remove(&resource_id);
                 ctx.state.resources.remove(&resource_id);
                 let status = if is_desired {
@@ -439,6 +490,12 @@ async fn refresh_state(
                     RefreshStatus::ManagedMissing
                 };
                 status_by_id.insert(resource_id, status);
+            }
+            DescribeResult::Unsupported => {
+                // Existence could not be confirmed — never prune on an
+                // unconfirmed describe. Persisted state is authoritative, so
+                // leave both `refreshed` and `ctx.state` untouched for this id.
+                status_by_id.insert(resource_id, RefreshStatus::Unknown);
             }
         }
     }
@@ -628,44 +685,39 @@ async fn apply_changes(
         let reversed: Vec<ResourceId> = sorted_deletes.into_iter().rev().collect();
 
         for rid in &reversed {
-            if let Some(current) = ctx.state.resources.get(rid).cloned() {
-                if let Some(resource) = resource_map.get(rid) {
-                    operation_index += 1;
-                    ctx.emit_apply_progress(
-                        "delete",
-                        rid,
-                        &current.resource_type,
-                        operation_index,
-                        total_operations,
-                    );
-                    info!(?rid, "deleting resource");
-                    let started = Instant::now();
-                    if let Err(err) = resource.delete(&current, ctx).await {
-                        ctx.emit_failed_progress(
-                            "delete",
-                            rid,
-                            &current.resource_type,
-                            started.elapsed(),
-                            &err,
-                        );
-                        return Err(err);
-                    }
-                    ctx.emit_complete_progress(
-                        "delete",
-                        rid,
-                        &current.resource_type,
-                        started.elapsed(),
-                    );
-                } else {
-                    warn!(
-                        ?rid,
-                        "resource in state but not in known managed set — removing from state only"
-                    );
-                }
-                ctx.state.resources.remove(rid);
-                if let Some(save) = saver {
-                    save(&ctx.state).await?;
-                }
+            let Some(current) = ctx.state.resources.get(rid).cloned() else {
+                continue;
+            };
+            // Fail-closed: a Delete must have a known `Resource` to delete the live
+            // object with. Dropping the state entry without deleting would orphan
+            // the live resource (Property 10).
+            let Some(resource) = resource_map.get(rid) else {
+                return Err(IacError::UnknownResourceDelete { resource_id: rid.0.clone() });
+            };
+            operation_index += 1;
+            ctx.emit_apply_progress(
+                "delete",
+                rid,
+                &current.resource_type,
+                operation_index,
+                total_operations,
+            );
+            info!(?rid, "deleting resource");
+            let started = Instant::now();
+            if let Err(err) = resource.delete(&current, ctx).await {
+                ctx.emit_failed_progress(
+                    "delete",
+                    rid,
+                    &current.resource_type,
+                    started.elapsed(),
+                    &err,
+                );
+                return Err(err);
+            }
+            ctx.emit_complete_progress("delete", rid, &current.resource_type, started.elapsed());
+            ctx.state.resources.remove(rid);
+            if let Some(save) = saver {
+                save(&ctx.state).await?;
             }
         }
     }
@@ -696,65 +748,86 @@ async fn destroy_changes(
     let mut operation_index = 0usize;
 
     for rid in &reversed {
-        if let Some(current) = ctx.state.resources.get(rid).cloned() {
-            if let Some(resource) = resource_map.get(rid) {
-                // Re-describe to get live state before deleting
-                match resource.describe(ctx).await.map_err(|err| {
-                    IacError::Other(anyhow::anyhow!(
-                        "failed to describe resource '{}' during destroy: {err}",
-                        rid.0
-                    ))
-                })? {
-                    Some(live_state) => {
-                        operation_index += 1;
-                        ctx.emit_apply_progress(
-                            "delete",
-                            rid,
-                            &live_state.resource_type,
-                            operation_index,
-                            total_operations,
-                        );
-                        info!(?rid, "destroying resource");
-                        let started = Instant::now();
-                        if let Err(err) = resource.delete(&live_state, ctx).await {
-                            ctx.emit_failed_progress(
-                                "delete",
-                                rid,
-                                &live_state.resource_type,
-                                started.elapsed(),
-                                &err,
-                            );
-                            return Err(err);
-                        }
-                        ctx.emit_complete_progress(
-                            "delete",
-                            rid,
-                            &live_state.resource_type,
-                            started.elapsed(),
-                        );
-                    }
-                    None => {
-                        warn!(
-                            ?rid,
-                            "resource already absent from provider, pruning from state"
-                        );
-                        ctx.emit_note_progress(
-                            rid,
-                            &current.resource_type,
-                            &format!("pruned absent: {}", rid.0),
-                        );
-                    }
+        let Some(current) = ctx.state.resources.get(rid).cloned() else {
+            continue;
+        };
+        // Fail-closed: a Delete must have a known `Resource` to delete the live
+        // object with (Property 10).
+        let Some(resource) = resource_map.get(rid) else {
+            return Err(IacError::UnknownResourceDelete { resource_id: rid.0.clone() });
+        };
+        // Re-describe to get live state before deleting
+        match resource.describe(ctx).await.map_err(|err| {
+            IacError::Other(anyhow::anyhow!(
+                "failed to describe resource '{}' during destroy: {err}",
+                rid.0
+            ))
+        })? {
+            DescribeResult::Present(live_state) => {
+                operation_index += 1;
+                ctx.emit_apply_progress(
+                    "delete",
+                    rid,
+                    &live_state.resource_type,
+                    operation_index,
+                    total_operations,
+                );
+                info!(?rid, "destroying resource");
+                let started = Instant::now();
+                if let Err(err) = resource.delete(&live_state, ctx).await {
+                    ctx.emit_failed_progress(
+                        "delete",
+                        rid,
+                        &live_state.resource_type,
+                        started.elapsed(),
+                        &err,
+                    );
+                    return Err(err);
                 }
-            } else {
-                warn!(
-                    ?rid,
-                    "resource in state but not in known managed set — skipping delete"
+                ctx.emit_complete_progress("delete", rid, &live_state.resource_type, started.elapsed());
+            }
+            DescribeResult::Absent => {
+                warn!(?rid, "resource already absent from provider, pruning from state");
+                ctx.emit_note_progress(
+                    rid,
+                    &current.resource_type,
+                    &format!("pruned absent: {}", rid.0),
                 );
             }
-            ctx.state.resources.remove(rid);
-            if let Some(save) = saver {
-                save(&ctx.state).await?;
+            DescribeResult::Unsupported => {
+                // `describe` cannot confirm presence, so absence must not be
+                // assumed — drive the delete from persisted state rather than
+                // pruning blind. The resource's `delete` must treat a provider
+                // not-found as success for this to remain idempotent.
+                operation_index += 1;
+                ctx.emit_apply_progress(
+                    "delete",
+                    rid,
+                    &current.resource_type,
+                    operation_index,
+                    total_operations,
+                );
+                info!(
+                    ?rid,
+                    "destroying resource from persisted state (describe unsupported)"
+                );
+                let started = Instant::now();
+                if let Err(err) = resource.delete(&current, ctx).await {
+                    ctx.emit_failed_progress(
+                        "delete",
+                        rid,
+                        &current.resource_type,
+                        started.elapsed(),
+                        &err,
+                    );
+                    return Err(err);
+                }
+                ctx.emit_complete_progress("delete", rid, &current.resource_type, started.elapsed());
             }
+        }
+        ctx.state.resources.remove(rid);
+        if let Some(save) = saver {
+            save(&ctx.state).await?;
         }
     }
 
@@ -994,6 +1067,10 @@ mod tests {
         id: ResourceId,
         module: &'static str,
         describe_state: Option<crate::ResourceState>,
+        /// When true, `describe` returns [`DescribeResult::Unsupported`]
+        /// regardless of `describe_state` — models a resource whose existence
+        /// cannot be confirmed from the provider.
+        describe_unsupported: bool,
         create_fails: bool,
         delete_counter: Option<Arc<AtomicUsize>>,
         delete_capture: Option<Arc<Mutex<Vec<String>>>>,
@@ -1005,6 +1082,7 @@ mod tests {
                 id: ResourceId(id.to_string()),
                 module,
                 describe_state: None,
+                describe_unsupported: false,
                 create_fails: false,
                 delete_counter: None,
                 delete_capture: None,
@@ -1016,6 +1094,7 @@ mod tests {
                 id: ResourceId(id.to_string()),
                 module,
                 describe_state: Some(stub_state(id, module)),
+                describe_unsupported: false,
                 create_fails: false,
                 delete_counter: None,
                 delete_capture: None,
@@ -1027,10 +1106,17 @@ mod tests {
                 id: ResourceId(id.to_string()),
                 module,
                 describe_state: None,
+                describe_unsupported: false,
                 create_fails: true,
                 delete_counter: None,
                 delete_capture: None,
             }
+        }
+
+        /// `describe` cannot confirm existence ([`DescribeResult::Unsupported`]).
+        fn with_describe_unsupported(mut self) -> Self {
+            self.describe_unsupported = true;
+            self
         }
 
         fn with_delete_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
@@ -1097,8 +1183,14 @@ mod tests {
         async fn describe(
             &self,
             _ctx: &ProvisionContext,
-        ) -> Result<Option<crate::ResourceState>, IacError> {
-            Ok(self.describe_state.clone())
+        ) -> Result<DescribeResult, IacError> {
+            if self.describe_unsupported {
+                return Ok(DescribeResult::Unsupported);
+            }
+            Ok(match self.describe_state.clone() {
+                Some(state) => DescribeResult::Present(state),
+                None => DescribeResult::Absent,
+            })
         }
 
         fn diff(&self, _current: &crate::ResourceState, _ctx: &ProvisionContext) -> InternalChange {
@@ -1198,6 +1290,99 @@ mod tests {
         let modules: Vec<Box<dyn Module>> = vec![];
         let sorted = topological_sort_modules(&modules).unwrap();
         assert!(sorted.is_empty());
+    }
+
+    // Property 10: a Delete never silently orphans a live resource.
+    #[tokio::test]
+    async fn fail_closed_delete_refuses_unknown_resource() {
+        // A resource recorded in state but absent from the known managed set: the
+        // engine has no `Resource` to delete the live object with, so it must
+        // refuse — never drop the state entry while leaving the live one orphaned.
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        ctx.state
+            .resources
+            .insert(ResourceId("orphan".into()), stub_state("orphan", "ghost"));
+
+        let none: Vec<Box<dyn Resource>> = boxed_resources(vec![]);
+        let err = engine
+            .apply_with_known(&refs(&none), &refs(&none), &mut ctx, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, IacError::UnknownResourceDelete { ref resource_id } if resource_id == "orphan"),
+            "expected fail-closed delete error, got {err:?}"
+        );
+        assert!(
+            ctx.state.resources.contains_key(&ResourceId("orphan".into())),
+            "fail-closed must NOT drop the orphan from state"
+        );
+    }
+
+    /// A test module that yields stub resources for the given ids.
+    #[derive(Debug)]
+    struct ResourceModule {
+        name: &'static str,
+        ids: &'static [&'static str],
+    }
+
+    impl Module for ResourceModule {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn dependencies(&self) -> &[&str] {
+            &[]
+        }
+        fn resources(
+            &self,
+            _ctx: &crate::ModuleContext,
+        ) -> Result<Vec<Box<dyn Resource>>, IacError> {
+            Ok(self
+                .ids
+                .iter()
+                .map(|id| Box::new(StubResource::missing(id, self.name)) as Box<dyn Resource>)
+                .collect())
+        }
+    }
+
+    // Property 12: composition validation refuses before any Delta.
+    #[tokio::test]
+    async fn composition_refuses_duplicate_resource_id() {
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        let composition = InfraComposition {
+            known_modules: vec![
+                Box::new(ResourceModule { name: "a", ids: &["dup"] }),
+                Box::new(ResourceModule { name: "b", ids: &["dup"] }),
+            ],
+            desired_modules: vec![
+                Box::new(ResourceModule { name: "a", ids: &["dup"] }),
+                Box::new(ResourceModule { name: "b", ids: &["dup"] }),
+            ],
+            active_modules: vec!["a".into(), "b".into()],
+        };
+        let err = engine.plan(&composition, &mut ctx).await.unwrap_err();
+        assert!(
+            matches!(err, IacError::CompositionInvalid(ref m) if m.contains("duplicate resource id")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn composition_refuses_desired_module_not_in_known() {
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        let composition = InfraComposition {
+            known_modules: vec![Box::new(StubModule { name: "a", deps: &[] })],
+            desired_modules: vec![Box::new(StubModule { name: "ghost", deps: &[] })],
+            active_modules: vec!["ghost".into()],
+        };
+        let err = engine.plan(&composition, &mut ctx).await.unwrap_err();
+        assert!(
+            matches!(err, IacError::CompositionInvalid(ref m) if m.contains("not in the known managed set")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1442,6 +1627,7 @@ mod tests {
             id: id.clone(),
             module: "module",
             describe_state: Some(live_state),
+            describe_unsupported: false,
             create_fails: false,
             delete_counter: None,
             delete_capture: None,
@@ -1458,6 +1644,76 @@ mod tests {
         assert_eq!(
             captured.lock().expect("delete capture mutex").as_slice(),
             ["live-physical"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_describe_deletes_from_persisted_state() {
+        // A resource whose `describe` cannot confirm existence
+        // (`DescribeResult::Unsupported`) must still be deleted from persisted
+        // state during destroy — never silently pruned (Property 10 / Req 10.3).
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        let id = ResourceId("resource".to_string());
+        let mut persisted = stub_state(&id.0, "module");
+        persisted.physical_id = "persisted-physical".to_string();
+        ctx.state.resources.insert(id.clone(), persisted);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let resource = StubResource::live(&id.0, "module")
+            .with_describe_unsupported()
+            .with_delete_capture(Arc::clone(&captured));
+        let resources = boxed_resources(vec![resource]);
+        let resource_refs = refs(&resources);
+
+        engine
+            .destroy_known(&resource_refs, &mut ctx, None)
+            .await
+            .unwrap();
+
+        // delete() was driven from the persisted state, not skipped.
+        assert_eq!(
+            captured.lock().expect("delete capture mutex").as_slice(),
+            ["persisted-physical"]
+        );
+        assert!(
+            !ctx.state.resources.contains_key(&id),
+            "state entry removed after successful delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_describe_is_not_pruned_on_refresh() {
+        // refresh_state must NOT prune a managed resource whose describe is
+        // Unsupported — only a provider-confirmed Absent prunes. A `missing`
+        // (Absent) resource in the same run is pruned, proving the contrast.
+        let mut ctx = ProvisionContext::default();
+        let keep = ResourceId("keep".to_string());
+        let prune = ResourceId("prune".to_string());
+        ctx.state
+            .resources
+            .insert(keep.clone(), stub_state(&keep.0, "module"));
+        ctx.state
+            .resources
+            .insert(prune.clone(), stub_state(&prune.0, "module"));
+        let resources = boxed_resources(vec![
+            StubResource::live(&keep.0, "module").with_describe_unsupported(),
+            StubResource::missing(&prune.0, "module"),
+        ]);
+        let resource_refs = refs(&resources);
+
+        // desired empty → both are managed-but-not-desired.
+        let report = refresh_state(&resource_refs, &[], &mut ctx, None)
+            .await
+            .expect("refresh succeeds");
+
+        assert!(
+            ctx.state.resources.contains_key(&keep),
+            "unsupported describe must not prune managed state"
+        );
+        assert!(report.state.resources.contains_key(&keep));
+        assert!(
+            !ctx.state.resources.contains_key(&prune),
+            "absent describe prunes managed state"
         );
     }
 

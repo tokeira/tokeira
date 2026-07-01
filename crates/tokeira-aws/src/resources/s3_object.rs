@@ -1,7 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
 use sha2::{Digest, Sha256};
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -94,8 +95,8 @@ impl Resource for S3Object {
         Ok(())
     }
 
-    async fn describe(&self, _ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
-        Ok(None)
+    async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
+        Ok(DescribeResult::Unsupported)
     }
 
     fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {

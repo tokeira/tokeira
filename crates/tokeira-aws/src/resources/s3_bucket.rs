@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -416,7 +417,7 @@ impl Resource for S3Bucket {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let name = &self.bucket_name;
 
         match ctx
@@ -488,7 +489,7 @@ impl Resource for S3Bucket {
                     }
                 };
                 let now = chrono::Utc::now().to_rfc3339();
-                Ok(Some(ResourceState {
+                Ok(DescribeResult::Present(ResourceState {
                     resource_type: ResourceType::new("S3Bucket"),
                     physical_id: self.bucket_name.clone(),
                     properties: serde_json::json!({
@@ -507,7 +508,7 @@ impl Resource for S3Bucket {
             Err(e) => {
                 let svc_err = e.into_service_error();
                 if svc_err.is_not_found() {
-                    Ok(None)
+                    Ok(DescribeResult::Absent)
                 } else {
                     Err(IacError::AwsSdk(format!("s3:HeadBucket: {svc_err}")))
                 }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -200,6 +201,9 @@ impl Resource for TaskDefinitionResource {
         current: &ResourceState,
         ctx: &ProvisionContext,
     ) -> Result<(), IacError> {
+        // Deregistering a persisted task-definition ARN is idempotent (an
+        // already-inactive definition still deregisters), and ECS exposes no
+        // clean not-found variant here, so no NotFound-tolerance branch is added.
         ctx.extension::<crate::AwsClients>()
             .expect("AwsClients")
             .ecs
@@ -216,8 +220,8 @@ impl Resource for TaskDefinitionResource {
         Ok(())
     }
 
-    async fn describe(&self, _ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
-        Ok(None)
+    async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
+        Ok(DescribeResult::Unsupported)
     }
 
     fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
@@ -404,7 +408,8 @@ impl Resource for EcsServiceResource {
         ctx: &ProvisionContext,
     ) -> Result<(), IacError> {
         let cluster = ctx.get_resource_state(&self.cluster_dependency)?;
-        ctx.extension::<crate::AwsClients>()
+        match ctx
+            .extension::<crate::AwsClients>()
             .expect("AwsClients")
             .ecs
             .delete_service()
@@ -413,14 +418,26 @@ impl Resource for EcsServiceResource {
             .force(true)
             .send()
             .await
-            .map_err(|e| {
-                IacError::AwsSdk(format!("ecs:DeleteService: {}", e.into_service_error()))
-            })?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let svc_err = e.into_service_error();
+                // Idempotent delete: an already-absent service (or cluster) is
+                // success. The engine may drive this from persisted state when
+                // `describe` is Unsupported, so the live object may already be gone.
+                if svc_err.is_service_not_found_exception()
+                    || svc_err.is_cluster_not_found_exception()
+                {
+                    Ok(())
+                } else {
+                    Err(IacError::AwsSdk(format!("ecs:DeleteService: {svc_err}")))
+                }
+            }
+        }
     }
 
-    async fn describe(&self, _ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
-        Ok(None)
+    async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
+        Ok(DescribeResult::Unsupported)
     }
 
     fn diff(&self, current: &ResourceState, ctx: &ProvisionContext) -> InternalChange {
@@ -521,8 +538,8 @@ impl Resource for CloudMapNamespaceResource {
         Ok(())
     }
 
-    async fn describe(&self, _ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
-        Ok(None)
+    async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
+        Ok(DescribeResult::Unsupported)
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {

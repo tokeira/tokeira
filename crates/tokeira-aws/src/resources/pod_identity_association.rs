@@ -1,7 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -217,12 +218,15 @@ impl Resource for PodIdentityAssociation {
             Err(e) => {
                 let svc_err = e.into_service_error();
                 if svc_err.is_resource_in_use_exception() {
-                    let existing = self.describe(ctx).await?.ok_or_else(|| {
-                        IacError::AwsSdk(
-                            "eks:CreatePodIdentityAssociation: association already exists but could not be described"
-                                .into(),
-                        )
-                    })?;
+                    let existing = match self.describe(ctx).await? {
+                        DescribeResult::Present(s) => s,
+                        _ => {
+                            return Err(IacError::AwsSdk(
+                                "eks:CreatePodIdentityAssociation: association already exists but could not be described"
+                                    .into(),
+                            ));
+                        }
+                    };
                     existing.physical_id
                 } else {
                     return Err(IacError::AwsSdk(format!(
@@ -311,13 +315,13 @@ impl Resource for PodIdentityAssociation {
         self.wait_until_deleted(ctx, association_id).await
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         if !ctx
             .state
             .resources
             .contains_key(&self.config.eks_cluster_dependency)
         {
-            return Ok(None);
+            return Ok(DescribeResult::Unsupported);
         }
 
         let cluster_name = self.cluster_name();
@@ -346,14 +350,14 @@ impl Resource for PodIdentityAssociation {
             });
         let list_output = match list_output {
             Ok(output) => output,
-            Err(IacError::ResourceNotFound { .. }) => return Ok(None),
+            Err(IacError::ResourceNotFound { .. }) => return Ok(DescribeResult::Absent),
             Err(err) => return Err(err),
         };
 
         if let Some(assoc) = list_output.associations().first() {
             let association_id = assoc.association_id().unwrap_or_default().to_string();
             let now = chrono::Utc::now().to_rfc3339();
-            Ok(Some(ResourceState {
+            Ok(DescribeResult::Present(ResourceState {
                 resource_type: ResourceType::new("PodIdentityAssociation"),
                 physical_id: association_id,
                 properties: serde_json::json!({
@@ -367,7 +371,7 @@ impl Resource for PodIdentityAssociation {
                 module: self.module().to_owned(),
             }))
         } else {
-            Ok(None)
+            Ok(DescribeResult::Absent)
         }
     }
 }

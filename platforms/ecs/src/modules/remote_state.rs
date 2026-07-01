@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use tokeira_aws::resources::s3_bucket::{S3Bucket, S3BucketConfig};
 use tokeira_iac::{
-    IacError, InternalChange, Module, ModuleContext, ProvisionContext, Resource, ResourceId,
-    ResourceState, ResourceType,
+    DescribeResult, IacError, InternalChange, Module, ModuleContext, ProvisionContext, Resource,
+    ResourceId, ResourceState, ResourceType,
 };
 
 use crate::{config::EcsConfig, state_bucket_name, state_key_prefix};
@@ -90,7 +90,7 @@ impl Resource for RemoteStateBucket {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         self.inner.describe(ctx).await
     }
 

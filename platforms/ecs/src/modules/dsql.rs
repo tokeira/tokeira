@@ -10,8 +10,8 @@ use tokeira_aws::{
     },
 };
 use tokeira_iac::{
-    IacError, InternalChange, Module, ModuleContext, ProvisionContext, Resource, ResourceId,
-    ResourceState, ResourceType,
+    DescribeResult, IacError, InternalChange, Module, ModuleContext, ProvisionContext, Resource,
+    ResourceId, ResourceState, ResourceType,
 };
 
 use crate::config::{DsqlClusterMode, DsqlConfig, EcsConfig};
@@ -220,8 +220,8 @@ impl Resource for AdoptedDsqlResource {
         Ok(())
     }
 
-    async fn describe(&self, _ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
-        Ok(Some(self.state()))
+    async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
+        Ok(DescribeResult::Present(self.state()))
     }
 
     fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
@@ -417,11 +417,14 @@ impl Resource for DsqlIamRoleResource {
         role.delete(current, ctx).await
     }
 
-    async fn describe(&self, _ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
-        Ok(self
-            .preexisting_role_arn
-            .as_deref()
-            .map(|role_arn| self.preexisting_state(role_arn)))
+    async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
+        // A preexisting (adopted) role describes from config; a managed role has
+        // no provider query here, so its existence is Unsupported rather than a
+        // confirmed Absent — the engine must not prune/skip on this.
+        Ok(match self.preexisting_role_arn.as_deref() {
+            Some(role_arn) => DescribeResult::Present(self.preexisting_state(role_arn)),
+            None => DescribeResult::Unsupported,
+        })
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {

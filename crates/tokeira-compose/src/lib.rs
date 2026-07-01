@@ -197,9 +197,11 @@ impl iac::Resource for ComposeService {
     async fn describe(
         &self,
         ctx: &iac::ProvisionContext,
-    ) -> Result<Option<iac::ResourceState>, iac::IacError> {
+    ) -> Result<iac::DescribeResult, iac::IacError> {
+        // Without the live ComposePlatform handle we cannot query Docker, so
+        // existence is unknown rather than confirmed absent.
         let Some(platform) = ctx.extension::<ComposePlatform>() else {
-            return Ok(None);
+            return Ok(iac::DescribeResult::Unsupported);
         };
         match platform.running_service(&self.name).await? {
             Some(mut service) => {
@@ -212,7 +214,7 @@ impl iac::Resource for ComposeService {
                 {
                     service.image = stale_digest;
                 }
-                Ok(Some(iac::ResourceState {
+                Ok(iac::DescribeResult::Present(iac::ResourceState {
                     resource_type: iac::ResourceType::new("compose_service"),
                     physical_id: service.name.clone(),
                     properties: service.to_manifest(),
@@ -222,7 +224,7 @@ impl iac::Resource for ComposeService {
                     module: self.name.clone(),
                 }))
             }
-            None => Ok(None),
+            None => Ok(iac::DescribeResult::Absent),
         }
     }
 

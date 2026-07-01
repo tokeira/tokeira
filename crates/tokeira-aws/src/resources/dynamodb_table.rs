@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -585,7 +586,7 @@ impl Resource for DynamoDbTable {
         self.wait_until_deleted(ctx).await
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let name = &self.table_name;
 
         match ctx
@@ -657,7 +658,7 @@ impl Resource for DynamoDbTable {
                         _ => None,
                     });
                 let now = chrono::Utc::now().to_rfc3339();
-                Ok(Some(ResourceState {
+                Ok(DescribeResult::Present(ResourceState {
                     resource_type: ResourceType::new("DynamoDbTable"),
                     physical_id: arn,
                     properties: serde_json::json!({
@@ -675,7 +676,7 @@ impl Resource for DynamoDbTable {
             Err(e) => {
                 let svc_err = e.into_service_error();
                 if svc_err.is_resource_not_found_exception() {
-                    Ok(None)
+                    Ok(DescribeResult::Absent)
                 } else {
                     Err(IacError::AwsSdk(format!(
                         "dynamodb:DescribeTable: {svc_err}"

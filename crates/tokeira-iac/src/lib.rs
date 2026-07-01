@@ -96,6 +96,36 @@ pub struct ResourceState {
     pub module: String,
 }
 
+/// Outcome of a [`Resource::describe`] call.
+///
+/// `describe` must distinguish "I queried the provider and the resource is
+/// genuinely absent" from "I could not determine the resource's existence".
+/// The engine treats these very differently:
+///
+/// - On [`Absent`](Self::Absent) the engine prunes the resource from persisted
+///   state (refresh) or treats a pending delete as already done.
+/// - On [`Unsupported`](Self::Unsupported) the engine **refuses to prune** and,
+///   when deleting, drives [`Resource::delete`] from the persisted state rather
+///   than skipping it. A resource whose `describe` cannot confirm absence is
+///   therefore never silently orphaned.
+///
+/// Return [`Unsupported`] from any path that yields "not found" without a real
+/// provider query confirming absence — an unimplemented/stub `describe`, or an
+/// early return because a prerequisite (physical id, dependency) is missing
+/// from local state. Reserve [`Absent`] for a provider query that positively
+/// reported the resource does not exist.
+#[derive(Debug, Clone)]
+pub enum DescribeResult {
+    /// The provider returned live state for the resource.
+    Present(ResourceState),
+    /// A provider query positively confirmed the resource does not exist.
+    Absent,
+    /// The resource's existence could not be determined (no describe support,
+    /// or a prerequisite for the provider query was unavailable). Persisted
+    /// state is authoritative; the engine must not prune on this outcome.
+    Unsupported,
+}
+
 /// Marker extension registered in [`ProvisionContext`] during destroy operations.
 ///
 /// Modules can inspect this via [`ModuleContext::extension`] to include
@@ -335,9 +365,12 @@ impl Default for ProvisionContext {
 /// - [`resource_id`](Self::resource_id) must be stable across runs.
 /// - [`dependencies`](Self::dependencies) should reference resource IDs, not
 ///   module names.
-/// - [`describe`](Self::describe) should return the live provider state when it
-///   can be read cheaply and safely; return `Ok(None)` only when the resource is
-///   absent.
+/// - [`describe`](Self::describe) returns a [`DescribeResult`]: `Present` with
+///   live provider state, `Absent` when a provider query confirms the resource
+///   does not exist, or `Unsupported` when existence cannot be determined (stub
+///   describe, or a missing prerequisite for the query). Never return `Absent`
+///   without a provider query confirming absence — the engine prunes state on
+///   `Absent`, so a wrong `Absent` silently orphans a live resource.
 /// - [`diff`](Self::diff) is a local comparison against current state. It should
 ///   avoid side effects and should explain update reasons in the `details`
 ///   string when possible.
@@ -369,7 +402,7 @@ pub trait Resource: Send + Sync {
     async fn describe(
         &self,
         ctx: &ProvisionContext,
-    ) -> Result<Option<ResourceState>, error::IacError>;
+    ) -> Result<DescribeResult, error::IacError>;
     fn diff(&self, current: &ResourceState, ctx: &ProvisionContext) -> InternalChange;
 }
 

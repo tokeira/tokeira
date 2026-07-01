@@ -2,7 +2,8 @@ use std::{collections::HashMap, time::Duration};
 
 use aws_sdk_dsql::client::Waiters as DsqlWaiters;
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -523,16 +524,16 @@ impl Resource for DsqlCluster {
         }
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         match self.config.mode {
             DsqlClusterMode::Preexisting => {
                 let endpoint = self.config.preexisting_endpoint.clone().unwrap_or_default();
                 let arn = self.config.preexisting_arn.clone().unwrap_or_default();
                 if endpoint.is_empty() && arn.is_empty() {
-                    return Ok(None);
+                    return Ok(DescribeResult::Unsupported);
                 }
                 let now = chrono::Utc::now().to_rfc3339();
-                Ok(Some(ResourceState {
+                Ok(DescribeResult::Present(ResourceState {
                     resource_type: ResourceType::new("DsqlCluster"),
                     physical_id: if !arn.is_empty() {
                         arn.clone()
@@ -555,7 +556,7 @@ impl Resource for DsqlCluster {
             DsqlClusterMode::Managed => {
                 let current = ctx.state.resources.get(&self.resource_id());
                 let Some(cluster_id) = self.resolve_identifier(current) else {
-                    return Ok(None);
+                    return Ok(DescribeResult::Unsupported);
                 };
 
                 let cluster = match ctx
@@ -572,7 +573,7 @@ impl Resource for DsqlCluster {
                         let svc_err = e.into_service_error();
                         let msg = format!("{svc_err}");
                         if msg.contains("ResourceNotFoundException") {
-                            return Ok(None);
+                            return Ok(DescribeResult::Absent);
                         }
                         return Err(IacError::AwsSdk(format!("dsql:GetCluster: {svc_err}")));
                     }
@@ -581,7 +582,7 @@ impl Resource for DsqlCluster {
                 let endpoint = cluster.endpoint().unwrap_or_default().to_string();
                 let arn = cluster.arn().to_string();
                 let now = chrono::Utc::now().to_rfc3339();
-                Ok(Some(ResourceState {
+                Ok(DescribeResult::Present(ResourceState {
                     resource_type: ResourceType::new("DsqlCluster"),
                     physical_id: cluster_id.clone(),
                     properties: serde_json::json!({

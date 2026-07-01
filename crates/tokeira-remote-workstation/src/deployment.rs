@@ -274,9 +274,9 @@ impl Resource for LocalStateResource {
     async fn describe(
         &self,
         _ctx: &iac::ProvisionContext,
-    ) -> Result<Option<iac::ResourceState>, iac::IacError> {
+    ) -> Result<iac::DescribeResult, iac::IacError> {
         if self.state_dir.exists() {
-            Ok(Some(iac::ResourceState {
+            Ok(iac::DescribeResult::Present(iac::ResourceState {
                 resource_type: self.resource_type(),
                 physical_id: self.state_dir.display().to_string(),
                 properties: serde_json::json!({}),
@@ -286,7 +286,9 @@ impl Resource for LocalStateResource {
                 updated_at: chrono::Utc::now().to_rfc3339(),
             }))
         } else {
-            Ok(None)
+            // `exists()` is a real existence check of the managed state dir, so
+            // a negative result is a confirmed Absent.
+            Ok(iac::DescribeResult::Absent)
         }
     }
 

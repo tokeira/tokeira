@@ -14,7 +14,8 @@ use aws_sdk_ec2::{
     },
 };
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -257,14 +258,14 @@ impl Resource for Ec2Instance {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let physical_id = ctx
             .get_resource_state(&self.resource_id())
             .ok()
             .map(|s| s.physical_id.clone());
 
         let Some(instance_id) = physical_id else {
-            return Ok(None);
+            return Ok(DescribeResult::Unsupported);
         };
 
         let clients = ctx.extension::<crate::AwsClients>().expect("AwsClients");
@@ -292,10 +293,10 @@ impl Resource for Ec2Instance {
                             .unwrap_or_default();
 
                         if state == "terminated" {
-                            return Ok(None);
+                            return Ok(DescribeResult::Absent);
                         }
 
-                        Ok(Some(ResourceState {
+                        Ok(DescribeResult::Present(ResourceState {
                             resource_type: self.resource_type(),
                             physical_id: instance_id,
                             properties: serde_json::json!({
@@ -308,13 +309,13 @@ impl Resource for Ec2Instance {
                             updated_at: chrono::Utc::now().to_rfc3339(),
                         }))
                     }
-                    None => Ok(None),
+                    None => Ok(DescribeResult::Absent),
                 }
             }
             Err(e) => {
                 let msg = format!("{}", e.into_service_error());
                 if msg.contains("InvalidInstanceID.NotFound") {
-                    Ok(None)
+                    Ok(DescribeResult::Absent)
                 } else {
                     Err(IacError::AwsSdk(format!(
                         "failed to describe instance {instance_id}: {msg}"

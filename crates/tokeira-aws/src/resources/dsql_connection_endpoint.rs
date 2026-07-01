@@ -1,7 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -199,7 +200,7 @@ impl Resource for DsqlConnectionEndpoint {
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
         let tags = ctx.resource_tags(&self.endpoint_tag_name());
 
-        if let Some(existing) = self.describe(ctx).await? {
+        if let DescribeResult::Present(existing) = self.describe(ctx).await? {
             tracing::warn!(
                 resource = %self.resource_id().0,
                 endpoint = %existing.physical_id,
@@ -445,9 +446,9 @@ impl Resource for DsqlConnectionEndpoint {
         }
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let Some(vpc_state) = ctx.state.resources.get(&self.config.vpc_dependency) else {
-            return Ok(None);
+            return Ok(DescribeResult::Unsupported);
         };
         let vpc_id = vpc_state
             .properties
@@ -461,7 +462,7 @@ impl Resource for DsqlConnectionEndpoint {
             .resources
             .get(&self.config.dsql_cluster_dependency)
         else {
-            return Ok(None);
+            return Ok(DescribeResult::Unsupported);
         };
         let cluster_id = Self::dsql_cluster_identifier(dsql_state).ok_or_else(|| {
             IacError::StateNotFound("cluster_id/cluster_endpoint not found in DSQL state".into())
@@ -488,12 +489,12 @@ impl Resource for DsqlConnectionEndpoint {
             });
         let svc = match svc {
             Ok(svc) => svc,
-            Err(IacError::ResourceNotFound { .. }) => return Ok(None),
+            Err(IacError::ResourceNotFound { .. }) => return Ok(DescribeResult::Absent),
             Err(err) => return Err(err),
         };
         let service_name = svc.service_name().to_string();
         if service_name.is_empty() {
-            return Ok(None);
+            return Ok(DescribeResult::Unsupported);
         }
 
         let out = ctx
@@ -528,7 +529,7 @@ impl Resource for DsqlConnectionEndpoint {
         });
 
         let Some(ep) = ep else {
-            return Ok(None);
+            return Ok(DescribeResult::Absent);
         };
         let endpoint_id = ep.vpc_endpoint_id().unwrap_or_default().to_string();
         let cluster_vpc_endpoint = svc.cluster_vpc_endpoint().unwrap_or_default().to_string();
@@ -544,7 +545,7 @@ impl Resource for DsqlConnectionEndpoint {
         };
         let now = chrono::Utc::now().to_rfc3339();
 
-        Ok(Some(ResourceState {
+        Ok(DescribeResult::Present(ResourceState {
             resource_type: ResourceType::new("DsqlConnectionEndpoint"),
             physical_id: endpoint_id.clone(),
             properties: serde_json::json!({

@@ -102,9 +102,9 @@ impl iac::Resource for LocalStateResource {
     async fn describe(
         &self,
         _ctx: &iac::ProvisionContext,
-    ) -> Result<Option<iac::ResourceState>, iac::IacError> {
+    ) -> Result<iac::DescribeResult, iac::IacError> {
         if self.state_dir.exists() {
-            Ok(Some(iac::ResourceState {
+            Ok(iac::DescribeResult::Present(iac::ResourceState {
                 resource_type: iac::ResourceType::new("local_state_dir"),
                 physical_id: self.state_dir.display().to_string(),
                 properties: serde_json::json!({ "path": self.state_dir }),
@@ -114,7 +114,8 @@ impl iac::Resource for LocalStateResource {
                 module: "local-state".into(),
             }))
         } else {
-            Ok(None)
+            // `exists()` is a real check of the managed state dir → confirmed Absent.
+            Ok(iac::DescribeResult::Absent)
         }
     }
 
@@ -393,14 +394,16 @@ impl iac::Resource for OwnedComposeResource {
     async fn describe(
         &self,
         ctx: &iac::ProvisionContext,
-    ) -> Result<Option<iac::ResourceState>, iac::IacError> {
+    ) -> Result<iac::DescribeResult, iac::IacError> {
+        // Re-tag the inner resource's live state with this wrapper's module and
+        // dependencies; pass Absent / Unsupported through unchanged.
         match self.service.describe(ctx).await? {
-            Some(mut state) => {
+            iac::DescribeResult::Present(mut state) => {
                 state.module = self.module_name.clone();
                 state.dependencies = self.dependencies();
-                Ok(Some(state))
+                Ok(iac::DescribeResult::Present(state))
             }
-            None => Ok(None),
+            other => Ok(other),
         }
     }
 

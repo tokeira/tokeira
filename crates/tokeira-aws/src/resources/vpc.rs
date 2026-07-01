@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -583,7 +584,7 @@ impl Resource for VpcResource {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let vpc_name = format!("{}-vpc", self.project);
 
         // ec2:DescribeVpcs with tag filter Name={project}-vpc
@@ -606,7 +607,7 @@ impl Resource for VpcResource {
 
         let vpcs = desc_output.vpcs();
         if vpcs.is_empty() {
-            return Ok(None);
+            return Ok(DescribeResult::Absent);
         }
 
         let vpc = &vpcs[0];
@@ -687,7 +688,7 @@ impl Resource for VpcResource {
             })
             .unwrap_or_default();
 
-        Ok(Some(ResourceState {
+        Ok(DescribeResult::Present(ResourceState {
             resource_type: ResourceType::new("Vpc"),
             physical_id: vpc_id.clone(),
             properties: serde_json::json!({

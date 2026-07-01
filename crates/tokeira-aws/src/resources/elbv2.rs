@@ -5,7 +5,8 @@ use aws_sdk_elasticloadbalancingv2::types::{
     Matcher, ProtocolEnum, RuleCondition, TargetTypeEnum,
 };
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -168,7 +169,7 @@ impl Resource for AlbResource {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        if let Some(existing) = self.describe(ctx).await? {
+        if let DescribeResult::Present(existing) = self.describe(ctx).await? {
             self.wait_until_active(&existing.physical_id, ctx).await?;
             return Ok(existing);
         }
@@ -250,7 +251,7 @@ impl Resource for AlbResource {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let output = match ctx
             .extension::<crate::AwsClients>()
             .expect("AwsClients")
@@ -265,18 +266,19 @@ impl Resource for AlbResource {
                 let svc_err = e.into_service_error();
                 let message = format!("{svc_err}");
                 if Self::is_not_found(&message) {
-                    return Ok(None);
+                    return Ok(DescribeResult::Absent);
                 }
                 return Err(IacError::AwsSdk(format!(
                     "elbv2:DescribeLoadBalancers: {svc_err}"
                 )));
             }
         };
-        output
-            .load_balancers()
-            .first()
-            .map(|load_balancer| self.state_from_load_balancer(load_balancer, ctx))
-            .transpose()
+        match output.load_balancers().first() {
+            Some(load_balancer) => Ok(DescribeResult::Present(
+                self.state_from_load_balancer(load_balancer, ctx)?,
+            )),
+            None => Ok(DescribeResult::Unsupported),
+        }
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
@@ -369,7 +371,7 @@ impl Resource for AlbTargetGroupResource {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        if let Some(existing) = self.describe(ctx).await? {
+        if let DescribeResult::Present(existing) = self.describe(ctx).await? {
             return Ok(existing);
         }
 
@@ -442,7 +444,7 @@ impl Resource for AlbTargetGroupResource {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let output = match ctx
             .extension::<crate::AwsClients>()
             .expect("AwsClients")
@@ -457,18 +459,19 @@ impl Resource for AlbTargetGroupResource {
                 let svc_err = e.into_service_error();
                 let message = format!("{svc_err}");
                 if Self::is_not_found(&message) {
-                    return Ok(None);
+                    return Ok(DescribeResult::Absent);
                 }
                 return Err(IacError::AwsSdk(format!(
                     "elbv2:DescribeTargetGroups: {svc_err}"
                 )));
             }
         };
-        output
-            .target_groups()
-            .first()
-            .map(|target_group| self.state_from_target_group(target_group, ctx))
-            .transpose()
+        match output.target_groups().first() {
+            Some(target_group) => Ok(DescribeResult::Present(
+                self.state_from_target_group(target_group, ctx)?,
+            )),
+            None => Ok(DescribeResult::Unsupported),
+        }
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
@@ -619,7 +622,7 @@ impl Resource for AlbListenerResource {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        if let Some(existing) = self.describe(ctx).await? {
+        if let DescribeResult::Present(existing) = self.describe(ctx).await? {
             return Ok(existing);
         }
 
@@ -730,10 +733,10 @@ impl Resource for AlbListenerResource {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let alb_state = match ctx.get_resource_state(&self.alb_dependency) {
             Ok(state) => state,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(DescribeResult::Unsupported),
         };
         let output = match ctx
             .extension::<crate::AwsClients>()
@@ -749,7 +752,7 @@ impl Resource for AlbListenerResource {
                 let svc_err = e.into_service_error();
                 let message = format!("{svc_err}");
                 if Self::is_not_found(&message) {
-                    return Ok(None);
+                    return Ok(DescribeResult::Absent);
                 }
                 return Err(IacError::AwsSdk(format!(
                     "elbv2:DescribeListeners: {svc_err}"
@@ -763,7 +766,10 @@ impl Resource for AlbListenerResource {
         });
         Ok(listener
             .and_then(|listener| listener.listener_arn())
-            .map(|listener_arn| self.state(listener_arn.to_owned(), None, None)))
+            .map(|listener_arn| {
+                DescribeResult::Present(self.state(listener_arn.to_owned(), None, None))
+            })
+            .unwrap_or(DescribeResult::Unsupported))
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {

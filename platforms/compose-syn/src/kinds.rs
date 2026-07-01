@@ -207,8 +207,13 @@ impl iac::Resource for LocalStateDirResource {
     async fn describe(
         &self,
         _ctx: &iac::ProvisionContext,
-    ) -> Result<Option<iac::ResourceState>, iac::IacError> {
-        Ok(self.state_dir.exists().then(|| self.state()))
+    ) -> Result<iac::DescribeResult, iac::IacError> {
+        // `exists()` is a real check of the managed state dir → confirmed Absent.
+        Ok(if self.state_dir.exists() {
+            iac::DescribeResult::Present(self.state())
+        } else {
+            iac::DescribeResult::Absent
+        })
     }
 
     fn diff(

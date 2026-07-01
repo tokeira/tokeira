@@ -89,7 +89,7 @@ mod tests {
         async fn describe(
             &self,
             _ctx: &ProvisionContext,
-        ) -> Result<Option<ResourceState>, IacError> {
+        ) -> Result<crate::DescribeResult, IacError> {
             unimplemented!()
         }
         fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {

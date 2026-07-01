@@ -27,8 +27,12 @@ Four ideas carry the design, in order of weight:
 3. **The mutating binary is the bound binary.** The operator drives lifecycle through `tkr`, but `tkr`
    resolves and runs the deployment's stamped `tkp` — so the bytes that mutate a deployment are exactly
    the bytes its integrity manifest names.
-4. **Rollback is undo-the-plan, not reverse-migration.** An upgrade is a recorded plan; rollback applies
-   its inverse (by the binary that authored it), then the prior binary re-asserts its config.
+4. **Rollback forward-reconciles toward the retained prior configuration revision, not an inverse of what
+   the upgrade committed** (Proposal 002). The prior revision is a deterministic, hermetic definition that
+   is already retained; rollback restores it and lets the forward engine reconcile toward it. The
+   superseded binary B deletes what it created (delete is already state-driven, so no recorded
+   before-images are needed), the binding re-pins to A, and A observes live state (`refresh_state`) and
+   forward-applies its retained prior revision — never reinterpreting B's recorded state.
 
 Scope is the minimal foundational set: provenance, binding, integrity, the upgrade/migration boundary,
 rollback, and binary retention for S3 state. Out of scope (follow-on): automated binary self-update,
@@ -68,17 +72,21 @@ triple — not a new engine capability:
 |-----------|---------|-------|--------|
 | `apply` | current config → resources | live | the bound binary |
 | `upgrade` | new (B) config → resources | live | candidate B |
-| `rollback` — undo | inverse of B's recorded upgrade plan | live (`S_B`) | superseded B |
-| `rollback` — reconcile | checkpoint (A) config → resources | restored `S_A` | prior A |
+| `rollback` — undo | ∅ (delete B's creations: `keys(S_B) − keys(S_A)`) | live (`S_B`) | superseded B |
+| `rollback` — reconcile | retained prior revision `R_a` → resources | live (observed via `refresh_state`) | prior A |
 
 One invariant governs *which binary* applies a given Delta:
 
-> **A binary reverses only the changes it made, and reads only state it authored.**
+> **A binary drives only changes over a config/state representation it authored; it may observe shared
+> live infrastructure, but never reinterprets another binary's recorded state.**
 
-This is why `rollback` is two operations: an upgrade plan applied by B can only be reversed by B (the same
-resource implementations and dependency versions that applied a change are required to reverse it), and
-the prior binary A re-asserts its own config afterward. Identity-key arithmetic (`keys(S_B) − keys(S_A)`)
-is the only permitted cross-version comparison, because it compares `ResourceId`s, never state bodies.
+This is why `rollback` is two operations (Proposal 002): the superseded binary B **deletes what it
+created** — a delete-only Delta over `keys(S_B) − keys(S_A)`, which needs no recorded before-images
+because delete is already state-driven and B alone can name its own kinds; then the binding re-pins to A,
+and A observes live state and **forward-applies its retained prior configuration revision `R_a`**,
+reconciling B's remaining updates and re-creations from A's own config. Identity-key arithmetic
+(`keys(S_B) − keys(S_A)`) is the only cross-version comparison, because it compares `ResourceId`s, never
+state bodies; A never reads B's recorded state, only live infrastructure it can `describe`.
 
 ## Versioning and binding
 
@@ -153,10 +161,15 @@ stamping stays reliable on both without a profusion of `tkp` builds. The split a
 - `upgrade` — a new *engine* identity → the gated transition, migration, and checkpoint. Rare, and only
   for a genuine behavioral code change.
 
-**This also bounds the heavy rollback.** The two-binary inverse-plan rollback is needed only across an
-*engine* transition. Reverting a bad *configuration* change is an ordinary same-engine `apply` of the
-prior config revision — one binary, no checkpoint, no inverse-plan — because the engine is unchanged and
-owns the whole plan. (A `tkp` verb may revert to a recorded prior config revision directly.)
+**This also bounds the heavy rollback.** The two-binary rollback is needed only across an *engine*
+transition. Reverting a bad *configuration* change is an ordinary same-engine `apply` of the prior
+config revision — one binary, no checkpoint — because the engine is unchanged and owns the whole plan.
+Config has no engine-managed restorable state of its own: the desired config is the operator's source of
+truth, so a "config revert" is just applying the prior config revision, not an engine verb that would
+compete with that source and be silently undone by the next ordinary apply. Proposal 002 generalizes
+exactly this reasoning to the engine-upgrade case: since the prior configuration revision is retained and
+the definition is deterministic, upgrade rollback too is a *forward apply of the retained prior revision*
+(after B deletes its creations and the binding re-pins to A) — not a recorded-delta inversion.
 
 **The boundary, stated honestly.** This works to the extent platform definition is *configuration (data)*
 rather than *compiled code*. A genuine resource-*implementation* change — a new resource kind, changed
@@ -165,6 +178,30 @@ exactly what the binding and rollback fidelity protect. The design's lever is th
 platform desired-state definition declaratively (as config the bound binary reads) wherever possible, so
 that everyday refinement is a plan rather than a rebuild; reserve `tkp` rebuilds for behavioral changes;
 and use a `dev` deployment for active platform-*code* development.
+
+### Configuration realization: the `.tkd` interpreter
+
+The configuration-revision axis above is realized concretely by the **rust-via-`syn` `.tkd` interpreter**
+(platform-config-dsl Proposal 004; prototyped in `platforms/compose-syn`). A deployment's platform
+*structure* — its modules, services, wiring, and knobs — is authored in a small Rust subset (`.tkd`),
+parsed and interpreted by the bound `tkp` at runtime into a `Deployment` the engine applies. That is what
+places platform structure on the **config-revision** axis rather than the engine-identity one: editing the
+`.tkd` is an ordinary `apply` (the engine converges to a new desired shape), not a `tkp` rebuild.
+
+Two reinforcements of the binding model:
+
+- **The interpreter, the builder vocabulary, and the kind library are engine identity** — compiled into
+  `tkp`, covered by `source_tree_hash`. A genuine resource-implementation change (a new kind, changed
+  `realize`/apply logic) perturbs the hash and correctly mints a version; the `.tkd` cannot.
+- **The interpreted subset *enforces* the binding invariant.** A reject-by-default allow-list lets a `.tkd`
+  only *name* the versioned vocabulary — it cannot define a new resource kind, perform I/O, or alter apply
+  logic. So a `.tkd` edit is structurally incapable of becoming an engine-identity change; the gate's
+  guarantee holds by construction, not policy. (Create-time-immutable inputs are marked `#[create]` and
+  enforced as a config-revision constraint, orthogonal to the engine binding.)
+
+The operator path is therefore `tkr … use <name>` → forward verb to the bound `tkp` → `tkp` loads +
+interprets the deployment's `.tkd` → adapts it to `tokeira_orchestrator::Deployment` → the Delta engine
+applies — with the `.tkd` as the config revision the bound binary reads.
 
 ## Command surfaces and launch classes
 
@@ -203,35 +240,68 @@ exactly the one the manifest records — that is the structural binding guarante
 The engine plans and applies create/update/delete; that machinery is unchanged and does the heavy
 lifting. Upgrade and rollback add only orchestration on top of it.
 
-**Upgrade** records a `RollbackCheckpoint`, runs any migration the *state-schema* transition requires
-(not every source change — a new digest at the same schema is a re-stamp), advances the recorded stamp,
-and applies B's plan. It is the only verb that authoritatively advances the recorded version. It refuses a
-downgrade, a same-semver/different-hash apply (a forgotten version bump), an unbridged schema migration,
-and re-stamping a deployment back to `dev`.
+**Binding is two-valued; an operation marker carries "in flight."** The recorded binding names exactly the
+binary authorized to operate — `A` *or* `B`, never a third "pending" value. Whether an upgrade or
+rollback is mid-flight is a separate **operation marker** (`UpgradeInFlight | RollbackInFlight | none`)
+recording the phase and resumable progress (and, optionally, an ids-only audit change log — never
+before-images). The marker — not the binding — gates the deployment to
+`resume`/`rollback`/`describe` while an operation is open; the remote operation lock provides mutual
+exclusion. Splitting these two concerns removes any ambiguous binding state.
 
-**Rollback** is *undo the upgrade's plan, then reconcile* — two operations with a sharp division of
-responsibility:
+**Upgrade transfers ownership atomically, *before* mutating.** The first act of `upgrade` is a single CAS
+commit that, together: flips the binding to **B**, captures a clone of **[A final]** as the checkpoint
+(A's snapshot + provenance + integrity manifest + config ref + retained-binary ref), and opens
+`UpgradeInFlight`. Only after that commit does B touch the provider. So the recorded binding is *always*
+the binary doing the work — a crash at any point recovers as B (recovery reads binding = B plus the open
+marker, and resumes or rolls back); A never runs against B-shaped infrastructure. B then runs any
+state-schema migration and applies its plan. It MAY record an **ids-only change log** (`id + op`) for
+audit and richer `plan`/`describe` output — but rollback needs **no before-images**, because it restores
+A's retained prior configuration revision, not an inverse of what B committed (Proposal 002). The marker
+closes on success. Upgrade is the only verb that authoritatively advances the
+recorded version; it refuses a downgrade, a same-semver/different-hash apply (a forgotten version bump),
+an unbridged schema migration, and re-stamping back to `dev`.
 
-- **Undo — B reverses *all* of its own changes.** The upgrade was a plan; B applies its inverse: delete
-  what it created, revert what it updated (to the checkpoint state), and re-create what it deleted (from
-  the checkpoint state). **Only B can.** Reversing a change requires the same resource implementation and
-  dependency versions that applied it — if B updated a resource through, say, a newer AWS SDK crate than A
-  carries, A's older code may be unable to read, diff, or revert it. B is therefore responsible for the
-  complete inverse of its plan, restoring live infrastructure *and* state to the checkpoint `S_A`. It runs
-  before the re-pin (after which B is refused).
-- **Reconcile — A re-asserts its own config.** Re-pinned, A runs its ordinary plan/apply against the
-  restored checkpoint, confirming its authority and converging any residual difference between the
-  checkpoint and A's current config. After B's full undo this is typically a confirming pass; A only ever
-  operates on checkpoint state A authored, never on a B-shaped resource.
+**The rollback baseline is the retained prior configuration revision `R_a`** — a deterministic, hermetic
+definition retained at upgrade (Proposal 002), not a set of recorded before-images. As a stricter option
+an upgrade MAY first compare live against the recorded [A final] and **refuse-and-surface** material drift
+("reconcile before upgrading"); this baseline gate is **advisory** — a cross-version consistency check,
+never a licence for B to authoritatively reconcile A's drift, which would breach the authorship discipline.
 
-This honors the authorship invariant on both sides: B reverses only what B did; A re-asserts only A's
-config. Migrations stay forward-only — rollback restores the retained checkpoint, never reverse-migrates.
+**Rollback deletes B's creations, re-pins to A, then A forward-reconciles toward `R_a`** — two
+operations, sharp division of responsibility (Proposal 002):
 
-**Resumable, not atomic.** Live infrastructure is not transactional: a delete can succeed and the next
-fail, or the process can crash between the undo and the re-pin. So rollback checks all preconditions
-before any destructive work, holds the remote operation lock across the whole undo → re-pin → reconcile
-sequence, and records progress in a durable `RollbackOperation` marker so an interruption resumes rather
-than leaving a half-rolled-back deployment.
+- **Undo — B deletes what it created.** B removes the resources it added (`keys(S_B) − keys(S_A)`,
+  recorded as *ids only*), in reverse dependency order, fail-closed and idempotent (absent ⇒ done). This
+  reuses the existing state-driven `delete` path, so it needs **no new capability and no before-images**.
+  **Only B can** delete resources of **B-introduced kinds** — kinds A cannot even name (Req 10
+  fail-closed) — which is precisely why B, not A, performs this step. B reads only its own recorded
+  id-set, never A's state.
+- **Re-pin + reconcile — A re-applies its retained revision over live.** Re-pinning to A is the symmetric
+  atomic commit (binding → A, marker closed). A then runs `refresh_state` to **observe live provider
+  truth itself** and forward-applies `R_a` — updating resources B modified back to `R_a`'s desired,
+  re-creating resources B deleted (ordinary `create`; *new/empty* for stateful kinds — see limitations),
+  and deleting anything still present but absent from `R_a` via the `known`-not-`desired` split. A never
+  reinterprets B's recorded state; it observes shared live infrastructure and drives it to its own config.
+
+This honors the (re-scoped) authorship invariant: B drives only deletions of ids it recorded; A drives
+only its own config over live state it observes by `describe`; neither reinterprets the other's recorded
+state representation. Migrations stay forward-only — rollback restores the retained prior revision, never
+reverse-migrates.
+
+**Resumable, not atomic at the provider.** Live infrastructure is not transactional: a delete can succeed
+and the next fail, or the process can crash mid-sequence. Both upgrade and rollback check preconditions
+before any destructive work, hold the remote operation lock for the whole sequence, and record progress
+in the operation marker (phase + resumable step markers) so an interruption resumes rather than leaving
+a half-applied deployment. Every step is idempotent. Because the binding already names the operating
+binary, a recovering process always relaunches the correct one.
+
+**Scope (decided).** Rollback covers **infrastructure *and* runtime/service state** (services + images),
+not infra-only, spanning both `infra_head` and `runtime_head`. Under Proposal 002 this needs **no
+state-driven-restore**: B deletes the services/images it created (which does require the deploy-engine
+`Platform` to gain a **delete** for a service's running workload — the one genuinely-new runtime surface),
+and A's reconcile re-applies `R_a`'s services through the existing forward `apply_manifests` path (apply
+*is* the state-driven reconcile). No `Service` restore capability and no runtime before-images are
+required — only a platform delete for B's delete-only undo.
 
 **Honest limitations.** Rollback reverts to the checkpoint: state recorded under B after the upgrade is
 not represented — it is recovery, not a merge. A resource B introduced of a kind it can no longer
@@ -286,13 +356,20 @@ S3 binary + config retention is what makes it self-contained.
   itself.
 - **Migration registry** (`tokeira-iac`) — forward-only migrations keyed by state-schema transition; run
   at the upgrade boundary, including the dev → versioned promotion.
-- **Upgrade/rollback orchestration** (`tkp`) — records the checkpoint and the forward plan on upgrade;
-  applies the inverse plan (B) and the reconcile (A) on rollback, under the operation lock and a resumable
-  marker.
-- **`Engine::apply_inverse_plan`** (`tokeira-iac`) — applies the inverse of a recorded plan: delete
-  recorded creates, revert recorded updates to their prior state, re-create recorded deletes from their
-  prior state, over the full current state in inverse dependency order. (`Engine::destroy_selected` — a
-  refs/id-set delete over the full state — is the delete-only sub-case.)
+- **Upgrade/rollback orchestration** (`tkp`) — atomic ownership transfer + checkpoint capture (incl. the
+  prior configuration-revision ref) on upgrade; on rollback, drives B's delete-only undo of its creations,
+  the atomic re-pin to A, and A's forward re-apply of the retained prior revision, under the operation
+  lock and a resumable operation marker (Proposal 002).
+- **Forward-engine replacement + destructive `plan` gating** (`tokeira-iac`) — the engine's diff/apply
+  gains **replacement** (an immutable-field change becomes delete+recreate) and `plan` surfaces
+  destructive changes requiring explicit `--yes`. These are **general apply features** (any immutable
+  change needs them), and they are what makes forward-reconcile rollback correct without a per-kind
+  restore surface. `Engine::destroy_selected` — a refs/id-set delete over the full state — is the
+  delete-only primitive B uses to remove its creations. **Rollback spans runtime/service state**
+  (services + images) as well as infra: B's delete-only undo requires the deploy-engine `Platform` to gain
+  a **service delete**, while A's reconcile re-applies `R_a`'s services through the existing forward
+  `apply_manifests` — no `Service` restore capability and no before-images (Proposal 002 supersedes the
+  `apply_inverse_delta` / state-driven-restore approach of Proposal 001).
 - **Fail-closed delete + authoritative `describe` + composition validation** (`tokeira-iac`) — the three
   framework correctness mechanics described above.
 - **Remote operation lock** (`tokeira-state` + `tkp`) — renewable mutual-exclusion lease.
@@ -315,23 +392,38 @@ S3 binary + config retention is what makes it self-contained.
   the engine distinguishes provider-absent (prune-safe) from not-implemented (must not prune).
 - **MigrationRegistry** — ordered `Migration { from_schema: u32, to_schema: u32, apply }`, keyed by state
   schema, forward-only. A new `source_tree_hash` at the same schema needs no migration.
-- **RecordedPlan** — the forward Delta an `upgrade` applied, with before-images sufficient to invert
-  (full prior `ResourceState` for updated and deleted resources). Inverting yields the rollback undo.
-- **RollbackCheckpoint** — `{ from_provenance: ProvenanceStamp, from_integrity: IntegrityManifest,
-  from_snapshot: SnapshotRef, from_config_ref: Option<String>, recorded_plan: RecordedPlan, recorded_at }`.
-  Carries the full prior integrity manifest (all targets — rollback may run from a different operator
-  platform) and A's config ref (A re-derives its desired from its own config).
-- **RollbackOperation** — `{ operation_id, phase: RollbackPhase, reverted: BTreeSet<ResourceId> }`. The
-  durable resumability marker.
+- **ChangeLog** (optional, audit only) — an **ids-only** record of what an apply committed: per change,
+  `{ id, op: Created | Updated | Deleted }`, **no before-images**. Recorded for observability and richer
+  `plan`/`describe` output; it is **never** the rollback mechanism (Proposal 002, Decision 4). Rollback is
+  driven by the retained prior configuration revision, not by inverting a recorded delta.
+- **RollbackCheckpoint** — the cloned **[A final]**: `{ from_provenance: ProvenanceStamp,
+  from_integrity: IntegrityManifest, from_snapshot: SnapshotRef, from_config_ref: Option<String>,
+  recorded_at }`. Captured atomically at the start of `upgrade`. Carries the full prior integrity manifest
+  (all targets — rollback may run from a different operator platform) and A's config ref — which is now
+  **load-bearing**: rollback restores A's prior configuration revision from `from_config_ref` and
+  forward-reconciles toward it (Proposal 002).
+- **Operation** — the in-flight marker: `{ operation_id, kind: UpgradeInFlight | RollbackInFlight,
+  phase, progress }` (resumable step markers; optionally an ids-only `ChangeLog`, never before-images).
+  While present it gates the deployment to
+  `resume`/`rollback`/`describe`; it records progress so an interrupted upgrade or rollback resumes; it
+  closes on success. `None` in steady state.
 - **OperationLock** — `{ holder, acquired_at, renewed_at, expires_at, operation }`. The remote
-  mutual-exclusion lease.
+  mutual-exclusion lease (distinct from the operator `lock.toml`).
 - **DeploymentStateEnvelope** — the single deployment-level authority: `{ schema_version, deployment_id,
-  provenance, integrity, config_revision: u64, rollback: Option<RollbackCheckpoint>,
-  lock: Option<OperationLock>, infra_head: SnapshotRef, runtime_head: SnapshotRef,
-  effective_config_ref: Option<String> }`. `provenance` is the engine identity (changes only on an
-  engine upgrade); `config_revision` + `effective_config_ref` are the desired-state identity (incremented
-  by each ordinary `apply`). The two are orthogonal — `describe` reports both. Reconciling this envelope
-  with the active store path is the largest open decision (see Notes in tasks).
+  binding: ProvenanceStamp, integrity, config_revision: u64, checkpoint: Option<RollbackCheckpoint>,
+  operation: Option<Operation>, lock: Option<OperationLock>, infra_head: SnapshotRef,
+  runtime_head: SnapshotRef, effective_config_ref: Option<String> }`. `binding` is **two-valued in
+  practice** — it names exactly the binary authorized to operate (`A` or `B`), flipped atomically by
+  `upgrade`/`rollback`, never a third "pending" value; whether an operation is mid-flight is the separate
+  `operation` marker. `binding` is the engine identity (changes only on upgrade); `config_revision` +
+  `effective_config_ref` are the desired-state identity (incremented by each ordinary `apply`). The two
+  are orthogonal — `describe` reports both. **The envelope is the manifest of `S3StateStore`** (the
+  authoritative remote, snapshot/lease store): its `SnapshotRef` heads, immutable [A final] checkpoint, and
+  `OperationLock` lease are that store's native primitives, which the single-doc `CasStore` cannot hold.
+  `CasStore`-over-`LocalBackend` remains the local/compose dev path; **ECS employs remote-state**
+  (`S3StateStore`), replacing its `CasStore`-over-`S3Backend` single-doc stopgap. The engine state seam is
+  abstracted over both stores so a platform selects its store, not just its backend; the operator-facing
+  `tkr remote-state` toggle is **held** — store choice stays platform-determined (task 13).
 
 ## Binary artifact: size and storage
 
@@ -410,15 +502,27 @@ NOT block it.
 
 **Validates: Requirements 8.2, 8.3**
 
-### Property 9: Rollback reverses only the changes each binary made
+### Property 9: Rollback forward-reconciles toward the retained prior revision; authorship preserved
 
-*For any* `rollback`: the superseded binary B applies the inverse of its recorded upgrade plan (delete its
-creates, revert its updates to the checkpoint state, re-create its deletes from the checkpoint state) over
-state B authored; the prior binary A applies only its own config over the restored checkpoint; neither
-binary reverses a change it did not make. `rollback` aborts if either binary's `sha256` mismatches, holds
-the operation lock across the sequence, and resumes from a durable marker after interruption.
+*For any* `rollback` (Proposal 002): the superseded binary B **deletes the resources it created**
+(`keys(S_B) − keys(S_A)`, ids only, fail-closed, idempotent) — B alone can name its own kinds, and delete
+is already state-driven, so no before-images are read; the binding then re-pins to A atomically; the prior
+binary A observes live state via `refresh_state` and **forward-applies its retained prior configuration
+revision `R_a`**, reconciling B's updates and re-creations from A's own config. Neither binary
+reinterprets the other's recorded state representation (A may observe shared live infrastructure it can
+`describe`). `rollback` aborts if either binary's `sha256` mismatches, holds the operation lock across the
+sequence, and resumes from a durable marker after interruption; every step is idempotent.
 
 **Validates: Requirements 9.2, 9.3, 9.7**
+
+### Property 15: Ownership transfer is atomic; the binding always names the operating binary
+
+*For any* `upgrade`, the binding flips to B in a single commit (with the [A final] checkpoint captured and
+the operation marker opened) *before* any provider mutation; *for any* crash during upgrade or rollback,
+recovery reads a binding that names exactly the binary that was operating — there is no "pending" binding
+under which a different binary could run. (Symmetrically, `rollback` flips the binding to A atomically.)
+
+**Validates: Requirements 4.5**
 
 ### Property 10: A Delete never silently orphans
 
@@ -473,7 +577,9 @@ required, and the `config_revision` SHALL advance. Reverting to a prior config r
 | Upgrade with an unbridged state-schema migration | Refuse; surface the gap (Req 4.3). |
 | `rollback`, missing checkpoint or either binary unavailable/checksum-mismatched | Refuse; instruct the operator to supply the matching binary (Req 9.3). |
 | `rollback`, a B-authored resource kind B can no longer instantiate | Refuse (fail closed); surface it rather than dropping it (Req 9.6). |
-| `rollback` interrupted | Resume from the `RollbackOperation` marker (`phase`, `reverted`); never half-applied silently (Req 9.7). |
+| `upgrade` begins | First act is one atomic CAS commit: binding → B, capture [A final] checkpoint, open the operation marker — *before* any provider mutation; a crash thereafter recovers as B, never A (Req 4). |
+| `upgrade`, live diverges from recorded [A final] | Advisory baseline gate MAY refuse-and-surface ("reconcile before upgrading"); it never lets B authoritatively reconcile A's drift (Req 4). |
+| `upgrade` or `rollback` interrupted | Resume from the operation marker (`phase` + resumable step markers; every step idempotent); the binding already names the operating binary, so recovery relaunches the correct one (Req 9.7). |
 | Delete id absent from `known` | Error; never remove from state without deleting the live resource (Req 10.1). |
 | `describe()` `Unsupported` | Do not prune; drive `delete()` from persisted state or fail (Req 10.3). |
 | Two concurrent mutations of one deployment | Second refuses/waits on the remote operation lock (Req 11). |
@@ -485,14 +591,17 @@ required, and the `config_revision` SHALL advance. Reverting to a prior config r
 ## Testing Strategy
 
 - **Unit:** stamp serialization round-trip; manifest descriptor encode/decode; binding verdict over all
-  mode/hash pairs (incl. `Unknown`); checksum verify pass/fail; inverse-plan construction from a recorded
-  plan.
-- **Property (proptest):** Properties 1–14, tagged to their requirements.
+  mode/hash pairs (incl. `Unknown`); checksum verify pass/fail; forward-engine replacement (immutable-field
+  change → delete+recreate) and destructive-change gating in `plan`; delete-only `destroy_selected` over an
+  id set.
+- **Property (proptest):** Properties 1–15, tagged to their requirements.
 - **Engine/config separation:** a config-only `apply` keeps the binding `Match` and the engine
   `source_tree_hash` unchanged while advancing `config_revision`; reverting to a prior config revision is a
   same-engine apply (no upgrade, no two-binary rollback).
 - **Integration (no live AWS):** against the in-memory CAS store — write-stamp → reopen-with-changed-hash
-  → assert gate; persist + retrieve a binary blob and assert verify/abort; rollback dependency-state test
+  → assert gate; persist + retrieve a binary blob and assert verify/abort; atomic-ownership crash recovery
+  (inject a crash immediately after `upgrade`'s first CAS commit but before any provider mutation, then
+  assert recovery resolves the binding to B and never A — Property 15); rollback dependency-state test
   (a reverted resource reads dependency state from the full snapshot); resumable rollback (crash mid-undo
   resumes from the marker); two-process remote-lock test (second mutation refuses before provider work);
   fail-closed delete and `Unsupported`-describe never prune.

@@ -1,6 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tokeira_iac::{
-    InternalChange, ProvisionContext, Resource, ResourceId, ResourceState, ResourceType,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
+    ResourceType,
     error::IacError,
 };
 
@@ -63,7 +64,7 @@ impl Resource for EcsClusterResource {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        if let Some(existing) = self.describe(ctx).await? {
+        if let DescribeResult::Present(existing) = self.describe(ctx).await? {
             return Ok(existing);
         }
         let service_connect_defaults =
@@ -128,7 +129,7 @@ impl Resource for EcsClusterResource {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let output = ctx
             .extension::<crate::AwsClients>()
             .expect("AwsClients")
@@ -144,7 +145,8 @@ impl Resource for EcsClusterResource {
             .clusters()
             .first()
             .and_then(|cluster| cluster.cluster_arn())
-            .map(|arn| self.state(arn.to_owned())))
+            .map(|arn| DescribeResult::Present(self.state(arn.to_owned())))
+            .unwrap_or(DescribeResult::Absent))
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
@@ -240,7 +242,7 @@ impl Resource for LaunchTemplateResource {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        if let Some(existing) = self.describe(ctx).await? {
+        if let DescribeResult::Present(existing) = self.describe(ctx).await? {
             return Ok(existing);
         }
         let ami_id = self.resolve_ami(ctx).await?;
@@ -309,7 +311,7 @@ impl Resource for LaunchTemplateResource {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let output = match ctx
             .extension::<crate::AwsClients>()
             .expect("AwsClients")
@@ -324,7 +326,7 @@ impl Resource for LaunchTemplateResource {
                 let svc_err = e.into_service_error();
                 let message = format!("{svc_err}");
                 if message.contains("InvalidLaunchTemplateName.NotFound") {
-                    return Ok(None);
+                    return Ok(DescribeResult::Absent);
                 }
                 return Err(IacError::AwsSdk(format!(
                     "ec2:DescribeLaunchTemplates: {svc_err}"
@@ -335,7 +337,10 @@ impl Resource for LaunchTemplateResource {
             .launch_templates()
             .first()
             .and_then(|template| template.launch_template_id())
-            .map(|template_id| self.state(template_id.to_owned(), String::new())))
+            .map(|template_id| {
+                DescribeResult::Present(self.state(template_id.to_owned(), String::new()))
+            })
+            .unwrap_or(DescribeResult::Absent))
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
@@ -402,7 +407,7 @@ impl Resource for AsgResource {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        if let Some(existing) = self.describe(ctx).await? {
+        if let DescribeResult::Present(existing) = self.describe(ctx).await? {
             return Ok(existing);
         }
         let lt_state = ctx.get_resource_state(&self.launch_template_dependency)?;
@@ -469,7 +474,7 @@ impl Resource for AsgResource {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let output = ctx
             .extension::<crate::AwsClients>()
             .expect("AwsClients")
@@ -484,13 +489,17 @@ impl Resource for AsgResource {
                     e.into_service_error()
                 ))
             })?;
-        Ok(output.auto_scaling_groups().first().map(|asg| {
-            self.state(
-                asg.auto_scaling_group_arn()
-                    .unwrap_or(&self.name)
-                    .to_owned(),
-            )
-        }))
+        Ok(output
+            .auto_scaling_groups()
+            .first()
+            .map(|asg| {
+                DescribeResult::Present(self.state(
+                    asg.auto_scaling_group_arn()
+                        .unwrap_or(&self.name)
+                        .to_owned(),
+                ))
+            })
+            .unwrap_or(DescribeResult::Absent))
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
@@ -547,7 +556,7 @@ impl Resource for CapacityProviderResource {
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {
-        if let Some(existing) = self.describe(ctx).await? {
+        if let DescribeResult::Present(existing) = self.describe(ctx).await? {
             return Ok(existing);
         }
         let asg_state = ctx.get_resource_state(&self.asg_dependency)?;
@@ -610,7 +619,7 @@ impl Resource for CapacityProviderResource {
         Ok(())
     }
 
-    async fn describe(&self, ctx: &ProvisionContext) -> Result<Option<ResourceState>, IacError> {
+    async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
         let output = ctx
             .extension::<crate::AwsClients>()
             .expect("AwsClients")
@@ -629,7 +638,8 @@ impl Resource for CapacityProviderResource {
             .capacity_providers()
             .first()
             .and_then(|provider| provider.capacity_provider_arn())
-            .map(|arn| self.state(arn.to_owned())))
+            .map(|arn| DescribeResult::Present(self.state(arn.to_owned())))
+            .unwrap_or(DescribeResult::Absent))
     }
 
     fn diff(&self, _current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {

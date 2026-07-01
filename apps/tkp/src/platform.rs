@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tokeira_compose::ComposePlatform;
+use tokeira_compose::{ComposeError, ComposePlatform};
 use tokeira_compose_syn::adapter::{TkdConfig, TkdDeployment};
 use tokeira_compose_syn::context::Cx;
 use tokeira_iac::{Change, ModuleSelection};
@@ -98,11 +98,53 @@ pub async fn infra_apply(deployment_dir: &Path, project_name: &str) -> Result<us
     }
 }
 
+/// Destroy the infrastructure for the resolved platform. Returns the change count.
+pub async fn infra_destroy(deployment_dir: &Path, project_name: &str) -> Result<usize> {
+    match detect(deployment_dir) {
+        Platform::Local => {
+            destroy_infra(LocalDeployment, load_local_config(deployment_dir)?, deployment_dir).await
+        }
+        Platform::ComposeSyn => {
+            let config = load_tkd_config(deployment_dir, project_name)?;
+            let mut engine = open_compose_syn_engine(config, deployment_dir, true).await?;
+            let composition = engine.compose(ModuleSelection::All)?;
+            let removed = engine
+                .destroy(&composition, ModuleSelection::All)
+                .await
+                .context("infrastructure destroy failed")?;
+            Ok(removed.len())
+        }
+    }
+}
+
+async fn destroy_infra<D: Deployment>(
+    deployment: D,
+    config: D::Config,
+    dir: &Path,
+) -> Result<usize> {
+    let mut engine = InfraEngine::new(deployment, &config, dir)
+        .await
+        .context("failed to open the infrastructure engine")?;
+    let composition = engine.compose(ModuleSelection::All)?;
+    let changes = engine
+        .destroy(&composition, ModuleSelection::All)
+        .await
+        .context("infrastructure destroy failed")?;
+    Ok(changes.len())
+}
+
 /// Open the compose-syn infra engine and register the live-apply Docker handle
 /// that compose-syn's `register_infra_extensions` leaves for `tkp` to provide
-/// (its container resources read `ComposePlatform` from the context). When
-/// `require_docker` is false (plan), a missing Docker is tolerated — a fresh
-/// deployment plans without describing live containers.
+/// (its container resources read `ComposePlatform` from the context).
+///
+/// The handle is registered only when the Docker daemon actually **responds**:
+/// `ComposePlatform::connect` succeeds whenever the socket *file* exists (it does
+/// not ping), so an installed-but-stopped daemon would otherwise be registered
+/// and then fail inside `describe`. We probe with `ensure_reachable` first.
+/// `require_docker` (apply/destroy) errors clearly when the daemon is missing or
+/// unreachable; otherwise (plan) its absence is tolerated — an unregistered
+/// platform makes container `describe` return `Unsupported`, so a fresh
+/// deployment still plans.
 async fn open_compose_syn_engine(
     config: TkdConfig,
     dir: &Path,
@@ -111,18 +153,30 @@ async fn open_compose_syn_engine(
     let mut engine = InfraEngine::new(TkdDeployment, &config, dir)
         .await
         .context("failed to open the infrastructure engine")?;
+
     let compose_file = dir.join("docker-compose.yml");
-    match ComposePlatform::connect(compose_file, &config.cx.project_name) {
-        Ok(platform) => engine.provision_context_mut().set_extension(platform),
-        Err(err) => {
-            if require_docker {
-                return Err(anyhow::anyhow!(err)).context(
-                    "compose-syn apply needs Docker — failed to connect the ComposePlatform",
-                );
-            }
-        }
+    let platform = match ComposePlatform::connect(compose_file, &config.cx.project_name) {
+        Ok(platform) => match platform.ensure_reachable().await {
+            Ok(()) => Some(platform),
+            Err(err) => docker_or_skip(err, require_docker)?,
+        },
+        Err(err) => docker_or_skip(err, require_docker)?,
+    };
+    if let Some(platform) = platform {
+        engine.provision_context_mut().set_extension(platform);
     }
     Ok(engine)
+}
+
+/// Turn a Docker connect/reachability failure into either a hard error (apply /
+/// destroy — the daemon is required) or a tolerated skip (plan).
+fn docker_or_skip(err: ComposeError, require_docker: bool) -> Result<Option<ComposePlatform>> {
+    if require_docker {
+        Err(anyhow::anyhow!(err))
+            .context("compose-syn apply/destroy needs a reachable Docker daemon")
+    } else {
+        Ok(None)
+    }
 }
 
 async fn plan_infra<D: Deployment>(

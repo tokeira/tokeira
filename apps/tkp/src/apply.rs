@@ -17,6 +17,7 @@ use chrono::Utc;
 use tokeira_local_deployment::LocalConfig;
 use tokeira_provisioner::ProvenanceStamp;
 
+use crate::config_history;
 use crate::envelope_store;
 use crate::gate::{GateOutcome, evaluate_gate};
 use crate::platform;
@@ -64,6 +65,10 @@ pub async fn apply(deployment_dir: &Path) -> Result<()> {
     envelope.binding = Some(running);
     envelope.config_revision += 1;
     envelope.effective_config_ref = Some(config_ref(deployment_dir));
+    // Retain this revision's config source so a later `revert` can re-apply it
+    // (task 14.3). Best-effort: a config-less local deployment has nothing to keep.
+    config_history::snapshot(deployment_dir, envelope.config_revision)
+        .context("failed to retain the applied config revision")?;
     store
         .save(&envelope, &version)
         .await

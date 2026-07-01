@@ -29,6 +29,7 @@ use tokeira_provisioner::{
 };
 
 use crate::apply::load_local_config;
+use crate::config_history;
 use crate::envelope_store;
 
 pub async fn init(deployment_dir: &Path) -> Result<()> {
@@ -59,6 +60,9 @@ pub async fn init(deployment_dir: &Path) -> Result<()> {
         .save(&envelope, &version)
         .await
         .context("failed to write the Day-0 stamp")?;
+    // Retain the Day-0 config source as revision 0 so it is revertable (task 14.3).
+    config_history::snapshot(deployment_dir, 0)
+        .context("failed to retain the Day-0 config revision")?;
 
     println!(
         "initialized deployment '{}' — stamped with provisioner {} ({:?}), source_tree_hash {}",

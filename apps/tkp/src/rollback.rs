@@ -16,17 +16,46 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use tokeira_provisioner::ProvenanceStamp;
 
 use crate::apply::deployment_identity;
 use crate::envelope_store;
+use crate::gate::{GateOutcome, evaluate_gate};
 use crate::platform;
 
 pub async fn rollback(deployment_dir: &Path) -> Result<()> {
+    let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, mut version) = store
         .load()
         .await
         .context("failed to load the deployment envelope")?;
+
+    // ── Binding gate, before any mutation ──
+    // Like every other mutating verb, `rollback` gates the running binary against
+    // the deployment's *current* recorded engine (B, post-upgrade): only the
+    // engine that owns the deployment may initiate its rollback. This closes the
+    // window where an unrelated binary could re-pin the binding to A and reconcile
+    // the provider without ever being verified. (The two-binary orchestration —
+    // `tkr` relaunches A for the reconcile — is a follow-on; today the running
+    // binary must be B.)
+    match evaluate_gate(envelope.binding.as_ref(), &running) {
+        GateOutcome::Refuse { verdict, reason } => {
+            anyhow::bail!("binding gate refuses `rollback` ({verdict:?}): {reason}");
+        }
+        GateOutcome::Proceed {
+            verdict,
+            authoritative: true,
+        } => {
+            println!("binding: {verdict:?} (authoritative) — proceeding");
+        }
+        GateOutcome::Proceed {
+            verdict,
+            authoritative: false,
+        } => {
+            eprintln!("warning: {verdict:?} — dev iteration, advisory (not authoritative)");
+        }
+    }
 
     // ── Preconditions (fail-closed, before any destructive work) ──
     let checkpoint = envelope.checkpoint.clone().ok_or_else(|| {
@@ -74,7 +103,53 @@ pub async fn rollback(deployment_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokeira_provisioner::{DeploymentStateEnvelope, ProvenanceStamp};
+    use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, ProvenanceStamp};
+
+    #[tokio::test]
+    async fn rollback_refuses_a_mismatched_running_binary() {
+        // Post-upgrade shape bound to a *versioned* engine B; the running test
+        // binary is a dev build (different identity) → the gate refuses before any
+        // re-pin or provider reconcile, and the state is left untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        let b = ProvenanceStamp {
+            version: "2.0.0".to_string(),
+            git_sha: "sB".to_string(),
+            source_tree_hash: "hB".to_string(),
+            build_mode: BuildMode::Versioned,
+            recorded_at: Utc::now(),
+        };
+        let a = ProvenanceStamp {
+            source_tree_hash: "hA".to_string(),
+            ..b.clone()
+        };
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(a),
+            config_revision: 2,
+            ..Default::default()
+        };
+        env.begin_upgrade(b, "op-up", Utc::now());
+        env.close_operation(); // binding now B, checkpoint from A
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        let err = rollback(tmp.path())
+            .await
+            .expect_err("a mismatched running binary is refused");
+        assert!(
+            err.to_string().contains("binding gate refuses"),
+            "unexpected: {err}"
+        );
+
+        // The re-pin/reconcile never ran: still bound to B, checkpoint intact.
+        let (after, _) = store.load().await.unwrap();
+        assert_eq!(
+            after.binding.as_ref().unwrap().source_tree_hash,
+            "hB",
+            "no re-pin happened"
+        );
+        assert!(after.checkpoint.is_some(), "checkpoint not consumed");
+    }
 
     #[tokio::test]
     async fn rollback_refuses_without_a_checkpoint() {

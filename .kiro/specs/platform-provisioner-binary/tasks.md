@@ -111,15 +111,15 @@ multi-consumer decision) are out of scope.
   - [ ] 7.1 `cargo build --release` the provisioner; record the stripped size and the linked AWS SDK
         client set; note the trim/`opt-level`/UPX levers in the design's size section.
 
-- [ ] 8. Provisioner binary + specialized CLI (`apps/tkp`, binary `tkp`) (Requirements 6, 7)
-  - [~] 8.1 Create the `apps/tkp` binary crate + its own clap surface scoped to the deployment lifecycle
-        (no operator/global verbs). DONE (scaffold): `apps/tkp` created with a clap surface —
-        `describe` (implemented) plus `apply`/`upgrade`/`rollback`/`resume` stubs that report
-        "not yet implemented". Links `tokeira-provisioner` + `tokeira-state` (what `describe` needs); the
-        full engine/platform/`tokeira-aws` linkage lands with the applying verbs (8.3+). A minimal
-        deployment-level **envelope store** (`Box<dyn DeploymentStore<DeploymentStateEnvelope>>`, a local
-        `CasStore` under `{dir}/state/envelope`) is the first slice of the 13.1 envelope wiring; cloud will
-        select `S3StateStore` via the platform seam.
+- [~] 8. Provisioner binary + specialized CLI (`apps/tkp`, binary `tkp`) (Requirements 6, 7)
+  - [x] 8.1 Create the `apps/tkp` binary crate + its own clap surface scoped to the deployment lifecycle
+        (no operator/global verbs). DONE: `apps/tkp` with the full lifecycle surface —
+        `init` / `describe` / `plan` (read-only) / `apply` / `destroy` / `revert` / `upgrade` / `rollback`
+        (`resume` still stubbed). Links `tokeira-provisioner` + `tokeira-state` plus the engine/platform
+        stack (`tokeira-orchestrator` + `tokeira-iac` + the `local` and `compose-syn` platforms +
+        `tokeira-compose` for the live Docker handle). The deployment-level **envelope store**
+        (`Box<dyn DeploymentStore<DeploymentStateEnvelope>>`, a local `CasStore` under
+        `{dir}/state/envelope`) is the 13.1 envelope wiring; cloud selects `S3StateStore` via the platform seam.
   - [x] 8.2 `describe`: read-only report of identity, recorded provenance (or `unknown`), binding
         verdict, integrity manifest, and state facts; human + `--json`; never gates (Req 6.1, 6.5). DONE.
         Reports the running provisioner (`ProvenanceStamp::current` from build-info), the deployment
@@ -127,19 +127,27 @@ multi-consumer decision) are out of scope.
         `check_binding` verdict + whether it proceeds / is authoritative, the integrity manifest summary,
         state-head presence, and operation/lock status. Tests: uninitialized→Unknown-refuses,
         recorded-Match, dev-binary-on-versioned→ModeRegression. Smoke-verified.
-  - [~] 8.3 Embed the binding gate (task 3) in the applying verbs `apply`, `destroy`, `scale`,
+  - [x] 8.3 Embed the binding gate (task 3) in the applying verbs `apply`, `destroy`, `scale`,
         `schema setup`, `image push|mirror`: versioned deployments refuse on non-`Match` (no override);
         dev deployments take the `DevIterate` re-stamp+warn path (Req 6.2). `plan` surfaces the verdict
-        and annotates without refusing (Req 2.5). DONE (first increment — `apply`): `tkp/src/gate.rs`
-        `evaluate_gate` → `GateOutcome::{Proceed{authoritative}, Refuse{verdict, reason}}` implements the
-        3.2/3.3 policy; `tkp apply` (`tkp/src/apply.rs`) evaluates the gate **before any mutation**
-        (versioned refuses non-`Match`; dev warns + proceeds on `DevIterate`; unstamped → `Unknown` refuses
-        — Day-0 stamping is `create`'s job, task 2.2), then runs the real `InfraEngine` apply (wired to the
-        **local** platform — empty plan, exercising the `DeploymentStore` seam) and **re-stamps** the
-        envelope (records the running binding, advances `config_revision` — task 14.2). Tests: 5 gate cases +
-        `apply_refuses_an_unstamped_deployment`, `apply_proceeds_on_dev_iterate_and_restamps`; CLI
-        smoke-verified. *Remaining: multi-platform dispatch (compose/ecs), the service/runtime apply, and
-        the other applying verbs (`destroy`/`scale`/`schema`/`image`), plus `plan`-surfaces-verdict.*
+        and annotates without refusing (Req 2.5). DONE (compose-syn focus; `scale`/`schema`/`image` are
+        ECS/AWS/DSQL verbs, deferred with ECS): `tkp/src/gate.rs` `evaluate_gate` →
+        `GateOutcome::{Proceed{authoritative}, Refuse{verdict, reason}}` implements the 3.2/3.3 policy.
+        `apply`, `destroy`, and `revert` (`apply.rs`/`destroy.rs`/`revert.rs`) all evaluate the gate
+        **before any mutation** (versioned refuses non-`Match`; dev warns + proceeds on `DevIterate`;
+        unstamped → `Unknown` refuses). `destroy` additionally requires `--yes` (irreversible) *after* the
+        gate. **Multi-platform dispatch** (`tkp/src/platform.rs`): a `definition.tkd` resolves to
+        **compose-syn** (the `.tkd` interpreter platform), else **local**; `tkp` loads + validates the
+        `.tkd` (Proposal 004 §19) and drives `InfraEngine` over `tokeira_orchestrator::Deployment`.
+        compose-syn container resources need the docker `ComposePlatform` that
+        `register_infra_extensions` leaves for `tkp` — `open_compose_syn_engine` connects + registers it;
+        apply/destroy **require** Docker (clear error if absent), plan **tolerates** its absence (container
+        `describe` → Unsupported). `plan` (`tkp/src/plan.rs`, read-only) surfaces the platform + binding
+        verdict + the infra plan without gating. Tests: 5 gate cases, apply (unstamped-refuse /
+        dev-iterate-restamp), destroy (needs-`--yes` / unstamped-refuse / local-teardown), compose-syn
+        dispatch (detect / plan-interprets-reference-`.tkd` (7 resources) / invalid-`.tkd`-rejected). CLI
+        smoke-verified end to end (init → apply → apply → revert → destroy). *Remaining (deferred with ECS):
+        the ECS platform + the `scale`/`schema`/`image` operator verbs.*
   - [~] 8.4 `upgrade`: atomic ownership transfer first (task 5.3) — flip binding → B, capture [A final]
         (incl. A's prior configuration-revision ref), open the marker, before any mutation; then run
         state-schema migrations, apply B's plan. DONE (first increment): `tkp upgrade` (`tkp/src/upgrade.rs`)
@@ -355,8 +363,18 @@ multi-consumer decision) are out of scope.
         absent — so a revision is identifiable and revertable-to, task 14.3); `tkp describe` reports the
         engine stamp, `config_revision`, and `effective_config` (human + `--json`). Property-14 test asserts
         the config ref is recorded; smoke-verified.
-  - [ ] 14.3 Add config-revision revert: a same-engine `apply` of a prior recorded config revision — not an
-        `upgrade`, not a two-binary rollback (Req 13.3).
+  - [x] 14.3 Add config-revision revert: a same-engine `apply` of a prior recorded config revision — not an
+        `upgrade`, not a two-binary rollback (Req 13.3). DONE: `tkp revert --to <revision>`
+        (`tkp/src/revert.rs`) runs the same binding gate as `apply` (before any mutation), refuses a
+        non-prior or **unretained** target, restores the retained revision's config **source** into the
+        live config file, then reconciles with the **same engine** (`platform::infra_apply`). Revisions are
+        monotonic-forward: reverting to `N` produces a *new* revision whose content equals `N`'s (the
+        counter is never rewound), so history stays append-only and a revert is itself revertable. Each
+        revision's config source is retained by `tkp/src/config_history.rs` — `init` snapshots revision 0,
+        every `apply`/`revert` snapshots the revision it produces, under `{dir}/state/config-revisions/{n}`
+        (platform-aware: the `.tkd` for compose-syn, `deployment.toml` for local). Tests: revert refuses a
+        non-prior revision, refuses an unretained revision, and (full local flow) restores a prior
+        revision's config and advances the counter forward; config_history snapshot/restore round-trip.
   - [ ] 14.4 Architectural direction (note, not a single task): express platform desired-state definition
         as runtime config/data wherever possible so refinement is a plan, not a rebuild; reserve `tkp`
         rebuilds for behavioral engine/resource-impl changes (Req 13.4).

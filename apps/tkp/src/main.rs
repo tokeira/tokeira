@@ -22,11 +22,14 @@ use tokeira_provisioner::{
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 mod apply;
+mod config_history;
+mod destroy;
 mod gate;
 mod init;
 mod lock;
 mod plan;
 mod platform;
+mod revert;
 mod rollback;
 mod upgrade;
 
@@ -53,6 +56,10 @@ enum Command {
     Plan(LifecycleArgs),
     /// Plan and apply the deployment, gated on the binding.
     Apply(LifecycleArgs),
+    /// Tear down the deployment's infrastructure, gated on the binding. Irreversible.
+    Destroy(DestroyArgs),
+    /// Revert to a prior config revision — a same-engine apply, gated on the binding.
+    Revert(RevertArgs),
     /// Upgrade to a new engine identity. (Not yet implemented.)
     Upgrade(LifecycleArgs),
     /// Roll back to the retained prior configuration revision. (Not yet implemented.)
@@ -78,6 +85,26 @@ struct LifecycleArgs {
     deployment_dir: PathBuf,
 }
 
+#[derive(Args)]
+struct DestroyArgs {
+    /// Deployment directory holding the state envelope.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Confirm the irreversible teardown (required).
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct RevertArgs {
+    /// Deployment directory holding the state envelope.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// The prior config revision to revert to (a same-engine re-apply of its config).
+    #[arg(long)]
+    to: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
@@ -93,6 +120,16 @@ async fn main() -> Result<()> {
         Command::Apply(args) => {
             let dir = args.deployment_dir;
             lock::with_operation_lock(&dir, "apply", || apply::apply(&dir)).await
+        }
+        Command::Destroy(args) => {
+            let dir = args.deployment_dir;
+            let yes = args.yes;
+            lock::with_operation_lock(&dir, "destroy", || destroy::destroy(&dir, yes)).await
+        }
+        Command::Revert(args) => {
+            let dir = args.deployment_dir;
+            let to = args.to;
+            lock::with_operation_lock(&dir, "revert", || revert::revert(&dir, to)).await
         }
         Command::Upgrade(args) => {
             let dir = args.deployment_dir;

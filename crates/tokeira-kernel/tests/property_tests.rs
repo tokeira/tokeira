@@ -178,6 +178,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         close_result: None,
         close_failure: None,
         request_id_infos: std::collections::BTreeMap::new(),
+        buffered_events: Vec::new(),
     }
 }
 
@@ -5135,5 +5136,294 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
                 .count(),
             0
         );
+    }
+}
+
+// ─── Feature: kernel-event-buffering (Phase 1) ───
+//
+// Buffered-event model + terminate force-close ordering, ground-truthed to
+// v1.31.0 (`bufferEvent` event_store.go:263; `failWorkflowTask` util.go:26;
+// `TerminateWorkflow` util.go:115). Spec: .kiro/specs/kernel-event-buffering.
+
+fn signal_request(name: &str, now: OffsetDateTime) -> SignalRequest {
+    SignalRequest {
+        signal_name: name.into(),
+        input: payloads("signal-input"),
+        header: None,
+        links: Vec::new(),
+        request: request_context(&format!("req-{name}"), now),
+        now,
+    }
+}
+
+proptest! {
+    // Feature: kernel-event-buffering, Property 1
+    // Signal during a started WFT buffers, not appends: no history event, no
+    // consumed event id, no new WFT dispatch; the dedupe op still lands at
+    // admission. (Req 2.1.1, 2.1.3, 2.2, 6.1.1)
+    #[test]
+    fn property_buffering_1_signal_during_started_wft_buffers(input in arb_payloads()) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+        let last_event_id = state.last_event_id;
+        let mut req = signal_request("buffered", now);
+        req.input = input;
+        let transition = kernel()
+            .apply(LoadedRun::Existing(state), Command::Signal(req))
+            .unwrap();
+        prop_assert!(transition.history_events.is_empty());
+        prop_assert_eq!(transition.next_state.last_event_id, last_event_id);
+        prop_assert_eq!(transition.next_state.buffered_events.len(), 1);
+        let buffered_is_signal = matches!(
+            transition.next_state.buffered_events[0].kind,
+            HistoryEventKind::WorkflowExecutionSignaled { .. }
+        );
+        prop_assert!(buffered_is_signal);
+        prop_assert_eq!(transition.request_dedupe_ops.len(), 1);
+        let enqueues_wft = transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }));
+        prop_assert!(!enqueues_wft);
+        // At-most-one-WFT preserved (Req 6.2.1).
+        prop_assert!(transition.next_state.pending_workflow_task.is_some());
+    }
+
+    // Feature: kernel-event-buffering, Property 2
+    // Signal without a started WFT appends immediately: exactly one
+    // WorkflowExecutionSignaled, nothing buffered. Covers both no-pending-WFT
+    // and scheduled-but-not-started. (Req 2.1.2)
+    #[test]
+    fn property_buffering_2_signal_without_started_wft_appends(
+        input in arb_payloads(),
+        scheduled_not_started in any::<bool>(),
+    ) {
+        let now = fixed_now();
+        let state = if scheduled_not_started {
+            with_pending_wft(make_open_state(now), 30, None, 1)
+        } else {
+            make_open_state(now)
+        };
+        let mut req = signal_request("immediate", now);
+        req.input = input;
+        let transition = kernel()
+            .apply(LoadedRun::Existing(state), Command::Signal(req))
+            .unwrap();
+        let signaled = transition
+            .history_events
+            .iter()
+            .filter(|event| {
+                matches!(event.kind, HistoryEventKind::WorkflowExecutionSignaled { .. })
+            })
+            .count();
+        prop_assert_eq!(signaled, 1);
+        prop_assert!(transition.next_state.buffered_events.is_empty());
+    }
+
+    // Feature: kernel-event-buffering, Property 3
+    // Flush on WFT completion preserves admission order and id contiguity:
+    // N buffered signals flush after WorkflowTaskCompleted in admission
+    // order with contiguous ids, the buffer empties, and a follow-up WFT is
+    // scheduled. (Req 3.1, 6.1.2)
+    #[test]
+    fn property_buffering_3_flush_on_completion_order_and_contiguity(count in 1usize..5) {
+        let now = fixed_now();
+        let mut state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+        let kernel = kernel();
+        // Buffer `count` signals through the real Signal path.
+        for index in 0..count {
+            let transition = kernel
+                .apply(
+                    LoadedRun::Existing(state),
+                    Command::Signal(signal_request(&format!("sig-{index}"), now)),
+                )
+                .unwrap();
+            state = transition.next_state;
+        }
+        prop_assert_eq!(state.buffered_events.len(), count);
+
+        let run_key = state.run_key;
+        let req = WorkflowTaskCompletedRequest {
+            token: WorkflowTaskToken {
+                run_key,
+                logical_seq: LogicalTaskSeq(30),
+                started_event_id: 13,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: Vec::new(),
+            force_new_workflow_task: false,
+            now,
+        };
+        let transition = kernel
+            .apply(LoadedRun::Existing(state), Command::WorkflowTaskCompleted(req))
+            .unwrap();
+
+        // Events: WorkflowTaskCompleted, then the flushed signals in
+        // admission order, then the follow-up WorkflowTaskScheduled.
+        let first_is_completed = matches!(
+            transition.history_events[0].kind,
+            HistoryEventKind::WorkflowTaskCompleted { .. }
+        );
+        prop_assert!(first_is_completed);
+        for index in 0..count {
+            match &transition.history_events[1 + index].kind {
+                HistoryEventKind::WorkflowExecutionSignaled { signal_name, .. } => {
+                    prop_assert_eq!(signal_name, &format!("sig-{index}"));
+                }
+                other => panic!("expected flushed signal at {index}, got {other:?}"),
+            }
+        }
+        let follow_up_is_scheduled = matches!(
+            transition.history_events[1 + count].kind,
+            HistoryEventKind::WorkflowTaskScheduled { .. }
+        );
+        prop_assert!(follow_up_is_scheduled);
+        // Contiguous ids across close event + flushed events (Req 6.1.2).
+        for pair in transition.history_events.windows(2) {
+            prop_assert_eq!(pair[1].event_id, pair[0].event_id + 1);
+        }
+        prop_assert!(transition.next_state.buffered_events.is_empty());
+        prop_assert!(transition.next_state.pending_workflow_task.is_some());
+    }
+
+    // Feature: kernel-event-buffering, Property 4
+    // Terminate force-close ordering: started WFT + one buffered signal
+    // terminates as WorkflowTaskFailed(ForceCloseCommand),
+    // WorkflowExecutionSignaled, WorkflowExecutionTerminated, contiguous,
+    // status Terminated. (Req 4.1)
+    #[test]
+    fn property_buffering_4_terminate_force_close_ordering(req in arb_terminate_request(fixed_now())) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+        let kernel = kernel();
+        let buffered = kernel
+            .apply(
+                LoadedRun::Existing(state),
+                Command::Signal(signal_request("buffered", now)),
+            )
+            .unwrap()
+            .next_state;
+        let transition = kernel
+            .apply(LoadedRun::Existing(buffered), Command::Terminate(req))
+            .unwrap();
+
+        prop_assert_eq!(transition.history_events.len(), 3);
+        match &transition.history_events[0].kind {
+            HistoryEventKind::WorkflowTaskFailed { failure_cause, .. } => {
+                prop_assert_eq!(failure_cause, &WorkflowTaskFailedCause::ForceCloseCommand);
+            }
+            other => panic!("expected force-close WorkflowTaskFailed, got {other:?}"),
+        }
+        let second_is_signal = matches!(
+            transition.history_events[1].kind,
+            HistoryEventKind::WorkflowExecutionSignaled { .. }
+        );
+        prop_assert!(second_is_signal);
+        let third_is_terminated = matches!(
+            transition.history_events[2].kind,
+            HistoryEventKind::WorkflowExecutionTerminated { .. }
+        );
+        prop_assert!(third_is_terminated);
+        for pair in transition.history_events.windows(2) {
+            prop_assert_eq!(pair[1].event_id, pair[0].event_id + 1);
+        }
+        prop_assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);
+        prop_assert!(transition.next_state.pending_workflow_task.is_none());
+    }
+
+    // Feature: kernel-event-buffering, Property 5
+    // Terminal cleanliness: closing transitions leave no buffered events —
+    // terminate flushes before the terminal event; a worker close command
+    // overtaking a buffered signal drops it, matching v1.31.0
+    // (`FlushBufferToCurrentBatch` workflowFinished branch,
+    // event_store.go:139). (Req 6.3)
+    #[test]
+    fn property_buffering_5_closed_runs_carry_no_buffered_events(close_via_terminate in any::<bool>()) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+        let kernel = kernel();
+        let buffered = kernel
+            .apply(
+                LoadedRun::Existing(state),
+                Command::Signal(signal_request("buffered", now)),
+            )
+            .unwrap()
+            .next_state;
+        let run_key = buffered.run_key;
+
+        let transition = if close_via_terminate {
+            kernel
+                .apply(
+                    LoadedRun::Existing(buffered),
+                    Command::Terminate(TerminateRequest {
+                        reason: "p5".into(),
+                        details: None,
+                        identity: "tester".into(),
+                        request: request_context("p5-terminate", now),
+                        now,
+                    }),
+                )
+                .unwrap()
+        } else {
+            kernel
+                .apply(
+                    LoadedRun::Existing(buffered),
+                    Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                        token: WorkflowTaskToken {
+                            run_key,
+                            logical_seq: LogicalTaskSeq(30),
+                            started_event_id: 13,
+                            attempt: 1,
+                            shard_epoch: ShardEpoch::ZERO,
+                        },
+                        identity: WorkerIdentity("worker".into()),
+                        sdk_metadata: None,
+                        metering_metadata: None,
+                        worker_version: None,
+                        versioning_behavior: VersioningBehavior::Unspecified,
+                        deployment_version: None,
+                        worker_deployment_name: None,
+                        sticky_ttl: None,
+                        commands: vec![WorkflowCommand::CompleteWorkflow {
+                            result: payloads("done"),
+                        }],
+                        force_new_workflow_task: false,
+                        now,
+                    }),
+                )
+                .unwrap()
+        };
+        prop_assert!(!transition.next_state.status.is_open());
+        prop_assert!(transition.next_state.buffered_events.is_empty());
+    }
+
+    // Feature: kernel-event-buffering, Req 1.1.4 — buffered events survive a
+    // serde round-trip without loss.
+    #[test]
+    fn property_buffering_serde_round_trip(count in 0usize..4) {
+        let now = fixed_now();
+        let mut state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+        let kernel = kernel();
+        for index in 0..count {
+            state = kernel
+                .apply(
+                    LoadedRun::Existing(state),
+                    Command::Signal(signal_request(&format!("rt-{index}"), now)),
+                )
+                .unwrap()
+                .next_state;
+        }
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: WorkflowState = serde_json::from_slice(&encoded).unwrap();
+        prop_assert_eq!(decoded, state);
     }
 }

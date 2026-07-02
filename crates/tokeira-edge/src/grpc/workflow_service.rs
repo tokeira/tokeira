@@ -1229,14 +1229,29 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::RespondWorkflowTaskFailedRequest>,
     ) -> Result<Response<workflowservice::RespondWorkflowTaskFailedResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
-        let cause = req.cause;
-        let failure_msg = req
+        let token: tokeira_types::WorkflowTaskToken = serde_json::from_slice(&req.task_token)
+            .map_err(|error| Status::invalid_argument(format!("invalid task token: {error}")))?;
+        let failure_cause = translate::wft_failed_cause_from_proto(req.cause);
+        let failure_details = req
             .failure
             .as_ref()
-            .map(|f| f.message.as_str())
-            .unwrap_or("unknown");
-        tracing::warn!(cause, failure = failure_msg, "respond_workflow_task_failed");
+            .map(tokeira_proto::conversions::common::failure_to_payload);
+        debug!(
+            cause = req.cause,
+            run_key = ?token.run_key,
+            "respond_workflow_task_failed"
+        );
+        self.inner
+            .respond_workflow_task_failed(
+                &headers,
+                token,
+                failure_cause,
+                failure_details,
+                req.identity,
+            )
+            .await?;
         Ok(Response::new(
             workflowservice::RespondWorkflowTaskFailedResponse {},
         ))

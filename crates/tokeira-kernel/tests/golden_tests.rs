@@ -14,13 +14,14 @@ use tokeira_kernel::{
     PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp,
     Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
     SignalWithStartRequest, StartDeploymentTransitionRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerState, Transition,
-    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningBehavior,
-    VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest, WorkflowState,
-    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest, TerminateRequest,
+    TimerDueRequest, TimerState, Transition, UnpauseActivityRequest, UnpauseWorkflowRequest,
+    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
+    VersioningBehavior, VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID,
+    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+    WorkflowStartDelayElapsedRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -272,6 +273,7 @@ fn make_open_state() -> WorkflowState {
         close_result: None,
         close_failure: None,
         request_id_infos: std::collections::BTreeMap::new(),
+        buffered_events: Vec::new(),
     }
 }
 
@@ -6428,4 +6430,157 @@ fn close_via_complete_clears_pending_nexus_operations() {
             .count(),
         0
     );
+}
+
+/// Feature: kernel-event-buffering, Golden G1 — message-too-large terminate.
+///
+/// Drives the full corpus lifecycle: start → WFT started → signal buffered
+/// while the WFT is started → `RespondWorkflowTaskFailed(GRPC_MESSAGE_TOO_LARGE)`
+/// force-close-terminate. The assembled history must exactly match the
+/// v1.31.0 corpus assertion (`tests/workflow_test.go:993 @ v1.31.0`):
+/// WorkflowExecutionStarted, WorkflowTaskScheduled, WorkflowTaskStarted,
+/// WorkflowTaskFailed, WorkflowExecutionSignaled, WorkflowExecutionTerminated.
+#[test]
+fn golden_message_too_large_terminate_history() {
+    let kernel = kernel();
+    let start = make_start_request();
+
+    // 1-2: WorkflowExecutionStarted + WorkflowTaskScheduled.
+    let started = kernel
+        .apply(LoadedRun::Absent, Command::Start(start))
+        .unwrap();
+    let pending = started
+        .next_state
+        .pending_workflow_task
+        .clone()
+        .expect("start schedules the first WFT");
+    let mut history: Vec<HistoryEvent> = started.history_events.to_vec();
+
+    // 3: WorkflowTaskStarted (worker polls, never responds successfully).
+    let wft_started = kernel
+        .apply(
+            LoadedRun::Existing(started.next_state),
+            Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                logical_seq: pending.logical_seq,
+                worker_identity: WorkerIdentity("worker".into()),
+                request_id: "g1-wft-start".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
+                deployment_transition: None,
+                deployment_transition_revision_number: None,
+                sticky_ttl: None,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    let started_event_id = wft_started
+        .next_state
+        .pending_workflow_task
+        .as_ref()
+        .and_then(|wft| wft.started_event_id)
+        .expect("WFT is started");
+    history.extend(wft_started.history_events.iter().cloned());
+
+    // Signal while the WFT is started: buffered, no history event.
+    let signaled = kernel
+        .apply(
+            LoadedRun::Existing(wft_started.next_state),
+            Command::Signal(SignalRequest {
+                signal_name: "buffered-signal".into(),
+                input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
+                request: request_context("g1-signal"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+    assert!(signaled.history_events.is_empty());
+    assert_eq!(signaled.next_state.buffered_events.len(), 1);
+    history.extend(signaled.history_events.iter().cloned());
+
+    // 4-6: RespondWorkflowTaskFailed(GRPC_MESSAGE_TOO_LARGE) →
+    // WorkflowTaskFailed(ForceCloseCommand), flushed WorkflowExecutionSignaled,
+    // WorkflowExecutionTerminated. Reason/identity per v1.31.0:
+    // `request.GetCause().String()` = "GrpcMessageTooLarge" and
+    // `consts.IdentityHistoryService` = "history-service".
+    let terminated = kernel
+        .apply(
+            LoadedRun::Existing(signaled.next_state),
+            Command::TerminateOnWorkflowTaskFailed(TerminateOnWorkflowTaskFailedRequest {
+                logical_seq: pending.logical_seq,
+                started_event_id,
+                reason: "GrpcMessageTooLarge".into(),
+                identity: "history-service".into(),
+                request: request_context("g1-terminate"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+    history.extend(terminated.history_events.iter().cloned());
+
+    let kinds: Vec<&'static str> = history
+        .iter()
+        .map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionStarted { .. } => "WorkflowExecutionStarted",
+            HistoryEventKind::WorkflowTaskScheduled { .. } => "WorkflowTaskScheduled",
+            HistoryEventKind::WorkflowTaskStarted { .. } => "WorkflowTaskStarted",
+            HistoryEventKind::WorkflowTaskFailed { .. } => "WorkflowTaskFailed",
+            HistoryEventKind::WorkflowExecutionSignaled { .. } => "WorkflowExecutionSignaled",
+            HistoryEventKind::WorkflowExecutionTerminated { .. } => "WorkflowExecutionTerminated",
+            other => panic!("unexpected event kind in G1 history: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "WorkflowExecutionStarted",
+            "WorkflowTaskScheduled",
+            "WorkflowTaskStarted",
+            "WorkflowTaskFailed",
+            "WorkflowExecutionSignaled",
+            "WorkflowExecutionTerminated",
+        ],
+        "history must match tests/workflow_test.go:993 @ v1.31.0"
+    );
+    // Event ids are the contiguous corpus ids 1..=6.
+    let ids: Vec<i64> = history.iter().map(|event| event.event_id).collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+
+    // The force-close WFT-failed event carries ForceCloseCommand (the inbound
+    // GrpcMessageTooLarge only selects the terminate route, Req 4.2.2).
+    match &history[3].kind {
+        HistoryEventKind::WorkflowTaskFailed { failure_cause, .. } => {
+            assert_eq!(failure_cause, &WorkflowTaskFailedCause::ForceCloseCommand);
+        }
+        other => panic!("expected WorkflowTaskFailed, got {other:?}"),
+    }
+    match &history[5].kind {
+        HistoryEventKind::WorkflowExecutionTerminated {
+            reason, identity, ..
+        } => {
+            assert_eq!(reason, "GrpcMessageTooLarge");
+            assert_eq!(identity, "history-service");
+        }
+        other => panic!("expected WorkflowExecutionTerminated, got {other:?}"),
+    }
+    assert_eq!(terminated.next_state.status, ExecutionStatus::Terminated);
+    assert!(terminated.next_state.buffered_events.is_empty());
+
+    // Stale-token fencing: a second message-too-large for the same (now
+    // closed) run rejects rather than mutating (Req 4.2.4 / 5.1).
+    let reject = kernel
+        .apply(
+            LoadedRun::Existing(terminated.next_state),
+            Command::TerminateOnWorkflowTaskFailed(TerminateOnWorkflowTaskFailedRequest {
+                logical_seq: pending.logical_seq,
+                started_event_id,
+                reason: "GrpcMessageTooLarge".into(),
+                identity: "history-service".into(),
+                request: request_context("g1-terminate-stale"),
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Terminated));
 }

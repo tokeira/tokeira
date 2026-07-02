@@ -1247,6 +1247,7 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::Signal(_) => "Signal",
         Command::Cancel(_) => "Cancel",
         Command::Terminate(_) => "Terminate",
+        Command::TerminateOnWorkflowTaskFailed(_) => "TerminateOnWorkflowTaskFailed",
         Command::Reset(_) => "Reset",
         Command::PauseWorkflow(_) => "PauseWorkflow",
         Command::UnpauseWorkflow(_) => "UnpauseWorkflow",
@@ -2152,6 +2153,7 @@ mod tests {
             close_result: None,
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
+            buffered_events: Vec::new(),
         }
     }
 

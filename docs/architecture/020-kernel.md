@@ -379,14 +379,24 @@ The following sections describe the exact behavior for each command.
 
 **Behavior:**
 
-1. Emit `RequestDedupeOp` for the request ID.
-2. Emit `WorkflowExecutionSignaled` event carrying signal name, input, request ID, and caller identity.
-3. If no WFT is currently pending, schedule one.
-4. If a WFT is already pending, do **not** create a second one.
+1. Emit `RequestDedupeOp` for the request ID (dedupe is durable at *admission*, independent of whether the event buffers below).
+2. If a WFT is currently **started** (a worker holds it), append a `WorkflowExecutionSignaled` entry to `WorkflowState.buffered_events` instead of emitting it — see [Buffered events](#buffered-events). No WFT is scheduled (one is by definition pending).
+3. Otherwise emit the `WorkflowExecutionSignaled` event immediately, carrying signal name, input, request ID, and caller identity.
+4. If no WFT is currently pending, schedule one.
+5. If a WFT is already pending, do **not** create a second one.
 
-**Events produced:** `WorkflowExecutionSignaled`, and optionally `WorkflowTaskScheduled`.
+**Events produced:** `WorkflowExecutionSignaled` (immediately or at flush), and optionally `WorkflowTaskScheduled`.
 
-**Rationale:** The at-most-one-WFT invariant prevents wakeup amplification during signal floods. The pending WFT will deliver all buffered signals when the worker picks it up. This is a deliberate semantic choice, not a performance optimization that could be relaxed.
+**Rationale:** The at-most-one-WFT invariant prevents wakeup amplification during signal floods. The pending WFT will deliver coalesced signals when the worker picks it up. This is a deliberate semantic choice, not a performance optimization that could be relaxed.
+
+### Buffered events
+
+The kernel adopts Temporal's **buffered-event model** (spec: `kernel-event-buffering`, superseding the earlier deliberate no-buffering deviation). A worker holding a started WFT has a history view frozen at `started_event_id`; externally-originated events admitted in that window are held durably on `WorkflowState.buffered_events` — without event ids — and flushed into history when the WFT closes.
+
+- **Predicate** (`should_buffer`, mirroring `bufferEvent`, `historybuilder/event_store.go:263 @ v1.31.0`): workflow state-change events, workflow-task events, and events generated directly from a worker command or protocol message never buffer. Externally-originated events buffer while a WFT is *started*. Phase 1 scopes the bufferable set to `WorkflowExecutionSignaled` and `WorkflowExecutionCancelRequested`; Phase 2 extends to activity/child/Nexus completion-class events with the `reorderBuffer` rule (`event_store.go:411`).
+- **Flush** happens at every WFT close — `WorkflowTaskCompleted`, `WorkflowTaskFailed`, `WorkflowTaskTimedOut`, and the force-close below — emitting buffered events in admission order with contiguous ids immediately after the close event (`failWorkflowTask`, `workflow/util.go:26 @ v1.31.0`). On completion, flushed events land after the completion's command events and before any follow-up `WorkflowTaskScheduled`, and their presence triggers that follow-up WFT.
+- **Forced closes** (`Terminate`, workflow timeout, and the `RespondWorkflowTaskFailed(GRPC_MESSAGE_TOO_LARGE)` route): a started WFT is failed first with cause `ForceCloseCommand`, buffered events flush, and only then is the terminal event appended (`TerminateWorkflow`/`TimeoutWorkflow`, `workflow/util.go:71,115 @ v1.31.0`).
+- **Close discards**: buffered events surviving to a worker-commanded close are dropped, matching v1.31.0 (`FlushBufferToCurrentBatch` workflowFinished branch, `event_store.go:139`). Closed runs always carry an empty buffer.
 
 ### `Update`
 

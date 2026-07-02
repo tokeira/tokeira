@@ -92,6 +92,28 @@ where
             .await
     }
 
+    async fn fail_workflow_task(
+        &self,
+        token: tokeira_types::WorkflowTaskToken,
+        failure_cause: tokeira_kernel::WorkflowTaskFailedCause,
+        failure_details: Option<tokeira_types::Payload>,
+        worker_identity: tokeira_types::WorkerIdentity,
+        request: tokeira_types::RequestContext,
+        now: time::OffsetDateTime,
+    ) -> Result<()> {
+        self.runtime
+            .fail_workflow_task(
+                token,
+                failure_cause,
+                failure_details,
+                worker_identity,
+                request,
+                now,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn poll_workflow_activation(
         &self,
         queue: tokeira_types::QueueKey,

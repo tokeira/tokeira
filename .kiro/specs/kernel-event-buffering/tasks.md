@@ -17,42 +17,45 @@ warnings`, `cargo +nightly fmt`, and `cargo test -p tokeira-kernel`.
 
 ## Phase 1 — Minimum conformant buffering + terminate force-close
 
-- [ ] 1.1 Add `buffered_events: Vec<BufferedEvent>` to `WorkflowState` and the `BufferedEvent` type
+- [x] 1.1 Add `buffered_events: Vec<BufferedEvent>` to `WorkflowState` and the `BufferedEvent` type
   (`state.rs`). Initialize empty on Start. Add serde round-trip property coverage. (Req 1.1)
-- [ ] 1.2 Add `WorkflowTaskFailedCause::{ForceCloseCommand, GrpcMessageTooLarge}` and confirm the
+- [x] 1.2 Add `WorkflowTaskFailedCause::{ForceCloseCommand, GrpcMessageTooLarge}` and confirm the
   values against `failed_cause.proto` (`17`, `36`). (Req 1.2)
-- [ ] 1.3 Add a `should_buffer(state, kind) -> bool` helper encoding the `bufferEvent` predicate
+- [x] 1.3 Add a `should_buffer(state, kind) -> bool` helper encoding the `bufferEvent` predicate
   (`event_store.go:263 @ v1.31.0`), scoped Phase 1 to `WorkflowExecutionSignaled` /
   `WorkflowExecutionCancelRequested`. Cite the source. (Req 2.1)
-- [ ] 1.4 Rework `apply_signal` (`kernel.rs:655`) to buffer during a started WFT (push to
+- [x] 1.4 Rework `apply_signal` (`kernel.rs:655`) to buffer during a started WFT (push to
   `buffered_events`, still emit `RequestDedupeOp`, do not schedule a WFT) and append immediately
   otherwise. WHY-comment the admission-time dedupe. (Req 2.1, 2.2)
-- [ ] 1.5 Add `TransitionBuilder::flush_buffered()` (drain → assign contiguous ids → clear; Phase-1
+- [x] 1.5 Add `TransitionBuilder::flush_buffered()` (drain → assign contiguous ids → clear; Phase-1
   plain order). (Req 3.1)
-- [ ] 1.6 Wire `flush_buffered()` into `apply_workflow_task_completed`; replace the
+- [x] 1.6 Wire `flush_buffered()` into `apply_workflow_task_completed`; replace the
   `pre_completion_last_event_id > started_event_id` follow-up check with "schedule a follow-up WFT if
   events were flushed or `force_new_workflow_task`". (Req 3.1)
-- [ ] 1.7 Wire `flush_buffered()` into `apply_workflow_task_failed` and
+- [x] 1.7 Wire `flush_buffered()` into `apply_workflow_task_failed` and
   `apply_workflow_task_timed_out` (Feature 2 retry path). (Req 3.1)
-- [ ] 1.8 Add the terminate force-close branch to `apply_terminate`: emit
+- [x] 1.8 Add the terminate force-close branch to `apply_terminate`: emit
   `WorkflowTaskFailed(ForceCloseCommand)` when the WFT is started, `flush_buffered()`, then
   `WorkflowExecutionTerminated` + existing cleanup. (Req 4.1)
-- [ ] 1.9 Add the message-too-large command path (design §7 route (a)): a dedicated command that carries
+- [x] 1.9 Add the message-too-large command path (design §7 route (a)): a dedicated command that carries
   WFT fencing + drives the Requirement 4.1 transition, emitting `ForceCloseCommand` and using the cause
   name as the terminate reason. Reuse Feature 2 fencing rejects. (Req 4.2, 5.1)
-- [ ] 1.10 Properties P1–P5 (`// Feature: kernel-event-buffering, Property N`). (Req P1–P5)
-- [ ] 1.11 Golden G1: the exact `tests/workflow_test.go:993 @ v1.31.0` history. (Req G1)
-- [ ] 1.12 Update `020-kernel.md` (`Signal` rationale + new buffered-events subsection) and the
+- [x] 1.10 Properties P1–P5 (`// Feature: kernel-event-buffering, Property N`). (Req P1–P5)
+- [x] 1.11 Golden G1: the exact `tests/workflow_test.go:993 @ v1.31.0` history. (Req G1)
+- [x] 1.12 Update `020-kernel.md` (`Signal` rationale + new buffered-events subsection) and the
   `state.rs:187` comment to describe the model. (Req 0.3)
 
 ## Phase 1 — Edge dependency (separate, owned elsewhere)
 
-- [ ] 1.13 Wire the edge `RespondWorkflowTaskFailed` handler: `GrpcMessageTooLarge` → the message-too-
+- [x] 1.13 Wire the edge `RespondWorkflowTaskFailed` handler: `GrpcMessageTooLarge` → the message-too-
   large kernel command (1.9); all other causes → the Feature 2 `WorkflowTaskFailed` retry command.
   Tracked under `edge-unimplemented.md` / `api-conformance-wft-completion`. Depends on Phase 1 landing.
-- [ ] 1.14 Remove the conformance skip for `TestTerminateWorkflowOnMessageTooLargeFailure`; confirm the
-  leaf goes green in the harness. Re-classify `TestWorkflowRetry` / `TestWorkflowRetryFailures` once
-  1.13 lands (may need no further kernel work — confirm).
+- [x] 1.14 (adapted) No skip existed to remove — the leaf was a live FAIL, not a registry entry; with
+  Phase 1 + the edge wiring it goes GREEN in the harness (verified 2026-07-02, out-of-process run:
+  `TestTerminateWorkflowOnMessageTooLargeFailure` PASS, suite 20 PASS / 12 FAIL / 2 SKIP). Re-classify of
+  `TestWorkflowRetry` / `TestWorkflowRetryFailures`: still FAIL after 1.13 — confirmed the retry-chain
+  gap (`api-conformance-wft-completion` / `edge-unimplemented.md`), not buffering; no further kernel work
+  from this spec.
 
 ## Phase 2 — Full buffering fidelity (separate PR)
 

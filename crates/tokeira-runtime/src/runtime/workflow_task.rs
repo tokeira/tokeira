@@ -421,6 +421,51 @@ where
         result
     }
 
+    /// `RespondWorkflowTaskFailed`: route on the reported cause.
+    /// `GrpcMessageTooLarge` terminates the run through the kernel's
+    /// force-close-then-terminate command instead of retrying the task
+    /// (`respondworkflowtaskfailed/api.go:88 @ v1.31.0`); every other cause
+    /// takes the WFT-failed retry path. The terminate reason is the cause's
+    /// v1.31.0 `String()` rendering and the identity is the internal
+    /// history-service identity (`consts.IdentityHistoryService`).
+    pub async fn fail_workflow_task(
+        &self,
+        token: WorkflowTaskToken,
+        failure_cause: tokeira_kernel::WorkflowTaskFailedCause,
+        failure_details: Option<Payload>,
+        worker_identity: WorkerIdentity,
+        request: RequestContext,
+        now: OffsetDateTime,
+    ) -> Result<CommitResult> {
+        self.validate_workflow_task_token(&token).await?;
+        let run_key = token.run_key;
+        let command = if matches!(
+            failure_cause,
+            tokeira_kernel::WorkflowTaskFailedCause::GrpcMessageTooLarge
+        ) {
+            Command::TerminateOnWorkflowTaskFailed(
+                tokeira_kernel::TerminateOnWorkflowTaskFailedRequest {
+                    logical_seq: token.logical_seq,
+                    started_event_id: token.started_event_id,
+                    reason: "GrpcMessageTooLarge".to_string(),
+                    identity: "history-service".to_string(),
+                    request,
+                    now,
+                },
+            )
+        } else {
+            Command::WorkflowTaskFailed(tokeira_kernel::WorkflowTaskFailedRequest {
+                logical_seq: token.logical_seq,
+                started_event_id: token.started_event_id,
+                failure_cause,
+                failure_details,
+                worker_identity,
+                now,
+            })
+        };
+        self.submit_for_owned_shard(run_key, command).await
+    }
+
     async fn cron_continuation_for_completion(
         &self,
         run_key: RunKey,
@@ -768,6 +813,7 @@ mod tests {
             close_result: None,
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
+            buffered_events: Vec::new(),
         }
     }
 

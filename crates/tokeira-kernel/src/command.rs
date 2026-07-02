@@ -67,6 +67,9 @@ pub enum Command {
     },
     /// A workflow task failed (non-determinism, bad commands).
     WorkflowTaskFailed(WorkflowTaskFailedRequest),
+    /// `RespondWorkflowTaskFailed(GRPC_MESSAGE_TOO_LARGE)`: force-close the
+    /// started WFT and terminate the run instead of retrying.
+    TerminateOnWorkflowTaskFailed(TerminateOnWorkflowTaskFailedRequest),
     /// A workflow task exceeded its start-to-close timeout.
     WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest),
     /// An activity reached a terminal state.
@@ -170,6 +173,20 @@ pub enum WorkflowTaskFailedCause {
     BadSignalWorkflowExecutionAttributes,
     /// The workflow task failed because a reset was applied.
     ResetWorkflow,
+    /// The started workflow task was force-failed as the first step of a
+    /// forced workflow close (terminate / workflow timeout), pinning the
+    /// close batch to the resulting `WorkflowTaskFailed` event
+    /// (`WORKFLOW_TASK_FAILED_CAUSE_FORCE_CLOSE_COMMAND = 17`,
+    /// `failed_cause.proto`; `TerminateWorkflow`,
+    /// `service/history/workflow/util.go:115 @ v1.31.0`).
+    ForceCloseCommand,
+    /// The worker could not ship its WFT response because it exceeded the
+    /// gRPC message size limit; `RespondWorkflowTaskFailed` with this cause
+    /// terminates the run instead of retrying the task
+    /// (`WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE = 36`,
+    /// `failed_cause.proto`;
+    /// `service/history/api/respondworkflowtaskfailed/api.go:88 @ v1.31.0`).
+    GrpcMessageTooLarge,
 }
 
 /// Which timeout fired on a workflow task.
@@ -757,6 +774,34 @@ pub struct WorkflowTaskFailedRequest {
     pub failure_details: Option<Payload>,
     /// Identity of the worker that reported the failure.
     pub worker_identity: WorkerIdentity,
+    /// Wall-clock time the command was accepted.
+    pub now: OffsetDateTime,
+}
+
+/// Request from the runtime when `RespondWorkflowTaskFailed` arrives with
+/// cause `GRPC_MESSAGE_TOO_LARGE`: instead of the normal WFT retry path, the
+/// run is force-close-terminated — the started WFT is failed with cause
+/// `ForceCloseCommand`, buffered events flush, and the run terminates
+/// (`respondworkflowtaskfailed/api.go:88` + `workflow/util.go:115 @ v1.31.0`;
+/// spec: `kernel-event-buffering` Req 4.2). Carries the same WFT fencing as
+/// [`WorkflowTaskFailedRequest`] so a stale task token is rejected.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TerminateOnWorkflowTaskFailedRequest {
+    /// Logical task sequence of the started task being force-closed.
+    pub logical_seq: LogicalTaskSeq,
+    /// Event ID of the `WorkflowTaskStarted` event.
+    pub started_event_id: i64,
+    /// Terminate reason recorded on `WorkflowExecutionTerminated`. v1.31.0
+    /// passes `request.GetCause().String()`, which renders as
+    /// `"GrpcMessageTooLarge"` (`WorkflowTaskFailedCause::String`,
+    /// `enums/v1/failed_cause.pb.go @ go.temporal.io/api v1.62.8`).
+    pub reason: String,
+    /// Identity recorded on the terminated event; v1.31.0 uses the internal
+    /// history-service identity (`consts.IdentityHistoryService =
+    /// "history-service"`, `service/history/consts/const.go:13 @ v1.31.0`).
+    pub identity: String,
+    /// Caller-supplied request context for dedupe and tracing.
+    pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }

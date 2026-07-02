@@ -414,6 +414,7 @@ mod tests {
             close_result: None,
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
+            buffered_events: Vec::new(),
         }
     }
 

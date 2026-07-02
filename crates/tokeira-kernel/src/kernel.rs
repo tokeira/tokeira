@@ -13,8 +13,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, QueueKey, RunId, RunKey,
-    StickyAffinity, TransitionSeq, WorkerIdentity, WorkflowId,
+    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, Payloads, QueueKey, RunId,
+    RunKey, StickyAffinity, TransitionSeq, WorkerIdentity, WorkflowId,
 };
 
 use crate::{
@@ -26,12 +26,13 @@ use crate::{
         ExternalSignalResult, FieldChange, NexusOperationResolvedRequest,
         NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
         ResetActivityRequest, ResetRequest, RetryState, ScheduleQueryTaskRequest, SignalRequest,
-        SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
-        TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
-        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
-        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-        WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
-        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+        SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest,
+        TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest,
+        UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+        UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, WorkflowCommand,
+        WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest,
+        WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+        WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
@@ -185,6 +186,9 @@ impl Kernel for BasicKernel {
                 cron_continuation,
             } => self.apply_workflow_task_completed(loaded, request, Some(cron_continuation)),
             Command::WorkflowTaskFailed(req) => self.apply_workflow_task_failed(loaded, req),
+            Command::TerminateOnWorkflowTaskFailed(req) => {
+                self.apply_terminate_on_workflow_task_failed(loaded, req)
+            }
             Command::WorkflowTaskTimedOut(req) => self.apply_workflow_task_timed_out(loaded, req),
             Command::ActivityResolved(req) => self.apply_activity_resolved(loaded, req),
             Command::ChildStartConfirmed(req) => self.apply_child_start_confirmed(loaded, req),
@@ -317,6 +321,7 @@ impl BasicKernel {
             close_result: None,
             close_failure: None,
             request_id_infos: BTreeMap::new(),
+            buffered_events: Vec::new(),
         };
         // Rebuild the start request id → WorkflowExecutionStarted mapping on cold
         // replay (the hot-state path records it in `apply_start`); kept in sync so
@@ -423,6 +428,7 @@ impl BasicKernel {
             close_result: None,
             close_failure: None,
             request_id_infos: BTreeMap::new(),
+            buffered_events: Vec::new(),
         };
 
         let mut builder = TransitionBuilder::new(initial, req.now);
@@ -579,6 +585,7 @@ impl BasicKernel {
             close_result: None,
             close_failure: None,
             request_id_infos: BTreeMap::new(),
+            buffered_events: Vec::new(),
         };
 
         let mut builder = TransitionBuilder::new(initial, req.now);
@@ -655,18 +662,33 @@ impl BasicKernel {
     fn apply_signal(&self, loaded: LoadedRun, req: SignalRequest) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
+        // The dedupe op is emitted at *admission* even when the event is
+        // buffered below: idempotency of `SignalWorkflowExecution` is anchored
+        // to the request id at durable acceptance, not to the signal's
+        // eventual history position (spec: kernel-event-buffering Req 2.1.3).
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
 
-        builder.emit(HistoryEventKind::WorkflowExecutionSignaled {
+        let kind = HistoryEventKind::WorkflowExecutionSignaled {
             signal_name: req.signal_name,
             input: req.input,
             header: req.header,
             links: req.links,
             request_id: req.request.request_id.0,
             identity: req.request.caller_identity,
-        });
+        };
+        if should_buffer(&builder.state, &kind) {
+            // A worker holds the started WFT and its view of history is frozen
+            // at started_event_id; the signal is held on state and flushed when
+            // the WFT closes (`bufferEvent`, event_store.go:263 @ v1.31.0). No
+            // new WFT is scheduled — a started WFT is by definition pending,
+            // and the flush-on-close path schedules the follow-up delivery
+            // (Req 2.2).
+            builder.buffer(kind);
+            return Ok(builder.finish());
+        }
+        builder.emit(kind);
 
         // Insight: Tokeira keeps the "at most one outstanding workflow task"
         // invariant because it dramatically reduces wakeup amplification during
@@ -720,14 +742,23 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        builder.emit(HistoryEventKind::WorkflowExecutionCancelRequested {
+        let kind = HistoryEventKind::WorkflowExecutionCancelRequested {
             reason: req.reason,
             external_workflow_execution: req.external_initiator,
             external_initiated_event_id: 0,
             identity: req.request.caller_identity.clone().unwrap_or_default(),
             request_id: req.request.request_id.0,
-        });
+        };
+        // `cancel_requested` flips at admission even when the event buffers:
+        // v1.31.0 mutates the execution info immediately while the event sits
+        // in the buffer (`ReplicateWorkflowExecutionCancelRequestedEvent`,
+        // mutable_state_impl.go @ v1.31.0).
         builder.state.cancel_requested = true;
+        if should_buffer(&builder.state, &kind) {
+            builder.buffer(kind);
+            return Ok(builder.finish());
+        }
+        builder.emit(kind);
 
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
@@ -739,6 +770,11 @@ impl BasicKernel {
     /// Forcefully close the workflow. Unlike cancel, terminate is
     /// immediate — the worker gets no say. All pending activities and
     /// timers are deleted because they can never resolve.
+    ///
+    /// When a WFT is started, it is force-failed first (cause
+    /// `ForceCloseCommand`) and buffered events flush before the terminated
+    /// event, matching `TerminateWorkflow`
+    /// (`service/history/workflow/util.go:115 @ v1.31.0`).
     fn apply_terminate(
         &self,
         loaded: LoadedRun,
@@ -749,27 +785,47 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        builder.emit(HistoryEventKind::WorkflowExecutionTerminated {
-            reason: req.reason,
-            details: req.details,
-            identity: req.identity,
+        builder.terminate_run(req.reason, req.details, req.identity);
+        Ok(builder.finish())
+    }
+
+    /// Force-close-then-terminate driven by `RespondWorkflowTaskFailed` with
+    /// cause `GRPC_MESSAGE_TOO_LARGE`
+    /// (`respondworkflowtaskfailed/api.go:88 @ v1.31.0`): instead of the WFT
+    /// retry path, the started WFT is failed with `ForceCloseCommand`,
+    /// buffered events flush, and the run terminates. Fencing matches the
+    /// WFT-failed path so a stale task token is rejected (spec:
+    /// kernel-event-buffering Req 4.2, 5.1).
+    fn apply_terminate_on_workflow_task_failed(
+        &self,
+        loaded: LoadedRun,
+        req: TerminateOnWorkflowTaskFailedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let pending = state
+            .pending_workflow_task
+            .clone()
+            .ok_or(Reject::NoPendingWorkflowTask)?;
+        let started_event_id = pending
+            .started_event_id
+            .ok_or(Reject::WorkflowTaskNotStarted {
+                logical_seq: pending.logical_seq.0,
+            })?;
+        if pending.logical_seq != req.logical_seq {
+            return Err(Reject::WorkflowTaskSeqMismatch {
+                expected: pending.logical_seq.0,
+                got: req.logical_seq.0,
+            });
+        }
+        if started_event_id != req.started_event_id {
+            return Err(Reject::WorkflowTaskTokenMismatch);
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.request_dedupe_ops.push(RequestDedupeOp {
+            request_id: req.request.request_id.clone(),
         });
-        builder.close(ExecutionStatus::Terminated);
-
-        let activities = std::mem::take(&mut builder.state.activities);
-        for (activity_id, _) in activities {
-            builder
-                .activity_ops
-                .push(ActivityOp::Delete { activity_id });
-        }
-
-        let timers = std::mem::take(&mut builder.state.timers);
-        for (timer_id, _) in timers {
-            builder.timer_ops.push(TimerOp::Delete { timer_id });
-        }
-
-        builder.apply_parent_close_policy();
-
+        builder.terminate_run(req.reason, None, req.identity);
         Ok(builder.finish())
     }
 
@@ -1262,6 +1318,12 @@ impl BasicKernel {
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
+        // A workflow-level timeout is a forced close like terminate: a started
+        // WFT is failed first (ForceCloseCommand) and buffered events flush
+        // before the timed-out event (`TimeoutWorkflow`,
+        // `service/history/workflow/util.go:71 @ v1.31.0`).
+        builder.force_close_started_workflow_task();
+        builder.flush_buffered();
         builder.emit(HistoryEventKind::WorkflowExecutionTimedOut {
             timeout_type: req.timeout_type,
             retry_state: req.retry_state,
@@ -1483,6 +1545,17 @@ impl BasicKernel {
             )?;
         }
 
+        // Flush buffered events after the completion's command events and
+        // before any follow-up WFT is scheduled: v1.31.0 flushes at the next
+        // `AddWorkflowTaskScheduledEvent` / transaction close, so buffered
+        // events land after command events and before the follow-up
+        // WorkflowTaskScheduled (`AddWorkflowTaskScheduledEventAsHeartbeat`
+        // flushes first, workflow_task_state_machine.go @ v1.31.0). If a close
+        // command finished the run, `close()` already dropped the buffer —
+        // v1.31.0 discards buffered events once the workflow finished
+        // (`FlushBufferToCurrentBatch`, event_store.go:139 @ v1.31.0).
+        let flushed = builder.flush_buffered();
+
         // Schedule a new WFT when the worker explicitly requests one
         // (heartbeat / local-activity keep-alive).
         if req.force_new_workflow_task
@@ -1493,12 +1566,16 @@ impl BasicKernel {
         }
 
         // Schedule a new WFT if events arrived while this WFT was in
-        // progress (e.g., signals). The worker only saw history up to
-        // started_event_id; any events beyond that are "buffered" and
-        // need a fresh WFT so the worker can process them.
+        // progress. Two sources: flushed buffered events (signals /
+        // cancel-requested, which no longer advance last_event_id before
+        // completion), and events still appended immediately during a started
+        // WFT in Phase 1 (activity/child/Nexus resolutions — Phase 2 buffers
+        // those too, at which point the numeric check becomes vestigial). The
+        // worker only saw history up to started_event_id; anything beyond
+        // needs a fresh WFT (spec: kernel-event-buffering Req 3.1.6).
         if builder.state.is_open()
             && builder.state.pending_workflow_task.is_none()
-            && pre_completion_last_event_id > started_event_id
+            && (flushed > 0 || pre_completion_last_event_id > started_event_id)
         {
             builder.schedule_workflow_task();
         }
@@ -2124,6 +2201,10 @@ impl BasicKernel {
             fork_event_version: None,
             fork_event_id: None,
         });
+        // Buffered events flush immediately after the WFT-failed event, before
+        // the retry re-dispatch (`failWorkflowTask` fails then flushes,
+        // `service/history/workflow/util.go:26 @ v1.31.0`).
+        builder.flush_buffered();
         let sticky_preferred = builder
             .state
             .sticky
@@ -2189,6 +2270,11 @@ impl BasicKernel {
             started_event_id,
             timeout_type: req.timeout_type,
         });
+        // WFT timeout is a close: buffered events flush after the timed-out
+        // event and before the retry's fresh WorkflowTaskScheduled
+        // (`AddWorkflowTaskScheduledEventAsHeartbeat` flushes first,
+        // workflow_task_state_machine.go @ v1.31.0).
+        builder.flush_buffered();
         builder.state.workflow_task_attempt += 1;
         builder.state.sticky = None;
         if builder.state.status == ExecutionStatus::Paused {
@@ -3572,6 +3658,32 @@ fn apply_workflow_command(
 /// the transition.
 ///
 /// See `docs/architecture/020-kernel.md` §Transition builder.
+/// Whether `kind` must be held in `buffered_events` rather than appended,
+/// given the run's current WFT state. Mirrors the v1.31.0 `bufferEvent`
+/// predicate (`service/history/historybuilder/event_store.go:263 @ v1.31.0`):
+/// workflow state-change events, workflow-task events, and events generated
+/// directly from a worker command or protocol message are never buffered;
+/// other externally-originated events buffer while a WFT is *started* (a
+/// worker holds it and its history view is frozen). Phase 1 scopes the
+/// bufferable set to `WorkflowExecutionSignaled` and
+/// `WorkflowExecutionCancelRequested`; Phase 2 extends it to
+/// activity/child/Nexus completion-class events per the full predicate
+/// (spec: kernel-event-buffering Req 2.1).
+fn should_buffer(state: &WorkflowState, kind: &HistoryEventKind) -> bool {
+    let workflow_task_started = state
+        .pending_workflow_task
+        .as_ref()
+        .is_some_and(|pending| pending.started_event_id.is_some());
+    if !workflow_task_started {
+        return false;
+    }
+    matches!(
+        kind,
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+            | HistoryEventKind::WorkflowExecutionCancelRequested { .. }
+    )
+}
+
 struct TransitionBuilder {
     /// Mutable working copy of the run state.
     state: WorkflowState,
@@ -3617,6 +3729,100 @@ impl TransitionBuilder {
             kind,
         });
         event_id
+    }
+
+    /// Hold an event on durable state instead of appending it: no event id is
+    /// consumed and `last_event_id` is untouched until the WFT closes and
+    /// [`Self::flush_buffered`] emits it (spec: kernel-event-buffering
+    /// Req 2.1, 6.1.1).
+    fn buffer(&mut self, kind: HistoryEventKind) {
+        self.state
+            .buffered_events
+            .push(crate::state::BufferedEvent {
+                admitted_at: self.now,
+                kind,
+            });
+    }
+
+    /// Drain `buffered_events` into history in admission order, assigning
+    /// contiguous event ids continuing from the last emitted event, and
+    /// return how many events were flushed. Called at every WFT-close site
+    /// (completed / failed / timed-out / forced close). Flushed events keep
+    /// their admission timestamps (v1.31.0 buffered events are fully formed
+    /// at admission except the id; `EventStore::add`, event_store.go:74).
+    /// Phase 1 has no completion-class buffered events, so admission order is
+    /// the final order (`reorderBuffer` is Phase 2; event_store.go:411).
+    fn flush_buffered(&mut self) -> usize {
+        let buffered = std::mem::take(&mut self.state.buffered_events);
+        let count = buffered.len();
+        for event in buffered {
+            let event_id = self.state.last_event_id + 1;
+            self.state.last_event_id = event_id;
+            self.history_events.push(HistoryEvent {
+                event_id,
+                happened_at: event.admitted_at,
+                kind: event.kind,
+            });
+        }
+        count
+    }
+
+    /// Fail a started WFT with cause `ForceCloseCommand` as the first step of
+    /// a forced workflow close (terminate / workflow timeout), so the close
+    /// batch's first event is the resulting `WorkflowTaskFailed`
+    /// (`failWorkflowTask` via `TerminateWorkflow`/`TimeoutWorkflow`,
+    /// `service/history/workflow/util.go:26,71,115 @ v1.31.0`). No-op when no
+    /// WFT is started. The identity is the internal history-service identity
+    /// (`consts.IdentityHistoryService`, const.go:13 @ v1.31.0).
+    fn force_close_started_workflow_task(&mut self) {
+        let Some(pending) = self.state.pending_workflow_task.clone() else {
+            return;
+        };
+        let Some(started_event_id) = pending.started_event_id else {
+            return;
+        };
+        self.emit(HistoryEventKind::WorkflowTaskFailed {
+            logical_seq: pending.logical_seq,
+            scheduled_event_id: pending.scheduled_event_id,
+            started_event_id,
+            failure_cause: WorkflowTaskFailedCause::ForceCloseCommand,
+            failure_details: None,
+            identity: WorkerIdentity("history-service".to_string()),
+            base_run_id: None,
+            new_run_id: None,
+            fork_event_version: None,
+            fork_event_id: None,
+        });
+        // The force-failed task is not retried — the run is about to close.
+        self.state.pending_workflow_task = None;
+    }
+
+    /// Shared terminate tail: force-close a started WFT, flush buffered
+    /// events, emit `WorkflowExecutionTerminated`, close as `Terminated`, and
+    /// clean up activities/timers/children. Ordering per `TerminateWorkflow`
+    /// (util.go:115 @ v1.31.0): WorkflowTaskFailed(ForceCloseCommand) →
+    /// flushed buffered events → WorkflowExecutionTerminated.
+    fn terminate_run(&mut self, reason: String, details: Option<Payloads>, identity: String) {
+        self.force_close_started_workflow_task();
+        self.flush_buffered();
+        self.emit(HistoryEventKind::WorkflowExecutionTerminated {
+            reason,
+            details,
+            identity,
+        });
+        self.close(ExecutionStatus::Terminated);
+
+        let activities = std::mem::take(&mut self.state.activities);
+        for (activity_id, _) in activities {
+            self.activity_ops.push(ActivityOp::Delete { activity_id });
+        }
+
+        let timers = std::mem::take(&mut self.state.timers);
+        for (timer_id, _) in timers {
+            self.timer_ops.push(TimerOp::Delete { timer_id });
+        }
+
+        self.apply_parent_close_policy();
     }
 
     /// Schedule a workflow task: emit the scheduled event,
@@ -3708,6 +3914,14 @@ impl TransitionBuilder {
         self.state.pending_updates.clear();
         self.state.admitted_updates.clear();
         self.state.pending_nexus_operations.clear();
+        // Buffered events that survive to a close are dropped, not flushed:
+        // once the workflow finished they can never be delivered, and v1.31.0
+        // discards them the same way (`FlushBufferToCurrentBatch`
+        // workflowFinished branch, event_store.go:139 @ v1.31.0). Forced
+        // closes (terminate / workflow timeout) flush *before* their terminal
+        // event, so this only drops events overtaken by a worker close
+        // command. Keeps closed runs buffer-free (Req 6.3).
+        self.state.buffered_events.clear();
         self.projection_ops.push(ProjectionOp::CloseExecution {
             status,
             closed_at: self.now,

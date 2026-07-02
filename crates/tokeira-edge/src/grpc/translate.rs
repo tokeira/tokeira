@@ -778,6 +778,30 @@ pub fn update_workflow_execution_options_response_to_proto(
     }
 }
 
+/// Translate an inbound `RespondWorkflowTaskFailed` cause
+/// (`temporal.api.enums.v1.WorkflowTaskFailedCause`) to the kernel enum.
+/// v1.31.0 records the reported cause verbatim on the `WorkflowTaskFailed`
+/// event (`respondworkflowtaskfailed/api.go @ v1.31.0`); causes the kernel
+/// does not model yet fall back to `WorkflowWorkerUnhandledFailure`, the
+/// generic worker-reported failure. `GrpcMessageTooLarge` (36) selects the
+/// runtime's force-close-terminate route.
+pub fn wft_failed_cause_from_proto(value: i32) -> tokeira_kernel::WorkflowTaskFailedCause {
+    use tokeira_kernel::WorkflowTaskFailedCause as K;
+    use tokeira_proto::enums::WorkflowTaskFailedCause as P;
+    match P::try_from(value) {
+        Ok(P::UnhandledCommand) => K::UnhandledCommand,
+        Ok(P::BadScheduleActivityAttributes) => K::BadScheduleActivityAttributes,
+        Ok(P::BadRequestCancelActivityAttributes) => K::BadRequestCancelActivityAttributes,
+        Ok(P::BadStartTimerAttributes) => K::BadStartTimerAttributes,
+        Ok(P::BadSignalWorkflowExecutionAttributes) => K::BadSignalWorkflowExecutionAttributes,
+        Ok(P::ResetWorkflow) => K::ResetWorkflow,
+        Ok(P::NonDeterministicError) => K::NonDeterminismError,
+        Ok(P::ForceCloseCommand) => K::ForceCloseCommand,
+        Ok(P::GrpcMessageTooLarge) => K::GrpcMessageTooLarge,
+        _ => K::WorkflowWorkerUnhandledFailure,
+    }
+}
+
 /// The engine's reserved internal per-namespace worker task queue
 /// (`primitives.PerNSWorkerTaskQueue @ v1.31.0 common/primitives/task_queues.go:12`).
 const PER_NS_WORKER_TASK_QUEUE: &str = "temporal-sys-per-ns-tq";

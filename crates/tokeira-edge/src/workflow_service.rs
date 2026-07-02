@@ -305,6 +305,32 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         req: WorkflowTaskCompletedRequest,
     ) -> Result<WorkflowMutationOutcome>;
 
+    /// `RespondWorkflowTaskFailed`: fail the workflow task identified by
+    /// `token`, or — for cause `GrpcMessageTooLarge` — force-close-terminate
+    /// the run (`respondworkflowtaskfailed/api.go:88 @ v1.31.0`). Defaulted so
+    /// workflow-task-only test doubles need not implement it.
+    async fn fail_workflow_task(
+        &self,
+        token: tokeira_types::WorkflowTaskToken,
+        failure_cause: tokeira_kernel::WorkflowTaskFailedCause,
+        failure_details: Option<tokeira_types::Payload>,
+        worker_identity: tokeira_types::WorkerIdentity,
+        request: tokeira_types::RequestContext,
+        now: time::OffsetDateTime,
+    ) -> Result<()> {
+        let _ = (
+            token,
+            failure_cause,
+            failure_details,
+            worker_identity,
+            request,
+            now,
+        );
+        Err(anyhow::anyhow!(
+            "fail_workflow_task is not supported by this runtime"
+        ))
+    }
+
     async fn poll_activity_task(
         &self,
         queue: tokeira_types::QueueKey,
@@ -3992,6 +4018,59 @@ impl WorkflowService {
                 .await;
 
                 Ok(RespondActivityTaskFailedResponse)
+            },
+        )
+        .await
+    }
+
+    /// `RespondWorkflowTaskFailed`. Routing on cause happens in the runtime:
+    /// `GrpcMessageTooLarge` force-close-terminates the run
+    /// (`respondworkflowtaskfailed/api.go:88 @ v1.31.0`); other causes take
+    /// the WFT-failed retry path.
+    pub async fn respond_workflow_task_failed(
+        &self,
+        headers: &HeaderMap,
+        token: tokeira_types::WorkflowTaskToken,
+        failure_cause: tokeira_kernel::WorkflowTaskFailedCause,
+        failure_details: Option<tokeira_types::Payload>,
+        identity: String,
+    ) -> EdgeResult<()> {
+        self.observe_edge_call(
+            headers,
+            "respond_workflow_task_failed",
+            None,
+            None,
+            async move {
+                let ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::RespondWorkflowTaskFailed, false)
+                    .await?;
+
+                let run_key = token.run_key;
+                self.runtime
+                    .fail_workflow_task(
+                        token,
+                        failure_cause,
+                        failure_details,
+                        tokeira_types::WorkerIdentity(identity),
+                        tokeira_types::RequestContext {
+                            request_id: tokeira_types::RequestId(
+                                ctx.request_id.as_str().to_string(),
+                            ),
+                            caller_identity: None,
+                            received_at: time::OffsetDateTime::now_utc(),
+                        },
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(
+                    run_key,
+                    read_last_event_id(self.repo.as_ref(), run_key).await?,
+                )
+                .await;
+
+                Ok(())
             },
         )
         .await

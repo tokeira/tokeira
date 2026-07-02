@@ -171,6 +171,31 @@ pub struct WorkflowState {
     /// `WorkflowExtendedInfo.request_id_infos`.
     #[serde(default)]
     pub request_id_infos: BTreeMap<String, RequestIdInfo>,
+    /// Events admitted while a workflow task was started, held here (without
+    /// event ids) until the WFT closes and they are flushed into history in
+    /// admission order. Mirrors the v1.31.0 buffered-event model: `bufferEvent`
+    /// decides eligibility (`historybuilder/event_store.go:263 @ v1.31.0`) and
+    /// the flush happens at WFT close (`failWorkflowTask`,
+    /// `workflow/util.go:26 @ v1.31.0`). Phase 1 buffers
+    /// `WorkflowExecutionSignaled` and `WorkflowExecutionCancelRequested`
+    /// (spec: `kernel-event-buffering`). Always empty for closed runs.
+    #[serde(default)]
+    pub buffered_events: Vec<BufferedEvent>,
+}
+
+/// A history event admitted while a workflow task was started, held durably on
+/// [`WorkflowState`] without an event id until the WFT closes and it is
+/// flushed into history (event ids are assigned only at flush). Buffered
+/// events keep their admission timestamp: v1.31.0 buffered events are
+/// fully-formed at admission except for the id
+/// (`EventStore::add`, `historybuilder/event_store.go:74 @ v1.31.0`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BufferedEvent {
+    /// Wall-clock time the authoring command was admitted; the flushed
+    /// history event carries this timestamp, not the flush time.
+    pub admitted_at: OffsetDateTime,
+    /// The event body to emit at flush.
+    pub kind: crate::event::HistoryEventKind,
 }
 
 /// `EventType` wire numbers the kernel authors into [`RequestIdInfo::event_type`].
@@ -184,9 +209,12 @@ pub const EVENT_TYPE_WORKFLOW_EXECUTION_STARTED: i32 = 1;
 pub const EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED: i32 = 55;
 
 /// Per-run record of which event a request id authored (mirrors
-/// `persistencespb.RequestIDInfo`). `buffered` is always `false` in tokeira,
-/// which has no buffered-event model; it is retained for wire parity with the
-/// `DescribeWorkflowExecution` surface.
+/// `persistencespb.RequestIDInfo`). Tokeira adopted the buffered-event model
+/// (spec: `kernel-event-buffering`, superseding the earlier no-buffering
+/// deviation), but request-id infos are only authored for start / options-
+/// updated events — kinds the `bufferEvent` predicate never buffers
+/// (`event_store.go:263 @ v1.31.0`) — so `buffered` remains `false` here; it
+/// is retained for wire parity with the `DescribeWorkflowExecution` surface.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestIdInfo {
     /// History event id that this request id authored.
@@ -195,7 +223,8 @@ pub struct RequestIdInfo {
     /// e.g. `WorkflowExecutionStarted` for the starting request or
     /// `WorkflowExecutionOptionsUpdated` for an attached request.
     pub event_type: i32,
-    /// Whether the authoring event is still buffered. Always `false` here.
+    /// Whether the authoring event is still buffered. Always `false` here
+    /// (see the struct-level note).
     pub buffered: bool,
 }
 
@@ -953,6 +982,7 @@ mod tests {
             close_result: None,
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
+            buffered_events: Vec::new(),
         }
     }
 

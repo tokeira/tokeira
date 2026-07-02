@@ -1567,6 +1567,8 @@ fn wft_failed_cause_i32(c: &WorkflowTaskFailedCause) -> i32 {
             C::BadSignalWorkflowExecutionAttributes
         }
         WorkflowTaskFailedCause::ResetWorkflow => C::ResetWorkflow,
+        WorkflowTaskFailedCause::ForceCloseCommand => C::ForceCloseCommand,
+        WorkflowTaskFailedCause::GrpcMessageTooLarge => C::GrpcMessageTooLarge,
     }) as i32
 }
 

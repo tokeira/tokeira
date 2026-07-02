@@ -124,8 +124,25 @@ pub fn search_attributes_to_domain(
         value
             .indexed_fields
             .iter()
-            .filter(|(_name, payload)| !is_temporal_nil_payload(payload))
-            .map(|(name, val)| Ok((name.clone(), search_attr_payload_to_domain(val)?)))
+            .map(|(name, val)| {
+                // Internal-only predefined attributes are rejected before any
+                // payload handling, with the verbatim v1.31.0 admission text
+                // (`searchattribute/validator.go:118-120 @ v1.31.0`); the
+                // whitelisted predefined set (BatcherUser etc.) stays settable.
+                if tokeira_types::is_banned_predefined_search_attribute(name) {
+                    return Err(ProtoConversionError::InvalidArgument(format!(
+                        "{name} attribute can't be set in SearchAttributes"
+                    )));
+                }
+                Ok((name, val))
+            })
+            .filter(
+                |entry| !matches!(entry, Ok((_name, payload)) if is_temporal_nil_payload(payload)),
+            )
+            .map(|entry| {
+                let (name, val) = entry?;
+                Ok((name.clone(), search_attr_payload_to_domain(val)?))
+            })
             .collect::<Result<_, ProtoConversionError>>()?,
     ))
 }
@@ -138,23 +155,102 @@ fn is_temporal_nil_payload(value: &common::Payload) -> bool {
     matches!(encoding, Some(b"json/plain")) && matches!(value.data.as_slice(), b"null" | b"[]")
 }
 
+/// Encode a search-attribute value in the standard Temporal wire format: the
+/// bare JSON value with `encoding=json/plain` plus a `type` metadata key naming
+/// the `IndexedValueType` (`searchattribute/encode_value.go:14-22` +
+/// `sadefs/util.go:22-33 @ v1.31.0`). Datetimes are RFC 3339 strings.
 fn search_attr_value_to_payload(value: &SearchAttrValue) -> common::Payload {
-    let data = serde_json::to_vec(value).unwrap_or_default();
+    let (type_name, json) = match value {
+        SearchAttrValue::Keyword(v) => ("Keyword", serde_json::json!(v)),
+        SearchAttrValue::KeywordList(v) => ("KeywordList", serde_json::json!(v)),
+        SearchAttrValue::Int(v) => ("Int", serde_json::json!(v)),
+        SearchAttrValue::Double(v) => ("Double", serde_json::json!(v)),
+        SearchAttrValue::Bool(v) => ("Bool", serde_json::json!(v)),
+        SearchAttrValue::Datetime(v) => (
+            "Datetime",
+            serde_json::json!(
+                v.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            ),
+        ),
+        SearchAttrValue::Text(v) => ("Text", serde_json::json!(v)),
+    };
     let mut metadata = std::collections::BTreeMap::new();
     metadata.insert("encoding".to_string(), b"json/plain".to_vec());
+    metadata.insert("type".to_string(), type_name.as_bytes().to_vec());
     common::Payload {
         metadata,
-        data,
+        data: serde_json::to_vec(&json).unwrap_or_default(),
         external_payloads: Vec::new(),
     }
 }
 
+/// Decode the standard Temporal search-attribute wire payload: bare JSON data
+/// (`payload.EncodeString` writes `encoding=json/plain` + the JSON value with
+/// NO type metadata, `common/payload/payload.go:19-23 @ v1.31.0`), with the
+/// optional `type` metadata key naming the `IndexedValueType` when the writer
+/// knew it (`searchattribute/decode_value.go` reads it). Without a `type`
+/// key the variant is inferred from the JSON shape — strings map to `Keyword`
+/// (Temporal's default for unregistered string attributes; `Text`/`Datetime`
+/// require an explicit type).
 fn search_attr_payload_to_domain(
     value: &common::Payload,
 ) -> Result<SearchAttrValue, ProtoConversionError> {
-    serde_json::from_slice(&value.data).map_err(|_err| {
-        ProtoConversionError::MissingField("SearchAttributes: invalid payload data")
-    })
+    let invalid = |_| ProtoConversionError::MissingField("SearchAttributes: invalid payload data");
+    let json: serde_json::Value = serde_json::from_slice(&value.data).map_err(invalid)?;
+    let type_name = value
+        .metadata
+        .get("type")
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+
+    let type_mismatch =
+        || ProtoConversionError::MissingField("SearchAttributes: invalid payload data");
+    match type_name.as_deref() {
+        Some("Keyword") => Ok(SearchAttrValue::Keyword(
+            json.as_str().ok_or_else(type_mismatch)?.to_string(),
+        )),
+        Some("Text") => Ok(SearchAttrValue::Text(
+            json.as_str().ok_or_else(type_mismatch)?.to_string(),
+        )),
+        Some("Int") => Ok(SearchAttrValue::Int(
+            json.as_i64().ok_or_else(type_mismatch)?,
+        )),
+        Some("Double") => Ok(SearchAttrValue::Double(
+            json.as_f64().ok_or_else(type_mismatch)?,
+        )),
+        Some("Bool") => Ok(SearchAttrValue::Bool(
+            json.as_bool().ok_or_else(type_mismatch)?,
+        )),
+        Some("Datetime") => {
+            let text = json.as_str().ok_or_else(type_mismatch)?;
+            let parsed =
+                OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+                    .map_err(|_| type_mismatch())?;
+            Ok(SearchAttrValue::Datetime(parsed))
+        }
+        Some("KeywordList") => keyword_list_from_json(&json).ok_or_else(type_mismatch),
+        // No (or unrecognised) type metadata: infer from the JSON shape.
+        _ => match &json {
+            serde_json::Value::String(text) => Ok(SearchAttrValue::Keyword(text.clone())),
+            serde_json::Value::Bool(flag) => Ok(SearchAttrValue::Bool(*flag)),
+            serde_json::Value::Number(number) => Ok(number
+                .as_i64()
+                .map(SearchAttrValue::Int)
+                .or_else(|| number.as_f64().map(SearchAttrValue::Double))
+                .ok_or_else(type_mismatch)?),
+            serde_json::Value::Array(_) => keyword_list_from_json(&json).ok_or_else(type_mismatch),
+            _ => Err(type_mismatch()),
+        },
+    }
+}
+
+fn keyword_list_from_json(json: &serde_json::Value) -> Option<SearchAttrValue> {
+    let items = json.as_array()?;
+    let values = items
+        .iter()
+        .map(|item| item.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    Some(SearchAttrValue::KeywordList(values))
 }
 
 pub fn workflow_execution_from_ids(
@@ -243,6 +339,69 @@ mod tests {
         assert!(!converted.0.contains_key("nil"));
         assert!(!converted.0.contains_key("empty"));
         assert!(converted.0.contains_key("kept"));
+    }
+
+    // Feature: search-attribute wire codec — the BatcherUser corpus case:
+    // payload.EncodeString("1.0.0") = {encoding=json/plain, data=b"\"1.0.0\"",
+    // NO type metadata} must decode as Keyword (payload.go:19-23 @ v1.31.0).
+    #[test]
+    fn search_attribute_decodes_standard_wire_string() {
+        let decoded = search_attr_payload_to_domain(&json_payload(br#""1.0.0""#))
+            .expect("bare JSON string decodes");
+        assert_eq!(decoded, SearchAttrValue::Keyword("1.0.0".to_string()));
+    }
+
+    #[test]
+    fn search_attribute_round_trips_every_variant() {
+        let values = vec![
+            SearchAttrValue::Keyword("k".to_string()),
+            SearchAttrValue::KeywordList(vec!["a".to_string(), "b".to_string()]),
+            SearchAttrValue::Int(42),
+            SearchAttrValue::Double(2.5),
+            SearchAttrValue::Bool(true),
+            SearchAttrValue::Datetime(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+            SearchAttrValue::Text("full text".to_string()),
+        ];
+        for value in values {
+            let payload = search_attr_value_to_payload(&value);
+            assert_eq!(
+                payload.metadata.get("encoding").map(Vec::as_slice),
+                Some(b"json/plain".as_slice())
+            );
+            assert!(payload.metadata.contains_key("type"));
+            let decoded = search_attr_payload_to_domain(&payload).expect("round trip");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn search_attribute_rejects_banned_predefined_names() {
+        let attributes = common::SearchAttributes {
+            indexed_fields: BTreeMap::from([(
+                "TemporalWorkerDeploymentVersion".to_string(),
+                json_payload(br#""1.0.0""#),
+            )]),
+        };
+        let error = search_attributes_to_domain(&attributes).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "TemporalWorkerDeploymentVersion attribute can't be set in SearchAttributes"
+        );
+    }
+
+    #[test]
+    fn search_attribute_allows_whitelisted_predefined_names() {
+        let attributes = common::SearchAttributes {
+            indexed_fields: BTreeMap::from([(
+                "BatcherUser".to_string(),
+                json_payload(br#""1.0.0""#),
+            )]),
+        };
+        let converted = search_attributes_to_domain(&attributes).expect("whitelisted");
+        assert_eq!(
+            converted.0.get("BatcherUser"),
+            Some(&SearchAttrValue::Keyword("1.0.0".to_string()))
+        );
     }
 
     #[test]

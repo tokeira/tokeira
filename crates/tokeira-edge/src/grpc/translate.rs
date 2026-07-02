@@ -74,7 +74,7 @@ use tokeira_storage::{
 };
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, NamespaceId, Payloads, RetryPolicy,
-    RunId, RunKey, TaskKind, TaskQueueName, WorkflowId, WorkflowType,
+    RunId, TaskKind, TaskQueueName, WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -2704,9 +2704,13 @@ pub fn signal_response_to_proto(
 pub fn poll_response_to_proto(
     resp: PollWorkflowTaskQueueResponse,
 ) -> workflowservice::PollWorkflowTaskQueueResponse {
+    // The wire run id is the run's user-visible RunId — never the internal
+    // storage RunKey (derived via dsql_spread_uuid, so the two differ). SDK
+    // pollers echo this execution into follow-up RPCs (GetWorkflowExecutionHistory,
+    // RespondActivityTaskCompletedById), which resolve by real run id.
     let workflow_execution = Some(workflow_execution_from_ids(
         &WorkflowId(resp.payload.workflow_id),
-        run_id_from_run_key(resp.payload.run_key),
+        resp.payload.run_id,
     ));
 
     let history_bytes =
@@ -4882,10 +4886,6 @@ fn non_empty(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn run_id_from_run_key(run_key: RunKey) -> RunId {
-    RunId(run_key.0)
-}
-
 // ── Activity endpoint translations ──
 
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -4925,9 +4925,10 @@ pub fn poll_activity_request_to_edge(
 pub fn poll_activity_response_to_proto(
     resp: crate::translate::PollActivityTaskQueueResponse,
 ) -> workflowservice::PollActivityTaskQueueResponse {
+    // Real RunId, not the internal RunKey (see poll_response_to_proto).
     let workflow_execution = Some(workflow_execution_from_ids(
         &WorkflowId(resp.workflow_id),
-        run_id_from_run_key(resp.run_key),
+        resp.run_id,
     ));
 
     workflowservice::PollActivityTaskQueueResponse {
@@ -5467,6 +5468,7 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_runtime::{RedirectRule, VersioningRules};
+    use tokeira_types::RunKey;
 
     #[test]
     fn workflow_timeout_zero_maps_to_unlimited() {
@@ -7159,6 +7161,7 @@ mod tests {
             poll_activity_response_to_proto(crate::translate::PollActivityTaskQueueResponse {
                 task_token: b"token".to_vec(),
                 activity_id: "activity-1".to_string(),
+                run_id: RunId(Uuid::from_u128(9)),
                 activity_type: "activity-type".to_string(),
                 input: Payloads::default(),
                 attempt: 2,
@@ -7205,6 +7208,7 @@ mod tests {
             payload: crate::translate::WorkflowTaskPayloadDto {
                 workflow_id: "workflow-a".to_string(),
                 run_key: RunKey(Uuid::from_u128(1)),
+                run_id: RunId(Uuid::from_u128(1)),
                 task_queue: "main".to_string(),
                 history: Vec::new(),
             },

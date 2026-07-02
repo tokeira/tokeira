@@ -623,6 +623,7 @@ where
                     );
                     return Ok(Some(StartedActivityTask {
                         run_key: task.run_key,
+                        run_id: state.run_id,
                         activity_id: next_activity.activity_id.clone(),
                         activity_type: next_activity.activity_type.clone(),
                         task_queue: next_activity.task_queue.clone(),

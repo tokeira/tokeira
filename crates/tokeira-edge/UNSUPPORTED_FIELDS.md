@@ -86,7 +86,7 @@ does not support or cannot yet populate, along with rationale.
 | Field | Status | Rationale |
 |---|---|---|
 | `versioning_override` | Supported | Serialized from the kernel `VersioningOverride` (Set → value, Clear → `unset_versioning_override`) by `api-conformance-workflow-options`. |
-| `attached_completion_callbacks`, `attached_request_id` | Not populated | Authored by the UseExisting-conflict attach path; their proto projection is not yet serialized (the attach-path history fidelity is tracked separately). |
+| `attached_completion_callbacks`, `attached_request_id` | Supported | Projected into the event attributes (empty string when the update attached no request id), mirroring `CreateWorkflowExecutionOptionsUpdatedEvent` (`event_factory.go:413-414 @ v1.31.0`); attached links land on event-level `HistoryEvent.links` (`event_factory.go:419`). |
 | `priority`, `time_skipping_config` | Not modeled | tokeira does not model these as mutable execution options; `UpdateWorkflowExecutionOptions` rejects a mask targeting them with `INVALID_ARGUMENT`. |
 
 ## UpdateWorkflowExecutionResponse

@@ -1161,6 +1161,10 @@ fn mutation_metadata(state: &WorkflowState) -> MutationMetadata {
 pub struct StartedWorkflowTask {
     /// Unique key for the workflow run.
     pub run_key: RunKey,
+    /// User-visible run id of the run. Distinct from the internal storage
+    /// `RunKey` (derived via `dsql_spread_uuid`); wire surfaces must carry
+    /// this, never the key.
+    pub run_id: tokeira_types::RunId,
     /// Human-readable workflow identifier.
     pub workflow_id: tokeira_types::WorkflowId,
     /// Task queue the task was dispatched on.
@@ -1209,6 +1213,8 @@ impl WorkflowActivation {
 pub struct StartedActivityTask {
     /// Unique key for the owning workflow run.
     pub run_key: RunKey,
+    /// User-visible run id of the owning run (see `StartedWorkflowTask::run_id`).
+    pub run_id: tokeira_types::RunId,
     /// Identifier of the activity within the workflow.
     pub activity_id: String,
     /// Activity type name.

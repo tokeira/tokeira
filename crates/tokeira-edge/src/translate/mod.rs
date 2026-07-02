@@ -254,6 +254,8 @@ pub struct PollWorkflowTaskQueueRequest {
 pub struct WorkflowTaskPayloadDto {
     pub workflow_id: String,
     pub run_key: RunKey,
+    /// User-visible run id (distinct from the internal storage `RunKey`).
+    pub run_id: RunId,
     pub task_queue: String,
     pub history: Vec<HistoryEvent>,
 }
@@ -561,6 +563,8 @@ pub struct PollActivityTaskQueueRequest {
 pub struct PollActivityTaskQueueResponse {
     pub task_token: Vec<u8>,
     pub activity_id: String,
+    /// User-visible run id of the owning run (distinct from `run_key`).
+    pub run_id: RunId,
     pub activity_type: String,
     pub input: Payloads,
     pub attempt: u32,

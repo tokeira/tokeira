@@ -613,7 +613,10 @@ fn arb_memo() -> impl Strategy<Value = Memo> {
 fn arb_search_attr_value() -> impl Strategy<Value = SearchAttrValue> {
     prop_oneof![
         arb_small_string().prop_map(SearchAttrValue::Keyword),
-        prop::collection::vec(arb_small_string(), 0..4).prop_map(SearchAttrValue::KeywordList),
+        // Non-empty only: an empty keyword list encodes as bare JSON `[]`,
+        // which the admission nil-filter drops as an unset marker
+        // (`common/payload/payload.go:94 @ v1.31.0`), so it cannot round-trip.
+        prop::collection::vec(arb_small_string(), 1..4).prop_map(SearchAttrValue::KeywordList),
         any::<i64>().prop_map(SearchAttrValue::Int),
         any::<bool>().prop_map(SearchAttrValue::Bool),
         (-1_000_000i64..1_000_000i64).prop_map(|v| SearchAttrValue::Double(v as f64 / 10.0)),
@@ -863,6 +866,7 @@ fn arb_poll_response() -> impl Strategy<Value = PollWorkflowTaskQueueResponse> {
                 payload: WorkflowTaskPayloadDto {
                     workflow_id,
                     run_key: RunKey(Uuid::from_u128(run_key)),
+                    run_id: RunId(Uuid::from_u128(run_key)),
                     task_queue,
                     history: Vec::new(),
                 },
@@ -1413,6 +1417,7 @@ fn arb_poll_activity_response() -> impl Strategy<Value = PollActivityTaskQueueRe
                 PollActivityTaskQueueResponse {
                     task_token: token_bytes,
                     activity_id,
+                    run_id: RunId(Uuid::from_u128(run_key)),
                     activity_type: String::new(),
                     input,
                     attempt,

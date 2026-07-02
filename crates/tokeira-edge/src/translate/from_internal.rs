@@ -52,6 +52,7 @@ pub async fn poll_response(
         scheduled_time: Some(started.scheduled_time),
         started_time: Some(started.started_time),
         payload: WorkflowTaskPayloadDto {
+            run_id: started.run_id,
             workflow_id: started.workflow_id.0,
             run_key: started.run_key,
             task_queue: started.task_queue.0,
@@ -91,6 +92,7 @@ pub fn poll_activity_response(
     Ok(crate::translate::PollActivityTaskQueueResponse {
         task_token: serde_json::to_vec(&started.token)?,
         activity_id: started.activity_id,
+        run_id: started.run_id,
         activity_type: started.activity_type,
         input: started.input,
         attempt: started.attempt,
@@ -228,6 +230,7 @@ mod tests {
                 shard_epoch: ShardEpoch(1),
             },
             run_key,
+            run_id: tokeira_types::RunId(uuid::Uuid::nil()),
             workflow_id: WorkflowId("workflow".to_string()),
             task_queue: TaskQueueName("queue".to_string()),
             previous_started_event_id,

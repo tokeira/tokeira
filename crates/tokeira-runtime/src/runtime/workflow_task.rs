@@ -630,6 +630,7 @@ where
 
         Ok(StartedWorkflowTask {
             run_key: new_state.run_key,
+            run_id: new_state.run_id,
             workflow_id: new_state.workflow_id,
             task_queue: new_state.task_queue,
             previous_started_event_id: new_state.previous_started_event_id,
@@ -673,6 +674,7 @@ where
         });
         Ok(StartedWorkflowTask {
             run_key: state.run_key,
+            run_id: state.run_id,
             workflow_id: state.workflow_id.clone(),
             task_queue: state.task_queue.clone(),
             previous_started_event_id: state.previous_started_event_id,

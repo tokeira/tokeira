@@ -41,3 +41,24 @@ pub enum SearchAttrValue {
 /// A `BTreeMap` is used for deterministic serialisation order.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SearchAttributes(pub BTreeMap<String, SearchAttrValue>);
+
+/// Predefined (server-internal) search attributes that user requests may NOT
+/// set: `sadefs.Predefined()` minus `sadefs.PredefinedWhiteList()`
+/// (`common/searchattribute/sadefs/constants.go:154-192 @ v1.31.0`). The
+/// whitelisted predefined attributes (TemporalChangeVersion, BinaryChecksums,
+/// BuildIds, BatcherNamespace, BatcherUser, TemporalScheduledStartTime,
+/// TemporalScheduledById, TemporalSchedulePaused, TemporalNamespaceDivision,
+/// TemporalPauseInfo, TemporalReportedProblems) remain user-settable; the
+/// validator rejects only the internal-only remainder
+/// (`searchattribute/validator.go:118-120 @ v1.31.0`).
+pub fn is_banned_predefined_search_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "TemporalWorkerDeploymentVersion"
+            | "TemporalWorkflowVersioningBehavior"
+            | "TemporalWorkerDeployment"
+            | "TemporalUsedWorkerDeploymentVersions"
+            | "TemporalExternalPayloadCount"
+            | "TemporalExternalPayloadSizeBytes"
+    )
+}

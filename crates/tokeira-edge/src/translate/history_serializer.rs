@@ -112,6 +112,12 @@ fn event_links(event: &HistoryEvent) -> Vec<proto_common::Link> {
         | HistoryEventKind::NexusOperationCompleted { links, .. } => {
             links.iter().map(link_to_proto).collect()
         }
+        // OnConflictOptions attach records the attached links on the event, not
+        // the attributes (`event.Links = links` in
+        // CreateWorkflowExecutionOptionsUpdatedEvent, event_factory.go:419 @ v1.31.0).
+        HistoryEventKind::WorkflowExecutionOptionsUpdated { attached_links, .. } => {
+            attached_links.iter().map(link_to_proto).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -1455,19 +1461,26 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 FieldChange::Clear => (None, true),
                 FieldChange::Unchanged => (None, false),
             };
-            // The on-conflict attachment fields are authored by the UseExisting-conflict
-            // path; their proto projection (`attached_completion_callbacks`,
-            // `attached_request_id`) is tracked separately in UNSUPPORTED_FIELDS.md.
-            let _ = (
-                completion_callbacks,
-                attached_completion_callbacks,
-                attached_links,
-                attached_request_id,
-            );
+            // The on-conflict attachment fields land IN the attributes:
+            // `CreateWorkflowExecutionOptionsUpdatedEvent` puts AttachedRequestId
+            // and AttachedCompletionCallbacks into the event attributes
+            // (`historybuilder/event_factory.go:413-414 @ v1.31.0`); an empty
+            // string means the update attached no request id. Attached links are
+            // event-level (`event.Links = links`, event_factory.go:419) and are
+            // projected by `event_links`, not here. The `completion_callbacks`
+            // FieldChange (a full replacement, distinct from attach) has no wire
+            // field on these attributes.
+            let _ = completion_callbacks;
+            let _ = attached_links;
             Attributes::WorkflowExecutionOptionsUpdatedEventAttributes(
                 history::WorkflowExecutionOptionsUpdatedEventAttributes {
                     versioning_override,
                     unset_versioning_override,
+                    attached_request_id: attached_request_id.clone().unwrap_or_default(),
+                    attached_completion_callbacks: attached_completion_callbacks
+                        .iter()
+                        .map(completion_callback_to_proto)
+                        .collect(),
                     ..Default::default()
                 },
             )
@@ -2141,6 +2154,84 @@ mod tests {
             history_event_to_proto(&event).worker_may_ignore,
             "OptionsUpdated must set worker_may_ignore so SDK replay tolerates it"
         );
+    }
+
+    // Feature: on-conflict attach history fidelity — the attach fields land in
+    // the event attributes and the attached links on event-level links,
+    // mirroring CreateWorkflowExecutionOptionsUpdatedEvent
+    // (event_factory.go:413-419 @ v1.31.0).
+    #[test]
+    fn options_updated_event_projects_attach_fields() {
+        let callback = tokeira_kernel::CompletionCallback {
+            spec: tokeira_kernel::CallbackSpec::Nexus {
+                url: "https://some-random-address".to_string(),
+                header: std::collections::BTreeMap::new(),
+            },
+            links: Vec::new(),
+            trigger: tokeira_kernel::CallbackTrigger::WorkflowClosed,
+            registration_time: Some(OffsetDateTime::from_unix_timestamp(1000).unwrap()),
+            state: tokeira_kernel::CallbackState::Standby,
+            attempt: 0,
+            last_attempt_failure: None,
+            next_attempt_at: None,
+        };
+        let link = tokeira_kernel::Link::WorkflowEvent {
+            namespace: "ns".to_string(),
+            workflow_id: "wf".to_string(),
+            run_id: "run".to_string(),
+            reference: None,
+        };
+        let event = HistoryEvent {
+            event_id: 3,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                versioning_override: tokeira_kernel::command::FieldChange::Unchanged,
+                completion_callbacks: tokeira_kernel::command::FieldChange::Unchanged,
+                attached_completion_callbacks: vec![callback],
+                attached_links: vec![link],
+                attached_request_id: Some("req-attach".to_string()),
+            },
+        };
+
+        let proto = history_event_to_proto(&event);
+        let Some(
+            history::history_event::Attributes::WorkflowExecutionOptionsUpdatedEventAttributes(
+                attrs,
+            ),
+        ) = &proto.attributes
+        else {
+            panic!(
+                "expected OptionsUpdated attributes, got {:?}",
+                proto.attributes
+            );
+        };
+        assert_eq!(attrs.attached_request_id, "req-attach");
+        assert_eq!(attrs.attached_completion_callbacks.len(), 1);
+        assert_eq!(proto.links.len(), 1);
+
+        // No attach → empty attribute string (workflow_test.go:403 asserts Empty).
+        let bare = HistoryEvent {
+            event_id: 3,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                versioning_override: tokeira_kernel::command::FieldChange::Unchanged,
+                completion_callbacks: tokeira_kernel::command::FieldChange::Unchanged,
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
+                attached_request_id: None,
+            },
+        };
+        let bare_proto = history_event_to_proto(&bare);
+        let Some(
+            history::history_event::Attributes::WorkflowExecutionOptionsUpdatedEventAttributes(
+                bare_attrs,
+            ),
+        ) = &bare_proto.attributes
+        else {
+            panic!("expected OptionsUpdated attributes");
+        };
+        assert_eq!(bare_attrs.attached_request_id, "");
+        assert!(bare_proto.links.is_empty());
     }
 
     // Negative control: ordinary events must not be ignorable, or workers would

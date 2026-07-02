@@ -2256,6 +2256,7 @@ impl WorkflowService {
             payload: crate::translate::WorkflowTaskPayloadDto {
                 workflow_id: state.workflow_id.0.clone(),
                 run_key: state.run_key,
+                run_id: state.run_id,
                 task_queue: state.task_queue.0.clone(),
                 history: Vec::new(),
             },
@@ -2340,6 +2341,7 @@ impl WorkflowService {
             payload: crate::translate::WorkflowTaskPayloadDto {
                 workflow_id: state.workflow_id.0,
                 run_key: state.run_key,
+                run_id: state.run_id,
                 task_queue: state.task_queue.0,
                 history,
             },

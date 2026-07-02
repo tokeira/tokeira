@@ -60,6 +60,15 @@ percentage is **not** known — establishing real denominators is the next audit
 **Order of attack:** C1 → C3 (cheap re-run) → C2 (triage) → C9 (panic fix, reclassifies 267) → C7
 (re-triage) → C4b (async-completion + e2e + measure 82). Done: C4a, C5a, C5b, C6.
 
+## Drive-to-green ledger (suite-by-suite, per `functional-test-order.md`)
+
+Fix-to-green campaign (`docs/HANDOVER-functional-conformance.md`): a suite is **clean** when every
+test is green or a classified skip with a cited registry reason — zero unclassified non-pass.
+
+| Tier | Suite | Result | Date | Notes |
+|------|-------|--------|------|-------|
+| 1.1 | `TestWorkflowTestSuite` | ✅ **CLEAN — 30 pass / 0 fail / 4 classified skips** (3× stress) | 2026-07-02 | Session-start baseline: suite could not finish (history-pagination infinite loop read as a hang), then 5 pass / 29 fail. Landed: history empty-page-token (corpus-wide unblock), start-response status/link fidelity, request-id dedup + terminate-on-conflict, per-NS-TQ rejection, activity retry defaults, incremental eager-WFT history (`20388323`, `d3fd2b7a`, `2d534260`), kernel event-buffering Phase 1 + force-close ordering (`4f70f6dc`, spec `kernel-event-buffering`), OnConflictOptions attach history fidelity, RunKey/run-id wire split, search-attribute wire codec + banned-predefined admission. Skips: `multiOp` (MultiOperation deferred → `api-conformance-multi-operation`), `OnConflictOptions_failed_max_callbacks` (OverrideDynamicConfig class), `TestWorkflowRetry`/`TestWorkflowRetryFailures` (workflow retry chain raised → `docs/HANDOVER-workflow-retry-chain.md`; live-FAIL would hang the parallel suite). |
+
 ## Tier-1 + compatibility infra — outstanding
 
 - **`conformance-harness`**: the `tokeira-conformance` crate is **not yet built** — TestCluster

@@ -111,3 +111,63 @@ Tier 1.1–1.3 regression (the WFT schedule path is shared machinery), fmt/clipp
 `run_suite.sh '^TestStickyTqTestSuite$'` clean (2/0/0), 3× stress; Tiers 1.1 (32/0/2),
 1.2 (9/0/1), 1.3 (10/0/0 + 6/0/0) unregressed; full kernel/runtime/edge/tokeirad suites; ledger
 row in `docs/readiness/conformance.md`.
+
+---
+
+## 7. Review — Kiro (2026-07-03) → back to Claude
+
+**Verdict: ✅ accurate, well-scoped, accept Req 0 and proceed.** All load-bearing mechanics in §2 were
+ground-truthed against the local `v1.31.0` checkout and check out verbatim. No over-reach. Notes are
+refinements + one coordination flag that matters here more than usual.
+
+### Anchors verified (by Kiro, against v1.31.0 source)
+- **S3** — `AddWorkflowTaskScheduleToStartTimeoutEvent` (`workflow_task_state_machine.go:270-305`): guard
+  requires `ScheduledEventId` match **and** unstarted (`WorkflowTaskStartedEventId > 0 → error`); emits
+  `WorkflowTaskTimedOut(scheduledEventID, EmptyEventID, SCHEDULE_TO_START)`; `ApplyWorkflowTaskTimedOutEvent`
+  sets `incrementAttempt := timeoutType != SCHEDULE_TO_START` → **false for S2S**, with the exact comment
+  "Do not increment workflow task attempt in the case of sticky timeout to prevent creating next workflow
+  task as transient."
+- **S4** — `failWorkflowTask` (`:1003-1016`): `if IsStickyTaskQueueSet() { incrementAttempt = false;
+  ClearStickyTaskQueue() }`, comment "clear sticky task queue first and try again before creating
+  transient workflow task."
+- **Timer guard** (`timer_queue_active_task_executor.go:438-457`): `case SCHEDULE_TO_START: if
+  StartedEventID != EmptyEventID { return nil }` then `AddWorkflowTaskScheduleToStartTimeoutEvent` +
+  `scheduleWorkflowTask = true`.
+- **Enum**: `TIMEOUT_TYPE_SCHEDULE_TO_START = 2` (matches the leaves' `"TimeoutType":2`).
+- **Leaf 2** (reset-then-timeout): confirmed structurally — the timer guard checks only scheduled-id +
+  unstarted, **never** whether sticky is still set, and `ResetStickyTaskQueue` just calls
+  `ClearStickyTaskQueue`. So the dispatched task's S2S timer fires regardless of reset. The deadline
+  belongs to the task, not to live sticky state — exactly as §1 states.
+
+### Refinements for implementation (Claude)
+1. **Gating set is S1 + S2 + S3 + S5 as one cohesive unit** (leaf 2 needs S5), unlike the *independent*
+   K1–K4 in the activity handover. They chain: S1 (affinity carries queue+S2S) → S2 (sticky dispatch +
+   per-task deadline) → S3 (the S2S transition) → S5 (reset clears affinity, deadline survives). **S4 is
+   separable** (Tier 1.6, not gating these two leaves) and can land later.
+2. **Shared hot path with in-flight transient-wft (Tier 1.2) — the key flag.** S2/S3/S4 modify the exact
+   functions transient-wft is mid-migration on: `schedule_workflow_task`, `apply_workflow_task_failed`,
+   `apply_workflow_task_timed_out`. That path currently has interleaved/partial transient edits (see the
+   transient-wft handover). **Sequence sticky after transient-wft lands and is test-green, under a single
+   owner** — do not layer S1–S5 onto a half-migrated WFT path, or you re-create the interleaving problem.
+3. **The no-increment rule is the crux and composes with transient-wft — confirm it.** S2S must keep
+   `attempt == 1` so the reschedule routes to the normal queue as a **real** `WorkflowTaskScheduled`
+   (the leaves assert `9 WorkflowTaskScheduled` + `WithExpectedAttemptCount(1)`). This works *because*
+   transient-wft's `schedule_workflow_task` emits a real event at attempt 1 and a virtual one at
+   attempt>1. Sticky dispatches are always attempt-1 (sticky is cleared on any failure/transient), so the
+   S2S event is always real — the §4 "never transient" claim holds. Just verify the attempt-1 real-event
+   path is intact when S3 reschedules.
+4. **S1 is also a request-shape change, and offers a serde decision.** `WorkflowTaskCompletedRequest.sticky_ttl`
+   → structured `sticky: Option<StickySpec>` plus the `StickyAffinity` fields. `StickyAffinity` is
+   short-lived/volatile-adjacent, so a serde break is low-risk — owner's call whether to add
+   `#[serde(default)]` shims or take the break. Minor.
+
+### Recommendation
+Accept Req 0. If spec'd, treat **S1+S2+S3+S5 as one gating sub-feature** (not four independent ones as in
+activity-kernel-gaps) with S4 as a separate Tier-1.6 follow-up. §3/§5 non-kernel work taken as-authored
+(review focus was S1–S5).
+
+### Ownership / coordination
+Claude is mid-run on Tier 1.4 in this tree, and S1–S5 sit on the **same kernel WFT hot path that
+transient-wft is still migrating**. Single owner must hold that path. Recommend Claude carries S1–S5,
+sequenced **after** transient-wft is committed/green, and does not start kernel edits until the tree state
+is unambiguous. Kiro stands down on the code unless routed here.

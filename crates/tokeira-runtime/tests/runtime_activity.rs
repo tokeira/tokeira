@@ -111,11 +111,14 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
         )
         .await?;
 
+    // The retried attempt is published only after the 1s retry backoff
+    // (v1.31.0 dispatches retries on a retry timer, activity.go:74 @ v1.31.0),
+    // so the poll window must cover it.
     let second = runtime
         .poll_activity_task(
             activity_queue(namespace_id),
             WorkerIdentity("worker-a".to_string()),
-            tokio::time::Duration::from_millis(5),
+            tokio::time::Duration::from_secs(5),
         )
         .await?
         .expect("retried activity should be pollable");
@@ -203,11 +206,13 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
             .is_none()
     );
 
+    // The retried attempt is published only after the 1s retry backoff
+    // (activity.go:74 @ v1.31.0), so the poll window must cover it.
     let second = runtime
         .poll_activity_task(
             activity_queue_with_version(namespace_id, Some(deployment), Some(build_id)),
             WorkerIdentity("worker-a".to_string()),
-            tokio::time::Duration::from_millis(5),
+            tokio::time::Duration::from_secs(5),
         )
         .await?
         .expect("versioned retry should be pollable");

@@ -406,6 +406,11 @@ pub struct PendingActivityDescription {
     pub scheduled_at: OffsetDateTime,
     pub started_at: Option<OffsetDateTime>,
     pub last_failure: Option<Payload>,
+    /// Latest worker heartbeat progress, surfaced only once a heartbeat has
+    /// been recorded (`GetPendingActivityInfo` gates `HeartbeatDetails` on a
+    /// recorded heartbeat, `service/history/workflow/activity.go:147-150 @
+    /// v1.31.0`).
+    pub heartbeat_details: Option<Payloads>,
     pub paused: bool,
     pub pause_info: Option<PauseInfoDescription>,
 }

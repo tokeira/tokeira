@@ -190,6 +190,19 @@ impl EdgeError {
 
 impl From<anyhow::Error> for EdgeError {
     fn from(value: anyhow::Error) -> Self {
+        // A failed activity-token revalidation surfaces as v1.31.0's
+        // `ErrActivityTaskNotFound`: code NotFound with this exact message,
+        // asserted verbatim by clients (`service/history/consts/const.go:44-45
+        // @ v1.31.0`). The typed error's own reason is diagnostic only.
+        if value
+            .downcast_ref::<tokeira_runtime::ActivityTaskNotFound>()
+            .is_some()
+        {
+            return Self::NotFound(
+                "invalid activityID or activity already timed out or invoking workflow is completed"
+                    .to_string(),
+            );
+        }
         match value.downcast::<tokeira_runtime::NotShardOwner>() {
             Ok(not_owner) => Self::NotShardOwner {
                 bundle_id: not_owner.bundle_id,

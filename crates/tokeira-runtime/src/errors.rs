@@ -42,6 +42,23 @@ impl NotShardOwner {
     }
 }
 
+/// A worker-presented activity task token failed revalidation against
+/// authoritative state: the run or activity is gone, or the token's identity
+/// (`schedule_event_id`, `attempt`) no longer matches the live activity.
+///
+/// This is the typed form of v1.31.0's `ErrActivityTaskNotFound` — the edge
+/// maps it to the fixed NotFound message `"invalid activityID or activity
+/// already timed out or invoking workflow is completed"`
+/// (`service/history/consts/const.go:44-45` +
+/// `IsActivityTaskNotFoundForToken`, `service/history/api/activity_util.go:58`
+/// @ v1.31.0) regardless of `reason`, which exists for diagnostics only.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("activity task not found: {reason}")]
+pub struct ActivityTaskNotFound {
+    /// Which revalidation check failed (diagnostic detail; never on the wire).
+    pub reason: &'static str,
+}
+
 /// Runtime could not construct an activity task token from authoritative state.
 ///
 /// Each variant marks a distinct point where token resolution failed against the

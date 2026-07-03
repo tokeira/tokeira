@@ -184,6 +184,13 @@ where
         let activity_id = token.activity_id.clone();
         let retry_policy = activity.retry_policy.clone().or(workflow_retry_policy);
 
+        // Retry-expiration anchor: the FIRST schedule + schedule-to-close (the
+        // deadline spans the whole retry chain; `retry.go:108-110 @ v1.31.0`).
+        let now = OffsetDateTime::now_utc();
+        let expiration = activity
+            .schedule_to_close_timeout
+            .filter(|timeout| !timeout.is_zero())
+            .map(|timeout| activity.scheduled_at + timeout);
         let should_retry = retry_policy.as_ref().map(|policy| {
             evaluate_activity_retry(
                 policy,
@@ -193,11 +200,26 @@ where
                 } else {
                     failure_error_type.as_deref()
                 },
+                now,
+                expiration,
             )
         });
 
-        if let Some(RetryDecision::Retry { next_attempt }) = should_retry {
-            match self.retry_activity_task(&token, next_attempt).await {
+        if let Some(RetryDecision::Retry {
+            next_attempt,
+            backoff,
+        }) = should_retry
+        {
+            match self
+                .retry_activity_task(
+                    &token,
+                    next_attempt,
+                    backoff,
+                    Some(failure.clone()),
+                    worker_identity.clone(),
+                )
+                .await
+            {
                 Ok(()) => runtime_metrics::record_activity_task_retry(OutcomeLabel::Success),
                 Err(error) => {
                     runtime_metrics::record_activity_task_retry(OutcomeLabel::Failure);
@@ -285,22 +307,40 @@ where
     ) -> Result<bool> {
         let mut attempts = 0u32;
         loop {
+            // Identity failures are the typed [`ActivityTaskNotFound`] —
+            // v1.31.0 heartbeats reject stale/unknown tokens AND
+            // not-yet-started activities with `ErrActivityTaskNotFound`
+            // (recordactivitytaskheartbeat/api.go:73-75 +
+            // IsActivityTaskNotFoundForToken, activity_util.go:58 @ v1.31.0).
             let LoadedRun::Existing(state) = self.repo.load_run(token.run_key).await? else {
-                return Err(anyhow!("run not found for activity heartbeat"));
+                return Err(ActivityTaskNotFound {
+                    reason: "run not found for activity heartbeat",
+                }
+                .into());
             };
             let Some(current) = state.activities.get(&token.activity_id).cloned() else {
-                return Err(anyhow!("activity not found for heartbeat"));
+                return Err(ActivityTaskNotFound {
+                    reason: "activity not found for heartbeat",
+                }
+                .into());
             };
             if current.schedule_event_id != token.schedule_event_id {
-                return Err(anyhow!("activity heartbeat schedule_event_id mismatch"));
+                return Err(ActivityTaskNotFound {
+                    reason: "activity heartbeat schedule_event_id mismatch",
+                }
+                .into());
             }
             if current.attempt != token.attempt {
-                return Err(anyhow!("activity heartbeat attempt mismatch"));
+                return Err(ActivityTaskNotFound {
+                    reason: "activity heartbeat attempt mismatch",
+                }
+                .into());
             }
             if current.started_event_id.is_none() {
-                return Err(anyhow!(
-                    "activity heartbeat for activity that has not started"
-                ));
+                return Err(ActivityTaskNotFound {
+                    reason: "activity heartbeat for activity that has not started",
+                }
+                .into());
             }
             if token.shard_epoch != self.shard_epoch_for_completion(token.run_key).await? {
                 return Err(anyhow!("activity heartbeat shard epoch mismatch"));
@@ -413,6 +453,144 @@ where
             attempt: activity.attempt,
             shard_epoch,
         })
+    }
+
+    /// Fabricate the `ActivityTaskStarted` event for a not-yet-started
+    /// activity so a by-id completion can force-complete it, returning a
+    /// token for the (now started) activity.
+    ///
+    /// `RespondActivityTaskCompletedById` on an unstarted activity does not
+    /// reject: v1.31.0 adds a started event carrying the *completing
+    /// caller's* identity and then completes
+    /// (`respondactivitytaskcompleted/api.go:89-105 @ v1.31.0`; the
+    /// `isCompletedByID` escape in `IsActivityTaskNotFoundForToken`,
+    /// activity_util.go:58-67). Only the completed-by-id verb gets this —
+    /// failed/canceled/heartbeat pass a nil `isCompletedByID` and reject.
+    ///
+    /// If a worker races us and starts the activity first, the freshly loaded
+    /// `started_event_id` is honoured and a token for the real start is
+    /// returned instead. The started event fabricated here is identical in
+    /// shape to [`Self::start_activity_task`]'s; a stale broker offer for
+    /// this activity dies at claim time against `started_event_id`.
+    pub async fn force_start_activity_for_completion(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+        identity: WorkerIdentity,
+    ) -> Result<ActivityTaskToken> {
+        let mut attempts = 0u32;
+        loop {
+            let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+                return Err(ActivityTaskNotFound {
+                    reason: "run not found for by-id force start",
+                }
+                .into());
+            };
+            if !state.is_open() {
+                return Err(ActivityTaskNotFound {
+                    reason: "workflow closed for by-id force start",
+                }
+                .into());
+            }
+            let Some(current) = state.activities.get(activity_id).cloned() else {
+                return Err(ActivityTaskNotFound {
+                    reason: "activity not found for by-id force start",
+                }
+                .into());
+            };
+            let token = ActivityTaskToken {
+                run_key,
+                activity_id: activity_id.to_string(),
+                schedule_event_id: current.schedule_event_id,
+                attempt: current.attempt,
+                shard_epoch: self.shard_epoch_for_completion(run_key).await?,
+            };
+            if current.started_event_id.is_some() {
+                return Ok(token);
+            }
+
+            let mut next_state = state.clone();
+            next_state.transition_seq = state.transition_seq.next();
+            let mut next_activity = current.clone();
+            next_activity.stamp += 1;
+            let now = OffsetDateTime::now_utc();
+            next_activity.started_at = Some(now);
+            let started_event_id = next_state.last_event_id + 1;
+            next_state.last_event_id = started_event_id;
+            next_activity.started_event_id = Some(started_event_id);
+            next_state
+                .activities
+                .insert(activity_id.to_string(), next_activity.clone());
+
+            let started_event = HistoryEvent {
+                event_id: started_event_id,
+                happened_at: now,
+                kind: HistoryEventKind::ActivityTaskStarted {
+                    activity_id: activity_id.to_string(),
+                    scheduled_event_id: current.schedule_event_id,
+                    attempt: current.attempt,
+                    identity: identity.clone(),
+                    request_id: format!("activity-start-{}-{}", activity_id, current.attempt),
+                    last_failure: current.last_failure.clone(),
+                },
+            };
+            let transition = Transition {
+                expected_seq: state.transition_seq,
+                next_state,
+                history_events: smallvec![started_event],
+                request_dedupe_ops: SmallVec::new(),
+                activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
+                timer_ops: SmallVec::new(),
+                dispatch_ops: SmallVec::new(),
+                projection_ops: SmallVec::new(),
+            };
+
+            // Same commit-epoch rule as start_activity_task: ZERO without a
+            // placement controller (no lease to fence), real local epoch under
+            // one so storage lease-fences a superseded owner's write.
+            let (bundle, commit_epoch) = {
+                let owner = self.shard_owner.read().unwrap();
+                let bundle_id = execution_home_bundle(
+                    state.namespace_id.0.as_bytes(),
+                    state.workflow_id.0.as_bytes(),
+                    owner.shard_count(),
+                );
+                let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
+                let epoch = if self.config.controller_managed_placement {
+                    local_epoch
+                } else {
+                    ShardEpoch::ZERO
+                };
+                (bundle_id, epoch)
+            };
+
+            match self
+                .repo
+                .commit_transition_for_bundle(run_key, bundle, transition, commit_epoch)
+                .await?
+            {
+                CommitResult::Applied { .. } => {
+                    runtime_metrics::record_activity_task_started(OutcomeLabel::Success);
+                    self.activity_tracking.record_started(
+                        run_key,
+                        activity_id,
+                        OffsetDateTime::now_utc(),
+                    );
+                    return Ok(token);
+                }
+                CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
+                    if attempts >= self.config.max_occ_retries {
+                        return Err(anyhow!("by-id force start OCC exhausted"));
+                    }
+                    attempts += 1;
+                }
+                // A duplicate means this exact transition already committed;
+                // re-loop to observe the started activity and mint its token.
+                CommitResult::Duplicate => {
+                    attempts += 1;
+                }
+            }
+        }
     }
 
     /// Resolve a Nexus operation back into its originator workflow.
@@ -697,21 +875,41 @@ where
     /// owner cannot resolve an activity on a shard it no longer owns. Returns
     /// the activity state plus the workflow-level retry policy (the fallback
     /// when the activity has no policy of its own).
+    ///
+    /// Identity failures (gone run/activity, stale `schedule_event_id` or
+    /// `attempt`) are the typed [`ActivityTaskNotFound`] so the edge can
+    /// surface v1.31.0's `ErrActivityTaskNotFound` (`RespondActivityTask*` /
+    /// `RecordActivityTaskHeartbeat` all funnel token mismatches there via
+    /// `IsActivityTaskNotFoundForToken`, activity_util.go:58 @ v1.31.0). The
+    /// epoch check stays an internal error: it is tokeira placement fencing,
+    /// not a Temporal-visible condition.
     async fn validate_activity_token(
         &self,
         token: &ActivityTaskToken,
     ) -> Result<(tokeira_kernel::ActivityState, Option<RetryPolicy>)> {
         let LoadedRun::Existing(state) = self.repo.load_run(token.run_key).await? else {
-            return Err(anyhow!("run not found for activity token"));
+            return Err(ActivityTaskNotFound {
+                reason: "run not found for activity token",
+            }
+            .into());
         };
         let Some(activity) = state.activities.get(&token.activity_id).cloned() else {
-            return Err(anyhow!("activity not found for token"));
+            return Err(ActivityTaskNotFound {
+                reason: "activity not found for token",
+            }
+            .into());
         };
         if activity.schedule_event_id != token.schedule_event_id {
-            return Err(anyhow!("activity schedule_event_id mismatch"));
+            return Err(ActivityTaskNotFound {
+                reason: "activity schedule_event_id mismatch",
+            }
+            .into());
         }
         if activity.attempt != token.attempt {
-            return Err(anyhow!("activity attempt mismatch"));
+            return Err(ActivityTaskNotFound {
+                reason: "activity attempt mismatch",
+            }
+            .into());
         }
         if token.shard_epoch != self.shard_epoch_for_completion(token.run_key).await? {
             return Err(anyhow!("activity shard epoch mismatch"));
@@ -721,59 +919,169 @@ where
 
     /// Re-dispatch an activity at its next attempt after a retryable failure.
     ///
-    /// Bumps the attempt, clears the started markers, and commits a transition
-    /// whose dispatch op re-enqueues the activity task — the reject-and-retry
-    /// half of activity failure handling. The reload-and-recheck OCC loop
-    /// guards against a concurrent resolution: if the token no longer matches
-    /// the current `(attempt, schedule_event_id)` the retry is abandoned with an
-    /// error, and a commit conflict is retried up to `max_occ_retries`.
+    /// Thin wrapper over [`commit_activity_retry`]: the worker's task token
+    /// supplies the staleness fence (`attempt`, `schedule_event_id`) that the
+    /// shared commit revalidates against durable state.
     async fn retry_activity_task(
         &self,
         token: &ActivityTaskToken,
         next_attempt: u32,
+        backoff: time::Duration,
+        failure: Option<Payload>,
+        _worker_identity: Option<WorkerIdentity>,
     ) -> Result<()> {
-        let mut attempts = 0u32;
-        loop {
-            let LoadedRun::Existing(state) = self.repo.load_run(token.run_key).await? else {
-                return Err(anyhow!("run not found for activity retry"));
-            };
-            let Some(current) = state.activities.get(&token.activity_id).cloned() else {
-                return Err(anyhow!("activity not found for retry"));
-            };
-            if current.attempt != token.attempt
-                || current.schedule_event_id != token.schedule_event_id
-            {
-                return Err(anyhow!("stale activity token for retry"));
-            }
-
-            let mut next_state = state.clone();
-            next_state.transition_seq = state.transition_seq.next();
-            let mut next_activity = current.clone();
-            next_activity.attempt = next_attempt;
-            next_activity.stamp += 1;
-            next_activity.started_at = None;
-            next_activity.started_event_id = None;
-            next_activity.current_attempt_scheduled_at = Some(OffsetDateTime::now_utc());
-            next_state
-                .activities
-                .insert(token.activity_id.clone(), next_activity.clone());
-
-            let queue = QueueKey {
-                namespace_id: state.namespace_id,
-                task_queue: next_activity.task_queue.clone(),
-                task_kind: tokeira_types::TaskKind::Activity,
-                deployment: next_activity
-                    .deployment
-                    .clone()
-                    .or_else(|| state.deployment.clone()),
-                build_id: next_activity
-                    .build_id
-                    .clone()
-                    .or_else(|| state.build_id.clone()),
-            };
-            let dispatch_task = DispatchableActivityTask {
+        commit_activity_retry(
+            &self.activity_retry_deps(),
+            ActivityRetryTarget {
                 run_key: token.run_key,
-                queue: queue.clone(),
+                activity_id: &token.activity_id,
+                expected_attempt: token.attempt,
+                expected_schedule_event_id: token.schedule_event_id,
+            },
+            next_attempt,
+            backoff,
+            failure,
+        )
+        .await
+    }
+
+    /// Bundle the runtime handles [`commit_activity_retry`] needs, so the
+    /// activity timeout scanner (a free task without `&self`) can run the
+    /// same retry transition as the worker-reported failure path.
+    pub(crate) fn activity_retry_deps(&self) -> ActivityRetryDeps<R> {
+        ActivityRetryDeps {
+            repo: self.repo.clone(),
+            shard_owner: self.shard_owner.clone(),
+            controller_managed_placement: self.config.controller_managed_placement,
+            max_occ_retries: self.config.max_occ_retries,
+            broker: self.activity_broker.clone(),
+            delivery_metrics: self.delivery_metrics.clone(),
+            tracking: self.activity_tracking.clone(),
+        }
+    }
+}
+
+/// Runtime handles shared by the failure-path retry
+/// ([`TokeiraRuntime::retry_activity_task`]) and the timeout scanner's
+/// retry-on-timeout, which runs outside the runtime `impl`.
+pub(crate) struct ActivityRetryDeps<R> {
+    pub repo: Arc<R>,
+    pub shard_owner: Arc<RwLock<ShardOwner>>,
+    pub controller_managed_placement: bool,
+    pub max_occ_retries: u32,
+    pub broker: InMemoryActivityBroker,
+    pub delivery_metrics: DeliveryMetrics,
+    pub tracking: ActivityTrackingState,
+}
+
+/// The staleness fence for a retry commit: which activity incarnation the
+/// caller decided to retry. The commit revalidates `(expected_attempt,
+/// expected_schedule_event_id)` against reloaded durable state so a
+/// concurrent resolution or competing retry abandons rather than double-fires.
+pub(crate) struct ActivityRetryTarget<'a> {
+    pub run_key: RunKey,
+    pub activity_id: &'a str,
+    pub expected_attempt: u32,
+    pub expected_schedule_event_id: i64,
+}
+
+/// Commit an activity's next attempt and (re)publish its dispatch task after
+/// the retry backoff.
+///
+/// Bumps the attempt, clears the started markers, and commits a transition
+/// whose dispatch op re-enqueues the activity task — the reject-and-retry
+/// half of activity failure handling, also run by the timeout scanner when a
+/// fired attempt timeout is retryable (`RetryActivity` →
+/// `UpdateActivityInfoForRetries`, mutable_state_impl.go + activity.go:63-97
+/// @ v1.31.0). The reload-and-recheck OCC loop guards against a concurrent
+/// resolution: if the target no longer matches the current `(attempt,
+/// schedule_event_id)` the retry is abandoned with an error, and a commit
+/// conflict is retried up to `max_occ_retries`.
+pub(crate) async fn commit_activity_retry<R>(
+    deps: &ActivityRetryDeps<R>,
+    target: ActivityRetryTarget<'_>,
+    next_attempt: u32,
+    backoff: time::Duration,
+    failure: Option<Payload>,
+) -> Result<()>
+where
+    R: RunRepository + 'static,
+{
+    let run_key = target.run_key;
+    let activity_id = target.activity_id;
+    let mut attempts = 0u32;
+    loop {
+        let LoadedRun::Existing(state) = deps.repo.load_run(run_key).await? else {
+            return Err(anyhow!("run not found for activity retry"));
+        };
+        let Some(current) = state.activities.get(activity_id).cloned() else {
+            return Err(anyhow!("activity not found for retry"));
+        };
+        if current.attempt != target.expected_attempt
+            || current.schedule_event_id != target.expected_schedule_event_id
+        {
+            return Err(anyhow!("stale activity token for retry"));
+        }
+
+        let mut next_state = state.clone();
+        next_state.transition_seq = state.transition_seq.next();
+        let mut next_activity = current.clone();
+        next_activity.attempt = next_attempt;
+        next_activity.stamp += 1;
+        next_activity.started_at = None;
+        next_activity.started_event_id = None;
+        // The next attempt is scheduled AFTER the retry backoff — v1.31.0
+        // advances ScheduledTime to now+backoff and dispatches on a retry
+        // timer, not immediately (`UpdateActivityInfoForRetries`,
+        // activity.go:74 + GenerateActivityRetryTasks @ v1.31.0).
+        let dispatch_at = OffsetDateTime::now_utc() + backoff;
+        next_activity.current_attempt_scheduled_at = Some(dispatch_at);
+        // The failed attempt's failure is durable retry bookkeeping,
+        // surfaced by Describe as LastFailure and by the next
+        // ActivityTaskStarted's last_failure (`RetryLastFailure`,
+        // activity.go:82 @ v1.31.0).
+        if let Some(failure) = failure.clone() {
+            next_activity.last_failure = Some(failure);
+        }
+        next_state
+            .activities
+            .insert(activity_id.to_string(), next_activity.clone());
+
+        let queue = QueueKey {
+            namespace_id: state.namespace_id,
+            task_queue: next_activity.task_queue.clone(),
+            task_kind: tokeira_types::TaskKind::Activity,
+            deployment: next_activity
+                .deployment
+                .clone()
+                .or_else(|| state.deployment.clone()),
+            build_id: next_activity
+                .build_id
+                .clone()
+                .or_else(|| state.build_id.clone()),
+        };
+        let dispatch_task = DispatchableActivityTask {
+            run_key,
+            queue: queue.clone(),
+            activity_id: next_activity.activity_id.clone(),
+            input: next_activity.input.clone(),
+            schedule_event_id: next_activity.schedule_event_id,
+            attempt: next_activity.attempt,
+            dispatch_revision: state
+                .versioning_info
+                .as_ref()
+                .map(|info| info.revision_number)
+                .unwrap_or_default(),
+        };
+        let transition = Transition {
+            expected_seq: state.transition_seq,
+            next_state,
+            history_events: SmallVec::new(),
+            request_dedupe_ops: SmallVec::new(),
+            activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
+            timer_ops: SmallVec::new(),
+            dispatch_ops: smallvec![DispatchOp::EnqueueActivityTask {
+                queue,
                 activity_id: next_activity.activity_id.clone(),
                 input: next_activity.input.clone(),
                 schedule_event_id: next_activity.schedule_event_id,
@@ -783,80 +1091,80 @@ where
                     .as_ref()
                     .map(|info| info.revision_number)
                     .unwrap_or_default(),
-            };
-            let transition = Transition {
-                expected_seq: state.transition_seq,
-                next_state,
-                history_events: SmallVec::new(),
-                request_dedupe_ops: SmallVec::new(),
-                activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
-                timer_ops: SmallVec::new(),
-                dispatch_ops: smallvec![DispatchOp::EnqueueActivityTask {
-                    queue,
-                    activity_id: next_activity.activity_id.clone(),
-                    input: next_activity.input.clone(),
-                    schedule_event_id: next_activity.schedule_event_id,
-                    attempt: next_activity.attempt,
-                    dispatch_revision: state
-                        .versioning_info
-                        .as_ref()
-                        .map(|info| info.revision_number)
-                        .unwrap_or_default(),
-                    schedule_to_close_timeout: next_activity.schedule_to_close_timeout,
-                    schedule_to_start_timeout: next_activity.schedule_to_start_timeout,
-                    start_to_close_timeout: next_activity.start_to_close_timeout,
-                    heartbeat_timeout: next_activity.heartbeat_timeout,
-                }],
-                projection_ops: SmallVec::new(),
-            };
+                schedule_to_close_timeout: next_activity.schedule_to_close_timeout,
+                schedule_to_start_timeout: next_activity.schedule_to_start_timeout,
+                start_to_close_timeout: next_activity.start_to_close_timeout,
+                heartbeat_timeout: next_activity.heartbeat_timeout,
+            }],
+            projection_ops: SmallVec::new(),
+        };
 
-            // Same commit-epoch rule as start_activity_task: ZERO without a
-            // placement controller (no lease to fence), real local epoch under
-            // one so storage lease-fences a superseded owner's write.
-            let (bundle, commit_epoch) = {
-                let owner = self.shard_owner.read().unwrap();
-                let bundle_id = execution_home_bundle(
-                    state.namespace_id.0.as_bytes(),
-                    state.workflow_id.0.as_bytes(),
-                    owner.shard_count(),
-                );
-                let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
-                let epoch = if self.config.controller_managed_placement {
-                    local_epoch
-                } else {
-                    ShardEpoch::ZERO
-                };
-                (bundle_id, epoch)
+        // Same commit-epoch rule as start_activity_task: ZERO without a
+        // placement controller (no lease to fence), real local epoch under
+        // one so storage lease-fences a superseded owner's write.
+        let (bundle, commit_epoch) = {
+            let owner = deps.shard_owner.read().unwrap();
+            let bundle_id = execution_home_bundle(
+                state.namespace_id.0.as_bytes(),
+                state.workflow_id.0.as_bytes(),
+                owner.shard_count(),
+            );
+            let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
+            let epoch = if deps.controller_managed_placement {
+                local_epoch
+            } else {
+                ShardEpoch::ZERO
             };
+            (bundle_id, epoch)
+        };
 
-            match self
-                .repo
-                .commit_transition_for_bundle(token.run_key, bundle, transition, commit_epoch)
-                .await?
-            {
-                CommitResult::Applied { .. } => {
-                    if let Err(error) = self
-                        .activity_broker
-                        .publish_activity_task(dispatch_task, Some(&self.delivery_metrics))
-                        .await
-                    {
-                        tracing::warn!(?error, run_key = ?token.run_key, activity_id = token.activity_id, "failed to publish retried activity task");
-                    }
-                    self.activity_tracking.record_retry(
-                        token.run_key,
-                        &token.activity_id,
-                        OffsetDateTime::now_utc(),
+        match deps
+            .repo
+            .commit_transition_for_bundle(run_key, bundle, transition, commit_epoch)
+            .await?
+        {
+            CommitResult::Applied { .. } => {
+                deps.tracking
+                    .record_retry(run_key, activity_id, dispatch_at);
+                if backoff.is_positive() {
+                    // Backoff-delayed dispatch: the commit above already
+                    // recorded the future schedule time durably; the publish
+                    // itself waits out the backoff (v1.31.0 uses a retry
+                    // timer task for this window). Recovery note: a process
+                    // restart inside the window relies on the timeout
+                    // scanner's schedule anchors rather than this in-memory
+                    // timer.
+                    let broker = deps.broker.clone();
+                    let metrics = deps.delivery_metrics.clone();
+                    let activity_id = activity_id.to_string();
+                    let delay = std::time::Duration::from_millis(
+                        backoff.whole_milliseconds().max(0) as u64,
                     );
-                    return Ok(());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        if let Err(error) = broker
+                            .publish_activity_task(dispatch_task, Some(&metrics))
+                            .await
+                        {
+                            tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish backoff-delayed activity retry");
+                        }
+                    });
+                } else if let Err(error) = deps
+                    .broker
+                    .publish_activity_task(dispatch_task, Some(&deps.delivery_metrics))
+                    .await
+                {
+                    tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish retried activity task");
                 }
-                CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
-                    if attempts >= self.config.max_occ_retries {
-                        return Err(anyhow!("activity retry OCC exhausted"));
-                    }
-                    attempts += 1;
-                }
-                CommitResult::Duplicate => return Ok(()),
+                return Ok(());
             }
+            CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
+                if attempts >= deps.max_occ_retries {
+                    return Err(anyhow!("activity retry OCC exhausted"));
+                }
+                attempts += 1;
+            }
+            CommitResult::Duplicate => return Ok(()),
         }
     }
 }
@@ -1069,7 +1377,11 @@ mod tests {
     ) -> (WorkflowState, ActivityTaskToken, QueueKey) {
         let mut state = open_state(None);
         let run_key = state.run_key;
-        let scheduled_at = now();
+        // Anchor at real time: the retry path measures the schedule-to-close
+        // retry-expiration against `OffsetDateTime::now_utc()` (retry.go:108-110
+        // @ v1.31.0), so a fixed-epoch anchor would classify every retry as
+        // expired.
+        let scheduled_at = OffsetDateTime::now_utc();
         let started_at = scheduled_at + Duration::seconds(1);
         let activity = tokeira_kernel::ActivityState {
             activity_id: "activity-1".to_string(),
@@ -1173,11 +1485,14 @@ mod tests {
         assert_eq!(retried.heartbeat_details, Some(details.clone()));
         assert!(retried.current_attempt_scheduled_at.is_some());
 
+        // The retried attempt is published only after the 1s retry backoff
+        // (v1.31.0 dispatches retries on a retry timer, `activity.go:74` +
+        // `GenerateActivityRetryTasks`), so the poll window must cover it.
         let started = runtime
             .poll_activity_task(
                 queue,
                 WorkerIdentity("activity-worker".to_string()),
-                tokio::time::Duration::from_secs(1),
+                tokio::time::Duration::from_secs(5),
             )
             .await
             .expect("poll should not fail")

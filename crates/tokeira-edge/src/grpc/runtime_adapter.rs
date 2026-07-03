@@ -230,6 +230,17 @@ where
             .await
     }
 
+    async fn force_start_activity_for_completion(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+        identity: tokeira_types::WorkerIdentity,
+    ) -> Result<ActivityTaskToken> {
+        self.runtime
+            .force_start_activity_for_completion(run_key, activity_id, identity)
+            .await
+    }
+
     async fn update_activity_options(
         &self,
         run_key: RunKey,

@@ -23,7 +23,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
 };
 
 use time::OffsetDateTime;
@@ -31,12 +31,20 @@ use tokeira_kernel::{
     ActivityResolution, ActivityResolvedRequest, ActivityState, Command, LoadedRun,
 };
 use tokeira_observability::OutcomeLabel;
+use tokeira_proto::{
+    conversions::common::failure_to_payload, public::temporal::api::enums::v1 as enums_proto,
+    public::temporal::api::failure::v1 as failure_proto,
+};
 use tokeira_storage::RunRepository;
-use tokeira_types::{RunKey, ShardId};
+use tokeira_types::{Payload, RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
+    lane::LaneHandle,
+    metrics as runtime_metrics,
+    retry::{RetryDecision, RetryExhaustedReason, evaluate_activity_retry},
+    runtime::{ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry},
+    scanner::pick_lane_for_run_key,
 };
 
 /// One open activity being watched for timeouts.
@@ -214,7 +222,7 @@ impl ActivityTrackingState {
 }
 
 /// Which activity deadline was exceeded.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeoutViolation {
     ScheduleToClose,
     ScheduleToStart,
@@ -250,36 +258,41 @@ impl Default for ActivityTimeoutScannerConfig {
 /// heartbeat lapse is the tighter, more specific failure); if it has *not* started
 /// yet, only schedule-to-start applies. The heartbeat clock falls back to
 /// `started_at` when no heartbeat has been received, so the first interval is
-/// measured from start. A zero timeout is treated as immediately due once its
-/// anchor is reached rather than as "no timeout".
+/// measured from start. A zero timeout never fires: v1.31.0 creates a timeout
+/// timer only for positive durations (`timer_sequence.go:268-271 @ v1.31.0`) —
+/// zero/unset means "no deadline" (the edge already normalizes present-zero
+/// SDK durations to `None`; the guards here are defense in depth).
 pub fn evaluate_activity_timeout(
     entry: &ActivityTrackingEntry,
     activity: &ActivityState,
     now: OffsetDateTime,
 ) -> Option<TimeoutViolation> {
     if let Some(timeout) = activity.schedule_to_close_timeout
-        && (now - entry.original_scheduled_at > timeout
-            || (timeout.is_zero() && now >= entry.original_scheduled_at))
+        && !timeout.is_zero()
+        && now - entry.original_scheduled_at > timeout
     {
         return Some(TimeoutViolation::ScheduleToClose);
     }
 
     if let Some(started_at) = entry.started_at {
-        if let Some(timeout) = activity.heartbeat_timeout {
+        if let Some(timeout) = activity.heartbeat_timeout
+            && !timeout.is_zero()
+        {
             let heartbeat_at = entry.last_heartbeat_at.unwrap_or(started_at);
-            if now - heartbeat_at > timeout || (timeout.is_zero() && now >= heartbeat_at) {
+            if now - heartbeat_at > timeout {
                 return Some(TimeoutViolation::Heartbeat);
             }
         }
 
         if let Some(timeout) = activity.start_to_close_timeout
-            && (now - started_at > timeout || (timeout.is_zero() && now >= started_at))
+            && !timeout.is_zero()
+            && now - started_at > timeout
         {
             return Some(TimeoutViolation::StartToClose);
         }
     } else if let Some(timeout) = activity.schedule_to_start_timeout
-        && (now - entry.last_dispatched_at > timeout
-            || (timeout.is_zero() && now >= entry.last_dispatched_at))
+        && !timeout.is_zero()
+        && now - entry.last_dispatched_at > timeout
     {
         return Some(TimeoutViolation::ScheduleToStart);
     }
@@ -287,18 +300,18 @@ pub fn evaluate_activity_timeout(
     None
 }
 
-/// Evaluate the tracked activities once and resolve any that have timed out,
-/// capped at `max_timeouts_per_scan`.
+/// Evaluate the tracked activities once, retrying attempts whose fired timeout
+/// is retryable and resolving the rest as timed out, capped at
+/// `max_timeouts_per_scan`.
 ///
-/// Each entry's run is reloaded from `repo` because the live `ActivityState` is
-/// the authority for the current timeouts and for whether the activity still
-/// exists; the tracking entry only supplies the timing anchors. An entry whose
-/// run is absent, or whose activity is no longer present in the loaded state, is
-/// dropped (it resolved by another path); a load error is transient and leaves
-/// the entry for the next scan.
+/// Each entry's run is reloaded from `deps.repo` because the live
+/// `ActivityState` is the authority for the current timeouts and for whether
+/// the activity still exists; the tracking entry only supplies the timing
+/// anchors. An entry whose run is absent, or whose activity is no longer
+/// present in the loaded state, is dropped (it resolved by another path); a
+/// load error is transient and leaves the entry for the next scan.
 pub(crate) async fn scan_activity_timeouts_once<R>(
-    repo: &R,
-    tracking: &ActivityTrackingState,
+    deps: &ActivityRetryDeps<R>,
     shard_id: Option<ShardId>,
     lanes: &[LaneHandle],
     lane_count: usize,
@@ -306,6 +319,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
 ) where
     R: RunRepository + 'static,
 {
+    let tracking = &deps.tracking;
     let now = OffsetDateTime::now_utc();
     let mut submitted = 0usize;
 
@@ -319,7 +333,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             break;
         }
 
-        let state = match repo.load_run(entry.run_key).await {
+        let state = match deps.repo.load_run(entry.run_key).await {
             Ok(LoadedRun::Existing(state)) => state,
             Ok(LoadedRun::Absent) => {
                 tracking.remove(entry.run_key, &entry.activity_id);
@@ -345,20 +359,117 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             continue;
         };
 
+        // A firing timeout runs the retry machinery FIRST; only a terminal
+        // retry state resolves the activity to its workflow
+        // (`processSingleActivityTimeoutTask`,
+        // timer_queue_active_task_executor.go:281-362 @ v1.31.0).
+        // ScheduleToStart / ScheduleToClose are server-enforced deadlines and
+        // never retried — they short-circuit to RETRY_STATE_TIMEOUT — and a
+        // requested cancel likewise suppresses retry
+        // (RETRY_STATE_CANCEL_REQUESTED) (`RetryActivity`,
+        // mutable_state_impl.go:6235-6266 @ v1.31.0).
+        let mut exhausted_reason = None;
+        if matches!(
+            violation,
+            TimeoutViolation::StartToClose | TimeoutViolation::Heartbeat
+        ) && !entry.cancel_requested
+            && let Some(policy) = activity
+                .retry_policy
+                .clone()
+                .or_else(|| state.retry_policy.clone())
+        {
+            // Retry-expiration anchor: the FIRST schedule + schedule-to-close
+            // (the deadline spans the whole retry chain;
+            // `retry.go:108-110 @ v1.31.0`).
+            let expiration = activity
+                .schedule_to_close_timeout
+                .filter(|timeout| !timeout.is_zero())
+                .map(|timeout| activity.scheduled_at + timeout);
+            // Timeout failures classify against the non-retryable list as
+            // "TemporalTimeout:<type>" (`isRetryable`, retry.go:124-133 +
+            // retrypolicy.TimeoutFailureTypePrefix @ v1.31.0).
+            let error_type = format!("TemporalTimeout:{}", timeout_type_name(violation));
+            match evaluate_activity_retry(
+                &policy,
+                activity.attempt,
+                Some(&error_type),
+                now,
+                expiration,
+            ) {
+                RetryDecision::Retry {
+                    next_attempt,
+                    backoff,
+                } => {
+                    let result = commit_activity_retry(
+                        deps,
+                        ActivityRetryTarget {
+                            run_key: entry.run_key,
+                            activity_id: &entry.activity_id,
+                            expected_attempt: activity.attempt,
+                            expected_schedule_event_id: activity.schedule_event_id,
+                        },
+                        next_attempt,
+                        backoff,
+                        // The timed-out attempt's failure becomes durable retry
+                        // bookkeeping (`RetryLastFailure`), surfaced by Describe
+                        // (`processSingleActivityTimeoutTask` builds it via
+                        // `failure.NewTimeoutFailure` @ v1.31.0).
+                        Some(timeout_failure_payload(violation)),
+                    )
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            runtime_metrics::record_activity_task_retry(OutcomeLabel::Success);
+                        }
+                        Err(error) => {
+                            // Lost a race with a concurrent resolution or hit a
+                            // transient commit error: leave the entry; the next
+                            // scan re-evaluates against reloaded state.
+                            runtime_metrics::record_activity_task_retry(OutcomeLabel::Failure);
+                            tracing::warn!(
+                                ?error,
+                                run_key = ?entry.run_key,
+                                activity_id = entry.activity_id,
+                                "activity timeout scanner failed to commit retry"
+                            );
+                        }
+                    }
+                    runtime_metrics::record_scanner_dispatched(
+                        "activity_timeout",
+                        entry.shard_id.0,
+                    );
+                    submitted += 1;
+                    continue;
+                }
+                RetryDecision::Exhausted { reason } => exhausted_reason = Some(reason),
+            }
+        }
+
+        // Terminal: resolve as timed out. When retries were cut short because
+        // there is not enough time for another attempt before the
+        // schedule-to-close deadline, the type converts to ScheduleToClose —
+        // except a fired ScheduleToStart keeps its own type
+        // (`processSingleActivityTimeoutTask`,
+        // timer_queue_active_task_executor.go:307-316 @ v1.31.0).
+        let timeout_type = if matches!(exhausted_reason, Some(RetryExhaustedReason::Timeout))
+            && violation != TimeoutViolation::ScheduleToStart
+        {
+            "schedule_to_close".to_string()
+        } else {
+            match violation {
+                TimeoutViolation::ScheduleToClose => "schedule_to_close".to_string(),
+                TimeoutViolation::ScheduleToStart => "schedule_to_start".to_string(),
+                TimeoutViolation::StartToClose => "start_to_close".to_string(),
+                TimeoutViolation::Heartbeat => "heartbeat".to_string(),
+            }
+        };
         let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
         let result = lane
             .submit(
                 entry.run_key,
                 Command::ActivityResolved(ActivityResolvedRequest {
                     activity_id: entry.activity_id.clone(),
-                    resolution: ActivityResolution::TimedOut {
-                        timeout_type: match violation {
-                            TimeoutViolation::ScheduleToClose => "schedule_to_close".to_string(),
-                            TimeoutViolation::ScheduleToStart => "schedule_to_start".to_string(),
-                            TimeoutViolation::StartToClose => "start_to_close".to_string(),
-                            TimeoutViolation::Heartbeat => "heartbeat".to_string(),
-                        },
-                    },
+                    resolution: ActivityResolution::TimedOut { timeout_type },
                     worker_identity: None,
                     now,
                 }),
@@ -403,19 +514,53 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
     }
 }
 
-/// Background loop: every `scan_interval`, resolve timed-out activities for each
-/// shard this node currently owns.
+/// The enum-name form of a fired timeout, used in failure messages and retry
+/// classification — mirrors `enumspb.TimeoutType.String()` (api-go v1.62.8
+/// custom Stringer: "StartToClose", "ScheduleToStart", "ScheduleToClose",
+/// "Heartbeat").
+fn timeout_type_name(violation: TimeoutViolation) -> &'static str {
+    match violation {
+        TimeoutViolation::ScheduleToClose => "ScheduleToClose",
+        TimeoutViolation::ScheduleToStart => "ScheduleToStart",
+        TimeoutViolation::StartToClose => "StartToClose",
+        TimeoutViolation::Heartbeat => "Heartbeat",
+    }
+}
+
+/// The timeout failure recorded as retry bookkeeping for a timed-out attempt:
+/// message `"activity <Type> timeout"` (`common.FailureReasonActivityTimeout`,
+/// common/util.go:95 @ v1.31.0) wrapping a `TimeoutFailureInfo` of the fired
+/// type (`failure.NewTimeoutFailure`, common/failure/failure.go:36 @ v1.31.0).
+fn timeout_failure_payload(violation: TimeoutViolation) -> Payload {
+    let timeout_type = match violation {
+        TimeoutViolation::ScheduleToClose => enums_proto::TimeoutType::ScheduleToClose,
+        TimeoutViolation::ScheduleToStart => enums_proto::TimeoutType::ScheduleToStart,
+        TimeoutViolation::StartToClose => enums_proto::TimeoutType::StartToClose,
+        TimeoutViolation::Heartbeat => enums_proto::TimeoutType::Heartbeat,
+    };
+    failure_to_payload(&failure_proto::Failure {
+        message: format!("activity {} timeout", timeout_type_name(violation)),
+        failure_info: Some(failure_proto::failure::FailureInfo::TimeoutFailureInfo(
+            failure_proto::TimeoutFailureInfo {
+                timeout_type: timeout_type as i32,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    })
+}
+
+/// Background loop: every `scan_interval`, retry or resolve timed-out
+/// activities for each shard this node currently owns.
 ///
 /// The active-shard set is re-read each tick so ownership changes (handoff, fresh
 /// sweep) are picked up without restarting the task. Each firing routes by
 /// `run_key` to the owning lane, keeping all commands for a run serialized on one
 /// lane.
 pub(crate) async fn run_activity_timeout_scanner<R>(
-    repo: Arc<R>,
-    tracking: ActivityTrackingState,
+    deps: ActivityRetryDeps<R>,
     lanes: Vec<LaneHandle>,
     lane_count: usize,
-    shard_owner: Arc<RwLock<ShardOwner>>,
     config: ActivityTimeoutScannerConfig,
     cancel: CancellationToken,
 ) where
@@ -427,18 +572,10 @@ pub(crate) async fn run_activity_timeout_scanner<R>(
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        let active_shards: Vec<_> = deps.shard_owner.read().unwrap().active_shards().collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("activity_timeout", shard_id.0);
-            scan_activity_timeouts_once(
-                repo.as_ref(),
-                &tracking,
-                Some(shard_id),
-                &lanes,
-                lane_count,
-                &config,
-            )
-            .await;
+            scan_activity_timeouts_once(&deps, Some(shard_id), &lanes, lane_count, &config).await;
         }
     }
 }

@@ -45,7 +45,7 @@ use crate::{
     buffered_queries::{BufferedQuery, BufferedQueryRegistry},
     deployment_registry::DeploymentRegistry,
     drain::RuntimeDrain,
-    errors::{ActivityTokenResolutionError, NotShardOwner},
+    errors::{ActivityTaskNotFound, ActivityTokenResolutionError, NotShardOwner},
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     heartbeat::{InMemoryHeartbeatStore, spawn_heartbeat_maintenance},
     lane::{LaneConfig, LaneHandle, spawn_lane_with_id},
@@ -86,6 +86,8 @@ mod lifecycle;
 mod membership;
 mod query;
 mod workflow_task;
+
+pub(crate) use activity::{ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry};
 
 /// Public runtime facade.
 ///
@@ -624,11 +626,17 @@ where
         )));
         let activity_timeout_scanner_cancel = CancellationToken::new();
         let activity_timeout_scanner_handle = Some(tokio::spawn(run_activity_timeout_scanner(
-            repo.clone(),
-            activity_tracking.clone(),
+            ActivityRetryDeps {
+                repo: repo.clone(),
+                shard_owner: shard_owner.clone(),
+                controller_managed_placement: config.controller_managed_placement,
+                max_occ_retries: config.max_occ_retries,
+                broker: activity_broker.clone(),
+                delivery_metrics: delivery_metrics.clone(),
+                tracking: activity_tracking.clone(),
+            },
             lanes.clone(),
             lane_count,
-            shard_owner.clone(),
             activity_timeout_config,
             activity_timeout_scanner_cancel.clone(),
         )));
@@ -1725,17 +1733,39 @@ mod tests {
             non_retryable_error_types: vec!["fatal".to_string()],
         };
 
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         assert_eq!(
-            evaluate_activity_retry(&policy, 1, None),
-            RetryDecision::Retry { next_attempt: 2 }
+            evaluate_activity_retry(&policy, 1, None, now, None),
+            RetryDecision::Retry {
+                next_attempt: 2,
+                backoff: Duration::seconds(1),
+            }
         );
         assert_eq!(
-            evaluate_activity_retry(&policy, 3, None),
-            RetryDecision::Exhausted
+            evaluate_activity_retry(&policy, 3, None, now, None),
+            RetryDecision::Exhausted {
+                reason: crate::retry::RetryExhaustedReason::MaximumAttemptsReached,
+            }
         );
         assert_eq!(
-            evaluate_activity_retry(&policy, 1, Some("fatal")),
-            RetryDecision::Exhausted
+            evaluate_activity_retry(&policy, 1, Some("fatal"), now, None),
+            RetryDecision::Exhausted {
+                reason: crate::retry::RetryExhaustedReason::NonRetryableFailure,
+            }
+        );
+        // Next attempt would begin past the schedule-to-close expiration →
+        // terminal Timeout (retry.go:108-110 @ v1.31.0).
+        assert_eq!(
+            evaluate_activity_retry(
+                &policy,
+                1,
+                None,
+                now,
+                Some(now + Duration::milliseconds(500))
+            ),
+            RetryDecision::Exhausted {
+                reason: crate::retry::RetryExhaustedReason::Timeout,
+            }
         );
     }
 

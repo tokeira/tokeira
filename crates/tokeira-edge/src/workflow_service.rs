@@ -390,6 +390,22 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         Err(ActivityTokenResolutionError::RunNotFound { run_key })
     }
 
+    /// Fabricate the started event for a not-yet-started activity so
+    /// completed-by-id can force-complete it
+    /// (`respondactivitytaskcompleted/api.go:89-105 @ v1.31.0`).
+    async fn force_start_activity_for_completion(
+        &self,
+        run_key: RunKey,
+        activity_id: &str,
+        identity: tokeira_types::WorkerIdentity,
+    ) -> Result<ActivityTaskToken> {
+        let _ = (run_key, activity_id, identity);
+        Err(tokeira_runtime::ActivityTaskNotFound {
+            reason: "force start unsupported by this runtime",
+        }
+        .into())
+    }
+
     async fn update_activity_options(
         &self,
         run_key: RunKey,
@@ -4218,14 +4234,37 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-                let token = self
-                    .resolve_activity_token_for_edge(
-                        run_key,
-                        &req.activity_id,
-                        &req.namespace,
-                        &req.workflow_id,
-                    )
-                    .await?;
+                let token = match self
+                    .runtime
+                    .resolve_activity_token(run_key, &req.activity_id)
+                    .await
+                {
+                    Ok(token) => token,
+                    // Completed-by-id FORCE-completes a not-yet-started
+                    // activity: v1.31.0 fabricates the started event with the
+                    // completing caller's identity and proceeds
+                    // (`respondactivitytaskcompleted/api.go:89-105 @ v1.31.0`).
+                    // Only this verb does — failed/canceled/heartbeat by-id
+                    // reject unstarted activities (nil `isCompletedByID`,
+                    // activity_util.go:58-67).
+                    Err(ActivityTokenResolutionError::ActivityNotStarted { .. }) => self
+                        .runtime
+                        .force_start_activity_for_completion(
+                            run_key,
+                            &req.activity_id,
+                            tokeira_types::WorkerIdentity(req.identity.clone()),
+                        )
+                        .await
+                        .map_err(EdgeError::from)?,
+                    Err(error) => {
+                        return Err(self.map_activity_resolution_error(
+                            error,
+                            &req.namespace,
+                            &req.workflow_id,
+                            &req.activity_id,
+                        ));
+                    }
+                };
                 let outcome = self
                     .runtime
                     .complete_activity_task(

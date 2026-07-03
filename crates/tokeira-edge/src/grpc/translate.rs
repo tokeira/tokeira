@@ -143,6 +143,53 @@ fn workflow_timeout_to_time(value: Option<&prost_types::Duration>) -> Option<tim
     proto_duration_to_time(value).filter(|duration| !duration.is_zero())
 }
 
+/// Translate an **activity** timeout with the same "zero means unset"
+/// convention: the Go SDK always serializes all four activity timeouts, zero
+/// when the user left them unset (`internal_event_handlers.go:616 @ sdk
+/// v1.41.1`), and v1.31.0 creates a timer only for positive durations
+/// (`timer_sequence.go:268-271 @ v1.31.0`). Mapping present-zero to
+/// `Some(ZERO)` had the activity-timeout scanner reaping every activity as an
+/// immediately-due ScheduleToClose.
+fn activity_timeout_to_time(value: Option<&prost_types::Duration>) -> Option<time::Duration> {
+    proto_duration_to_time(value).filter(|duration| !duration.is_zero())
+}
+
+/// Normalized activity timeouts per v1.31.0 `validateAndNormalizeTimeouts`
+/// (`chasm/lib/activity/validator.go:142-206`): with ScheduleToClose set,
+/// ScheduleToStart/StartToClose default to it (and are capped by it);
+/// HeartbeatTimeout never exceeds StartToClose. The run-timeout-derived
+/// ScheduleToClose fill (validator.go:178-181) needs workflow state and is
+/// intentionally not applied at this stateless boundary.
+fn normalized_activity_timeouts(
+    schedule_to_close: Option<&prost_types::Duration>,
+    schedule_to_start: Option<&prost_types::Duration>,
+    start_to_close: Option<&prost_types::Duration>,
+    heartbeat: Option<&prost_types::Duration>,
+) -> (
+    Option<time::Duration>,
+    Option<time::Duration>,
+    Option<time::Duration>,
+    Option<time::Duration>,
+) {
+    let schedule_to_close = activity_timeout_to_time(schedule_to_close);
+    let mut schedule_to_start = activity_timeout_to_time(schedule_to_start);
+    let mut start_to_close = activity_timeout_to_time(start_to_close);
+    let mut heartbeat = activity_timeout_to_time(heartbeat);
+    if let Some(s2c) = schedule_to_close {
+        schedule_to_start = Some(schedule_to_start.map_or(s2c, |s2s| s2s.min(s2c)));
+        start_to_close = Some(start_to_close.map_or(s2c, |stc| stc.min(s2c)));
+    }
+    if let (Some(hb), Some(stc)) = (heartbeat, start_to_close) {
+        heartbeat = Some(hb.min(stc));
+    }
+    (
+        schedule_to_close,
+        schedule_to_start,
+        start_to_close,
+        heartbeat,
+    )
+}
+
 fn valid_non_negative_duration(
     value: Option<&prost_types::Duration>,
     field: &'static str,
@@ -3064,6 +3111,9 @@ fn pending_activity_to_proto(
         scheduled_time: Some(to_proto_timestamp(act.scheduled_at)),
         last_started_time: act.started_at.map(to_proto_timestamp),
         last_failure: act.last_failure.as_ref().map(payload_to_failure),
+        // Present only once a heartbeat has been recorded
+        // (`GetPendingActivityInfo`, activity.go:147-150 @ v1.31.0).
+        heartbeat_details: act.heartbeat_details.as_ref().map(payloads_from_domain),
         paused: act.paused,
         pause_info: act.pause_info.as_ref().map(|info| {
             workflow::pending_activity_info::PauseInfo {
@@ -4215,6 +4265,12 @@ pub fn proto_command_to_workflow_command(
                     .ok_or(ProtoConversionError::MissingField(
                         "ScheduleActivityCommandAttributes.task_queue",
                     ))?;
+            let activity_timeouts = normalized_activity_timeouts(
+                attrs.schedule_to_close_timeout.as_ref(),
+                attrs.schedule_to_start_timeout.as_ref(),
+                attrs.start_to_close_timeout.as_ref(),
+                attrs.heartbeat_timeout.as_ref(),
+            );
             Ok(WorkflowCommand::ScheduleActivity {
                 activity_id: attrs.activity_id,
                 activity_type: attrs
@@ -4236,16 +4292,10 @@ pub fn proto_command_to_workflow_command(
                 )),
                 deployment: None,
                 build_id: None,
-                schedule_to_close_timeout: proto_duration_to_time(
-                    attrs.schedule_to_close_timeout.as_ref(),
-                ),
-                schedule_to_start_timeout: proto_duration_to_time(
-                    attrs.schedule_to_start_timeout.as_ref(),
-                ),
-                start_to_close_timeout: proto_duration_to_time(
-                    attrs.start_to_close_timeout.as_ref(),
-                ),
-                heartbeat_timeout: proto_duration_to_time(attrs.heartbeat_timeout.as_ref()),
+                schedule_to_close_timeout: activity_timeouts.0,
+                schedule_to_start_timeout: activity_timeouts.1,
+                start_to_close_timeout: activity_timeouts.2,
+                heartbeat_timeout: activity_timeouts.3,
             })
         }
         Some(Attributes::StartTimerCommandAttributes(attrs)) => {

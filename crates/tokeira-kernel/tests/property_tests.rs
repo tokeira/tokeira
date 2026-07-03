@@ -233,6 +233,7 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
     state.activities.insert(
         activity_id.into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: activity_id.into(),
@@ -1482,6 +1483,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 with_pending_wft(make_open_state(now), 43, Some(18), 1),
                 "activity-1",
             );
+            let cancel_scheduled_event_id = state.activities["activity-1"].schedule_event_id;
             let req = WorkflowTaskCompletedRequest {
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
@@ -1499,7 +1501,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 worker_deployment_name: None,
                 sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
-                    activity_id: "activity-1".into(),
+                    scheduled_event_id: cancel_scheduled_event_id,
                 }],
                 force_new_workflow_task: false,
                 now,
@@ -2792,6 +2794,7 @@ proptest! {
         state.activities.insert(
             "activity-2".into(),
             ActivityState {
+                cancel_requested: false,
                 started_identity: None,
                 retry_last_worker_identity: None,
                 activity_id: "activity-2".into(),
@@ -2993,6 +2996,7 @@ proptest! {
         state.activities.insert(
             "activity-2".into(),
             ActivityState {
+                cancel_requested: false,
                 started_identity: None,
                 retry_last_worker_identity: None,
                 activity_id: "activity-2".into(),
@@ -3539,10 +3543,19 @@ fn property_15_wft_timed_out_clears_sticky() {
 #[test]
 fn property_23_request_cancel_activity_preserves_activity() {
     let now = fixed_now();
-    let state = with_activity(
+    let mut state = with_activity(
         with_pending_wft(make_open_state(now), 92, Some(20), 1),
         "activity-1",
     );
+    // K4: only a STARTED activity survives a cancel request (with the durable
+    // cancel bit set); an unstarted one is cancelled immediately and removed
+    // (workflow_task_completed_handler.go:651-665 @ v1.31.0).
+    let scheduled_event_id = {
+        let activity = state.activities.get_mut("activity-1").expect("fixture");
+        activity.started_event_id = Some(activity.schedule_event_id + 1);
+        activity.started_at = Some(now);
+        activity.schedule_event_id
+    };
     let transition = kernel()
         .apply(
             LoadedRun::Existing(state),
@@ -3562,15 +3575,18 @@ fn property_23_request_cancel_activity_preserves_activity() {
                 deployment_version: None,
                 worker_deployment_name: None,
                 sticky_ttl: None,
-                commands: vec![WorkflowCommand::RequestCancelActivity {
-                    activity_id: "activity-1".into(),
-                }],
+                commands: vec![WorkflowCommand::RequestCancelActivity { scheduled_event_id }],
                 force_new_workflow_task: false,
                 now,
             }),
         )
         .unwrap();
-    assert!(transition.next_state.activities.contains_key("activity-1"));
+    let activity = transition
+        .next_state
+        .activities
+        .get("activity-1")
+        .expect("started activity survives the cancel request");
+    assert!(activity.cancel_requested);
     assert!(
         transition
             .activity_ops

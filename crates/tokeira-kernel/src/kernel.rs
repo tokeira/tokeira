@@ -1541,6 +1541,12 @@ impl BasicKernel {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
+        // Kept aside so an invalid command can convert this completion into a
+        // WFT failure against the ORIGINAL state (v1.31.0 writes no
+        // WorkflowTaskCompleted event in that case — the whole completion is
+        // replaced by the failure; `failWorkflowTaskOnInvalidArgument`
+        // @ v1.31.0).
+        let fallback_state = state.clone();
         let mut builder = TransitionBuilder::new(state, req.now);
 
         // Capture last_event_id before emitting the completion event.
@@ -1597,6 +1603,7 @@ impl BasicKernel {
             req.deployment_version,
             req.worker_deployment_name,
         );
+        let worker_identity_for_failure = req.identity.clone();
         builder.state.sticky = req.sticky_ttl.map(|ttl| StickyAffinity {
             worker_identity: req.identity,
             expires_at: req.now + ttl,
@@ -1607,13 +1614,35 @@ impl BasicKernel {
             if closed {
                 return Err(Reject::CommandsAfterClose { index });
             }
-            closed = apply_workflow_command(
+            closed = match apply_workflow_command(
                 &mut builder,
                 command,
                 wft_completed_event_id,
                 cron_continuation.as_ref(),
                 retry_continuation.as_ref(),
-            )?;
+            ) {
+                Ok(closed) => closed,
+                // Invalid command attributes fail the WORKFLOW TASK with the
+                // command's cause — the completion (and everything the loop
+                // built so far) is discarded and the WFT takes the failed
+                // path against the pre-completion state
+                // (`failWorkflowTaskOnInvalidArgument`,
+                // workflow_task_completed_handler.go @ v1.31.0).
+                Err(Reject::InvalidCommandAttributes { cause, message: _ }) => {
+                    return self.apply_workflow_task_failed(
+                        LoadedRun::Existing(fallback_state),
+                        WorkflowTaskFailedRequest {
+                            logical_seq: req.token.logical_seq,
+                            started_event_id: req.token.started_event_id,
+                            failure_cause: cause,
+                            failure_details: None,
+                            worker_identity: worker_identity_for_failure,
+                            now: req.now,
+                        },
+                    );
+                }
+                Err(reject) => return Err(reject),
+            };
         }
 
         // Flush buffered events after the completion's command events and
@@ -2731,6 +2760,7 @@ impl BasicKernel {
                 state.activities.insert(
                     activity_id.clone(),
                     ActivityState {
+                        cancel_requested: false,
                         started_identity: None,
                         retry_last_worker_identity: None,
                         activity_id: activity_id.clone(),
@@ -3166,6 +3196,7 @@ fn apply_workflow_command(
             });
 
             let activity = ActivityState {
+                cancel_requested: false,
                 started_identity: None,
                 retry_last_worker_identity: None,
                 activity_id: activity_id.clone(),
@@ -3401,21 +3432,88 @@ fn apply_workflow_command(
             builder.apply_parent_close_policy();
             Ok(true)
         }
-        WorkflowCommand::RequestCancelActivity { activity_id } => {
-            if !builder.state.activities.contains_key(&activity_id) {
-                return Err(Reject::UnknownActivity(activity_id));
-            }
-            let scheduled_event_id = builder
+        WorkflowCommand::RequestCancelActivity { scheduled_event_id } => {
+            // Keyed by scheduled_event_id — the proto command's only field
+            // (kernel raise K4). Invalid requests FAIL THE WORKFLOW TASK
+            // (`handleCommandRequestCancelActivity`,
+            // workflow_task_completed_handler.go:626-668 @ v1.31.0), never
+            // reject the completion.
+            let target = builder
                 .state
                 .activities
-                .get(&activity_id)
-                .map(|activity| activity.schedule_event_id)
-                .unwrap_or(0);
+                .values()
+                .find(|activity| activity.schedule_event_id == scheduled_event_id)
+                .cloned();
+            let Some(activity) = target else {
+                // The activity may have finished while this WFT ran — its
+                // terminal event is buffered. v1.31.0 still records the
+                // CancelRequested event and takes no further action
+                // (`AddActivityTaskCancelRequestedEvent`,
+                // mutable_state_impl.go:4364-4376 @ v1.31.0).
+                if builder.state.buffered_events.iter().any(|buffered| {
+                    activity_finish_scheduled_event_id(&buffered.kind) == Some(scheduled_event_id)
+                }) {
+                    builder.emit(HistoryEventKind::ActivityTaskCancelRequested {
+                        workflow_task_completed_event_id,
+                        activity_id: String::new(),
+                        scheduled_event_id,
+                    });
+                    return Ok(false);
+                }
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::BadRequestCancelActivityAttributes,
+                    message: format!("ScheduledEventID: {scheduled_event_id}"),
+                });
+            };
+            // Duplicate cancellation is a caller error too
+            // (mutable_state_impl.go:4379-4388 @ v1.31.0).
+            if activity.cancel_requested {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::BadRequestCancelActivityAttributes,
+                    message: format!("ScheduledEventID: {scheduled_event_id}"),
+                });
+            }
             builder.emit(HistoryEventKind::ActivityTaskCancelRequested {
                 workflow_task_completed_event_id,
-                activity_id,
+                activity_id: activity.activity_id.clone(),
                 scheduled_event_id,
             });
+            if activity.started_event_id.is_some() {
+                // Started: set the durable cancel bit; the worker learns via
+                // its next heartbeat response and resolves cooperatively
+                // (`ai.CancelRequested = true` in
+                // ApplyActivityTaskCancelRequestedEvent @ v1.31.0).
+                let snapshot = {
+                    let activity = builder
+                        .state
+                        .activities
+                        .get_mut(&activity.activity_id)
+                        .expect("activity present: found by scheduled_event_id above");
+                    activity.cancel_requested = true;
+                    activity.clone()
+                };
+                builder.activity_ops.push(ActivityOp::Upsert(snapshot));
+            } else {
+                // Not started: cancel immediately with the canonical details
+                // payload and wake the workflow
+                // (workflow_task_completed_handler.go:651-665; the constant
+                // `activityCancellationMsgActivityNotStarted` at :48
+                // @ v1.31.0).
+                builder.emit(HistoryEventKind::ActivityTaskCanceled {
+                    activity_id: activity.activity_id.clone(),
+                    scheduled_event_id,
+                    started_event_id: 0,
+                    identity: None,
+                    details: Some(activity_id_not_started_details()),
+                });
+                builder.state.activities.remove(&activity.activity_id);
+                builder.activity_ops.push(ActivityOp::Delete {
+                    activity_id: activity.activity_id.clone(),
+                });
+                if builder.state.is_open() && builder.state.pending_workflow_task.is_none() {
+                    builder.schedule_workflow_task();
+                }
+            }
             Ok(false)
         }
         WorkflowCommand::CancelTimer { timer_id } => {
@@ -4197,6 +4295,40 @@ impl TransitionBuilder {
     }
 }
 
+/// The `ActivityTaskScheduled` event id a buffered terminal activity event
+/// resolves, if `kind` is one (used by the cancel command's already-finished
+/// tolerance, `hBuilder.HasActivityFinishEvent` @ v1.31.0).
+fn activity_finish_scheduled_event_id(kind: &HistoryEventKind) -> Option<i64> {
+    match kind {
+        HistoryEventKind::ActivityTaskCompleted {
+            scheduled_event_id, ..
+        }
+        | HistoryEventKind::ActivityTaskFailed {
+            scheduled_event_id, ..
+        }
+        | HistoryEventKind::ActivityTaskTimedOut {
+            scheduled_event_id, ..
+        }
+        | HistoryEventKind::ActivityTaskCanceled {
+            scheduled_event_id, ..
+        } => Some(*scheduled_event_id),
+        _ => None,
+    }
+}
+
+/// The canonical details payload for an immediately-cancelled unstarted
+/// activity: `payloads.EncodeString("ACTIVITY_ID_NOT_STARTED")` — a single
+/// json/plain payload (`activityCancellationMsgActivityNotStarted`,
+/// workflow_task_completed_handler.go:48,659 @ v1.31.0).
+fn activity_id_not_started_details() -> Payloads {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("encoding".to_string(), "json/plain".to_string());
+    Payloads(vec![tokeira_types::Payload {
+        data: b"\"ACTIVITY_ID_NOT_STARTED\"".to_vec(),
+        metadata,
+    }])
+}
+
 /// Reasons the kernel rejects a command.
 ///
 /// Each variant describes a precondition violation or
@@ -4205,6 +4337,17 @@ impl TransitionBuilder {
 /// codes or internal retry decisions.
 #[derive(Debug, Error, PartialEq)]
 pub enum Reject {
+    /// A workflow command carried invalid attributes. v1.31.0 FAILS THE
+    /// WORKFLOW TASK with `cause` instead of rejecting the completion call
+    /// (`failWorkflowTaskOnInvalidArgument`,
+    /// respondworkflowtaskcompleted/workflow_task_completed_handler.go @
+    /// v1.31.0); the completion applier converts this variant into a
+    /// WFT-failed transition, so it never surfaces as a command reject.
+    #[error("invalid command attributes ({cause:?}): {message}")]
+    InvalidCommandAttributes {
+        cause: WorkflowTaskFailedCause,
+        message: String,
+    },
     /// A `Start` command was issued but the run already
     /// exists in durable storage.
     #[error("run already exists")]

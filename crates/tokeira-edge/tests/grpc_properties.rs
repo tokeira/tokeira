@@ -1192,8 +1192,9 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 }
             ),
         Just(WorkflowCommand::CancelWorkflow),
-        arb_small_string()
-            .prop_map(|activity_id| { WorkflowCommand::RequestCancelActivity { activity_id } }),
+        (1i64..10_000).prop_map(|scheduled_event_id| {
+            WorkflowCommand::RequestCancelActivity { scheduled_event_id }
+        }),
         arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
         (
             arb_small_string(),

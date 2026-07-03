@@ -384,6 +384,7 @@ where
                 .activities
                 .insert(token.activity_id.clone(), next_activity.clone());
 
+            let cancel_requested = next_activity.cancel_requested;
             let transition = Transition {
                 expected_seq: state.transition_seq,
                 next_state,
@@ -417,7 +418,12 @@ where
                 .await?
             {
                 CommitResult::Applied { .. } | CommitResult::Duplicate => {
-                    let cancel_requested = self
+                    // Reset the volatile heartbeat clock; the CANCEL signal
+                    // itself comes from the durable state loaded above — the
+                    // kernel's `cancel_requested` bit is the authority
+                    // (`cancelRequested = ai.CancelRequested`,
+                    // recordactivitytaskheartbeat/api.go:83 @ v1.31.0; K4).
+                    let tracking_cancel = self
                         .activity_tracking
                         .record_heartbeat(
                             token.run_key,
@@ -425,7 +431,7 @@ where
                             OffsetDateTime::now_utc(),
                         )
                         .unwrap_or(false);
-                    return Ok(cancel_requested);
+                    return Ok(cancel_requested || tracking_cancel);
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                     if attempts >= self.config.max_occ_retries {
@@ -1428,6 +1434,7 @@ mod tests {
         let scheduled_at = OffsetDateTime::now_utc();
         let started_at = scheduled_at + Duration::seconds(1);
         let activity = tokeira_kernel::ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-1".to_string(),

@@ -625,6 +625,7 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
     state.activities.insert(
         id.into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: id.into(),
@@ -659,6 +660,7 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
     state.activities.insert(
         id.into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: id.into(),
@@ -1350,6 +1352,7 @@ fn terminate_with_activities_and_timers() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -1520,6 +1523,7 @@ fn reset_cleans_up_activities_and_timers() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -1679,6 +1683,7 @@ fn pause_workflow_happy_path() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -1809,6 +1814,7 @@ fn unpause_workflow_happy_path() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -2822,6 +2828,7 @@ fn workflow_execution_timed_out_with_entities() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -3586,6 +3593,7 @@ fn reject_duplicate_activity_id() {
     with_activity.activities.insert(
         "dup".into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "dup".into(),
@@ -4085,7 +4093,7 @@ fn request_cancel_activity() {
                 worker_deployment_name: None,
                 sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
-                    activity_id: "activity-1".into(),
+                    scheduled_event_id: 7,
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -4093,19 +4101,33 @@ fn request_cancel_activity() {
         )
         .unwrap();
 
+    // K4: an UNSTARTED activity cancels immediately — CancelRequested +
+    // ActivityTaskCanceled with the canonical "ACTIVITY_ID_NOT_STARTED"
+    // details, removal, and a fresh WFT so the workflow observes it
+    // (workflow_task_completed_handler.go:651-665 @ v1.31.0).
     assert!(transition.history_events.iter().any(|event| matches!(
         &event.kind,
-        HistoryEventKind::ActivityTaskCancelRequested { activity_id, .. } if activity_id == "activity-1"
+        HistoryEventKind::ActivityTaskCancelRequested { activity_id, scheduled_event_id: 7, .. } if activity_id == "activity-1"
     )));
-    assert!(transition.next_state.activities.contains_key("activity-1"));
-    assert!(transition.activity_ops.is_empty());
+    assert!(transition.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::ActivityTaskCanceled { activity_id, details: Some(details), .. }
+            if activity_id == "activity-1"
+                && details.0[0].data == b"\"ACTIVITY_ID_NOT_STARTED\"".to_vec()
+    )));
+    assert!(!transition.next_state.activities.contains_key("activity-1"));
+    assert!(transition.activity_ops.iter().any(|op| matches!(
+        op,
+        tokeira_kernel::ActivityOp::Delete { activity_id } if activity_id == "activity-1"
+    )));
+    assert!(transition.next_state.pending_workflow_task.is_some());
 }
 
 #[test]
-fn request_cancel_activity_unknown() {
-    let state = make_open_state_with_started_wft();
-    assert_eq!(
-        kernel().apply(
+fn request_cancel_activity_started_sets_durable_cancel_requested() {
+    let state = with_started_activity_started_wft();
+    let transition = kernel()
+        .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
                 token: WorkflowTaskToken {
@@ -4124,13 +4146,81 @@ fn request_cancel_activity_unknown() {
                 worker_deployment_name: None,
                 sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
-                    activity_id: "missing".into(),
+                    scheduled_event_id: 7,
                 }],
                 force_new_workflow_task: false,
                 now: now(),
             }),
-        ),
-        Err(Reject::UnknownActivity("missing".into()))
+        )
+        .unwrap();
+
+    // K4: a STARTED activity stays pending with the durable cancel bit set;
+    // the worker learns via its next heartbeat response
+    // (`ai.CancelRequested = true` @ v1.31.0).
+    assert!(transition.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::ActivityTaskCancelRequested { activity_id, .. } if activity_id == "activity-1"
+    )));
+    let activity = transition
+        .next_state
+        .activities
+        .get("activity-1")
+        .expect("started activity stays pending");
+    assert!(activity.cancel_requested);
+    assert!(transition.activity_ops.iter().any(|op| matches!(
+        op,
+        tokeira_kernel::ActivityOp::Upsert(state) if state.cancel_requested
+    )));
+}
+
+#[test]
+fn request_cancel_activity_unknown() {
+    let state = make_open_state_with_started_wft();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky_ttl: None,
+                commands: vec![WorkflowCommand::RequestCancelActivity {
+                    scheduled_event_id: 999,
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    // K4: an unknown scheduled_event_id FAILS THE WORKFLOW TASK with
+    // BAD_REQUEST_CANCEL_ACTIVITY_ATTRIBUTES — the completion (and its
+    // WorkflowTaskCompleted event) is discarded, not rejected
+    // (`failWorkflowTaskOnInvalidArgument` @ v1.31.0).
+    assert!(transition.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::WorkflowTaskFailed {
+            failure_cause:
+                tokeira_kernel::WorkflowTaskFailedCause::BadRequestCancelActivityAttributes,
+            ..
+        }
+    )));
+    assert!(
+        !transition
+            .history_events
+            .iter()
+            .any(|event| matches!(&event.kind, HistoryEventKind::WorkflowTaskCompleted { .. }))
     );
 }
 
@@ -4211,7 +4301,7 @@ fn cancel_timer_unknown() {
 
 #[test]
 fn request_cancel_activity_then_resolved_canceled() {
-    let state = with_pending_activity_started_wft();
+    let state = with_started_activity_started_wft();
     let first = kernel()
         .apply(
             LoadedRun::Existing(state.clone()),
@@ -4232,7 +4322,7 @@ fn request_cancel_activity_then_resolved_canceled() {
                 worker_deployment_name: None,
                 sticky_ttl: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
-                    activity_id: "activity-1".into(),
+                    scheduled_event_id: 7,
                 }],
                 force_new_workflow_task: false,
                 now: now(),
@@ -4344,6 +4434,7 @@ fn with_pending_activity_started_wft() -> WorkflowState {
     state.activities.insert(
         "activity-1".into(),
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-1".into(),
@@ -4370,6 +4461,17 @@ fn with_pending_activity_started_wft() -> WorkflowState {
             stamp: 0,
         },
     );
+    state
+}
+
+fn with_started_activity_started_wft() -> WorkflowState {
+    let mut state = with_pending_activity_started_wft();
+    let activity = state
+        .activities
+        .get_mut("activity-1")
+        .expect("fixture activity");
+    activity.started_event_id = Some(8);
+    activity.started_at = Some(OffsetDateTime::UNIX_EPOCH);
     state
 }
 

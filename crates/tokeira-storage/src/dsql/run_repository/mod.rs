@@ -1644,6 +1644,7 @@ mod tests {
 
     fn sample_activity_state(seed: u64) -> ActivityState {
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: format!("activity-{seed}"),

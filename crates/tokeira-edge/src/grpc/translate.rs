@@ -4347,8 +4347,10 @@ pub fn proto_command_to_workflow_command(
             })
         }
         Some(Attributes::RequestCancelActivityTaskCommandAttributes(attrs)) => {
+            // The proto command's only key (message.proto:71-74 @ v1.31.0);
+            // carried through verbatim (kernel raise K4).
             Ok(WorkflowCommand::RequestCancelActivity {
-                activity_id: attrs.scheduled_event_id.to_string(),
+                scheduled_event_id: attrs.scheduled_event_id,
             })
         }
         Some(Attributes::CancelTimerCommandAttributes(attrs)) => Ok(WorkflowCommand::CancelTimer {
@@ -4625,10 +4627,10 @@ pub fn workflow_command_to_proto(
                 },
             ))
         }
-        WorkflowCommand::RequestCancelActivity { activity_id } => {
+        WorkflowCommand::RequestCancelActivity { scheduled_event_id } => {
             Some(Attributes::RequestCancelActivityTaskCommandAttributes(
                 command::RequestCancelActivityTaskCommandAttributes {
-                    scheduled_event_id: activity_id.parse::<i64>().unwrap_or_default(),
+                    scheduled_event_id: *scheduled_event_id,
                 },
             ))
         }

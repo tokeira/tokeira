@@ -1169,7 +1169,13 @@ pub enum WorkflowCommand {
     CancelWorkflow,
     /// Request cancellation of a pending activity. The
     /// activity remains open until resolved.
-    RequestCancelActivity { activity_id: String },
+    RequestCancelActivity {
+        /// The `ActivityTaskScheduled` event id — the proto command's ONLY
+        /// key (`RequestCancelActivityTaskCommandAttributes`,
+        /// temporal/api/command/v1/message.proto:71-74 @ v1.31.0; kernel
+        /// raise K4).
+        scheduled_event_id: i64,
+    },
     /// Cancel a pending timer before it fires.
     CancelTimer { timer_id: String },
     /// Initiate a child workflow execution.

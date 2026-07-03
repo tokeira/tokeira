@@ -986,6 +986,7 @@ mod tests {
 
                 let mut t = start_transition(run_key);
                 let act = ActivityState {
+                    cancel_requested: false,
                     started_identity: None,
                     retry_last_worker_identity: None,
                     activity_id: "act-1".into(),

@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     lane::LaneHandle,
     metrics as runtime_metrics,
-    retry::{RetryDecision, RetryExhaustedReason, evaluate_activity_retry},
+    retry::{RetryDecision, evaluate_activity_retry},
     runtime::{
         ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry,
         exhausted_reason_to_retry_state,
@@ -667,6 +667,7 @@ mod tests {
 
     fn sample_activity() -> ActivityState {
         ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "a".into(),

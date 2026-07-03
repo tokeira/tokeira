@@ -2066,6 +2066,7 @@ mod tests {
 
     fn activity_state(activity_id: &str) -> tokeira_kernel::ActivityState {
         tokeira_kernel::ActivityState {
+            cancel_requested: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: activity_id.into(),
@@ -3663,6 +3664,7 @@ mod tests {
 
                     let act_id = format!("act-{idx}");
                     let act = tokeira_kernel::ActivityState {
+                        cancel_requested: false,
                         started_identity: None,
                         retry_last_worker_identity: None,
                         activity_id: act_id.clone(),

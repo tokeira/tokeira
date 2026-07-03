@@ -503,6 +503,13 @@ pub struct ActivityState {
     /// rather than volatile timeout tracking.
     #[serde(default)]
     pub heartbeat_details: Option<Payloads>,
+    /// A workflow requested cancellation of this (started) activity; the
+    /// worker learns via its next heartbeat response and resolves
+    /// cooperatively (`ai.CancelRequested` @ v1.31.0; kernel raise K4). This
+    /// durable bit is the authority — the in-memory tracking flag is only a
+    /// delivery aid.
+    #[serde(default)]
+    pub cancel_requested: bool,
     /// Pause metadata when the activity is individually
     /// paused.
     pub pause_info: Option<ActivityPauseInfo>,

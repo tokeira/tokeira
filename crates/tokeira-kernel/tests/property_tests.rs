@@ -14,14 +14,15 @@ use tokeira_kernel::{
     NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
     PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
     PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Priority,
-    ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
-    StartRequest, StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState,
-    Transition, UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, UserMetadata,
-    VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType, WorkflowVersioningInfo,
+    ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryContinuation,
+    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+    TimerDueRequest, TimerOp, TimerState, Transition, UnpauseActivityRequest,
+    UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
+    UpdateProtocolBody, UpdateRequest, UserMetadata, VersioningBehavior, VersioningOverride,
+    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    WorkflowVersioningInfo,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -5426,4 +5427,172 @@ proptest! {
         let decoded: WorkflowState = serde_json::from_slice(&encoded).unwrap();
         prop_assert_eq!(decoded, state);
     }
+}
+
+// ── workflow-retry-chain: FailWorkflow retry-continuation recording ──
+//
+// These drive a started WFT to completion with a single FailWorkflow command and
+// the runtime-supplied RetryContinuation, asserting the kernel records the
+// decision on WorkflowExecutionFailed (Req 1.2). They are example-based single
+// transitions: the retry *evaluation* the continuation stands in for is a runtime
+// concern (wall-clock/policy dependent), out of the pure kernel.
+
+fn fail_workflow_completion_request(state: &WorkflowState) -> WorkflowTaskCompletedRequest {
+    WorkflowTaskCompletedRequest {
+        token: WorkflowTaskToken {
+            run_key: state.run_key,
+            logical_seq: LogicalTaskSeq(30),
+            started_event_id: 13,
+            attempt: 1,
+            shard_epoch: ShardEpoch::ZERO,
+        },
+        identity: WorkerIdentity("worker".into()),
+        sdk_metadata: None,
+        metering_metadata: None,
+        worker_version: None,
+        versioning_behavior: VersioningBehavior::Unspecified,
+        deployment_version: None,
+        worker_deployment_name: None,
+        sticky_ttl: None,
+        commands: vec![WorkflowCommand::FailWorkflow {
+            failure: payload("boom"),
+        }],
+        force_new_workflow_task: false,
+        now: fixed_now(),
+    }
+}
+
+fn fail_with_retry_continuation(
+    state: &WorkflowState,
+    retry_continuation: RetryContinuation,
+) -> Transition {
+    kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompletedWithRetry {
+                request: fail_workflow_completion_request(state),
+                retry_continuation,
+            },
+        )
+        .unwrap()
+}
+
+fn failed_event_outcome(transition: &Transition) -> Option<(RetryState, Option<RunId>)> {
+    transition
+        .history_events
+        .iter()
+        .find_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionFailed {
+                retry_state,
+                new_execution_run_id,
+                ..
+            } => Some((retry_state.clone(), *new_execution_run_id)),
+            _ => None,
+        })
+}
+
+#[test]
+fn retry_continuation_links_successor() {
+    // Feature: workflow-retry-chain, Property 1: a retry-eligible FailWorkflow
+    // records retry_state=InProgress and new_execution_run_id=Some(successor).
+    let state = with_pending_wft(make_open_state(fixed_now()), 30, Some(13), 1);
+    let successor = RunId::new();
+    let transition = fail_with_retry_continuation(
+        &state,
+        RetryContinuation::Retry {
+            new_run_id: successor,
+        },
+    );
+    assert_eq!(
+        failed_event_outcome(&transition),
+        Some((RetryState::InProgress, Some(successor)))
+    );
+    assert_eq!(transition.next_state.status, ExecutionStatus::Failed);
+}
+
+#[test]
+fn retry_continuation_terminal_max_attempts_has_no_successor() {
+    // Feature: workflow-retry-chain, Property 2: Terminal(MaximumAttemptsReached)
+    // records that retry_state and no successor.
+    let state = with_pending_wft(make_open_state(fixed_now()), 30, Some(13), 1);
+    let transition = fail_with_retry_continuation(
+        &state,
+        RetryContinuation::Terminal {
+            retry_state: RetryState::MaximumAttemptsReached,
+        },
+    );
+    assert_eq!(
+        failed_event_outcome(&transition),
+        Some((RetryState::MaximumAttemptsReached, None))
+    );
+}
+
+#[test]
+fn retry_continuation_terminal_non_retryable_has_no_successor() {
+    // Feature: workflow-retry-chain, Property 3: Terminal(NonRetryableFailure)
+    // records that retry_state and no successor.
+    let state = with_pending_wft(make_open_state(fixed_now()), 30, Some(13), 1);
+    let transition = fail_with_retry_continuation(
+        &state,
+        RetryContinuation::Terminal {
+            retry_state: RetryState::NonRetryableFailure,
+        },
+    );
+    assert_eq!(
+        failed_event_outcome(&transition),
+        Some((RetryState::NonRetryableFailure, None))
+    );
+}
+
+#[test]
+fn fail_workflow_without_retry_policy_is_terminal() {
+    // Feature: workflow-retry-chain, Property 4: a run with no retry policy fails
+    // terminally with RetryPolicyNotSet and no successor (behaviour unchanged from
+    // before the retry chain existed; no continuation is supplied).
+    let mut state = with_pending_wft(make_open_state(fixed_now()), 30, Some(13), 1);
+    state.retry_policy = None;
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(fail_workflow_completion_request(&state)),
+        )
+        .unwrap();
+    assert_eq!(
+        failed_event_outcome(&transition),
+        Some((RetryState::RetryPolicyNotSet, None))
+    );
+}
+
+#[test]
+fn workflow_execution_failed_new_run_id_round_trips() {
+    // Feature: workflow-retry-chain, Property 6: WorkflowExecutionFailed round-trips
+    // with and without new_execution_run_id, and a record written before the field
+    // existed (key absent) decodes to None via #[serde(default)].
+    for new_execution_run_id in [None, Some(RunId::new())] {
+        let event = HistoryEventKind::WorkflowExecutionFailed {
+            workflow_task_completed_event_id: 4,
+            failure: payload("boom"),
+            retry_state: RetryState::InProgress,
+            attempt: 1,
+            new_execution_run_id,
+        };
+        let encoded = serde_json::to_vec(&event).unwrap();
+        let decoded: HistoryEventKind = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    let event = HistoryEventKind::WorkflowExecutionFailed {
+        workflow_task_completed_event_id: 4,
+        failure: payload("boom"),
+        retry_state: RetryState::InProgress,
+        attempt: 1,
+        new_execution_run_id: None,
+    };
+    let mut value = serde_json::to_value(&event).unwrap();
+    value["WorkflowExecutionFailed"]
+        .as_object_mut()
+        .unwrap()
+        .remove("new_execution_run_id");
+    let decoded: HistoryEventKind = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded, event);
 }

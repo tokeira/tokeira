@@ -1626,7 +1626,11 @@ where
                 status: state.status,
                 start_time: Some(state.started_at),
                 close_time: state.closed_at,
-                execution_time: state.first_run_started_at.unwrap_or(state.started_at),
+                // v1.31.0 ExecutionTime = this run's StartTime + FirstWorkflowTaskBackoff
+                // (mutable_state_impl.go:2859) — NOT the chain's first-run start. tokeira
+                // carries that backoff (client start delay / workflow-retry backoff) as
+                // `workflow_start_delay`; TestWorkflowRetry asserts start + backoff per attempt.
+                execution_time: state.started_at + state.workflow_start_delay.unwrap_or_default(),
                 execution_config: tokeira_edge::translate::ExecutionConfigDescription {
                     task_queue: state.task_queue.0.clone(),
                     workflow_execution_timeout: state.workflow_execution_timeout,

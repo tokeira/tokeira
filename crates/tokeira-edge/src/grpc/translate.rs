@@ -550,6 +550,38 @@ fn activity_retry_policy_with_defaults(
     }
 }
 
+/// Apply v1.31.0 workflow-start retry-policy `EnsureDefaults` to a
+/// client-supplied policy, filling only unset subfields: InitialInterval 1s,
+/// BackoffCoefficient 2.0, MaximumInterval 100×InitialInterval, MaximumAttempts 0
+/// (unlimited) (`common/retrypolicy/retry_policy.go` `EnsureDefaults`, applied at
+/// StartWorkflowExecution via `workflow_handler.go:6600 @ v1.31.0`). Only called
+/// when the client actually supplied a policy, so an absent policy still means
+/// "no retry" (unlike activities, which always carry one). The runtime's retry
+/// evaluation depends on these defaults (e.g. the 1s InitialInterval drives the
+/// backoff that `TestWorkflowRetry` asserts), so defaulting here — not the
+/// generic `retry_policy_to_domain`, which uses BackoffCoefficient 1.0 — is what
+/// makes the workflow retry chain match the release.
+fn workflow_retry_policy_with_defaults(proto: &tokeira_proto::common::RetryPolicy) -> RetryPolicy {
+    let initial_interval = proto_duration_to_time(proto.initial_interval.as_ref())
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or(time::Duration::seconds(1));
+    let backoff_coefficient = if proto.backoff_coefficient > 0.0 {
+        proto.backoff_coefficient
+    } else {
+        2.0
+    };
+    let maximum_interval = proto_duration_to_time(proto.maximum_interval.as_ref())
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or(initial_interval * 100);
+    RetryPolicy {
+        initial_interval,
+        backoff_coefficient,
+        maximum_interval: Some(maximum_interval),
+        maximum_attempts: proto.maximum_attempts.max(0) as u32,
+        non_retryable_error_types: proto.non_retryable_error_types.clone(),
+    }
+}
+
 fn parent_close_policy_to_domain(value: i32) -> ParentClosePolicy {
     match value {
         2 => ParentClosePolicy::Abandon,
@@ -903,7 +935,10 @@ pub fn start_request_to_edge(
         ),
         workflow_run_timeout: workflow_timeout_to_time(req.workflow_run_timeout.as_ref()),
         workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
-        retry_policy: req.retry_policy.as_ref().map(retry_policy_to_domain),
+        retry_policy: req
+            .retry_policy
+            .as_ref()
+            .map(workflow_retry_policy_with_defaults),
         conflict_policy,
         reuse_policy,
         header: req.header.as_ref().map(headers_to_domain),
@@ -3467,6 +3502,7 @@ pub fn get_history_reverse_request_to_edge(
 pub fn get_history_response_to_proto(
     resp: crate::translate::GetWorkflowExecutionHistoryResponse,
     filter_type: i32,
+    client_follows_next_run_id: bool,
 ) -> workflowservice::GetWorkflowExecutionHistoryResponse {
     use prost::Message;
     let history_bytes = crate::translate::history_serializer::serialize_history(&resp.history);
@@ -3477,6 +3513,18 @@ pub fn get_history_response_to_proto(
         && let Some(ref mut h) = history
     {
         h.events.retain(|event| is_close_event(event.event_type));
+        // FixFollowEvents (`get_history_util.go:555-586 @ v1.31.0`): pre-Sept-2021
+        // SDKs cannot follow `new_execution_run_id` off a Failed/TimedOut/Completed
+        // close event, so a close-event-only read for a client NOT advertising the
+        // `follows-next-run-id` feature rewrites the closing event into a synthetic
+        // ContinuedAsNew carrying the successor run id. Capable clients get the
+        // real event (an unconditional rewrite would be wrong for them).
+        if !client_follows_next_run_id
+            && let Some(last) = h.events.last_mut()
+            && let Some(fake) = fake_continued_as_new_event(last)
+        {
+            *last = fake;
+        }
     }
 
     workflowservice::GetWorkflowExecutionHistoryResponse {
@@ -3493,6 +3541,63 @@ pub fn get_history_response_to_proto(
         },
         ..Default::default()
     }
+}
+
+/// Build the synthetic `WorkflowExecutionContinuedAsNew` that `FixFollowEvents`
+/// substitutes for a retry/cron-chained close event when serving a legacy
+/// client (`makeFakeContinuedAsNewEvent`, `get_history_util.go:588-640 @
+/// v1.31.0`): only Completed/Failed/TimedOut events with a non-empty
+/// `new_execution_run_id` rewrite; the fake keeps the original event id/time
+/// and copies the result/failure so the outcome stays visible.
+fn fake_continued_as_new_event(
+    last: &tokeira_proto::history::HistoryEvent,
+) -> Option<tokeira_proto::history::HistoryEvent> {
+    use tokeira_proto::history::{
+        HistoryEvent, WorkflowExecutionContinuedAsNewEventAttributes, history_event::Attributes,
+    };
+    let mut new_attrs = WorkflowExecutionContinuedAsNewEventAttributes::default();
+    match &last.attributes {
+        Some(Attributes::WorkflowExecutionCompletedEventAttributes(attrs))
+            if !attrs.new_execution_run_id.is_empty() =>
+        {
+            new_attrs.new_execution_run_id = attrs.new_execution_run_id.clone();
+            new_attrs.last_completion_result = attrs.result.clone();
+        }
+        Some(Attributes::WorkflowExecutionFailedEventAttributes(attrs))
+            if !attrs.new_execution_run_id.is_empty() =>
+        {
+            new_attrs.new_execution_run_id = attrs.new_execution_run_id.clone();
+            new_attrs.failure = attrs.failure.clone();
+        }
+        Some(Attributes::WorkflowExecutionTimedOutEventAttributes(attrs))
+            if !attrs.new_execution_run_id.is_empty() =>
+        {
+            new_attrs.new_execution_run_id = attrs.new_execution_run_id.clone();
+            // failure.NewTimeoutFailure("workflow timeout", START_TO_CLOSE).
+            new_attrs.failure = Some(failure_proto::Failure {
+                message: "workflow timeout".to_string(),
+                failure_info: Some(failure_proto::failure::FailureInfo::TimeoutFailureInfo(
+                    failure_proto::TimeoutFailureInfo {
+                        timeout_type: enums::TimeoutType::StartToClose as i32,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            });
+        }
+        _ => return None,
+    }
+    Some(HistoryEvent {
+        event_id: last.event_id,
+        event_time: last.event_time.clone(),
+        event_type: enums::EventType::WorkflowExecutionContinuedAsNew as i32,
+        version: last.version,
+        task_id: last.task_id,
+        attributes: Some(Attributes::WorkflowExecutionContinuedAsNewEventAttributes(
+            new_attrs,
+        )),
+        ..Default::default()
+    })
 }
 
 pub fn get_history_reverse_response_to_proto(
@@ -3846,7 +3951,10 @@ pub fn signal_with_start_request_to_edge(
         ),
         workflow_run_timeout: workflow_timeout_to_time(req.workflow_run_timeout.as_ref()),
         workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
-        retry_policy: req.retry_policy.as_ref().map(retry_policy_to_domain),
+        retry_policy: req
+            .retry_policy
+            .as_ref()
+            .map(workflow_retry_policy_with_defaults),
         conflict_policy,
         reuse_policy,
         header: req.header.as_ref().map(headers_to_domain),

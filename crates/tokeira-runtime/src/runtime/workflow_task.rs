@@ -14,14 +14,19 @@
 //! source for each non-obvious decision.
 
 use super::*;
-use tokeira_kernel::{VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef};
+use prost::Message as _;
+use tokeira_kernel::{
+    RetryContinuation, RetryState, VersioningBehavior, VersioningOverride,
+    WorkerDeploymentVersionRef,
+};
 use tokeira_observability::OutcomeLabel;
+use tokeira_proto::failure::{Failure, failure::FailureInfo};
 use tokeira_storage::{
     DeploymentKey, DeploymentName, StoredRoutingConfig, WorkerDeploymentVersionKey,
 };
 use tokeira_types::WorkflowId;
 
-use crate::versioning::deterministic_bucket;
+use crate::{timeout::WorkflowTimeoutEntry, versioning::deterministic_bucket};
 
 /// Workflow-task routing target computed from durable run state plus registry config.
 ///
@@ -401,12 +406,34 @@ where
         }
         let run_key = req.token.run_key;
         let cron_continuation = self.cron_continuation_for_completion(run_key, &req).await?;
-        let command = match cron_continuation {
-            Some(cron_continuation) => Command::WorkflowTaskCompletedWithCron {
+        // Retry is evaluated before cron (retry.go @ v1.31.0). The cron helper
+        // already declines when a retry policy is present on a FailWorkflow, so
+        // the two are mutually exclusive here; compute retry only when cron did
+        // not claim the completion.
+        let retry_continuation = if cron_continuation.is_none() {
+            self.retry_continuation_for_completion(run_key, &req)
+                .await?
+        } else {
+            None
+        };
+        // Capture the successor id before `req` moves into the command: a Retry
+        // continuation means the committed WorkflowExecutionFailed will carry
+        // this new_execution_run_id, and we must start that successor run after
+        // the predecessor's close commits (Req 2.2).
+        let retry_successor_run_id = match &retry_continuation {
+            Some(RetryContinuation::Retry { new_run_id }) => Some(*new_run_id),
+            _ => None,
+        };
+        let command = match (retry_continuation, cron_continuation) {
+            (Some(retry_continuation), _) => Command::WorkflowTaskCompletedWithRetry {
+                request: req,
+                retry_continuation,
+            },
+            (None, Some(cron_continuation)) => Command::WorkflowTaskCompletedWithCron {
                 request: req,
                 cron_continuation,
             },
-            None => Command::WorkflowTaskCompleted(req),
+            (None, None) => Command::WorkflowTaskCompleted(req),
         };
         let result = self.submit_for_owned_shard(run_key, command).await;
         match &result {
@@ -417,6 +444,22 @@ where
             | Err(_) => {
                 runtime_metrics::record_workflow_task_completed(OutcomeLabel::Failure);
             }
+        }
+        // Start the attempt-N+1 successor once the predecessor's Failed-with-retry
+        // close is durable. The successor start is a derived effect of the
+        // authoritative close: if it fails, the predecessor close still stands
+        // (Req 2.2.3), mirroring the continue-as-new successor posture. The
+        // successor run id is fixed by the committed new_execution_run_id, so a
+        // re-drive is idempotent on the derived run key.
+        if let (Ok(CommitResult::Applied { .. }), Some(new_run_id)) =
+            (&result, retry_successor_run_id)
+            && let Err(error) = self.start_retry_successor(run_key, new_run_id).await
+        {
+            tracing::error!(
+                ?error,
+                predecessor_run_key = ?run_key,
+                "failed to start workflow retry successor",
+            );
         }
         result
     }
@@ -516,6 +559,194 @@ where
             input: input.clone(),
             cron_schedule: cron_schedule.clone(),
         }))
+    }
+
+    /// Evaluate the workflow retry decision for a WFT completion that fails the
+    /// run, returning the [`RetryContinuation`] to record on
+    /// `WorkflowExecutionFailed`, or `None` when no retry continuation applies (no
+    /// `FailWorkflow` command, or no retry policy — the kernel maps those to the
+    /// terminal `RetryPolicyNotSet`).
+    ///
+    /// Mirrors `service/history/workflow/retry.go:32-116` +
+    /// `mutable_state_impl.go:1630 @ v1.31.0`: a run with a retry policy retries on
+    /// failure unless the failure is non-retryable, the maximum attempts are
+    /// reached, or the successor's first attempt would begin at/after the
+    /// workflow-execution deadline. The evaluation (failure decoding, wall clock,
+    /// backoff) is a runtime concern; the kernel only records the outcome (Req 2.1).
+    async fn retry_continuation_for_completion(
+        &self,
+        run_key: RunKey,
+        req: &WorkflowTaskCompletedRequest,
+    ) -> Result<Option<RetryContinuation>> {
+        let Some(failure) = req.commands.iter().find_map(|command| match command {
+            WorkflowCommand::FailWorkflow { failure } => Some(failure.clone()),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Ok(None);
+        };
+        let Some(policy) = state.retry_policy.clone() else {
+            return Ok(None);
+        };
+
+        if !workflow_failure_is_retryable(&failure, &policy.non_retryable_error_types) {
+            return Ok(Some(RetryContinuation::Terminal {
+                retry_state: RetryState::NonRetryableFailure,
+            }));
+        }
+        // `maximum_attempts == 0` means unlimited (v1.31.0 NoInterval semantics).
+        if policy.maximum_attempts > 0 && state.attempt >= policy.maximum_attempts {
+            return Ok(Some(RetryContinuation::Terminal {
+                retry_state: RetryState::MaximumAttemptsReached,
+            }));
+        }
+        // Execution-expiration cap: if the next attempt could not begin before the
+        // workflow-execution deadline, the chain ends as Timeout (retry.go). The
+        // deadline is anchored on the first run's start so it spans the whole chain.
+        let backoff = retry_backoff(&policy, state.attempt);
+        if let Some(execution_timeout) = state.workflow_execution_timeout {
+            let anchor = state.first_run_started_at.unwrap_or(state.started_at);
+            if req.now + backoff >= anchor + execution_timeout {
+                return Ok(Some(RetryContinuation::Terminal {
+                    retry_state: RetryState::Timeout,
+                }));
+            }
+        }
+        Ok(Some(RetryContinuation::Retry {
+            new_run_id: RunId::new(),
+        }))
+    }
+
+    /// Start the attempt-N+1 successor after a Failed-with-retry close commits.
+    ///
+    /// Mirrors the continue-as-new / cron successor start in `lane.rs`: the
+    /// successor inherits the run's type/queue/input/policy/timeouts, chains its
+    /// lineage (`continued_execution_run_id`, first-run identity), carries the
+    /// predecessor's failure as `continued_failure`, and delays its first workflow
+    /// task by the recomputed backoff. The original input re-runs on retry, read
+    /// from the run's `WorkflowExecutionStarted` event (the same source cron uses).
+    /// The successor start is submitted through the normal run-routing path so it
+    /// lands on the owning lane; `Duplicate` is treated as success because a
+    /// re-driven close mints the same derived run key (Req 2.2, 5.1.3).
+    async fn start_retry_successor(
+        &self,
+        predecessor_run_key: RunKey,
+        new_run_id: RunId,
+    ) -> Result<()> {
+        let LoadedRun::Existing(state) = self.repo.load_run(predecessor_run_key).await? else {
+            return Err(anyhow!("predecessor run not found for retry successor"));
+        };
+        let Some(policy) = state.retry_policy.clone() else {
+            return Err(anyhow!("retry successor requested without a retry policy"));
+        };
+        let start_event = self.repo.read_history(predecessor_run_key, 0, 1).await?;
+        let input = match start_event.first().map(|event| &event.kind) {
+            Some(HistoryEventKind::WorkflowExecutionStarted { input, .. }) => input.clone(),
+            _ => Payloads::default(),
+        };
+        let backoff = retry_backoff(&policy, state.attempt);
+        let successor_run_key = RunKey::derive(state.namespace_id, &state.workflow_id, new_run_id);
+        // Chain origin propagates so execution-level timeouts and lineage queries
+        // span the whole retry chain, not just this hop.
+        let first_execution_run_id = Some(state.first_execution_run_id.unwrap_or(state.run_id));
+        let first_run_started_at = Some(state.first_run_started_at.unwrap_or(state.started_at));
+        // Root identity only propagates within a child lineage.
+        let (root_workflow_id, root_run_id) = if state.parent_run_key.is_some() {
+            (state.root_workflow_id.clone(), state.root_run_id)
+        } else {
+            (None, None)
+        };
+        let start_request = StartRequest {
+            run_key: successor_run_key,
+            namespace_id: state.namespace_id,
+            workflow_id: state.workflow_id.clone(),
+            run_id: new_run_id,
+            workflow_type: state.workflow_type.clone(),
+            task_queue: state.task_queue.clone(),
+            deployment: state.deployment.clone(),
+            build_id: state.build_id.clone(),
+            versioning_override: state.versioning_override().cloned(),
+            workflow_start_delay: Some(backoff),
+            completion_callbacks: state.completion_callbacks.clone(),
+            user_metadata: state.user_metadata.clone(),
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: state.priority.clone(),
+            input,
+            header: None,
+            memo: state.memo.clone(),
+            search_attributes: state.search_attributes.clone(),
+            workflow_execution_timeout: state.workflow_execution_timeout,
+            workflow_run_timeout: state.workflow_run_timeout,
+            workflow_task_timeout: state.workflow_task_timeout,
+            retry_policy: Some(policy),
+            conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            attempt: state.attempt + 1,
+            continued_execution_run_id: Some(state.run_id),
+            first_execution_run_id,
+            parent_run_key: None,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_initiated_event_id: 0,
+            root_workflow_id,
+            root_run_id,
+            original_execution_run_id: Some(
+                state.original_execution_run_id.unwrap_or(state.run_id),
+            ),
+            continued_failure: state.close_failure.clone(),
+            last_completion_result: state.close_result.clone(),
+            first_run_started_at,
+            request: RequestContext {
+                // Deterministic request id keyed on (predecessor, successor) so a
+                // replayed close dedupes to the same successor start instead of
+                // forking a duplicate run (mirrors the continue-as-new key).
+                request_id: tokeira_types::RequestId(format!(
+                    "workflow-retry:{}:{}",
+                    state.run_id.0, new_run_id.0
+                )),
+                caller_identity: None,
+                received_at: OffsetDateTime::now_utc(),
+            },
+            now: OffsetDateTime::now_utc(),
+            client_cron_schedule: None,
+            cron_schedule: None,
+            reserved_poller_identity: None,
+        };
+        let shard_id = self.shard_id_for(successor_run_key).await;
+        match self
+            .submit(successor_run_key, Command::Start(start_request))
+            .await?
+        {
+            CommitResult::Applied { new_state } => {
+                if new_state.workflow_execution_timeout.is_some()
+                    || new_state.workflow_run_timeout.is_some()
+                {
+                    self.workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
+                        run_key: new_state.run_key,
+                        shard_id,
+                        workflow_execution_timeout: new_state.workflow_execution_timeout,
+                        workflow_run_timeout: new_state.workflow_run_timeout,
+                        started_at: new_state.started_at,
+                        first_run_started_at: new_state.first_run_started_at,
+                        has_retry_policy: new_state.retry_policy.is_some(),
+                    });
+                }
+                Ok(())
+            }
+            CommitResult::Duplicate => Ok(()),
+            CommitResult::Conflict { reason } => {
+                Err(anyhow!("retry successor start conflicted: {reason}"))
+            }
+            CommitResult::CurrentExecutionConflict {
+                existing_run_key, ..
+            } => Err(anyhow!(
+                "retry successor current-execution conflict: {existing_run_key:?}"
+            )),
+        }
     }
 
     /// Atomically transition a polled workflow task into the Started state.
@@ -686,6 +917,69 @@ where
     }
 }
 
+/// Workflow-retry failure classification, mirroring `isRetryable`
+/// (`service/history/workflow/retry.go:115 @ v1.31.0`) exactly:
+///
+/// - no / undecodable / info-less failure → **retryable** (nil → true and the
+///   trailing default → true);
+/// - Terminated / Canceled info → not retryable;
+/// - Timeout info → retryable only for StartToClose / Heartbeat, and then only
+///   when `"TemporalTimeout:" + type` is absent from the policy's
+///   non-retryable types (`retrypolicy.TimeoutFailureTypePrefix`,
+///   retry_policy.go:19);
+/// - Server info → `!non_retryable` (the corpus drives workflow retry with
+///   `failure.NewServerFailure`, tests/workflow_test.go:1543);
+/// - Application info → `!non_retryable` and `type` not excluded.
+///
+/// Decoding the proto failure lives here because the retry decision is a
+/// runtime concern (the kernel stays proto-free).
+fn workflow_failure_is_retryable(failure: &Payload, non_retryable_types: &[String]) -> bool {
+    use tokeira_proto::enums::TimeoutType;
+    let Ok(decoded) = Failure::decode(failure.data.as_slice()) else {
+        return true;
+    };
+    match decoded.failure_info {
+        Some(FailureInfo::TerminatedFailureInfo(_)) | Some(FailureInfo::CanceledFailureInfo(_)) => {
+            false
+        }
+        Some(FailureInfo::TimeoutFailureInfo(timeout)) => {
+            let (retryable_kind, type_name) = match TimeoutType::try_from(timeout.timeout_type) {
+                Ok(TimeoutType::StartToClose) => (true, "StartToClose"),
+                Ok(TimeoutType::Heartbeat) => (true, "Heartbeat"),
+                _ => (false, ""),
+            };
+            retryable_kind
+                && !non_retryable_types
+                    .iter()
+                    .any(|excluded| excluded == &format!("TemporalTimeout:{type_name}"))
+        }
+        Some(FailureInfo::ServerFailureInfo(server)) => !server.non_retryable,
+        Some(FailureInfo::ApplicationFailureInfo(app)) => {
+            !app.non_retryable
+                && !non_retryable_types
+                    .iter()
+                    .any(|excluded| excluded == &app.r#type)
+        }
+        _ => true,
+    }
+}
+
+/// Exponential retry backoff for the attempt-N+1 successor:
+/// `initial_interval × backoff_coefficient^(attempt-1)`, capped by
+/// `maximum_interval` when set (`retry.go @ v1.31.0`). Wall-clock-free and
+/// deterministic, so the retry decision and the successor start compute the same
+/// delay without threading it through the kernel.
+fn retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1) as f64;
+    let seconds =
+        policy.initial_interval.as_seconds_f64() * policy.backoff_coefficient.powf(exponent);
+    let capped = match policy.maximum_interval {
+        Some(max) if max.as_seconds_f64() > 0.0 => seconds.min(max.as_seconds_f64()),
+        _ => seconds,
+    };
+    Duration::seconds_f64(capped.max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet};
@@ -699,6 +993,151 @@ mod tests {
     };
 
     use super::*;
+
+    fn app_failure(error_type: &str, non_retryable: bool) -> Payload {
+        use prost::Message as _;
+        use tokeira_proto::failure::{ApplicationFailureInfo, Failure, failure::FailureInfo};
+        let failure = Failure {
+            message: "boom".to_string(),
+            failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                ApplicationFailureInfo {
+                    r#type: error_type.to_string(),
+                    non_retryable,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        Payload::new(failure.encode_to_vec())
+    }
+
+    #[test]
+    fn workflow_failure_retryable_classification() {
+        // Feature: workflow-retry-chain — classification mirrors `isRetryable`
+        // (service/history/workflow/retry.go:115 @ v1.31.0) across every
+        // failure-info class, not just ApplicationFailureInfo.
+        use prost::Message as _;
+        use tokeira_proto::failure::{
+            CanceledFailureInfo, Failure, ServerFailureInfo, TerminatedFailureInfo,
+            TimeoutFailureInfo, failure::FailureInfo,
+        };
+        let encoded = |info: FailureInfo| {
+            Payload::new(
+                Failure {
+                    message: "boom".to_string(),
+                    failure_info: Some(info),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+        };
+
+        // Application failures: flag, then excluded-type check.
+        assert!(workflow_failure_is_retryable(
+            &app_failure("Boom", false),
+            &[]
+        ));
+        assert!(!workflow_failure_is_retryable(
+            &app_failure("Boom", true),
+            &[]
+        ));
+        assert!(!workflow_failure_is_retryable(
+            &app_failure("Fatal", false),
+            &["Fatal".to_string()],
+        ));
+
+        // Server failures use only their non_retryable flag — the corpus drives
+        // workflow retry with failure.NewServerFailure
+        // (tests/workflow_test.go:1543 @ v1.31.0), and the excluded-type list
+        // does NOT apply to them (retry.go:138-140).
+        assert!(workflow_failure_is_retryable(
+            &encoded(FailureInfo::ServerFailureInfo(ServerFailureInfo {
+                non_retryable: false,
+            })),
+            &["boom".to_string()],
+        ));
+        assert!(!workflow_failure_is_retryable(
+            &encoded(FailureInfo::ServerFailureInfo(ServerFailureInfo {
+                non_retryable: true,
+            })),
+            &[],
+        ));
+
+        // Terminated / Canceled → never retryable (retry.go:120-122).
+        assert!(!workflow_failure_is_retryable(
+            &encoded(FailureInfo::TerminatedFailureInfo(
+                TerminatedFailureInfo::default()
+            )),
+            &[],
+        ));
+        assert!(!workflow_failure_is_retryable(
+            &encoded(FailureInfo::CanceledFailureInfo(
+                CanceledFailureInfo::default()
+            )),
+            &[],
+        ));
+
+        // Timeouts: StartToClose/Heartbeat retry unless excluded via the
+        // "TemporalTimeout:" prefix; other timeout kinds never retry
+        // (retry.go:124-136; TimeoutFailureTypePrefix, retry_policy.go:19).
+        let timeout = |timeout_type: tokeira_proto::enums::TimeoutType| {
+            encoded(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+                timeout_type: timeout_type as i32,
+                ..Default::default()
+            }))
+        };
+        assert!(workflow_failure_is_retryable(
+            &timeout(tokeira_proto::enums::TimeoutType::StartToClose),
+            &[],
+        ));
+        assert!(!workflow_failure_is_retryable(
+            &timeout(tokeira_proto::enums::TimeoutType::StartToClose),
+            &["TemporalTimeout:StartToClose".to_string()],
+        ));
+        assert!(!workflow_failure_is_retryable(
+            &timeout(tokeira_proto::enums::TimeoutType::ScheduleToClose),
+            &[],
+        ));
+
+        // No failure info / undecodable → retryable (nil → true and the
+        // trailing default → true, retry.go:116-118,152).
+        assert!(workflow_failure_is_retryable(
+            &Payload::new(Vec::new()),
+            &[]
+        ));
+        assert!(workflow_failure_is_retryable(
+            &encoded(FailureInfo::ApplicationFailureInfo(Default::default())),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn retry_backoff_matches_exponential_formula() {
+        // Feature: workflow-retry-chain — backoff = initial × coeff^(attempt-1),
+        // capped by maximum_interval.
+        let policy = RetryPolicy {
+            initial_interval: Duration::seconds(1),
+            backoff_coefficient: 2.0,
+            maximum_interval: Some(Duration::seconds(10)),
+            maximum_attempts: 0,
+            non_retryable_error_types: Vec::new(),
+        };
+        assert_eq!(retry_backoff(&policy, 1), Duration::seconds(1));
+        assert_eq!(retry_backoff(&policy, 2), Duration::seconds(2));
+        assert_eq!(retry_backoff(&policy, 3), Duration::seconds(4));
+        assert_eq!(retry_backoff(&policy, 6), Duration::seconds(10));
+
+        // TestWorkflowRetry uses coefficient 1.0 → a constant 1s backoff per attempt.
+        let flat = RetryPolicy {
+            initial_interval: Duration::seconds(1),
+            backoff_coefficient: 1.0,
+            maximum_interval: None,
+            maximum_attempts: 3,
+            non_retryable_error_types: Vec::new(),
+        };
+        assert_eq!(retry_backoff(&flat, 1), Duration::seconds(1));
+        assert_eq!(retry_backoff(&flat, 3), Duration::seconds(1));
+    }
 
     #[derive(Clone, Debug)]
     enum VersioningCase {

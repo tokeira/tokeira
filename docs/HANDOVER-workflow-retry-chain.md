@@ -1,14 +1,23 @@
 # Hand-over — workflow retry chain (TestWorkflowRetry / TestWorkflowRetryFailures)
 
-**Author:** Claude (functional-conformance drive) · **Date:** 2026-07-02 · **For:** Kiro
-**Status:** RAISE — needs kernel work; stop-and-raise per the conformance discipline.
+**Author:** Claude (raise, functional-conformance drive) · **Implemented by:** Kiro · **Date:** 2026-07-02 · **For:** the conformance drive (Claude)
+**Status:** ✅ IMPLEMENTED (in-repo) — Requirement 0 accepted (2026-07-02, owner); spec
+[`.kiro/specs/workflow-retry-chain/`](../.kiro/specs/workflow-retry-chain/requirements.md) Phases 1–5
+landed and verified (fmt/clippy/tests/doc green, `tokeirad` builds). **One operator-gated step remains**
+— run the functional conformance harness, then remove the two skip entries and flip them to
+required-pass. See §4.
+
+**Classification of the two leaves:** currently registry **skips**, reason updated to **real-gap
+(implemented; pending harness confirmation)**. They flip to required-pass once a harness run confirms
+green. See §4 and "Skip vs FAIL" below.
 
 > **TL;DR.** The two retry leaves need **workflow-retry-on-failure**: a run that fails with a
-> `RetryPolicy` must close as Failed carrying `new_execution_run_id` and a successor run
-> (attempt N+1) must start. tokeira has per-run `retry_policy`/`attempt` state and the cron
-> continuation machinery, but no retry continuation. Two of the pieces are kernel changes →
-> raised, not inline-patched. A shared edge bug (RunKey leaked as wire run_id) that also
-> broke these tests was fixed separately (see `docs/HANDOVER-functional-conformance.md` drive).
+> `RetryPolicy` must close as Failed carrying `new_execution_run_id` and a successor run (attempt N+1)
+> must start. This was raised (two kernel changes → stop-and-raise, not inline-patched), spec'd, accepted,
+> and is now **implemented** (kernel + runtime + edge, §3). The only thing left is an operator harness run
+> to confirm green and flip the two skips to required-pass (§4). §1–§2 below are the original ground truth;
+> read them before touching any assertion detail. A shared edge bug (RunKey leaked as wire run_id) that
+> also broke these tests was fixed separately (see `docs/HANDOVER-functional-conformance.md`).
 
 ## 1. The tests (ground truth)
 
@@ -43,32 +52,67 @@
   carries `new_execution_run_id` into a synthetic ContinuedAsNew so `GetWorkflowHistory` follows
   the chain — the corpus helper relies on this.
 
-## 3. What tokeira has / lacks
+## 3. What landed (implemented + verified in-repo)
 
-Has: `WorkflowState.{retry_policy, attempt, first_execution_run_id, original_execution_run_id}`,
-cron continuation (`WorkflowTaskCompletedWithCron` + `cron_continuation_for_completion`,
-runtime/workflow_task.rs) as the architectural template, and (post-`20388323`) activity retry
-EnsureDefaults.
+- **Kernel:** `HistoryEventKind::WorkflowExecutionFailed.new_execution_run_id: Option<RunId>`
+  (`#[serde(default)]`, mirrors `WorkflowExecutionTimedOut`). New `Command::WorkflowTaskCompletedWithRetry`
+  + `RetryContinuation { Retry { new_run_id } | Terminal { retry_state } }`. The `FailWorkflow` arm records
+  the runtime's decision (`InProgress` + successor id, or terminal `retry_state` + `None`); cron branch and
+  no-continuation fallback preserved. Kernel property tests P1–P4, P6.
+- **Runtime** (`runtime/workflow_task.rs`): `retry_continuation_for_completion` evaluates `retry.go`
+  semantics (proto-decoding non-retryable check, max-attempts, execution-expiration, exponential backoff)
+  — runtime-side, kernel stays proto-free. `start_retry_successor` starts the attempt-N+1 run mirroring the
+  continue-as-new successor path (inherited config, `attempt=N+1`, `continued_execution_run_id`, inherited
+  first-run identity, `continued_failure`, backoff-delayed first WFT, idempotent). Wired into
+  `complete_workflow_task` (cron-first precedence). End-to-end integration tests in `runtime_lane.rs`.
+- **Edge:** workflow retry-policy `EnsureDefaults` on `StartWorkflowExecution` + `SignalWithStart`
+  (`workflow_retry_policy_with_defaults`). The Failed-event serializer projects `new_execution_run_id`.
+- **Docs:** `docs/architecture/020-kernel.md` (Workflow-level retry section) updated to the shipped model.
 
-Lacks (kernel — the raise):
-1. `HistoryEventKind::WorkflowExecutionFailed.new_execution_run_id: Option<RunId>`
-   (`#[serde(default)]`, mirroring `WorkflowExecutionTimedOut`, event.rs:130).
-2. A `RetryContinuation { new_run_id, retry_state }` input alongside `cron_continuation` on the
-   WFT-completed command; the FailWorkflow arm currently hardcodes
-   `retry_state = InProgress if retry_policy.is_some()` (kernel.rs FailWorkflow arm) with no
-   successor linkage and no MaximumAttemptsReached/NonRetryableFailure derivation.
+**Deliberate deferrals (not gaps):**
+- ~~`FixFollowEvents` legacy-client rewrite~~ — **SUPERSEDED (2026-07-03, harness confirmation):** the
+  deferral rationale was wrong for the corpus. `TestWorkflowRetry` explicitly simulates a pre-2021 Java
+  SDK (`headers.SetVersionsForTests(ctx, "1.3.1", ClientNameJavaSDK, ...)`,
+  tests/workflow_test.go:1498-1516 @ v1.31.0) and asserts the synthetic ContinuedAsNew on
+  CLOSE_EVENT-filtered reads. Implemented during harness confirmation: capability is purely
+  header-driven (`supported-features` metadata contains `follows-next-run-id`,
+  `version_checker.go:152` — no version-map fallback), and the rewrite mirrors
+  `makeFakeContinuedAsNewEvent` (`get_history_util.go:588-640`) in the edge proto layer. Capable
+  clients still get the real close event. (Spec Req 3.2 — now shipped.)
+- Timeout-retry successor — `WorkflowExecutionTimedOut` already carries `new_execution_run_id`; the
+  timeout retry-continuation + successor are the same mechanism, deferred until a timeout-retry case
+  demands it.
 
-Lacks (runtime/edge — implementable once the kernel lands):
-3. `retry_continuation_for_completion` (runtime): evaluate retry.go semantics
-   (non-retryable types / max attempts / expiration / backoff) and mint the successor run id.
-4. Successor start on committed Failed-with-retry (runtime lane, mirroring the ContinuedAsNew
-   successor block in lane.rs).
-5. Workflow retry-policy EnsureDefaults at start (edge translate; activity-side already landed).
-6. `FixFollowEvents` for CLOSE_EVENT-filtered reads (edge get_workflow_execution_history).
+## 4. Remaining step for the conformance drive (Claude)
 
-## 4. Recommendation
+The implementation is done and verified in-repo; the only thing left is the **operator-invoked** harness
+confirmation (it needs the Go corpus + a running `tokeirad`, per
+`docs/testing/functional-conformance-harness.md` — not runnable from the Kiro side). To finish:
 
-Extend `.kiro/specs/api-conformance-wft-completion/` (or a dedicated `workflow-retry-chain` spec)
-with the kernel Requirement (items 1-2) for owner sign-off, then implement 3-6 in
-runtime/edge. Items 5-6 are independently landable but do not flip the leaves alone.
-Until then the two leaves remain honest FAILs (not skips — the feature is in-claim).
+1. Build `tokeirad` (it carries all the changes above): `cargo build -p tokeirad`.
+2. Remove the two entries from `tests/testcore/tokeira_conformance_skip.go`
+   (`TestWorkflowTestSuite/TestWorkflowRetry`, `TestWorkflowTestSuite/TestWorkflowRetryFailures`) — their
+   reasons already say "implemented; pending harness confirmation … flip to required-pass once green."
+3. Run the harness for those leaves and confirm both GREEN.
+4. Flip them to required-pass in the coverage report (real-gap → pass), and check off Phase 4.2 in the
+   spec `tasks.md`.
+
+If a leaf is not green, capture the specific assertion and route it back — do **not** re-implement the
+chain (it exists and is unit/integration-tested); the likely suspects are conformance-only details
+(exact `execution_time`/backoff assertions, per-attempt history shape) rather than the mechanism.
+
+## Skip vs FAIL (reconciliation)
+
+An earlier revision of this doc said the two leaves would "remain honest FAILs (not skips)". That is
+**superseded**: they are now registry **skips** in
+`tests/testcore/tokeira_conformance_skip.go`, classified **real-gap (DEFERRED GAP, raised)**.
+
+Why the change from FAIL to skip: after the RunKey/run-id edge fix, the leaves no longer fail fast — the
+corpus helper (`functional_test_base.go:588`) successfully reads attempt 1's history and then polls
+**indefinitely** for the attempt-2 successor run that never starts, hanging until the go-test timeout and
+**aborting the parallel suite with 0 outcomes recorded** (observed: `TestWorkflowRetryFailures` hung
+2m56s → 8-min timeout, masking ~30 passing tests). A hang-to-timeout leaf erases the suite's signal
+entirely, so a cited skip is strictly better than a live FAIL — the same class as the existing
+`TestNexusOperationSyncCompletion` suite-abort skip. The skip stays classified real-gap (remove-when-
+lands), so it flips to required-pass the moment the spec's Phase 4 runs; it is not out-of-scope and does
+not rot.

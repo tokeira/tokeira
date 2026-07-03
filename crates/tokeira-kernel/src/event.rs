@@ -550,6 +550,15 @@ pub enum HistoryEventKind {
         failure: Payload,
         retry_state: RetryState,
         attempt: u32,
+        /// Run ID of the retry successor when the run's retry policy continues
+        /// the chain; `None` on terminal failure. Mirrors the field already on
+        /// `WorkflowExecutionTimedOut` and the proto's `new_execution_run_id = 4`
+        /// (`temporal/api/history/v1/message.proto` → `WorkflowExecutionFailedEventAttributes`;
+        /// `workflow_task_completed_handler.go:788 @ v1.31.0`). `#[serde(default)]`
+        /// keeps transition-log records written before the retry chain existed
+        /// readable — they deserialize to `None`.
+        #[serde(default)]
+        new_execution_run_id: Option<RunId>,
     },
     /// The workflow ended by spawning a new run via
     /// continue-as-new.

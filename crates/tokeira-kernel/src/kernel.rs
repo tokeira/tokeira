@@ -25,14 +25,14 @@ use crate::{
         ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
         ExternalSignalResult, FieldChange, NexusOperationResolvedRequest,
         NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
-        ResetActivityRequest, ResetRequest, RetryState, ScheduleQueryTaskRequest, SignalRequest,
-        SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest,
-        TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest,
-        UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-        UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, WorkflowCommand,
-        WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest,
-        WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-        WorkflowTaskTimedOutRequest,
+        ResetActivityRequest, ResetRequest, RetryContinuation, RetryState,
+        ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartRequest,
+        StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest, TerminateRequest,
+        TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
+        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
+        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
@@ -179,12 +179,18 @@ impl Kernel for BasicKernel {
                 self.apply_start_deployment_transition(loaded, req)
             }
             Command::WorkflowTaskCompleted(req) => {
-                self.apply_workflow_task_completed(loaded, req, None)
+                self.apply_workflow_task_completed(loaded, req, None, None)
             }
             Command::WorkflowTaskCompletedWithCron {
                 request,
                 cron_continuation,
-            } => self.apply_workflow_task_completed(loaded, request, Some(cron_continuation)),
+            } => self.apply_workflow_task_completed(loaded, request, Some(cron_continuation), None),
+            Command::WorkflowTaskCompletedWithRetry {
+                request,
+                retry_continuation,
+            } => {
+                self.apply_workflow_task_completed(loaded, request, None, Some(retry_continuation))
+            }
             Command::WorkflowTaskFailed(req) => self.apply_workflow_task_failed(loaded, req),
             Command::TerminateOnWorkflowTaskFailed(req) => {
                 self.apply_terminate_on_workflow_task_failed(loaded, req)
@@ -1478,6 +1484,7 @@ impl BasicKernel {
         loaded: LoadedRun,
         req: WorkflowTaskCompletedRequest,
         cron_continuation: Option<CronContinuation>,
+        retry_continuation: Option<RetryContinuation>,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let pending = state
@@ -1542,6 +1549,7 @@ impl BasicKernel {
                 command,
                 wft_completed_event_id,
                 cron_continuation.as_ref(),
+                retry_continuation.as_ref(),
             )?;
         }
 
@@ -2997,6 +3005,7 @@ fn apply_workflow_command(
     command: WorkflowCommand,
     workflow_task_completed_event_id: i64,
     cron_continuation: Option<&CronContinuation>,
+    retry_continuation: Option<&RetryContinuation>,
 ) -> Result<bool, Reject> {
     match command {
         WorkflowCommand::ScheduleActivity {
@@ -3164,15 +3173,33 @@ fn apply_workflow_command(
         }
         WorkflowCommand::FailWorkflow { failure } => {
             builder.state.close_failure = Some(failure.clone());
-            let retry_state = if builder.state.retry_policy.is_some() {
-                RetryState::InProgress
-            } else {
-                RetryState::RetryPolicyNotSet
-            };
             let attempt = builder.state.attempt;
-            if let Some(cron) = cron_continuation
-                && builder.state.retry_policy.is_none()
-            {
+            // Precedence is resolved in the runtime, which supplies at most one
+            // of {retry_continuation, cron_continuation} for a FailWorkflow —
+            // retry is evaluated before cron (`retry.go @ v1.31.0`), and the cron
+            // helper already declines when a retry policy is present. The kernel
+            // only records the already-decided outcome so replay reconstructs the
+            // same close deterministically (retry evaluation is wall-clock- and
+            // policy-dependent, hence a runtime concern, not pure kernel logic).
+            if let Some(retry) = retry_continuation {
+                // Binding new_execution_run_id to the retry outcome is what makes
+                // a Failed close chase its successor: FixFollowEvents and the
+                // runtime successor-start both key off this field (Req 1.2/2.2).
+                let (retry_state, new_execution_run_id) = match retry {
+                    RetryContinuation::Retry { new_run_id } => {
+                        (RetryState::InProgress, Some(*new_run_id))
+                    }
+                    RetryContinuation::Terminal { retry_state } => (retry_state.clone(), None),
+                };
+                builder.emit(HistoryEventKind::WorkflowExecutionFailed {
+                    workflow_task_completed_event_id,
+                    failure,
+                    retry_state,
+                    attempt,
+                    new_execution_run_id,
+                });
+                builder.close(ExecutionStatus::Failed);
+            } else if let Some(cron) = cron_continuation {
                 emit_cron_continue_as_new(
                     builder,
                     workflow_task_completed_event_id,
@@ -3181,11 +3208,22 @@ fn apply_workflow_command(
                     None,
                 );
             } else {
+                // Terminal failure with neither retry nor cron. A run with a
+                // retry policy but no runtime-supplied continuation is
+                // unreachable once the runtime wires retry evaluation; the
+                // conservative InProgress mapping is preserved for any caller
+                // that omits the continuation rather than silently dropping it.
+                let retry_state = if builder.state.retry_policy.is_some() {
+                    RetryState::InProgress
+                } else {
+                    RetryState::RetryPolicyNotSet
+                };
                 builder.emit(HistoryEventKind::WorkflowExecutionFailed {
                     workflow_task_completed_event_id,
                     failure,
                     retry_state,
                     attempt,
+                    new_execution_run_id: None,
                 });
                 builder.close(ExecutionStatus::Failed);
             }

@@ -1259,9 +1259,9 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::WorkflowExecutionTimedOut(_) => "WorkflowExecutionTimedOut",
         Command::WorkflowTaskStarted(_) => "WorkflowTaskStarted",
         Command::StartDeploymentTransition(_) => "StartDeploymentTransition",
-        Command::WorkflowTaskCompleted(_) | Command::WorkflowTaskCompletedWithCron { .. } => {
-            "WorkflowTaskCompleted"
-        }
+        Command::WorkflowTaskCompleted(_)
+        | Command::WorkflowTaskCompletedWithCron { .. }
+        | Command::WorkflowTaskCompletedWithRetry { .. } => "WorkflowTaskCompleted",
         Command::WorkflowTaskFailed(_) => "WorkflowTaskFailed",
         Command::WorkflowTaskTimedOut(_) => "WorkflowTaskTimedOut",
         Command::ActivityResolved(_) => "ActivityResolved",

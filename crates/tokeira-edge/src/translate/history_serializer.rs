@@ -457,6 +457,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             failure,
             retry_state,
             attempt: _,
+            new_execution_run_id,
         } => {
             let failure = Some(payload_to_failure(failure));
             Attributes::WorkflowExecutionFailedEventAttributes(
@@ -464,7 +465,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                     failure,
                     retry_state: retry_state_i32(retry_state),
                     workflow_task_completed_event_id: *workflow_task_completed_event_id,
-                    ..Default::default()
+                    new_execution_run_id: opt_run_id(new_execution_run_id),
                 },
             )
         }
@@ -1807,6 +1808,7 @@ mod tests {
                     failure,
                     retry_state: rs,
                     attempt: att,
+                    new_execution_run_id: None,
                 }
             },),
             Just(HistoryEventKind::WorkflowExecutionCanceled {
@@ -2686,6 +2688,7 @@ mod tests {
                     failure: payload,
                     retry_state,
                     attempt,
+                    new_execution_run_id: None,
                 },
             };
             let proto = history_event_to_proto(&event);
@@ -2818,6 +2821,7 @@ mod tests {
                     failure: payload,
                     retry_state: RetryState::InProgress,
                     attempt: 1,
+                    new_execution_run_id: None,
                 },
                 1 => HistoryEventKind::ActivityTaskFailed {
                     activity_id: "act-1".to_string(),
@@ -2903,6 +2907,7 @@ mod tests {
                 failure: make_failure_payload(&failure),
                 retry_state: RetryState::NonRetryableFailure,
                 attempt: 1,
+                new_execution_run_id: None,
             },
         };
         let proto = history_event_to_proto(&event);

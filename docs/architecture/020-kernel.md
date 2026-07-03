@@ -612,11 +612,12 @@ This command is issued by the runtime when the workflow's execution timeout or r
 
 Temporal retries workflows on both timeout and failure if a retry policy is configured. Tokeira handles this the same way as Continue-As-New: the kernel closes the current run with the appropriate terminal status and emits linkage metadata. The runtime reads that metadata and decides whether to create a retry run.
 
-Specifically:
+Specifically (failure path — implemented; see `.kiro/specs/workflow-retry-chain/`):
 
-- When `FailWorkflow` closes a run and the workflow has a `retry_policy`, the kernel emits the current `attempt` count and retry state in the `WorkflowExecutionFailed` event. The runtime checks the retry policy (max attempts, non-retryable error types, backoff) and, if a retry is warranted, issues a `Start` command for the new run with an incremented `attempt` and `continued_execution_run_id` linking back.
-- When `WorkflowExecutionTimedOut` closes a run, the same pattern applies: the kernel emits retry state, the runtime decides.
-- The kernel does not evaluate retry policy logic. It records the attempt count and terminal status. The runtime owns the retry decision, backoff calculation, and successor creation.
+- The runtime evaluates the retry decision (`retry_continuation_for_completion`): it decodes the failure to test `non_retryable_error_types`, checks `maximum_attempts` and the execution-expiration cap, and computes the exponential backoff — all wall-clock/policy-dependent work that stays out of the pure kernel. It submits the completion as `WorkflowTaskCompletedWithCron`, `WorkflowTaskCompletedWithRetry`, or plain `WorkflowTaskCompleted` (retry is evaluated before cron; they are mutually exclusive per completion).
+- On `WorkflowTaskCompletedWithRetry`, the kernel records the runtime's decision on `WorkflowExecutionFailed`: `retry_state = InProgress` and `new_execution_run_id = Some(successor)` when the chain continues, or the terminal `retry_state` (`MaximumAttemptsReached` / `NonRetryableFailure` / `RetryPolicyNotSet`) with `new_execution_run_id = None`. The kernel evaluates no policy logic; it only records the outcome and authors the event, so replay reconstructs the same close.
+- After the Failed-with-retry close commits, the runtime starts the attempt-N+1 successor (`start_retry_successor`), mirroring the continue-as-new successor path: inherited config, `attempt = N+1`, `continued_execution_run_id` linking back, inherited first-run identity, the predecessor's failure as `continued_failure`, and a backoff-delayed first workflow task. A capability-aware client follows `new_execution_run_id` to that successor.
+- **Timeout path (not yet wired):** `WorkflowExecutionTimedOut` already carries `new_execution_run_id`, but the timeout retry-continuation + successor are the same mechanism and are deferred until a timeout-retry case demands them.
 
 This keeps the kernel focused on single-run transitions while giving the runtime full control over retry semantics.
 

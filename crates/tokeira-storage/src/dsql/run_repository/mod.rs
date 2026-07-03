@@ -1696,7 +1696,10 @@ mod tests {
             execution_status: state.status,
             start_time: state.started_at,
             update_time: state.closed_at.unwrap_or(state.started_at),
-            execution_time: Some(state.started_at),
+            // v1.31.0 ExecutionTime = StartTime + FirstWorkflowTaskBackoff
+            // (mutable_state_impl.go:2859); tokeira carries that backoff (client
+            // start delay / workflow-retry backoff) as `workflow_start_delay`.
+            execution_time: Some(state.started_at + state.workflow_start_delay.unwrap_or_default()),
             close_time: state.closed_at,
             history_length: state.last_event_id,
             execution_duration: None,

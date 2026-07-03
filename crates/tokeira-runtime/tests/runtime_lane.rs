@@ -752,6 +752,196 @@ async fn burst_signals_produce_complete_history() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
+    // Feature: workflow-retry-chain — a retry-eligible FailWorkflow closes the run
+    // Failed with new_execution_run_id and starts a backoff-delayed attempt-2
+    // successor chained to the predecessor (Req 1.2, 2.2, 4.2).
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("retry-successor-workflow".to_string());
+    let queue = queue(namespace_id, "queue-a");
+
+    let mut request = start_request(namespace_id, workflow_id.clone(), "req-retry-successor");
+    // Coefficient 1.0 → a flat 1s backoff; three attempts allowed.
+    request.retry_policy = Some(tokeira_types::RetryPolicy {
+        initial_interval: Duration::seconds(1),
+        backoff_coefficient: 1.0,
+        maximum_interval: Some(Duration::seconds(10)),
+        maximum_attempts: 3,
+        non_retryable_error_types: Vec::new(),
+    });
+
+    let start = runtime.start_workflow(request).await?;
+    let predecessor = applied_state(&start);
+    let first_task = runtime
+        .poll_workflow_task(
+            queue.clone(),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("first WFT should be published");
+
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: first_task.token,
+            identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![WorkflowCommand::FailWorkflow {
+                failure: retryable_app_failure("BoomError"),
+            }],
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    // The predecessor closed Failed with retry_state InProgress and a successor id.
+    let history = store.read_history(predecessor.run_key, 0, 16).await?;
+    let successor_run_id = history
+        .iter()
+        .find_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionFailed {
+                new_execution_run_id,
+                retry_state,
+                ..
+            } => {
+                assert_eq!(*retry_state, tokeira_kernel::RetryState::InProgress);
+                *new_execution_run_id
+            }
+            _ => None,
+        })
+        .expect("failed event should carry a retry successor run id");
+    let successor_key = RunKey::derive(namespace_id, &workflow_id, successor_run_id);
+
+    // The attempt-2 successor started, chained and backoff-delayed by 1s.
+    let successor = wait_for_existing_run(&store, successor_key).await?;
+    assert_eq!(successor.attempt, 2);
+    assert_eq!(successor.first_execution_run_id, Some(predecessor.run_id));
+    assert_eq!(successor.workflow_start_delay, Some(Duration::seconds(1)));
+    let successor_history = store.read_history(successor_key, 0, 1).await?;
+    assert!(matches!(
+        successor_history.first().map(|event| &event.kind),
+        Some(HistoryEventKind::WorkflowExecutionStarted {
+            continued_execution_run_id,
+            attempt,
+            ..
+        }) if *continued_execution_run_id == Some(predecessor.run_id) && *attempt == 2
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_retryable_failure_is_terminal_without_successor() -> Result<()> {
+    // Feature: workflow-retry-chain — a failure whose type is in the policy's
+    // non_retryable_error_types closes the run terminally (NonRetryableFailure),
+    // with no successor run id and no successor started (Req 4.1).
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig::default(),
+    );
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("retry-terminal-workflow".to_string());
+    let queue = queue(namespace_id, "queue-a");
+
+    let mut request = start_request(namespace_id, workflow_id.clone(), "req-retry-terminal");
+    request.retry_policy = Some(tokeira_types::RetryPolicy {
+        initial_interval: Duration::seconds(1),
+        backoff_coefficient: 2.0,
+        maximum_interval: Some(Duration::seconds(10)),
+        maximum_attempts: 3,
+        non_retryable_error_types: vec!["FatalError".to_string()],
+    });
+
+    let start = runtime.start_workflow(request).await?;
+    let predecessor = applied_state(&start);
+    let first_task = runtime
+        .poll_workflow_task(
+            queue.clone(),
+            WorkerIdentity("worker-a".to_string()),
+            tokio::time::Duration::from_millis(5),
+        )
+        .await?
+        .expect("first WFT should be published");
+
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            token: first_task.token,
+            identity: WorkerIdentity("worker-a".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky_ttl: None,
+            commands: vec![WorkflowCommand::FailWorkflow {
+                failure: retryable_app_failure("FatalError"),
+            }],
+            force_new_workflow_task: false,
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    let history = store.read_history(predecessor.run_key, 0, 16).await?;
+    let outcome = history
+        .iter()
+        .find_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionFailed {
+                new_execution_run_id,
+                retry_state,
+                ..
+            } => Some((retry_state.clone(), *new_execution_run_id)),
+            _ => None,
+        })
+        .expect("failed event should be present");
+    assert_eq!(
+        outcome,
+        (tokeira_kernel::RetryState::NonRetryableFailure, None)
+    );
+
+    Ok(())
+}
+
+/// Encode a retryable application `Failure` payload (an `ApplicationFailureInfo`
+/// of the given type, not flagged non-retryable) for a FailWorkflow command.
+fn retryable_app_failure(error_type: &str) -> Payload {
+    use prost::Message as _;
+    use tokeira_proto::failure::{ApplicationFailureInfo, Failure, failure::FailureInfo};
+    let failure = Failure {
+        message: "boom".to_string(),
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: error_type.to_string(),
+                non_retryable: false,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    Payload::new(failure.encode_to_vec())
+}
+
 fn applied_state(result: &CommitResult) -> tokeira_kernel::WorkflowState {
     match result {
         CommitResult::Applied { new_state } => new_state.clone(),

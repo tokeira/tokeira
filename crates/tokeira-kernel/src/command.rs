@@ -65,6 +65,18 @@ pub enum Command {
         /// Runtime-computed cron successor metadata.
         cron_continuation: CronContinuation,
     },
+    /// A worker completed a workflow task whose terminal `FailWorkflow` command
+    /// triggers a retry-policy continuation. The runtime evaluated the retry
+    /// decision (`service/history/workflow/retry.go @ v1.31.0`) and supplies the
+    /// outcome; the kernel only records it. Mutually exclusive with
+    /// `WorkflowTaskCompletedWithCron` per completion — the runtime selects at
+    /// most one (retry is evaluated before cron).
+    WorkflowTaskCompletedWithRetry {
+        /// Normal workflow-task completion request.
+        request: WorkflowTaskCompletedRequest,
+        /// Runtime-computed retry decision for the failing run.
+        retry_continuation: RetryContinuation,
+    },
     /// A workflow task failed (non-determinism, bad commands).
     WorkflowTaskFailed(WorkflowTaskFailedRequest),
     /// `RespondWorkflowTaskFailed(GRPC_MESSAGE_TOO_LARGE)`: force-close the
@@ -714,6 +726,36 @@ pub struct CronContinuation {
     pub input: Payloads,
     /// Client-authored cron expression preserved on the successor start event.
     pub cron_schedule: String,
+}
+
+/// Runtime-supplied workflow retry decision for a failing run.
+///
+/// The retry *evaluation* — non-retryable error-type match, maximum attempts,
+/// execution-expiration cap, and backoff magnitude — is wall-clock- and
+/// policy-dependent and stays in the runtime (`service/history/workflow/retry.go`
+/// @ v1.31.0), mirroring how [`CronContinuation`] keeps calendar math out of the
+/// kernel. The kernel only records the outcome on `WorkflowExecutionFailed`:
+/// either the successor run id (retry continues) or the terminal `RetryState`.
+///
+/// The first-workflow-task backoff is deliberately absent. Unlike cron's
+/// calendar delay, the retry backoff is a pure function of the policy and the
+/// predecessor attempt (`initial × coefficient^(attempt-1)`, capped by
+/// `maximum_interval`); the runtime recomputes it deterministically when it
+/// starts the successor, so it need not be threaded through the kernel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RetryContinuation {
+    /// The retry policy continues the chain. `new_run_id` is authored into the
+    /// failed run's `new_execution_run_id` and becomes the successor run.
+    Retry {
+        /// Run ID minted by the runtime for the attempt-N+1 successor.
+        new_run_id: RunId,
+    },
+    /// The chain ends. `retry_state` is the reason the run will not retry
+    /// (`MaximumAttemptsReached`, `NonRetryableFailure`, or `RetryPolicyNotSet`).
+    Terminal {
+        /// Terminal retry outcome recorded on the failed event.
+        retry_state: RetryState,
+    },
 }
 
 /// Request from a worker that has finished processing a

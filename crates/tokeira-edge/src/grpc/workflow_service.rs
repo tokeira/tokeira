@@ -1134,7 +1134,19 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .get_workflow_execution_history(&headers, edge_req)
             .await?;
         let num_events = edge_resp.history.len();
-        let resp = translate::get_history_response_to_proto(edge_resp, filter_type);
+        // `ClientSupportsFeature(FeatureFollowsNextRunID)` is purely header-driven:
+        // the comma-delimited `supported-features` metadata must contain
+        // "follows-next-run-id" (`version_checker.go:152` + headers.go:17 @ v1.31.0).
+        // Legacy clients lacking it get the FixFollowEvents close-event rewrite.
+        let client_follows_next_run_id = headers
+            .get("supported-features")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|features| features.split(',').any(|f| f == "follows-next-run-id"));
+        let resp = translate::get_history_response_to_proto(
+            edge_resp,
+            filter_type,
+            client_follows_next_run_id,
+        );
         let filtered_events = resp.history.as_ref().map(|h| h.events.len()).unwrap_or(0);
         debug!(
             num_events,

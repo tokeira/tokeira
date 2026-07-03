@@ -1737,20 +1737,29 @@ mod tests {
 
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         assert_eq!(
-            evaluate_activity_retry(&policy, 1, None, now, None),
+            evaluate_activity_retry(&policy, 1, None, false, now, None),
             RetryDecision::Retry {
                 next_attempt: 2,
                 backoff: Duration::seconds(1),
             }
         );
         assert_eq!(
-            evaluate_activity_retry(&policy, 3, None, now, None),
+            evaluate_activity_retry(&policy, 3, None, false, now, None),
             RetryDecision::Exhausted {
                 reason: crate::retry::RetryExhaustedReason::MaximumAttemptsReached,
             }
         );
         assert_eq!(
-            evaluate_activity_retry(&policy, 1, Some("fatal"), now, None),
+            evaluate_activity_retry(&policy, 1, Some("fatal"), false, now, None),
+            RetryDecision::Exhausted {
+                reason: crate::retry::RetryExhaustedReason::NonRetryableFailure,
+            }
+        );
+        // A worker-flagged non-retryable failure stops retries even when its
+        // type is not in the policy's list (`isRetryable` checks the flag
+        // before the list, retry.go:139-147 @ v1.31.0).
+        assert_eq!(
+            evaluate_activity_retry(&policy, 1, None, true, now, None),
             RetryDecision::Exhausted {
                 reason: crate::retry::RetryExhaustedReason::NonRetryableFailure,
             }
@@ -1762,6 +1771,7 @@ mod tests {
                 &policy,
                 1,
                 None,
+                false,
                 now,
                 Some(now + Duration::milliseconds(500))
             ),

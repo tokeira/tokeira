@@ -1668,6 +1668,26 @@ where
                             started_at: activity.started_at,
                             last_failure: activity.last_failure.clone(),
                             heartbeat_details: activity.heartbeat_details.clone(),
+                            last_worker_identity: {
+                                // `LastWorkerIdentity = StartedIdentity`, falling
+                                // back to `RetryLastWorkerIdentity` when empty and
+                                // a retry policy exists (`GetPendingActivityInfo`,
+                                // workflow/activity.go:159-166 @ v1.31.0).
+                                let started = activity
+                                    .started_identity
+                                    .clone()
+                                    .map(|identity| identity.0)
+                                    .unwrap_or_default();
+                                if started.is_empty() && activity.retry_policy.is_some() {
+                                    activity
+                                        .retry_last_worker_identity
+                                        .clone()
+                                        .map(|identity| identity.0)
+                                        .unwrap_or_default()
+                                } else {
+                                    started
+                                }
+                            },
                             paused: activity.pause_info.is_some(),
                             pause_info: activity.pause_info.as_ref().map(|info| {
                                 tokeira_edge::translate::PauseInfoDescription {

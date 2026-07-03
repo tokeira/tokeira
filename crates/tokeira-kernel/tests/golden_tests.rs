@@ -625,6 +625,8 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
     state.activities.insert(
         id.into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: id.into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 7,
@@ -657,6 +659,8 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
     state.activities.insert(
         id.into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: id.into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 7,
@@ -1346,6 +1350,8 @@ fn terminate_with_activities_and_timers() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 6,
@@ -1514,6 +1520,8 @@ fn reset_cleans_up_activities_and_timers() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 6,
@@ -1671,6 +1679,8 @@ fn pause_workflow_happy_path() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 8,
@@ -1799,6 +1809,8 @@ fn unpause_workflow_happy_path() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 8,
@@ -2810,6 +2822,8 @@ fn workflow_execution_timed_out_with_entities() {
     state.activities.insert(
         "activity-2".into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 6,
@@ -3572,6 +3586,8 @@ fn reject_duplicate_activity_id() {
     with_activity.activities.insert(
         "dup".into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: "dup".into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 1,
@@ -4328,6 +4344,8 @@ fn with_pending_activity_started_wft() -> WorkflowState {
     state.activities.insert(
         "activity-1".into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: "activity-1".into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 7,

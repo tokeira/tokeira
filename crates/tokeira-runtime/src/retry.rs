@@ -43,9 +43,19 @@ pub fn evaluate_activity_retry(
     policy: &RetryPolicy,
     current_attempt: u32,
     failure_error_type: Option<&str>,
+    failure_non_retryable: bool,
     now: time::OffsetDateTime,
     expiration: Option<time::OffsetDateTime>,
 ) -> RetryDecision {
+    // A worker-flagged non-retryable failure never retries, regardless of the
+    // policy's non-retryable list (`isRetryable` checks
+    // `ApplicationFailureInfo.NonRetryable` before the type list,
+    // retry.go:139-147 @ v1.31.0).
+    if failure_non_retryable {
+        return RetryDecision::Exhausted {
+            reason: RetryExhaustedReason::NonRetryableFailure,
+        };
+    }
     if let Some(error_type) = failure_error_type
         && policy
             .non_retryable_error_types

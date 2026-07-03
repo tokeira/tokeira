@@ -233,6 +233,8 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
     state.activities.insert(
         activity_id.into(),
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: activity_id.into(),
             activity_type: "activity-type".into(),
             schedule_event_id: state.last_event_id - 2,
@@ -2790,6 +2792,8 @@ proptest! {
         state.activities.insert(
             "activity-2".into(),
             ActivityState {
+                started_identity: None,
+                retry_last_worker_identity: None,
                 activity_id: "activity-2".into(),
                 activity_type: "activity-type".into(),
                 schedule_event_id: 11,
@@ -2989,6 +2993,8 @@ proptest! {
         state.activities.insert(
             "activity-2".into(),
             ActivityState {
+                started_identity: None,
+                retry_last_worker_identity: None,
                 activity_id: "activity-2".into(),
                 activity_type: "activity-type".into(),
                 schedule_event_id: 11,

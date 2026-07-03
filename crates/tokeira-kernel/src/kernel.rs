@@ -1678,7 +1678,7 @@ impl BasicKernel {
             activity_id: activity_id.to_string(),
             scheduled_event_id: activity.schedule_event_id,
             attempt: activity.attempt,
-            identity,
+            identity: identity.clone(),
             request_id: format!("activity-start-{}-{}", activity_id, activity.attempt),
             last_failure: activity.last_failure.clone(),
         });
@@ -1686,6 +1686,9 @@ impl BasicKernel {
         if let Some(act) = builder.state.activities.get_mut(activity_id) {
             act.started_event_id = Some(started_event_id);
             act.started_at = Some(now);
+            // `ai.StartedIdentity` (kernel raise K3) — Describe's primary
+            // `LastWorkerIdentity` source (workflow/activity.go:159 @ v1.31.0).
+            act.started_identity = Some(identity);
         }
 
         Ok(builder.finish())
@@ -2728,6 +2731,8 @@ impl BasicKernel {
                 state.activities.insert(
                     activity_id.clone(),
                     ActivityState {
+                        started_identity: None,
+                        retry_last_worker_identity: None,
                         activity_id: activity_id.clone(),
                         activity_type: activity_type.clone(),
                         schedule_event_id: event.event_id,
@@ -3161,6 +3166,8 @@ fn apply_workflow_command(
             });
 
             let activity = ActivityState {
+                started_identity: None,
+                retry_last_worker_identity: None,
                 activity_id: activity_id.clone(),
                 activity_type,
                 schedule_event_id,

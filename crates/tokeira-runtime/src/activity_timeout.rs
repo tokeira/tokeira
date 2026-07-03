@@ -398,6 +398,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                 policy,
                 activity.attempt,
                 Some(&error_type),
+                false,
                 now,
                 expiration,
             ) {
@@ -666,6 +667,8 @@ mod tests {
 
     fn sample_activity() -> ActivityState {
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: "a".into(),
             activity_type: "activity-type".into(),
             schedule_event_id: 1,

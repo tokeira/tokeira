@@ -3114,6 +3114,7 @@ fn pending_activity_to_proto(
         // Present only once a heartbeat has been recorded
         // (`GetPendingActivityInfo`, activity.go:147-150 @ v1.31.0).
         heartbeat_details: act.heartbeat_details.as_ref().map(payloads_from_domain),
+        last_worker_identity: act.last_worker_identity.clone(),
         paused: act.paused,
         pause_info: act.pause_info.as_ref().map(|info| {
             workflow::pending_activity_info::PauseInfo {

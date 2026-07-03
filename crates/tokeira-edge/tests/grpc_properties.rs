@@ -995,6 +995,7 @@ fn arb_pending_activity() -> impl Strategy<Value = PendingActivityDescription> {
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
                 last_failure: None,
                 heartbeat_details: None,
+                last_worker_identity: String::new(),
                 paused: false,
                 pause_info: None,
             },

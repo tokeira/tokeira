@@ -145,6 +145,7 @@ impl StoreExecutionResolver {
                             started_at: activity.started_at,
                             last_failure: activity.last_failure.clone(),
                             heartbeat_details: activity.heartbeat_details.clone(),
+                            last_worker_identity: String::new(),
                             paused: activity.pause_info.is_some(),
                             pause_info: activity.pause_info.as_ref().map(|info| {
                                 tokeira_edge::translate::PauseInfoDescription {

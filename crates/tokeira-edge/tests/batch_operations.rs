@@ -175,6 +175,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         &self,
         _token: ActivityTaskToken,
         _details: Option<Payloads>,
+        _identity: Option<tokeira_types::WorkerIdentity>,
     ) -> Result<bool> {
         unreachable!()
     }

@@ -379,6 +379,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         &self,
         token: ActivityTaskToken,
         details: Option<Payloads>,
+        identity: Option<tokeira_types::WorkerIdentity>,
     ) -> Result<bool>;
 
     async fn resolve_activity_token(
@@ -4112,7 +4113,11 @@ impl WorkflowService {
 
                 let cancel_requested = self
                     .runtime
-                    .record_activity_heartbeat(req.token, req.details)
+                    .record_activity_heartbeat(
+                        req.token,
+                        req.details,
+                        worker_identity_from_request(req.identity),
+                    )
                     .await
                     .map_err(EdgeError::from)?;
 
@@ -4202,7 +4207,11 @@ impl WorkflowService {
                 };
                 let cancel_requested = self
                     .runtime
-                    .record_activity_heartbeat(token, req.details)
+                    .record_activity_heartbeat(
+                        token,
+                        req.details,
+                        worker_identity_from_request(req.identity),
+                    )
                     .await
                     .map_err(EdgeError::from)?;
                 Ok(RecordActivityTaskHeartbeatByIdResponse { cancel_requested })

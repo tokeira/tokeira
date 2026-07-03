@@ -6,7 +6,7 @@ use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
     Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, StickyAffinity, TaskQueueName,
-    TransitionSeq, WorkflowId, WorkflowType,
+    TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 /// Durable state for an open or closed workflow run.
@@ -480,6 +480,20 @@ pub struct ActivityState {
     /// Failure from the previous attempt, surfaced on the next
     /// `ActivityTaskStarted` event when the activity retries.
     pub last_failure: Option<Payload>,
+    /// Identity of the worker that started the current attempt
+    /// (`ai.StartedIdentity` @ v1.31.0; kernel raise K3). NOT cleared on
+    /// retry — `UpdateActivityInfoForRetries` copies it into
+    /// `retry_last_worker_identity` and leaves it in place
+    /// (`workflow/activity.go:63-97 @ v1.31.0`); the next start overwrites.
+    #[serde(default)]
+    pub started_identity: Option<WorkerIdentity>,
+    /// Identity bookkeeping for Describe's `LastWorkerIdentity` fallback
+    /// (`ai.RetryLastWorkerIdentity` @ v1.31.0; kernel raise K3): written by
+    /// heartbeats carrying a non-empty identity
+    /// (`recordactivitytaskheartbeat/api.go:79-81`) and by retries from the
+    /// failing attempt's `started_identity`.
+    #[serde(default)]
+    pub retry_last_worker_identity: Option<WorkerIdentity>,
     /// Latest worker heartbeat progress for this activity.
     ///
     /// Temporal stores this on mutable activity info and returns it on the next

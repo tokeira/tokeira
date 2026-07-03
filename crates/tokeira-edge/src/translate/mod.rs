@@ -411,6 +411,11 @@ pub struct PendingActivityDescription {
     /// recorded heartbeat, `service/history/workflow/activity.go:147-150 @
     /// v1.31.0`).
     pub heartbeat_details: Option<Payloads>,
+    /// `LastWorkerIdentity`: the starting worker's identity, falling back —
+    /// only under a retry policy — to the retry bookkeeping identity written
+    /// by heartbeats/retries (`GetPendingActivityInfo`,
+    /// `workflow/activity.go:159-166 @ v1.31.0`). Empty = never reported.
+    pub last_worker_identity: String,
     pub paused: bool,
     pub pause_info: Option<PauseInfoDescription>,
 }

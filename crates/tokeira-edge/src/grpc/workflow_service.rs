@@ -3392,6 +3392,7 @@ mod tests {
             &self,
             _token: tokeira_types::ActivityTaskToken,
             _details: Option<tokeira_types::Payloads>,
+            _identity: Option<tokeira_types::WorkerIdentity>,
         ) -> Result<bool> {
             unreachable!()
         }
@@ -3559,6 +3560,7 @@ mod tests {
             &self,
             _token: tokeira_types::ActivityTaskToken,
             _details: Option<tokeira_types::Payloads>,
+            _identity: Option<tokeira_types::WorkerIdentity>,
         ) -> Result<bool> {
             unreachable!()
         }
@@ -3724,6 +3726,7 @@ mod tests {
             &self,
             _token: tokeira_types::ActivityTaskToken,
             _details: Option<tokeira_types::Payloads>,
+            _identity: Option<tokeira_types::WorkerIdentity>,
         ) -> Result<bool> {
             unreachable!()
         }

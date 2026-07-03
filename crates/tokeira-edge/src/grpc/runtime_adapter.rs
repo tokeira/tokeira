@@ -216,8 +216,11 @@ where
         &self,
         token: ActivityTaskToken,
         details: Option<Payloads>,
+        identity: Option<tokeira_types::WorkerIdentity>,
     ) -> Result<bool> {
-        self.runtime.record_activity_heartbeat(token, details).await
+        self.runtime
+            .record_activity_heartbeat(token, details, identity)
+            .await
     }
 
     async fn resolve_activity_token(

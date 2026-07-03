@@ -1644,6 +1644,8 @@ mod tests {
 
     fn sample_activity_state(seed: u64) -> ActivityState {
         ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: format!("activity-{seed}"),
             activity_type: "activity-type".to_owned(),
             schedule_event_id: i64::try_from(seed).unwrap(),

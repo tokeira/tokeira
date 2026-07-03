@@ -206,11 +206,8 @@ where
             evaluate_activity_retry(
                 policy,
                 activity.attempt,
-                if is_non_retryable {
-                    Some("__tokeira_non_retryable__")
-                } else {
-                    failure_error_type.as_deref()
-                },
+                failure_error_type.as_deref(),
+                is_non_retryable,
                 now,
                 expiration,
             )
@@ -329,6 +326,7 @@ where
         &self,
         token: ActivityTaskToken,
         details: Option<Payloads>,
+        identity: Option<WorkerIdentity>,
     ) -> Result<bool> {
         let mut attempts = 0u32;
         loop {
@@ -375,6 +373,13 @@ where
             next_state.transition_seq = state.transition_seq.next();
             let mut next_activity = current;
             next_activity.heartbeat_details = details.clone();
+            // A heartbeat carrying a non-empty identity updates the retry
+            // bookkeeping identity, Describe's `LastWorkerIdentity` fallback
+            // (`ai.RetryLastWorkerIdentity = req.HeartbeatRequest.Identity`,
+            // recordactivitytaskheartbeat/api.go:79-81 @ v1.31.0; K3).
+            if let Some(identity) = identity.clone().filter(|identity| !identity.0.is_empty()) {
+                next_activity.retry_last_worker_identity = Some(identity);
+            }
             next_state
                 .activities
                 .insert(token.activity_id.clone(), next_activity.clone());
@@ -540,6 +545,10 @@ where
             next_activity.stamp += 1;
             let now = OffsetDateTime::now_utc();
             next_activity.started_at = Some(now);
+            // The fabricated start carries the completing caller's identity
+            // (respondactivitytaskcompleted/api.go:96 @ v1.31.0; K3 makes it
+            // durable as `started_identity`).
+            next_activity.started_identity = Some(identity.clone());
             let started_event_id = next_state.last_event_id + 1;
             next_state.last_event_id = started_event_id;
             next_activity.started_event_id = Some(started_event_id);
@@ -663,7 +672,7 @@ where
         &self,
         task: &DispatchableActivityTask,
         entered_at: tokio::time::Instant,
-        _worker_identity: &WorkerIdentity,
+        worker_identity: &WorkerIdentity,
     ) -> Result<Option<StartedActivityTask>> {
         let mut attempts = 0u32;
         loop {
@@ -753,6 +762,11 @@ where
             next_activity.stamp += 1;
             let now = OffsetDateTime::now_utc();
             next_activity.started_at = Some(now);
+            // `ai.StartedIdentity` (kernel raise K3): the polling worker's
+            // identity, Describe's primary `LastWorkerIdentity` source
+            // (workflow/activity.go:159 @ v1.31.0). May be empty — v1.31.0
+            // stores it verbatim and Describe falls back on empty.
+            next_activity.started_identity = Some(worker_identity.clone());
 
             // Emit ActivityTaskStarted so the SDK's activity state machine
             // sees the required Scheduled → Started → Completed sequence.
@@ -771,7 +785,7 @@ where
                     activity_id: task.activity_id.clone(),
                     scheduled_event_id: current.schedule_event_id,
                     attempt: current.attempt,
-                    identity: _worker_identity.clone(),
+                    identity: worker_identity.clone(),
                     request_id: format!("activity-start-{}-{}", task.activity_id, current.attempt),
                     last_failure: current.last_failure.clone(),
                 },
@@ -1068,6 +1082,11 @@ where
         if let Some(failure) = failure.clone() {
             next_activity.last_failure = Some(failure);
         }
+        // `ai.RetryLastWorkerIdentity = ai.StartedIdentity` — the FAILING
+        // attempt's starter, not the request identity; `started_identity`
+        // itself is deliberately NOT cleared
+        // (`UpdateActivityInfoForRetries`, activity.go:81 @ v1.31.0).
+        next_activity.retry_last_worker_identity = next_activity.started_identity.clone();
         next_state
             .activities
             .insert(activity_id.to_string(), next_activity.clone());
@@ -1409,6 +1428,8 @@ mod tests {
         let scheduled_at = OffsetDateTime::now_utc();
         let started_at = scheduled_at + Duration::seconds(1);
         let activity = tokeira_kernel::ActivityState {
+            started_identity: None,
+            retry_last_worker_identity: None,
             activity_id: "activity-1".to_string(),
             activity_type: "activity-type".to_string(),
             schedule_event_id: 7,
@@ -1483,7 +1504,7 @@ mod tests {
         let details = payloads(b"checkpoint-1");
 
         let cancel_requested = runtime
-            .record_activity_heartbeat(token.clone(), Some(details.clone()))
+            .record_activity_heartbeat(token.clone(), Some(details.clone()), None)
             .await
             .expect("heartbeat should persist");
         assert!(!cancel_requested);

@@ -4880,6 +4880,14 @@ impl WorkflowService {
                     .await?;
                 let caller_last_event_id = decode_history_page_token(&req.next_page_token)
                     .map_err(EdgeError::BadRequest)?;
+                // Transient events go to every client except the CLI/UI
+                // (`ClientSupportsTranOrSpecEvents`, get_history_util.go:427 @ v1.31.0).
+                let client_supports_transient_events = !matches!(
+                    headers
+                        .get("client-name")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("temporal-cli") | Some("temporal-ui")
+                );
                 let limit = if req.maximum_page_size > 0 {
                     req.maximum_page_size
                 } else {
@@ -4927,8 +4935,24 @@ impl WorkflowService {
                             } else {
                                 Vec::new()
                             };
+                        let mut events: Vec<_> = filtered.into_iter().take(limit).collect();
+                        // Transient-suffix synthesis (spec transient-wft Req B.7): on the
+                        // FINAL page of an unfiltered read, append the transient (attempt>1)
+                        // pending task's unpersisted Scheduled(+Started) at their virtual
+                        // ids so a mid-retry reader sees the task Temporal would show
+                        // (`appendTransientTasks`, getworkflowexecutionhistory/api.go:32-116
+                        // @ v1.31.0). Gated off for CLI/UI clients
+                        // (`ClientSupportsTranOrSpecEvents`, get_history_util.go:427: every
+                        // client EXCEPT temporal-cli / temporal-ui receives them).
+                        if next_page_token.is_empty()
+                            && req.history_event_filter_type != 2
+                            && client_supports_transient_events
+                        {
+                            append_transient_suffix(&mut events, self.repo.as_ref(), run_key)
+                                .await?;
+                        }
                         return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
-                            history: filtered.into_iter().take(limit).collect(),
+                            history: events,
                             next_page_token,
                         });
                     }
@@ -5240,6 +5264,69 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::FailedPrecondition(_) => "failed_precondition",
         EdgeError::Internal(_) => "internal",
     }
+}
+
+/// Append the unpersisted transient-WFT suffix to a final-page history read
+/// (spec transient-wft Req B.7). A transient (attempt>1) pending task's
+/// Scheduled/Started events exist only virtually (`GetTransientWorkflowTaskInfo`
+/// mutable_state_impl.go:1189-1250 @ v1.31.0); mid-retry readers see them
+/// appended after the last persisted event, and they vanish once the retry
+/// chain materializes or the run closes. Synthesizes Scheduled always and
+/// Started only when the task is started, at ids last+1 / last+2.
+async fn append_transient_suffix(
+    events: &mut Vec<tokeira_kernel::HistoryEvent>,
+    repo: &dyn tokeira_storage::RunRepository,
+    run_key: tokeira_types::RunKey,
+) -> EdgeResult<()> {
+    let tokeira_kernel::LoadedRun::Existing(state) =
+        repo.load_run(run_key).await.map_err(EdgeError::from)?
+    else {
+        return Ok(());
+    };
+    if !state.is_open() {
+        return Ok(());
+    }
+    let Some(pending) = state.pending_workflow_task.as_ref() else {
+        return Ok(());
+    };
+    // Transient = attempt>1 with a virtual (unpersisted) scheduled id.
+    if pending.attempt <= 1 || pending.scheduled_event_id != state.last_event_id + 1 {
+        return Ok(());
+    }
+    // Only append when the read actually reached the end of persisted history.
+    if events.last().map(|event| event.event_id) != Some(state.last_event_id)
+        && !(events.is_empty() && state.last_event_id == 0)
+    {
+        return Ok(());
+    }
+    events.push(tokeira_kernel::HistoryEvent {
+        event_id: pending.scheduled_event_id,
+        happened_at: pending.scheduled_at,
+        kind: tokeira_kernel::HistoryEventKind::WorkflowTaskScheduled {
+            logical_seq: pending.logical_seq,
+            task_queue: state.task_queue.clone(),
+            workflow_task_timeout: state.workflow_task_timeout,
+            attempt: pending.attempt,
+        },
+    });
+    if let (Some(started_event_id), Some(started_at)) =
+        (pending.started_event_id, pending.started_at)
+    {
+        events.push(tokeira_kernel::HistoryEvent {
+            event_id: started_event_id,
+            happened_at: started_at,
+            kind: tokeira_kernel::HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: pending.scheduled_event_id,
+                attempt: pending.attempt,
+                identity: tokeira_types::WorkerIdentity(String::new()),
+                request_id: format!("transient-{}-{}", pending.logical_seq.0, pending.attempt),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
+            },
+        });
+    }
+    Ok(())
 }
 
 fn decode_history_page_token(token: &[u8]) -> std::result::Result<i64, String> {

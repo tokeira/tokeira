@@ -4,6 +4,15 @@
 
 This feature adds two new kernel commands — `WorkflowTaskFailed` and `WorkflowTaskTimedOut` — to the `tokeira-kernel` crate. Both commands handle WFT recovery: they require an open run with a started pending WFT, emit one history event, clear `started_event_id` (reverting the WFT to scheduled-but-not-started), and re-dispatch the WFT for retry.
 
+> **AMENDED by `transient-wft` (Req 0 accepted 2026-07-03):** the per-attempt-event model described
+> here is superseded. Only the **attempt-1** failure/timeout persists its history event; the retry is
+> *transient* — its scheduled id is the virtual next-event id, no `WorkflowTaskScheduled`/`Started`
+> events persist for attempt>1, fail/timeout/force-close of a transient task writes nothing, and the
+> chain materializes real Scheduled+Started only on successful completion. A non-empty buffered-event
+> flush at the failed/timed-out close converts the retry back to a NORMAL attempt-1 task with a real
+> fresh `WorkflowTaskScheduled` (`workflow_task_state_machine.go:329-338, 376-379 @ v1.31.0`). See
+> `.kiro/specs/transient-wft/` and `docs/architecture/020-kernel.md` ("Transient workflow tasks").
+
 The key behavioral difference: `WorkflowTaskTimedOut` clears `StickyAffinity` (the worker is presumed dead), while `WorkflowTaskFailed` preserves it (the worker is still reachable, the task just produced bad output).
 
 Neither command is terminal for the workflow. Both are internal runtime machinery and carry no request dedup.

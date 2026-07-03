@@ -1381,24 +1381,58 @@ impl BasicKernel {
 
         let mut builder = TransitionBuilder::new(state, req.now);
         let attempt = pending.attempt.max(1);
-        let started_event_id = builder.emit(HistoryEventKind::WorkflowTaskStarted {
-            logical_seq: pending.logical_seq,
-            scheduled_event_id: pending.scheduled_event_id,
-            attempt,
-            identity: req.worker_identity.clone(),
-            request_id: req.request_id,
-            history_size_bytes: req.history_size_bytes,
-            suggest_continue_as_new: req.suggest_continue_as_new,
-        });
+        // Transient (attempt>1) start persists no WorkflowTaskStarted event: the started
+        // id is virtual (scheduled_event_id + 1) and last_event_id is unchanged
+        // (workflow_task_state_machine.go:480 @ v1.31.0). Conversion (rule ii): if new
+        // events landed after the virtual scheduling — the virtual scheduled id no longer
+        // equals last_event_id + 1 — convert back to a NORMAL attempt-1 task with real
+        // Scheduled + Started, since the frozen virtual suffix is now invalid
+        // (workflow_task_state_machine.go:559-576 @ v1.31.0).
+        let transient = attempt > 1;
+        let new_events_since_schedule =
+            transient && pending.scheduled_event_id != builder.state.last_event_id + 1;
+        let (scheduled_event_id, started_event_id) = if transient && !new_events_since_schedule {
+            (pending.scheduled_event_id, pending.scheduled_event_id + 1)
+        } else if new_events_since_schedule {
+            builder.state.workflow_task_attempt = 1;
+            let scheduled = builder.emit(HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: pending.logical_seq,
+                task_queue: builder.state.task_queue.clone(),
+                workflow_task_timeout: builder.state.workflow_task_timeout,
+                attempt: 1,
+            });
+            let started = builder.emit(HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: scheduled,
+                attempt: 1,
+                identity: req.worker_identity.clone(),
+                request_id: req.request_id,
+                history_size_bytes: req.history_size_bytes,
+                suggest_continue_as_new: req.suggest_continue_as_new,
+            });
+            (scheduled, started)
+        } else {
+            let started = builder.emit(HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: pending.scheduled_event_id,
+                attempt,
+                identity: req.worker_identity.clone(),
+                request_id: req.request_id,
+                history_size_bytes: req.history_size_bytes,
+                suggest_continue_as_new: req.suggest_continue_as_new,
+            });
+            (pending.scheduled_event_id, started)
+        };
 
         let current = builder
             .state
             .pending_workflow_task
             .as_mut()
             .expect("validated pending workflow task must still exist");
+        current.scheduled_event_id = scheduled_event_id;
         current.started_event_id = Some(started_event_id);
         current.started_at = Some(req.now);
-        current.attempt = attempt;
+        current.attempt = builder.state.workflow_task_attempt;
 
         if let Some(ttl) = req.sticky_ttl {
             builder.state.sticky = Some(StickyAffinity {
@@ -1514,10 +1548,39 @@ impl BasicKernel {
         // the WFT was in progress (e.g., signals) and need a fresh WFT.
         let pre_completion_last_event_id = builder.state.last_event_id;
 
+        // Late materialization (Req B.6): a TRANSIENT (attempt>1) task's
+        // Scheduled/Started events were never persisted; the whole retry chain
+        // materializes exactly once — real WorkflowTaskScheduled +
+        // WorkflowTaskStarted immediately before WorkflowTaskCompleted, with
+        // contiguous ids (workflow_task_state_machine.go:750-800 @ v1.31.0).
+        // With signals buffered during the started task the real ids equal the
+        // virtual ones; if other events advanced history, fresh real ids are
+        // assigned (v1.31.0 re-wires ids the same way at flush).
+        let (scheduled_event_id, started_event_id) = if pending.attempt > 1 {
+            let scheduled = builder.emit(HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: pending.logical_seq,
+                task_queue: builder.state.task_queue.clone(),
+                workflow_task_timeout: builder.state.workflow_task_timeout,
+                attempt: pending.attempt,
+            });
+            let started = builder.emit(HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: scheduled,
+                attempt: pending.attempt,
+                identity: req.identity.clone(),
+                request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
+            });
+            (scheduled, started)
+        } else {
+            (pending.scheduled_event_id, started_event_id)
+        };
+
         let wft_completed_event_id = builder.emit(HistoryEventKind::WorkflowTaskCompleted {
             logical_seq: req.token.logical_seq,
-            scheduled_event_id: pending.scheduled_event_id,
-            started_event_id: req.token.started_event_id,
+            scheduled_event_id,
+            started_event_id,
             identity: req.identity.clone(),
             sdk_metadata: req.sdk_metadata,
             metering_metadata: req.metering_metadata,
@@ -1526,7 +1589,7 @@ impl BasicKernel {
             deployment_version: req.deployment_version.clone(),
             worker_deployment_name: req.worker_deployment_name.clone(),
         });
-        builder.state.previous_started_event_id = req.token.started_event_id;
+        builder.state.previous_started_event_id = started_event_id;
         builder.state.workflow_task_attempt = 1;
         builder.state.pending_workflow_task = None;
         builder.state.apply_wft_versioning(
@@ -2197,48 +2260,82 @@ impl BasicKernel {
         }
 
         let mut builder = TransitionBuilder::new(state, req.now);
-        builder.emit(HistoryEventKind::WorkflowTaskFailed {
-            logical_seq: pending.logical_seq,
-            scheduled_event_id: pending.scheduled_event_id,
-            started_event_id,
-            failure_cause: req.failure_cause,
-            failure_details: req.failure_details,
-            identity: req.worker_identity,
-            base_run_id: None,
-            new_run_id: None,
-            fork_event_version: None,
-            fork_event_id: None,
-        });
+        // Only the attempt-1 failure persists a WorkflowTaskFailed event; a
+        // transient (attempt>1) failure writes nothing — the retry chain lives
+        // off-history ("Only emit WorkflowTaskFailedEvent if workflow task is
+        // not transient", workflow_task_state_machine.go:892-895 @ v1.31.0;
+        // spec transient-wft Req B.3).
+        if pending.attempt == 1 {
+            builder.emit(HistoryEventKind::WorkflowTaskFailed {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: pending.scheduled_event_id,
+                started_event_id,
+                failure_cause: req.failure_cause,
+                failure_details: req.failure_details,
+                identity: req.worker_identity,
+                base_run_id: None,
+                new_run_id: None,
+                fork_event_version: None,
+                fork_event_id: None,
+            });
+        }
         // Buffered events flush immediately after the WFT-failed event, before
         // the retry re-dispatch (`failWorkflowTask` fails then flushes,
         // `service/history/workflow/util.go:26 @ v1.31.0`).
-        builder.flush_buffered();
-        let sticky_preferred = builder
-            .state
-            .sticky
-            .as_ref()
-            .map(|sticky| sticky.worker_identity.clone());
-        let current = builder
-            .state
-            .pending_workflow_task
-            .as_mut()
-            .expect("validated pending workflow task must still exist");
-        current.started_event_id = None;
-        current.started_at = None;
-        builder.state.workflow_task_attempt += 1;
-        current.attempt = builder.state.workflow_task_attempt;
-        if builder.state.status != ExecutionStatus::Paused {
-            builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
-                queue: QueueKey {
-                    namespace_id: builder.state.namespace_id,
-                    task_queue: builder.state.task_queue.clone(),
-                    task_kind: tokeira_types::TaskKind::Workflow,
-                    deployment: builder.state.deployment.clone(),
-                    build_id: builder.state.build_id.clone(),
-                },
-                logical_seq: pending.logical_seq,
-                sticky_preferred,
-            });
+        let flushed = builder.flush_buffered();
+        let paused = builder.state.status == ExecutionStatus::Paused;
+        if flushed > 0 && !paused {
+            // Events buffered during the WFT invalidate any continuously-failing
+            // (transient) suffix: v1.31.0 resets the next task to a NORMAL,
+            // attempt-1 task with a REAL WorkflowTaskScheduled — the flushed events
+            // must be delivered on a fresh, persisted task, not re-dispatched onto
+            // the failed one (`workflow_task_state_machine.go:329-334 @ v1.31.0`;
+            // spec transient-wft Req A.1, generalized by B.4 rule (i)).
+            // `schedule_workflow_task` reads `workflow_task_attempt` for the emitted
+            // event, so reset it to 1 first.
+            builder.state.workflow_task_attempt = 1;
+            builder.state.pending_workflow_task = None;
+            builder.schedule_workflow_task();
+        } else {
+            // No new events (or paused): keep the failed task alive for a retry with
+            // the same `logical_seq` and no new WorkflowTaskScheduled event. Phase B
+            // refines this attempt>1 branch to virtual ids + event suppression.
+            let sticky_preferred = builder
+                .state
+                .sticky
+                .as_ref()
+                .map(|sticky| sticky.worker_identity.clone());
+            let virtual_scheduled_event_id = builder.state.last_event_id + 1;
+            let current = builder
+                .state
+                .pending_workflow_task
+                .as_mut()
+                .expect("validated pending workflow task must still exist");
+            current.started_event_id = None;
+            current.started_at = None;
+            builder.state.workflow_task_attempt += 1;
+            current.attempt = builder.state.workflow_task_attempt;
+            // The retry is transient: its Scheduled event is never persisted, so
+            // its scheduled id becomes the VIRTUAL next-event id. This is what
+            // lets `apply_workflow_task_started`'s transient branch fire (and its
+            // conversion rule detect genuinely-new events) — keeping the stale
+            // attempt-1 real id would misread every retry as "new events landed"
+            // (`scheduledEventID = m.ms.GetNextEventID()`,
+            // workflow_task_state_machine.go:376-379 @ v1.31.0; Req B.1/B.3).
+            current.scheduled_event_id = virtual_scheduled_event_id;
+            if !paused {
+                builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+                    queue: QueueKey {
+                        namespace_id: builder.state.namespace_id,
+                        task_queue: builder.state.task_queue.clone(),
+                        task_kind: tokeira_types::TaskKind::Workflow,
+                        deployment: builder.state.deployment.clone(),
+                        build_id: builder.state.build_id.clone(),
+                    },
+                    logical_seq: pending.logical_seq,
+                    sticky_preferred,
+                });
+            }
         }
         Ok(builder.finish())
     }
@@ -2272,18 +2369,29 @@ impl BasicKernel {
         }
 
         let mut builder = TransitionBuilder::new(state, req.now);
-        builder.emit(HistoryEventKind::WorkflowTaskTimedOut {
-            logical_seq: pending.logical_seq,
-            scheduled_event_id: pending.scheduled_event_id,
-            started_event_id,
-            timeout_type: req.timeout_type,
-        });
+        // Only the attempt-1 timeout persists a WorkflowTaskTimedOut event; a
+        // transient (attempt>1) timeout writes nothing
+        // (workflow_task_state_machine.go:965-967 @ v1.31.0; Req B.3).
+        if pending.attempt == 1 {
+            builder.emit(HistoryEventKind::WorkflowTaskTimedOut {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: pending.scheduled_event_id,
+                started_event_id,
+                timeout_type: req.timeout_type,
+            });
+        }
         // WFT timeout is a close: buffered events flush after the timed-out
         // event and before the retry's fresh WorkflowTaskScheduled
         // (`AddWorkflowTaskScheduledEventAsHeartbeat` flushes first,
-        // workflow_task_state_machine.go @ v1.31.0).
-        builder.flush_buffered();
-        builder.state.workflow_task_attempt += 1;
+        // workflow_task_state_machine.go @ v1.31.0). As at WFT-failed close, a
+        // non-empty flush converts the retry back to a NORMAL attempt-1 task
+        // (rule (i), workflow_task_state_machine.go:329-338; Req B.4).
+        let flushed = builder.flush_buffered();
+        if flushed > 0 {
+            builder.state.workflow_task_attempt = 1;
+        } else {
+            builder.state.workflow_task_attempt += 1;
+        }
         builder.state.sticky = None;
         if builder.state.status == ExecutionStatus::Paused {
             // Paused workflows retain the pending task (cleared of started
@@ -3819,6 +3927,15 @@ impl TransitionBuilder {
         let Some(started_event_id) = pending.started_event_id else {
             return;
         };
+        // Force-closing a TRANSIENT (attempt>1) task writes nothing — its
+        // Scheduled/Started were never persisted, so there is no event to fail
+        // ("Failing transient WT doesn't create any events at all and
+        // wtFailedEvent is nil", workflow/util.go:118-120 @ v1.31.0; Req B.5).
+        // The close batch's first event is then the terminal event itself.
+        if pending.attempt > 1 {
+            self.state.pending_workflow_task = None;
+            return;
+        }
         self.emit(HistoryEventKind::WorkflowTaskFailed {
             logical_seq: pending.logical_seq,
             scheduled_event_id: pending.scheduled_event_id,
@@ -3872,12 +3989,26 @@ impl TransitionBuilder {
         }
         let logical_seq = self.state.next_workflow_task_seq;
         self.state.next_workflow_task_seq = logical_seq.next();
-        let scheduled_event_id = self.emit(HistoryEventKind::WorkflowTaskScheduled {
-            logical_seq,
-            task_queue: self.state.task_queue.clone(),
-            workflow_task_timeout: self.state.workflow_task_timeout,
-            attempt: self.state.workflow_task_attempt,
-        });
+        // A continuously-failing workflow task (attempt > 1) is *transient*: v1.31.0
+        // does not persist its WorkflowTaskScheduled event. The scheduled id is the
+        // virtual next-event id (last_event_id + 1) and `last_event_id` is NOT
+        // advanced; the event materializes only if the task later succeeds (see
+        // apply_workflow_task_completed) or is converted back to normal at start time
+        // when new events arrived (`IsTransientWorkflowTask`, mutable_state_impl.go:2250;
+        // `createWorkflowTaskScheduledEvent = !IsTransientWorkflowTask()`,
+        // workflow_task_state_machine.go:326,368-379 @ v1.31.0). Buffered events at
+        // scheduling reset to a normal attempt-1 task before reaching here (the
+        // flush-reset branch in apply_workflow_task_failed / _timed_out).
+        let scheduled_event_id = if self.state.workflow_task_attempt > 1 {
+            self.state.last_event_id + 1
+        } else {
+            self.emit(HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq,
+                task_queue: self.state.task_queue.clone(),
+                workflow_task_timeout: self.state.workflow_task_timeout,
+                attempt: self.state.workflow_task_attempt,
+            })
+        };
         self.state.pending_workflow_task = Some(PendingWorkflowTask {
             logical_seq,
             scheduled_event_id,

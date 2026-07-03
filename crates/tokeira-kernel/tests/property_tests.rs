@@ -2345,8 +2345,13 @@ proptest! {
         ).unwrap();
         let failed_pending = failed_transition.next_state.pending_workflow_task.unwrap();
         prop_assert_eq!(failed_pending.logical_seq, LogicalTaskSeq(60));
-        prop_assert_eq!(failed_pending.scheduled_event_id, 13);
+        // The retry is TRANSIENT (spec transient-wft Req B.1/B.3): its scheduled
+        // id is the virtual next-event id (WorkflowTaskFailed landed as event 15
+        // -> virtual 16), not the original real Scheduled id
+        // (workflow_task_state_machine.go:376-379 @ v1.31.0).
+        prop_assert_eq!(failed_pending.scheduled_event_id, 16);
         prop_assert_eq!(failed_pending.started_event_id, None);
+        prop_assert_eq!(failed_pending.attempt, 2);
 
         let timed_out_transition = kernel().apply(
             LoadedRun::Existing(with_pending_wft(make_open_state(now), 61, Some(31), 1)),
@@ -2359,7 +2364,10 @@ proptest! {
         ).unwrap();
         let timed_out_pending = timed_out_transition.next_state.pending_workflow_task.unwrap();
         prop_assert_eq!(timed_out_pending.logical_seq, LogicalTaskSeq(62));
+        // Virtual scheduled id: TimedOut landed as event 15 and the transient
+        // reschedule persists nothing, so 16 is virtual (last_event_id stays 15).
         prop_assert_eq!(timed_out_pending.scheduled_event_id, 16);
+        prop_assert_eq!(timed_out_transition.next_state.last_event_id, 15);
         prop_assert_eq!(timed_out_pending.started_event_id, None);
     }
 
@@ -2403,10 +2411,12 @@ proptest! {
                 now,
             }),
         ).unwrap();
-        prop_assert_eq!(timed_out_transition.history_events.len(), 2);
+        // Transient model (spec transient-wft Req B.1/B.3): the attempt-1 timeout
+        // persists WorkflowTaskTimedOut only; the retry's Scheduled event is
+        // virtual (workflow_task_state_machine.go:376-379 @ v1.31.0).
+        prop_assert_eq!(timed_out_transition.history_events.len(), 1);
         prop_assert_eq!(timed_out_transition.dispatch_ops.len(), 1);
         prop_assert_eq!(matches!(timed_out_transition.history_events[0].kind, HistoryEventKind::WorkflowTaskTimedOut { .. }), true);
-        prop_assert_eq!(matches!(timed_out_transition.history_events[1].kind, HistoryEventKind::WorkflowTaskScheduled { .. }), true);
         prop_assert_eq!(matches!(timed_out_transition.dispatch_ops[0], DispatchOp::EnqueueWorkflowTask { logical_seq: LogicalTaskSeq(82), .. }), true);
         prop_assert!(timed_out_transition.request_dedupe_ops.is_empty());
         prop_assert!(timed_out_transition.activity_ops.is_empty());
@@ -5595,4 +5605,62 @@ fn workflow_execution_failed_new_run_id_round_trips() {
         .remove("new_execution_run_id");
     let decoded: HistoryEventKind = serde_json::from_value(value).unwrap();
     assert_eq!(decoded, event);
+}
+
+#[test]
+fn wft_failed_with_buffered_events_schedules_fresh_normal_task() {
+    // Feature: transient-wft, Property 1: a WFT that fails after events buffered
+    // during it flushes them and schedules a fresh NORMAL (attempt-1) task with a
+    // real WorkflowTaskScheduled — not a re-dispatch of the failed task
+    // (workflow_task_state_machine.go:329-334 @ v1.31.0).
+    let now = fixed_now();
+    let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+    let kernel = kernel();
+
+    // Buffer a signal while the WFT is started.
+    let buffered = kernel
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Signal(signal_request("sig", now)),
+        )
+        .unwrap()
+        .next_state;
+    assert_eq!(buffered.buffered_events.len(), 1);
+
+    // Fail the WFT — the buffered signal flushes and a fresh normal task schedules.
+    let transition = kernel
+        .apply(
+            LoadedRun::Existing(buffered),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: LogicalTaskSeq(30),
+                started_event_id: 13,
+                failure_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now,
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 3);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskFailed { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[2].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+    assert_eq!(transition.next_state.workflow_task_attempt, 1);
+    let pending = transition
+        .next_state
+        .pending_workflow_task
+        .expect("a fresh workflow task must be scheduled");
+    assert_eq!(pending.attempt, 1);
+    assert!(pending.started_event_id.is_none());
+    assert!(transition.next_state.buffered_events.is_empty());
 }

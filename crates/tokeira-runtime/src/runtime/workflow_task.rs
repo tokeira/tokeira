@@ -222,8 +222,9 @@ where
         new_state: &WorkflowState,
         reserved: ReservedPoller,
     ) -> Result<()> {
+        let worker_identity = reserved.worker_identity().clone();
         let task = self
-            .started_workflow_task_from_state(new_state, true)
+            .started_workflow_task_from_state(new_state, true, worker_identity)
             .await?;
         if !reserved.deliver(task) {
             tracing::warn!(
@@ -868,6 +869,8 @@ where
             is_sticky_match: offered.sticky_preferred.as_ref() == Some(&worker_identity),
             scheduled_time: pending.scheduled_at,
             started_time: pending.started_at.unwrap_or(now),
+            workflow_task_timeout: new_state.workflow_task_timeout,
+            worker_identity,
             token,
         })
     }
@@ -876,6 +879,7 @@ where
         &self,
         state: &WorkflowState,
         is_sticky_match: bool,
+        worker_identity: WorkerIdentity,
     ) -> Result<StartedWorkflowTask> {
         let pending = state
             .pending_workflow_task
@@ -912,6 +916,8 @@ where
             is_sticky_match,
             scheduled_time: pending.scheduled_at,
             started_time: started_at,
+            workflow_task_timeout: state.workflow_task_timeout,
+            worker_identity: worker_identity.clone(),
             token,
         })
     }

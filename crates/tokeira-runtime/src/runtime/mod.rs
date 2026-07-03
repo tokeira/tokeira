@@ -1178,6 +1178,11 @@ pub struct StartedWorkflowTask {
     pub scheduled_time: OffsetDateTime,
     /// Timestamp of the start event for this task.
     pub started_time: OffsetDateTime,
+    /// Run's workflow-task timeout, carried for transient-suffix synthesis
+    /// (the synthesized `WorkflowTaskScheduled` needs it; nothing persisted).
+    pub workflow_task_timeout: time::Duration,
+    /// Identity of the polling worker (transient `WorkflowTaskStarted` synthesis).
+    pub worker_identity: tokeira_types::WorkerIdentity,
     /// Opaque token used to complete the task.
     pub token: WorkflowTaskToken,
 }

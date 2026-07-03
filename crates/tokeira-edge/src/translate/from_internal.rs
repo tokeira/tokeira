@@ -41,9 +41,46 @@ pub async fn poll_response(
     repo: &dyn RunRepository,
 ) -> Result<PollWorkflowTaskQueueResponse> {
     let after_event_id = workflow_task_history_after_event_id(&started);
-    let history = repo
+    let mut history = repo
         .read_history(started.run_key, after_event_id, usize::MAX)
         .await?;
+    // Transient-suffix synthesis (spec transient-wft Req B.7): a transient
+    // (attempt>1) task's Scheduled/Started events are never persisted — the
+    // poll response synthesizes them at the virtual ids so the worker's
+    // history matches the task token it must respond with
+    // (`GetTransientWorkflowTaskInfo`, mutable_state_impl.go:1189-1250;
+    // `response.TransientWorkflowTask`, recordworkflowtaskstarted/api.go:430
+    // @ v1.31.0). Nothing is persisted; ids continue past the last real event.
+    let last_persisted = history.last().map(|event| event.event_id).unwrap_or(0);
+    if started.token.attempt > 1 && started.token.started_event_id > last_persisted {
+        let scheduled_event_id = started.token.started_event_id - 1;
+        history.push(tokeira_kernel::HistoryEvent {
+            event_id: scheduled_event_id,
+            happened_at: started.scheduled_time,
+            kind: tokeira_kernel::HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: started.token.logical_seq,
+                task_queue: started.task_queue.clone(),
+                workflow_task_timeout: started.workflow_task_timeout,
+                attempt: started.token.attempt,
+            },
+        });
+        history.push(tokeira_kernel::HistoryEvent {
+            event_id: started.token.started_event_id,
+            happened_at: started.started_time,
+            kind: tokeira_kernel::HistoryEventKind::WorkflowTaskStarted {
+                logical_seq: started.token.logical_seq,
+                scheduled_event_id,
+                attempt: started.token.attempt,
+                identity: started.worker_identity.clone(),
+                request_id: format!(
+                    "transient-{}-{}",
+                    started.token.logical_seq.0, started.token.attempt
+                ),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
+            },
+        });
+    }
     Ok(PollWorkflowTaskQueueResponse {
         task_token: serde_json::to_vec(&started.token)?,
         started_event_id: started.token.started_event_id,
@@ -231,6 +268,8 @@ mod tests {
             },
             run_key,
             run_id: tokeira_types::RunId(uuid::Uuid::nil()),
+            workflow_task_timeout: time::Duration::seconds(10),
+            worker_identity: tokeira_types::WorkerIdentity("worker".to_string()),
             workflow_id: WorkflowId("workflow".to_string()),
             task_queue: TaskQueueName("queue".to_string()),
             previous_started_event_id,

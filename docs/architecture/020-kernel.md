@@ -398,6 +398,16 @@ The kernel adopts Temporal's **buffered-event model** (spec: `kernel-event-buffe
 - **Forced closes** (`Terminate`, workflow timeout, and the `RespondWorkflowTaskFailed(GRPC_MESSAGE_TOO_LARGE)` route): a started WFT is failed first with cause `ForceCloseCommand`, buffered events flush, and only then is the terminal event appended (`TerminateWorkflow`/`TimeoutWorkflow`, `workflow/util.go:71,115 @ v1.31.0`).
 - **Close discards**: buffered events surviving to a worker-commanded close are dropped, matching v1.31.0 (`FlushBufferToCurrentBatch` workflowFinished branch, `event_store.go:139`). Closed runs always carry an empty buffer.
 
+### Transient workflow tasks
+
+A continuously-failing WFT (attempt > 1) is **transient** (spec `transient-wft`, superseding the Feature-2 per-attempt-event model; `IsTransientWorkflowTask`, `mutable_state_impl.go:2250 @ v1.31.0`): it lives only in `WorkflowState`, never in history, until it succeeds.
+
+- **Virtual ids:** the retry's `scheduled_event_id` is the virtual next-event id (`last_event_id + 1`, no event persisted; `workflow_task_state_machine.go:376-379`); its started id is `scheduled + 1` (also virtual). `last_event_id` is unchanged across every transient transition.
+- **Suppressed events:** only the attempt-1 failure/timeout persists `WorkflowTaskFailed`/`TimedOut` (`:892-895, :965-967`); a transient fail/timeout writes nothing. The terminate/timeout force-close of a transient task also writes nothing (`workflow/util.go:118-120`) — the close batch begins at the terminal event.
+- **Conversion to normal:** (i) a non-empty buffered flush at the failed/timed-out close resets attempt to 1 and persists a real fresh `WorkflowTaskScheduled` (`:329-338`); (ii) new events by start time (the virtual scheduled id no longer equals `last_event_id + 1`) reset attempt to 1 and persist real Scheduled + Started (`:559-576`).
+- **Late materialization:** a transient task that completes successfully materializes its real `WorkflowTaskScheduled` + `WorkflowTaskStarted` immediately before `WorkflowTaskCompleted`, contiguous (`:750-800`).
+- **Synthesis (runtime/edge, nothing persisted):** the poll response and final-page `GetWorkflowExecutionHistory` reads append the unpersisted virtual Scheduled(+Started) suffix so workers and readers see the task Temporal would show (`GetTransientWorkflowTaskInfo`, `mutable_state_impl.go:1189-1250`; `appendTransientTasks`, `getworkflowexecutionhistory/api.go:32-116`); CLI/UI clients are excluded (`ClientSupportsTranOrSpecEvents`, `get_history_util.go:427`).
+
 ### `Update`
 
 **Precondition:** Run must exist and be open.
@@ -500,7 +510,7 @@ This command is issued by the runtime when a workflow task fails due to non-dete
 
 **Events produced:** `WorkflowTaskFailed`.
 
-**Rationale:** WFT failure is not terminal for the workflow. The server retries the WFT, giving the worker another chance to replay and produce valid commands.
+**Rationale:** WFT failure is not terminal for the workflow. The server retries the WFT, giving the worker another chance to replay and produce valid commands. The retry is **transient** — see "Transient workflow tasks" above: the failed event only persists for attempt 1, and the retry carries virtual ids with no persisted scheduling events.
 
 ### `WorkflowTaskTimedOut`
 

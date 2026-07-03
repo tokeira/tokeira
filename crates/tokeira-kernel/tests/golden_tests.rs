@@ -3145,8 +3145,14 @@ fn wft_failed_with_started_wft() {
     ));
     let pending = transition.next_state.pending_workflow_task.unwrap();
     assert_eq!(pending.logical_seq, LogicalTaskSeq(3));
-    assert_eq!(pending.scheduled_event_id, 8);
+    // The retry is TRANSIENT (spec transient-wft Req B.1/B.3): its scheduled id
+    // becomes the virtual next-event id (WorkflowTaskFailed landed as event 10,
+    // so virtual = 11) and no WorkflowTaskScheduled event is persisted
+    // (workflow_task_state_machine.go:376-379 @ v1.31.0).
+    assert_eq!(pending.scheduled_event_id, 11);
     assert_eq!(pending.started_event_id, None);
+    assert_eq!(pending.attempt, 2);
+    assert_eq!(transition.next_state.last_event_id, 10);
     assert_eq!(transition.next_state.sticky, state.sticky);
     assert_eq!(transition.dispatch_ops.len(), 1);
     assert!(matches!(
@@ -3179,8 +3185,12 @@ fn wft_timed_out_with_started_wft() {
         )
         .unwrap();
 
-    // After timeout: WorkflowTaskTimedOut + fresh WorkflowTaskScheduled
-    assert_eq!(transition.history_events.len(), 2);
+    // After an attempt-1 timeout: WorkflowTaskTimedOut only — the retry is
+    // TRANSIENT (spec transient-wft Req B.1/B.3): no fresh WorkflowTaskScheduled
+    // is persisted; the reschedule carries the virtual next-event id
+    // (TimedOut landed as event 10 → virtual scheduled = 11;
+    // workflow_task_state_machine.go:376-379 @ v1.31.0).
+    assert_eq!(transition.history_events.len(), 1);
     assert!(matches!(
         &transition.history_events[0].kind,
         HistoryEventKind::WorkflowTaskTimedOut {
@@ -3194,13 +3204,11 @@ fn wft_timed_out_with_started_wft() {
             && *started_event_id == 9
             && *timeout_type == WorkflowTaskTimeoutType::StartToClose
     ));
-    assert!(matches!(
-        &transition.history_events[1].kind,
-        HistoryEventKind::WorkflowTaskScheduled { logical_seq, .. }
-        if *logical_seq == LogicalTaskSeq(4)
-    ));
     let pending = transition.next_state.pending_workflow_task.unwrap();
     assert_eq!(pending.logical_seq, LogicalTaskSeq(4));
+    assert_eq!(pending.scheduled_event_id, 11);
+    assert_eq!(pending.attempt, 2);
+    assert_eq!(transition.next_state.last_event_id, 10);
     assert_eq!(pending.started_event_id, None);
     assert!(transition.next_state.sticky.is_none());
     assert_eq!(transition.dispatch_ops.len(), 1);

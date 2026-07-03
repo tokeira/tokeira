@@ -32,11 +32,12 @@ use tokeira_kernel::{
 };
 use tokeira_observability::OutcomeLabel;
 use tokeira_proto::{
-    conversions::common::failure_to_payload, public::temporal::api::enums::v1 as enums_proto,
+    conversions::common::{failure_to_payload, payloads_from_domain},
+    public::temporal::api::enums::v1 as enums_proto,
     public::temporal::api::failure::v1 as failure_proto,
 };
 use tokeira_storage::RunRepository;
-use tokeira_types::{Payload, RunKey, ShardId};
+use tokeira_types::{Payload, Payloads, RunKey, ShardId};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -449,24 +450,6 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             }
         }
 
-        // Terminal: resolve as timed out. When retries were cut short because
-        // there is not enough time for another attempt before the
-        // schedule-to-close deadline, the type converts to ScheduleToClose —
-        // except a fired ScheduleToStart keeps its own type
-        // (`processSingleActivityTimeoutTask`,
-        // timer_queue_active_task_executor.go:307-316 @ v1.31.0).
-        let timeout_type = if matches!(exhausted_reason, Some(RetryExhaustedReason::Timeout))
-            && violation != TimeoutViolation::ScheduleToStart
-        {
-            "schedule_to_close".to_string()
-        } else {
-            match violation {
-                TimeoutViolation::ScheduleToClose => "schedule_to_close".to_string(),
-                TimeoutViolation::ScheduleToStart => "schedule_to_start".to_string(),
-                TimeoutViolation::StartToClose => "start_to_close".to_string(),
-                TimeoutViolation::Heartbeat => "heartbeat".to_string(),
-            }
-        };
         // Why retries stopped, mirroring `RetryActivity`'s derivation order
         // (mutable_state_impl.go:6243-6270 @ v1.31.0): no policy →
         // RETRY_POLICY_NOT_SET; a requested cancel → CANCEL_REQUESTED; the
@@ -489,6 +472,24 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                 None => RetryState::Timeout,
             }
         };
+        // Terminal: resolve as timed out. Whenever the retry state is TIMEOUT
+        // ("no time for another attempt") the failure AND type convert to
+        // ScheduleToClose — this covers both backoff exhaustion and a directly
+        // fired ScheduleToClose under a retry policy; a fired ScheduleToStart
+        // keeps its own type (`processSingleActivityTimeoutTask`,
+        // timer_queue_active_task_executor.go:307-316 @ v1.31.0).
+        let converted =
+            retry_state == RetryState::Timeout && violation != TimeoutViolation::ScheduleToStart;
+        let timeout_type = if converted {
+            "schedule_to_close".to_string()
+        } else {
+            match violation {
+                TimeoutViolation::ScheduleToClose => "schedule_to_close".to_string(),
+                TimeoutViolation::ScheduleToStart => "schedule_to_start".to_string(),
+                TimeoutViolation::StartToClose => "start_to_close".to_string(),
+                TimeoutViolation::Heartbeat => "heartbeat".to_string(),
+            }
+        };
         let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
         let result = lane
             .submit(
@@ -498,6 +499,11 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                     resolution: ActivityResolution::TimedOut {
                         timeout_type,
                         retry_state,
+                        failure: Some(terminal_timeout_failure(
+                            violation,
+                            converted,
+                            activity.heartbeat_details.as_ref(),
+                        )),
                     },
                     worker_identity: None,
                     now,
@@ -556,23 +562,64 @@ fn timeout_type_name(violation: TimeoutViolation) -> &'static str {
     }
 }
 
-/// The timeout failure recorded as retry bookkeeping for a timed-out attempt:
-/// message `"activity <Type> timeout"` (`common.FailureReasonActivityTimeout`,
-/// common/util.go:95 @ v1.31.0) wrapping a `TimeoutFailureInfo` of the fired
-/// type (`failure.NewTimeoutFailure`, common/failure/failure.go:36 @ v1.31.0).
-fn timeout_failure_payload(violation: TimeoutViolation) -> Payload {
-    let timeout_type = match violation {
+/// The wire `TimeoutType` for a fired violation.
+fn proto_timeout_type(violation: TimeoutViolation) -> enums_proto::TimeoutType {
+    match violation {
         TimeoutViolation::ScheduleToClose => enums_proto::TimeoutType::ScheduleToClose,
         TimeoutViolation::ScheduleToStart => enums_proto::TimeoutType::ScheduleToStart,
         TimeoutViolation::StartToClose => enums_proto::TimeoutType::StartToClose,
         TimeoutViolation::Heartbeat => enums_proto::TimeoutType::Heartbeat,
-    };
+    }
+}
+
+/// The timeout failure recorded as retry bookkeeping for a timed-out attempt:
+/// message `"activity <Type> timeout"` (`common.FailureReasonActivityTimeout`,
+/// common/util.go:95 @ v1.31.0) wrapping a `TimeoutFailureInfo` of the fired
+/// type (`failure.NewTimeoutFailure`, common/failure/failure.go:36 @ v1.31.0).
+/// No heartbeat details: v1.31.0 folds those onto the TERMINAL failure only
+/// (after the in-progress early return, timer_queue_active_task_executor.go:341).
+fn timeout_failure_payload(violation: TimeoutViolation) -> Payload {
     failure_to_payload(&failure_proto::Failure {
         message: format!("activity {} timeout", timeout_type_name(violation)),
         failure_info: Some(failure_proto::failure::FailureInfo::TimeoutFailureInfo(
             failure_proto::TimeoutFailureInfo {
-                timeout_type: timeout_type as i32,
+                timeout_type: proto_timeout_type(violation) as i32,
                 ..Default::default()
+            },
+        )),
+        ..Default::default()
+    })
+}
+
+/// The failure carried on a terminal `ActivityTaskTimedOut` event (kernel
+/// raise K2): the fired type's own failure, or — when the retry state is
+/// TIMEOUT and the fired type is not ScheduleToStart — the converted
+/// ScheduleToClose failure; the last recorded heartbeat details ride along
+/// (`processSingleActivityTimeoutTask`,
+/// timer_queue_active_task_executor.go:307-345 @ v1.31.0).
+fn terminal_timeout_failure(
+    violation: TimeoutViolation,
+    converted_to_schedule_to_close: bool,
+    last_heartbeat_details: Option<&Payloads>,
+) -> Payload {
+    let (message, timeout_type) = if converted_to_schedule_to_close {
+        (
+            "Not enough time to schedule next retry before activity ScheduleToClose timeout, giving up retrying"
+                .to_string(),
+            enums_proto::TimeoutType::ScheduleToClose,
+        )
+    } else {
+        (
+            format!("activity {} timeout", timeout_type_name(violation)),
+            proto_timeout_type(violation),
+        )
+    };
+    failure_to_payload(&failure_proto::Failure {
+        message,
+        failure_info: Some(failure_proto::failure::FailureInfo::TimeoutFailureInfo(
+            failure_proto::TimeoutFailureInfo {
+                timeout_type: timeout_type as i32,
+                last_heartbeat_details: last_heartbeat_details.map(payloads_from_domain),
             },
         )),
         ..Default::default()

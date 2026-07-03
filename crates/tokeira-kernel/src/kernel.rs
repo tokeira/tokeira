@@ -1735,6 +1735,7 @@ impl BasicKernel {
             ActivityResolution::TimedOut {
                 timeout_type,
                 retry_state,
+                failure,
             } => {
                 builder.emit(HistoryEventKind::ActivityTaskTimedOut {
                     activity_id: activity.activity_id.clone(),
@@ -1742,6 +1743,7 @@ impl BasicKernel {
                     started_event_id: activity.started_event_id.unwrap_or(0),
                     timeout_type,
                     retry_state,
+                    failure,
                 });
             }
             ActivityResolution::Canceled { details } => {

@@ -239,6 +239,14 @@ pub enum HistoryEventKind {
         started_event_id: i64,
         timeout_type: String,
         retry_state: RetryState,
+        /// The caller-built timeout failure (message, converted type,
+        /// `last_heartbeat_details`) carried onto the event verbatim
+        /// (`AddActivityTaskTimedOutEvent(..., timeoutFailure, ...)`,
+        /// timer_queue_active_task_executor.go:281-362 @ v1.31.0). `None` for
+        /// events written before kernel raise K2; the edge serializer then
+        /// synthesizes its legacy placeholder.
+        #[serde(default)]
+        failure: Option<Payload>,
     },
     /// The activity was canceled (cooperative cancellation).
     ActivityTaskCanceled {
@@ -618,6 +626,13 @@ pub enum ActivityResolution {
         /// raise K1, docs/HANDOVER-activity-kernel-gaps.md.
         #[serde(default = "default_timed_out_retry_state")]
         retry_state: RetryState,
+        /// The caller-built timeout failure carried onto the event (kernel
+        /// raise K2): message per `common/util.go:95`, the ScheduleToClose
+        /// "not enough time" conversion, and `last_heartbeat_details` folded
+        /// from durable heartbeat state
+        /// (timer_queue_active_task_executor.go:307-345 @ v1.31.0).
+        #[serde(default)]
+        failure: Option<Payload>,
     },
     /// The activity was canceled (cooperative cancellation).
     Canceled { details: Option<Payloads> },

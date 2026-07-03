@@ -786,18 +786,29 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             started_event_id,
             timeout_type,
             retry_state,
+            failure,
         } => Attributes::ActivityTaskTimedOutEventAttributes(
             history::ActivityTaskTimedOutEventAttributes {
-                failure: Some(proto_failure::Failure {
-                    message: format!("activity timed out: {timeout_type}"),
-                    failure_info: Some(proto_failure::failure::FailureInfo::TimeoutFailureInfo(
-                        proto_failure::TimeoutFailureInfo {
-                            timeout_type: activity_timeout_type_i32(timeout_type),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }),
+                // K2: the event carries the runtime-built timeout failure
+                // verbatim (message per common/util.go:95, the ScheduleToClose
+                // conversion, last_heartbeat_details —
+                // timer_queue_active_task_executor.go:301-345 @ v1.31.0). The
+                // synthesized placeholder below serves only events written
+                // before the field existed.
+                failure: Some(failure.as_ref().map(payload_to_failure).unwrap_or_else(|| {
+                    proto_failure::Failure {
+                        message: format!("activity timed out: {timeout_type}"),
+                        failure_info: Some(
+                            proto_failure::failure::FailureInfo::TimeoutFailureInfo(
+                                proto_failure::TimeoutFailureInfo {
+                                    timeout_type: activity_timeout_type_i32(timeout_type),
+                                    ..Default::default()
+                                },
+                            ),
+                        ),
+                        ..Default::default()
+                    }
+                })),
                 scheduled_event_id: *scheduled_event_id,
                 started_event_id: *started_event_id,
                 retry_state: retry_state_i32(retry_state),

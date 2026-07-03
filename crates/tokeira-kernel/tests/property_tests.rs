@@ -894,12 +894,18 @@ fn arb_activity_resolution() -> impl Strategy<Value = ActivityResolution> {
                 retry_state,
             }
         }),
-        (arb_small_string(), arb_retry_state()).prop_map(|(timeout_type, retry_state)| {
-            ActivityResolution::TimedOut {
-                timeout_type,
-                retry_state,
-            }
-        }),
+        (
+            arb_small_string(),
+            arb_retry_state(),
+            prop::option::of(arb_failure_payload()),
+        )
+            .prop_map(|(timeout_type, retry_state, failure)| {
+                ActivityResolution::TimedOut {
+                    timeout_type,
+                    retry_state,
+                    failure,
+                }
+            }),
         prop::option::of(arb_payloads())
             .prop_map(|details| ActivityResolution::Canceled { details }),
     ]
@@ -1872,11 +1878,13 @@ proptest! {
                 // K1: the event carries the caller-computed state verbatim.
                 prop_assert_eq!(retry_state, &expected_retry_state);
             }
-            (HistoryEventKind::ActivityTaskTimedOut { activity_id, timeout_type, retry_state, .. }, ActivityResolution::TimedOut { timeout_type: expected, retry_state: expected_retry_state }) => {
+            (HistoryEventKind::ActivityTaskTimedOut { activity_id, timeout_type, retry_state, failure, .. }, ActivityResolution::TimedOut { timeout_type: expected, retry_state: expected_retry_state, failure: expected_failure }) => {
                 prop_assert_eq!(activity_id, "activity-1");
                 prop_assert_eq!(timeout_type, &expected);
                 // K1: the event carries the caller-computed state verbatim.
                 prop_assert_eq!(retry_state, &expected_retry_state);
+                // K2: the caller-built timeout failure carries through verbatim.
+                prop_assert_eq!(failure, &expected_failure);
             }
             (HistoryEventKind::ActivityTaskCanceled { activity_id, details, .. }, ActivityResolution::Canceled { details: expected }) => {
                 prop_assert_eq!(activity_id, "activity-1");

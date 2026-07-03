@@ -17,7 +17,7 @@ use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command,
     CronContinuation, DispatchOp, FieldChange, HistoryEvent, HistoryEventKind, LoadedRun,
-    PauseWorkflowRequest, SignalRequest, SignalWithStartRequest, StartRequest,
+    PauseWorkflowRequest, RetryState, SignalRequest, SignalWithStartRequest, StartRequest,
     StartWorkflowTaskRequest, TerminateRequest, Transition, UnpauseWorkflowRequest,
     UpdateExecutionOptionsRequest, UpdateRequest, WorkflowCommand, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest,
@@ -59,7 +59,7 @@ use crate::{
     publisher::{RuntimeDispatchPublisher, run_completion_callback_scanner},
     query::{QueryResult, QueryTask},
     recovery::{lease_rejected_error, run_lease_renewer, sweep_shard},
-    retry::{RetryDecision, evaluate_activity_retry},
+    retry::{RetryDecision, RetryExhaustedReason, evaluate_activity_retry},
     scanner::{
         TimerScannerConfig, lane_index_for_run_key, pick_lane_for_run_key, run_timer_scanner,
     },
@@ -87,7 +87,9 @@ mod membership;
 mod query;
 mod workflow_task;
 
-pub(crate) use activity::{ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry};
+pub(crate) use activity::{
+    ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry, exhausted_reason_to_retry_state,
+};
 
 /// Public runtime facade.
 ///

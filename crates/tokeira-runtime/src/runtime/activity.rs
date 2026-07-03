@@ -64,6 +64,17 @@ fn activity_start_rejected_by_in_flight_transition(state: &WorkflowState) -> boo
         .is_some()
 }
 
+/// Map the runtime's retry-exhaustion reason onto the wire `RetryState`
+/// carried by terminal activity resolutions (`nextBackoffInterval`,
+/// retry.go:96-110 @ v1.31.0).
+pub(crate) fn exhausted_reason_to_retry_state(reason: RetryExhaustedReason) -> RetryState {
+    match reason {
+        RetryExhaustedReason::NonRetryableFailure => RetryState::NonRetryableFailure,
+        RetryExhaustedReason::MaximumAttemptsReached => RetryState::MaximumAttemptsReached,
+        RetryExhaustedReason::Timeout => RetryState::Timeout,
+    }
+}
+
 impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + 'static,
@@ -229,12 +240,26 @@ where
             return Ok(());
         }
 
+        // Terminal failure: the resolution carries WHY retries stopped
+        // (`RetryActivity` → `AddActivityTaskFailedEvent(..., retryState)`,
+        // mutable_state_impl.go:6235-6320 @ v1.31.0). No policy →
+        // RETRY_POLICY_NOT_SET. CANCEL_REQUESTED lands with kernel raise K4
+        // (durable cancel_requested).
+        let retry_state = match should_retry {
+            None => RetryState::RetryPolicyNotSet,
+            Some(RetryDecision::Exhausted { reason }) => exhausted_reason_to_retry_state(reason),
+            // `Retry` returned above.
+            Some(RetryDecision::Retry { .. }) => unreachable!("retry path returns early"),
+        };
         let result = self
             .submit_for_owned_shard(
                 token.run_key,
                 Command::ActivityResolved(ActivityResolvedRequest {
                     activity_id,
-                    resolution: ActivityResolution::Failed { failure },
+                    resolution: ActivityResolution::Failed {
+                        failure,
+                        retry_state,
+                    },
                     worker_identity,
                     now: OffsetDateTime::now_utc(),
                 }),

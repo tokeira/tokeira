@@ -1716,23 +1716,32 @@ impl BasicKernel {
                     result,
                 });
             }
-            ActivityResolution::Failed { failure } => {
+            ActivityResolution::Failed {
+                failure,
+                retry_state,
+            } => {
                 builder.emit(HistoryEventKind::ActivityTaskFailed {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
                     identity: req.worker_identity.clone(),
-                    retry_state: RetryState::RetryPolicyNotSet,
+                    // Carried from the caller's retry evaluation — the kernel
+                    // does not re-derive it (`AddActivityTaskFailedEvent(...,
+                    // retryState)` @ v1.31.0; kernel raise K1).
+                    retry_state,
                     failure,
                 });
             }
-            ActivityResolution::TimedOut { timeout_type } => {
+            ActivityResolution::TimedOut {
+                timeout_type,
+                retry_state,
+            } => {
                 builder.emit(HistoryEventKind::ActivityTaskTimedOut {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
                     timeout_type,
-                    retry_state: RetryState::Timeout,
+                    retry_state,
                 });
             }
             ActivityResolution::Canceled { details } => {

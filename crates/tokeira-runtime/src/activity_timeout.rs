@@ -28,7 +28,7 @@ use std::{
 
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    ActivityResolution, ActivityResolvedRequest, ActivityState, Command, LoadedRun,
+    ActivityResolution, ActivityResolvedRequest, ActivityState, Command, LoadedRun, RetryState,
 };
 use tokeira_observability::OutcomeLabel;
 use tokeira_proto::{
@@ -43,7 +43,10 @@ use crate::{
     lane::LaneHandle,
     metrics as runtime_metrics,
     retry::{RetryDecision, RetryExhaustedReason, evaluate_activity_retry},
-    runtime::{ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry},
+    runtime::{
+        ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry,
+        exhausted_reason_to_retry_state,
+    },
     scanner::pick_lane_for_run_key,
 };
 
@@ -369,14 +372,15 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
         // (RETRY_STATE_CANCEL_REQUESTED) (`RetryActivity`,
         // mutable_state_impl.go:6235-6266 @ v1.31.0).
         let mut exhausted_reason = None;
+        let retry_policy = activity
+            .retry_policy
+            .clone()
+            .or_else(|| state.retry_policy.clone());
         if matches!(
             violation,
             TimeoutViolation::StartToClose | TimeoutViolation::Heartbeat
         ) && !entry.cancel_requested
-            && let Some(policy) = activity
-                .retry_policy
-                .clone()
-                .or_else(|| state.retry_policy.clone())
+            && let Some(policy) = retry_policy.as_ref()
         {
             // Retry-expiration anchor: the FIRST schedule + schedule-to-close
             // (the deadline spans the whole retry chain;
@@ -390,7 +394,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             // retrypolicy.TimeoutFailureTypePrefix @ v1.31.0).
             let error_type = format!("TemporalTimeout:{}", timeout_type_name(violation));
             match evaluate_activity_retry(
-                &policy,
+                policy,
                 activity.attempt,
                 Some(&error_type),
                 now,
@@ -463,13 +467,38 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                 TimeoutViolation::Heartbeat => "heartbeat".to_string(),
             }
         };
+        // Why retries stopped, mirroring `RetryActivity`'s derivation order
+        // (mutable_state_impl.go:6243-6270 @ v1.31.0): no policy →
+        // RETRY_POLICY_NOT_SET; a requested cancel → CANCEL_REQUESTED; the
+        // server-deadline types → TIMEOUT; otherwise the exhaustion reason
+        // from `nextBackoffInterval` (retry.go:96-110).
+        let retry_state = if retry_policy.is_none() {
+            RetryState::RetryPolicyNotSet
+        } else if entry.cancel_requested {
+            RetryState::CancelRequested
+        } else if matches!(
+            violation,
+            TimeoutViolation::ScheduleToStart | TimeoutViolation::ScheduleToClose
+        ) {
+            RetryState::Timeout
+        } else {
+            match exhausted_reason {
+                Some(reason) => exhausted_reason_to_retry_state(reason),
+                // Unreachable in practice: a retryable violation with a policy
+                // and no cancel either retried (`continue` above) or exhausted.
+                None => RetryState::Timeout,
+            }
+        };
         let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
         let result = lane
             .submit(
                 entry.run_key,
                 Command::ActivityResolved(ActivityResolvedRequest {
                     activity_id: entry.activity_id.clone(),
-                    resolution: ActivityResolution::TimedOut { timeout_type },
+                    resolution: ActivityResolution::TimedOut {
+                        timeout_type,
+                        retry_state,
+                    },
                     worker_identity: None,
                     now,
                 }),

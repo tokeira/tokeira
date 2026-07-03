@@ -3029,6 +3029,7 @@ fn activity_resolved_timed_out_schedules_wft() {
                 activity_id: "activity-1".into(),
                 resolution: tokeira_kernel::ActivityResolution::TimedOut {
                     timeout_type: "HEARTBEAT".into(),
+                    retry_state: tokeira_kernel::RetryState::Timeout,
                 },
                 worker_identity: None,
                 now: now(),

@@ -599,11 +599,40 @@ pub enum ActivityResolution {
     /// The activity returned a successful result.
     Completed { result: Payloads },
     /// The activity failed with an application-level error.
-    Failed { failure: Payload },
+    Failed {
+        failure: Payload,
+        /// Why retries stopped, computed by the caller's retry evaluation and
+        /// carried onto the `ActivityTaskFailed` event
+        /// (`AddActivityTaskFailedEvent(..., retryState)` via `RetryActivity`,
+        /// mutable_state_impl.go:6235-6320 @ v1.31.0). Kernel raise K1,
+        /// docs/HANDOVER-activity-kernel-gaps.md.
+        #[serde(default = "default_failed_retry_state")]
+        retry_state: RetryState,
+    },
     /// The activity exceeded one of its configured timeouts.
-    TimedOut { timeout_type: String },
+    TimedOut {
+        timeout_type: String,
+        /// Why retries stopped, carried onto the `ActivityTaskTimedOut` event
+        /// (`AddActivityTaskTimedOutEvent(..., retryState)`,
+        /// timer_queue_active_task_executor.go:281-362 @ v1.31.0). Kernel
+        /// raise K1, docs/HANDOVER-activity-kernel-gaps.md.
+        #[serde(default = "default_timed_out_retry_state")]
+        retry_state: RetryState,
+    },
     /// The activity was canceled (cooperative cancellation).
     Canceled { details: Option<Payloads> },
+}
+
+/// Serde default preserving the pre-K1 hardcoded state for `Failed`
+/// resolutions encoded before the field existed.
+fn default_failed_retry_state() -> RetryState {
+    RetryState::RetryPolicyNotSet
+}
+
+/// Serde default preserving the pre-K1 hardcoded state for `TimedOut`
+/// resolutions encoded before the field existed.
+fn default_timed_out_retry_state() -> RetryState {
+    RetryState::Timeout
 }
 
 /// Summary of how and when a workflow execution closed.

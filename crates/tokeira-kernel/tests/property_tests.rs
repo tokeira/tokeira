@@ -888,8 +888,18 @@ fn arb_wft_versioning_completion() -> impl Strategy<
 fn arb_activity_resolution() -> impl Strategy<Value = ActivityResolution> {
     prop_oneof![
         arb_payloads().prop_map(|result| ActivityResolution::Completed { result }),
-        arb_failure_payload().prop_map(|failure| ActivityResolution::Failed { failure }),
-        arb_small_string().prop_map(|timeout_type| ActivityResolution::TimedOut { timeout_type }),
+        (arb_failure_payload(), arb_retry_state()).prop_map(|(failure, retry_state)| {
+            ActivityResolution::Failed {
+                failure,
+                retry_state,
+            }
+        }),
+        (arb_small_string(), arb_retry_state()).prop_map(|(timeout_type, retry_state)| {
+            ActivityResolution::TimedOut {
+                timeout_type,
+                retry_state,
+            }
+        }),
         prop::option::of(arb_payloads())
             .prop_map(|details| ActivityResolution::Canceled { details }),
     ]
@@ -1856,13 +1866,17 @@ proptest! {
                 prop_assert_eq!(activity_id, "activity-1");
                 prop_assert_eq!(result, &expected);
             }
-            (HistoryEventKind::ActivityTaskFailed { activity_id, failure, .. }, ActivityResolution::Failed { failure: expected }) => {
+            (HistoryEventKind::ActivityTaskFailed { activity_id, failure, retry_state, .. }, ActivityResolution::Failed { failure: expected, retry_state: expected_retry_state }) => {
                 prop_assert_eq!(activity_id, "activity-1");
                 prop_assert_eq!(failure, &expected);
+                // K1: the event carries the caller-computed state verbatim.
+                prop_assert_eq!(retry_state, &expected_retry_state);
             }
-            (HistoryEventKind::ActivityTaskTimedOut { activity_id, timeout_type, .. }, ActivityResolution::TimedOut { timeout_type: expected }) => {
+            (HistoryEventKind::ActivityTaskTimedOut { activity_id, timeout_type, retry_state, .. }, ActivityResolution::TimedOut { timeout_type: expected, retry_state: expected_retry_state }) => {
                 prop_assert_eq!(activity_id, "activity-1");
                 prop_assert_eq!(timeout_type, &expected);
+                // K1: the event carries the caller-computed state verbatim.
+                prop_assert_eq!(retry_state, &expected_retry_state);
             }
             (HistoryEventKind::ActivityTaskCanceled { activity_id, details, .. }, ActivityResolution::Canceled { details: expected }) => {
                 prop_assert_eq!(activity_id, "activity-1");

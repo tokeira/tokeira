@@ -14,6 +14,7 @@ impl From<EdgeError> for Status {
             EdgeError::NotFound(message) => Status::not_found(message),
             EdgeError::AlreadyExists(message) => Status::already_exists(message),
             EdgeError::ResourceExhausted(message) => Status::resource_exhausted(message),
+            EdgeError::WorkflowClosing => workflow_closing_status(),
             EdgeError::Unauthorized(message) => Status::unauthenticated(message),
             EdgeError::Forbidden { action, namespace } => {
                 let message = match namespace {
@@ -51,6 +52,9 @@ impl From<EdgeError> for Status {
                 format!("{namespace}/{workflow_id} already started as {run_id}"),
                 run_id,
             ),
+            EdgeError::WorkflowStartRejected { message, run_id } => {
+                workflow_already_started_status(message, run_id)
+            }
             EdgeError::BatchOperationAlreadyExists { namespace, job_id } => {
                 Status::already_exists(format!("{namespace}/{job_id}"))
             }
@@ -120,6 +124,41 @@ impl From<EdgeError> for Status {
 ///
 /// `start_request_id` is left empty: the `WorkflowAlreadyStarted` edge error does not carry
 /// it, and SDK type reconstruction keys on the detail's *type*, not its fields.
+/// Build v1.31.0's `consts.ErrWorkflowClosing` gRPC status: code
+/// RESOURCE_EXHAUSTED carrying a `ResourceExhaustedFailure` detail with cause
+/// BUSY_WORKFLOW and scope NAMESPACE (consts/const.go:62-67 @ v1.31.0). The Go
+/// SDK reconstructs `serviceerror.ResourceExhausted` — including the Cause the
+/// corpus asserts — from the `google.rpc.Status` detail in the trailer.
+fn workflow_closing_status() -> Status {
+    use prost::Message as _;
+    use tokeira_proto::public::temporal::api::{
+        enums::v1::{ResourceExhaustedCause, ResourceExhaustedScope},
+        errordetails::v1::ResourceExhaustedFailure,
+    };
+
+    let message = "workflow operation can not be applied because workflow is closing".to_owned();
+    let failure = ResourceExhaustedFailure {
+        cause: ResourceExhaustedCause::BusyWorkflow as i32,
+        scope: ResourceExhaustedScope::Namespace as i32,
+    };
+    let detail = ProtoAny {
+        type_url: "type.googleapis.com/temporal.api.errordetails.v1.ResourceExhaustedFailure"
+            .to_owned(),
+        value: failure.encode_to_vec(),
+    };
+    let rpc_status = RpcStatus {
+        code: Code::ResourceExhausted as i32,
+        message: message.clone(),
+        details: vec![detail],
+    };
+    Status::with_details_and_metadata(
+        Code::ResourceExhausted,
+        message,
+        rpc_status.encode_to_vec().into(),
+        MetadataMap::new(),
+    )
+}
+
 fn workflow_already_started_status(message: String, run_id: String) -> Status {
     use prost::Message as _;
     use tokeira_proto::public::temporal::api::errordetails::v1::WorkflowExecutionAlreadyStartedFailure;

@@ -148,6 +148,11 @@ pub enum DispatchOp {
         target_run_id: Option<RunId>,
         signal_name: String,
         input: Payloads,
+        /// The command's header, delivered onto the target's
+        /// `WorkflowExecutionSignaled` event (the initiated event's Header is
+        /// forwarded into the target signal request,
+        /// transfer_queue_active_task_executor.go:1592 @ v1.31.0).
+        header: Option<tokeira_types::Headers>,
     },
     /// Request cancellation of an external workflow.
     RequestCancelExternalWorkflow {

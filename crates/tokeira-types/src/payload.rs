@@ -36,7 +36,12 @@ pub struct Payload {
     /// execution's external-payload statistics
     /// (`CalculateExternalPayloadSize`,
     /// service/history/workflow/external_payload_size.go @ v1.31.0).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// NOTE: no `skip_serializing_if` — payloads persist through the DSQL
+    /// postcard codec, which is positional: a field skipped on encode but
+    /// read on decode corrupts the stream. `default` covers self-describing
+    /// (JSON) readers of older blobs only.
+    #[serde(default)]
     pub external_payloads: Vec<ExternalPayloadDetail>,
 }
 

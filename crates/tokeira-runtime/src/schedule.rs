@@ -1225,7 +1225,9 @@ where
             start_workflow_status: WorkflowExecutionStatus::Running,
         },
         Ok(StartWorkflowResult::UsedExisting { run_key, run_id })
-        | Ok(StartWorkflowResult::Rejected { run_key, run_id }) => ScheduleActionResult {
+        | Ok(StartWorkflowResult::Rejected {
+            run_key, run_id, ..
+        }) => ScheduleActionResult {
             schedule_time: nominal_time,
             actual_time,
             start_workflow_result: Some(WorkflowExecution {

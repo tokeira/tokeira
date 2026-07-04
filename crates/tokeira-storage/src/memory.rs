@@ -397,7 +397,18 @@ impl RunRepository for InMemoryStore {
                 workflow_key.1.clone(),
                 op.request_id.0.clone(),
             );
-            if store.request_dedupe.contains_key(&dedupe_key) {
+            // Request-id dedupe is scoped to the RUN, mirroring v1.31.0 where
+            // request ids live in the run's mutable state: a request id reused
+            // against a NEW run (e.g. signal-with-start after the prior run
+            // closed) is fresh, not a duplicate
+            // (`pendingSignalRequestedIDs` / `request_id_infos` are per-run,
+            // mutable_state_impl.go:2361-2398 @ v1.31.0; start-retry dedup is
+            // the conflict-resolution layer's job, not this table's).
+            if store
+                .request_dedupe
+                .get(&dedupe_key)
+                .is_some_and(|record| record.run_id == state.run_id)
+            {
                 storage_metrics::record_commit_transition_duration(
                     namespace.clone(),
                     "duplicate",
@@ -3074,6 +3085,7 @@ mod tests {
         let workflow_id = WorkflowId("workflow".into());
         first.next_state.namespace_id = namespace_id;
         first.next_state.workflow_id = workflow_id.clone();
+        let run_id = first.next_state.run_id;
         first.request_dedupe_ops.push(RequestDedupeOp {
             request_id: RequestId("req-1".into()),
         });
@@ -3120,6 +3132,10 @@ mod tests {
         };
         duplicate.next_state.namespace_id = namespace_id;
         duplicate.next_state.workflow_id = workflow_id;
+        // Same RUN retrying the same request id — dedupe is run-scoped
+        // (a different run reusing the id is fresh, per v1.31.0's per-run
+        // request-id space).
+        duplicate.next_state.run_id = run_id;
         duplicate.next_state.transition_seq = TransitionSeq(2);
         duplicate.request_dedupe_ops.push(RequestDedupeOp {
             request_id: RequestId("req-1".into()),

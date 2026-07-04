@@ -527,6 +527,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::NotFound(_) => Code::NotFound,
         EdgeError::AlreadyExists(_) => Code::AlreadyExists,
         EdgeError::ResourceExhausted(_) => Code::ResourceExhausted,
+        EdgeError::WorkflowClosing => Code::ResourceExhausted,
         EdgeError::Unauthorized(_) => Code::Unauthenticated,
         EdgeError::Forbidden { .. } => Code::PermissionDenied,
         EdgeError::NamespaceNotFound(_)
@@ -535,6 +536,7 @@ fn expected_code(err: &EdgeError) -> Code {
         | EdgeError::BatchOperationNotFound { .. } => Code::NotFound,
         EdgeError::ActivityNotStarted { .. } => Code::FailedPrecondition,
         EdgeError::WorkflowAlreadyStarted { .. }
+        | EdgeError::WorkflowStartRejected { .. }
         | EdgeError::BatchOperationAlreadyExists { .. } => Code::AlreadyExists,
         EdgeError::ActivityExecutionAlreadyStarted { .. } => Code::AlreadyExists,
         EdgeError::NamespaceDeleted(_) => Code::FailedPrecondition,

@@ -165,8 +165,16 @@ where
                         CommitResult::CurrentExecutionConflict { .. } => continue,
                     }
                 }
-                ConflictResolution::Rejected { run_key, run_id } => {
-                    return Ok(StartWorkflowResult::Rejected { run_key, run_id });
+                ConflictResolution::Rejected {
+                    run_key,
+                    run_id,
+                    reason,
+                } => {
+                    return Ok(StartWorkflowResult::Rejected {
+                        run_key,
+                        run_id,
+                        reason,
+                    });
                 }
                 ConflictResolution::DedupRetried {
                     run_key,
@@ -274,10 +282,15 @@ where
                         run_key: request.run_key,
                         run_id: request.run_id,
                     }),
-                    CommitResult::Duplicate => Err(anyhow!(
-                        "unexpected duplicate signal-with-start commit for {:?}",
-                        request.run_key
-                    )),
+                    // A duplicate here means THIS run already accepted this
+                    // request id (the dedupe table is run-scoped) — a redriven
+                    // commit of the same start. Effectively unreachable (the
+                    // OCC seq check fires first for an existing run), mapped
+                    // to idempotent success defensively rather than erroring.
+                    CommitResult::Duplicate => Ok(SignalWithStartResult::Started {
+                        run_key: request.run_key,
+                        run_id: request.run_id,
+                    }),
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                     CommitResult::CurrentExecutionConflict {
                         existing_run_key, ..
@@ -333,10 +346,15 @@ where
                         run_key: request.run_key,
                         run_id: request.run_id,
                     }),
-                    CommitResult::Duplicate => Err(anyhow!(
-                        "unexpected duplicate signal-with-start commit for {:?}",
-                        request.run_key
-                    )),
+                    // A duplicate here means THIS run already accepted this
+                    // request id (the dedupe table is run-scoped) — a redriven
+                    // commit of the same start. Effectively unreachable (the
+                    // OCC seq check fires first for an existing run), mapped
+                    // to idempotent success defensively rather than erroring.
+                    CommitResult::Duplicate => Ok(SignalWithStartResult::Started {
+                        run_key: request.run_key,
+                        run_id: request.run_id,
+                    }),
                     CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
                     CommitResult::CurrentExecutionConflict {
                         existing_run_key, ..
@@ -345,9 +363,15 @@ where
                     )),
                 }
             }
-            ConflictResolution::Rejected { run_key, run_id } => {
-                Ok(SignalWithStartResult::Rejected { run_key, run_id })
-            }
+            ConflictResolution::Rejected {
+                run_key,
+                run_id,
+                reason,
+            } => Ok(SignalWithStartResult::Rejected {
+                run_key,
+                run_id,
+                reason,
+            }),
             // A retried signal-with-start whose RequestId authored the incumbent's start is
             // idempotent: return the existing run (mirrors the start dedup path, api.go:332).
             ConflictResolution::DedupRetried {
@@ -367,6 +391,38 @@ where
             .resolve_execution(&execution)
             .await?
             .ok_or_else(|| anyhow!("execution not found"))?;
+        // A workflow that already ATTEMPTED to close (a close command bounced
+        // off buffered events with UnhandledCommand) rejects new signals while
+        // the retrying WFT is started — otherwise a steady signal stream could
+        // keep the close bouncing forever
+        // (`IsWorkflowCloseAttempted() && HasStartedWorkflowTask()` →
+        // ErrWorkflowClosing, signal_workflow_util.go:63-70 @ v1.31.0).
+        if self
+            .close_attempt_tracking
+            .lock()
+            .expect("close-attempt tracking lock")
+            .contains(&run_key)
+        {
+            match self.repo.load_run(run_key).await? {
+                LoadedRun::Existing(state) if state.status.is_open() => {
+                    if state
+                        .pending_workflow_task
+                        .as_ref()
+                        .is_some_and(|pending| pending.started_event_id.is_some())
+                    {
+                        return Err(crate::errors::WorkflowClosing.into());
+                    }
+                }
+                // The run closed (or vanished) without another successful WFT
+                // completion — drop the stale bit so the set stays bounded.
+                _ => {
+                    self.close_attempt_tracking
+                        .lock()
+                        .expect("close-attempt tracking lock")
+                        .remove(&run_key);
+                }
+            }
+        }
         self.submit(run_key, Command::Signal(request)).await
     }
 
@@ -565,6 +621,7 @@ where
                     WorkflowIdConflictPolicy::Fail => ConflictResolution::Rejected {
                         run_key,
                         run_id: state.run_id,
+                        reason: StartRejectReason::ConflictPolicyFail,
                     },
                     WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
                         run_key,
@@ -597,6 +654,7 @@ where
                 WorkflowIdConflictPolicy::Fail => ConflictResolution::Rejected {
                     run_key,
                     run_id: state.run_id,
+                    reason: StartRejectReason::ConflictPolicyFail,
                 },
                 WorkflowIdConflictPolicy::UseExisting => ConflictResolution::UseExisting {
                     run_key,
@@ -605,6 +663,24 @@ where
                 WorkflowIdConflictPolicy::TerminateExisting => {
                     ConflictResolution::TerminateAndStart { run_key }
                 }
+            });
+        }
+
+        // A retried start whose RequestId authored THIS (now closed) run's
+        // WorkflowExecutionStarted dedupes to it BEFORE any reuse policy —
+        // v1.31.0's handleConflict consults the current run's request ids
+        // regardless of open/closed and responds to the retried request with
+        // the incumbent (startworkflow/api.go handleConflict +
+        // signal_with_start_workflow.go:264-266 @ v1.31.0). Without this, a
+        // network-retried start after a fast-closing first run would silently
+        // create a second run.
+        if let Some(info) = state.request_id_infos.get(request_id)
+            && info.event_type == tokeira_kernel::EVENT_TYPE_WORKFLOW_EXECUTION_STARTED
+        {
+            return Ok(ConflictResolution::DedupRetried {
+                run_key,
+                run_id: state.run_id,
+                execution_status: state.status,
             });
         }
 
@@ -623,12 +699,14 @@ where
                     ConflictResolution::Rejected {
                         run_key,
                         run_id: state.run_id,
+                        reason: StartRejectReason::ReuseAllowFailedOnly,
                     }
                 }
             }
             WorkflowIdReusePolicy::RejectDuplicate => ConflictResolution::Rejected {
                 run_key,
                 run_id: state.run_id,
+                reason: StartRejectReason::ReuseRejectDuplicate,
             },
         })
     }
@@ -670,11 +748,11 @@ where
                         // terminateWorkflowAction) runs under IdentityHistoryService and does NOT
                         // consume the start's RequestId — that id is reserved for the new run's
                         // WorkflowExecutionStarted. tokeira records a request-dedupe op for every
-                        // terminate (kernel.rs apply_terminate), so reusing the start's request_id
-                        // here would poison the (namespace, workflow_id, request_id) dedupe slot and
-                        // make the subsequent replacement-start commit return CommitResult::Duplicate.
-                        // Derive a distinct, deterministic id keyed on the displaced run so retries
-                        // of the same terminate stay idempotent while the start's id stays free.
+                        // terminate (kernel.rs apply_terminate); the start's id must stay free to
+                        // author the replacement run's start event (and its request_id_infos
+                        // entry, which the retry-dedup path reads). Derive a distinct,
+                        // deterministic id keyed on the displaced run so retries of the same
+                        // terminate stay idempotent while the start's id stays free.
                         request_id: tokeira_types::RequestId(format!(
                             "conflict-terminate:{}:{}",
                             request.request_id.0, state.run_id.0

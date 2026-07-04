@@ -106,8 +106,8 @@ impl DsqlRunRepository {
                         &op.request_id,
                     );
                     let started = Instant::now();
-                    let row = sqlx::query_as::<_, (i32,)>(
-                        "SELECT 1 FROM request_dedupe
+                    let row = sqlx::query_as::<_, (Uuid,)>(
+                        "SELECT run_id FROM request_dedupe
                  WHERE key = $1",
                     )
                     .bind(key)
@@ -118,10 +118,14 @@ impl DsqlRunRepository {
                         "dedupe_check",
                         started.elapsed(),
                     );
-                    if row.is_some() {
-                        // Dedupe is checked before any state mutation. Returning
-                        // Duplicate lets callers short-circuit idempotent requests
-                        // without turning them into conflicts.
+                    // Request-id dedupe is scoped to the RUN, mirroring v1.31.0
+                    // where request ids live in the run's mutable state: a
+                    // request id reused against a NEW run (e.g. signal-with-start
+                    // after the prior run closed) is fresh, not a duplicate
+                    // (mutable_state_impl.go:2361-2398 @ v1.31.0). Dedupe is
+                    // checked before any state mutation so idempotent retries
+                    // short-circuit without turning into conflicts.
+                    if row.is_some_and(|(run_id,)| run_id == state.run_id.0) {
                         tx.rollback().await?;
                         return Ok(CommitResult::Duplicate);
                     }
@@ -307,10 +311,19 @@ async fn write_transition(
             &state.workflow_id,
             &op.request_id,
         );
+        // A new run reusing a prior run's request id takes over the record
+        // (matching the in-memory store's overwrite): the table answers "which
+        // run most recently accepted this request id" for lookups, while the
+        // duplicate CHECK above is run-scoped.
         sqlx::query(
             "INSERT INTO request_dedupe
              (key, namespace_id, workflow_id, request_id, run_key, run_id, first_seen_transition_seq, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, now())",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+             ON CONFLICT (key) DO UPDATE SET
+                 run_key = EXCLUDED.run_key,
+                 run_id = EXCLUDED.run_id,
+                 first_seen_transition_seq = EXCLUDED.first_seen_transition_seq,
+                 created_at = EXCLUDED.created_at",
         )
         .bind(key)
         .bind(state.namespace_id.0)

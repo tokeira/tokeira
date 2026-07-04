@@ -700,7 +700,20 @@ impl BasicKernel {
         // Insight: Tokeira keeps the "at most one outstanding workflow task"
         // invariant because it dramatically reduces wakeup amplification during
         // signal floods without weakening per-run correctness.
-        if builder.state.pending_workflow_task.is_none() {
+        //
+        // A run still inside its first-WFT backoff window (client start delay
+        // or cron initial interval — the start-delay timer is armed and no WFT
+        // has ever existed) records the signal but does NOT create a workflow
+        // task; the backoff timer schedules the first WFT when it fires
+        // (`CreateWorkflowTask := !IsWorkflowPendingOnWorkflowTaskBackoff`,
+        // signalworkflow/api.go:70-74 + mutable_state_impl.go:2368-2374
+        // @ v1.31.0).
+        if builder.state.pending_workflow_task.is_none()
+            && !builder
+                .state
+                .timers
+                .contains_key(WORKFLOW_START_DELAY_TIMER_ID)
+        {
             builder.schedule_workflow_task();
         }
 
@@ -3806,6 +3819,7 @@ fn apply_workflow_command(
             header,
             control,
         } => {
+            let dispatch_header = header.clone();
             let initiated_event_id =
                 builder.emit(HistoryEventKind::SignalExternalWorkflowExecutionInitiated {
                     workflow_task_completed_event_id,
@@ -3839,6 +3853,7 @@ fn apply_workflow_command(
                     target_run_id,
                     signal_name,
                     input,
+                    header: dispatch_header,
                 });
             Ok(false)
         }

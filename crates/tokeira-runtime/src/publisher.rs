@@ -527,10 +527,46 @@ where
         target_run_id: Option<RunId>,
         signal_name: String,
         input: Payloads,
+        header: Option<tokeira_types::Headers>,
         originator_run_key: RunKey,
         namespace_id: NamespaceId,
         initiated_event_id: i64,
     ) {
+        // A workflow cannot signal-external ITSELF: same target namespace and
+        // workflow id fails with EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND before
+        // any delivery — "it does not matter if the run ID is a mismatch"
+        // (transfer_queue_active_task_executor.go:683-697 @ v1.31.0).
+        let originator_identity = match self.repo.load_run(originator_run_key).await {
+            Ok(LoadedRun::Existing(state)) => Some((state.namespace_id, state.workflow_id)),
+            _ => None,
+        };
+        if originator_identity
+            .as_ref()
+            .is_some_and(|(origin_ns, origin_wf)| {
+                *origin_ns == namespace_id && *origin_wf == target_workflow_id
+            })
+        {
+            let resolve = Command::ExternalSignalResolved(ExternalSignalResolvedRequest {
+                initiated_event_id,
+                result: ExternalSignalResult::Failed {
+                    cause: "external workflow execution not found (self-signal)".to_string(),
+                },
+                now: OffsetDateTime::now_utc(),
+            });
+            if let Err(error) = self
+                .pick_lane(originator_run_key)
+                .submit(originator_run_key, resolve)
+                .await
+            {
+                tracing::warn!(
+                    ?error,
+                    originator_run_key = ?originator_run_key,
+                    initiated_event_id,
+                    "failed to deliver self-signal ExternalSignalResolved"
+                );
+            }
+            return;
+        }
         let signal_result = match self
             .repo
             .resolve_execution(&ExecutionRef {
@@ -541,16 +577,21 @@ where
             .await
         {
             Ok(Some(target_run_key)) => {
+                // The delivered signal carries the command's header and the
+                // history service's identity, exactly as the transfer executor
+                // forwards them (Identity=consts.IdentityHistoryService +
+                // Header: attributes.Header,
+                // transfer_queue_active_task_executor.go:1574-1604 @ v1.31.0).
                 let command = Command::Signal(SignalRequest {
                     signal_name,
                     input,
-                    header: None,
+                    header,
                     links: Vec::new(),
                     request: RequestContext {
                         request_id: RequestId(format!(
                             "ext-signal-{originator_run_key:?}-{initiated_event_id}"
                         )),
-                        caller_identity: Some("runtime-external-signal-orchestrator".to_string()),
+                        caller_identity: Some("history-service".to_string()),
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -1566,12 +1607,14 @@ where
                     target_run_id,
                     signal_name,
                     input,
+                    header,
                 } => {
                     let publisher = RuntimeDispatchPublisher::clone(self);
                     let target_workflow_id = target_workflow_id.clone();
                     let target_run_id = *target_run_id;
                     let signal_name = signal_name.clone();
                     let input = input.clone();
+                    let header = header.clone();
                     let originator_run_key = *originator_run_key;
                     let namespace_id = *namespace_id;
                     let initiated_event_id = *initiated_event_id;
@@ -1582,6 +1625,7 @@ where
                                 target_run_id,
                                 signal_name,
                                 input,
+                                header,
                                 originator_run_key,
                                 namespace_id,
                                 initiated_event_id,

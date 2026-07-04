@@ -113,7 +113,14 @@ where
             _ => initial_cursor,
         };
         let mut backoff = tokio::time::Duration::from_millis(100);
-        let max_backoff = tokio::time::Duration::from_secs(5);
+        // The idle cap bounds worst-case visibility staleness: a record landing
+        // just after an empty poll waits at most this long to be projected.
+        // The corpus's tightest visibility assert gives ListOpen 4 seconds
+        // (`testcore.WaitForESToSettle`) — a 5s cap flaked it roughly 1-in-2
+        // once earlier leaves had idled the partition to max backoff. 1s keeps
+        // idle polling trivial (one light read per partition per second) while
+        // staying well inside every corpus budget.
+        let max_backoff = tokio::time::Duration::from_secs(1);
         let mut last_checkpoint = Instant::now();
         record_checkpoint_sequence(&cursor);
 

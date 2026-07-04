@@ -2082,7 +2082,9 @@ impl WorkflowService {
                 start_workflow_status: WorkflowExecutionStatus::Running,
             },
             StartWorkflowResult::UsedExisting { run_key, run_id }
-            | StartWorkflowResult::Rejected { run_key, run_id } => ScheduleActionResult {
+            | StartWorkflowResult::Rejected {
+                run_key, run_id, ..
+            } => ScheduleActionResult {
                 schedule_time: nominal_time,
                 actual_time,
                 start_workflow_result: Some(WorkflowExecution {
@@ -2516,10 +2518,9 @@ impl WorkflowService {
                             eager_workflow_task: None,
                         })
                     }
-                    StartWorkflowResult::Rejected { run_id, .. } => {
-                        Err(EdgeError::WorkflowAlreadyStarted {
-                            namespace,
-                            workflow_id,
+                    StartWorkflowResult::Rejected { run_id, reason, .. } => {
+                        Err(EdgeError::WorkflowStartRejected {
+                            message: start_reject_message(reason, &workflow_id, run_id),
                             run_id: run_id.0.to_string(),
                         })
                     }
@@ -3918,10 +3919,9 @@ impl WorkflowService {
                             started: false,
                         })
                     }
-                    SignalWithStartResult::Rejected { run_id, .. } => {
-                        Err(EdgeError::WorkflowAlreadyStarted {
-                            namespace: req.namespace,
-                            workflow_id: req.workflow_id,
+                    SignalWithStartResult::Rejected { run_id, reason, .. } => {
+                        Err(EdgeError::WorkflowStartRejected {
+                            message: start_reject_message(reason, &req.workflow_id, run_id),
                             run_id: run_id.0.to_string(),
                         })
                     }
@@ -5358,6 +5358,33 @@ impl WorkflowService {
     }
 }
 
+/// Render v1.31.0's `WorkflowExecutionAlreadyStarted` message for a start
+/// rejected by the workflow-id conflict/reuse policy — the corpus asserts the
+/// policy suffixes verbatim (`workflow_id_dedup.go:95-129 @ v1.31.0`).
+fn start_reject_message(
+    reason: tokeira_runtime::StartRejectReason,
+    workflow_id: &str,
+    run_id: tokeira_types::RunId,
+) -> String {
+    match reason {
+        tokeira_runtime::StartRejectReason::ConflictPolicyFail => format!(
+            "Workflow execution is already running. WorkflowId: {workflow_id}, RunId: {run_id}.",
+            run_id = run_id.0
+        ),
+        tokeira_runtime::StartRejectReason::ReuseRejectDuplicate => format!(
+            "Workflow execution already finished. WorkflowId: {workflow_id}, RunId: {run_id}. \
+             Workflow Id reuse policy: reject duplicate workflow Id.",
+            run_id = run_id.0
+        ),
+        tokeira_runtime::StartRejectReason::ReuseAllowFailedOnly => format!(
+            "Workflow execution already finished successfully. WorkflowId: {workflow_id}, \
+             RunId: {run_id}. Workflow Id reuse policy: allow duplicate workflow Id if last \
+             run failed.",
+            run_id = run_id.0
+        ),
+    }
+}
+
 fn grpc_error_code(error: &EdgeError) -> &'static str {
     match error {
         EdgeError::BadRequest(_) => "invalid_argument",
@@ -5365,6 +5392,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::NotFound(_) => "not_found",
         EdgeError::AlreadyExists(_) => "already_exists",
         EdgeError::ResourceExhausted(_) => "resource_exhausted",
+        EdgeError::WorkflowClosing => "resource_exhausted",
         EdgeError::Unauthorized(_) => "unauthenticated",
         EdgeError::Forbidden { .. } => "permission_denied",
         EdgeError::NamespaceNotFound(_)
@@ -5373,6 +5401,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         | EdgeError::BatchOperationNotFound { .. } => "not_found",
         EdgeError::ActivityNotStarted { .. } => "failed_precondition",
         EdgeError::WorkflowAlreadyStarted { .. }
+        | EdgeError::WorkflowStartRejected { .. }
         | EdgeError::BatchOperationAlreadyExists { .. }
         | EdgeError::NamespaceAlreadyExists(_) => "already_exists",
         EdgeError::ActivityExecutionAlreadyStarted { .. } => "already_exists",
@@ -6119,10 +6148,17 @@ mod tests {
             .await
             .expect_err("Fail policy must reject a running incumbent");
 
-        assert!(
-            matches!(err, EdgeError::WorkflowAlreadyStarted { .. }),
-            "got {err:?}"
-        );
+        // The Fail-policy rejection renders v1.31.0's exact
+        // WorkflowExecutionAlreadyStarted message (workflow_id_dedup.go:95-97).
+        match err {
+            EdgeError::WorkflowStartRejected { message, .. } => {
+                assert!(
+                    message.starts_with("Workflow execution is already running. WorkflowId:"),
+                    "got message {message:?}"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
         Ok(())
     }
 

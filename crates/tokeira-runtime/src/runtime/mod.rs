@@ -131,6 +131,16 @@ pub struct TokeiraRuntime<R> {
     wft_timeout_scanner_cancel: CancellationToken,
     /// Runtime-local Nexus timeout tracking.
     nexus_timeout_tracking: NexusTimeoutTrackingState,
+    /// Runs whose worker attempted to close past buffered events (an
+    /// `UnhandledCommand`-rejected close). While set AND a started WFT is in
+    /// flight, new signals are rejected with `WorkflowClosing` — the
+    /// in-memory mirror of v1.31.0's volatile
+    /// `MutableStateImpl.workflowCloseAttempted` (mutable_state_impl.go:191,
+    /// set at workflow_task_state_machine.go:924-928; checked by
+    /// signal_workflow_util.go:63-70). Cleared when a later WFT completes
+    /// successfully (the workflow moved on) — v1.31.0 clears on
+    /// mutable-state reload, which every WFT failure triggers.
+    close_attempt_tracking: Arc<std::sync::Mutex<std::collections::HashSet<RunKey>>>,
     /// Runtime-local index of `BackingOff` completion callbacks to re-fire.
     completion_callback_tracking: CompletionCallbackTrackingState,
     /// In-memory Nexus worker-task broker.
@@ -225,14 +235,40 @@ pub enum StartWorkflowResult {
     Rejected {
         run_key: RunKey,
         run_id: RunId,
+        reason: StartRejectReason,
     },
+}
+
+/// Why a start (or signal-with-start) was rejected against the incumbent run.
+/// The edge renders each as v1.31.0's exact `WorkflowExecutionAlreadyStarted`
+/// message (`workflow_id_dedup.go:95-129 @ v1.31.0`) — the corpus asserts the
+/// policy-specific suffixes verbatim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartRejectReason {
+    /// `WorkflowIdConflictPolicy::Fail` against a RUNNING incumbent.
+    ConflictPolicyFail,
+    /// `WorkflowIdReusePolicy::RejectDuplicate` against a closed incumbent.
+    ReuseRejectDuplicate,
+    /// `WorkflowIdReusePolicy::AllowDuplicateFailedOnly` against an incumbent
+    /// that finished successfully.
+    ReuseAllowFailedOnly,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SignalWithStartResult {
-    Started { run_key: RunKey, run_id: RunId },
-    Signaled { run_key: RunKey, run_id: RunId },
-    Rejected { run_key: RunKey, run_id: RunId },
+    Started {
+        run_key: RunKey,
+        run_id: RunId,
+    },
+    Signaled {
+        run_key: RunKey,
+        run_id: RunId,
+    },
+    Rejected {
+        run_key: RunKey,
+        run_id: RunId,
+        reason: StartRejectReason,
+    },
 }
 
 /// Aggregate runtime tuning passed to [`TokeiraRuntime`] at construction.
@@ -279,6 +315,7 @@ enum ConflictResolution {
     Rejected {
         run_key: RunKey,
         run_id: RunId,
+        reason: StartRejectReason,
     },
     /// The incoming RequestId already authored the open incumbent's
     /// `WorkflowExecutionStarted`: this is a retry of the original start and is
@@ -730,6 +767,9 @@ where
             wft_timeout_scanner_handle,
             wft_timeout_scanner_cancel,
             nexus_timeout_tracking,
+            close_attempt_tracking: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             completion_callback_tracking,
             nexus_task_broker,
             update_registry,
@@ -1535,7 +1575,8 @@ mod tests {
             rejected,
             StartWorkflowResult::Rejected {
                 run_key: first.run_key,
-                run_id: first.run_id
+                run_id: first.run_id,
+                reason: StartRejectReason::ConflictPolicyFail,
             }
         );
 

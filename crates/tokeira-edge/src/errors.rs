@@ -32,6 +32,14 @@ pub enum EdgeError {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    /// v1.31.0's `consts.ErrWorkflowClosing`: a signal (or update) arrived
+    /// while the workflow has a close attempt bouncing off buffered events
+    /// with a started WFT retrying it. RESOURCE_EXHAUSTED with cause
+    /// BUSY_WORKFLOW, scope NAMESPACE, and this exact message — the corpus
+    /// asserts cause and message verbatim (consts/const.go:62-67 @ v1.31.0).
+    #[error("workflow operation can not be applied because workflow is closing")]
+    WorkflowClosing,
+
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
@@ -76,6 +84,15 @@ pub enum EdgeError {
         workflow_id: String,
         run_id: String,
     },
+
+    /// A start (or signal-with-start) rejected by the workflow-id conflict or
+    /// reuse policy against the incumbent run. Carries v1.31.0's exact
+    /// policy-specific message (`workflow_id_dedup.go:95-129 @ v1.31.0` —
+    /// the corpus asserts the suffixes verbatim) and maps to the typed
+    /// `WorkflowExecutionAlreadyStarted` serviceerror like
+    /// [`EdgeError::WorkflowAlreadyStarted`].
+    #[error("{message}")]
+    WorkflowStartRejected { message: String, run_id: String },
 
     /// A standalone-activity Start was rejected by the id reuse/conflict policy
     /// against an existing run. Carries the current run's id and create request id
@@ -136,6 +153,7 @@ impl EdgeError {
             EdgeError::NotFound(_) => StatusCode::NOT_FOUND,
             EdgeError::AlreadyExists(_) => StatusCode::CONFLICT,
             EdgeError::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
+            EdgeError::WorkflowClosing => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             EdgeError::Forbidden { .. } => StatusCode::FORBIDDEN,
             EdgeError::NamespaceNotFound(_)
@@ -144,6 +162,7 @@ impl EdgeError {
             | EdgeError::BatchOperationNotFound { .. } => StatusCode::NOT_FOUND,
             EdgeError::ActivityNotStarted { .. } => StatusCode::PRECONDITION_FAILED,
             EdgeError::WorkflowAlreadyStarted { .. }
+            | EdgeError::WorkflowStartRejected { .. }
             | EdgeError::BatchOperationAlreadyExists { .. } => StatusCode::CONFLICT,
             EdgeError::ActivityExecutionAlreadyStarted { .. } => StatusCode::CONFLICT,
             EdgeError::NamespaceDeleted(_) => StatusCode::GONE,
@@ -164,6 +183,7 @@ impl EdgeError {
             EdgeError::NotFound(_) => "not_found",
             EdgeError::AlreadyExists(_) => "already_exists",
             EdgeError::ResourceExhausted(_) => "resource_exhausted",
+            EdgeError::WorkflowClosing => "workflow_closing",
             EdgeError::Unauthorized(_) => "unauthorized",
             EdgeError::Forbidden { .. } => "forbidden",
             EdgeError::NamespaceNotFound(_) => "namespace_not_found",
@@ -173,6 +193,7 @@ impl EdgeError {
             EdgeError::ActivityNotFound { .. } => "activity_not_found",
             EdgeError::ActivityNotStarted { .. } => "activity_not_started",
             EdgeError::WorkflowAlreadyStarted { .. } => "workflow_already_started",
+            EdgeError::WorkflowStartRejected { .. } => "workflow_already_started",
             EdgeError::ActivityExecutionAlreadyStarted { .. } => {
                 "activity_execution_already_started"
             }
@@ -209,6 +230,24 @@ impl From<anyhow::Error> for EdgeError {
         // (respondworkflowtaskcompleted/api.go:739-742 @ v1.31.0).
         if let Some(invalid) = value.downcast_ref::<tokeira_runtime::InvalidWorkflowCommand>() {
             return Self::BadRequest(invalid.message.clone());
+        }
+        // The close-attempted signal gate surfaces v1.31.0's
+        // `ErrWorkflowClosing` (signal_workflow_util.go:63-70).
+        if value
+            .downcast_ref::<tokeira_runtime::WorkflowClosing>()
+            .is_some()
+        {
+            return Self::WorkflowClosing;
+        }
+        // Any mutation against an already-closed run surfaces v1.31.0's
+        // `ErrWorkflowCompleted`: NOT_FOUND with this exact message
+        // (`consts/const.go:51 @ v1.31.0`) — asserted by type on
+        // signal-after-terminate (tests/signal_workflow_test.go:231).
+        if value
+            .downcast_ref::<tokeira_runtime::KernelRejected>()
+            .is_some_and(|rejected| matches!(rejected.0, tokeira_kernel::Reject::RunClosed(_)))
+        {
+            return Self::NotFound("workflow execution already completed".to_string());
         }
         match value.downcast::<tokeira_runtime::NotShardOwner>() {
             Ok(not_owner) => Self::NotShardOwner {

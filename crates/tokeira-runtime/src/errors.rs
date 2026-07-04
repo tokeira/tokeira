@@ -101,6 +101,17 @@ pub struct InvalidWorkflowCommand {
     pub message: String,
 }
 
+/// Signal admission rejected because the workflow already ATTEMPTED to close
+/// (a close command bounced off buffered events with `UnhandledCommand`) and
+/// a started workflow task is in flight retrying that close — v1.31.0's
+/// `consts.ErrWorkflowClosing`: RESOURCE_EXHAUSTED with cause BUSY_WORKFLOW,
+/// scope NAMESPACE, and this exact message
+/// (`IsWorkflowCloseAttempted() && HasStartedWorkflowTask()`,
+/// signal_workflow_util.go:63-70 + consts/const.go:62-67 @ v1.31.0).
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("workflow operation can not be applied because workflow is closing")]
+pub struct WorkflowClosing;
+
 /// Runtime could not resolve a requested workflow update.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum UpdateLifecycleError {

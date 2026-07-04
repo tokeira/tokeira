@@ -176,6 +176,10 @@ pub enum WorkflowTaskFailedCause {
     BadScheduleActivityAttributes,
     /// The `StartTimer` command carried invalid attributes.
     BadStartTimerAttributes,
+    /// The `CancelTimer` command referenced a timer that is neither running
+    /// nor fired-and-buffered (`AddTimerCanceledEvent` caller error,
+    /// mutable_state_impl.go @ v1.31.0).
+    BadCancelTimerAttributes,
     /// The worker returned a command the kernel does not
     /// recognise or cannot process in the current state.
     UnhandledCommand,

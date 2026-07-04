@@ -1581,6 +1581,7 @@ fn wft_failed_cause_i32(c: &WorkflowTaskFailedCause) -> i32 {
         WorkflowTaskFailedCause::NonDeterminismError => C::NonDeterministicError,
         WorkflowTaskFailedCause::BadScheduleActivityAttributes => C::BadScheduleActivityAttributes,
         WorkflowTaskFailedCause::BadStartTimerAttributes => C::BadStartTimerAttributes,
+        WorkflowTaskFailedCause::BadCancelTimerAttributes => C::BadCancelTimerAttributes,
         WorkflowTaskFailedCause::UnhandledCommand => C::UnhandledCommand,
         WorkflowTaskFailedCause::BadRequestCancelActivityAttributes => {
             C::BadRequestCancelActivityAttributes

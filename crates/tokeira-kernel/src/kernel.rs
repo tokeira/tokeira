@@ -2556,10 +2556,17 @@ impl BasicKernel {
             .ok_or_else(|| Reject::UnknownTimer(req.timer_id.clone()))?;
 
         let mut builder = TransitionBuilder::new(state, req.fired_at);
-        builder.emit(HistoryEventKind::TimerFired {
+        let fired = HistoryEventKind::TimerFired {
             timer_id: timer.timer_id.clone(),
             started_event_id: timer.started_event_id,
-        });
+        };
+        // A fire during a started WFT buffers (Phase 2 timer slice); the
+        // WFT-close flush delivers it and schedules the follow-up task.
+        if should_buffer(&builder.state, &fired) {
+            builder.buffer(fired);
+        } else {
+            builder.emit(fired);
+        }
         builder.state.timers.remove(&timer.timer_id);
         builder.timer_ops.push(TimerOp::Delete {
             timer_id: timer.timer_id,
@@ -3606,23 +3613,51 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::CancelTimer { timer_id } => {
-            if !builder.state.timers.contains_key(&timer_id) {
-                return Err(Reject::UnknownTimer(timer_id));
+            if let Some(timer) = builder.state.timers.get(&timer_id) {
+                let started_event_id = timer.started_event_id;
+                builder.emit(HistoryEventKind::TimerCanceled {
+                    workflow_task_completed_event_id,
+                    timer_id: timer_id.clone(),
+                    started_event_id,
+                });
+                builder.state.timers.remove(&timer_id);
+                builder.timer_ops.push(TimerOp::Delete { timer_id });
+                return Ok(false);
             }
-            let started_event_id = builder
-                .state
-                .timers
-                .get(&timer_id)
-                .map(|timer| timer.started_event_id)
-                .unwrap_or(0);
-            builder.emit(HistoryEventKind::TimerCanceled {
-                workflow_task_completed_event_id,
-                timer_id: timer_id.clone(),
-                started_event_id,
-            });
-            builder.state.timers.remove(&timer_id);
-            builder.timer_ops.push(TimerOp::Delete { timer_id });
-            Ok(false)
+            // The timer may have fired DURING this started WFT — its fired
+            // event is buffered. v1.31.0 lets the cancel win: the buffered
+            // TimerFired is deleted and only TimerCanceled reaches history
+            // (`GetAndRemoveTimerFireEvent` in `AddTimerCanceledEvent`,
+            // mutable_state_impl.go @ v1.31.0). The timer itself already left
+            // durable state when it fired.
+            if let Some(position) = builder.state.buffered_events.iter().position(|buffered| {
+                matches!(
+                    &buffered.kind,
+                    HistoryEventKind::TimerFired { timer_id: fired, .. } if *fired == timer_id
+                )
+            }) {
+                let removed = builder.state.buffered_events.remove(position);
+                let HistoryEventKind::TimerFired {
+                    started_event_id, ..
+                } = removed.kind
+                else {
+                    unreachable!("position matched a TimerFired event");
+                };
+                builder.emit(HistoryEventKind::TimerCanceled {
+                    workflow_task_completed_event_id,
+                    timer_id: timer_id.clone(),
+                    started_event_id,
+                });
+                return Ok(false);
+            }
+            // Neither running nor fired-and-buffered: v1.31.0 FAILS THE
+            // WORKFLOW TASK (`failWorkflowTaskOnInvalidArgument(
+            // BAD_CANCEL_TIMER_ATTRIBUTES)`), not the completion call — the
+            // K4 invalid-command seam.
+            Err(Reject::InvalidCommandAttributes {
+                cause: WorkflowTaskFailedCause::BadCancelTimerAttributes,
+                message: format!("TimerID: {timer_id}"),
+            })
         }
         WorkflowCommand::RequestNewWorkflowTask => {
             if builder.state.pending_workflow_task.is_none() && builder.state.is_open() {
@@ -4032,6 +4067,12 @@ fn should_buffer(state: &WorkflowState, kind: &HistoryEventKind) -> bool {
         kind,
         HistoryEventKind::WorkflowExecutionSignaled { .. }
             | HistoryEventKind::WorkflowExecutionCancelRequested { .. }
+            // Phase 2 timer slice (spec kernel-event-buffering; trigger met by
+            // TestCancelTimer_CancelFiredAndBuffered): a timer firing during a
+            // started WFT buffers, so a CancelTimer in that WFT's completion
+            // can still win by deleting the buffered fired event
+            // (`GetAndRemoveTimerFireEvent` @ v1.31.0).
+            | HistoryEventKind::TimerFired { .. }
     )
 }
 

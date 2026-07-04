@@ -4393,8 +4393,8 @@ fn cancel_timer() {
 #[test]
 fn cancel_timer_unknown() {
     let state = make_open_state_with_started_wft();
-    assert_eq!(
-        kernel().apply(
+    let transition = kernel()
+        .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
                 token: WorkflowTaskToken {
@@ -4418,9 +4418,94 @@ fn cancel_timer_unknown() {
                 force_new_workflow_task: false,
                 now: now(),
             }),
-        ),
-        Err(Reject::UnknownTimer("missing".into()))
+        )
+        .unwrap();
+
+    // A cancel of a timer that is neither running nor fired-and-buffered
+    // FAILS THE WORKFLOW TASK with BAD_CANCEL_TIMER_ATTRIBUTES — the K4
+    // invalid-command seam (`failWorkflowTaskOnInvalidArgument` @ v1.31.0).
+    assert!(transition.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::WorkflowTaskFailed {
+            failure_cause: tokeira_kernel::WorkflowTaskFailedCause::BadCancelTimerAttributes,
+            ..
+        }
+    )));
+    assert!(
+        !transition
+            .history_events
+            .iter()
+            .any(|event| matches!(&event.kind, HistoryEventKind::WorkflowTaskCompleted { .. }))
     );
+}
+
+#[test]
+fn cancel_timer_fired_and_buffered_deletes_buffered_fired_event() {
+    // TestCancelTimer_CancelFiredAndBuffered's spine: the timer fires DURING
+    // the started WFT (fired event buffered, Phase 2 timer slice), then the
+    // same WFT's completion cancels it — the buffered TimerFired is deleted
+    // and only TimerCanceled reaches history
+    // (`GetAndRemoveTimerFireEvent` in `AddTimerCanceledEvent` @ v1.31.0).
+    let state = with_pending_timer_started_wft();
+    let fired = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::TimerDue(TimerDueRequest {
+                timer_id: "timer-1".into(),
+                fired_at: now(),
+            }),
+        )
+        .unwrap();
+    // Buffered, not appended: no TimerFired in history, timer gone from state.
+    assert!(
+        !fired
+            .history_events
+            .iter()
+            .any(|event| matches!(&event.kind, HistoryEventKind::TimerFired { .. }))
+    );
+    assert_eq!(fired.next_state.buffered_events.len(), 1);
+    assert!(!fired.next_state.timers.contains_key("timer-1"));
+
+    let cancelled = kernel()
+        .apply(
+            LoadedRun::Existing(fired.next_state),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: RunKey::new(),
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky: None,
+                commands: vec![WorkflowCommand::CancelTimer {
+                    timer_id: "timer-1".into(),
+                }],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    // TimerCanceled wins; the buffered TimerFired is deleted (flush emits
+    // nothing), so no follow-up WFT is scheduled for it.
+    assert!(cancelled.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::TimerCanceled { timer_id, .. } if timer_id == "timer-1"
+    )));
+    assert!(
+        !cancelled
+            .history_events
+            .iter()
+            .any(|event| matches!(&event.kind, HistoryEventKind::TimerFired { .. }))
+    );
+    assert!(cancelled.next_state.buffered_events.is_empty());
 }
 
 #[test]

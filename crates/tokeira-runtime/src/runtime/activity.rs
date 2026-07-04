@@ -1400,6 +1400,7 @@ mod tests {
         Payloads(vec![Payload {
             data: bytes.to_vec(),
             metadata: BTreeMap::new(),
+            external_payloads: Vec::new(),
         }])
     }
 
@@ -1407,6 +1408,7 @@ mod tests {
         Payload {
             data: bytes.to_vec(),
             metadata: BTreeMap::new(),
+            external_payloads: Vec::new(),
         }
     }
 

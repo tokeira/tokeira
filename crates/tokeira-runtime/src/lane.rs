@@ -599,6 +599,45 @@ where
                                     );
                                 }
                             }
+                            // v1.31.0's resetter fails the fork-point WFT on the
+                            // successor branch with cause ResetWorkflow and
+                            // schedules a fresh task (`AddWorkflowTaskFailedEvent`
+                            // with RESET_WORKFLOW, workflow_resetter.go @ v1.31.0).
+                            // The replayed successor ends with that WFT still
+                            // STARTED (its finish event is the fork point, cut
+                            // from the copied prefix), so the ordinary WFT-failed
+                            // path authors the failure and re-dispatches a fresh
+                            // task. Submitted off-lane: the successor may hash to
+                            // the very lane running this activation.
+                            if let Some(pending) = successor_state.pending_workflow_task.as_ref()
+                                && let Some(started_event_id) = pending.started_event_id
+                            {
+                                let command = tokeira_kernel::Command::WorkflowTaskFailed(
+                                    tokeira_kernel::WorkflowTaskFailedRequest {
+                                        logical_seq: pending.logical_seq,
+                                        started_event_id,
+                                        failure_cause:
+                                            tokeira_kernel::WorkflowTaskFailedCause::ResetWorkflow,
+                                        failure_details: None,
+                                        worker_identity: tokeira_types::WorkerIdentity(
+                                            "reset".into(),
+                                        ),
+                                        now: time::OffsetDateTime::now_utc(),
+                                    },
+                                );
+                                let publisher = publisher.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) =
+                                        publisher.submit_to_run(successor_run_key, command).await
+                                    {
+                                        tracing::error!(
+                                            ?error,
+                                            successor_run_key = ?successor_run_key,
+                                            "failed to fail the reset successor's fork-point workflow task"
+                                        );
+                                    }
+                                });
+                            }
                         }
                     }
                 }

@@ -724,10 +724,15 @@ impl RunRepository for InMemoryStore {
             .get(&base_run_key)
             .ok_or_else(|| anyhow::anyhow!("base history not found: {:?}", base_run_key))?;
 
+        // The fork event is the WFT-FINISH event being reset; the successor
+        // branch keeps only the events BEFORE it — v1.31.0 rebuilds mutable
+        // state to `WorkflowTaskFinishEventId - 1`
+        // (`baseRebuildLastEventID`, resetworkflow/api.go:119 @ v1.31.0). The
+        // replayed successor thus ends with that WFT still started; the reset
+        // flow then fails it with cause ResetWorkflow and re-dispatches.
         let prefix_len = base_history
             .iter()
             .position(|event| event.event_id == fork_event_id)
-            .map(|idx| idx + 1)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "fork_event_id {} outside committed history for {:?}",
@@ -3255,7 +3260,12 @@ mod tests {
         ];
         seed_base_run(&store, base_run_key, base_state.clone(), history).await;
 
-        RunRepository::materialize_reset_successor(&store, base_run_key, 6, successor_run_id)
+        // Fork at the WFT-finish event 4: the successor keeps only events
+        // 1..3 (v1.31.0 rebuilds to `WorkflowTaskFinishEventId - 1`,
+        // resetworkflow/api.go:119) — the reset WFT is still STARTED and the
+        // activity/timer it commanded (events 5/6) never happened on this
+        // branch.
+        RunRepository::materialize_reset_successor(&store, base_run_key, 4, successor_run_id)
             .await
             .unwrap();
 
@@ -3268,10 +3278,15 @@ mod tests {
 
         assert_eq!(successor.run_id, successor_run_id);
         assert_eq!(successor.transition_seq, TransitionSeq::ZERO);
-        assert_eq!(successor.last_event_id, 6);
-        assert!(successor.pending_workflow_task.is_none());
-        assert!(successor.activities.contains_key("a1"));
-        assert!(successor.timers.contains_key("t1"));
+        assert_eq!(successor.last_event_id, 3);
+        let pending = successor
+            .pending_workflow_task
+            .as_ref()
+            .expect("the reset WFT is still started on the successor branch");
+        assert_eq!(pending.scheduled_event_id, 2);
+        assert_eq!(pending.started_event_id, Some(3));
+        assert!(successor.activities.is_empty());
+        assert!(successor.timers.is_empty());
     }
 
     #[tokio::test]
@@ -3423,11 +3438,13 @@ mod tests {
         .unwrap();
         assert_eq!(resolved, Some(successor_run_key));
 
+        // The cut is EXCLUSIVE of the fork event (v1.31.0 rebuilds to
+        // `WorkflowTaskFinishEventId - 1`): only event 1 survives.
         let history = RunRepository::read_history(&store, successor_run_key, 0, 10)
             .await
             .unwrap();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[1].event_id, 2);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].event_id, 1);
     }
 
     proptest! {
@@ -3495,14 +3512,25 @@ mod tests {
                     worker_deployment_name: base_state.worker_deployment_name.clone(),
                     priority: base_state.priority.clone(),
                         },
+                    ),
+                    history_event(
+                        2,
+                        fixed_now(),
+                        HistoryEventKind::WorkflowTaskScheduled {
+                            logical_seq: LogicalTaskSeq::ONE,
+                            task_queue: base_state.task_queue.clone(),
+                            workflow_task_timeout: base_state.workflow_task_timeout,
+                            attempt: 1,
+                        },
                     )],
                 )
                 .await;
 
+                // Exclusive cut: forking at event 2 keeps only the start event.
                 RunRepository::materialize_reset_successor(
                     &store,
                     base_run_key,
-                    1,
+                    2,
                     successor_run_id,
                 )
                 .await

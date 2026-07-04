@@ -3072,6 +3072,7 @@ mod tests {
         let corrupted = Payload {
             data: b"not valid proto bytes".to_vec(),
             metadata: Default::default(),
+            external_payloads: Vec::new(),
         };
         let decoded = payload_to_failure(&corrupted);
         assert_eq!(decoded.message, "not valid proto bytes");

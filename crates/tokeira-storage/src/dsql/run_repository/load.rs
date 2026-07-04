@@ -261,17 +261,20 @@ impl DsqlRunRepository {
                 .await?;
                 let mut copied_events = Vec::new();
                 let mut found_fork = false;
-                // Reset materialization copies only the committed prefix through the
-                // fork event. Replay then derives the successor state, avoiding a
-                // second source of truth for reset snapshots.
+                // Reset materialization copies only the committed prefix BEFORE the
+                // fork event: the fork is the WFT-FINISH event being reset, and
+                // v1.31.0 rebuilds mutable state to `WorkflowTaskFinishEventId - 1`
+                // (`baseRebuildLastEventID`, resetworkflow/api.go:119 @ v1.31.0).
+                // Replay then derives the successor state — ending with the reset
+                // WFT still started, ready for the ResetWorkflow failure — avoiding
+                // a second source of truth for reset snapshots.
                 for (events_data, _first_event_id, _last_event_id) in history_rows {
                     for event in codec::decode_history_events(&events_data)? {
-                        let is_fork = event.event_id == fork_event_id;
-                        copied_events.push(event);
-                        if is_fork {
+                        if event.event_id == fork_event_id {
                             found_fork = true;
                             break;
                         }
+                        copied_events.push(event);
                     }
                     if found_fork {
                         break;

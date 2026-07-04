@@ -943,6 +943,7 @@ fn payloads(value: &str) -> Payloads {
     Payloads(vec![Payload {
         data: value.as_bytes().to_vec(),
         metadata: Default::default(),
+        external_payloads: Vec::new(),
     }])
 }
 
@@ -950,5 +951,6 @@ fn payload(value: &str) -> Payload {
     Payload {
         data: value.as_bytes().to_vec(),
         metadata: Default::default(),
+        external_payloads: Vec::new(),
     }
 }

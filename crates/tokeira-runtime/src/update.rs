@@ -358,6 +358,7 @@ mod tests {
         prop::collection::vec(any::<u8>(), 0..32).prop_map(|data| Payload {
             data,
             metadata: BTreeMap::new(),
+            external_payloads: Vec::new(),
         })
     }
 

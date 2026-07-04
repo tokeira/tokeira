@@ -586,7 +586,11 @@ fn arb_failure_payload() -> impl Strategy<Value = Payload> {
         failure.encode(&mut data).unwrap();
         let mut metadata = BTreeMap::new();
         metadata.insert("encoding".to_string(), "temporal/failure+proto".to_string());
-        Payload { data, metadata }
+        Payload {
+            data,
+            metadata,
+            external_payloads: Vec::new(),
+        }
     })
 }
 

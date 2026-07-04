@@ -2398,6 +2398,7 @@ fn reset_activity_preserves_heartbeat_without_reset_flag() {
     let heartbeat = Payloads(vec![Payload {
         data: b"progress".to_vec(),
         metadata: BTreeMap::new(),
+        external_payloads: Vec::new(),
     }]);
     if let Some(activity) = state.activities.get_mut("activity-1") {
         activity.attempt = 5;

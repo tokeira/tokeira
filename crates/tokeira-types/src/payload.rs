@@ -30,6 +30,23 @@ pub struct Payload {
     /// serialisation order is deterministic, which simplifies
     /// snapshot testing and history comparison.
     pub metadata: BTreeMap<String, String>,
+    /// References to payload content stored OUTSIDE the event blob
+    /// (`Payload.external_payloads` on the wire). The server never
+    /// dereferences these; they round-trip opaquely and feed the
+    /// execution's external-payload statistics
+    /// (`CalculateExternalPayloadSize`,
+    /// service/history/workflow/external_payload_size.go @ v1.31.0).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_payloads: Vec<ExternalPayloadDetail>,
+}
+
+/// A single external-payload reference: the wire proto's
+/// `Payload.ExternalPayloadDetails` (size only — the server counts and
+/// sizes external payloads for execution statistics without ever
+/// dereferencing them).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalPayloadDetail {
+    pub size_bytes: i64,
 }
 
 impl Payload {
@@ -38,6 +55,7 @@ impl Payload {
         Self {
             data: data.into(),
             metadata: BTreeMap::new(),
+            external_payloads: Vec::new(),
         }
     }
 }

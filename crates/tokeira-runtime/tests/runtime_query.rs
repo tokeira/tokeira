@@ -450,5 +450,6 @@ fn payloads(value: &str) -> Payloads {
     Payloads(vec![tokeira_types::Payload {
         data: value.as_bytes().to_vec(),
         metadata: Default::default(),
+        external_payloads: Vec::new(),
     }])
 }

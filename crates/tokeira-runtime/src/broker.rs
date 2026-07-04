@@ -649,6 +649,26 @@ impl InMemoryBroker {
             .collect()
     }
 
+    /// Queues with parked pollers, with the parked-poller count for each.
+    ///
+    /// The drain loop treats each parked poller as one unit of live demand:
+    /// the fairness budget is seeded from COMPLETED polls in the metrics
+    /// window, so a poller that is still parked contributes nothing to it —
+    /// without this count, a queue whose first poller arrived after its tasks
+    /// aged into the backlog would sit at budget 0 forever (the poll can never
+    /// complete without a drain, and the budget can never re-seed without a
+    /// completed poll).
+    pub async fn workflow_waiter_counts(&self) -> HashMap<QueueKey, u32> {
+        self.inner
+            .lock()
+            .await
+            .waiter_counts
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(queue, count)| (queue.clone(), u32::try_from(*count).unwrap_or(u32::MAX)))
+            .collect()
+    }
+
     async fn try_take_query(&self, queue: &QueueKey, worker: &WorkerIdentity) -> Option<QueryTask> {
         let mut inner = self.inner.lock().await;
         let ready = inner.query_ready.get_mut(queue)?;

@@ -3589,16 +3589,14 @@ pub fn get_history_response_to_proto(
 
     workflowservice::GetWorkflowExecutionHistoryResponse {
         history,
-        // Only set next_page_token when there are genuinely more events to
-        // paginate. For close-event filtered responses or complete histories,
-        // an empty token tells the SDK "you have everything."
-        next_page_token: if filter_type == 2 {
-            // Close-event filter: the SDK only needs the close event(s).
-            // Never paginate — return empty token so the SDK stops.
-            vec![]
-        } else {
-            resp.next_page_token
-        },
+        // The edge handler owns token semantics for BOTH filter types: a
+        // close-event-filtered long poll on an OPEN run returns empty events
+        // with a NON-empty token so the client keeps polling until the close
+        // event arrives; only the page delivering the close event (or a
+        // non-long-poll exhausted read) ends pagination
+        // (`getworkflowexecutionhistory/api.go:488` @ v1.31.0;
+        // TestGetWorkflowExecutionHistory_Close pins the open-run token).
+        next_page_token: resp.next_page_token,
         ..Default::default()
     }
 }
@@ -4883,6 +4881,10 @@ fn workflow_execution_info_from_description(
             .as_ref()
             .map(workflow_versioning_info_from_edge),
         worker_deployment_name: value.worker_deployment_name.clone().unwrap_or_default(),
+        // External-payload statistics accumulated over the run's history
+        // (describeworkflow/api.go:166 @ v1.31.0).
+        external_payload_count: value.external_payload_count,
+        external_payload_size_bytes: value.external_payload_size_bytes,
         ..Default::default()
     }
 }
@@ -5685,6 +5687,7 @@ mod tests {
             last_attempt_failure: Some(tokeira_types::Payload {
                 data: b"delivery refused".to_vec(),
                 metadata: std::collections::BTreeMap::new(),
+                external_payloads: Vec::new(),
             }),
             next_attempt_at: Some(next_attempt),
         };
@@ -7142,6 +7145,8 @@ mod tests {
             versioning_info: case.versioning_info.clone(),
             worker_deployment_name: case.worker_deployment_name.clone(),
             request_id_infos: std::collections::BTreeMap::new(),
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
         }
     }
 
@@ -7287,6 +7292,7 @@ mod tests {
         let details = Payloads(vec![tokeira_types::Payload {
             data: b"progress".to_vec(),
             metadata: Default::default(),
+            external_payloads: Vec::new(),
         }]);
         let token = ActivityTaskToken {
             run_key: RunKey(Uuid::nil()),
@@ -7327,6 +7333,7 @@ mod tests {
         let details = Payloads(vec![tokeira_types::Payload {
             data: b"checkpoint".to_vec(),
             metadata: Default::default(),
+            external_payloads: Vec::new(),
         }]);
         let scheduled = OffsetDateTime::from_unix_timestamp(100).unwrap();
         let current_attempt = OffsetDateTime::from_unix_timestamp(200).unwrap();
@@ -7372,6 +7379,7 @@ mod tests {
         let payloads = Payloads(vec![tokeira_types::Payload {
             data: b"input".to_vec(),
             metadata: Default::default(),
+            external_payloads: Vec::new(),
         }]);
         let proto = poll_response_to_proto(crate::translate::PollWorkflowTaskQueueResponse {
             task_token: b"query-token".to_vec(),
@@ -7414,6 +7422,7 @@ mod tests {
         let payloads = Payloads(vec![tokeira_types::Payload {
             data: b"payload".to_vec(),
             metadata: Default::default(),
+            external_payloads: Vec::new(),
         }]);
 
         let completed = respond_activity_completed_by_id_to_edge(
@@ -7590,6 +7599,7 @@ mod tests {
         let details = Payloads(vec![tokeira_types::Payload {
             data: b"stack-trace".to_vec(),
             metadata: Default::default(),
+            external_payloads: Vec::new(),
         }]);
         let req = workflowservice::TerminateWorkflowExecutionRequest {
             namespace: "ns".to_string(),
@@ -7826,6 +7836,7 @@ mod tests {
         let corrupted = tokeira_types::Payload {
             data: b"garbage bytes".to_vec(),
             metadata: Default::default(),
+            external_payloads: Vec::new(),
         };
         let decoded = payload_to_failure(&corrupted);
         assert_eq!(decoded.message, "garbage bytes");

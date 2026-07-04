@@ -23,7 +23,13 @@ pub fn payload_from_domain(value: &DomainPayload) -> common::Payload {
             .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
             .collect(),
         data: value.data.clone(),
-        external_payloads: Vec::new(),
+        external_payloads: value
+            .external_payloads
+            .iter()
+            .map(|detail| common::payload::ExternalPayloadDetails {
+                size_bytes: detail.size_bytes,
+            })
+            .collect(),
     }
 }
 
@@ -35,6 +41,13 @@ pub fn payload_to_domain(value: &common::Payload) -> DomainPayload {
             .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
             .collect(),
         data: value.data.clone(),
+        external_payloads: value
+            .external_payloads
+            .iter()
+            .map(|detail| tokeira_types::ExternalPayloadDetail {
+                size_bytes: detail.size_bytes,
+            })
+            .collect(),
     }
 }
 
@@ -44,6 +57,7 @@ pub fn failure_to_payload(value: &failure_proto::Failure) -> DomainPayload {
     DomainPayload {
         data: value.encode_to_vec(),
         metadata,
+        external_payloads: Vec::new(),
     }
 }
 

@@ -4539,6 +4539,7 @@ fn activity_id_not_started_details() -> Payloads {
     Payloads(vec![tokeira_types::Payload {
         data: b"\"ACTIVITY_ID_NOT_STARTED\"".to_vec(),
         metadata,
+        external_payloads: Vec::new(),
     }])
 }
 

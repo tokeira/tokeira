@@ -5084,7 +5084,13 @@ impl WorkflowService {
                         .history_waiters
                         .receiver(run_key, current_last_event_id)
                         .await;
-                    if tokio::time::timeout(Duration::from_secs(60), wait.changed())
+                    // Long-poll hold interval mirrors v1.31.0's
+                    // `history.longPollExpirationInterval` default of 20s
+                    // (`HistoryLongPollExpirationInterval`,
+                    // common/dynamicconfig/constants.go @ v1.31.0): on expiry
+                    // the poll returns an empty page with a live token and the
+                    // client re-polls.
+                    if tokio::time::timeout(Duration::from_secs(20), wait.changed())
                         .await
                         .is_err()
                     {
@@ -5989,6 +5995,7 @@ mod tests {
             input: Payloads(vec![Payload {
                 metadata: Default::default(),
                 data: b"input".to_vec(),
+                external_payloads: Vec::new(),
             }]),
             wait_policy,
             timeout: std::time::Duration::from_millis(20),

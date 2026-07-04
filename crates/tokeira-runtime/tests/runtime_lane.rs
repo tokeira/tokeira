@@ -708,6 +708,53 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
     Ok(())
 }
 
+// A WFT published with NO poller parked ages past the grace window into the
+// durable backlog; a poller arriving later must still receive it via the
+// demand-driven drain loop (TestGetWorkflowExecutionHistory_All starts the
+// workflow 8s before its first poll and hung forever on this path).
+#[tokio::test]
+async fn late_poller_receives_workflow_task_from_backlog() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let runtime = TokeiraRuntime::new(
+        store.clone(),
+        2,
+        LaneConfig::default(),
+        TimerScannerConfig::default(),
+        WorkflowTimeoutScannerConfig::default(),
+        BacklogConfig {
+            workflow_grace_window: tokio::time::Duration::from_millis(100),
+            activity_grace_window: tokio::time::Duration::from_millis(100),
+            grace_scan_interval: tokio::time::Duration::from_millis(25),
+            drain_interval: tokio::time::Duration::from_millis(50),
+            drain_batch_limit: 100,
+        },
+    );
+    let namespace_id = NamespaceId::new();
+    let workflow_id = WorkflowId("workflow-late-poller".to_string());
+
+    let start = runtime
+        .start_workflow(start_request(namespace_id, workflow_id, "req-late-poller"))
+        .await?;
+    let started_state = applied_state(&start);
+
+    // Let the unclaimed task expire out of the in-memory broker into the
+    // durable backlog before the first poller ever shows up.
+    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+
+    let task = runtime
+        .poll_workflow_task(
+            queue(namespace_id, "queue-a"),
+            WorkerIdentity("late-worker".to_string()),
+            tokio::time::Duration::from_secs(5),
+        )
+        .await?
+        .expect("late poller must receive the backlogged workflow task");
+    assert_eq!(task.run_key, started_state.run_key);
+    assert_eq!(task.token.logical_seq, LogicalTaskSeq::ONE);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn burst_signals_produce_complete_history() -> Result<()> {
     let store = Arc::new(InMemoryStore::default());

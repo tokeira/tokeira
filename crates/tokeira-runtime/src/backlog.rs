@@ -81,6 +81,11 @@ pub(crate) async fn scan_grace_once<R>(
     if expired_workflow.is_empty() && expired_activity.is_empty() {
         return;
     }
+    tracing::debug!(
+        workflow_tasks = expired_workflow.len(),
+        activity_tasks = expired_activity.len(),
+        "demoting grace-expired live-ready tasks to durable backlog"
+    );
 
     let mut entries = Vec::with_capacity(expired_workflow.len() + expired_activity.len());
     entries.extend(expired_workflow.iter().map(workflow_to_backlog_entry));
@@ -147,11 +152,23 @@ pub(crate) async fn drain_once<R>(
 ) where
     R: RunRepository + ?Sized,
 {
-    for queue in broker.queues_with_waiters().await {
-        let budget = fairness.remaining_budget(&queue);
-        if budget == 0 {
-            continue;
-        }
+    let waiting_queues = broker.workflow_waiter_counts().await;
+    if !waiting_queues.is_empty() {
+        tracing::trace!(
+            queue_count = waiting_queues.len(),
+            "drain tick: queues with parked workflow pollers"
+        );
+    }
+    for (queue, parked_pollers) in waiting_queues {
+        // The fairness budget is seeded from COMPLETED polls (`share ×
+        // recent_poll_count`), but a parked long-poll only counts once it
+        // completes — so a queue whose first poller arrived after its tasks
+        // aged into the backlog would re-seed to 0 forever: no drain → the
+        // poll never completes → no polls in the window → budget 0. Each
+        // PARKED poller is one unit of live, unmet demand, so it floors the
+        // effective budget; a hot queue's throughput is still capped by its
+        // fairness allotment.
+        let budget = fairness.remaining_budget(&queue).max(parked_pollers);
         let limit = (budget as usize).min(config.drain_batch_limit);
         match repo.drain_backlog(&queue, limit).await {
             Ok(entries) => {
@@ -191,6 +208,11 @@ pub(crate) async fn drain_once<R>(
                     }
                 }
                 if drained_count > 0 {
+                    tracing::debug!(
+                        ?queue,
+                        drained_count,
+                        "re-hydrated workflow tasks from durable backlog"
+                    );
                     fairness.consume_budget(&queue, drained_count as u32);
                     metrics.set_backlog_age(&queue, max_age);
                 }
@@ -614,6 +636,71 @@ mod tests {
         assert_eq!(calls, vec![queue.clone()]);
         let delivered = waiter.await.unwrap();
         assert!(delivered.is_some());
+    }
+
+    // The budget-livelock spine (TestGetWorkflowExecutionHistory_All): the
+    // control loop re-seeds budget from COMPLETED polls, so a queue whose
+    // first poller arrives after its task aged into the backlog sits at
+    // budget 0 with the poll parked — and the parked poll can never complete
+    // to earn budget. A parked poller must floor the effective drain budget.
+    #[tokio::test]
+    async fn drain_serves_parked_poller_despite_zero_fairness_budget() {
+        let repo = MockBacklogRepo::default();
+        let broker = InMemoryBroker::default();
+        let activity_broker = InMemoryActivityBroker::default();
+        let fairness = FairnessState::new();
+        let metrics = DeliveryMetrics::new();
+        let queue = workflow_queue();
+        // Simulate the control tick that seeded this queue's budget from an
+        // empty poll window (share × 0 completed polls = 0).
+        fairness.apply_adjustment(
+            std::collections::HashMap::from([(queue.clone(), 0.5)]),
+            &std::collections::HashMap::new(),
+            OffsetDateTime::now_utc(),
+        );
+        assert_eq!(fairness.remaining_budget(&queue), 0);
+        repo.drained.lock().unwrap().insert(
+            queue.clone(),
+            VecDeque::from(vec![BacklogEntry {
+                run_key: RunKey::new(),
+                queue: queue.clone(),
+                payload: BacklogPayload::Workflow {
+                    logical_seq: LogicalTaskSeq::ONE,
+                },
+                scheduled_at: OffsetDateTime::now_utc(),
+                insertion_seq: 0,
+            }]),
+        );
+
+        let broker_clone = broker.clone();
+        let queue_clone = queue.clone();
+        let waiter = tokio::spawn(async move {
+            broker_clone
+                .poll_workflow_task(
+                    &queue_clone,
+                    &tokeira_types::WorkerIdentity("worker".into()),
+                    std::time::Duration::from_millis(50),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+
+        drain_once(
+            &broker,
+            &activity_broker,
+            &repo,
+            &BacklogConfig::default(),
+            &fairness,
+            &metrics,
+        )
+        .await;
+
+        let delivered = waiter.await.unwrap();
+        assert!(
+            delivered.is_some(),
+            "a parked poller is live demand and must not be starved by a zero budget"
+        );
     }
 
     proptest! {

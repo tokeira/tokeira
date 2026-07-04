@@ -696,5 +696,6 @@ fn payloads(value: &str) -> Payloads {
     Payloads(vec![tokeira_types::Payload {
         metadata: std::collections::BTreeMap::new(),
         data: value.as_bytes().to_vec(),
+        external_payloads: Vec::new(),
     }])
 }

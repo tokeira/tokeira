@@ -588,7 +588,11 @@ fn arb_payload() -> impl Strategy<Value = Payload> {
         prop::collection::btree_map(arb_small_string(), arb_small_string(), 0..3),
         prop::collection::vec(any::<u8>(), 0..8),
     )
-        .prop_map(|(metadata, data)| Payload { metadata, data })
+        .prop_map(|(metadata, data)| Payload {
+            metadata,
+            data,
+            external_payloads: Vec::new(),
+        })
 }
 
 fn arb_payloads() -> impl Strategy<Value = Payloads> {
@@ -961,6 +965,8 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                 versioning_info: None,
                 worker_deployment_name: None,
                 request_id_infos: std::collections::BTreeMap::new(),
+                external_payload_count: 0,
+                external_payload_size_bytes: 0,
             },
         )
 }

@@ -550,10 +550,7 @@ mod tests {
 
     #[test]
     fn split_top_level_lone_between_does_not_split() {
-        assert_eq!(
-            split_top_level("StartTime BETWEEN 1 AND 2", " AND "),
-            None
-        );
+        assert_eq!(split_top_level("StartTime BETWEEN 1 AND 2", " AND "), None);
     }
 
     fn arb_system_string_field() -> impl Strategy<Value = &'static str> {

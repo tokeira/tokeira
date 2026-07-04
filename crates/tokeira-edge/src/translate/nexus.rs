@@ -599,7 +599,11 @@ pub fn nexus_failure_to_kernel_payload(
     })?;
     let mut metadata = BTreeMap::new();
     metadata.insert("encoding".to_string(), "json/plain".to_string());
-    Ok(Payload { data, metadata })
+    Ok(Payload {
+        data,
+        metadata,
+        external_payloads: Vec::new(),
+    })
 }
 
 fn single_payload_to_payloads(payload: Option<tokeira_proto::public::common::Payload>) -> Payloads {
@@ -643,6 +647,7 @@ mod tests {
         Payload {
             data: bytes,
             metadata: BTreeMap::new(),
+            external_payloads: Vec::new(),
         }
     }
 

@@ -253,6 +253,7 @@ fn failure_body(message: &str) -> Vec<u8> {
                 "encoding".to_string(),
                 "json/plain".to_string(),
             )]),
+            external_payloads: Vec::new(),
         },
     }
     .encode()

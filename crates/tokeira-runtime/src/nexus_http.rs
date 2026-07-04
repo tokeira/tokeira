@@ -627,6 +627,7 @@ pub fn body_to_payloads(body: &[u8], content_type: Option<&str>) -> Payloads {
         return Payloads(vec![Payload {
             data: body.to_vec(),
             metadata,
+            external_payloads: Vec::new(),
         }]);
     };
 
@@ -670,6 +671,7 @@ pub fn body_to_payloads(body: &[u8], content_type: Option<&str>) -> Payloads {
     Payloads(vec![Payload {
         data: body.to_vec(),
         metadata,
+        external_payloads: Vec::new(),
     }])
 }
 
@@ -683,6 +685,7 @@ fn decode_x_temporal_payload(body: &[u8]) -> Option<Payload> {
             .into_iter()
             .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
             .collect(),
+        external_payloads: Vec::new(),
     })
 }
 
@@ -903,6 +906,7 @@ mod tests {
         let input = Payloads(vec![Payload {
             data: b"\"input\"".to_vec(),
             metadata: BTreeMap::from([("encoding".to_owned(), "json/plain".to_owned())]),
+            external_payloads: Vec::new(),
         }]);
         let (body, content_type) = payload_to_body(&input);
         assert_eq!(body, b"\"input\"");
@@ -1164,6 +1168,7 @@ mod tests {
                 NexusCompletion::Succeeded(Payloads(vec![Payload {
                     data: b"\"r\"".to_vec(),
                     metadata: BTreeMap::from([("encoding".to_owned(), "json/plain".to_owned())]),
+                    external_payloads: Vec::new(),
                 }])),
                 &[],
             )

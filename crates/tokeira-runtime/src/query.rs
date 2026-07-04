@@ -239,6 +239,7 @@ mod tests {
                             tokeira_types::Payload {
                                 data: data.as_bytes().to_vec(),
                                 metadata: Default::default(),
+                                external_payloads: Vec::new(),
                             },
                         ]),
                     }

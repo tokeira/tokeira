@@ -389,6 +389,12 @@ pub struct WorkflowExecutionDescription {
     /// Per-request → authoring-event map for `WorkflowExtendedInfo.request_id_infos`
     /// (the start request → STARTED, each UseExisting attach → OPTIONS_UPDATED).
     pub request_id_infos: std::collections::BTreeMap<String, tokeira_kernel::RequestIdInfo>,
+    /// Count of external-payload references across the run's history
+    /// (`executionStats.ExternalPayloadCount` surfaced by Describe,
+    /// describeworkflow/api.go:166 @ v1.31.0).
+    pub external_payload_count: i64,
+    /// Total declared size of those external payloads in bytes.
+    pub external_payload_size_bytes: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1145,3 +1151,95 @@ pub struct ResetActivityRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResetActivityResponse;
+
+/// Sum the external-payload references across a run's history events.
+///
+/// Mirrors `CalculateExternalPayloadSize` (`proxy.VisitPayloads` over every
+/// event, `service/history/workflow/external_payload_size.go @ v1.31.0`):
+/// every `Payload` anywhere in an event contributes its `external_payloads`
+/// count and declared byte sizes. Rather than enumerating every
+/// payload-bearing field of every event variant (which would silently go
+/// stale as variants grow), the fold walks the event's serde tree: the domain
+/// `Payload` is the ONLY type that serializes an `external_payloads` array
+/// (and only when non-empty), so each occurrence is exactly one payload's
+/// details. Search attributes are typed values — never `Payload` — so they
+/// are naturally excluded, matching v1.31.0's `SkipSearchAttributes`.
+pub fn external_payload_stats(events: &[tokeira_kernel::HistoryEvent]) -> (i64, i64) {
+    fn walk(value: &serde_json::Value, count: &mut i64, size: &mut i64) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Array(details)) = map.get("external_payloads") {
+                    for detail in details {
+                        if let Some(bytes) = detail.get("size_bytes").and_then(|v| v.as_i64()) {
+                            *count += 1;
+                            *size += bytes;
+                        }
+                    }
+                }
+                for entry in map.values() {
+                    walk(entry, count, size);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, count, size);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut count = 0;
+    let mut size = 0;
+    for event in events {
+        if let Ok(value) = serde_json::to_value(event) {
+            walk(&value, &mut count, &mut size);
+        }
+    }
+    (count, size)
+}
+
+#[cfg(test)]
+mod external_payload_stats_tests {
+    use super::*;
+    use tokeira_types::{ExternalPayloadDetail, Payload, Payloads};
+
+    #[test]
+    fn counts_external_payload_details_across_event_payloads() {
+        let mut input_payload = Payload::new(Vec::new());
+        input_payload.external_payloads = vec![ExternalPayloadDetail { size_bytes: 1024 }];
+        let mut activity_payload = Payload::new(Vec::new());
+        activity_payload.external_payloads = vec![
+            ExternalPayloadDetail { size_bytes: 2048 },
+            ExternalPayloadDetail { size_bytes: 8 },
+        ];
+        let events = vec![
+            tokeira_kernel::HistoryEvent {
+                event_id: 1,
+                happened_at: time::OffsetDateTime::UNIX_EPOCH,
+                kind: tokeira_kernel::HistoryEventKind::WorkflowExecutionSignaled {
+                    signal_name: "s".into(),
+                    input: Payloads(vec![input_payload]),
+                    header: None,
+                    links: Vec::new(),
+                    identity: None,
+                    request_id: "r".into(),
+                },
+            },
+            tokeira_kernel::HistoryEvent {
+                event_id: 2,
+                happened_at: time::OffsetDateTime::UNIX_EPOCH,
+                kind: tokeira_kernel::HistoryEventKind::WorkflowExecutionSignaled {
+                    signal_name: "s2".into(),
+                    input: Payloads(vec![activity_payload, Payload::new(b"plain".to_vec())]),
+                    header: None,
+                    links: Vec::new(),
+                    identity: None,
+                    request_id: "r2".into(),
+                },
+            },
+        ];
+
+        assert_eq!(external_payload_stats(&events), (3, 1024 + 2048 + 8));
+    }
+}

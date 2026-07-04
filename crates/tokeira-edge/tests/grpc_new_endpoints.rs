@@ -221,6 +221,8 @@ impl StoreExecutionResolver {
                 versioning_info: state.versioning_info.clone(),
                 worker_deployment_name: state.worker_deployment_name.clone(),
                 request_id_infos: state.request_id_infos.clone(),
+                external_payload_count: 0,
+                external_payload_size_bytes: 0,
             })),
             LoadedRun::Absent => Err(anyhow::anyhow!("resolved run missing")),
         }

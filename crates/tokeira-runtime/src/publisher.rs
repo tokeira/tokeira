@@ -1260,6 +1260,7 @@ fn external_handler_error_resolution(
                     "encoding".to_string(),
                     "json/plain".to_string(),
                 )]),
+                external_payloads: Vec::new(),
             };
             Some(payloads_from_domain(&Payloads(vec![payload])))
         };

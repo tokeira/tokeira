@@ -203,6 +203,13 @@ impl From<anyhow::Error> for EdgeError {
                     .to_string(),
             );
         }
+        // An invalid workflow command fails the WFT server-side and errors the
+        // completion with INVALID_ARGUMENT carrying the cause message — the
+        // corpus asserts err.Error() == "UnhandledCommand" exactly
+        // (respondworkflowtaskcompleted/api.go:739-742 @ v1.31.0).
+        if let Some(invalid) = value.downcast_ref::<tokeira_runtime::InvalidWorkflowCommand>() {
+            return Self::BadRequest(invalid.message.clone());
+        }
         match value.downcast::<tokeira_runtime::NotShardOwner>() {
             Ok(not_owner) => Self::NotShardOwner {
                 bundle_id: not_owner.bundle_id,

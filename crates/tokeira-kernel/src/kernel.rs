@@ -1548,12 +1548,6 @@ impl BasicKernel {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
-        // Kept aside so an invalid command can convert this completion into a
-        // WFT failure against the ORIGINAL state (v1.31.0 writes no
-        // WorkflowTaskCompleted event in that case — the whole completion is
-        // replaced by the failure; `failWorkflowTaskOnInvalidArgument`
-        // @ v1.31.0).
-        let fallback_state = state.clone();
         let mut builder = TransitionBuilder::new(state, req.now);
 
         // Capture last_event_id before emitting the completion event.
@@ -1610,7 +1604,6 @@ impl BasicKernel {
             req.deployment_version,
             req.worker_deployment_name,
         );
-        let worker_identity_for_failure = req.identity.clone();
         // Sticky raise S1: the completion's sticky attributes carry the
         // sticky QUEUE and the per-dispatch schedule-to-start timeout; a
         // completion without them clears the affinity (`ClearStickyTaskQueue`
@@ -1627,35 +1620,19 @@ impl BasicKernel {
             if closed {
                 return Err(Reject::CommandsAfterClose { index });
             }
-            closed = match apply_workflow_command(
+            // An invalid command REJECTS the completion; the runtime then
+            // fails the WORKFLOW TASK with the carried cause and surfaces
+            // InvalidArgument to the worker — mirroring v1.31.0's split
+            // between the command handler (collects `wtFailedCause`) and the
+            // API layer (`failWorkflowTask` + error return,
+            // respondworkflowtaskcompleted/api.go:455-485,739-742).
+            closed = apply_workflow_command(
                 &mut builder,
                 command,
                 wft_completed_event_id,
                 cron_continuation.as_ref(),
                 retry_continuation.as_ref(),
-            ) {
-                Ok(closed) => closed,
-                // Invalid command attributes fail the WORKFLOW TASK with the
-                // command's cause — the completion (and everything the loop
-                // built so far) is discarded and the WFT takes the failed
-                // path against the pre-completion state
-                // (`failWorkflowTaskOnInvalidArgument`,
-                // workflow_task_completed_handler.go @ v1.31.0).
-                Err(Reject::InvalidCommandAttributes { cause, message: _ }) => {
-                    return self.apply_workflow_task_failed(
-                        LoadedRun::Existing(fallback_state),
-                        WorkflowTaskFailedRequest {
-                            logical_seq: req.token.logical_seq,
-                            started_event_id: req.token.started_event_id,
-                            failure_cause: cause,
-                            failure_details: None,
-                            worker_identity: worker_identity_for_failure,
-                            now: req.now,
-                        },
-                    );
-                }
-                Err(reject) => return Err(reject),
-            };
+            )?;
         }
 
         // Flush buffered events after the completion's command events and
@@ -3404,6 +3381,18 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::CompleteWorkflow { result } => {
+            // A close command with buffered events is an UnhandledCommand:
+            // the workflow must observe the buffered events before closing
+            // (`hasBufferedEventsOrMessages` guards in the close handlers,
+            // workflow_task_completed_handler.go @ v1.31.0). Message is the
+            // cause's exact string — the corpus asserts err.Error() ==
+            // "UnhandledCommand".
+            if !builder.state.buffered_events.is_empty() {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::UnhandledCommand,
+                    message: "UnhandledCommand".to_string(),
+                });
+            }
             if let Some(cron) = cron_continuation {
                 builder.state.close_result = Some(result.clone());
                 emit_cron_continue_as_new(
@@ -3425,6 +3414,18 @@ fn apply_workflow_command(
             Ok(true)
         }
         WorkflowCommand::FailWorkflow { failure } => {
+            // A close command with buffered events is an UnhandledCommand:
+            // the workflow must observe the buffered events before closing
+            // (`hasBufferedEventsOrMessages` guards in the close handlers,
+            // workflow_task_completed_handler.go @ v1.31.0). Message is the
+            // cause's exact string — the corpus asserts err.Error() ==
+            // "UnhandledCommand".
+            if !builder.state.buffered_events.is_empty() {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::UnhandledCommand,
+                    message: "UnhandledCommand".to_string(),
+                });
+            }
             builder.state.close_failure = Some(failure.clone());
             let attempt = builder.state.attempt;
             // Precedence is resolved in the runtime, which supplies at most one
@@ -3495,6 +3496,18 @@ fn apply_workflow_command(
             workflow_task_timeout,
             retry_policy,
         } => {
+            // A close command with buffered events is an UnhandledCommand:
+            // the workflow must observe the buffered events before closing
+            // (`hasBufferedEventsOrMessages` guards in the close handlers,
+            // workflow_task_completed_handler.go @ v1.31.0). Message is the
+            // cause's exact string — the corpus asserts err.Error() ==
+            // "UnhandledCommand".
+            if !builder.state.buffered_events.is_empty() {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::UnhandledCommand,
+                    message: "UnhandledCommand".to_string(),
+                });
+            }
             builder.emit(HistoryEventKind::WorkflowExecutionContinuedAsNew {
                 workflow_task_completed_event_id,
                 new_run_id,
@@ -3520,6 +3533,18 @@ fn apply_workflow_command(
             Ok(true)
         }
         WorkflowCommand::CancelWorkflow => {
+            // A close command with buffered events is an UnhandledCommand:
+            // the workflow must observe the buffered events before closing
+            // (`hasBufferedEventsOrMessages` guards in the close handlers,
+            // workflow_task_completed_handler.go @ v1.31.0). Message is the
+            // cause's exact string — the corpus asserts err.Error() ==
+            // "UnhandledCommand".
+            if !builder.state.buffered_events.is_empty() {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::UnhandledCommand,
+                    message: "UnhandledCommand".to_string(),
+                });
+            }
             builder.emit(HistoryEventKind::WorkflowExecutionCanceled {
                 workflow_task_completed_event_id,
                 details: None,

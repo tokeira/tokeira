@@ -1121,7 +1121,7 @@ where
         let transition = transition_span.in_scope(|| {
             kernel
                 .apply(loaded, command.clone())
-                .map_err(|reject| anyhow!("kernel rejected command: {reject}"))
+                .map_err(|reject| anyhow::Error::new(KernelRejected(reject)))
         })?;
         transition_span.record("tokeira.run_id", transition.next_state.run_id.0.to_string());
         transition_span.record(
@@ -1263,6 +1263,17 @@ fn storage_commit_span(
         tokeira.bundle_id = execution_home_bundle.0,
     )
 }
+
+/// A kernel [`Reject`](tokeira_kernel::Reject) crossing the lane boundary.
+///
+/// Display is identical to the old stringified form ("kernel rejected
+/// command: …") so every existing string matcher keeps working, while the
+/// typed reject stays downcastable — the completion path needs
+/// [`tokeira_kernel::Reject::InvalidCommandAttributes`] to run v1.31.0's
+/// fail-the-WFT-then-error contract.
+#[derive(Debug, thiserror::Error)]
+#[error("kernel rejected command: {0}")]
+pub struct KernelRejected(pub tokeira_kernel::Reject);
 
 fn command_type_name(command: &Command) -> &'static str {
     match command {

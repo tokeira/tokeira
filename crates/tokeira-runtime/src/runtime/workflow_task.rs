@@ -406,6 +406,8 @@ where
             return Err(error);
         }
         let run_key = req.token.run_key;
+        let completion_token = req.token.clone();
+        let completion_identity = req.identity.clone();
         let cron_continuation = self.cron_continuation_for_completion(run_key, &req).await?;
         // Retry is evaluated before cron (retry.go @ v1.31.0). The cron helper
         // already declines when a retry policy is present on a FailWorkflow, so
@@ -437,6 +439,45 @@ where
             (None, None) => Command::WorkflowTaskCompleted(req),
         };
         let result = self.submit_for_owned_shard(run_key, command).await;
+        // v1.31.0's invalid-command contract: the completion is discarded, the
+        // WORKFLOW TASK is failed with the command's cause (persisted — unless
+        // a transient attempt keeps failing on a non-UnhandledCommand cause,
+        // which is dropped to time out instead), and the completion call
+        // errors with INVALID_ARGUMENT carrying the cause message
+        // (respondworkflowtaskcompleted/api.go:455-485,739-742).
+        if let Err(error) = &result
+            && let Some(crate::lane::KernelRejected(
+                tokeira_kernel::Reject::InvalidCommandAttributes { cause, message },
+            )) = error.downcast_ref()
+        {
+            let cause = cause.clone();
+            let message = message.clone();
+            runtime_metrics::record_workflow_task_completed(OutcomeLabel::Rejected);
+            let drop_without_failing = completion_token.attempt > 1
+                && cause != tokeira_kernel::WorkflowTaskFailedCause::UnhandledCommand;
+            if !drop_without_failing
+                && let Err(error) = self
+                    .submit_for_owned_shard(
+                        run_key,
+                        Command::WorkflowTaskFailed(tokeira_kernel::WorkflowTaskFailedRequest {
+                            logical_seq: completion_token.logical_seq,
+                            started_event_id: completion_token.started_event_id,
+                            failure_cause: cause,
+                            failure_details: None,
+                            worker_identity: completion_identity,
+                            now: OffsetDateTime::now_utc(),
+                        }),
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    ?error,
+                    run_key = ?run_key,
+                    "failed to persist WFT failure for invalid command"
+                );
+            }
+            return Err(crate::errors::InvalidWorkflowCommand { message }.into());
+        }
         match &result {
             Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
                 runtime_metrics::record_workflow_task_completed(OutcomeLabel::Success);

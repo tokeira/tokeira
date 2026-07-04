@@ -14,7 +14,7 @@ use tokeira_kernel::{
     NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
     PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
     PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Priority,
-    ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryContinuation,
+    Reject, ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryContinuation,
     RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
     TimerDueRequest, TimerOp, TimerState, Transition, UnpauseActivityRequest,
     UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
@@ -5432,29 +5432,67 @@ proptest! {
                 )
                 .unwrap()
         } else {
-            kernel
+            // A worker CANNOT close past buffered events — the close command
+            // is an UnhandledCommand (Tier 1.6; `hasBufferedEventsOrMessages`
+            // close guards @ v1.31.0). The run stays open with its buffer;
+            // only force-closes (terminate branch above) drop it.
+            let rejected = kernel.apply(
+                LoadedRun::Existing(buffered.clone()),
+                Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    token: WorkflowTaskToken {
+                        run_key,
+                        logical_seq: LogicalTaskSeq(30),
+                        started_event_id: 13,
+                        attempt: 1,
+                        shard_epoch: ShardEpoch::ZERO,
+                    },
+                    identity: WorkerIdentity("worker".into()),
+                    sdk_metadata: None,
+                    metering_metadata: None,
+                    worker_version: None,
+                    versioning_behavior: VersioningBehavior::Unspecified,
+                    deployment_version: None,
+                    worker_deployment_name: None,
+                    sticky: None,
+                    commands: vec![WorkflowCommand::CompleteWorkflow {
+                        result: payloads("done"),
+                    }],
+                    force_new_workflow_task: false,
+                    now,
+                }),
+            );
+            prop_assert_eq!(
+                rejected,
+                Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::UnhandledCommand,
+                    message: "UnhandledCommand".to_string(),
+                })
+            );
+            // The runtime then fails the WFT; the failure flushes the buffer
+            // onto a fresh attempt-1 task, after which a clean close drops
+            // nothing. Model that here to keep the closed-run invariant.
+            let failed = kernel
                 .apply(
                     LoadedRun::Existing(buffered),
-                    Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-                        token: WorkflowTaskToken {
-                            run_key,
-                            logical_seq: LogicalTaskSeq(30),
-                            started_event_id: 13,
-                            attempt: 1,
-                            shard_epoch: ShardEpoch::ZERO,
-                        },
-                        identity: WorkerIdentity("worker".into()),
-                        sdk_metadata: None,
-                        metering_metadata: None,
-                        worker_version: None,
-                        versioning_behavior: VersioningBehavior::Unspecified,
-                        deployment_version: None,
-                        worker_deployment_name: None,
-                        sticky: None,
-                        commands: vec![WorkflowCommand::CompleteWorkflow {
-                            result: payloads("done"),
-                        }],
-                        force_new_workflow_task: false,
+                    Command::WorkflowTaskFailed(tokeira_kernel::WorkflowTaskFailedRequest {
+                        logical_seq: LogicalTaskSeq(30),
+                        started_event_id: 13,
+                        failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
+                        failure_details: None,
+                        worker_identity: WorkerIdentity("worker".into()),
+                        now,
+                    }),
+                )
+                .unwrap();
+            prop_assert!(failed.next_state.buffered_events.is_empty());
+            kernel
+                .apply(
+                    LoadedRun::Existing(failed.next_state),
+                    Command::Terminate(TerminateRequest {
+                        reason: "p5-after-fail".into(),
+                        details: None,
+                        identity: "tester".into(),
+                        request: request_context("p5-terminate-2", now),
                         now,
                     }),
                 )

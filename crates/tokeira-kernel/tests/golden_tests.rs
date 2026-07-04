@@ -4300,51 +4300,99 @@ fn request_cancel_activity_started_sets_durable_cancel_requested() {
 #[test]
 fn request_cancel_activity_unknown() {
     let state = make_open_state_with_started_wft();
-    let transition = kernel()
-        .apply(
-            LoadedRun::Existing(state.clone()),
-            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-                token: WorkflowTaskToken {
-                    run_key: state.run_key,
-                    logical_seq: LogicalTaskSeq(3),
-                    started_event_id: 9,
-                    attempt: 1,
-                    shard_epoch: ShardEpoch::ZERO,
-                },
-                identity: WorkerIdentity("worker".into()),
-                sdk_metadata: None,
-                metering_metadata: None,
-                worker_version: None,
-                versioning_behavior: VersioningBehavior::Unspecified,
-                deployment_version: None,
-                worker_deployment_name: None,
-                sticky: None,
-                commands: vec![WorkflowCommand::RequestCancelActivity {
-                    scheduled_event_id: 999,
-                }],
-                force_new_workflow_task: false,
-                now: now(),
-            }),
-        )
-        .unwrap();
+    let transition = kernel().apply(
+        LoadedRun::Existing(state.clone()),
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            token: WorkflowTaskToken {
+                run_key: state.run_key,
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![WorkflowCommand::RequestCancelActivity {
+                scheduled_event_id: 999,
+            }],
+            force_new_workflow_task: false,
+            now: now(),
+        }),
+    );
 
-    // K4: an unknown scheduled_event_id FAILS THE WORKFLOW TASK with
-    // BAD_REQUEST_CANCEL_ACTIVITY_ATTRIBUTES — the completion (and its
-    // WorkflowTaskCompleted event) is discarded, not rejected
-    // (`failWorkflowTaskOnInvalidArgument` @ v1.31.0).
-    assert!(transition.history_events.iter().any(|event| matches!(
-        &event.kind,
-        HistoryEventKind::WorkflowTaskFailed {
-            failure_cause:
-                tokeira_kernel::WorkflowTaskFailedCause::BadRequestCancelActivityAttributes,
-            ..
-        }
-    )));
-    assert!(
-        !transition
-            .history_events
-            .iter()
-            .any(|event| matches!(&event.kind, HistoryEventKind::WorkflowTaskCompleted { .. }))
+    // K4 (revised in Tier 1.6): an unknown scheduled_event_id REJECTS the
+    // completion with the WFT-failure cause; the RUNTIME then persists the
+    // WorkflowTaskFailed transition and errors the call with
+    // INVALID_ARGUMENT — v1.31.0's handler/API split
+    // (respondworkflowtaskcompleted/api.go:455-485,739-742).
+    assert_eq!(
+        transition,
+        Err(Reject::InvalidCommandAttributes {
+            cause: tokeira_kernel::WorkflowTaskFailedCause::BadRequestCancelActivityAttributes,
+            message: "ScheduledEventID: 999".to_string(),
+        })
+    );
+}
+
+#[test]
+fn close_command_with_buffered_events_is_unhandled_command() {
+    // TestNoTransientWorkflowTaskAfterFlushBufferedEvents' spine: an event
+    // buffered during the started WFT makes any CLOSE command an
+    // UnhandledCommand — the completion rejects with the exact cause string
+    // the corpus asserts as err.Error() ("UnhandledCommand"); the runtime
+    // fails the WFT and the buffered event flushes onto a fresh attempt-1
+    // task (`hasBufferedEventsOrMessages` close guards @ v1.31.0).
+    let mut state = make_open_state_with_started_wft();
+    state
+        .buffered_events
+        .push(tokeira_kernel::state::BufferedEvent {
+            admitted_at: now(),
+            kind: HistoryEventKind::WorkflowExecutionSignaled {
+                signal_name: "buffered-signal-1".into(),
+                input: payloads("buffered-signal-input"),
+                header: None,
+                links: Vec::new(),
+                request_id: "buffered-signal-req".into(),
+                identity: Some("worker1".into()),
+            },
+        });
+    let transition = kernel().apply(
+        LoadedRun::Existing(state.clone()),
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            token: WorkflowTaskToken {
+                run_key: state.run_key,
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![WorkflowCommand::CompleteWorkflow {
+                result: payloads("done"),
+            }],
+            force_new_workflow_task: false,
+            now: now(),
+        }),
+    );
+    assert_eq!(
+        transition,
+        Err(Reject::InvalidCommandAttributes {
+            cause: tokeira_kernel::WorkflowTaskFailedCause::UnhandledCommand,
+            message: "UnhandledCommand".to_string(),
+        })
     );
 }
 
@@ -4393,49 +4441,43 @@ fn cancel_timer() {
 #[test]
 fn cancel_timer_unknown() {
     let state = make_open_state_with_started_wft();
-    let transition = kernel()
-        .apply(
-            LoadedRun::Existing(state.clone()),
-            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
-                token: WorkflowTaskToken {
-                    run_key: state.run_key,
-                    logical_seq: LogicalTaskSeq(3),
-                    started_event_id: 9,
-                    attempt: 1,
-                    shard_epoch: ShardEpoch::ZERO,
-                },
-                identity: WorkerIdentity("worker".into()),
-                sdk_metadata: None,
-                metering_metadata: None,
-                worker_version: None,
-                versioning_behavior: VersioningBehavior::Unspecified,
-                deployment_version: None,
-                worker_deployment_name: None,
-                sticky: None,
-                commands: vec![WorkflowCommand::CancelTimer {
-                    timer_id: "missing".into(),
-                }],
-                force_new_workflow_task: false,
-                now: now(),
-            }),
-        )
-        .unwrap();
+    let transition = kernel().apply(
+        LoadedRun::Existing(state.clone()),
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            token: WorkflowTaskToken {
+                run_key: state.run_key,
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![WorkflowCommand::CancelTimer {
+                timer_id: "missing".into(),
+            }],
+            force_new_workflow_task: false,
+            now: now(),
+        }),
+    );
 
     // A cancel of a timer that is neither running nor fired-and-buffered
-    // FAILS THE WORKFLOW TASK with BAD_CANCEL_TIMER_ATTRIBUTES — the K4
-    // invalid-command seam (`failWorkflowTaskOnInvalidArgument` @ v1.31.0).
-    assert!(transition.history_events.iter().any(|event| matches!(
-        &event.kind,
-        HistoryEventKind::WorkflowTaskFailed {
-            failure_cause: tokeira_kernel::WorkflowTaskFailedCause::BadCancelTimerAttributes,
-            ..
-        }
-    )));
-    assert!(
-        !transition
-            .history_events
-            .iter()
-            .any(|event| matches!(&event.kind, HistoryEventKind::WorkflowTaskCompleted { .. }))
+    // REJECTS the completion with the WFT-failure cause; the RUNTIME then
+    // persists the WorkflowTaskFailed transition and errors the call with
+    // INVALID_ARGUMENT — v1.31.0's handler/API split
+    // (respondworkflowtaskcompleted/api.go:455-485,739-742).
+    assert_eq!(
+        transition,
+        Err(Reject::InvalidCommandAttributes {
+            cause: tokeira_kernel::WorkflowTaskFailedCause::BadCancelTimerAttributes,
+            message: "TimerID: missing".to_string(),
+        })
     );
 }
 

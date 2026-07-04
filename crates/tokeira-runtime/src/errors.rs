@@ -89,6 +89,18 @@ pub enum ActivityTokenResolutionError {
     Runtime(String),
 }
 
+/// A workflow-task completion carried an invalid command: the workflow task
+/// was failed with the command's cause (already persisted) and the completion
+/// call errors with INVALID_ARGUMENT carrying `message`
+/// ("Mutable state was already persisted … although error is returned",
+/// respondworkflowtaskcompleted/api.go:739-742 @ v1.31.0).
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("{message}")]
+pub struct InvalidWorkflowCommand {
+    /// The v1.31.0 `wtFailedCause.Message()` — e.g. "UnhandledCommand".
+    pub message: String,
+}
+
 /// Runtime could not resolve a requested workflow update.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum UpdateLifecycleError {

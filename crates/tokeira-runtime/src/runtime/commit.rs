@@ -123,12 +123,18 @@ where
     /// tracking untouched because no transition landed.
     pub(super) fn handle_post_commit(&self, run_key: RunKey, result: &CommitResult) {
         if let CommitResult::Applied { new_state } = result {
-            if new_state
-                .pending_workflow_task
-                .as_ref()
-                .and_then(|pending| pending.started_at)
-                .is_none()
-            {
+            let pending = new_state.pending_workflow_task.as_ref();
+            let started = pending.and_then(|pending| pending.started_at).is_some();
+            // A sticky-dispatched UNSTARTED task is still being watched — for
+            // its schedule-to-start deadline (sticky raise S2/S3; the lane's
+            // post-commit hook owns that entry). Only an unstarted task with
+            // no such deadline has nothing to time out.
+            let s2s_armed = pending
+                .map(|pending| {
+                    pending.started_at.is_none() && pending.schedule_to_start_deadline.is_some()
+                })
+                .unwrap_or(false);
+            if !started && !s2s_armed {
                 self.wft_timeout_tracking.remove(run_key);
             }
             if new_state.closed_at.is_some() {

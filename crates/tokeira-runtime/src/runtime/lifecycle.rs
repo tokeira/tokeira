@@ -370,6 +370,25 @@ where
         self.submit(run_key, Command::Signal(request)).await
     }
 
+    /// Clear a run's sticky affinity (`ResetStickyTaskQueue` @ v1.31.0;
+    /// sticky raise S5). Any pending sticky-dispatched WFT keeps its
+    /// schedule-to-start deadline — the reset only drops the affinity, so a
+    /// parked sticky task still times out onto the normal queue.
+    pub async fn reset_sticky_task_queue(&self, execution: ExecutionRef) -> Result<CommitResult> {
+        let run_key = self
+            .repo
+            .resolve_execution(&execution)
+            .await?
+            .ok_or_else(|| anyhow!("execution not found"))?;
+        self.submit(
+            run_key,
+            Command::ResetSticky(tokeira_kernel::ResetStickyRequest {
+                now: OffsetDateTime::now_utc(),
+            }),
+        )
+        .await
+    }
+
     /// Forcibly terminate a workflow execution.
     pub async fn terminate_workflow(
         &self,

@@ -582,7 +582,7 @@ async fn start_and_schedule_activity_with_version(
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::ScheduleActivity {
                 activity_id: activity_id.to_string(),
                 activity_type: "activity-type".to_string(),

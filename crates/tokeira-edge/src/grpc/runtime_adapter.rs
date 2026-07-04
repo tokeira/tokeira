@@ -81,6 +81,12 @@ where
         commit_result_to_outcome(result)
     }
 
+    async fn reset_sticky_task_queue(&self, run_key: tokeira_types::RunKey) -> Result<()> {
+        let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
+        self.runtime.reset_sticky_task_queue(execution).await?;
+        Ok(())
+    }
+
     async fn poll_workflow_task(
         &self,
         queue: tokeira_types::QueueKey,

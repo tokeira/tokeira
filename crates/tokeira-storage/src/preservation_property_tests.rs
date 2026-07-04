@@ -53,6 +53,7 @@ mod tests {
             last_event_id: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq(1),
                 scheduled_event_id: 1,
                 scheduled_at: fixed_now(),

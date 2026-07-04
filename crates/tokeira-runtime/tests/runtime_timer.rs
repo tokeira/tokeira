@@ -196,7 +196,7 @@ async fn complete_with_commands(
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands,
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),

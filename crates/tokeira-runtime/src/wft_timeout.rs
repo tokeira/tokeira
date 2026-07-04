@@ -29,10 +29,26 @@ use crate::{
     lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
 };
 
-/// One started workflow task being watched for a start-to-close timeout.
+/// Which workflow-task deadline an entry watches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WftTimeoutKind {
+    /// A STARTED task's start-to-close window (anchor = `started_at`).
+    StartToClose,
+    /// A sticky-dispatched UNSTARTED task's schedule-to-start window
+    /// (anchor = the schedule time; sticky raise S2/S3). Fires
+    /// `WorkflowTaskTimedOut(SCHEDULE_TO_START)`, which clears sticky and
+    /// reschedules on the normal queue.
+    ScheduleToStart,
+}
+
+/// One workflow task being watched for a deadline.
 ///
-/// `logical_seq` and `started_event_id` identify the exact attempt so the kernel
-/// can fence a timeout submitted against a task that has since been superseded.
+/// `logical_seq` (and, for start-to-close, `started_event_id`) identify the
+/// exact attempt so the kernel can fence a timeout submitted against a task
+/// that has since been superseded. For `ScheduleToStart` entries
+/// `started_event_id` is 0 and `started_at` holds the SCHEDULE time; the map
+/// stays keyed by run, so the start-to-close entry inserted when a worker
+/// picks the task up simply replaces the schedule-to-start one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WftTimeoutEntry {
     pub run_key: RunKey,
@@ -42,6 +58,7 @@ pub struct WftTimeoutEntry {
     pub started_event_id: i64,
     pub started_at: OffsetDateTime,
     pub workflow_task_timeout: Duration,
+    pub kind: WftTimeoutKind,
 }
 
 /// Shared in-memory tracking state for started workflow tasks.
@@ -215,12 +232,16 @@ pub(crate) async fn run_wft_timeout_scanner(
                 runtime_metrics::record_scanner_dispatched("wft_timeout", shard_id.0);
                 let lane = pick_lane_for_run_key(&lanes, lane_count, entry.run_key).clone();
                 async move {
+                    let timeout_type = match entry.kind {
+                        WftTimeoutKind::StartToClose => WorkflowTaskTimeoutType::StartToClose,
+                        WftTimeoutKind::ScheduleToStart => WorkflowTaskTimeoutType::ScheduleToStart,
+                    };
                     lane.submit(
                         entry.run_key,
                         Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
                             logical_seq: entry.logical_seq,
                             started_event_id: entry.started_event_id,
-                            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                            timeout_type,
                             now,
                         }),
                     )
@@ -243,6 +264,7 @@ mod tests {
 
     fn sample_entry(run_key: RunKey, started_at: OffsetDateTime) -> WftTimeoutEntry {
         WftTimeoutEntry {
+            kind: WftTimeoutKind::StartToClose,
             run_key,
             shard_id: ShardId(0),
             logical_seq: LogicalTaskSeq(7),

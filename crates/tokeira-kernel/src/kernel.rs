@@ -11,10 +11,10 @@ use std::collections::BTreeMap;
 
 use smallvec::SmallVec;
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, Payloads, QueueKey, RunId,
-    RunKey, StickyAffinity, TransitionSeq, WorkerIdentity, WorkflowId,
+    RunKey, StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId,
 };
 
 use crate::{
@@ -25,14 +25,14 @@ use crate::{
         ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
         ExternalSignalResult, FieldChange, NexusOperationResolvedRequest,
         NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
-        ResetActivityRequest, ResetRequest, RetryContinuation, RetryState,
+        ResetActivityRequest, ResetRequest, ResetStickyRequest, RetryContinuation, RetryState,
         ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartRequest,
         StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest, TerminateRequest,
         TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
         UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
         UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
         WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
-        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind},
     state::{
@@ -196,6 +196,7 @@ impl Kernel for BasicKernel {
                 self.apply_terminate_on_workflow_task_failed(loaded, req)
             }
             Command::WorkflowTaskTimedOut(req) => self.apply_workflow_task_timed_out(loaded, req),
+            Command::ResetSticky(req) => self.apply_reset_sticky(loaded, req),
             Command::ActivityResolved(req) => self.apply_activity_resolved(loaded, req),
             Command::ChildStartConfirmed(req) => self.apply_child_start_confirmed(loaded, req),
             Command::ChildResolved(req) => self.apply_child_resolved(loaded, req),
@@ -1435,9 +1436,15 @@ impl BasicKernel {
         current.attempt = builder.state.workflow_task_attempt;
 
         if let Some(ttl) = req.sticky_ttl {
+            // Poll-side affinity is a sync-match HINT only: no sticky queue
+            // and no S2S deadline (empty queue name disables sticky
+            // dispatch). Real sticky attributes arrive on the completion
+            // (sticky raise S1).
             builder.state.sticky = Some(StickyAffinity {
                 worker_identity: req.worker_identity,
                 expires_at: req.now + ttl,
+                sticky_queue: TaskQueueName(String::new()),
+                schedule_to_start_timeout: Duration::ZERO,
             });
         }
 
@@ -1604,9 +1611,15 @@ impl BasicKernel {
             req.worker_deployment_name,
         );
         let worker_identity_for_failure = req.identity.clone();
-        builder.state.sticky = req.sticky_ttl.map(|ttl| StickyAffinity {
+        // Sticky raise S1: the completion's sticky attributes carry the
+        // sticky QUEUE and the per-dispatch schedule-to-start timeout; a
+        // completion without them clears the affinity (`ClearStickyTaskQueue`
+        // on nil StickyAttributes @ v1.31.0).
+        builder.state.sticky = req.sticky.map(|spec| StickyAffinity {
             worker_identity: req.identity,
-            expires_at: req.now + ttl,
+            expires_at: req.now + spec.schedule_to_start_timeout,
+            sticky_queue: spec.queue,
+            schedule_to_start_timeout: spec.schedule_to_start_timeout,
         });
 
         let mut closed = false;
@@ -2385,6 +2398,22 @@ impl BasicKernel {
 
     /// Record a WFT timeout. Clears sticky affinity so the retry
     /// goes to the normal queue — the sticky worker is presumed dead.
+    /// Clear the run's sticky affinity (`ResetStickyTaskQueue` →
+    /// `ClearStickyTaskQueue` @ v1.31.0; sticky raise S5). Deliberately does
+    /// NOT touch a pending sticky-dispatched WFT or its schedule-to-start
+    /// deadline: the v1.31.0 timer keeps ticking after a reset and still
+    /// fires (stickytq leaf 2). No history events.
+    fn apply_reset_sticky(
+        &self,
+        loaded: LoadedRun,
+        req: ResetStickyRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let mut builder = TransitionBuilder::new(state, req.now);
+        builder.state.sticky = None;
+        Ok(builder.finish())
+    }
+
     fn apply_workflow_task_timed_out(
         &self,
         loaded: LoadedRun,
@@ -2395,6 +2424,62 @@ impl BasicKernel {
             .pending_workflow_task
             .clone()
             .ok_or(Reject::NoPendingWorkflowTask)?;
+
+        // Sticky raise S3: schedule-to-start fires only on an UNSTARTED
+        // sticky dispatch (the v1.31.0 timer guard no-ops once started,
+        // timer_queue_active_task_executor.go:439-457) — a started or
+        // superseded task makes the firing stale, surfaced as a reject the
+        // scanner drops.
+        if req.timeout_type == WorkflowTaskTimeoutType::ScheduleToStart {
+            if pending.logical_seq != req.logical_seq {
+                return Err(Reject::WorkflowTaskSeqMismatch {
+                    expected: pending.logical_seq.0,
+                    got: req.logical_seq.0,
+                });
+            }
+            if pending.started_event_id.is_some() {
+                return Err(Reject::WorkflowTaskTokenMismatch);
+            }
+            let mut builder = TransitionBuilder::new(state, req.now);
+            // Always a REAL event: S2S deadlines exist only on sticky
+            // attempt-1 dispatches (schedule_workflow_task guards them),
+            // never on transient retries
+            // (`AddWorkflowTaskScheduleToStartTimeoutEvent` emits
+            // WorkflowTaskTimedOut(scheduled, EmptyEventID, SCHEDULE_TO_START),
+            // workflow_task_state_machine.go:270-305 @ v1.31.0).
+            builder.emit(HistoryEventKind::WorkflowTaskTimedOut {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: pending.scheduled_event_id,
+                started_event_id: 0,
+                timeout_type: WorkflowTaskTimeoutType::ScheduleToStart,
+            });
+            // `failWorkflowTask(incrementAttempt=false)`: clear sticky and do
+            // NOT increment the attempt ("Do not increment workflow task
+            // attempt in the case of sticky timeout to prevent creating next
+            // workflow task as transient",
+            // workflow_task_state_machine.go:263-268 @ v1.31.0) — the
+            // reschedule is a real attempt-1 task routed to the NORMAL queue
+            // now that the affinity is gone.
+            builder.state.sticky = None;
+            builder.state.workflow_task_attempt = 1;
+            let _ = builder.flush_buffered();
+            if builder.state.status == ExecutionStatus::Paused {
+                let current = builder
+                    .state
+                    .pending_workflow_task
+                    .as_mut()
+                    .expect("validated pending workflow task must still exist");
+                current.attempt = 1;
+                // Disarm the fired deadline so a paused-retained task cannot
+                // time out again before resume re-dispatches it.
+                current.schedule_to_start_deadline = None;
+            } else {
+                builder.state.pending_workflow_task = None;
+                builder.schedule_workflow_task();
+            }
+            return Ok(builder.finish());
+        }
+
         let started_event_id = pending
             .started_event_id
             .ok_or(Reject::WorkflowTaskNotStarted {
@@ -2634,6 +2719,7 @@ impl BasicKernel {
             } => {
                 state.timers.remove(WORKFLOW_START_DELAY_TIMER_ID);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    schedule_to_start_deadline: None,
                     logical_seq: *logical_seq,
                     scheduled_event_id: event.event_id,
                     scheduled_at: event.happened_at,
@@ -2653,6 +2739,7 @@ impl BasicKernel {
                 ..
             } => {
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    schedule_to_start_deadline: None,
                     logical_seq: *logical_seq,
                     scheduled_event_id: *scheduled_event_id,
                     scheduled_at: state
@@ -2699,6 +2786,7 @@ impl BasicKernel {
                         .map(|pending| pending.attempt)
                         .unwrap_or(0);
                     state.pending_workflow_task = Some(PendingWorkflowTask {
+                        schedule_to_start_deadline: None,
                         logical_seq: *logical_seq,
                         scheduled_event_id: *scheduled_event_id,
                         scheduled_at: state
@@ -2727,6 +2815,7 @@ impl BasicKernel {
                     .map(|pending| pending.attempt)
                     .unwrap_or(0);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    schedule_to_start_deadline: None,
                     logical_seq: *logical_seq,
                     scheduled_event_id: *scheduled_event_id,
                     scheduled_at: state
@@ -4115,12 +4204,34 @@ impl TransitionBuilder {
         // workflow_task_state_machine.go:326,368-379 @ v1.31.0). Buffered events at
         // scheduling reset to a normal attempt-1 task before reaching here (the
         // flush-reset branch in apply_workflow_task_failed / _timed_out).
+        // Sticky raise S2: while a sticky affinity (with a queue) holds, the
+        // next WFT is scheduled ON the sticky queue with a per-dispatch
+        // schedule-to-start deadline (the scheduled event records the sticky
+        // queue, mirroring `CurrentTaskQueue()` @ v1.31.0). Guarded to
+        // attempt-1: v1.31.0 clears sticky on any WFT failure before a
+        // transient retry could exist (S4, deferred), and pre-S1 encodings
+        // (empty queue name) degrade to a normal-queue sync-match hint.
+        let sticky_dispatch = self
+            .state
+            .sticky
+            .as_ref()
+            .filter(|sticky| {
+                self.state.workflow_task_attempt == 1 && !sticky.sticky_queue.0.is_empty()
+            })
+            .cloned();
+        let dispatch_task_queue = sticky_dispatch
+            .as_ref()
+            .map(|sticky| sticky.sticky_queue.clone())
+            .unwrap_or_else(|| self.state.task_queue.clone());
+        let schedule_to_start_deadline = sticky_dispatch
+            .as_ref()
+            .map(|sticky| self.now + sticky.schedule_to_start_timeout);
         let scheduled_event_id = if self.state.workflow_task_attempt > 1 {
             self.state.last_event_id + 1
         } else {
             self.emit(HistoryEventKind::WorkflowTaskScheduled {
                 logical_seq,
-                task_queue: self.state.task_queue.clone(),
+                task_queue: dispatch_task_queue.clone(),
                 workflow_task_timeout: self.state.workflow_task_timeout,
                 attempt: self.state.workflow_task_attempt,
             })
@@ -4132,11 +4243,12 @@ impl TransitionBuilder {
             started_event_id: None,
             started_at: None,
             attempt: self.state.workflow_task_attempt,
+            schedule_to_start_deadline,
         });
         self.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
             queue: QueueKey {
                 namespace_id: self.state.namespace_id,
-                task_queue: self.state.task_queue.clone(),
+                task_queue: dispatch_task_queue,
                 task_kind: tokeira_types::TaskKind::Workflow,
                 deployment: self.state.deployment.clone(),
                 build_id: self.state.build_id.clone(),

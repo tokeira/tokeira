@@ -638,7 +638,10 @@ mod tests {
                 versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: Some(time::Duration::seconds(30)),
+                sticky: Some(tokeira_kernel::StickySpec {
+                    queue: tokeira_types::TaskQueueName(String::new()),
+                    schedule_to_start_timeout: time::Duration::seconds(30),
+                }),
                 commands: Vec::new(),
                 force_new_workflow_task: false,
                 now: OffsetDateTime::now_utc(),

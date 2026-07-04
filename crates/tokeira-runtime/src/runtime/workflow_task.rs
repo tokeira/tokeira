@@ -850,6 +850,7 @@ where
         };
         let shard_id = self.shard_id_for(new_state.run_key).await;
         self.wft_timeout_tracking.insert(WftTimeoutEntry {
+            kind: WftTimeoutKind::StartToClose,
             run_key: new_state.run_key,
             shard_id,
             logical_seq: pending.logical_seq,
@@ -900,6 +901,7 @@ where
         };
         let shard_id = self.shard_id_for(state.run_key).await;
         self.wft_timeout_tracking.insert(WftTimeoutEntry {
+            kind: WftTimeoutKind::StartToClose,
             run_key: state.run_key,
             shard_id,
             logical_seq: pending.logical_seq,

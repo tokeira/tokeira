@@ -575,6 +575,7 @@ fn replay_history_rejects_empty_or_non_started_sequences() {
 fn make_open_state_with_pending_wft() -> WorkflowState {
     let mut state = make_open_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -588,6 +589,7 @@ fn make_open_state_with_pending_wft() -> WorkflowState {
 fn make_open_state_with_started_wft() -> WorkflowState {
     let mut state = make_open_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -601,6 +603,8 @@ fn make_open_state_with_started_wft() -> WorkflowState {
 fn make_open_state_with_started_wft_and_sticky() -> WorkflowState {
     let mut state = make_open_state_with_started_wft();
     state.sticky = Some(StickyAffinity {
+        sticky_queue: tokeira_types::TaskQueueName(String::new()),
+        schedule_to_start_timeout: time::Duration::ZERO,
         worker_identity: WorkerIdentity("sticky-worker".into()),
         expires_at: now() + Duration::seconds(30),
     });
@@ -1131,6 +1135,119 @@ fn signal_with_start_rejects_existing_run() {
         )
         .unwrap_err();
     assert_eq!(reject, Reject::RunAlreadyExists);
+}
+
+#[test]
+fn sticky_completion_dispatches_next_wft_sticky_then_s2s_times_out() {
+    // The stickytq leaves' spine (sticky raise S1–S3): complete with sticky
+    // attributes → a signal's WFT dispatches on the STICKY queue with a
+    // schedule-to-start deadline → the S2S timeout writes a real
+    // WorkflowTaskTimedOut(ScheduleToStart), clears sticky, keeps attempt 1,
+    // and reschedules on the NORMAL queue.
+    let state = make_open_state_with_started_wft();
+    let completed = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 9,
+                    attempt: 1,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker1".into()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky: Some(tokeira_kernel::StickySpec {
+                    queue: tokeira_types::TaskQueueName("queue-sticky".into()),
+                    schedule_to_start_timeout: Duration::seconds(2),
+                }),
+                commands: vec![],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    let sticky = completed
+        .next_state
+        .sticky
+        .as_ref()
+        .expect("completion with sticky attributes records the affinity");
+    assert_eq!(sticky.sticky_queue.0, "queue-sticky");
+    assert_eq!(sticky.schedule_to_start_timeout, Duration::seconds(2));
+
+    let signaled = kernel()
+        .apply(
+            LoadedRun::Existing(completed.next_state),
+            Command::Signal(SignalRequest {
+                signal_name: "sigA".into(),
+                input: payloads("signal"),
+                header: None,
+                links: Vec::new(),
+                request: request_context("signal-sticky"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+    // The scheduled event and the dispatch op both name the STICKY queue.
+    assert!(signaled.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::WorkflowTaskScheduled { task_queue, .. } if task_queue.0 == "queue-sticky"
+    )));
+    assert!(signaled.dispatch_ops.iter().any(|op| matches!(
+        op,
+        tokeira_kernel::DispatchOp::EnqueueWorkflowTask { queue, .. }
+            if queue.task_queue.0 == "queue-sticky"
+    )));
+    let pending = signaled
+        .next_state
+        .pending_workflow_task
+        .clone()
+        .expect("signal schedules a WFT");
+    let deadline = pending
+        .schedule_to_start_deadline
+        .expect("sticky dispatch carries a schedule-to-start deadline");
+    assert_eq!(deadline, now() + Duration::seconds(2));
+    assert!(pending.started_event_id.is_none());
+
+    let timed_out = kernel()
+        .apply(
+            LoadedRun::Existing(signaled.next_state),
+            Command::WorkflowTaskTimedOut(tokeira_kernel::WorkflowTaskTimedOutRequest {
+                logical_seq: pending.logical_seq,
+                started_event_id: 0,
+                timeout_type: tokeira_kernel::WorkflowTaskTimeoutType::ScheduleToStart,
+                now: now() + Duration::seconds(3),
+            }),
+        )
+        .unwrap();
+    // Real WorkflowTaskTimedOut(SCHEDULE_TO_START) + fresh attempt-1
+    // WorkflowTaskScheduled on the NORMAL queue; sticky cleared.
+    assert!(timed_out.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::WorkflowTaskTimedOut {
+            timeout_type: tokeira_kernel::WorkflowTaskTimeoutType::ScheduleToStart,
+            started_event_id: 0,
+            ..
+        }
+    )));
+    assert!(timed_out.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::WorkflowTaskScheduled { task_queue, attempt: 1, .. }
+            if task_queue.0 != "queue-sticky"
+    )));
+    assert!(timed_out.next_state.sticky.is_none());
+    let rescheduled = timed_out
+        .next_state
+        .pending_workflow_task
+        .expect("S2S timeout reschedules");
+    assert_eq!(rescheduled.attempt, 1);
+    assert!(rescheduled.schedule_to_start_deadline.is_none());
 }
 
 #[test]
@@ -1998,6 +2115,7 @@ fn activity_resolved_paused_workflow_no_wft() {
 fn wft_failed_paused_workflow_no_redispatch() {
     let mut state = make_paused_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -2037,6 +2155,7 @@ fn wft_failed_paused_workflow_no_redispatch() {
 fn wft_timed_out_paused_workflow_no_redispatch() {
     let mut state = make_paused_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -2074,6 +2193,7 @@ fn wft_timed_out_paused_workflow_no_redispatch() {
 fn wft_completed_paused_workflow_no_force_wft() {
     let mut state = make_paused_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -2099,7 +2219,7 @@ fn wft_completed_paused_workflow_no_force_wft() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![],
                 force_new_workflow_task: true,
                 now: now(),
@@ -2133,7 +2253,7 @@ fn wft_completion_tracks_previous_started_event_id() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2413,6 +2533,8 @@ fn start_deployment_transition_reuses_pending_wft_without_double_schedule() {
     };
     let mut state = make_open_state_with_pending_wft();
     state.sticky = Some(StickyAffinity {
+        sticky_queue: tokeira_types::TaskQueueName(String::new()),
+        schedule_to_start_timeout: time::Duration::ZERO,
         worker_identity: WorkerIdentity("sticky".into()),
         expires_at: now() + Duration::seconds(30),
     });
@@ -2496,7 +2618,7 @@ fn workflow_task_completed_with_activity_and_timer() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![
                     WorkflowCommand::ScheduleActivity {
                         activity_id: "activity-1".into(),
@@ -2584,7 +2706,7 @@ fn workflow_task_completed_with_complete_workflow() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],
@@ -2632,7 +2754,7 @@ fn workflow_task_completed_with_fail_workflow() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
@@ -2720,7 +2842,7 @@ fn continue_as_new_closes_run() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![command.clone()],
                 force_new_workflow_task: false,
                 now: now(),
@@ -2782,7 +2904,7 @@ fn continue_as_new_then_another_command() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![
                     make_continue_as_new_command(),
                     WorkflowCommand::RequestNewWorkflowTask,
@@ -2880,6 +3002,8 @@ fn workflow_execution_timed_out_with_entities() {
 fn workflow_execution_timed_out_with_pending_wft() {
     let mut state = make_open_state_with_pending_wft();
     state.sticky = Some(StickyAffinity {
+        sticky_queue: tokeira_types::TaskQueueName(String::new()),
+        schedule_to_start_timeout: time::Duration::ZERO,
         worker_identity: WorkerIdentity("sticky-worker".into()),
         expires_at: now() + Duration::seconds(30),
     });
@@ -2938,7 +3062,7 @@ fn fail_workflow_with_retry_policy() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
@@ -2980,7 +3104,7 @@ fn fail_workflow_without_retry_policy() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::FailWorkflow {
                     failure: payload("nope"),
                 }],
@@ -3481,7 +3605,7 @@ fn reject_wft_completed_no_pending() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3511,7 +3635,7 @@ fn reject_wft_completed_not_started() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3542,7 +3666,7 @@ fn reject_wft_completed_seq_mismatch() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3576,7 +3700,7 @@ fn reject_wft_completed_token_mismatch() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
                 now: now(),
@@ -3638,7 +3762,7 @@ fn reject_duplicate_activity_id() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::ScheduleActivity {
                     activity_id: "dup".into(),
                     activity_type: "activity-type".into(),
@@ -3692,7 +3816,7 @@ fn reject_duplicate_timer_id() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::StartTimer {
                     timer_id: "dup".into(),
                     fire_at: now()
@@ -3968,7 +4092,7 @@ fn reject_commands_after_close() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![
                     WorkflowCommand::CompleteWorkflow {
                         result: payloads("done")
@@ -4004,7 +4128,7 @@ fn cancel_workflow_command() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::CancelWorkflow],
                 force_new_workflow_task: false,
                 now: now(),
@@ -4057,7 +4181,7 @@ fn cancel_workflow_then_another_command() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![
                     WorkflowCommand::CancelWorkflow,
                     WorkflowCommand::RequestNewWorkflowTask,
@@ -4091,7 +4215,7 @@ fn request_cancel_activity() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     scheduled_event_id: 7,
                 }],
@@ -4144,7 +4268,7 @@ fn request_cancel_activity_started_sets_durable_cancel_requested() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     scheduled_event_id: 7,
                 }],
@@ -4194,7 +4318,7 @@ fn request_cancel_activity_unknown() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     scheduled_event_id: 999,
                 }],
@@ -4245,7 +4369,7 @@ fn cancel_timer() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "timer-1".into(),
                 }],
@@ -4287,7 +4411,7 @@ fn cancel_timer_unknown() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::CancelTimer {
                     timer_id: "missing".into(),
                 }],
@@ -4320,7 +4444,7 @@ fn request_cancel_activity_then_resolved_canceled() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity {
                     scheduled_event_id: 7,
                 }],
@@ -4390,6 +4514,7 @@ fn cancel_then_cancel_workflow_e2e() {
         .pending_workflow_task
         .clone()
         .unwrap_or(PendingWorkflowTask {
+            schedule_to_start_deadline: None,
             logical_seq: LogicalTaskSeq(4),
             scheduled_event_id: 11,
             scheduled_at: now(),
@@ -4415,7 +4540,7 @@ fn cancel_then_cancel_workflow_e2e() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::CancelWorkflow],
                 force_new_workflow_task: false,
                 now: now(),
@@ -4584,7 +4709,7 @@ fn start_child_workflow_happy_path() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::StartChildWorkflow {
                     child_workflow_id: child_workflow_id.clone(),
                     namespace_id: NamespaceId::new(),
@@ -4755,7 +4880,7 @@ fn signal_external_workflow_happy_path() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
                     target_namespace_id: state.namespace_id,
                     target_namespace: None,
@@ -4830,7 +4955,7 @@ fn request_cancel_external_workflow_happy_path() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
                     target_namespace_id: state.namespace_id,
                     target_namespace: None,
@@ -5027,7 +5152,7 @@ fn update_completed_happy_path() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::UpdateCompleted {
                     update_id: "update-1".into(),
                     result: payloads("done"),
@@ -5072,7 +5197,7 @@ fn update_rejected_happy_path() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::UpdateRejected {
                     update_id: "update-1".into(),
                     failure: payload("nope"),
@@ -5117,7 +5242,7 @@ fn update_completed_unknown_update() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::UpdateCompleted {
                     update_id: "missing".into(),
                     result: payloads("done"),
@@ -5152,7 +5277,7 @@ fn update_rejected_unknown_update() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::UpdateRejected {
                     update_id: "missing".into(),
                     failure: payload("nope"),
@@ -5187,7 +5312,7 @@ fn protocol_message_accepted_body() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-1".into(),
                     body: UpdateProtocolBody::Accepted {
@@ -5236,7 +5361,7 @@ fn protocol_message_completed_body() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-2".into(),
                     body: UpdateProtocolBody::Completed {
@@ -5283,7 +5408,7 @@ fn protocol_message_rejected_body() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::ProtocolMessage {
                     message_id: "msg-3".into(),
                     body: UpdateProtocolBody::Rejected {
@@ -5342,7 +5467,7 @@ fn complete_workflow_clears_pending_updates() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],
@@ -5378,7 +5503,7 @@ fn record_marker_happy_path() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::RecordMarker {
                     marker_name: "marker".into(),
                     details: details.clone(),
@@ -5430,7 +5555,7 @@ fn record_marker_after_close_rejected() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![
                     WorkflowCommand::CompleteWorkflow {
                         result: payloads("done"),
@@ -5645,7 +5770,7 @@ fn close_via_wft(state: WorkflowState, commands: Vec<WorkflowCommand>) -> Transi
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands,
                 force_new_workflow_task: false,
                 now: now(),
@@ -5918,7 +6043,7 @@ fn schedule_nexus_operation_happy_path() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::ScheduleNexusOperation {
                     operation_id: "op-1".into(),
                     endpoint: "endpoint".into(),
@@ -5975,7 +6100,7 @@ fn schedule_nexus_operation_duplicate_rejected() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::ScheduleNexusOperation {
                     operation_id: "op-1".into(),
                     endpoint: "endpoint".into(),
@@ -6017,7 +6142,7 @@ fn cancel_nexus_operation_happy_path() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -6076,7 +6201,7 @@ fn cancel_nexus_operation_unknown() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::CancelNexusOperation {
                     scheduled_event_id: 12,
                 }],
@@ -6539,7 +6664,7 @@ fn close_via_complete_clears_pending_nexus_operations() {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky_ttl: None,
+                sticky: None,
                 commands: vec![WorkflowCommand::CompleteWorkflow {
                     result: payloads("done"),
                 }],

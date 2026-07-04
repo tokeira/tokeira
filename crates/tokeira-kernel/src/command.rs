@@ -84,6 +84,11 @@ pub enum Command {
     TerminateOnWorkflowTaskFailed(TerminateOnWorkflowTaskFailedRequest),
     /// A workflow task exceeded its start-to-close timeout.
     WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest),
+    /// `ResetStickyTaskQueue`: clear the run's sticky affinity. The pending
+    /// sticky-dispatched WFT (if any) keeps its schedule-to-start deadline —
+    /// v1.31.0's reset only calls `ClearStickyTaskQueue`; the dispatched
+    /// task's timer still fires (sticky raise S5).
+    ResetSticky(ResetStickyRequest),
     /// An activity reached a terminal state.
     ActivityResolved(ActivityResolvedRequest),
     /// A child workflow start was confirmed or failed.
@@ -207,6 +212,10 @@ pub enum WorkflowTaskTimeoutType {
     /// The worker did not complete the task within the
     /// configured start-to-close deadline.
     StartToClose,
+    /// A sticky-dispatched task was not started within the sticky
+    /// schedule-to-start window (`AddWorkflowTaskScheduleToStartTimeoutEvent`,
+    /// workflow_task_state_machine.go:270-305 @ v1.31.0; sticky raise S3).
+    ScheduleToStart,
 }
 
 /// Which Nexus operation timeout fired.
@@ -685,6 +694,27 @@ pub struct StartWorkflowTaskRequest {
     pub now: OffsetDateTime,
 }
 
+/// Request to clear a run's sticky affinity (`ResetStickyTaskQueue`
+/// @ v1.31.0; sticky raise S5).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResetStickyRequest {
+    /// Wall-clock time the command was accepted.
+    pub now: OffsetDateTime,
+}
+
+/// Sticky execution attributes from a workflow-task completion
+/// (`StickyExecutionAttributes` @ v1.31.0; sticky raise S1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StickySpec {
+    /// The sticky task queue the completing worker polls; the next WFT is
+    /// dispatched onto this queue while the affinity holds.
+    pub queue: TaskQueueName,
+    /// How long a sticky-dispatched WFT may sit unstarted before it times
+    /// out with `WorkflowTaskTimedOut(SCHEDULE_TO_START)` and reschedules on
+    /// the normal queue.
+    pub schedule_to_start_timeout: Duration,
+}
+
 /// Request to apply an already-decided Worker Deployment transition.
 ///
 /// The runtime computes whether an activity-start poller should move the
@@ -786,12 +816,13 @@ pub struct WorkflowTaskCompletedRequest {
     pub worker_deployment_name: Option<String>,
     /// Sticky execution TTL requested by the completing worker.
     ///
-    /// Temporal's wire field names a sticky task queue, but Tokeira's current
-    /// matching model keys sticky delivery by the completing worker identity.
-    /// The TTL is the durable compatibility signal needed to update that
-    /// existing affinity without introducing worker-lifecycle semantics here.
+    /// Mirrors `RespondWorkflowTaskCompleted.sticky_attributes` @ v1.31.0:
+    /// the sticky queue the worker polls plus the per-dispatch
+    /// schedule-to-start timeout (sticky raise S1). `None` clears any
+    /// existing affinity (a completion without sticky attributes calls
+    /// `ClearStickyTaskQueue` @ v1.31.0).
     #[serde(default)]
-    pub sticky_ttl: Option<Duration>,
+    pub sticky: Option<StickySpec>,
     /// Ordered list of workflow commands produced by the
     /// worker's replay/execution.
     pub commands: Vec<WorkflowCommand>,

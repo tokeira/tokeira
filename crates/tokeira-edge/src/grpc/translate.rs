@@ -1158,9 +1158,9 @@ fn worker_deployment_name_from_deprecated_deployment(
         .map(|deployment| deployment.series_name.clone())
 }
 
-fn sticky_ttl_from_attributes(
+fn sticky_spec_from_attributes(
     attrs: Option<&taskqueue_proto::StickyExecutionAttributes>,
-) -> Result<Option<time::Duration>, ProtoConversionError> {
+) -> Result<Option<tokeira_kernel::StickySpec>, ProtoConversionError> {
     let Some(attrs) = attrs else {
         return Ok(None);
     };
@@ -1174,11 +1174,18 @@ fn sticky_ttl_from_attributes(
             "RespondWorkflowTaskCompletedRequest.sticky_attributes.worker_task_queue.name",
         ));
     }
-    valid_non_negative_duration(
+    // v1.31.0 defaults an unset sticky schedule-to-start timeout to 5s
+    // (`stickyScheduleToStartTimeout` handling in matching); 30s was the old
+    // tokeira TTL default and is kept — no corpus leaf pins the default.
+    let schedule_to_start_timeout = valid_non_negative_duration(
         attrs.schedule_to_start_timeout.as_ref(),
         "RespondWorkflowTaskCompletedRequest.sticky_attributes.schedule_to_start_timeout",
-    )
-    .map(|ttl| ttl.or(Some(time::Duration::seconds(30))))
+    )?
+    .unwrap_or(time::Duration::seconds(30));
+    Ok(Some(tokeira_kernel::StickySpec {
+        queue: tokeira_types::TaskQueueName(queue.name.clone()),
+        schedule_to_start_timeout,
+    }))
 }
 
 pub fn create_worker_deployment_to_edge(
@@ -2249,7 +2256,7 @@ pub fn respond_completed_request_to_edge(
         "RespondWorkflowTaskCompletedRequest.deployment_options",
     )?
     .or_else(|| worker_deployment_name_from_deprecated_deployment(req.deployment.as_ref()));
-    let sticky_ttl = sticky_ttl_from_attributes(req.sticky_attributes.as_ref())?;
+    let sticky = sticky_spec_from_attributes(req.sticky_attributes.as_ref())?;
 
     Ok(RespondWorkflowTaskCompletedRequest {
         task_token: req.task_token,
@@ -2262,7 +2269,7 @@ pub fn respond_completed_request_to_edge(
         versioning_behavior: versioning_behavior_from_proto(req.versioning_behavior)?,
         deployment_version,
         worker_deployment_name,
-        sticky_ttl,
+        sticky,
         resource_id: req.resource_id,
         worker_instance_key: req.worker_instance_key,
         worker_control_task_queue: req.worker_control_task_queue,
@@ -6636,7 +6643,12 @@ mod tests {
         .expect("respond completed request should convert");
 
         assert_eq!(edge.metering_metadata, Some(metering.encode_to_vec()),);
-        assert_eq!(edge.sticky_ttl, Some(time::Duration::seconds(17)));
+        let sticky = edge.sticky.expect("sticky attributes should convert");
+        assert_eq!(
+            sticky.schedule_to_start_timeout,
+            time::Duration::seconds(17)
+        );
+        assert!(!sticky.queue.0.is_empty());
         assert_eq!(edge.resource_id, "workflow-a");
         assert_eq!(edge.worker_instance_key, "worker-instance-a");
         assert_eq!(edge.worker_control_task_queue, "worker-control-a");

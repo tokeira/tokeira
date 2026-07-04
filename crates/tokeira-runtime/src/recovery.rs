@@ -50,7 +50,7 @@ use crate::{
     },
     scanner::pick_lane_for_run_key,
     timeout::{WorkflowTimeoutEntry, WorkflowTimeoutTrackingState},
-    wft_timeout::{WftTimeoutEntry, WftTimeoutTrackingState},
+    wft_timeout::{WftTimeoutEntry, WftTimeoutKind, WftTimeoutTrackingState},
 };
 
 /// Observability summary produced by a shard sweep.
@@ -167,6 +167,7 @@ where
         .await?
     {
         wft_timeout_tracking.insert(WftTimeoutEntry {
+            kind: WftTimeoutKind::StartToClose,
             run_key: entry.run_key,
             shard_id,
             logical_seq: entry.logical_seq,
@@ -363,6 +364,7 @@ mod tests {
             last_event_id: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq(1),
                 scheduled_event_id: 1,
                 scheduled_at: fixed_now(),
@@ -462,6 +464,7 @@ mod tests {
         let mut transition = start_transition(run_key);
         transition.next_state.workflow_task_timeout = Duration::seconds(15);
         transition.next_state.pending_workflow_task = Some(PendingWorkflowTask {
+            schedule_to_start_deadline: None,
             logical_seq: LogicalTaskSeq(7),
             scheduled_event_id: 1,
             scheduled_at: fixed_now(),
@@ -873,6 +876,8 @@ mod tests {
                     fixed_now() - Duration::seconds(1);
                 t.next_state.sticky = Some(
                     tokeira_types::StickyAffinity {
+                        sticky_queue: tokeira_types::TaskQueueName(String::new()),
+                        schedule_to_start_timeout: time::Duration::ZERO,
                         worker_identity: WorkerIdentity(
                             "old-worker".into(),
                         ),

@@ -66,7 +66,7 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),
@@ -337,7 +337,7 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: Payloads::default(),
             }],
@@ -492,7 +492,7 @@ async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Res
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: Payloads::default(),
             }],
@@ -549,7 +549,7 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: Payloads::default(),
             }],
@@ -647,7 +647,10 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
                 build_id: build_id.clone(),
             }),
             worker_deployment_name: Some(deployment.clone()),
-            sticky_ttl: Some(Duration::seconds(60)),
+            sticky: Some(tokeira_kernel::StickySpec {
+                queue: tokeira_types::TaskQueueName(String::new()),
+                schedule_to_start_timeout: Duration::seconds(60),
+            }),
             commands: Vec::new(),
             force_new_workflow_task: true,
             now: start_time,
@@ -801,7 +804,7 @@ async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::FailWorkflow {
                 failure: retryable_app_failure("BoomError"),
             }],
@@ -894,7 +897,7 @@ async fn non_retryable_failure_is_terminal_without_successor() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::FailWorkflow {
                 failure: retryable_app_failure("FatalError"),
             }],

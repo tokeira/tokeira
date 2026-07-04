@@ -424,6 +424,12 @@ pub struct PendingWorkflowTask {
     /// Number of times this task has been started (incremented
     /// on each start, including retries after failure/timeout).
     pub attempt: u32,
+    /// Schedule-to-start deadline for a STICKY dispatch (sticky raise S2);
+    /// `None` for normal dispatch (normal WFTs have no schedule-to-start
+    /// timer @ v1.31.0). Captured at schedule time — a sticky RESET does not
+    /// disarm it (the v1.31.0 timer fires regardless; stickytq leaf 2).
+    #[serde(default)]
+    pub schedule_to_start_deadline: Option<OffsetDateTime>,
 }
 
 /// Durable state for a single open activity.
@@ -1090,9 +1096,12 @@ mod tests {
         let mut state = open_state();
         state.sticky = Some(StickyAffinity {
             worker_identity: WorkerIdentity("sticky-worker".into()),
+            sticky_queue: TaskQueueName("queue-sticky".into()),
+            schedule_to_start_timeout: Duration::seconds(5),
             expires_at: now() + Duration::seconds(30),
         });
         state.pending_workflow_task = Some(PendingWorkflowTask {
+            schedule_to_start_deadline: None,
             logical_seq: LogicalTaskSeq(2),
             scheduled_event_id: 10,
             scheduled_at: now(),
@@ -1123,6 +1132,7 @@ mod tests {
         let target_version = version("deployment", "target");
         let mut state = open_state();
         state.pending_workflow_task = Some(PendingWorkflowTask {
+            schedule_to_start_deadline: None,
             logical_seq: LogicalTaskSeq(2),
             scheduled_event_id: 10,
             scheduled_at: now(),

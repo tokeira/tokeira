@@ -265,6 +265,15 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         req: SignalRequest,
     ) -> Result<WorkflowMutationOutcome>;
 
+    /// Clear a run's sticky affinity (`ResetStickyTaskQueue` @ v1.31.0;
+    /// sticky raise S5).
+    async fn reset_sticky_task_queue(&self, run_key: RunKey) -> Result<()> {
+        let _ = run_key;
+        Err(anyhow::anyhow!(
+            "reset_sticky_task_queue unsupported by this runtime"
+        ))
+    }
+
     async fn poll_workflow_task(
         &self,
         queue: tokeira_types::QueueKey,
@@ -2975,9 +2984,25 @@ impl WorkflowService {
                         .map_err(EdgeError::from)?;
                     if let tokeira_kernel::LoadedRun::Existing(state) = loaded {
                         if wants_eager_return && state.pending_workflow_task.is_some() {
+                            // The pending WFT was dispatched onto the STICKY
+                            // queue when this completion set a sticky affinity
+                            // (sticky raise S2) — claim it from where the
+                            // kernel actually enqueued it.
+                            let sticky_dispatched =
+                                state.pending_workflow_task.as_ref().is_some_and(|pending| {
+                                    pending.schedule_to_start_deadline.is_some()
+                                });
+                            let task_queue = state
+                                .sticky
+                                .as_ref()
+                                .filter(|sticky| {
+                                    sticky_dispatched && !sticky.sticky_queue.0.is_empty()
+                                })
+                                .map(|sticky| sticky.sticky_queue.clone())
+                                .unwrap_or_else(|| state.task_queue.clone());
                             let queue = tokeira_types::QueueKey {
                                 namespace_id: state.namespace_id,
-                                task_queue: state.task_queue.clone(),
+                                task_queue,
                                 task_kind: TaskKind::Workflow,
                                 deployment: state.deployment.clone(),
                                 build_id: state.build_id.clone(),
@@ -4444,6 +4469,47 @@ impl WorkflowService {
     }
 
     // ── Advanced workflow endpoints ──
+
+    /// `ResetStickyTaskQueue`: clear the run's sticky affinity (sticky raise
+    /// S5). Deliberately leaves any pending sticky-dispatched WFT and its
+    /// schedule-to-start deadline in place — v1.31.0's reset only clears
+    /// mutable-state stickiness; the dispatched task still times out onto the
+    /// normal queue (stickytq leaf 2).
+    pub async fn reset_sticky_task_queue(
+        &self,
+        headers: &HeaderMap,
+        namespace: String,
+        workflow_id: String,
+        run_id: Option<String>,
+    ) -> EdgeResult<()> {
+        let namespace_label = namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "reset_sticky_task_queue",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let _ctx = self
+                    .interceptors
+                    .begin(
+                        headers,
+                        Some(&namespace),
+                        Action::ResetStickyTaskQueue,
+                        false,
+                    )
+                    .await?;
+                let run_key = self
+                    .resolve_execution_run_key(&namespace, &workflow_id, run_id.as_deref())
+                    .await?;
+                self.runtime
+                    .reset_sticky_task_queue(run_key)
+                    .await
+                    .map_err(EdgeError::from)?;
+                Ok(())
+            },
+        )
+        .await
+    }
 
     pub async fn terminate_workflow_execution(
         &self,

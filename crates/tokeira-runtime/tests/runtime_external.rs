@@ -50,7 +50,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
                 target_namespace_id: namespace_id,
                 target_namespace: None,
@@ -125,7 +125,7 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::RequestCancelExternalWorkflowExecution {
                 target_namespace_id: namespace_id,
                 target_namespace: None,
@@ -200,7 +200,7 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
                 target_namespace_id: target_ns,
                 target_namespace: None,
@@ -265,7 +265,7 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::SignalExternalWorkflowExecution {
                 target_namespace_id: namespace_id,
                 target_namespace: None,

@@ -291,7 +291,9 @@ pub struct RespondWorkflowTaskCompletedRequest {
     pub versioning_behavior: tokeira_kernel::state::VersioningBehavior,
     pub deployment_version: Option<tokeira_kernel::state::WorkerDeploymentVersionRef>,
     pub worker_deployment_name: Option<String>,
-    pub sticky_ttl: Option<time::Duration>,
+    /// Sticky queue + schedule-to-start timeout from
+    /// `sticky_attributes` (v1.31.0; sticky raise S1). `None` clears sticky.
+    pub sticky: Option<tokeira_kernel::StickySpec>,
     pub resource_id: String,
     pub worker_instance_key: String,
     pub worker_control_task_queue: String,

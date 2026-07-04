@@ -432,6 +432,31 @@ where
             Ok((commit_result, mut dispatch_ops, history_events)) => {
                 let mut reset_materialization_error = None;
                 if let CommitResult::Applied { new_state } = &commit_result {
+                    // Sticky raise S2/S3: a sticky-dispatched WFT carries a
+                    // schedule-to-start deadline; track it so the scanner can
+                    // fire the S2S timeout. Keyed by run — a later start
+                    // (which inserts the StartToClose entry) replaces it, and
+                    // a superseding transition's kernel reject drops it.
+                    if let Some(pending) = &new_state.pending_workflow_task
+                        && pending.started_event_id.is_none()
+                        && let Some(deadline) = pending.schedule_to_start_deadline
+                    {
+                        tracing::debug!(
+                            run_key = ?message.run_key,
+                            logical_seq = pending.logical_seq.0,
+                            ?deadline,
+                            "tracking sticky wft schedule-to-start deadline"
+                        );
+                        wft_timeout_tracking.insert(crate::wft_timeout::WftTimeoutEntry {
+                            run_key: message.run_key,
+                            shard_id,
+                            logical_seq: pending.logical_seq,
+                            started_event_id: 0,
+                            started_at: pending.scheduled_at,
+                            workflow_task_timeout: deadline - pending.scheduled_at,
+                            kind: crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
+                        });
+                    }
                     for event in &history_events {
                         match &event.kind {
                             HistoryEventKind::ActivityTaskCancelRequested {
@@ -1247,6 +1272,7 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::Signal(_) => "Signal",
         Command::Cancel(_) => "Cancel",
         Command::Terminate(_) => "Terminate",
+        Command::ResetSticky(_) => "ResetSticky",
         Command::TerminateOnWorkflowTaskFailed(_) => "TerminateOnWorkflowTaskFailed",
         Command::Reset(_) => "Reset",
         Command::PauseWorkflow(_) => "PauseWorkflow",
@@ -2102,6 +2128,7 @@ mod tests {
             last_event_id: 0,
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: Some(PendingWorkflowTask {
+                schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq::ONE,
                 scheduled_event_id: 1,
                 scheduled_at: OffsetDateTime::now_utc(),

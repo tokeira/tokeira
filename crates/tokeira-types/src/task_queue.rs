@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 use crate::{NamespaceId, QueuePartition};
 
@@ -77,7 +77,7 @@ mod tests {
 ///
 /// Workers poll a named queue; the runtime matches incoming
 /// tasks to waiting pollers by this name.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskQueueName(pub String);
 
 /// Self-reported identity string from a worker process.
@@ -152,6 +152,21 @@ pub struct QueuePartitionKey {
 pub struct StickyAffinity {
     /// Identity of the worker that holds cached run state.
     pub worker_identity: WorkerIdentity,
+    /// The sticky task queue name the worker polls (v1.31.0
+    /// `executionInfo.StickyTaskQueue`; sticky raise S1). While set, the next
+    /// WFT is dispatched onto THIS queue, not the workflow's normal queue. An
+    /// empty name (pre-S1 encodings via the serde default) disables sticky
+    /// dispatch — the affinity degrades to a sync-match hint.
+    #[serde(default)]
+    pub sticky_queue: TaskQueueName,
+    /// Per-dispatch schedule-to-start deadline for sticky WFTs
+    /// (`sticky_attributes.schedule_to_start_timeout`;
+    /// `executionInfo.StickyScheduleToStartTimeout` @ v1.31.0). A sticky WFT
+    /// unstarted past this window times out with
+    /// `WorkflowTaskTimedOut(SCHEDULE_TO_START)` and reschedules on the
+    /// normal queue.
+    #[serde(default)]
+    pub schedule_to_start_timeout: Duration,
     /// Wall-clock deadline after which the affinity is stale.
     pub expires_at: OffsetDateTime,
 }

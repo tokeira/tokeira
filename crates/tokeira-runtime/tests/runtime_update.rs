@@ -55,7 +55,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -127,7 +127,7 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -199,7 +199,7 @@ async fn update_accepted_wait_returns_stage_without_outcome() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::ProtocolMessage {
                 message_id: "msg-accept-update-1".into(),
                 body: UpdateProtocolBody::Accepted {
@@ -331,7 +331,7 @@ async fn poll_update_waits_for_history_stage_or_returns_reached_stage() -> Resul
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::ProtocolMessage {
                 message_id: "msg-accept-update-1".into(),
                 body: UpdateProtocolBody::Accepted {
@@ -405,7 +405,7 @@ async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -573,7 +573,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),
@@ -649,7 +649,7 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("closed"),
             }],
@@ -731,7 +731,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![
                 WorkflowCommand::ProtocolMessage {
                     message_id: "msg-accept-update-1".into(),

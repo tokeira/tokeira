@@ -1602,9 +1602,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn reset_sticky_task_queue(
         &self,
-        _request: Request<workflowservice::ResetStickyTaskQueueRequest>,
+        request: Request<workflowservice::ResetStickyTaskQueueRequest>,
     ) -> Result<Response<workflowservice::ResetStickyTaskQueueResponse>, Status> {
-        debug!("reset_sticky_task_queue");
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+        let execution = req
+            .execution
+            .ok_or_else(|| Status::invalid_argument("execution is required"))?;
+        let run_id = if execution.run_id.is_empty() {
+            None
+        } else {
+            Some(execution.run_id)
+        };
+        self.inner
+            .reset_sticky_task_queue(&headers, req.namespace, execution.workflow_id, run_id)
+            .await?;
         Ok(Response::new(
             workflowservice::ResetStickyTaskQueueResponse {},
         ))

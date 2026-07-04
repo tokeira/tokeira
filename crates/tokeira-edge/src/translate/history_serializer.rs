@@ -1601,6 +1601,9 @@ fn wft_timeout_i32(t: &WorkflowTaskTimeoutType) -> i32 {
     use tokeira_proto::enums::TimeoutType as T;
     (match t {
         WorkflowTaskTimeoutType::StartToClose => T::StartToClose,
+        // Sticky schedule-to-start (raise S3) — the corpus asserts
+        // `{"TimeoutType":2}` on the timed-out event.
+        WorkflowTaskTimeoutType::ScheduleToStart => T::ScheduleToStart,
     }) as i32
 }
 

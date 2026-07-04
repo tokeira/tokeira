@@ -75,7 +75,8 @@ use crate::{
     },
     versioning::VersioningRuleStore,
     wft_timeout::{
-        WftTimeoutEntry, WftTimeoutScannerConfig, WftTimeoutTrackingState, run_wft_timeout_scanner,
+        WftTimeoutEntry, WftTimeoutKind, WftTimeoutScannerConfig, WftTimeoutTrackingState,
+        run_wft_timeout_scanner,
     },
     worker_registry::{WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata},
 };
@@ -1673,7 +1674,7 @@ mod tests {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
             now: OffsetDateTime::now_utc(),

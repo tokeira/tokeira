@@ -870,6 +870,8 @@ mod tests {
             let now = fixed_now();
             let mut state = sample_state(RunKey::new());
             state.sticky = Some(StickyAffinity {
+                sticky_queue: tokeira_types::TaskQueueName(String::new()),
+                schedule_to_start_timeout: time::Duration::ZERO,
                 worker_identity: WorkerIdentity("sticky-worker".to_owned()),
                 expires_at: now + Duration::seconds(delta_seconds),
             });
@@ -1120,6 +1122,8 @@ mod tests {
         assert_eq!(sticky_fields(&state, now), (None, None));
 
         state.sticky = Some(StickyAffinity {
+            sticky_queue: tokeira_types::TaskQueueName(String::new()),
+            schedule_to_start_timeout: time::Duration::ZERO,
             worker_identity: WorkerIdentity("worker".to_owned()),
             expires_at: now,
         });
@@ -1132,6 +1136,8 @@ mod tests {
         let mut state = sample_state(RunKey::new());
         let expires_at = now + Duration::seconds(30);
         state.sticky = Some(StickyAffinity {
+            sticky_queue: tokeira_types::TaskQueueName(String::new()),
+            schedule_to_start_timeout: time::Duration::ZERO,
             worker_identity: WorkerIdentity("worker".to_owned()),
             expires_at,
         });
@@ -1572,6 +1578,7 @@ mod tests {
             last_event_id: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq(1),
                 scheduled_event_id: 1,
                 scheduled_at: fixed_now(),

@@ -52,7 +52,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::StartChildWorkflow {
                 child_workflow_id: child_workflow_id.clone(),
                 namespace_id,
@@ -106,7 +106,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("child-result"),
             }],
@@ -185,7 +185,7 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("parent-done"),
             }],
@@ -252,7 +252,7 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::CompleteWorkflow {
                 result: payloads("parent-done"),
             }],
@@ -322,7 +322,7 @@ async fn duplicate_child_start_delivers_failed_confirmation_to_parent() -> Resul
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::StartChildWorkflow {
                 child_workflow_id: child_workflow_id.clone(),
                 namespace_id,
@@ -393,7 +393,7 @@ async fn start_parent_with_child(
             versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
             deployment_version: None,
             worker_deployment_name: None,
-            sticky_ttl: None,
+            sticky: None,
             commands: vec![WorkflowCommand::StartChildWorkflow {
                 child_workflow_id: child_workflow_id.clone(),
                 namespace_id,

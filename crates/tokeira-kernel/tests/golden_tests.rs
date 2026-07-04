@@ -4335,7 +4335,7 @@ fn request_cancel_activity_unknown() {
         transition,
         Err(Reject::InvalidCommandAttributes {
             cause: tokeira_kernel::WorkflowTaskFailedCause::BadRequestCancelActivityAttributes,
-            message: "ScheduledEventID: 999".to_string(),
+            message: Some("ScheduledEventID: 999".to_string()),
         })
     );
 }
@@ -4391,7 +4391,7 @@ fn close_command_with_buffered_events_is_unhandled_command() {
         transition,
         Err(Reject::InvalidCommandAttributes {
             cause: tokeira_kernel::WorkflowTaskFailedCause::UnhandledCommand,
-            message: "UnhandledCommand".to_string(),
+            message: None,
         })
     );
 }
@@ -4476,9 +4476,138 @@ fn cancel_timer_unknown() {
         transition,
         Err(Reject::InvalidCommandAttributes {
             cause: tokeira_kernel::WorkflowTaskFailedCause::BadCancelTimerAttributes,
-            message: "TimerID: missing".to_string(),
+            message: Some("TimerID: missing".to_string()),
         })
     );
+}
+
+#[test]
+fn record_marker_missing_name_fails_wft() {
+    // TestRespondWorkflowTaskCompletedReturnsErrorIfInvalidArgument's spine
+    // (Tier 1.7): an empty MarkerName REJECTS the completion with
+    // BadRecordMarkerAttributes and the validator's exact causeErr
+    // (`ValidateRecordMarkerAttributes`, command_attr_validator.go:194-211
+    // @ v1.31.0); the runtime persists the WFT failure and renders the wire
+    // message "BadRecordMarkerAttributes: MarkerName is not set on
+    // RecordMarkerCommand." — asserted verbatim by the corpus.
+    let state = make_open_state_with_started_wft();
+    let transition = kernel().apply(
+        LoadedRun::Existing(state.clone()),
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            token: WorkflowTaskToken {
+                run_key: state.run_key,
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![WorkflowCommand::RecordMarker {
+                marker_name: String::new(),
+                details: std::collections::BTreeMap::new(),
+                failure: None,
+                header: None,
+            }],
+            force_new_workflow_task: false,
+            now: now(),
+        }),
+    );
+    assert_eq!(
+        transition,
+        Err(Reject::InvalidCommandAttributes {
+            cause: tokeira_kernel::WorkflowTaskFailedCause::BadRecordMarkerAttributes,
+            message: Some("MarkerName is not set on RecordMarkerCommand.".to_string()),
+        })
+    );
+}
+
+#[test]
+fn transient_completion_materializes_scheduled_started_with_task_times() {
+    // Req B.6 timestamp fidelity (Tier 1.7): the late-materialized
+    // Scheduled/Started pair carries the transient task's ACTUAL
+    // schedule/start times — the worker observed them on its poll response,
+    // and TestWorkflowTaskFailed asserts the persisted started time equals
+    // the observed one, ≥1s before the close event
+    // (`workflowTask.ScheduledTime` / `workflowTask.StartedTime` in
+    // `AddWorkflowTaskCompletedEvent`,
+    // workflow_task_state_machine.go:768-800 @ v1.31.0).
+    let mut state = make_open_state_with_started_wft();
+    let scheduled_at = now() - Duration::seconds(10);
+    let started_at = now() - Duration::seconds(5);
+    state.workflow_task_attempt = 3;
+    state.pending_workflow_task = Some(PendingWorkflowTask {
+        schedule_to_start_deadline: None,
+        logical_seq: LogicalTaskSeq(3),
+        scheduled_event_id: 10, // virtual: last_event_id (9) + 1
+        scheduled_at,
+        started_event_id: Some(11),
+        started_at: Some(started_at),
+        attempt: 3,
+    });
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                token: WorkflowTaskToken {
+                    run_key: state.run_key,
+                    logical_seq: LogicalTaskSeq(3),
+                    started_event_id: 11,
+                    attempt: 3,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky: None,
+                commands: vec![],
+                force_new_workflow_task: false,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    let scheduled = transition
+        .history_events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.kind,
+                HistoryEventKind::WorkflowTaskScheduled { attempt: 3, .. }
+            )
+        })
+        .expect("materialized WorkflowTaskScheduled");
+    assert_eq!(scheduled.event_id, 10);
+    assert_eq!(scheduled.happened_at, scheduled_at);
+    let started = transition
+        .history_events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.kind,
+                HistoryEventKind::WorkflowTaskStarted { attempt: 3, .. }
+            )
+        })
+        .expect("materialized WorkflowTaskStarted");
+    assert_eq!(started.event_id, 11);
+    assert_eq!(started.happened_at, started_at);
+    let completed = transition
+        .history_events
+        .iter()
+        .find(|event| matches!(event.kind, HistoryEventKind::WorkflowTaskCompleted { .. }))
+        .expect("WorkflowTaskCompleted");
+    assert_eq!(completed.event_id, 12);
+    assert_eq!(completed.happened_at, now());
 }
 
 #[test]

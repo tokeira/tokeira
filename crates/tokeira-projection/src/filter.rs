@@ -373,8 +373,46 @@ fn parse_value(input: &str) -> FilterValue {
     FilterValue::String(trimmed.to_string())
 }
 
+/// Split `input` at the first top-level occurrence of `needle`: outside
+/// single-quoted string values and, for `" AND "`, not the connective of a
+/// `BETWEEN low AND high` range. A composed query like
+/// `CloseTime BETWEEN 'a' AND 'b' AND WorkflowId = 'x'` (the legacy
+/// list-closed conversion; also any user query) must conjoin at the SECOND
+/// `AND` — v1.31.0's visibility query parser is a real SQL grammar
+/// (`common/persistence/visibility/store/query` @ v1.31.0), so range and
+/// string-literal `AND`s never split.
 fn split_top_level<'a>(input: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
-    input.split_once(needle)
+    const BETWEEN_KEYWORD: &str = " BETWEEN ";
+    let mut in_quotes = false;
+    let mut between_pending = false;
+    let mut skip_until = 0;
+    for (i, ch) in input.char_indices() {
+        if i < skip_until {
+            continue;
+        }
+        if ch == '\'' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if in_quotes {
+            continue;
+        }
+        let rest = &input[i..];
+        if rest.starts_with(BETWEEN_KEYWORD) {
+            between_pending = true;
+            skip_until = i + BETWEEN_KEYWORD.len();
+            continue;
+        }
+        if rest.starts_with(needle) {
+            if needle == " AND " && between_pending {
+                between_pending = false;
+                skip_until = i + needle.len();
+                continue;
+            }
+            return Some((&input[..i], &input[i + needle.len()..]));
+        }
+    }
+    None
 }
 
 fn parse_between(input: &str) -> Option<(&str, String, String)> {
@@ -478,6 +516,45 @@ mod tests {
     use super::*;
     use crate::memory::InMemoryVisibilityStore;
     use proptest::prelude::*;
+
+    // The legacy list-closed conversion emits
+    // `CloseTime BETWEEN 'a' AND 'b' AND WorkflowId = 'x'` — the conjunction
+    // must split at the SECOND `AND`, never the range connective
+    // (TestWorkflowTimeout, tests/workflow_failures_test.go @ v1.31.0).
+    #[test]
+    fn split_top_level_skips_between_connective() {
+        let input = "CloseTime BETWEEN '2026-07-04T15:00:19Z' AND '2026-07-04T15:00:29Z' AND WorkflowId = 'wf-1'";
+        let (lhs, rhs) = split_top_level(input, " AND ").expect("must split at the conjunction");
+        assert_eq!(
+            lhs,
+            "CloseTime BETWEEN '2026-07-04T15:00:19Z' AND '2026-07-04T15:00:29Z'"
+        );
+        assert_eq!(rhs, "WorkflowId = 'wf-1'");
+    }
+
+    #[test]
+    fn split_top_level_two_between_ranges_split_at_conjunction() {
+        let input = "StartTime BETWEEN 1 AND 2 AND CloseTime BETWEEN 3 AND 4";
+        let (lhs, rhs) = split_top_level(input, " AND ").expect("must split between the ranges");
+        assert_eq!(lhs, "StartTime BETWEEN 1 AND 2");
+        assert_eq!(rhs, "CloseTime BETWEEN 3 AND 4");
+    }
+
+    #[test]
+    fn split_top_level_ignores_and_inside_quoted_value() {
+        let input = "WorkflowId = 'alpha AND beta' AND TaskQueue = 'q'";
+        let (lhs, rhs) = split_top_level(input, " AND ").expect("must split after the literal");
+        assert_eq!(lhs, "WorkflowId = 'alpha AND beta'");
+        assert_eq!(rhs, "TaskQueue = 'q'");
+    }
+
+    #[test]
+    fn split_top_level_lone_between_does_not_split() {
+        assert_eq!(
+            split_top_level("StartTime BETWEEN 1 AND 2", " AND "),
+            None
+        );
+    }
 
     fn arb_system_string_field() -> impl Strategy<Value = &'static str> {
         prop_oneof![Just("WorkflowId"), Just("WorkflowType"), Just("TaskQueue"),]

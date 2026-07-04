@@ -872,6 +872,8 @@ pub fn wft_failed_cause_from_proto(value: i32) -> tokeira_kernel::WorkflowTaskFa
         Ok(P::BadScheduleActivityAttributes) => K::BadScheduleActivityAttributes,
         Ok(P::BadRequestCancelActivityAttributes) => K::BadRequestCancelActivityAttributes,
         Ok(P::BadStartTimerAttributes) => K::BadStartTimerAttributes,
+        Ok(P::BadCancelTimerAttributes) => K::BadCancelTimerAttributes,
+        Ok(P::BadRecordMarkerAttributes) => K::BadRecordMarkerAttributes,
         Ok(P::BadSignalWorkflowExecutionAttributes) => K::BadSignalWorkflowExecutionAttributes,
         Ok(P::ResetWorkflow) => K::ResetWorkflow,
         Ok(P::NonDeterministicError) => K::NonDeterminismError,

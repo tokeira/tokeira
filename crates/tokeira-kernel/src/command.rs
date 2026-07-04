@@ -180,6 +180,10 @@ pub enum WorkflowTaskFailedCause {
     /// nor fired-and-buffered (`AddTimerCanceledEvent` caller error,
     /// mutable_state_impl.go @ v1.31.0).
     BadCancelTimerAttributes,
+    /// The `RecordMarker` command carried invalid or missing attributes
+    /// (`ValidateRecordMarkerAttributes`, command_attr_validator.go:194-211
+    /// @ v1.31.0).
+    BadRecordMarkerAttributes,
     /// The worker returned a command the kernel does not
     /// recognise or cannot process in the current state.
     UnhandledCommand,
@@ -208,6 +212,34 @@ pub enum WorkflowTaskFailedCause {
     /// `failed_cause.proto`;
     /// `service/history/api/respondworkflowtaskfailed/api.go:88 @ v1.31.0`).
     GrpcMessageTooLarge,
+}
+
+impl WorkflowTaskFailedCause {
+    /// The cause's v1.31.0 `String()` rendering — the CamelCase shorthand the
+    /// generated Go enum stringer produces (e.g.
+    /// `WORKFLOW_TASK_FAILED_CAUSE_BAD_RECORD_MARKER_ATTRIBUTES` →
+    /// `"BadRecordMarkerAttributes"`). The invalid-command wire message is
+    /// composed from this name (`workflowTaskFailedCause.Message()`,
+    /// respondworkflowtaskcompleted/workflow_task_completed_handler.go:1502-1510
+    /// @ v1.31.0), and the corpus asserts the rendered strings verbatim.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            // v1.31.0's proto value is NON_DETERMINISTIC_ERROR; the variant
+            // name predates the corpus campaign and stays.
+            Self::NonDeterminismError => "NonDeterministicError",
+            Self::BadScheduleActivityAttributes => "BadScheduleActivityAttributes",
+            Self::BadStartTimerAttributes => "BadStartTimerAttributes",
+            Self::BadCancelTimerAttributes => "BadCancelTimerAttributes",
+            Self::BadRecordMarkerAttributes => "BadRecordMarkerAttributes",
+            Self::UnhandledCommand => "UnhandledCommand",
+            Self::BadRequestCancelActivityAttributes => "BadRequestCancelActivityAttributes",
+            Self::WorkflowWorkerUnhandledFailure => "WorkflowWorkerUnhandledFailure",
+            Self::BadSignalWorkflowExecutionAttributes => "BadSignalWorkflowExecutionAttributes",
+            Self::ResetWorkflow => "ResetWorkflow",
+            Self::ForceCloseCommand => "ForceCloseCommand",
+            Self::GrpcMessageTooLarge => "GrpcMessageTooLarge",
+        }
+    }
 }
 
 /// Which timeout fired on a workflow task.

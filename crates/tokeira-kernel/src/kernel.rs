@@ -1564,21 +1564,34 @@ impl BasicKernel {
         // virtual ones; if other events advanced history, fresh real ids are
         // assigned (v1.31.0 re-wires ids the same way at flush).
         let (scheduled_event_id, started_event_id) = if pending.attempt > 1 {
-            let scheduled = builder.emit(HistoryEventKind::WorkflowTaskScheduled {
-                logical_seq: pending.logical_seq,
-                task_queue: builder.state.task_queue.clone(),
-                workflow_task_timeout: builder.state.workflow_task_timeout,
-                attempt: pending.attempt,
-            });
-            let started = builder.emit(HistoryEventKind::WorkflowTaskStarted {
-                logical_seq: pending.logical_seq,
-                scheduled_event_id: scheduled,
-                attempt: pending.attempt,
-                identity: req.identity.clone(),
-                request_id: format!("transient-materialize-{}", pending.logical_seq.0),
-                history_size_bytes: 0,
-                suggest_continue_as_new: false,
-            });
+            // The materialized pair carries the task's ACTUAL schedule/start
+            // times, not the completion time — the worker already observed
+            // these timestamps on its poll response's synthesized transient
+            // events, and the corpus asserts the persisted WorkflowTaskStarted
+            // time equals what the worker saw (`workflowTask.ScheduledTime` /
+            // `workflowTask.StartedTime` in `AddWorkflowTaskCompletedEvent`,
+            // workflow_task_state_machine.go:768-800 @ v1.31.0).
+            let scheduled = builder.emit_at(
+                pending.scheduled_at,
+                HistoryEventKind::WorkflowTaskScheduled {
+                    logical_seq: pending.logical_seq,
+                    task_queue: builder.state.task_queue.clone(),
+                    workflow_task_timeout: builder.state.workflow_task_timeout,
+                    attempt: pending.attempt,
+                },
+            );
+            let started = builder.emit_at(
+                pending.started_at.unwrap_or(req.now),
+                HistoryEventKind::WorkflowTaskStarted {
+                    logical_seq: pending.logical_seq,
+                    scheduled_event_id: scheduled,
+                    attempt: pending.attempt,
+                    identity: req.identity.clone(),
+                    request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                    history_size_bytes: 0,
+                    suggest_continue_as_new: false,
+                },
+            );
             (scheduled, started)
         } else {
             (pending.scheduled_event_id, started_event_id)
@@ -3371,6 +3384,17 @@ fn apply_workflow_command(
             failure,
             header,
         } => {
+            // An empty marker name FAILS THE WORKFLOW TASK with
+            // BadRecordMarkerAttributes (`ValidateRecordMarkerAttributes`,
+            // command_attr_validator.go:194-211 @ v1.31.0); the corpus asserts
+            // the rendered wire message verbatim
+            // (tests/workflow_failures_test.go:373 @ v1.31.0).
+            if marker_name.is_empty() {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::BadRecordMarkerAttributes,
+                    message: Some("MarkerName is not set on RecordMarkerCommand.".to_string()),
+                });
+            }
             builder.emit(HistoryEventKind::MarkerRecorded {
                 workflow_task_completed_event_id,
                 marker_name,
@@ -3384,13 +3408,13 @@ fn apply_workflow_command(
             // A close command with buffered events is an UnhandledCommand:
             // the workflow must observe the buffered events before closing
             // (`hasBufferedEventsOrMessages` guards in the close handlers,
-            // workflow_task_completed_handler.go @ v1.31.0). Message is the
-            // cause's exact string — the corpus asserts err.Error() ==
-            // "UnhandledCommand".
+            // workflow_task_completed_handler.go @ v1.31.0). No causeErr —
+            // the API layer renders the bare cause name, and the corpus
+            // asserts err.Error() == "UnhandledCommand".
             if !builder.state.buffered_events.is_empty() {
                 return Err(Reject::InvalidCommandAttributes {
                     cause: WorkflowTaskFailedCause::UnhandledCommand,
-                    message: "UnhandledCommand".to_string(),
+                    message: None,
                 });
             }
             if let Some(cron) = cron_continuation {
@@ -3417,13 +3441,13 @@ fn apply_workflow_command(
             // A close command with buffered events is an UnhandledCommand:
             // the workflow must observe the buffered events before closing
             // (`hasBufferedEventsOrMessages` guards in the close handlers,
-            // workflow_task_completed_handler.go @ v1.31.0). Message is the
-            // cause's exact string — the corpus asserts err.Error() ==
-            // "UnhandledCommand".
+            // workflow_task_completed_handler.go @ v1.31.0). No causeErr —
+            // the API layer renders the bare cause name, and the corpus
+            // asserts err.Error() == "UnhandledCommand".
             if !builder.state.buffered_events.is_empty() {
                 return Err(Reject::InvalidCommandAttributes {
                     cause: WorkflowTaskFailedCause::UnhandledCommand,
-                    message: "UnhandledCommand".to_string(),
+                    message: None,
                 });
             }
             builder.state.close_failure = Some(failure.clone());
@@ -3499,13 +3523,13 @@ fn apply_workflow_command(
             // A close command with buffered events is an UnhandledCommand:
             // the workflow must observe the buffered events before closing
             // (`hasBufferedEventsOrMessages` guards in the close handlers,
-            // workflow_task_completed_handler.go @ v1.31.0). Message is the
-            // cause's exact string — the corpus asserts err.Error() ==
-            // "UnhandledCommand".
+            // workflow_task_completed_handler.go @ v1.31.0). No causeErr —
+            // the API layer renders the bare cause name, and the corpus
+            // asserts err.Error() == "UnhandledCommand".
             if !builder.state.buffered_events.is_empty() {
                 return Err(Reject::InvalidCommandAttributes {
                     cause: WorkflowTaskFailedCause::UnhandledCommand,
-                    message: "UnhandledCommand".to_string(),
+                    message: None,
                 });
             }
             builder.emit(HistoryEventKind::WorkflowExecutionContinuedAsNew {
@@ -3536,13 +3560,13 @@ fn apply_workflow_command(
             // A close command with buffered events is an UnhandledCommand:
             // the workflow must observe the buffered events before closing
             // (`hasBufferedEventsOrMessages` guards in the close handlers,
-            // workflow_task_completed_handler.go @ v1.31.0). Message is the
-            // cause's exact string — the corpus asserts err.Error() ==
-            // "UnhandledCommand".
+            // workflow_task_completed_handler.go @ v1.31.0). No causeErr —
+            // the API layer renders the bare cause name, and the corpus
+            // asserts err.Error() == "UnhandledCommand".
             if !builder.state.buffered_events.is_empty() {
                 return Err(Reject::InvalidCommandAttributes {
                     cause: WorkflowTaskFailedCause::UnhandledCommand,
-                    message: "UnhandledCommand".to_string(),
+                    message: None,
                 });
             }
             builder.emit(HistoryEventKind::WorkflowExecutionCanceled {
@@ -3583,7 +3607,7 @@ fn apply_workflow_command(
                 }
                 return Err(Reject::InvalidCommandAttributes {
                     cause: WorkflowTaskFailedCause::BadRequestCancelActivityAttributes,
-                    message: format!("ScheduledEventID: {scheduled_event_id}"),
+                    message: Some(format!("ScheduledEventID: {scheduled_event_id}")),
                 });
             };
             // Duplicate cancellation is a caller error too
@@ -3591,7 +3615,7 @@ fn apply_workflow_command(
             if activity.cancel_requested {
                 return Err(Reject::InvalidCommandAttributes {
                     cause: WorkflowTaskFailedCause::BadRequestCancelActivityAttributes,
-                    message: format!("ScheduledEventID: {scheduled_event_id}"),
+                    message: Some(format!("ScheduledEventID: {scheduled_event_id}")),
                 });
             }
             builder.emit(HistoryEventKind::ActivityTaskCancelRequested {
@@ -3681,7 +3705,7 @@ fn apply_workflow_command(
             // K4 invalid-command seam.
             Err(Reject::InvalidCommandAttributes {
                 cause: WorkflowTaskFailedCause::BadCancelTimerAttributes,
-                message: format!("TimerID: {timer_id}"),
+                message: Some(format!("TimerID: {timer_id}")),
             })
         }
         WorkflowCommand::RequestNewWorkflowTask => {
@@ -4138,11 +4162,22 @@ impl TransitionBuilder {
     /// Append a history event and return its assigned event
     /// ID. Event IDs are contiguous within a transition.
     fn emit(&mut self, kind: HistoryEventKind) -> i64 {
+        self.emit_at(self.now, kind)
+    }
+
+    /// [`Self::emit`] with an explicit timestamp, for events whose recorded
+    /// time predates the transition applying them — e.g. a transient WFT's
+    /// late-materialized Scheduled/Started pair carries the task's actual
+    /// schedule/start times, not the completion time
+    /// (`workflowTask.ScheduledTime` / `workflowTask.StartedTime` in
+    /// `AddWorkflowTaskCompletedEvent`,
+    /// workflow_task_state_machine.go:768-800 @ v1.31.0).
+    fn emit_at(&mut self, happened_at: OffsetDateTime, kind: HistoryEventKind) -> i64 {
         let event_id = self.state.last_event_id + 1;
         self.state.last_event_id = event_id;
         self.history_events.push(HistoryEvent {
             event_id,
-            happened_at: self.now,
+            happened_at,
             kind,
         });
         event_id
@@ -4521,10 +4556,15 @@ pub enum Reject {
     /// respondworkflowtaskcompleted/workflow_task_completed_handler.go @
     /// v1.31.0); the completion applier converts this variant into a
     /// WFT-failed transition, so it never surfaces as a command reject.
-    #[error("invalid command attributes ({cause:?}): {message}")]
+    ///
+    /// `message` mirrors v1.31.0's nullable `causeErr`: the API layer renders
+    /// the wire message as `"{cause}: {message}"`, or the bare cause name when
+    /// `None` (`workflowTaskFailedCause.Message()`,
+    /// workflow_task_completed_handler.go:1502-1510 @ v1.31.0).
+    #[error("invalid command attributes ({cause:?}): {}", message.as_deref().unwrap_or("<none>"))]
     InvalidCommandAttributes {
         cause: WorkflowTaskFailedCause,
-        message: String,
+        message: Option<String>,
     },
     /// A `Start` command was issued but the run already
     /// exists in durable storage.

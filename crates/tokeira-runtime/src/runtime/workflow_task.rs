@@ -223,8 +223,11 @@ where
         reserved: ReservedPoller,
     ) -> Result<()> {
         let worker_identity = reserved.worker_identity().clone();
+        // A start sync-match delivers on the run's NORMAL queue: not a sticky
+        // match (the flag licenses partial-history attach, moot here anyway
+        // since a fresh run has previous_started_event_id == 0).
         let task = self
-            .started_workflow_task_from_state(new_state, true, worker_identity)
+            .started_workflow_task_from_state(new_state, false, worker_identity)
             .await?;
         if !reserved.deliver(task) {
             tracing::warn!(
@@ -451,7 +454,17 @@ where
             )) = error.downcast_ref()
         {
             let cause = cause.clone();
-            let message = message.clone();
+            // The wire message mirrors `workflowTaskFailedCause.Message()`:
+            // `"{cause}: {causeErr}"` when a cause error exists, the bare
+            // cause name otherwise (workflow_task_completed_handler.go:
+            // 1502-1510 @ v1.31.0). The same rendering is persisted as the
+            // WFT-failed event's server failure
+            // (`failure.NewServerFailure(wtFailedCause.Message(), false)`,
+            // respondworkflowtaskcompleted/api.go:1049-1059 @ v1.31.0).
+            let wire_message = match message {
+                Some(cause_err) => format!("{}: {}", cause.as_str(), cause_err),
+                None => cause.as_str().to_string(),
+            };
             runtime_metrics::record_workflow_task_completed(OutcomeLabel::Rejected);
             let drop_without_failing = completion_token.attempt > 1
                 && cause != tokeira_kernel::WorkflowTaskFailedCause::UnhandledCommand;
@@ -463,7 +476,7 @@ where
                             logical_seq: completion_token.logical_seq,
                             started_event_id: completion_token.started_event_id,
                             failure_cause: cause,
-                            failure_details: None,
+                            failure_details: Some(server_failure_payload(&wire_message)),
                             worker_identity: completion_identity,
                             now: OffsetDateTime::now_utc(),
                         }),
@@ -476,7 +489,10 @@ where
                     "failed to persist WFT failure for invalid command"
                 );
             }
-            return Err(crate::errors::InvalidWorkflowCommand { message }.into());
+            return Err(crate::errors::InvalidWorkflowCommand {
+                message: wire_message,
+            }
+            .into());
         }
         match &result {
             Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
@@ -902,13 +918,26 @@ where
         self.delivery_metrics
             .record_latency(&offered.queue, entered_at.elapsed());
 
+        // Partial-history attach is licensed by STICKY-QUEUE dispatch, not by
+        // worker-identity affinity: v1.31.0 trims history to
+        // previous_started+1 only when the run's sticky queue is set
+        // (`setHistoryForRecordWfTaskStartedResp`,
+        // recordworkflowtaskstarted/api.go:272-278; `IsStickyTaskQueueSet`,
+        // api.go:418 @ v1.31.0). Tokeira's degraded identity-only hint (empty
+        // sticky queue, e.g. a transient retry preferring the failing worker)
+        // dispatches on the NORMAL queue and must attach full history — the
+        // dispatch queue differing from the run's queue is the sticky-dispatch
+        // marker (`schedule_workflow_task` dispatches on the sticky queue
+        // name; broker redirects rewrite only build ids, never queue names).
+        let is_sticky_match = offered.queue.task_queue != new_state.task_queue
+            && offered.sticky_preferred.as_ref() == Some(&worker_identity);
         Ok(StartedWorkflowTask {
             run_key: new_state.run_key,
             run_id: new_state.run_id,
             workflow_id: new_state.workflow_id,
             task_queue: new_state.task_queue,
             previous_started_event_id: new_state.previous_started_event_id,
-            is_sticky_match: offered.sticky_preferred.as_ref() == Some(&worker_identity),
+            is_sticky_match,
             scheduled_time: pending.scheduled_at,
             started_time: pending.started_at.unwrap_or(now),
             workflow_task_timeout: new_state.workflow_task_timeout,
@@ -1027,6 +1056,23 @@ fn retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
         _ => seconds,
     };
     Duration::seconds_f64(capped.max(0.0))
+}
+
+/// The server failure persisted on an invalid-command `WorkflowTaskFailed`
+/// event: message = the rendered cause message, `ServerFailureInfo`,
+/// non-retryable false (`failure.NewServerFailure(wtFailedCause.Message(),
+/// false)` in `failWorkflowTask`, respondworkflowtaskcompleted/api.go:1049-1059
+/// @ v1.31.0).
+fn server_failure_payload(message: &str) -> Payload {
+    tokeira_proto::conversions::common::failure_to_payload(&Failure {
+        message: message.to_string(),
+        failure_info: Some(FailureInfo::ServerFailureInfo(
+            tokeira_proto::failure::ServerFailureInfo {
+                non_retryable: false,
+            },
+        )),
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]

@@ -5465,7 +5465,7 @@ proptest! {
                 rejected,
                 Err(Reject::InvalidCommandAttributes {
                     cause: WorkflowTaskFailedCause::UnhandledCommand,
-                    message: "UnhandledCommand".to_string(),
+                    message: None,
                 })
             );
             // The runtime then fails the WFT; the failure flushes the buffer

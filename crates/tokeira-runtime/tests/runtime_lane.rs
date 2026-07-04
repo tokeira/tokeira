@@ -698,7 +698,12 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
         .await?
         .expect("recovered pending WFT should retain sticky and versioned routing metadata");
     assert_eq!(sticky_task.run_key, started.run_key);
-    assert!(sticky_task.is_sticky_match);
+    // The empty-queue sticky spec is an identity-only delivery hint: worker-a
+    // is preferred (asserted above), but the task dispatches on the NORMAL
+    // queue, so it is NOT a sticky match — partial-history attach requires
+    // sticky-QUEUE dispatch (`setHistoryForRecordWfTaskStartedResp`,
+    // recordworkflowtaskstarted/api.go:272-278 @ v1.31.0).
+    assert!(!sticky_task.is_sticky_match);
 
     Ok(())
 }

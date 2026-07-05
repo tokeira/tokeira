@@ -1024,6 +1024,7 @@ fn arb_cancel_request(now: OffsetDateTime) -> impl Strategy<Value = CancelReques
             move |(reason, external_initiator, request_id)| CancelRequest {
                 reason,
                 external_initiator,
+                external_initiated_event_id: 0,
                 request: request_context(&request_id, now),
                 now,
             },
@@ -1476,7 +1477,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 deployment_version: None,
                 worker_deployment_name: None,
                 sticky: None,
-                commands: vec![WorkflowCommand::CancelWorkflow],
+                commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
                 force_new_workflow_task: false,
                 now,
             };
@@ -3253,6 +3254,7 @@ proptest! {
             Command::Cancel(CancelRequest {
                 reason: "cancel".into(),
                 external_initiator: None,
+                external_initiated_event_id: 0,
                 request: request_context("cancel-req", now),
                 now,
             }),
@@ -3927,7 +3929,7 @@ fn property_42_parent_close_policy_all_paths() {
             wf_close(WorkflowCommand::FailWorkflow {
                 failure: payload("fail"),
             }),
-            wf_close(WorkflowCommand::CancelWorkflow),
+            wf_close(WorkflowCommand::CancelWorkflow { details: None }),
             wf_close(WorkflowCommand::ContinueAsNew {
                 new_run_id: RunId::new(),
                 workflow_type: WorkflowType("next".into()),
@@ -4246,7 +4248,7 @@ fn property_57_close_clears_pending_updates() {
         wf_close(WorkflowCommand::FailWorkflow {
             failure: payload("fail"),
         }),
-        wf_close(WorkflowCommand::CancelWorkflow),
+        wf_close(WorkflowCommand::CancelWorkflow { details: None }),
         wf_close(WorkflowCommand::ContinueAsNew {
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("next".into()),
@@ -4528,7 +4530,7 @@ fn property_63_close_preserves_execution_options() {
         wf_close(WorkflowCommand::FailWorkflow {
             failure: payload("fail"),
         }),
-        wf_close(WorkflowCommand::CancelWorkflow),
+        wf_close(WorkflowCommand::CancelWorkflow { details: None }),
         wf_close(WorkflowCommand::ContinueAsNew {
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("next".into()),
@@ -4628,7 +4630,7 @@ fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
         CloseKind::Failed(bytes) => wft(vec![WorkflowCommand::FailWorkflow {
             failure: Payload::new(bytes.clone()),
         }]),
-        CloseKind::Canceled => wft(vec![WorkflowCommand::CancelWorkflow]),
+        CloseKind::Canceled => wft(vec![WorkflowCommand::CancelWorkflow { details: None }]),
         CloseKind::ContinuedAsNew => wft(vec![WorkflowCommand::ContinueAsNew {
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("wf".into()),
@@ -5169,7 +5171,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
         wf_close(WorkflowCommand::FailWorkflow {
             failure: payload("fail"),
         }),
-        wf_close(WorkflowCommand::CancelWorkflow),
+        wf_close(WorkflowCommand::CancelWorkflow { details: None }),
         wf_close(WorkflowCommand::ContinueAsNew {
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("next".into()),

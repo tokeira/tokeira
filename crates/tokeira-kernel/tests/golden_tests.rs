@@ -719,6 +719,7 @@ fn make_cancel_request() -> CancelRequest {
     CancelRequest {
         reason: "cancel requested".into(),
         external_initiator: None,
+        external_initiated_event_id: 0,
         request: request_context("cancel-req"),
         now: now(),
     }
@@ -3482,14 +3483,53 @@ fn reject_cancel_absent_run() {
 }
 
 #[test]
-fn reject_cancel_closed_run() {
-    assert_eq!(
-        kernel().apply(
+fn cancel_closed_run_is_success_noop() {
+    // "the request to cancel this workflow is a success even if the target
+    // workflow has already finished" — no event, no WFT
+    // (requestcancelworkflow/api.go:44-53 @ v1.31.0).
+    let transition = kernel()
+        .apply(
             LoadedRun::Existing(make_closed_state()),
             Command::Cancel(make_cancel_request()),
-        ),
-        Err(Reject::RunClosed(ExecutionStatus::Completed))
+        )
+        .unwrap();
+    assert!(transition.history_events.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+    assert!(!transition.next_state.cancel_requested);
+}
+
+#[test]
+fn cancel_already_cancel_requested_run_is_success_noop() {
+    // Repeat cancel requests short-circuit on `IsCancelRequested` — no
+    // second WorkflowExecutionCancelRequested event
+    // (requestcancelworkflow/api.go:74-81 @ v1.31.0).
+    let first = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::Cancel(make_cancel_request()),
+        )
+        .unwrap();
+    assert_eq!(
+        first
+            .history_events
+            .iter()
+            .filter(|e| matches!(
+                e.kind,
+                HistoryEventKind::WorkflowExecutionCancelRequested { .. }
+            ))
+            .count(),
+        1
     );
+    let mut repeat = make_cancel_request();
+    repeat.request = request_context("cancel-req-2");
+    let second = kernel()
+        .apply(
+            LoadedRun::Existing(first.next_state),
+            Command::Cancel(repeat),
+        )
+        .unwrap();
+    assert!(second.history_events.is_empty());
+    assert!(second.next_state.cancel_requested);
 }
 
 #[test]
@@ -4130,7 +4170,7 @@ fn cancel_workflow_command() {
                 deployment_version: None,
                 worker_deployment_name: None,
                 sticky: None,
-                commands: vec![WorkflowCommand::CancelWorkflow],
+                commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
                 force_new_workflow_task: false,
                 now: now(),
             }),
@@ -4184,7 +4224,7 @@ fn cancel_workflow_then_another_command() {
                 worker_deployment_name: None,
                 sticky: None,
                 commands: vec![
-                    WorkflowCommand::CancelWorkflow,
+                    WorkflowCommand::CancelWorkflow { details: None },
                     WorkflowCommand::RequestNewWorkflowTask,
                 ],
                 force_new_workflow_task: false,
@@ -4798,7 +4838,7 @@ fn cancel_then_cancel_workflow_e2e() {
                 deployment_version: None,
                 worker_deployment_name: None,
                 sticky: None,
-                commands: vec![WorkflowCommand::CancelWorkflow],
+                commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
                 force_new_workflow_task: false,
                 now: now(),
             }),
@@ -6089,7 +6129,7 @@ fn dispatch_completion_callback_outcome_failed() {
 fn dispatch_completion_callback_outcome_canceled() {
     let transition = close_via_wft(
         make_started_wft_with_standby_callback(),
-        vec![WorkflowCommand::CancelWorkflow],
+        vec![WorkflowCommand::CancelWorkflow { details: None }],
     );
     assert_eq!(
         single_dispatched_outcome(&transition),

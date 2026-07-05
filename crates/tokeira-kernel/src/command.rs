@@ -212,6 +212,17 @@ pub enum WorkflowTaskFailedCause {
     /// `failed_cause.proto`;
     /// `service/history/api/respondworkflowtaskfailed/api.go:88 @ v1.31.0`).
     GrpcMessageTooLarge,
+    /// The `RequestCancelExternalWorkflowExecution` command carried invalid
+    /// attributes — including start-and-cancel of the same child workflow in
+    /// one workflow task (`ValidateCancelExternalWorkflowExecutionAttributes`,
+    /// command_attr_validator.go:250-293 @ v1.31.0;
+    /// `WORKFLOW_TASK_FAILED_CAUSE_BAD_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_ATTRIBUTES
+    /// = 10`, `failed_cause.proto`).
+    ///
+    /// Declared LAST: this enum is embedded in persisted `WorkflowTaskFailed`
+    /// history events and postcard encodes variants by declaration index —
+    /// appending keeps every pre-existing discriminant stable.
+    BadRequestCancelExternalWorkflowExecutionAttributes,
 }
 
 impl WorkflowTaskFailedCause {
@@ -235,6 +246,9 @@ impl WorkflowTaskFailedCause {
             Self::BadRequestCancelActivityAttributes => "BadRequestCancelActivityAttributes",
             Self::WorkflowWorkerUnhandledFailure => "WorkflowWorkerUnhandledFailure",
             Self::BadSignalWorkflowExecutionAttributes => "BadSignalWorkflowExecutionAttributes",
+            Self::BadRequestCancelExternalWorkflowExecutionAttributes => {
+                "BadRequestCancelExternalWorkflowExecutionAttributes"
+            }
             Self::ResetWorkflow => "ResetWorkflow",
             Self::ForceCloseCommand => "ForceCloseCommand",
             Self::GrpcMessageTooLarge => "GrpcMessageTooLarge",
@@ -550,6 +564,13 @@ pub struct CancelRequest {
     /// If the cancel was initiated by another workflow, its
     /// identity is recorded here for history.
     pub external_initiator: Option<ExternalWorkflowExecution>,
+    /// The initiator's `RequestCancelExternalWorkflowExecutionInitiated`
+    /// event id, recorded on the target's `WorkflowExecutionCancelRequested`
+    /// event (`ExternalInitiatedEventId: task.InitiatedEventID`,
+    /// transfer_queue_active_task_executor.go:1552-1567 @ v1.31.0). Zero for
+    /// direct RPC cancels.
+    #[serde(default)]
+    pub external_initiated_event_id: i64,
     /// Caller-supplied request context for dedupe and tracing.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
@@ -1233,7 +1254,12 @@ pub enum WorkflowCommand {
     },
     /// Cancel the workflow (cooperative cancellation
     /// completed). Closes the run.
-    CancelWorkflow,
+    CancelWorkflow {
+        /// Worker-supplied cancellation details, carried verbatim onto the
+        /// `WorkflowExecutionCanceled` event (`Details: command.Details`,
+        /// event_factory.go:592-604 @ v1.31.0).
+        details: Option<Payloads>,
+    },
     /// Request cancellation of a pending activity. The
     /// activity remains open until resolved.
     RequestCancelActivity {

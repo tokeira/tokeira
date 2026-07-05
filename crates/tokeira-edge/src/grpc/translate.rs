@@ -875,6 +875,9 @@ pub fn wft_failed_cause_from_proto(value: i32) -> tokeira_kernel::WorkflowTaskFa
         Ok(P::BadCancelTimerAttributes) => K::BadCancelTimerAttributes,
         Ok(P::BadRecordMarkerAttributes) => K::BadRecordMarkerAttributes,
         Ok(P::BadSignalWorkflowExecutionAttributes) => K::BadSignalWorkflowExecutionAttributes,
+        Ok(P::BadRequestCancelExternalWorkflowExecutionAttributes) => {
+            K::BadRequestCancelExternalWorkflowExecutionAttributes
+        }
         Ok(P::ResetWorkflow) => K::ResetWorkflow,
         Ok(P::NonDeterministicError) => K::NonDeterminismError,
         Ok(P::ForceCloseCommand) => K::ForceCloseCommand,
@@ -4367,8 +4370,10 @@ pub fn proto_command_to_workflow_command(
         Some(Attributes::CancelTimerCommandAttributes(attrs)) => Ok(WorkflowCommand::CancelTimer {
             timer_id: attrs.timer_id,
         }),
-        Some(Attributes::CancelWorkflowExecutionCommandAttributes(_attrs)) => {
-            Ok(WorkflowCommand::CancelWorkflow)
+        Some(Attributes::CancelWorkflowExecutionCommandAttributes(attrs)) => {
+            Ok(WorkflowCommand::CancelWorkflow {
+                details: attrs.details.as_ref().map(payloads_to_domain),
+            })
         }
         Some(Attributes::RequestCancelExternalWorkflowExecutionCommandAttributes(attrs)) => {
             Ok(WorkflowCommand::RequestCancelExternalWorkflowExecution {
@@ -4650,9 +4655,11 @@ pub fn workflow_command_to_proto(
                 timer_id: timer_id.clone(),
             }),
         ),
-        WorkflowCommand::CancelWorkflow => {
+        WorkflowCommand::CancelWorkflow { details } => {
             Some(Attributes::CancelWorkflowExecutionCommandAttributes(
-                command::CancelWorkflowExecutionCommandAttributes::default(),
+                command::CancelWorkflowExecutionCommandAttributes {
+                    details: details.as_ref().map(payloads_from_domain),
+                },
             ))
         }
         WorkflowCommand::RecordMarker {

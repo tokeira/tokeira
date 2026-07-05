@@ -1282,6 +1282,7 @@ pub async fn cancel_workflows<R>(
                 CancelRequest {
                     reason: "schedule overlap policy".to_string(),
                     external_initiator: None,
+                    external_initiated_event_id: 0,
                     request: request.clone(),
                     now: OffsetDateTime::now_utc(),
                 },

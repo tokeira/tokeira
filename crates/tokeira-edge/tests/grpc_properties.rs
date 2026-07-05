@@ -295,7 +295,7 @@ proptest! {
             | WorkflowCommand::UpsertSearchAttributes(_)
             | WorkflowCommand::CompleteWorkflow { .. }
             | WorkflowCommand::FailWorkflow { .. }
-            | WorkflowCommand::CancelWorkflow
+            | WorkflowCommand::CancelWorkflow { .. }
             | WorkflowCommand::CancelTimer { .. }
             | WorkflowCommand::StartChildWorkflow { .. }
             | WorkflowCommand::SignalExternalWorkflowExecution { .. }
@@ -1202,7 +1202,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                     }
                 }
             ),
-        Just(WorkflowCommand::CancelWorkflow),
+        Just(WorkflowCommand::CancelWorkflow { details: None }),
         (1i64..10_000).prop_map(|scheduled_event_id| {
             WorkflowCommand::RequestCancelActivity { scheduled_event_id }
         }),

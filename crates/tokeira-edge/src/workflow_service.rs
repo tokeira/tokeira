@@ -1649,6 +1649,7 @@ impl WorkflowService {
                 CancelRequest {
                     reason: "batch cancel".to_string(),
                     external_initiator: None,
+                    external_initiated_event_id: 0,
                     request: batch_request_context(ctx),
                     now: OffsetDateTime::now_utc(),
                 },
@@ -1935,6 +1936,7 @@ impl WorkflowService {
                             CancelRequest {
                                 reason: "schedule overlap policy".to_string(),
                                 external_initiator: None,
+                                external_initiated_event_id: 0,
                                 request: schedule_request_context(actual_time),
                                 now: actual_time,
                             },
@@ -5029,8 +5031,13 @@ impl WorkflowService {
                             && req.history_event_filter_type != 2
                             && client_supports_transient_events
                         {
-                            append_transient_suffix(&mut events, self.repo.as_ref(), run_key)
-                                .await?;
+                            append_transient_suffix(
+                                &mut events,
+                                self.repo.as_ref(),
+                                run_key,
+                                current_last_event_id,
+                            )
+                            .await?;
                         }
                         return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
                             history: events,
@@ -5396,6 +5403,7 @@ async fn append_transient_suffix(
     events: &mut Vec<tokeira_kernel::HistoryEvent>,
     repo: &dyn tokeira_storage::RunRepository,
     run_key: tokeira_types::RunKey,
+    read_position: i64,
 ) -> EdgeResult<()> {
     let tokeira_kernel::LoadedRun::Existing(state) =
         repo.load_run(run_key).await.map_err(EdgeError::from)?
@@ -5412,10 +5420,14 @@ async fn append_transient_suffix(
     if pending.attempt <= 1 || pending.scheduled_event_id != state.last_event_id + 1 {
         return Ok(());
     }
-    // Only append when the read actually reached the end of persisted history.
-    if events.last().map(|event| event.event_id) != Some(state.last_event_id)
-        && !(events.is_empty() && state.last_event_id == 0)
-    {
+    // Only append when the read actually reached the end of persisted
+    // history. The reader's position — last event id covered by this page,
+    // or the page-token position when the final page is EMPTY (the previous
+    // page's events exactly filled its size limit) — must sit at the run's
+    // last event, mirroring v1.31.0's suffix validation that the transient
+    // ids continue from nextEventID (`ValidateTransientWorkflowTaskEvents`,
+    // get_history_util.go:438-457 @ v1.31.0).
+    if read_position != state.last_event_id {
         return Ok(());
     }
     events.push(tokeira_kernel::HistoryEvent {
@@ -5830,7 +5842,7 @@ mod tests {
                 }
             ),
             arb_small_string().prop_map(|timer_id| WorkflowCommand::CancelTimer { timer_id }),
-            Just(WorkflowCommand::CancelWorkflow),
+            Just(WorkflowCommand::CancelWorkflow { details: None }),
         ]
     }
 

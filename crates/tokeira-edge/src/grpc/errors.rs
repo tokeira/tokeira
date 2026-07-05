@@ -34,9 +34,15 @@ impl From<EdgeError> for Status {
             EdgeError::NamespaceDeleted(namespace) => Status::failed_precondition(namespace),
             EdgeError::NamespaceAlreadyExists(namespace) => Status::already_exists(namespace),
             EdgeError::WorkflowNotFound {
-                namespace,
+                namespace: _,
                 workflow_id,
-            } => Status::not_found(format!("{namespace}/{workflow_id}")),
+            } => {
+                // v1.31.0's current-execution lookup rewrites any missing-
+                // workflow NotFound to this exact message — workflow id only,
+                // no namespace, no run id (`GetCurrentExecution`,
+                // common/persistence/execution_manager.go:855-859 @ v1.31.0).
+                Status::not_found(format!("workflow not found for ID: {workflow_id}"))
+            }
             EdgeError::ActivityNotFound {
                 namespace,
                 workflow_id,

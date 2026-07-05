@@ -757,7 +757,20 @@ impl BasicKernel {
     /// Record a cancellation request. This does not close the workflow —
     /// the worker decides how to honour the request during its next WFT.
     fn apply_cancel(&self, loaded: LoadedRun, req: CancelRequest) -> Result<Transition, Reject> {
-        let state = expect_open(loaded)?;
+        let state = match loaded {
+            LoadedRun::Absent => return Err(Reject::MissingRun),
+            LoadedRun::Existing(state) => state,
+        };
+        // A cancel of a closed run or an already-cancel-requested run is a
+        // success NO-OP — no event, no WFT: "the request to cancel this
+        // workflow is a success even if the target workflow has already
+        // finished", and repeat requests short-circuit on `IsCancelRequested`
+        // (requestcancelworkflow/api.go:44-53,74-81 @ v1.31.0). This is also
+        // what turns a cancel-external against a finished target into the
+        // source's ExternalWorkflowExecutionCancelRequested SUCCESS event.
+        if !state.is_open() || state.cancel_requested {
+            return Ok(TransitionBuilder::new(state, req.now).finish());
+        }
         let mut builder = TransitionBuilder::new(state, req.now);
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
@@ -765,7 +778,7 @@ impl BasicKernel {
         let kind = HistoryEventKind::WorkflowExecutionCancelRequested {
             reason: req.reason,
             external_workflow_execution: req.external_initiator,
-            external_initiated_event_id: 0,
+            external_initiated_event_id: req.external_initiated_event_id,
             identity: req.request.caller_identity.clone().unwrap_or_default(),
             request_id: req.request.request_id.0,
         };
@@ -3569,7 +3582,7 @@ fn apply_workflow_command(
             builder.apply_parent_close_policy();
             Ok(true)
         }
-        WorkflowCommand::CancelWorkflow => {
+        WorkflowCommand::CancelWorkflow { details } => {
             // A close command with buffered events is an UnhandledCommand:
             // the workflow must observe the buffered events before closing
             // (`hasBufferedEventsOrMessages` guards in the close handlers,
@@ -3584,7 +3597,7 @@ fn apply_workflow_command(
             }
             builder.emit(HistoryEventKind::WorkflowExecutionCanceled {
                 workflow_task_completed_event_id,
-                details: None,
+                details,
             });
             builder.close(ExecutionStatus::Cancelled);
             builder.apply_parent_close_policy();
@@ -3864,6 +3877,60 @@ fn apply_workflow_command(
             target_run_id,
             control,
         } => {
+            // Attribute validation fails the WORKFLOW TASK with
+            // BadRequestCancelExternalWorkflowExecutionAttributes and the
+            // validator's message rendered from the RAW command attributes
+            // (`ValidateCancelExternalWorkflowExecutionAttributes`,
+            // command_attr_validator.go:250-293 @ v1.31.0).
+            let raw_run_id = target_run_id.map(|r| r.0.to_string()).unwrap_or_default();
+            let raw_namespace = target_namespace.clone().unwrap_or_default();
+            // Inherit the source namespace when the command's is nil (empty
+            // string from the SDK means "same namespace"), matching the
+            // handler's default of the source namespace id
+            // (`handleCommandRequestCancelExternalWorkflow`,
+            // workflow_task_completed_handler.go:870-880 @ v1.31.0). Also
+            // keeps the publisher's self-cancel guard honest for
+            // namespace-less self-cancels.
+            let target_namespace_id = if target_namespace_id.0.is_nil() {
+                builder.state.namespace_id
+            } else {
+                target_namespace_id
+            };
+            if target_workflow_id.0.is_empty() {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause:
+                        WorkflowTaskFailedCause::BadRequestCancelExternalWorkflowExecutionAttributes,
+                    message: Some(format!(
+                        "WorkflowId is not set on RequestCancelExternalWorkflowExecutionCommand. \
+                         Namespace={raw_namespace} RunId={raw_run_id}"
+                    )),
+                });
+            }
+            // Start + RequestCancel of the SAME child workflow id within one
+            // completion batch is rejected before any event persists — the
+            // check is against children initiated by EARLIER COMMANDS IN
+            // THIS RespondWorkflowTaskCompleted only
+            // (`initiatedChildExecutionsInBatch`, keyed by workflow id,
+            // workflow_task_completed_handler.go:887-891,1150 @ v1.31.0).
+            // Children from earlier workflow tasks have initiated event ids
+            // below this completion's event id, so the id comparison
+            // discriminates batch-local children exactly.
+            if builder
+                .state
+                .children
+                .get(&target_workflow_id)
+                .is_some_and(|child| child.initiated_event_id > workflow_task_completed_event_id)
+            {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause:
+                        WorkflowTaskFailedCause::BadRequestCancelExternalWorkflowExecutionAttributes,
+                    message: Some(format!(
+                        "Start and RequestCancel for child workflow is not allowed in same \
+                         workflow task. WorkflowId={} RunId={raw_run_id} Namespace={raw_namespace}",
+                        target_workflow_id.0
+                    )),
+                });
+            }
             let initiated_event_id = builder.emit(
                 HistoryEventKind::RequestCancelExternalWorkflowExecutionInitiated {
                     workflow_task_completed_event_id,

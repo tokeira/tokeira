@@ -691,7 +691,7 @@ where
                                 scheduled_at: op.scheduled_at,
                             });
                         }
-                        if new_state.closed_at.is_some() {
+                        if new_state.closed_at.is_some() && close_authored_by(&history_events) {
                             // A child run closing must notify its parent so the
                             // parent can resolve the pending child future. Skip
                             // when the close is a reset fork (handled above) —
@@ -1456,6 +1456,27 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
     }
 }
 
+/// Whether THIS transition authored the run's close — it appended a terminal
+/// workflow event. The parent child-resolution notify must key on this, not
+/// on `new_state.closed_at`: a success-noop commit against an already-closed
+/// run (e.g. a repeat cancel, requestcancelworkflow/api.go:44-53 @ v1.31.0)
+/// carries the closed state but no terminal event, and re-firing the notify
+/// would deliver a duplicate `ChildResolved` — matching the wrong incarnation
+/// when the parent reused the child workflow id.
+fn close_authored_by(history_events: &[HistoryEvent]) -> bool {
+    history_events.iter().any(|event| {
+        matches!(
+            event.kind,
+            HistoryEventKind::WorkflowExecutionCompleted { .. }
+                | HistoryEventKind::WorkflowExecutionFailed { .. }
+                | HistoryEventKind::WorkflowExecutionCanceled { .. }
+                | HistoryEventKind::WorkflowExecutionTerminated { .. }
+                | HistoryEventKind::WorkflowExecutionTimedOut { .. }
+                | HistoryEventKind::WorkflowExecutionContinuedAsNew { .. }
+        )
+    })
+}
+
 /// Detect a reset from a committed close: a `WorkflowTaskFailed` carrying the
 /// `ResetWorkflow` cause names the successor run and the fork point. Returns
 /// `(new_run_id, fork_event_id)` so the lane can materialize the forked run.
@@ -1634,20 +1655,33 @@ mod tests {
             next_state.transition_seq = current.transition_seq.next();
             next_state.last_event_id += 1;
 
+            // A transition against an already-closed state stands in for a
+            // real close-authoring commit in these tests, so it must carry
+            // the terminal event — the lane's parent-notify keys on the
+            // close being authored by THIS transition, not on closed state.
+            let event_kind = if current.closed_at.is_some() {
+                tokeira_kernel::HistoryEventKind::WorkflowExecutionCompleted {
+                    workflow_task_completed_event_id: 0,
+                    result: Payloads::default(),
+                }
+            } else {
+                tokeira_kernel::HistoryEventKind::WorkflowExecutionSignaled {
+                    signal_name: "test".to_string(),
+                    input: Payloads::default(),
+                    header: None,
+                    links: Vec::new(),
+                    request_id: "req".to_string(),
+                    identity: None,
+                }
+            };
+
             Ok(Transition {
                 expected_seq: current.transition_seq,
                 next_state,
                 history_events: smallvec![HistoryEvent {
                     event_id: current.last_event_id + 1,
                     happened_at: OffsetDateTime::now_utc(),
-                    kind: tokeira_kernel::HistoryEventKind::WorkflowExecutionSignaled {
-                        signal_name: "test".to_string(),
-                        input: Payloads::default(),
-                        header: None,
-                        links: Vec::new(),
-                        request_id: "req".to_string(),
-                        identity: None,
-                    },
+                    kind: event_kind,
                 }],
                 request_dedupe_ops: SmallVec::<[RequestDedupeOp; 1]>::new(),
                 activity_ops: SmallVec::<[tokeira_kernel::ActivityOp; 4]>::new(),

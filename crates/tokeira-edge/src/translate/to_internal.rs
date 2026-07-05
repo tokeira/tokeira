@@ -502,9 +502,13 @@ pub fn cancel_request(
     tokeira_kernel::CancelRequest {
         reason: req.reason,
         external_initiator: None,
+        external_initiated_event_id: 0,
         request: RequestContext {
             request_id: CoreRequestId(request_id.as_str().to_string()),
-            caller_identity: None,
+            // The request identity lands on the WorkflowExecutionCancelRequested
+            // event verbatim (`Identity: request.CancelRequest.Identity`,
+            // event_factory.go:578-590 @ v1.31.0).
+            caller_identity: Some(req.identity),
             received_at: now,
         },
         now,

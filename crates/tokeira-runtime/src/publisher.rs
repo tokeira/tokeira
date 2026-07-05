@@ -473,6 +473,7 @@ where
                 let command = Command::Cancel(CancelRequest {
                     reason,
                     external_initiator: None,
+                    external_initiated_event_id: 0,
                     request: RequestContext {
                         request_id: RequestId(format!("cancel-child-{child_run_id:?}")),
                         caller_identity: Some("runtime-child-orchestrator".to_string()),
@@ -658,6 +659,34 @@ where
         initiated_event_id: i64,
         reason: String,
     ) {
+        // A workflow cannot cancel-external ITSELF: same target namespace and
+        // workflow id fails with EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND before
+        // any delivery — "it does not matter if the run ID is a mismatch"
+        // (transfer_queue_active_task_executor.go:546-559 @ v1.31.0). Both
+        // ids must match: the corpus cancels the SAME workflow id in a
+        // DIFFERENT namespace, which must go through.
+        if originator_namespace_id == namespace_id && originator_workflow_id == target_workflow_id {
+            let resolve = Command::ExternalCancelResolved(ExternalCancelResolvedRequest {
+                initiated_event_id,
+                result: ExternalCancelResult::Failed {
+                    cause: "EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND".to_string(),
+                },
+                now: OffsetDateTime::now_utc(),
+            });
+            if let Err(error) = self
+                .pick_lane(originator_run_key)
+                .submit(originator_run_key, resolve)
+                .await
+            {
+                tracing::warn!(
+                    ?error,
+                    originator_run_key = ?originator_run_key,
+                    initiated_event_id,
+                    "failed to deliver self-cancel ExternalCancelResolved"
+                );
+            }
+            return;
+        }
         let cancel_result = match self
             .repo
             .resolve_execution(&ExecutionRef {
@@ -668,6 +697,12 @@ where
             .await
         {
             Ok(Some(target_run_key)) => {
+                // The delivered cancel carries the initiator's initiated
+                // event id and the history service's identity, exactly as
+                // the transfer executor forwards them
+                // (ExternalInitiatedEventId: task.InitiatedEventID,
+                // Identity=consts.IdentityHistoryService,
+                // transfer_queue_active_task_executor.go:1544-1567 @ v1.31.0).
                 let command = Command::Cancel(CancelRequest {
                     reason,
                     external_initiator: Some(ExternalWorkflowExecution {
@@ -675,11 +710,12 @@ where
                         workflow_id: originator_workflow_id,
                         run_id: originator_run_id,
                     }),
+                    external_initiated_event_id: initiated_event_id,
                     request: RequestContext {
                         request_id: RequestId(format!(
                             "ext-cancel-{originator_run_key:?}-{initiated_event_id}"
                         )),
-                        caller_identity: Some("runtime-external-cancel-orchestrator".to_string()),
+                        caller_identity: Some("history-service".to_string()),
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -707,8 +743,13 @@ where
                     },
                 }
             }
+            // The canonical cause string is what the history serializer maps
+            // to CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_
+            // WORKFLOW_EXECUTION_NOT_FOUND on the Failed event (NotFound from
+            // the target lookup, transfer_queue_active_task_executor.go:
+            // 577-599 @ v1.31.0).
             Ok(None) => ExternalCancelResult::Failed {
-                cause: format!("target workflow not found: {}", target_workflow_id.0),
+                cause: "EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND".to_string(),
             },
             Err(error) => ExternalCancelResult::Failed {
                 cause: error.to_string(),

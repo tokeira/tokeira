@@ -1593,6 +1593,9 @@ fn wft_failed_cause_i32(c: &WorkflowTaskFailedCause) -> i32 {
         WorkflowTaskFailedCause::BadSignalWorkflowExecutionAttributes => {
             C::BadSignalWorkflowExecutionAttributes
         }
+        WorkflowTaskFailedCause::BadRequestCancelExternalWorkflowExecutionAttributes => {
+            C::BadRequestCancelExternalWorkflowExecutionAttributes
+        }
         WorkflowTaskFailedCause::ResetWorkflow => C::ResetWorkflow,
         WorkflowTaskFailedCause::ForceCloseCommand => C::ForceCloseCommand,
         WorkflowTaskFailedCause::GrpcMessageTooLarge => C::GrpcMessageTooLarge,

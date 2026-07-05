@@ -575,16 +575,57 @@ impl TokeiraConfig {
     }
 
     pub fn resolve(config_path: Option<&Path>) -> Result<(Self, &'static str), ConfigError> {
-        if let Some(path) = config_path {
-            return Ok((Self::load(path)?, "cli --config"));
+        let (mut config, source) = if let Some(path) = config_path {
+            (Self::load(path)?, "cli --config")
+        } else if let Ok(env_path) = std::env::var("TOKEIRA_CONFIG") {
+            (Self::load(Path::new(&env_path))?, "TOKEIRA_CONFIG env")
+        } else {
+            let mut config = Self::default();
+            config.apply_storage_defaults();
+            config.validate()?;
+            (config, "defaults")
+        };
+        // Per-pod placement overrides from the environment. Under Kubernetes/ECS the
+        // config document is a shared ConfigMap, so a node's own reachable membership
+        // address cannot be baked into the file — every pod would advertise the same
+        // host and the controller would route them all to one endpoint. The platform
+        // injects each pod's address via the downward API (`status.podIP`); these
+        // overrides let that per-pod value win over the shared file so a node advertises
+        // its own membership endpoint. Applied after load so the environment wins; an
+        // unset var leaves the file value untouched.
+        config.apply_placement_env_overrides()?;
+        Ok((config, source))
+    }
+
+    /// Override the membership advertise address from the environment.
+    ///
+    /// `TOKEIRA_NODE_HOST` (non-empty) sets `infrastructure.placement.node_host` and
+    /// `TOKEIRA_NODE_PORT` (a valid `u16`) sets `infrastructure.placement.node_port`.
+    /// These exist so a pod that shares a ConfigMap can still advertise its own
+    /// reachable endpoint, injected per-pod from the downward API — an unset or empty
+    /// var leaves the file value in place. A malformed `TOKEIRA_NODE_PORT` is a hard
+    /// error rather than a silent fallback, so a misconfigured deployment fails loudly
+    /// instead of advertising the wrong port and silently mis-routing membership.
+    fn apply_placement_env_overrides(&mut self) -> Result<(), ConfigError> {
+        if let Ok(host) = std::env::var("TOKEIRA_NODE_HOST") {
+            let host = host.trim();
+            if !host.is_empty() {
+                self.infrastructure.placement.node_host = host.to_string();
+            }
         }
-        if let Ok(env_path) = std::env::var("TOKEIRA_CONFIG") {
-            return Ok((Self::load(Path::new(&env_path))?, "TOKEIRA_CONFIG env"));
+        if let Ok(port) = std::env::var("TOKEIRA_NODE_PORT") {
+            let port = port.trim();
+            if !port.is_empty() {
+                let parsed = port.parse::<u16>().map_err(|err| {
+                    ConfigError::Validation(vec![ValidationError::Field {
+                        field: "infrastructure.placement.node_port".to_string(),
+                        message: format!("TOKEIRA_NODE_PORT must be a valid u16: {err}"),
+                    }])
+                })?;
+                self.infrastructure.placement.node_port = Some(parsed);
+            }
         }
-        let mut config = Self::default();
-        config.apply_storage_defaults();
-        config.validate()?;
-        Ok((config, "defaults"))
+        Ok(())
     }
 
     pub fn apply_storage_defaults(&mut self) {
@@ -1292,6 +1333,34 @@ mod tests {
             std::env::remove_var("TOKEIRA_CONFIG");
         }
         let _ = std::fs::remove_file(env_path);
+    }
+
+    #[test]
+    fn resolve_applies_placement_env_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("TOKEIRA_CONFIG");
+            std::env::set_var("TOKEIRA_NODE_HOST", "10.0.4.7");
+            std::env::set_var("TOKEIRA_NODE_PORT", "7233");
+        }
+
+        // The downward-API-injected host/port win over the file (here, the defaults),
+        // so a pod sharing a ConfigMap advertises its own membership endpoint.
+        let (config, _source) = TokeiraConfig::resolve(None).unwrap();
+        assert_eq!(config.infrastructure.placement.node_host, "10.0.4.7");
+        assert_eq!(config.infrastructure.placement.node_port, Some(7233));
+
+        // A malformed port fails loudly rather than advertising the wrong port.
+        unsafe {
+            std::env::set_var("TOKEIRA_NODE_PORT", "not-a-port");
+        }
+        let err = TokeiraConfig::resolve(None).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "got {err:?}");
+
+        unsafe {
+            std::env::remove_var("TOKEIRA_NODE_HOST");
+            std::env::remove_var("TOKEIRA_NODE_PORT");
+        }
     }
 
     #[test]

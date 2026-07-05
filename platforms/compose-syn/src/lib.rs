@@ -11,6 +11,7 @@
 //!   `syn`-interpreting that same file is the deferred foundation.
 
 pub mod adapter;
+pub mod bridge;
 pub mod builder;
 pub mod context;
 pub mod definition;

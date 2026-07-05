@@ -1,0 +1,18 @@
+[package]
+name = "tokeira-tkd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The `.tkd` interpreter front-end: `syn` parses the definition (Rust syntax),
+# the interpreter walks it. `full` is mandatory — default features are
+# derive-input-only and lack ItemFn/Block/Stmt/statement-Expr nodes. We parse +
+# walk, never emit tokens, so `quote` is not needed. `proc-macro2` is needed for
+# `Span` (diagnostics). Hand-pinned (not `cargo add`) to reuse the locked version.
+syn = { version = "2", features = ["full", "extra-traits"] }
+proc-macro2 = "1"
+
+[lints]
+workspace = true

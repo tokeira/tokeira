@@ -1,16 +1,16 @@
 //! Static tables extracted from the parsed `.tkd`: the config types it defines
 //! (`TypeTable`) and its functions (`FnTable`). Engine-agnostic — names no
-//! `crate::builder`/`crate::kinds`.
+//! platform type.
 
 use std::collections::HashMap;
 
 use syn::{Fields, File, Item, ItemEnum, ItemFn, ItemStruct};
 
-use super::value::EvalError;
+use crate::value::EvalError;
 
 /// The `struct`/`enum` types the `.tkd` defines (the config schema). Used to
 /// decide whether a named type is a config type (generic `Value`) or an author
-/// type (routed to the registry).
+/// type (routed to the bridge).
 pub struct TypeTable {
     structs: HashMap<String, ItemStruct>,
     enums: HashMap<String, ItemEnum>,

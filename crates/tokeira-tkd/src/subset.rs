@@ -4,14 +4,14 @@
 //! violations as spanned diagnostics. It runs *before* evaluation, so the
 //! evaluator only ever sees vetted nodes — the no-panic security model.
 //!
-//! Engine-agnostic except for the registry (method/kind/assoc names), which it
+//! Engine-agnostic except for the bridge (kind/method/assoc names), which it
 //! consults to validate calls at check time rather than letting them fail at run
 //! time.
 
 use proc_macro2::Span;
 use syn::{Expr, File, Item, Pat, Stmt, punctuated::Punctuated, spanned::Spanned, token::Comma};
 
-use super::{registry::Registry, schema::TypeTable};
+use crate::{bridge::HostBridge, schema::TypeTable};
 
 /// One subset violation.
 pub struct Diagnostic {
@@ -42,9 +42,9 @@ impl std::fmt::Display for Diagnostics {
 }
 
 /// Validate that `file` is within the interpreted subset.
-pub fn check(file: &File, reg: &Registry, types: &TypeTable) -> Result<(), Diagnostics> {
+pub fn check<B: HostBridge>(file: &File, bridge: &B, types: &TypeTable) -> Result<(), Diagnostics> {
     let mut c = Checker {
-        reg,
+        bridge,
         types,
         diags: Vec::new(),
     };
@@ -58,13 +58,13 @@ pub fn check(file: &File, reg: &Registry, types: &TypeTable) -> Result<(), Diagn
     }
 }
 
-struct Checker<'a> {
-    reg: &'a Registry,
+struct Checker<'a, B: HostBridge> {
+    bridge: &'a B,
     types: &'a TypeTable,
     diags: Vec<Diagnostic>,
 }
 
-impl Checker<'_> {
+impl<B: HostBridge> Checker<'_, B> {
     fn reject(&mut self, span: Span, msg: impl Into<String>) {
         self.diags.push(Diagnostic {
             msg: msg.into(),
@@ -142,11 +142,11 @@ impl Checker<'_> {
         let is_kind = match e {
             Expr::Struct(es) => {
                 let segs = path_segs(&es.path);
-                segs.len() == 1 && self.reg.is_kind(&segs[0])
+                segs.len() == 1 && self.bridge.is_kind(&segs[0])
             }
             Expr::Path(ep) => {
                 let segs = path_segs(&ep.path);
-                segs.len() == 1 && self.reg.is_kind(&segs[0])
+                segs.len() == 1 && self.bridge.is_kind(&segs[0])
             }
             _ => false,
         };
@@ -252,7 +252,7 @@ impl Checker<'_> {
             let segs = path_segs(&ep.path);
             let joined = segs.join("::");
             let allowed = joined == "Some"
-                || self.reg.assoc(&joined).is_some()
+                || self.bridge.knows_assoc(&joined)
                 || (segs.len() == 2 && self.types.is_enum(&segs[0]));
             if !allowed {
                 self.reject(ec.span(), format!("call `{joined}` is not allowed"));
@@ -293,7 +293,7 @@ impl Checker<'_> {
     }
 
     fn method_allowed(&self, name: &str) -> bool {
-        self.reg.knows_method(name)
+        self.bridge.knows_method(name)
             || matches!(
                 name,
                 "clone" | "into" | "to_string" | "as_deref" | "as_str" | "is_some" | "is_none"

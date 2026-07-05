@@ -3,7 +3,8 @@
 //! neither is visible to the structure. Engine-agnostic — names only `syn`, the
 //! value model, and the evaluator.
 
-use super::{
+use crate::{
+    bridge::HostBridge,
     eval::Interp,
     value::{EvalError, FieldMap, Value, VariantBody},
 };
@@ -75,7 +76,7 @@ fn push_requires(attrs: &[syn::Attribute], scope: &str, out: &mut Vec<RequireCla
 /// `#[create]` retarget check: every create-time-immutable field must be
 /// structurally unchanged between the recorded config and the new one. A change
 /// is a *retarget* — refused, not reconciled (003 §7).
-pub fn check_retarget(adm: &Admission, old: &Value, new: &Value) -> Result<(), EvalError> {
+pub fn check_retarget<H>(adm: &Admission, old: &Value<H>, new: &Value<H>) -> Result<(), EvalError> {
     // The diff domain must be config-only. A host handle here means a kind leaked
     // into config (rejected at interpret-time, but guard anyway so this can never
     // panic on an adversarial recorded config).
@@ -90,7 +91,7 @@ pub fn check_retarget(adm: &Admission, old: &Value, new: &Value) -> Result<(), E
 /// Recurse through the config value in lockstep, flagging any changed `#[create]`
 /// field. Mirrors `collect_struct_fields`' structural reach so a create field
 /// nested inside an enum variant / Option / Vec is not missed.
-fn diff(creates: &[(String, String)], old: &Value, new: &Value) -> Result<(), EvalError> {
+fn diff<H>(creates: &[(String, String)], old: &Value<H>, new: &Value<H>) -> Result<(), EvalError> {
     match (old, new) {
         (Value::Struct { ty: t1, fields: f1 }, Value::Struct { ty: t2, fields: f2 })
             if t1 == t2 =>
@@ -147,7 +148,11 @@ fn diff(creates: &[(String, String)], old: &Value, new: &Value) -> Result<(), Ev
 
 /// `#[require]` check: each clause's expression, evaluated against the config in
 /// the scope type's field environment, must be `true`.
-pub fn check_requires(interp: &Interp, adm: &Admission, cfg: &Value) -> Result<(), EvalError> {
+pub fn check_requires<B: HostBridge>(
+    interp: &Interp<B>,
+    adm: &Admission,
+    cfg: &Value<B::Host>,
+) -> Result<(), EvalError> {
     for clause in &adm.requires {
         let mut instances = Vec::new();
         collect_struct_fields(cfg, &clause.scope, &mut instances);
@@ -174,7 +179,7 @@ pub fn check_requires(interp: &Interp, adm: &Admission, cfg: &Value) -> Result<(
 }
 
 /// Collect the fields of EVERY `Struct { ty == scope, .. }` reachable in `cfg`.
-fn collect_struct_fields<'a>(v: &'a Value, scope: &str, out: &mut Vec<&'a FieldMap>) {
+fn collect_struct_fields<'a, H>(v: &'a Value<H>, scope: &str, out: &mut Vec<&'a FieldMap<H>>) {
     match v {
         Value::Struct { ty, fields } => {
             if ty == scope {

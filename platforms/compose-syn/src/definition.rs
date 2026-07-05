@@ -3,7 +3,7 @@
 //! author's vocabulary ([`crate::builder`] + [`crate::kinds`]), nothing of the
 //! engine directly — and nothing non-hermetic: no paths, no `std::env`, no
 //! filesystem probes, no loops. Those mechanics live author-side now
-//! ([`crate::kinds::Service::to_compose_service`] + the [`Cx`] helpers).
+//! (`crate::kinds::Service::to_compose_service` + the [`Cx`] helpers).
 //!
 //! `config()` is the operator surface; `deployment(cfg, cx)` is the structure.
 //! Both reproduce `platforms/compose/src` faithfully.

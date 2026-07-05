@@ -23,13 +23,9 @@ askama = "0.12"
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-# The `.tkd` interpreter front-end: `syn` parses the definition (Rust syntax),
-# the interpreter walks it. `full` is mandatory — default features are
-# derive-input-only and lack ItemFn/Block/Stmt/statement-Expr nodes. We parse +
-# walk, never emit tokens, so `quote` is not needed. Hand-pinned (not `cargo add`)
-# to reuse the version already locked transitively.
-syn = { version = "2", features = ["full", "extra-traits"] }
-proc-macro2 = "1"
+# The `.tkd` interpreter now lives in the shared `tokeira-tkd` crate; compose-syn
+# supplies its `ComposeBridge` (host adapter) and delegates parsing/eval to it.
+tokeira-tkd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

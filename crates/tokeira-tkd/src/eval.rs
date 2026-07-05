@@ -1,29 +1,28 @@
 //! The tree-walking evaluator. Walks the `.tkd` AST against the value model and
-//! the host registry, producing a real `builder::Deployment` (via opaque host
-//! handles) without ever naming `crate::builder`/`crate::kinds` itself.
+//! the platform [`HostBridge`], producing the platform's deployment (via opaque
+//! host handles) without ever naming a concrete kind or builder type.
 //!
-//! No operator-reachable path panics: every failure is an [`EvalError`]. The only
-//! `unreachable!`s live in the registry's post-dispatch receiver matches.
+//! No operator-reachable path panics: every failure is an [`EvalError`]. Host
+//! construction/dispatch/field-reads all route through the bridge.
 
 use std::collections::HashMap;
 
 use syn::{Expr, Pat, punctuated::Punctuated, token::Comma};
 
-use crate::context::Cx;
-
-use super::{
-    registry::{self, Registry},
+use crate::{
+    bridge::HostBridge,
     schema::{FnTable, TypeTable, fn_param_names},
-    value::{EnumPath, EvalError, FieldMap, HostObj, Value, VariantBody},
+    value::{EnumPath, EvalError, FieldMap, Value, VariantBody},
 };
 
 /// Lexical scopes. `child()` snapshots the parent (cheap; host handles share via
-/// `Rc`, so builder mutations stay shared while new bindings don't leak outward).
-struct Env {
-    scopes: Vec<HashMap<String, Value>>,
+/// the platform's `Rc`, so builder mutations stay shared while new bindings don't
+/// leak outward).
+struct Env<H> {
+    scopes: Vec<HashMap<String, Value<H>>>,
 }
 
-impl Env {
+impl<H: Clone> Env<H> {
     fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()],
@@ -36,11 +35,11 @@ impl Env {
         Self { scopes }
     }
 
-    fn get(&self, name: &str) -> Option<&Value> {
+    fn get(&self, name: &str) -> Option<&Value<H>> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
-    fn insert(&mut self, name: String, v: Value) {
+    fn insert(&mut self, name: String, v: Value<H>) {
         self.scopes
             .last_mut()
             .expect("at least one scope")
@@ -48,17 +47,21 @@ impl Env {
     }
 }
 
-/// The evaluator — borrows the registry, the type/fn tables, and the context.
-pub struct Interp<'a> {
-    pub reg: &'a Registry,
+/// The evaluator — borrows the bridge, the type/fn tables, and the context.
+pub struct Interp<'a, B: HostBridge> {
+    pub bridge: &'a B,
     pub types: &'a TypeTable,
     pub fns: &'a FnTable,
-    pub cx: &'a Cx,
+    pub cx: &'a B::Cx,
 }
 
-impl Interp<'_> {
+impl<B: HostBridge> Interp<'_, B> {
     /// Evaluate a `.tkd` function with the given argument values.
-    pub fn eval_fn(&self, name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
+    pub fn eval_fn(
+        &self,
+        name: &str,
+        args: Vec<Value<B::Host>>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let f = self
             .fns
             .get(name)
@@ -80,7 +83,11 @@ impl Interp<'_> {
 
     /// Evaluate a standalone expression (a `#[require]` clause) with the given
     /// fields bound — the admission pass uses this to check config constraints.
-    pub fn eval_with_fields(&self, e: &Expr, fields: &FieldMap) -> Result<Value, EvalError> {
+    pub fn eval_with_fields(
+        &self,
+        e: &Expr,
+        fields: &FieldMap<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let mut env = Env::new();
         for (k, v) in fields {
             env.insert(k.clone(), v.clone());
@@ -88,7 +95,11 @@ impl Interp<'_> {
         self.eval_expr(e, &mut env)
     }
 
-    fn eval_block(&self, block: &syn::Block, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_block(
+        &self,
+        block: &syn::Block,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let mut last = Value::Unit;
         for stmt in &block.stmts {
             match stmt {
@@ -118,7 +129,7 @@ impl Interp<'_> {
         Ok(last)
     }
 
-    fn eval_local(&self, local: &syn::Local, env: &mut Env) -> Result<(), EvalError> {
+    fn eval_local(&self, local: &syn::Local, env: &mut Env<B::Host>) -> Result<(), EvalError> {
         let init = local
             .init
             .as_ref()
@@ -137,7 +148,7 @@ impl Interp<'_> {
         }
     }
 
-    fn eval_expr(&self, e: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_expr(&self, e: &Expr, env: &mut Env<B::Host>) -> Result<Value<B::Host>, EvalError> {
         match e {
             Expr::Lit(el) => eval_lit(&el.lit),
             Expr::Path(ep) => self.eval_path(&ep.path, env),
@@ -177,7 +188,7 @@ impl Interp<'_> {
         }
     }
 
-    fn eval_path(&self, path: &syn::Path, env: &Env) -> Result<Value, EvalError> {
+    fn eval_path(&self, path: &syn::Path, env: &Env<B::Host>) -> Result<Value<B::Host>, EvalError> {
         let segs = path_segs(path);
         match segs.len() {
             1 => {
@@ -188,9 +199,9 @@ impl Interp<'_> {
                 if name == "None" {
                     return Ok(Value::Opt(None));
                 }
-                if self.reg.is_kind(name) {
+                if self.bridge.is_kind(name) {
                     return self
-                        .reg
+                        .bridge
                         .construct_kind(name, FieldMap::new(), self.cx)
                         .map(Value::Host);
                 }
@@ -225,7 +236,11 @@ impl Interp<'_> {
         }
     }
 
-    fn eval_struct(&self, es: &syn::ExprStruct, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_struct(
+        &self,
+        es: &syn::ExprStruct,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let segs = path_segs(&es.path);
         let head = segs[0].clone();
 
@@ -277,10 +292,10 @@ impl Interp<'_> {
         }
 
         // author kind: `Service { .. ..Service::EMPTY }`, `DsqlCluster { .. }`, …
-        if segs.len() == 1 && self.reg.is_kind(&head) {
+        if segs.len() == 1 && self.bridge.is_kind(&head) {
             let mut fields = if let Some(rest) = &es.rest {
                 check_empty_spread(rest, &head)?;
-                self.reg
+                self.bridge
                     .kind_defaults(&head)
                     .ok_or_else(|| EvalError::new(format!("`{head}` has no `..EMPTY` defaults")))?
             } else {
@@ -290,7 +305,7 @@ impl Interp<'_> {
                 fields.insert(member_name(&fv.member)?, self.eval_expr(&fv.expr, env)?);
             }
             return self
-                .reg
+                .bridge
                 .construct_kind(&head, fields, self.cx)
                 .map(Value::Host);
         }
@@ -301,7 +316,11 @@ impl Interp<'_> {
         )))
     }
 
-    fn eval_call(&self, ec: &syn::ExprCall, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_call(
+        &self,
+        ec: &syn::ExprCall,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let Expr::Path(ep) = &*ec.func else {
             return Err(EvalError::new("only path calls are supported"));
         };
@@ -319,9 +338,9 @@ impl Interp<'_> {
 
         // an associated builder fn, e.g. `Deployment::new(..)`
         let joined = segs.join("::");
-        if let Some(assoc) = self.reg.assoc(&joined) {
+        if self.bridge.knows_assoc(&joined) {
             let args = self.eval_args(&ec.args, env)?;
-            return assoc(args, self.cx).map(Value::Host);
+            return self.bridge.assoc(&joined, args, self.cx).map(Value::Host);
         }
 
         // enum tuple-variant: `Ty::Variant(..)`
@@ -346,7 +365,11 @@ impl Interp<'_> {
         Err(EvalError::new(format!("unsupported call `{joined}`")))
     }
 
-    fn eval_method(&self, em: &syn::ExprMethodCall, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_method(
+        &self,
+        em: &syn::ExprMethodCall,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let method = em.method.to_string();
         let recv = self.eval_expr(&em.receiver, env)?;
 
@@ -370,21 +393,19 @@ impl Interp<'_> {
         }
 
         if let Value::Host(host) = &recv {
-            if let Some(m) = self.reg.method(host.kind(), &method) {
-                let args = self.eval_args(&em.args, env)?;
-                return m(host, args, self.cx);
-            }
-            return Err(EvalError::new(format!(
-                "`{:?}` has no method `{method}`",
-                host.kind()
-            )));
+            let args = self.eval_args(&em.args, env)?;
+            return self.bridge.call_method(host, &method, args, self.cx);
         }
         Err(EvalError::new(format!(
             "method `{method}` on a non-host value"
         )))
     }
 
-    fn eval_field(&self, ef: &syn::ExprField, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_field(
+        &self,
+        ef: &syn::ExprField,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let base = self.eval_expr(&ef.base, env)?;
         let name = member_name(&ef.member)?;
         match base {
@@ -392,14 +413,18 @@ impl Interp<'_> {
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| EvalError::new(format!("no field `{name}`"))),
-            Value::Host(HostObj::Cx(cx)) => registry::cx_field(&cx, &name),
+            Value::Host(host) => self.bridge.host_field(&host, &name),
             other => Err(EvalError::new(format!(
                 "cannot read field `{name}` of {other:?}"
             ))),
         }
     }
 
-    fn eval_if(&self, ei: &syn::ExprIf, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_if(
+        &self,
+        ei: &syn::ExprIf,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         if let Expr::Let(elet) = &*ei.cond {
             let scrut = self.eval_expr(&elet.expr, env)?;
             let mut child = env.child();
@@ -418,7 +443,11 @@ impl Interp<'_> {
         }
     }
 
-    fn eval_match(&self, em: &syn::ExprMatch, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_match(
+        &self,
+        em: &syn::ExprMatch,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let scrut = self.eval_expr(&em.expr, env)?;
         for arm in &em.arms {
             let mut child = env.child();
@@ -437,7 +466,12 @@ impl Interp<'_> {
 
     /// Refutable pattern match used by `if let`/`match`. Returns whether the
     /// pattern matched, binding its idents into `env`.
-    fn match_pattern(&self, pat: &Pat, val: &Value, env: &mut Env) -> Result<bool, EvalError> {
+    fn match_pattern(
+        &self,
+        pat: &Pat,
+        val: &Value<B::Host>,
+        env: &mut Env<B::Host>,
+    ) -> Result<bool, EvalError> {
         match pat {
             Pat::Wild(_) => Ok(true),
             Pat::Ident(pi) => {
@@ -521,8 +555,8 @@ impl Interp<'_> {
     fn match_seq(
         &self,
         pats: &Punctuated<Pat, Comma>,
-        vals: &[Value],
-        env: &mut Env,
+        vals: &[Value<B::Host>],
+        env: &mut Env<B::Host>,
     ) -> Result<bool, EvalError> {
         let pats: Vec<&Pat> = pats.iter().collect();
         let Some(rest_idx) = pats.iter().position(|p| matches!(p, Pat::Rest(_))) else {
@@ -561,7 +595,11 @@ impl Interp<'_> {
         Ok(true)
     }
 
-    fn eval_macro(&self, mac: &syn::Macro, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_macro(
+        &self,
+        mac: &syn::Macro,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let name = mac
             .path
             .segments
@@ -585,7 +623,11 @@ impl Interp<'_> {
         }
     }
 
-    fn eval_format(&self, mac: &syn::Macro, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_format(
+        &self,
+        mac: &syn::Macro,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let args = mac
             .parse_body_with(Punctuated::<Expr, Comma>::parse_terminated)
             .map_err(|e| EvalError::new(format!("format! parse error: {e}")))?;
@@ -604,7 +646,11 @@ impl Interp<'_> {
         Ok(Value::Str(interpolate(&tmpl, &parts)?))
     }
 
-    fn eval_matches(&self, mac: &syn::Macro, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_matches(
+        &self,
+        mac: &syn::Macro,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let (expr, pat) = mac
             .parse_body_with(|input: syn::parse::ParseStream| {
                 let expr: Expr = input.parse()?;
@@ -618,7 +664,11 @@ impl Interp<'_> {
         Ok(Value::Bool(self.match_pattern(&pat, &v, &mut probe)?))
     }
 
-    fn eval_binary(&self, eb: &syn::ExprBinary, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_binary(
+        &self,
+        eb: &syn::ExprBinary,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         use syn::BinOp;
         // short-circuit the boolean connectives
         match eb.op {
@@ -652,7 +702,11 @@ impl Interp<'_> {
         Ok(Value::Bool(b))
     }
 
-    fn eval_unary(&self, eu: &syn::ExprUnary, env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_unary(
+        &self,
+        eu: &syn::ExprUnary,
+        env: &mut Env<B::Host>,
+    ) -> Result<Value<B::Host>, EvalError> {
         let v = self.eval_expr(&eu.expr, env)?;
         match eu.op {
             syn::UnOp::Not(_) => Ok(Value::Bool(!as_bool(&v)?)),
@@ -663,8 +717,8 @@ impl Interp<'_> {
     fn eval_args(
         &self,
         args: &Punctuated<Expr, Comma>,
-        env: &mut Env,
-    ) -> Result<Vec<Value>, EvalError> {
+        env: &mut Env<B::Host>,
+    ) -> Result<Vec<Value<B::Host>>, EvalError> {
         let mut out = Vec::with_capacity(args.len());
         for a in args {
             out.push(self.eval_expr(a, env)?);
@@ -673,7 +727,7 @@ impl Interp<'_> {
     }
 }
 
-// ── pure helpers ────────────────────────────────────────────────────────────
+// ── pure helpers (host-generic; never touch a host handle) ──────────────────
 
 fn path_segs(p: &syn::Path) -> Vec<String> {
     p.segments.iter().map(|s| s.ident.to_string()).collect()
@@ -714,7 +768,7 @@ fn check_empty_spread(rest: &Expr, ty: &str) -> Result<(), EvalError> {
     )))
 }
 
-fn eval_lit(lit: &syn::Lit) -> Result<Value, EvalError> {
+fn eval_lit<H>(lit: &syn::Lit) -> Result<Value<H>, EvalError> {
     match lit {
         syn::Lit::Str(s) => Ok(Value::Str(s.value())),
         syn::Lit::Bool(b) => Ok(Value::Bool(b.value)),
@@ -726,14 +780,14 @@ fn eval_lit(lit: &syn::Lit) -> Result<Value, EvalError> {
     }
 }
 
-fn as_bool(v: &Value) -> Result<bool, EvalError> {
+fn as_bool<H: std::fmt::Debug>(v: &Value<H>) -> Result<bool, EvalError> {
     match v {
         Value::Bool(b) => Ok(*b),
         other => Err(EvalError::new(format!("expected a boolean, got {other:?}"))),
     }
 }
 
-fn int_of(v: &Value) -> Result<i128, EvalError> {
+fn int_of<H: std::fmt::Debug>(v: &Value<H>) -> Result<i128, EvalError> {
     match v {
         Value::Int(n) => Ok(*n),
         other => Err(EvalError::new(format!(
@@ -742,7 +796,7 @@ fn int_of(v: &Value) -> Result<i128, EvalError> {
     }
 }
 
-fn value_to_display(v: &Value) -> Result<String, EvalError> {
+fn value_to_display<H: std::fmt::Debug>(v: &Value<H>) -> Result<String, EvalError> {
     match v {
         Value::Str(s) => Ok(s.clone()),
         Value::Int(n) => Ok(n.to_string()),

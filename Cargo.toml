@@ -21,6 +21,8 @@ members = [
     "crates/tokeira-autoscaler",
     "crates/tokeira-remote-workstation",
     "crates/tokeira-orchestrator",
+    "crates/tokeira-tkd",
+    "crates/tokeira-k8s",
     "crates/tokeira-compose",
     "crates/tokeira-storage",
     "crates/tokeira-controller",
@@ -32,6 +34,7 @@ members = [
     "platforms/compose",
     "platforms/compose-syn",
     "platforms/ecs",
+    "platforms/eks",
     "apps/tkr",
     "apps/tkp",
     "apps/tokeirad",
@@ -107,6 +110,8 @@ tokeira-iac = { path = "crates/tokeira-iac" }
 tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
 tokeira-config = { path = "crates/tokeira-config" }
 tokeira-aws = { path = "crates/tokeira-aws" }
+tokeira-tkd = { path = "crates/tokeira-tkd" }
+tokeira-k8s = { path = "crates/tokeira-k8s" }
 tokeira-observability = { path = "crates/tokeira-observability" }
 tokeira-build-info = { path = "crates/tokeira-build-info" }
 tokeira-compatibility = { path = "crates/tokeira-compatibility" }

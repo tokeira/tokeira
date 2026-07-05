@@ -49,8 +49,14 @@ pub struct QueryTask {
 pub enum QueryResult {
     /// Query completed successfully.
     Completed { result: Payloads },
-    /// Query evaluation failed at the worker.
-    Failed { message: String },
+    /// Query evaluation failed at the worker. `failure` is the worker's
+    /// structured failure, propagated to the caller inside the typed
+    /// `QueryFailed` serviceerror's `QueryFailedFailure` detail
+    /// (`serviceerror/query_failed.go @ go.temporal.io/api v1.62`).
+    Failed {
+        message: String,
+        failure: Option<tokeira_types::Payload>,
+    },
     /// Query was rejected without dispatch because the workflow's current
     /// status does not permit queries (for example, a paused workflow).
     Rejected {
@@ -246,6 +252,7 @@ mod tests {
                 } else {
                     QueryResult::Failed {
                         message: data.clone(),
+                        failure: None,
                     }
                 };
                 tx.send(sent.clone()).unwrap();
@@ -593,6 +600,7 @@ mod tests {
                 .unwrap();
             let _ = task.response_tx.send(QueryResult::Failed {
                 message: "closed".into(),
+                failure: None,
             });
         });
 
@@ -614,7 +622,8 @@ mod tests {
         assert_eq!(
             result,
             QueryResult::Failed {
-                message: "closed".into()
+                message: "closed".into(),
+                failure: None,
             }
         );
     }

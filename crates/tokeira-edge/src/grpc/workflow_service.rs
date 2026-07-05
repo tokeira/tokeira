@@ -1087,8 +1087,16 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         request: Request<workflowservice::QueryWorkflowRequest>,
     ) -> Result<Response<workflowservice::QueryWorkflowResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
-        let edge_req = translate::query_request_to_edge(request.into_inner())
+        // The caller's gRPC deadline drives query semantics — the
+        // backoff-vs-deadline guard and the long-poll park both use it
+        // (v1.31.0 threads ctx straight through, queryworkflow/api.go). The
+        // translate-layer default applies only when no deadline was sent.
+        let caller_timeout = parse_grpc_timeout(request.metadata());
+        let mut edge_req = translate::query_request_to_edge(request.into_inner())
             .map_err(proto_conversion_status)?;
+        if let Some(timeout) = caller_timeout {
+            edge_req.timeout = timeout;
+        }
         let edge_resp = self.inner.query_workflow(&headers, edge_req).await?;
         Ok(Response::new(translate::query_response_to_proto(edge_resp)))
     }
@@ -1590,6 +1598,10 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             | tokeira_proto::enums::QueryResultType::Unspecified => {
                 tokeira_runtime::QueryResult::Failed {
                     message: req.error_message,
+                    failure: req
+                        .failure
+                        .as_ref()
+                        .map(tokeira_proto::conversions::common::failure_to_payload),
                 }
             }
         };

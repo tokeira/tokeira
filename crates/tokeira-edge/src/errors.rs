@@ -40,6 +40,31 @@ pub enum EdgeError {
     #[error("workflow operation can not be applied because workflow is closing")]
     WorkflowClosing,
 
+    /// v1.31.0's `serviceerror.WorkflowNotReady`: a query arrived while the
+    /// workflow cannot serve one (closed before any WFT started, first WFT
+    /// still pending on backoff past the query deadline, or the WFT stuck
+    /// failing). gRPC FAILED_PRECONDITION with a `WorkflowNotReadyFailure`
+    /// detail; the guard messages come verbatim from
+    /// queryworkflow/api.go:116-143 @ v1.31.0.
+    #[error("{0}")]
+    WorkflowNotReady(String),
+
+    /// The worker answered a query with a failure: the typed `QueryFailed`
+    /// serviceerror (gRPC INVALID_ARGUMENT + `QueryFailedFailure` detail
+    /// carrying the worker's structured failure,
+    /// serviceerror/query_failed.go @ go.temporal.io/api v1.62).
+    #[error("{message}")]
+    QueryFailed {
+        message: String,
+        failure: Option<tokeira_types::Payload>,
+    },
+
+    /// A query waited out its deadline with no worker answering — v1.31.0's
+    /// frontend rewrite `DeadlineExceeded("query timed out before a worker
+    /// could process it")` (workflow_handler.go:3178-3180).
+    #[error("query timed out before a worker could process it")]
+    QueryTimedOut,
+
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
@@ -154,6 +179,9 @@ impl EdgeError {
             EdgeError::AlreadyExists(_) => StatusCode::CONFLICT,
             EdgeError::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowClosing => StatusCode::TOO_MANY_REQUESTS,
+            EdgeError::WorkflowNotReady(_) => StatusCode::PRECONDITION_FAILED,
+            EdgeError::QueryFailed { .. } => StatusCode::BAD_REQUEST,
+            EdgeError::QueryTimedOut => StatusCode::REQUEST_TIMEOUT,
             EdgeError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             EdgeError::Forbidden { .. } => StatusCode::FORBIDDEN,
             EdgeError::NamespaceNotFound(_)
@@ -184,6 +212,9 @@ impl EdgeError {
             EdgeError::AlreadyExists(_) => "already_exists",
             EdgeError::ResourceExhausted(_) => "resource_exhausted",
             EdgeError::WorkflowClosing => "workflow_closing",
+            EdgeError::WorkflowNotReady(_) => "workflow_not_ready",
+            EdgeError::QueryFailed { .. } => "query_failed",
+            EdgeError::QueryTimedOut => "query_timed_out",
             EdgeError::Unauthorized(_) => "unauthorized",
             EdgeError::Forbidden { .. } => "forbidden",
             EdgeError::NamespaceNotFound(_) => "namespace_not_found",
@@ -230,6 +261,19 @@ impl From<anyhow::Error> for EdgeError {
         // (respondworkflowtaskcompleted/api.go:739-742 @ v1.31.0).
         if let Some(invalid) = value.downcast_ref::<tokeira_runtime::InvalidWorkflowCommand>() {
             return Self::BadRequest(invalid.message.clone());
+        }
+        // Query pre-dispatch guards surface v1.31.0's WorkflowNotReady
+        // (queryworkflow/api.go:116-143).
+        if let Some(not_ready) = value.downcast_ref::<tokeira_runtime::WorkflowNotReady>() {
+            return Self::WorkflowNotReady(not_ready.message.to_string());
+        }
+        // A query that outlived its deadline surfaces v1.31.0's frontend
+        // rewrite (workflow_handler.go:3178-3180).
+        if value
+            .downcast_ref::<tokeira_runtime::QueryTimedOut>()
+            .is_some()
+        {
+            return Self::QueryTimedOut;
         }
         // The close-attempted signal gate surfaces v1.31.0's
         // `ErrWorkflowClosing` (signal_workflow_util.go:63-70).

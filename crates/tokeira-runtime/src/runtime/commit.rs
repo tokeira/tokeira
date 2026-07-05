@@ -116,8 +116,10 @@ where
     /// Two cleanups, both keyed on the committed `new_state`:
     /// - If the run no longer has a *started* WFT pending, drop its WFT-timeout
     ///   entry so the scanner stops watching a deadline that no longer applies.
-    /// - If the run just closed, fail any buffered queries waiting on it (they
-    ///   can never be satisfied now) and drop its WFT-timeout entry.
+    /// - If the run just closed, UNBLOCK any buffered queries into direct
+    ///   dispatch (a worker answers them against the closed run by replay,
+    ///   per v1.31.0's Unblocked completion state) and drop its WFT-timeout
+    ///   entry.
     ///
     /// Only `Applied` results carry a new state; `Duplicate`/`Conflict` leave
     /// tracking untouched because no transition landed.
@@ -138,8 +140,41 @@ where
                 self.wft_timeout_tracking.remove(run_key);
             }
             if new_state.closed_at.is_some() {
-                self.buffered_queries
-                    .fail_run_queries(run_key, "workflow execution completed");
+                // Buffered queries are UNBLOCKED at close, not failed:
+                // v1.31.0 marks every unanswered buffered query Unblocked
+                // whenever the completing WFT creates no successor —
+                // explicitly including workflow close — and re-dispatches it
+                // directly so a worker answers it against the closed run by
+                // replay (handleBufferedQueries,
+                // respondworkflowtaskcompleted/api.go:1010-1029 +
+                // queryworkflow/api.go:242-260 @ v1.31.0). Sticky affinity is
+                // cleared at close, so these deliver with full history.
+                let unblocked = self.buffered_queries.drain_all(run_key);
+                if !unblocked.is_empty() {
+                    let broker = self.broker.clone();
+                    let queue = QueueKey {
+                        namespace_id: new_state.namespace_id,
+                        task_queue: new_state.task_queue.clone(),
+                        task_kind: TaskKind::Workflow,
+                        deployment: new_state.deployment.clone(),
+                        build_id: new_state.build_id.clone(),
+                    };
+                    tokio::spawn(async move {
+                        for query in unblocked {
+                            broker
+                                .publish_query_task(crate::query::QueryTask {
+                                    run_key,
+                                    query_type: query.query_type,
+                                    query_args: query.query_args,
+                                    queue: queue.clone(),
+                                    sticky_preferred: None,
+                                    sticky_deadline: None,
+                                    response_tx: query.response_tx,
+                                })
+                                .await;
+                        }
+                    });
+                }
                 self.wft_timeout_tracking.remove(run_key);
             }
         }

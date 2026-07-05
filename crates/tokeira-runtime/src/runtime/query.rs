@@ -77,6 +77,62 @@ where
             });
         }
 
+        // v1.31.0's pre-dispatch guards (queryworkflow/api.go:116-143): a
+        // query can only ever be answered by a worker that has completed at
+        // least one workflow task for this run (the SDK cannot evaluate a
+        // handler on a run it has never seen — api.go:153).
+        let has_completed_any_wft = state.previous_started_event_id > 0;
+        tracing::debug!(
+            run_key = ?run_key,
+            has_completed_any_wft,
+            pending = state.pending_workflow_task.is_some(),
+            delay_timer = ?state
+                .timers
+                .get(tokeira_kernel::WORKFLOW_START_DELAY_TIMER_ID)
+                .map(|t| t.fire_at),
+            ?timeout_after,
+            wft_attempt = state.workflow_task_attempt,
+            "query admission guards"
+        );
+        if !has_completed_any_wft {
+            // (i) Closed without ever starting a workflow task: nothing can
+            // answer, now or ever (`ErrWorkflowClosedBeforeWorkflowTaskStarted`,
+            // consts/const.go:114-115).
+            if !state.status.is_open() {
+                return Err(crate::errors::WorkflowNotReady {
+                    message: "Workflow execution closed before WorkflowTaskStarted event",
+                }
+                .into());
+            }
+            // (ii) First WFT still pending on start-delay backoff and the
+            // query's deadline lands before it would even be scheduled: fail
+            // fast so the SDK's retry loop keeps polling until the backoff
+            // elapses (`ErrWorkflowTaskNotScheduled` +
+            // queryWillTimeoutsBeforeFirstWorkflowTaskStart,
+            // queryworkflow/api.go:121-132,288-310; consts/const.go:96-97).
+            if let Some(delay_timer) = state
+                .timers
+                .get(tokeira_kernel::WORKFLOW_START_DELAY_TIMER_ID)
+                .filter(|_| state.pending_workflow_task.is_none())
+                && OffsetDateTime::now_utc() + timeout_after < delay_timer.fire_at
+            {
+                return Err(crate::errors::WorkflowNotReady {
+                    message: "Workflow task is not scheduled yet.",
+                }
+                .into());
+            }
+        }
+        // (iii) The workflow task is stuck failing: after 3 attempts the
+        // query fails fast instead of buffering behind a task that will not
+        // complete (`failQueryWorkflowTaskAttemptCount`,
+        // queryworkflow/api.go:31,134-143).
+        if state.workflow_task_attempt >= 3 {
+            return Err(crate::errors::WorkflowNotReady {
+                message: "Unable to query workflow due to Workflow Task in failed state.",
+            }
+            .into());
+        }
+
         let queue = QueueKey {
             namespace_id: state.namespace_id,
             task_queue: state.task_queue.clone(),
@@ -102,9 +158,16 @@ where
 
         let (response_tx, response_rx) = oneshot::channel();
         let query_id = Uuid::new_v4().to_string();
-        let has_pending_wft = state.pending_workflow_task.is_some();
+        // Direct dispatch requires BOTH a completed workflow task (else no
+        // worker can answer) AND a quiescent run — closed, or open with no
+        // in-flight WFT (`safeToDispatchDirectly`, queryworkflow/api.go:
+        // 147-183 @ v1.31.0). Everything else buffers behind the barrier and
+        // rides (or is unblocked by) the next workflow task.
+        let safe_to_dispatch_directly = has_completed_any_wft
+            && (!state.status.is_open() || state.pending_workflow_task.is_none());
+        let buffer_query = !safe_to_dispatch_directly;
 
-        if has_pending_wft {
+        if buffer_query {
             self.buffered_queries
                 .buffer(
                     run_key,
@@ -154,7 +217,7 @@ where
             registry: self.buffered_queries.clone(),
             run_key,
             query_id,
-            enabled: has_pending_wft,
+            enabled: buffer_query,
         };
 
         match tokio::time::timeout(timeout_after, response_rx).await {
@@ -163,7 +226,7 @@ where
                 Ok(result)
             }
             Ok(Err(_)) => Err(anyhow!("query response channel closed")),
-            Err(_) => Err(anyhow!("query timed out")),
+            Err(_) => Err(crate::errors::QueryTimedOut.into()),
         }
     }
 

@@ -2298,6 +2298,10 @@ pub fn respond_completed_request_to_edge(
                     enums::QueryResultType::Failed | enums::QueryResultType::Unspecified => {
                         QueryResultDto::Failed {
                             error_message: result.error_message,
+                            failure: result
+                                .failure
+                                .as_ref()
+                                .map(tokeira_proto::conversions::common::failure_to_payload),
                         }
                     }
                 };

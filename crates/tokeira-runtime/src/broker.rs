@@ -673,19 +673,24 @@ impl InMemoryBroker {
         let mut inner = self.inner.lock().await;
         let ready = inner.query_ready.get_mut(queue)?;
 
-        if let Some(idx) = ready
-            .iter()
-            .position(|task| task.sticky_preferred.as_ref() == Some(worker))
-        {
-            return ready.remove(idx);
-        }
-
+        // Expire sticky preferences FIRST: past the sticky deadline v1.31.0
+        // abandons the sticky attempt and re-dispatches on the normal queue
+        // with full history (queryworkflow/api.go:355-385) — even the
+        // preferred worker must then receive the task as a NON-sticky
+        // delivery (its cache may be gone; empty history would strand it).
         let now = OffsetDateTime::now_utc();
         for task in ready.iter_mut() {
             if task.sticky_deadline.is_some_and(|deadline| deadline <= now) {
                 task.sticky_preferred = None;
                 task.sticky_deadline = None;
             }
+        }
+
+        if let Some(idx) = ready
+            .iter()
+            .position(|task| task.sticky_preferred.as_ref() == Some(worker))
+        {
+            return ready.remove(idx);
         }
 
         if let Some(idx) = ready

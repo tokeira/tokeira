@@ -2243,73 +2243,6 @@ impl WorkflowService {
         }
     }
 
-    /// Build a synthetic query-only WFT for eager return.
-    ///
-    /// When the SDK requests `return_new_workflow_task` and there are
-    /// buffered queries ready, we construct a WFT with an empty history
-    /// and `started_event_id = 0`. The zero started-event-id signals to
-    /// the SDK that this is a query-only evaluation against the current
-    /// cached state (sticky evaluation) — no replay is needed. This
-    /// eliminates an extra poll round-trip for the common case where a
-    /// query arrives just after a WFT completion.
-    async fn build_eager_query_workflow_task(
-        &self,
-        state: &tokeira_kernel::WorkflowState,
-        shard_epoch: tokeira_types::ShardEpoch,
-        barrier: i64,
-    ) -> Option<PollWorkflowTaskQueueResponse> {
-        let queries = self
-            .buffered_queries
-            .drain_satisfied(state.run_key, barrier);
-        if queries.is_empty() {
-            return None;
-        }
-
-        let query_token = tokeira_types::WorkflowTaskToken {
-            run_key: state.run_key,
-            logical_seq: tokeira_types::LogicalTaskSeq(0),
-            started_event_id: 0,
-            attempt: 1,
-            shard_epoch,
-        };
-
-        let task_token = serde_json::to_vec(&query_token).ok()?;
-        let mut response = PollWorkflowTaskQueueResponse {
-            task_token: task_token.clone(),
-            started_event_id: 0,
-            previous_started_event_id: state.previous_started_event_id,
-            attempt: 1,
-            scheduled_time: None,
-            started_time: None,
-            payload: crate::translate::WorkflowTaskPayloadDto {
-                workflow_id: state.workflow_id.0.clone(),
-                run_key: state.run_key,
-                run_id: state.run_id,
-                task_queue: state.task_queue.0.clone(),
-                history: Vec::new(),
-            },
-            query: None,
-            queries: std::collections::HashMap::new(),
-            messages: Vec::new(),
-        };
-
-        for query in queries {
-            let query_id = Uuid::new_v4().to_string();
-            self.pending_queries
-                .insert(&task_token, query_id.clone(), query.response_tx)
-                .await;
-            response.queries.insert(
-                query_id,
-                WorkflowQueryDto {
-                    query_type: query.query_type,
-                    query_args: query.query_args,
-                },
-            );
-        }
-
-        Some(response)
-    }
-
     async fn build_direct_query_poll_response(
         &self,
         query: tokeira_runtime::QueryTask,
@@ -2329,17 +2262,25 @@ impl WorkflowService {
                 });
             }
         };
-        let sticky_match = query.sticky_preferred.as_ref() == Some(worker);
-        let history_after_event_id = if sticky_match && state.previous_started_event_id > 0 {
-            state.previous_started_event_id
+        // v1.31.0's matching engine sends EMPTY history on a sticky query
+        // delivery (the worker answers from its cache) and FULL history from
+        // event 1 on a normal-queue delivery (the worker replays)
+        // (getHistoryForQueryTask, matching_engine.go:839-899 @ v1.31.0).
+        // tokeira's query tasks route sticky-ness by worker identity rather
+        // than a sticky queue key, so a delivery claimed by the
+        // sticky-preferred worker IS the sticky case: attach nothing — a full
+        // history here makes the SDK replay instead of using its cache
+        // (TestQueryWorkflow_Sticky pins replayCount == 1). Partial history
+        // (the old shape) matches neither mode.
+        let sticky_delivery = query.sticky_preferred.as_ref() == Some(worker);
+        let history = if sticky_delivery {
+            Vec::new()
         } else {
-            0
+            self.repo
+                .read_history(query.run_key, 0, usize::MAX)
+                .await
+                .map_err(EdgeError::from)?
         };
-        let history = self
-            .repo
-            .read_history(query.run_key, history_after_event_id, usize::MAX)
-            .await
-            .map_err(EdgeError::from)?;
 
         // Temporal returns direct queries as workflow-poll tasks with
         // `started_event_id = 0` and a query task token, because no history
@@ -2826,10 +2767,11 @@ impl WorkflowService {
     ///
     /// 3. **Post-completion quiescence check** — after committing the
     ///    completion, if the run is still open, has buffered queries, and
-    ///    is now quiescent (no pending WFT), we either build an eager
-    ///    inline WFT (if the SDK requested `return_new_workflow_task`) or
-    ///    dispatch queries directly through the broker. This avoids
-    ///    queries sitting in the buffer until the next unrelated mutation.
+    ///    is now quiescent (no pending WFT), the remaining buffered queries
+    ///    are UNBLOCKED into direct broker dispatch (v1.31.0's
+    ///    QueryCompletionTypeUnblocked model), regardless of
+    ///    `return_new_workflow_task`. This avoids queries sitting in the
+    ///    buffer until the next unrelated mutation.
     pub async fn respond_workflow_task_completed(
         &self,
         headers: &HeaderMap,
@@ -2859,8 +2801,12 @@ impl WorkflowService {
                             QueryResultDto::Answered { result } => QueryResult::Completed {
                                 result: result.clone(),
                             },
-                            QueryResultDto::Failed { error_message } => QueryResult::Failed {
+                            QueryResultDto::Failed {
+                                error_message,
+                                failure,
+                            } => QueryResult::Failed {
                                 message: error_message.clone(),
+                                failure: failure.clone(),
                             },
                         });
                     }
@@ -3036,22 +2982,23 @@ impl WorkflowService {
                                 resp.workflow_task = Some(workflow_task);
                             }
                         } else if state.pending_workflow_task.is_none() {
-                            if wants_eager_return {
-                                resp.workflow_task = self
-                                    .build_eager_query_workflow_task(
-                                        &state,
-                                        token.shard_epoch,
-                                        state.last_event_id,
-                                    )
-                                    .await;
-                            } else {
-                                self.dispatch_queries_direct(
-                                    state.run_key,
-                                    &state,
-                                    state.last_event_id,
-                                )
-                                .await;
-                            }
+                            // The completing WFT created no follow-up task:
+                            // remaining buffered queries are UNBLOCKED and
+                            // dispatch directly through the broker as
+                            // standalone query tasks — v1.31.0 does the same
+                            // regardless of ReturnNewWorkflowTask
+                            // (QueryCompletionTypeUnblocked,
+                            // respondworkflowtaskcompleted/api.go:1010-1029 +
+                            // queryworkflow/api.go:242-260). The old inline
+                            // "eager query WFT" (empty history, no legacy
+                            // query field) was a shape v1.31.0 never emits
+                            // and crashed SDK workers without a cache entry.
+                            self.dispatch_queries_direct(
+                                state.run_key,
+                                &state,
+                                state.last_event_id,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -4748,17 +4695,37 @@ impl WorkflowService {
                     .await?;
 
                 let workflow_id = req.workflow_id.clone();
-                let execution = ExecutionRef {
-                    namespace_id: to_internal::namespace_id_for(&req.namespace),
-                    workflow_id: tokeira_types::WorkflowId(workflow_id),
-                    run_id: None,
-                };
+                let execution =
+                    ExecutionRef {
+                        namespace_id: to_internal::namespace_id_for(&req.namespace),
+                        workflow_id: tokeira_types::WorkflowId(workflow_id),
+                        // A run-id-pinned query targets exactly that run
+                        // (queryworkflow/api.go:53-62 resolves the current run
+                        // only when the request's run id is empty). A malformed
+                        // run id is rejected up front, as the frontend's
+                        // validateExecution does (workflow_handler.go:3134
+                        // @ v1.31.0).
+                        run_id: match req.run_id.as_deref().filter(|value| !value.is_empty()) {
+                            Some(value) => Some(RunId(Uuid::parse_str(value).map_err(|_| {
+                                EdgeError::BadRequest("Invalid RunId.".to_string())
+                            })?)),
+                            None => None,
+                        },
+                    };
 
                 let result = self
                     .runtime
                     .query_workflow(execution, req.query_type, req.query_args, req.timeout)
                     .await
                     .map_err(EdgeError::from)?;
+
+                // A worker-failed query is the typed `QueryFailed` ERROR on
+                // the wire (INVALID_ARGUMENT + QueryFailedFailure detail),
+                // never an empty success (matching_engine.go:1126-1127 +
+                // serviceerror/query_failed.go @ v1.62).
+                if let tokeira_runtime::QueryResult::Failed { message, failure } = result {
+                    return Err(EdgeError::QueryFailed { message, failure });
+                }
 
                 Ok(from_internal::query_response(result))
             },
@@ -5393,6 +5360,9 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::AlreadyExists(_) => "already_exists",
         EdgeError::ResourceExhausted(_) => "resource_exhausted",
         EdgeError::WorkflowClosing => "resource_exhausted",
+        EdgeError::WorkflowNotReady(_) => "failed_precondition",
+        EdgeError::QueryFailed { .. } => "invalid_argument",
+        EdgeError::QueryTimedOut => "deadline_exceeded",
         EdgeError::Unauthorized(_) => "unauthenticated",
         EdgeError::Forbidden { .. } => "permission_denied",
         EdgeError::NamespaceNotFound(_)

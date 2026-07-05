@@ -528,6 +528,9 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::AlreadyExists(_) => Code::AlreadyExists,
         EdgeError::ResourceExhausted(_) => Code::ResourceExhausted,
         EdgeError::WorkflowClosing => Code::ResourceExhausted,
+        EdgeError::WorkflowNotReady(_) => Code::FailedPrecondition,
+        EdgeError::QueryFailed { .. } => Code::InvalidArgument,
+        EdgeError::QueryTimedOut => Code::DeadlineExceeded,
         EdgeError::Unauthorized(_) => Code::Unauthenticated,
         EdgeError::Forbidden { .. } => Code::PermissionDenied,
         EdgeError::NamespaceNotFound(_)

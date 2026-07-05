@@ -183,12 +183,13 @@ pub fn query_response(
                 rejected_status: None,
             }
         }
-        tokeira_runtime::QueryResult::Failed { message: _ } => {
-            crate::translate::QueryWorkflowResponse {
-                result: None,
-                rejected_status: None,
-            }
-        }
+        // Unreachable from the edge handler (a Failed result returns the
+        // typed QueryFailed error before response translation); kept
+        // exhaustive-and-inert for any other caller.
+        tokeira_runtime::QueryResult::Failed { .. } => crate::translate::QueryWorkflowResponse {
+            result: None,
+            rejected_status: None,
+        },
         tokeira_runtime::QueryResult::Rejected { status } => {
             crate::translate::QueryWorkflowResponse {
                 result: None,

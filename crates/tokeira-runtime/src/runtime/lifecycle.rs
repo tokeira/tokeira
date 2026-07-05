@@ -29,7 +29,17 @@ where
     /// the start is durably `Applied`.
     pub async fn start_workflow(&self, mut request: StartRequest) -> Result<CommitResult> {
         apply_client_cron_start_backoff(&mut request)?;
-        let reserved_poller = self.try_reserve_start_poller(&request).await;
+        // A delayed start (client start-delay or cron initial backoff) arms
+        // the start-delay timer instead of scheduling a first WFT — there is
+        // nothing to hand a reserved poller, so do not reserve one (the
+        // sync-match delivery path requires a pending WFT and would
+        // otherwise fail the whole Start RPC with "workflow task missing
+        // after reserved start").
+        let reserved_poller = if request.workflow_start_delay.is_none() {
+            self.try_reserve_start_poller(&request).await
+        } else {
+            None
+        };
         if let Some(reserved) = &reserved_poller {
             request.reserved_poller_identity = Some(reserved.worker_identity().clone());
         }
@@ -48,8 +58,22 @@ where
         };
         match (&result, reserved_poller) {
             (CommitResult::Applied { new_state }, Some(reserved)) => {
-                self.deliver_reserved_start_workflow_task(new_state, reserved)
-                    .await?;
+                // The run is durably started; a failed sync-match delivery
+                // must not fail the Start RPC. The broker-enqueue op was
+                // suppressed for a reserved start, so recovery is the WFT
+                // start-to-close timeout scanner (the tracking entry is
+                // inserted before delivery) or, on a shard handover, the new
+                // owner's sweep reconstructing it from committed state.
+                if let Err(error) = self
+                    .deliver_reserved_start_workflow_task(new_state, reserved)
+                    .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        run_key = ?request.run_key,
+                        "reserved-start sync-match delivery failed; WFT timeout scanner will recover"
+                    );
+                }
             }
             (_, Some(reserved)) => {
                 self.broker.return_reserved_poller(reserved).await;

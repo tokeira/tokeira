@@ -138,6 +138,7 @@ async fn closed_run_query_with_explicit_run_id_still_dispatches() -> Result<()> 
             .expect("query should still dispatch");
         let _ = query.response_tx.send(QueryResult::Failed {
             message: "closed cache".into(),
+            failure: None,
         });
     });
 
@@ -158,7 +159,8 @@ async fn closed_run_query_with_explicit_run_id_still_dispatches() -> Result<()> 
     assert_eq!(
         result,
         QueryResult::Failed {
-            message: "closed cache".into()
+            message: "closed cache".into(),
+            failure: None,
         }
     );
     Ok(())

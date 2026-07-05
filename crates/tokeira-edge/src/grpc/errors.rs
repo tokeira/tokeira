@@ -15,6 +15,11 @@ impl From<EdgeError> for Status {
             EdgeError::AlreadyExists(message) => Status::already_exists(message),
             EdgeError::ResourceExhausted(message) => Status::resource_exhausted(message),
             EdgeError::WorkflowClosing => workflow_closing_status(),
+            EdgeError::WorkflowNotReady(message) => workflow_not_ready_status(message),
+            EdgeError::QueryFailed { message, failure } => query_failed_status(message, failure),
+            EdgeError::QueryTimedOut => Status::deadline_exceeded(err_static(
+                "query timed out before a worker could process it",
+            )),
             EdgeError::Unauthorized(message) => Status::unauthenticated(message),
             EdgeError::Forbidden { action, namespace } => {
                 let message = match namespace {
@@ -129,6 +134,61 @@ impl From<EdgeError> for Status {
 /// BUSY_WORKFLOW and scope NAMESPACE (consts/const.go:62-67 @ v1.31.0). The Go
 /// SDK reconstructs `serviceerror.ResourceExhausted` — including the Cause the
 /// corpus asserts — from the `google.rpc.Status` detail in the trailer.
+/// Build v1.31.0's `serviceerror.WorkflowNotReady` status: FAILED_PRECONDITION
+/// with an empty `WorkflowNotReadyFailure` detail so the SDK reconstructs the
+/// typed error (`serviceerror/workflow_not_ready.go` @ go.temporal.io/api v1.62).
+fn workflow_not_ready_status(message: String) -> Status {
+    use prost::Message as _;
+    use tokeira_proto::public::temporal::api::errordetails::v1::WorkflowNotReadyFailure;
+
+    let detail = ProtoAny {
+        type_url: "type.googleapis.com/temporal.api.errordetails.v1.WorkflowNotReadyFailure"
+            .to_owned(),
+        value: WorkflowNotReadyFailure {}.encode_to_vec(),
+    };
+    let rpc_status = RpcStatus {
+        code: Code::FailedPrecondition as i32,
+        message: message.clone(),
+        details: vec![detail],
+    };
+    Status::with_details_and_metadata(
+        Code::FailedPrecondition,
+        message,
+        rpc_status.encode_to_vec().into(),
+        MetadataMap::new(),
+    )
+}
+
+/// Build v1.31.0's `serviceerror.QueryFailed` status: INVALID_ARGUMENT with a
+/// `QueryFailedFailure` detail carrying the worker's structured failure
+/// (`serviceerror/query_failed.go` @ go.temporal.io/api v1.62).
+fn query_failed_status(message: String, failure: Option<tokeira_types::Payload>) -> Status {
+    use prost::Message as _;
+    use tokeira_proto::public::temporal::api::errordetails::v1::QueryFailedFailure;
+
+    let failure_proto = failure
+        .as_ref()
+        .map(tokeira_proto::conversions::common::payload_to_failure);
+    let detail = ProtoAny {
+        type_url: "type.googleapis.com/temporal.api.errordetails.v1.QueryFailedFailure".to_owned(),
+        value: QueryFailedFailure {
+            failure: failure_proto,
+        }
+        .encode_to_vec(),
+    };
+    let rpc_status = RpcStatus {
+        code: Code::InvalidArgument as i32,
+        message: message.clone(),
+        details: vec![detail],
+    };
+    Status::with_details_and_metadata(
+        Code::InvalidArgument,
+        message,
+        rpc_status.encode_to_vec().into(),
+        MetadataMap::new(),
+    )
+}
+
 fn workflow_closing_status() -> Status {
     use prost::Message as _;
     use tokeira_proto::public::temporal::api::{

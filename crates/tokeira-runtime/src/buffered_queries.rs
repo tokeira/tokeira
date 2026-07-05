@@ -126,6 +126,7 @@ impl BufferedQueryRegistry {
             );
             let _ = query.response_tx.send(QueryResult::Failed {
                 message: message.clone(),
+                failure: None,
             });
         }
     }

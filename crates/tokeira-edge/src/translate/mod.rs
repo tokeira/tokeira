@@ -312,8 +312,15 @@ pub struct WorkflowQueryDto {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum QueryResultDto {
-    Answered { result: Payloads },
-    Failed { error_message: String },
+    Answered {
+        result: Payloads,
+    },
+    Failed {
+        error_message: String,
+        /// The worker's structured failure, forwarded into the caller's
+        /// typed `QueryFailed` serviceerror.
+        failure: Option<Payload>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

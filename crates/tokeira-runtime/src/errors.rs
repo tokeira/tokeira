@@ -112,6 +112,25 @@ pub struct InvalidWorkflowCommand {
 #[error("workflow operation can not be applied because workflow is closing")]
 pub struct WorkflowClosing;
 
+/// Query admission rejected because the workflow cannot serve a query right
+/// now — v1.31.0's `serviceerror.WorkflowNotReady` (gRPC FAILED_PRECONDITION
+/// with a `WorkflowNotReadyFailure` detail). The message is one of the three
+/// pre-dispatch guard messages from `queryworkflow/api.go:116-143 @ v1.31.0`,
+/// asserted verbatim by the corpus.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("{message}")]
+pub struct WorkflowNotReady {
+    pub message: &'static str,
+}
+
+/// A query waited out its deadline without any worker answering — the
+/// frontend rewrites context-deadline errors to
+/// `DeadlineExceeded("query timed out before a worker could process it")`
+/// (`workflow_handler.go:3178-3180 @ v1.31.0`).
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("query timed out before a worker could process it")]
+pub struct QueryTimedOut;
+
 /// Runtime could not resolve a requested workflow update.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum UpdateLifecycleError {

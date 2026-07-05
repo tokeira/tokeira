@@ -1,0 +1,30 @@
+[package]
+name = "tokeira-k8s"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokeira-iac = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = "0.3"
+
+# Live Kubernetes access. `client` gives the typed/dynamic `Api`; `ws` is
+# required for the port-forward tunnel. We deliberately omit `runtime` (readiness
+# uses a short `get_opt` poll loop, not a watcher) and `derive` (no CRD types) to
+# keep the dependency surface minimal. `k8s-openapi` is pinned to the `v1_33`
+# object set (task 1.1); tokeira has no other `k8s-openapi` consumer, so this is
+# the sole version feature and cannot conflict via feature unification.
+kube = { version = "1", features = ["client", "ws"] }
+k8s-openapi = { version = "0.25", features = ["v1_33"] }
+
+[lints]
+workspace = true

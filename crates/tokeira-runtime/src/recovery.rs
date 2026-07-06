@@ -364,6 +364,7 @@ mod tests {
             last_event_id: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq(1),
                 scheduled_event_id: 1,
@@ -464,6 +465,7 @@ mod tests {
         let mut transition = start_transition(run_key);
         transition.next_state.workflow_task_timeout = Duration::seconds(15);
         transition.next_state.pending_workflow_task = Some(PendingWorkflowTask {
+            task_type: tokeira_kernel::WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
             logical_seq: LogicalTaskSeq(7),
             scheduled_event_id: 1,

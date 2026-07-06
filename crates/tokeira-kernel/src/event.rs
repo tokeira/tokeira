@@ -596,6 +596,41 @@ pub enum HistoryEventKind {
         workflow_task_completed_event_id: i64,
         details: Option<Payloads>,
     },
+    /// Failure-capable successor of [`Self::WorkflowExecutionUpdateCompleted`]
+    /// (spec speculative-wft K6, Req 7.2). v1.31.0's completed event carries a
+    /// success-or-failure `Outcome` plus `Meta.UpdateId` and
+    /// `accepted_event_id`
+    /// (`CreateWorkflowExecutionUpdateCompletedEvent`,
+    /// event_factory.go:442-456 @ v1.31.0); the original variant hardwired a
+    /// success `Payloads` and cannot change shape in place — this enum is
+    /// postcard-persisted and variants encode by declaration index, so the
+    /// new shape is APPENDED at the end and the old variant becomes
+    /// decode-only (the kernel stops emitting it; old history still decodes).
+    WorkflowExecutionUpdateCompletedV2 {
+        update_id: String,
+        /// Handler name from the accepted update, carried for read-model
+        /// hydration (the proto attributes derive it from the accepted
+        /// event's request).
+        update_name: String,
+        /// Event id of the corresponding `WorkflowExecutionUpdateAccepted`.
+        accepted_event_id: i64,
+        /// Success result or post-acceptance handler failure.
+        outcome: UpdateEventOutcome,
+    },
+}
+
+/// Outcome recorded on [`HistoryEventKind::WorkflowExecutionUpdateCompletedV2`]
+/// — the kernel model of `temporal.api.update.v1.Outcome` (`oneof value
+/// {Payloads success; Failure failure}`; spec speculative-wft K6). A `Failure`
+/// is a COMPLETED update whose handler failed after acceptance, not a
+/// rejection (rejections persist nothing).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum UpdateEventOutcome {
+    /// The update handler returned a result.
+    Success(Payloads),
+    /// The update handler failed post-acceptance
+    /// (`Outcome.Failure` @ v1.31.0).
+    Failure(Payload),
 }
 
 /// How an activity task was resolved by the runtime.

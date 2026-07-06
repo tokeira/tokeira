@@ -86,6 +86,12 @@ pub enum DispatchOp {
         queue: QueueKey,
         logical_seq: tokeira_types::LogicalTaskSeq,
         sticky_preferred: Option<tokeira_types::WorkerIdentity>,
+        /// A SPECULATIVE task bypasses the durable backlog and publishes
+        /// straight to the broker (direct add-to-matching, no transfer task —
+        /// updateworkflow/api.go:218-252 @ v1.31.0; spec speculative-wft R1).
+        /// Delivery loss recovers via the in-memory schedule-to-start timer,
+        /// never via a backlog row.
+        speculative: bool,
     },
     /// Place an activity task on the task queue for a worker
     /// to pick up.

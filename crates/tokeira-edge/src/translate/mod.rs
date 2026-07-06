@@ -340,6 +340,12 @@ pub struct RespondWorkflowTaskCompletedResponse {
     pub was_duplicate: bool,
     pub workflow_task: Option<PollWorkflowTaskQueueResponse>,
     pub activity_tasks: Vec<PollActivityTaskQueueResponse>,
+    /// Non-zero when a SPECULATIVE workflow task DROPPED: the SDK rewinds its
+    /// workflow-machine cache to this event id
+    /// (`ResetHistoryEventId = LastCompletedWorkflowTaskStartedEventId` iff
+    /// no completed event was written, respondworkflowtaskcompleted/
+    /// api.go:770 @ v1.31.0; spec speculative-wft E2).
+    pub reset_history_event_id: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -575,6 +575,7 @@ fn replay_history_rejects_empty_or_non_started_sequences() {
 fn make_open_state_with_pending_wft() -> WorkflowState {
     let mut state = make_open_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
@@ -589,6 +590,7 @@ fn make_open_state_with_pending_wft() -> WorkflowState {
 fn make_open_state_with_started_wft() -> WorkflowState {
     let mut state = make_open_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
@@ -1202,6 +1204,7 @@ fn sticky_completion_dispatches_next_wft_sticky_then_s2s_times_out() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -2168,6 +2171,7 @@ fn activity_resolved_paused_workflow_no_wft() {
 fn wft_failed_paused_workflow_no_redispatch() {
     let mut state = make_paused_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
@@ -2208,6 +2212,7 @@ fn wft_failed_paused_workflow_no_redispatch() {
 fn wft_timed_out_paused_workflow_no_redispatch() {
     let mut state = make_paused_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
@@ -2246,6 +2251,7 @@ fn wft_timed_out_paused_workflow_no_redispatch() {
 fn wft_completed_paused_workflow_no_force_wft() {
     let mut state = make_paused_state();
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
@@ -2258,6 +2264,7 @@ fn wft_completed_paused_workflow_no_force_wft() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -2292,6 +2299,7 @@ fn wft_completion_tracks_previous_started_event_id() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -2658,6 +2666,7 @@ fn workflow_task_completed_with_activity_and_timer() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -2746,6 +2755,7 @@ fn workflow_task_completed_with_complete_workflow() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -2794,6 +2804,7 @@ fn workflow_task_completed_with_fail_workflow() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -2882,6 +2893,7 @@ fn continue_as_new_closes_run() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -2944,6 +2956,7 @@ fn continue_as_new_then_another_command() {
         kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -3102,6 +3115,7 @@ fn fail_workflow_with_retry_policy() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -3144,6 +3158,7 @@ fn fail_workflow_without_retry_policy() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -3684,6 +3699,7 @@ fn reject_wft_completed_no_pending() {
         kernel().apply(
             LoadedRun::Existing(make_open_state()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: RunKey::new(),
                     logical_seq: LogicalTaskSeq(3),
@@ -3714,6 +3730,7 @@ fn reject_wft_completed_not_started() {
         kernel().apply(
             LoadedRun::Existing(make_open_state_with_pending_wft()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: RunKey::new(),
                     logical_seq: LogicalTaskSeq(3),
@@ -3745,6 +3762,7 @@ fn reject_wft_completed_seq_mismatch() {
         kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(4),
@@ -3779,6 +3797,7 @@ fn reject_wft_completed_token_mismatch() {
         kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -3841,6 +3860,7 @@ fn reject_duplicate_activity_id() {
         kernel().apply(
             LoadedRun::Existing(with_activity),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -3895,6 +3915,7 @@ fn reject_duplicate_timer_id() {
         kernel().apply(
             LoadedRun::Existing(with_timer),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -4171,6 +4192,7 @@ fn reject_commands_after_close() {
         kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -4207,6 +4229,7 @@ fn cancel_workflow_command() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -4260,6 +4283,7 @@ fn cancel_workflow_then_another_command() {
         kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -4294,6 +4318,7 @@ fn request_cancel_activity() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -4347,6 +4372,7 @@ fn request_cancel_activity_started_sets_durable_cancel_requested() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -4396,6 +4422,7 @@ fn request_cancel_activity_unknown() {
     let transition = kernel().apply(
         LoadedRun::Existing(state.clone()),
         Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: WorkflowTaskToken {
                 run_key: state.run_key,
                 logical_seq: LogicalTaskSeq(3),
@@ -4458,6 +4485,7 @@ fn close_command_with_buffered_events_is_unhandled_command() {
     let transition = kernel().apply(
         LoadedRun::Existing(state.clone()),
         Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: WorkflowTaskToken {
                 run_key: state.run_key,
                 logical_seq: LogicalTaskSeq(3),
@@ -4496,6 +4524,7 @@ fn cancel_timer() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -4537,6 +4566,7 @@ fn cancel_timer_unknown() {
     let transition = kernel().apply(
         LoadedRun::Existing(state.clone()),
         Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: WorkflowTaskToken {
                 run_key: state.run_key,
                 logical_seq: LogicalTaskSeq(3),
@@ -4587,6 +4617,7 @@ fn record_marker_missing_name_fails_wft() {
     let transition = kernel().apply(
         LoadedRun::Existing(state.clone()),
         Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: WorkflowTaskToken {
                 run_key: state.run_key,
                 logical_seq: LogicalTaskSeq(3),
@@ -4636,6 +4667,7 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
     let started_at = now() - Duration::seconds(5);
     state.workflow_task_attempt = 3;
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 10, // virtual: last_event_id (9) + 1
@@ -4648,6 +4680,7 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -4734,6 +4767,7 @@ fn cancel_timer_fired_and_buffered_deletes_buffered_fired_event() {
         .apply(
             LoadedRun::Existing(fired.next_state),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: RunKey::new(),
                     logical_seq: LogicalTaskSeq(3),
@@ -4779,6 +4813,7 @@ fn request_cancel_activity_then_resolved_canceled() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(3),
@@ -4863,6 +4898,7 @@ fn cancel_then_cancel_workflow_e2e() {
         .pending_workflow_task
         .clone()
         .unwrap_or(PendingWorkflowTask {
+            task_type: tokeira_kernel::WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
             logical_seq: LogicalTaskSeq(4),
             scheduled_event_id: 11,
@@ -4875,6 +4911,7 @@ fn cancel_then_cancel_workflow_e2e() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5044,6 +5081,7 @@ fn start_child_workflow_happy_path() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5215,6 +5253,7 @@ fn signal_external_workflow_happy_path() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5290,6 +5329,7 @@ fn request_cancel_external_workflow_happy_path() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5377,11 +5417,20 @@ fn terminate_clears_pending_externals() {
     )));
 }
 
+// Feature: speculative-wft, Golden (a) / Property P1 — an update against a
+// quiescent run (no pending WFT, no buffered events) schedules a SPECULATIVE
+// task: NO events persist, `last_event_id` is untouched, ids are virtual
+// (scheduled = last_event_id + 1), and the dispatch op is marked speculative
+// (`AddWorkflowTaskScheduledEvent(false, SPECULATIVE)`,
+// updateworkflow/api.go:171-186 + workflow_task_state_machine.go:309-410
+// @ v1.31.0).
 #[test]
 fn update_with_no_pending_wft() {
+    let state = make_open_state();
+    let last_event_id = state.last_event_id;
     let transition = kernel()
         .apply(
-            LoadedRun::Existing(make_open_state()),
+            LoadedRun::Existing(state),
             Command::Update(UpdateRequest {
                 update_id: "update-1".into(),
                 update_name: "handler".into(),
@@ -5392,14 +5441,27 @@ fn update_with_no_pending_wft() {
         )
         .unwrap();
 
-    // apply_update no longer emits UpdateAccepted — that happens
-    // when the worker sends an Acceptance protocol message.
-    // It only schedules a WFT and tracks the update as admitted.
     assert_eq!(transition.request_dedupe_ops.len(), 1);
     assert!(transition.next_state.admitted_updates.contains("update-1"));
+    assert!(transition.history_events.is_empty());
+    assert_eq!(transition.next_state.last_event_id, last_event_id);
+    let pending = transition
+        .next_state
+        .pending_workflow_task
+        .as_ref()
+        .expect("speculative task must be pending");
+    assert_eq!(
+        pending.task_type,
+        tokeira_kernel::WorkflowTaskType::Speculative
+    );
+    assert_eq!(pending.attempt, 1);
+    assert_eq!(pending.scheduled_event_id, last_event_id + 1);
     assert!(matches!(
-        transition.history_events[0].kind,
-        HistoryEventKind::WorkflowTaskScheduled { .. }
+        transition.dispatch_ops[0],
+        DispatchOp::EnqueueWorkflowTask {
+            speculative: true,
+            ..
+        }
     ));
 }
 
@@ -5487,6 +5549,7 @@ fn update_completed_happy_path() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5512,9 +5575,14 @@ fn update_completed_happy_path() {
         )
         .unwrap();
 
+    // The kernel emits the failure-capable V2 completed shape; the original
+    // variant is decode-only (spec speculative-wft K6).
     assert!(matches!(
         transition.history_events[1].kind,
-        HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
+        HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
+            outcome: tokeira_kernel::UpdateEventOutcome::Success(..),
+            ..
+        }
     ));
     assert!(
         !transition
@@ -5532,6 +5600,7 @@ fn update_rejected_happy_path() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5580,6 +5649,7 @@ fn update_completed_unknown_update() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5615,6 +5685,7 @@ fn update_rejected_unknown_update_is_tolerated() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5658,6 +5729,7 @@ fn protocol_message_accepted_body() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5679,6 +5751,7 @@ fn protocol_message_accepted_body() {
                         update_id: "update-1".into(),
                         update_name: "handler".into(),
                         input: payloads("input"),
+                        sequencing_event_id: 1,
                     },
                 }],
                 force_new_workflow_task: false,
@@ -5707,6 +5780,7 @@ fn protocol_message_completed_body() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5727,6 +5801,7 @@ fn protocol_message_completed_body() {
                     body: UpdateProtocolBody::Completed {
                         update_id: "update-1".into(),
                         result: payloads("done"),
+                        failure: None,
                     },
                 }],
                 force_new_workflow_task: false,
@@ -5734,9 +5809,14 @@ fn protocol_message_completed_body() {
             }),
         )
         .unwrap();
+    // Completions emit the failure-capable V2 shape; the original variant is
+    // decode-only (spec speculative-wft K6).
     assert!(matches!(
         transition.history_events[1].kind,
-        HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
+        HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
+            outcome: tokeira_kernel::UpdateEventOutcome::Success(..),
+            ..
+        }
     ));
     assert!(
         !transition
@@ -5754,6 +5834,7 @@ fn protocol_message_rejected_body() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5818,6 +5899,7 @@ fn complete_workflow_clears_pending_updates() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5854,6 +5936,7 @@ fn record_marker_happy_path() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -5906,6 +5989,7 @@ fn record_marker_after_close_rejected() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -6127,6 +6211,7 @@ fn close_via_wft(state: WorkflowState, commands: Vec<WorkflowCommand>) -> Transi
         .apply(
             LoadedRun::Existing(state),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token,
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
@@ -6395,6 +6480,7 @@ fn schedule_nexus_operation_happy_path() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -6452,6 +6538,7 @@ fn schedule_nexus_operation_duplicate_rejected() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -6494,6 +6581,7 @@ fn cancel_nexus_operation_happy_path() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -6553,6 +6641,7 @@ fn cancel_nexus_operation_unknown() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -7016,6 +7105,7 @@ fn close_via_complete_clears_pending_nexus_operations() {
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: pending.logical_seq,
@@ -7204,4 +7294,846 @@ fn golden_message_too_large_terminate_history() {
         )
         .unwrap_err();
     assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Terminated));
+}
+
+// ─── Feature: speculative-wft — kernel goldens (spec speculative-wft K.4-K.6) ───
+//
+// All goldens assume the standard corpus 4-event lead-in (1
+// WorkflowExecutionStarted, 2 WorkflowTaskScheduled, 3 WorkflowTaskStarted,
+// 4 WorkflowTaskCompleted): last_event_id = 4, previous_started_event_id = 3,
+// no pending WFT.
+
+fn make_quiescent_state_after_first_wft() -> WorkflowState {
+    let mut state = make_open_state();
+    state.last_event_id = 4;
+    state.previous_started_event_id = 3;
+    state
+}
+
+/// Admit an update via the kernel, returning the post-admission state (a
+/// pending SPECULATIVE task when the run was quiescent, per K2).
+fn admit_update(state: WorkflowState, update_id: &str) -> WorkflowState {
+    kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Update(UpdateRequest {
+                update_id: update_id.into(),
+                update_name: "handler".into(),
+                input: payloads("input"),
+                request: request_context(&format!("admit-{update_id}")),
+                now: now(),
+            }),
+        )
+        .unwrap()
+        .next_state
+}
+
+/// Start the pending workflow task through the kernel command path.
+fn start_pending_task(state: WorkflowState) -> Transition {
+    let pending = state.pending_workflow_task.clone().unwrap();
+    kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                logical_seq: pending.logical_seq,
+                worker_identity: WorkerIdentity("worker".into()),
+                request_id: "speculative-start".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
+                deployment_transition: None,
+                deployment_transition_revision_number: None,
+                sticky_ttl: None,
+                now: now(),
+            }),
+        )
+        .unwrap()
+}
+
+fn speculative_completion_request(
+    state: &WorkflowState,
+    commands: Vec<WorkflowCommand>,
+) -> WorkflowTaskCompletedRequest {
+    let pending = state.pending_workflow_task.clone().unwrap();
+    WorkflowTaskCompletedRequest {
+        client_discards_speculative_with_events: false,
+        token: WorkflowTaskToken {
+            run_key: state.run_key,
+            logical_seq: pending.logical_seq,
+            started_event_id: pending.started_event_id.unwrap(),
+            attempt: pending.attempt,
+            shard_epoch: ShardEpoch::ZERO,
+        },
+        identity: WorkerIdentity("worker".into()),
+        sdk_metadata: None,
+        metering_metadata: None,
+        worker_version: None,
+        versioning_behavior: VersioningBehavior::Unspecified,
+        deployment_version: None,
+        worker_deployment_name: None,
+        sticky: None,
+        commands,
+        force_new_workflow_task: false,
+        now: now(),
+    }
+}
+
+fn accepted_body(update_id: &str, sequencing_event_id: i64) -> UpdateProtocolBody {
+    UpdateProtocolBody::Accepted {
+        update_id: update_id.into(),
+        update_name: "handler".into(),
+        input: payloads("input"),
+        sequencing_event_id,
+    }
+}
+
+// Feature: speculative-wft, Golden (a) / P1 — schedule + start persist
+// nothing: virtual ids scheduled = last_event_id + 1, started = scheduled + 1
+// (workflow_task_state_machine.go:309-410, 556-627 @ v1.31.0; Req 1.1, 2.1).
+#[test]
+fn speculative_start_persists_nothing() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let started = start_pending_task(state);
+    assert!(started.history_events.is_empty());
+    assert_eq!(started.next_state.last_event_id, 4);
+    let pending = started.next_state.pending_workflow_task.as_ref().unwrap();
+    assert_eq!(
+        pending.task_type,
+        tokeira_kernel::WorkflowTaskType::Speculative
+    );
+    assert_eq!(pending.scheduled_event_id, 5);
+    assert_eq!(pending.started_event_id, Some(6));
+}
+
+// Feature: speculative-wft, Golden (b) / P2 — a rejection-only completion of
+// a started speculative task DROPS without trace: zero history events,
+// last_event_id unchanged, pending task cleared, the rejected update gone
+// from the admitted set (`skipWorkflowTaskCompletedEvent`,
+// workflow_task_state_machine.go:676-748 @ v1.31.0; Req 3.1). The follow-up
+// rule (K7) fires when OTHER admitted updates remain: a fresh SPECULATIVE
+// task is scheduled (respondworkflowtaskcompleted/api.go:512-541 @ v1.31.0;
+// Req 8).
+#[test]
+fn speculative_rejection_only_completion_drops_without_trace() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let started = start_pending_task(state).next_state;
+
+    // Plain drop: nothing left admitted, no successor task.
+    let dropped = kernel()
+        .apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &started,
+                vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-reject".into(),
+                    body: UpdateProtocolBody::Rejected {
+                        update_id: "update-1".into(),
+                        failure: payload("rejected"),
+                    },
+                }],
+            )),
+        )
+        .unwrap();
+    assert!(dropped.history_events.is_empty());
+    assert_eq!(dropped.next_state.last_event_id, 4);
+    assert_eq!(dropped.next_state.previous_started_event_id, 3);
+    assert!(dropped.next_state.pending_workflow_task.is_none());
+    assert!(!dropped.next_state.admitted_updates.contains("update-1"));
+    assert!(dropped.dispatch_ops.is_empty());
+
+    // K7 follow-up: a second update admitted while the task ran keeps a
+    // delivery vehicle — the drop schedules a fresh speculative task.
+    let with_second = admit_update(started.clone(), "update-2");
+    let dropped = kernel()
+        .apply(
+            LoadedRun::Existing(with_second.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &with_second,
+                vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-reject".into(),
+                    body: UpdateProtocolBody::Rejected {
+                        update_id: "update-1".into(),
+                        failure: payload("rejected"),
+                    },
+                }],
+            )),
+        )
+        .unwrap();
+    assert!(dropped.history_events.is_empty());
+    assert_eq!(dropped.next_state.last_event_id, 4);
+    let follow_up = dropped.next_state.pending_workflow_task.as_ref().unwrap();
+    assert_eq!(
+        follow_up.task_type,
+        tokeira_kernel::WorkflowTaskType::Speculative
+    );
+    assert_eq!(follow_up.scheduled_event_id, 5);
+    assert!(dropped.next_state.admitted_updates.contains("update-2"));
+    assert!(matches!(
+        dropped.dispatch_ops[0],
+        DispatchOp::EnqueueWorkflowTask {
+            speculative: true,
+            ..
+        }
+    ));
+}
+
+// Feature: speculative-wft, Golden (c) / P3 / design G1 — an accept+complete
+// completion MATERIALIZES the task late: Scheduled(5), Started(6),
+// Completed(7), then UpdateAccepted(8) carrying the worker sequencing id (5 =
+// the delivering virtual scheduled id) and the failure-capable V2
+// Completed(9) anchored at accepted_event_id 8
+// (`AddWorkflowTaskCompletedEvent`, workflow_task_state_machine.go:750-819;
+// event_factory.go:424-456 @ v1.31.0; Req 3.4, 7.1, 7.2).
+#[test]
+fn speculative_accept_complete_materializes_late() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let started = start_pending_task(state).next_state;
+
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &started,
+                vec![
+                    WorkflowCommand::ProtocolMessage {
+                        message_id: "msg-accept".into(),
+                        body: accepted_body("update-1", 5),
+                    },
+                    WorkflowCommand::ProtocolMessage {
+                        message_id: "msg-complete".into(),
+                        body: UpdateProtocolBody::Completed {
+                            update_id: "update-1".into(),
+                            result: payloads("done"),
+                            failure: None,
+                        },
+                    },
+                ],
+            )),
+        )
+        .unwrap();
+
+    let ids: Vec<i64> = transition
+        .history_events
+        .iter()
+        .map(|event| event.event_id)
+        .collect();
+    assert_eq!(ids, vec![5, 6, 7, 8, 9]);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskScheduled { attempt: 1, .. }
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskStarted {
+            scheduled_event_id: 5,
+            ..
+        }
+    ));
+    assert!(matches!(
+        transition.history_events[2].kind,
+        HistoryEventKind::WorkflowTaskCompleted {
+            scheduled_event_id: 5,
+            started_event_id: 6,
+            ..
+        }
+    ));
+    match &transition.history_events[3].kind {
+        HistoryEventKind::WorkflowExecutionUpdateAccepted {
+            update_id,
+            accepted_request_sequencing_event_id,
+            ..
+        } => {
+            assert_eq!(update_id, "update-1");
+            // Worker-provided anchor recorded verbatim (Req 7.1).
+            assert_eq!(*accepted_request_sequencing_event_id, 5);
+        }
+        other => panic!("expected UpdateAccepted, got {other:?}"),
+    }
+    match &transition.history_events[4].kind {
+        HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
+            update_id,
+            accepted_event_id,
+            outcome,
+            ..
+        } => {
+            assert_eq!(update_id, "update-1");
+            assert_eq!(*accepted_event_id, 8);
+            assert_eq!(
+                outcome,
+                &tokeira_kernel::UpdateEventOutcome::Success(payloads("done"))
+            );
+        }
+        other => panic!("expected V2 UpdateCompleted, got {other:?}"),
+    }
+    assert_eq!(transition.next_state.last_event_id, 9);
+    assert_eq!(transition.next_state.previous_started_event_id, 6);
+    assert!(transition.next_state.pending_workflow_task.is_none());
+}
+
+// Feature: speculative-wft, Golden (d) / P4 — a signal while the speculative
+// task is SCHEDULED converts it in place with the Scheduled event BEFORE the
+// signal: Scheduled(5), Signaled(6), then the start persists Started(7)
+// (`convertSpeculativeWorkflowTaskToNormal`,
+// workflow_task_state_machine.go:1466-1530 @ v1.31.0; corpus
+// `TestScheduledSpeculativeWorkflowTask_ConvertToNormalBecauseOfSignal`;
+// Req 4.1).
+#[test]
+fn speculative_signal_while_scheduled_converts_scheduled_before_signaled() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let scheduled_at = state.pending_workflow_task.as_ref().unwrap().scheduled_at;
+
+    let signaled = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: payloads("signal"),
+                header: None,
+                links: Vec::new(),
+                request: request_context("signal-convert"),
+                now: now() + Duration::seconds(1),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(signaled.history_events.len(), 2);
+    match &signaled.history_events[0] {
+        HistoryEvent {
+            event_id,
+            happened_at,
+            kind: HistoryEventKind::WorkflowTaskScheduled { attempt, .. },
+        } => {
+            assert_eq!(*event_id, 5);
+            // The materialized Scheduled event keeps the task's original
+            // schedule time (`wt.ScheduledTime` @ v1.31.0).
+            assert_eq!(*happened_at, scheduled_at);
+            assert_eq!(*attempt, 1);
+        }
+        other => panic!("expected WorkflowTaskScheduled, got {other:?}"),
+    }
+    assert!(matches!(
+        signaled.history_events[1].kind,
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+    ));
+    assert_eq!(signaled.history_events[1].event_id, 6);
+    let pending = signaled.next_state.pending_workflow_task.as_ref().unwrap();
+    assert_eq!(pending.task_type, tokeira_kernel::WorkflowTaskType::Normal);
+    assert_eq!(pending.scheduled_event_id, 5);
+    assert!(pending.started_event_id.is_none());
+
+    // The converted (now normal) task starts with a REAL Started event at 7.
+    let started = start_pending_task(signaled.next_state);
+    assert_eq!(started.history_events.len(), 1);
+    assert!(matches!(
+        started.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskStarted {
+            scheduled_event_id: 5,
+            ..
+        }
+    ));
+    assert_eq!(started.history_events[0].event_id, 7);
+}
+
+// Feature: speculative-wft, Golden (K4.2) / P4 — a signal BUFFERED while the
+// speculative task is STARTED blocks the drop: the rejection-only completion
+// MATERIALIZES and the buffered signal flushes AFTER the completed event,
+// then the flushed event forces a real follow-up task — corpus shape
+// 5 WTScheduled, 6 WTStarted, 7 WTCompleted, 8 Signaled, 9 WTScheduled
+// (`TestStartedSpeculativeWorkflowTask_ConvertToNormalBecauseOfBufferedSignal`;
+// Req 4.2).
+#[test]
+fn speculative_buffered_signal_blocks_drop_and_flushes_after_completed() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let started = start_pending_task(state).next_state;
+
+    let buffered = kernel()
+        .apply(
+            LoadedRun::Existing(started),
+            Command::Signal(SignalRequest {
+                signal_name: "sig".into(),
+                input: payloads("signal"),
+                header: None,
+                links: Vec::new(),
+                request: request_context("signal-buffer"),
+                now: now() + Duration::seconds(1),
+            }),
+        )
+        .unwrap();
+    assert!(buffered.history_events.is_empty());
+    assert_eq!(buffered.next_state.buffered_events.len(), 1);
+
+    let completed = kernel()
+        .apply(
+            LoadedRun::Existing(buffered.next_state.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &buffered.next_state,
+                vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-reject".into(),
+                    body: UpdateProtocolBody::Rejected {
+                        update_id: "update-1".into(),
+                        failure: payload("rejected"),
+                    },
+                }],
+            )),
+        )
+        .unwrap();
+
+    let kinds: Vec<&HistoryEventKind> = completed
+        .history_events
+        .iter()
+        .map(|event| &event.kind)
+        .collect();
+    assert_eq!(completed.history_events.len(), 5);
+    assert!(matches!(
+        kinds[0],
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+    assert!(matches!(
+        kinds[1],
+        HistoryEventKind::WorkflowTaskStarted { .. }
+    ));
+    assert!(matches!(
+        kinds[2],
+        HistoryEventKind::WorkflowTaskCompleted { .. }
+    ));
+    assert!(matches!(
+        kinds[3],
+        HistoryEventKind::WorkflowExecutionSignaled { .. }
+    ));
+    assert!(matches!(
+        kinds[4],
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+    assert_eq!(completed.history_events[3].event_id, 8);
+    // The flushed-signal follow-up is a NORMAL task with a real Scheduled
+    // event at 9.
+    assert_eq!(completed.history_events[4].event_id, 9);
+    let follow_up = completed.next_state.pending_workflow_task.as_ref().unwrap();
+    assert_eq!(
+        follow_up.task_type,
+        tokeira_kernel::WorkflowTaskType::Normal
+    );
+    assert_eq!(follow_up.scheduled_event_id, 9);
+}
+
+// Feature: speculative-wft, Golden (K4.3) / P5 — START_TO_CLOSE on a started
+// speculative task persists Scheduled(5) + Started(6) late, then
+// WorkflowTaskTimedOut(7), and the attempt-2 retry stays virtual (transient)
+// (`AddWorkflowTaskTimedOutEvent`, workflow_task_state_machine.go:934-960;
+// timer_queue_active_task_executor.go:425-440 @ v1.31.0; Req 5.1; corpus
+// `TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+#[test]
+fn speculative_start_to_close_timeout_persists_and_retries_transient() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let started = start_pending_task(state).next_state;
+    let pending = started.pending_workflow_task.clone().unwrap();
+
+    let timed_out = kernel()
+        .apply(
+            LoadedRun::Existing(started),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: pending.logical_seq,
+                started_event_id: pending.started_event_id.unwrap(),
+                timeout_type: WorkflowTaskTimeoutType::StartToClose,
+                now: now() + Duration::seconds(10),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(timed_out.history_events.len(), 3);
+    assert!(matches!(
+        timed_out.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskScheduled { attempt: 1, .. }
+    ));
+    assert!(matches!(
+        timed_out.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskStarted {
+            scheduled_event_id: 5,
+            ..
+        }
+    ));
+    assert!(matches!(
+        timed_out.history_events[2].kind,
+        HistoryEventKind::WorkflowTaskTimedOut {
+            scheduled_event_id: 5,
+            started_event_id: 6,
+            timeout_type: WorkflowTaskTimeoutType::StartToClose,
+            ..
+        }
+    ));
+    assert_eq!(timed_out.next_state.last_event_id, 7);
+    // Attempt-2 retry: transient — no persisted Scheduled event, virtual id 8.
+    let retry = timed_out.next_state.pending_workflow_task.as_ref().unwrap();
+    assert_eq!(retry.attempt, 2);
+    assert_eq!(retry.task_type, tokeira_kernel::WorkflowTaskType::Normal);
+    assert_eq!(retry.scheduled_event_id, 8);
+    // The still-admitted update survives for redelivery on the retry.
+    assert!(timed_out.next_state.admitted_updates.contains("update-1"));
+}
+
+// Feature: speculative-wft, Golden (K4.3) / P5 — SCHEDULE_TO_START on a
+// scheduled speculative task persists Scheduled(5) +
+// WorkflowTaskTimedOut(6, SCHEDULE_TO_START), resets the attempt to 1, and
+// reschedules a REAL normal-queue task with Scheduled(7)
+// (`AddWorkflowTaskScheduleToStartTimeoutEvent`,
+// workflow_task_state_machine.go:270-305 + the 5s in-memory timer,
+// workflow_task_timer.go:15-19 @ v1.31.0; Req 5.2/5.3; corpus
+// `TestSpeculativeWorkflowTask_ScheduleToStartTimeout*`).
+#[test]
+fn speculative_schedule_to_start_timeout_persists_and_reschedules_real() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let pending = state.pending_workflow_task.clone().unwrap();
+
+    let timed_out = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::WorkflowTaskTimedOut(WorkflowTaskTimedOutRequest {
+                logical_seq: pending.logical_seq,
+                started_event_id: 0,
+                timeout_type: WorkflowTaskTimeoutType::ScheduleToStart,
+                now: now() + Duration::seconds(5),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(timed_out.history_events.len(), 3);
+    assert!(matches!(
+        timed_out.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskScheduled { attempt: 1, .. }
+    ));
+    assert_eq!(timed_out.history_events[0].event_id, 5);
+    assert!(matches!(
+        timed_out.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskTimedOut {
+            scheduled_event_id: 5,
+            started_event_id: 0,
+            timeout_type: WorkflowTaskTimeoutType::ScheduleToStart,
+            ..
+        }
+    ));
+    assert!(matches!(
+        timed_out.history_events[2].kind,
+        HistoryEventKind::WorkflowTaskScheduled { attempt: 1, .. }
+    ));
+    assert_eq!(timed_out.history_events[2].event_id, 7);
+    let retry = timed_out.next_state.pending_workflow_task.as_ref().unwrap();
+    assert_eq!(retry.attempt, 1);
+    assert_eq!(retry.task_type, tokeira_kernel::WorkflowTaskType::Normal);
+    assert_eq!(retry.scheduled_event_id, 7);
+    assert!(matches!(
+        timed_out.dispatch_ops[0],
+        DispatchOp::EnqueueWorkflowTask {
+            speculative: false,
+            ..
+        }
+    ));
+}
+
+// Feature: speculative-wft, Golden (e) — the bad-update-message taxonomy
+// (Req 6.1/6.2 + owner amendment F5): double-accept and zero sequencing id
+// reject with `BadUpdateMessage` (InvalidArgument flavor); an unknown accept
+// without the echoed request is NotFound; an unknown accept WITH the echoed
+// request RESURRECTS (`checkStateSet`, update/update.go:648-656;
+// `validateAcceptanceMsg`, update/validation.go:62-68; `TryResurrect`,
+// update/registry.go:238-281;
+// workflow_task_completed_handler.go:375-425 @ v1.31.0).
+#[test]
+fn bad_update_message_taxonomy() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let started = start_pending_task(state).next_state;
+
+    // Double accept in one completion → invalid state transition, rendered at
+    // the in-flight state ProvisionallyAccepted.
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &started,
+                vec![
+                    WorkflowCommand::ProtocolMessage {
+                        message_id: "msg-accept-1".into(),
+                        body: accepted_body("update-1", 5),
+                    },
+                    WorkflowCommand::ProtocolMessage {
+                        message_id: "msg-accept-2".into(),
+                        body: accepted_body("update-1", 5),
+                    },
+                ],
+            )),
+        )
+        .unwrap_err();
+    assert_eq!(
+        reject,
+        Reject::BadUpdateMessage {
+            message: "invalid state transition attempted for Update update-1: received \
+                      *update.Acceptance message while in state ProvisionallyAccepted"
+                .into(),
+            not_found: false,
+        }
+    );
+
+    // Accept for an update accepted by a PREVIOUS task → state Accepted.
+    let previously_accepted = with_pending_update(started.clone(), "update-2");
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(previously_accepted.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &previously_accepted,
+                vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept".into(),
+                    body: accepted_body("update-2", 5),
+                }],
+            )),
+        )
+        .unwrap_err();
+    assert_eq!(
+        reject,
+        Reject::BadUpdateMessage {
+            message: "invalid state transition attempted for Update update-2: received \
+                      *update.Acceptance message while in state Accepted"
+                .into(),
+            not_found: false,
+        }
+    );
+
+    // Unknown update, no echoed request → NotFound, exact v1.31.0 message
+    // (workflow_task_completed_handler.go:381).
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &started,
+                vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept".into(),
+                    body: UpdateProtocolBody::Accepted {
+                        update_id: "update-ghost".into(),
+                        update_name: String::new(),
+                        input: Payloads::default(),
+                        sequencing_event_id: 5,
+                    },
+                }],
+            )),
+        )
+        .unwrap_err();
+    assert_eq!(
+        reject,
+        Reject::BadUpdateMessage {
+            message: "update update-ghost wasn't found on the server. This is most likely a \
+                      transient error which will be resolved automatically by retries"
+                .into(),
+            not_found: true,
+        }
+    );
+
+    // Unknown update WITH the echoed request → resurrect and accept.
+    let resurrected = kernel()
+        .apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &started,
+                vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept".into(),
+                    body: accepted_body("update-ghost", 5),
+                }],
+            )),
+        )
+        .unwrap();
+    assert!(
+        resurrected
+            .next_state
+            .pending_updates
+            .contains_key("update-ghost")
+    );
+    assert!(resurrected.history_events.iter().any(|event| matches!(
+        &event.kind,
+        HistoryEventKind::WorkflowExecutionUpdateAccepted { update_id, .. }
+            if update_id == "update-ghost"
+    )));
+
+    // Zero sequencing id → exact validateAcceptanceMsg rendering
+    // (update/validation.go:62-68 @ v1.31.0).
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &started,
+                vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept".into(),
+                    body: accepted_body("update-1", 0),
+                }],
+            )),
+        )
+        .unwrap_err();
+    assert_eq!(
+        reject,
+        Reject::BadUpdateMessage {
+            message: "invalid *update.Acceptance: accepted_request_sequencing_event_id is not set"
+                .into(),
+            not_found: false,
+        }
+    );
+
+    // Out-of-range sequencing id → owner amendment F5 bounds check.
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &started,
+                vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-accept".into(),
+                    body: accepted_body("update-1", 999),
+                }],
+            )),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        reject,
+        Reject::BadUpdateMessage {
+            not_found: false,
+            ..
+        }
+    ));
+
+    // Complete-before-accept: the update the task delivered is in state Sent.
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &started,
+                vec![WorkflowCommand::ProtocolMessage {
+                    message_id: "msg-complete".into(),
+                    body: UpdateProtocolBody::Completed {
+                        update_id: "update-1".into(),
+                        result: payloads("done"),
+                        failure: None,
+                    },
+                }],
+            )),
+        )
+        .unwrap_err();
+    assert_eq!(
+        reject,
+        Reject::BadUpdateMessage {
+            message: "invalid state transition attempted for Update update-1: received \
+                      *update.Response message while in state Sent"
+                .into(),
+            not_found: false,
+        }
+    );
+}
+
+// Feature: speculative-wft — a Response with a Failure outcome is a COMPLETED
+// update whose handler failed post-acceptance: it materializes the task and
+// persists the failure-capable V2 event, NOT a rejection (Req 7.2;
+// mutable_state_impl.go:5288-5378 @ v1.31.0).
+#[test]
+fn update_completed_with_failure_outcome_persists_v2_failure() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let started = start_pending_task(state).next_state;
+
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(started.clone()),
+            Command::WorkflowTaskCompleted(speculative_completion_request(
+                &started,
+                vec![
+                    WorkflowCommand::ProtocolMessage {
+                        message_id: "msg-accept".into(),
+                        body: accepted_body("update-1", 5),
+                    },
+                    WorkflowCommand::ProtocolMessage {
+                        message_id: "msg-complete".into(),
+                        body: UpdateProtocolBody::Completed {
+                            update_id: "update-1".into(),
+                            result: Payloads::default(),
+                            failure: Some(payload("handler-failed")),
+                        },
+                    },
+                ],
+            )),
+        )
+        .unwrap();
+
+    match &transition.history_events[4].kind {
+        HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
+            accepted_event_id,
+            outcome,
+            ..
+        } => {
+            assert_eq!(*accepted_event_id, 8);
+            assert_eq!(
+                outcome,
+                &tokeira_kernel::UpdateEventOutcome::Failure(payload("handler-failed"))
+            );
+        }
+        other => panic!("expected V2 UpdateCompleted, got {other:?}"),
+    }
+    assert!(
+        !transition
+            .next_state
+            .pending_updates
+            .contains_key("update-1")
+    );
+}
+
+// Feature: speculative-wft — an explicit WFT failure (RespondWorkflowTaskFailed
+// or the bad-update-message seam) on a STARTED speculative task persists
+// Scheduled(5) + Started(6) late, then WorkflowTaskFailed(7); the retry is an
+// ordinary transient attempt-2 and the update stays admitted for redelivery
+// (`AddWorkflowTaskFailedEvent`, workflow_task_state_machine.go:865-891
+// @ v1.31.0; corpus `TestSpeculativeWorkflowTask_Fail` distinction, Req 6.3).
+#[test]
+fn speculative_explicit_fail_materializes_and_keeps_update_admitted() {
+    let state = admit_update(make_quiescent_state_after_first_wft(), "update-1");
+    let started = start_pending_task(state).next_state;
+    let pending = started.pending_workflow_task.clone().unwrap();
+
+    let failed = kernel()
+        .apply(
+            LoadedRun::Existing(started),
+            Command::WorkflowTaskFailed(WorkflowTaskFailedRequest {
+                logical_seq: pending.logical_seq,
+                started_event_id: pending.started_event_id.unwrap(),
+                failure_cause: WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage,
+                failure_details: None,
+                worker_identity: WorkerIdentity("worker".into()),
+                now: now() + Duration::seconds(1),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(failed.history_events.len(), 3);
+    assert!(matches!(
+        failed.history_events[0].kind,
+        HistoryEventKind::WorkflowTaskScheduled { attempt: 1, .. }
+    ));
+    assert!(matches!(
+        failed.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskStarted {
+            scheduled_event_id: 5,
+            ..
+        }
+    ));
+    match &failed.history_events[2].kind {
+        HistoryEventKind::WorkflowTaskFailed {
+            scheduled_event_id,
+            started_event_id,
+            failure_cause,
+            ..
+        } => {
+            assert_eq!(*scheduled_event_id, 5);
+            assert_eq!(*started_event_id, 6);
+            assert_eq!(
+                failure_cause,
+                &WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage
+            );
+        }
+        other => panic!("expected WorkflowTaskFailed, got {other:?}"),
+    }
+    // Retry is transient attempt-2 with a virtual scheduled id; the update
+    // stays admitted for redelivery.
+    let retry = failed.next_state.pending_workflow_task.as_ref().unwrap();
+    assert_eq!(retry.attempt, 2);
+    assert_eq!(retry.task_type, tokeira_kernel::WorkflowTaskType::Normal);
+    assert_eq!(retry.scheduled_event_id, 8);
+    assert!(failed.next_state.admitted_updates.contains("update-1"));
 }

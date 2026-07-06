@@ -500,6 +500,35 @@ where
                                     },
                                 );
                             }
+                            HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
+                                update_id,
+                                outcome,
+                                ..
+                            } => {
+                                let resolution = match outcome {
+                                    tokeira_kernel::UpdateEventOutcome::Success(result) => {
+                                        UpdateResolution::Completed {
+                                            result: result.clone(),
+                                        }
+                                    }
+                                    // A COMPLETED update whose outcome is a
+                                    // Failure resolves waiters exactly like a
+                                    // rejection: v1.31.0's caller-visible
+                                    // Outcome carries the same Failure value
+                                    // either way — rejected and
+                                    // completed-with-failure are
+                                    // indistinguishable on the wire, only the
+                                    // persisted history differs (rejections
+                                    // persist nothing; spec speculative-wft
+                                    // K6, Req 7.2).
+                                    tokeira_kernel::UpdateEventOutcome::Failure(failure) => {
+                                        UpdateResolution::Rejected {
+                                            failure: failure.clone(),
+                                        }
+                                    }
+                                };
+                                update_registry.notify(message.run_key, update_id, resolution);
+                            }
                             HistoryEventKind::WorkflowExecutionUpdateRejected {
                                 update_id,
                                 failure,
@@ -1472,6 +1501,11 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
             "WorkflowExecutionContinuedAsNew"
         }
         HistoryEventKind::WorkflowExecutionCanceled { .. } => "WorkflowExecutionCanceled",
+        // The failure-capable V2 shape serializes to the same public event
+        // type as its decode-only predecessor (spec speculative-wft K6).
+        HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { .. } => {
+            "WorkflowExecutionUpdateCompleted"
+        }
     }
 }
 
@@ -2252,6 +2286,7 @@ mod tests {
             last_event_id: 0,
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: Some(PendingWorkflowTask {
+                task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq::ONE,
                 scheduled_event_id: 1,
@@ -2325,6 +2360,7 @@ mod tests {
 
     fn sample_dispatch_ops(namespace_id: NamespaceId) -> SmallVec<[DispatchOp; 4]> {
         smallvec![DispatchOp::EnqueueWorkflowTask {
+            speculative: false,
             queue: QueueKey {
                 namespace_id,
                 task_queue: TaskQueueName("queue-a".to_string()),

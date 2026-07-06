@@ -640,6 +640,7 @@ mod tests {
             .expect("initial workflow task should be available");
         let _ = runtime
             .complete_workflow_task(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: started.token,
                 identity: WorkerIdentity("w".into()),
                 sdk_metadata: None,

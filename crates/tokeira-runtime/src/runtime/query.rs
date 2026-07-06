@@ -605,6 +605,48 @@ where
                         }),
                     }));
                 }
+                // Failure-capable successor of the arm above (spec
+                // speculative-wft K6, Req 7.2): a Success outcome reads as
+                // Completed; a Failure outcome reads as the failure-shaped
+                // outcome — the same caller-visible `Outcome{Failure}` a
+                // rejection produces (v1.31.0 renders both identically on
+                // the wire).
+                HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
+                    update_id: event_update_id,
+                    update_name,
+                    accepted_event_id,
+                    outcome,
+                } if event_update_id == update_id => {
+                    let resolved_name = if update_name.is_empty() {
+                        accepted
+                            .as_ref()
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_default()
+                    } else {
+                        update_name
+                    };
+                    let outcome = match outcome {
+                        tokeira_kernel::UpdateEventOutcome::Success(result) => {
+                            UpdateOutcome::Completed {
+                                accepted_event_id,
+                                result,
+                            }
+                        }
+                        tokeira_kernel::UpdateEventOutcome::Failure(failure) => {
+                            UpdateOutcome::Rejected {
+                                accepted_event_id,
+                                failure,
+                            }
+                        }
+                    };
+                    return Ok(Some(UpdateLifecycleSnapshot {
+                        workflow_execution: workflow_execution.clone(),
+                        update_id: update_id.to_string(),
+                        update_name: resolved_name,
+                        stage: UpdateLifecycleStage::Completed,
+                        outcome: Some(outcome),
+                    }));
+                }
                 HistoryEventKind::WorkflowExecutionUpdateRejected {
                     update_id: event_update_id,
                     failure,

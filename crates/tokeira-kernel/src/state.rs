@@ -430,6 +430,29 @@ pub struct PendingWorkflowTask {
     /// disarm it (the v1.31.0 timer fires regardless; stickytq leaf 2).
     #[serde(default)]
     pub schedule_to_start_deadline: Option<OffsetDateTime>,
+    /// Which task mode this pending WFT runs in. A SPECULATIVE task persists
+    /// nothing at schedule/start and either drops without trace or
+    /// materializes late at completion — it is attempt 1, so the transient
+    /// `attempt > 1` predicate cannot classify it and an explicit bit is
+    /// required (`WORKFLOW_TASK_TYPE_SPECULATIVE`,
+    /// `workflow_task_state_machine.go:676-748 @ v1.31.0`; spec
+    /// speculative-wft K1). `#[serde(default)]` decodes pre-existing state
+    /// as Normal.
+    #[serde(default)]
+    pub task_type: WorkflowTaskType,
+}
+
+/// Task mode for a pending workflow task (spec speculative-wft K1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkflowTaskType {
+    /// Ordinary durable task: `WorkflowTaskScheduled`/`Started` persist as
+    /// they happen (attempt-1) or virtually (transient attempt>1).
+    #[default]
+    Normal,
+    /// Update-carrying task that persists NOTHING until completion decides
+    /// drop (rejection-only) or late materialization
+    /// (`WORKFLOW_TASK_TYPE_SPECULATIVE` @ v1.31.0).
+    Speculative,
 }
 
 /// Durable state for a single open activity.
@@ -1101,6 +1124,7 @@ mod tests {
             expires_at: now() + Duration::seconds(30),
         });
         state.pending_workflow_task = Some(PendingWorkflowTask {
+            task_type: WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
             logical_seq: LogicalTaskSeq(2),
             scheduled_event_id: 10,
@@ -1132,6 +1156,7 @@ mod tests {
         let target_version = version("deployment", "target");
         let mut state = open_state();
         state.pending_workflow_task = Some(PendingWorkflowTask {
+            task_type: WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
             logical_seq: LogicalTaskSeq(2),
             scheduled_event_id: 10,

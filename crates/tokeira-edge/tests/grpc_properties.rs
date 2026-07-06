@@ -825,6 +825,7 @@ fn arb_start_response() -> impl Strategy<Value = StartWorkflowExecutionResponse>
 fn arb_completed_response() -> impl Strategy<Value = RespondWorkflowTaskCompletedResponse> {
     prop::collection::vec(arb_poll_activity_response(), 0..6).prop_map(|activity_tasks| {
         RespondWorkflowTaskCompletedResponse {
+            reset_history_event_id: 0,
             transition_seq: 0,
             last_event_id: 0,
             execution_status: ExecutionStatus::Running,
@@ -1292,6 +1293,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 update_id: "update-1".into(),
                 update_name: "handler".into(),
                 input,
+                sequencing_event_id: 1,
             },
         }),
     ]

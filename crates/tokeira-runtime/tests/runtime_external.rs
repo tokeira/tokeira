@@ -42,6 +42,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
     let originator_task = poll_wft(&runtime, workflow_queue(namespace_id, "originator-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: originator_task.token,
             identity: WorkerIdentity("worker-originator".into()),
             sdk_metadata: None,
@@ -117,6 +118,7 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
     let originator_task = poll_wft(&runtime, workflow_queue(namespace_id, "originator-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: originator_task.token,
             identity: WorkerIdentity("worker-originator".into()),
             sdk_metadata: None,
@@ -192,6 +194,7 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
     let originator_task = poll_wft(&runtime, workflow_queue(originator_ns, "originator-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: originator_task.token,
             identity: WorkerIdentity("worker-originator".into()),
             sdk_metadata: None,
@@ -257,6 +260,7 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
     let originator_task = poll_wft(&runtime, workflow_queue(namespace_id, "originator-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: originator_task.token,
             identity: WorkerIdentity("worker-originator".into()),
             sdk_metadata: None,

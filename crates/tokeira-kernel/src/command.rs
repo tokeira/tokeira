@@ -222,10 +222,20 @@ pub enum WorkflowTaskFailedCause {
     /// `WORKFLOW_TASK_FAILED_CAUSE_BAD_REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION_ATTRIBUTES
     /// = 10`, `failed_cause.proto`).
     ///
-    /// Declared LAST: this enum is embedded in persisted `WorkflowTaskFailed`
-    /// history events and postcard encodes variants by declaration index —
-    /// appending keeps every pre-existing discriminant stable.
+    /// This enum is embedded in persisted `WorkflowTaskFailed` history events
+    /// and postcard encodes variants by declaration index — new variants are
+    /// APPENDED so every pre-existing discriminant stays stable.
     BadRequestCancelExternalWorkflowExecutionAttributes,
+    /// A worker update protocol message failed validation on
+    /// `RespondWorkflowTaskCompleted`: unknown update id with no resurrect
+    /// payload, a wrong-state transition (double-accept,
+    /// complete-before-accept), or an invalid acceptance sequencing id
+    /// (`WORKFLOW_TASK_FAILED_CAUSE_BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE
+    /// = 30`, `failed_cause.proto`; `handleMessage` failing the WFT with this
+    /// cause, workflow_task_completed_handler.go:375-425 @ v1.31.0; spec
+    /// speculative-wft K5). Appended LAST per the postcard positional
+    /// discipline above.
+    BadUpdateWorkflowExecutionMessage,
 }
 
 impl WorkflowTaskFailedCause {
@@ -255,6 +265,7 @@ impl WorkflowTaskFailedCause {
             Self::ResetWorkflow => "ResetWorkflow",
             Self::ForceCloseCommand => "ForceCloseCommand",
             Self::GrpcMessageTooLarge => "GrpcMessageTooLarge",
+            Self::BadUpdateWorkflowExecutionMessage => "BadUpdateWorkflowExecutionMessage",
         }
     }
 }
@@ -872,6 +883,13 @@ pub enum RetryContinuation {
 pub struct WorkflowTaskCompletedRequest {
     /// Token that proves the worker held the correct task.
     pub token: WorkflowTaskToken,
+    /// SDK capability `discard_speculative_workflow_task_with_events`: widens
+    /// the speculative-drop events-window from 0 to the pinned v1.31.0
+    /// default of 10 interleaved events
+    /// (`DiscardSpeculativeWorkflowTaskMaximumEventsCount`, constants.go:2447
+    /// @ v1.31.0; spec speculative-wft Req 3.3).
+    #[serde(default)]
+    pub client_discards_speculative_with_events: bool,
     /// Identity of the completing worker.
     pub identity: WorkerIdentity,
     /// Raw encoded Temporal SDK metadata from the completion request.
@@ -1180,16 +1198,46 @@ pub struct NexusOperationRetryRequest {
 ///
 /// Updates span two transitions (acceptance and completion),
 /// so the protocol message can carry any of the three phases.
+///
+/// This is the KERNEL-OWNED wire-message model (spec speculative-wft owner
+/// amendment F1): the edge decodes the proto `Acceptance`/`Response`/
+/// `Rejection` bodies into these variants so the kernel classifies
+/// completions (e.g. K3's "rejection-only" drop) with no proto dependency.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum UpdateProtocolBody {
     /// The worker accepted the update.
     Accepted {
         update_id: String,
+        /// Handler name echoed from the acceptance's embedded
+        /// `accepted_request` (the resurrect source, `TryResurrect`,
+        /// update/registry.go:238-281 @ v1.31.0). Empty when the worker did
+        /// not echo the original request; the edge core hydrates it from the
+        /// update registry when available.
         update_name: String,
+        /// Original update arguments echoed with `update_name` (see above).
         input: Payloads,
+        /// Worker-provided `accepted_request_sequencing_event_id`, recorded
+        /// verbatim on the `WorkflowExecutionUpdateAccepted` event
+        /// (`CreateWorkflowExecutionUpdateAcceptedEvent`,
+        /// event_factory.go:424-440 @ v1.31.0). Bounds-checked by the kernel
+        /// per owner amendment F5 (spec speculative-wft K6); zero fails
+        /// v1.31.0's `validateAcceptanceMsg` (update/validation.go:62-68).
+        #[serde(default)]
+        sequencing_event_id: i64,
     },
-    /// The worker completed the update with a result.
-    Completed { update_id: String, result: Payloads },
+    /// The worker completed the update — a `Response` message whose outcome
+    /// is either Success or Failure. A Failure outcome is a COMPLETED update
+    /// whose handler failed post-acceptance, NOT a rejection
+    /// (`Outcome.Failure` on `updatepb.Response`; validateResponseMsg,
+    /// update/validation.go:70-78 @ v1.31.0; spec speculative-wft Req 7.2).
+    Completed {
+        update_id: String,
+        /// Success payloads; empty when `failure` is set.
+        result: Payloads,
+        /// `Some` = COMPLETED stage with a Failure outcome.
+        #[serde(default)]
+        failure: Option<Payload>,
+    },
     /// The worker rejected the update.
     Rejected { update_id: String, failure: Payload },
 }

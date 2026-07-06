@@ -52,7 +52,11 @@ pub async fn poll_response(
     // `response.TransientWorkflowTask`, recordworkflowtaskstarted/api.go:430
     // @ v1.31.0). Nothing is persisted; ids continue past the last real event.
     let last_persisted = history.last().map(|event| event.event_id).unwrap_or(0);
-    if started.token.attempt > 1 && started.token.started_event_id > last_persisted {
+    // A started id beyond persisted history means the task is virtual —
+    // transient (attempt>1) OR speculative (attempt-1, spec speculative-wft
+    // E1): both synthesize the suffix; a normal attempt-1 task's started
+    // event is persisted and never trips this.
+    if started.token.started_event_id > last_persisted {
         let scheduled_event_id = started.token.started_event_id - 1;
         history.push(tokeira_kernel::HistoryEvent {
             event_id: scheduled_event_id,
@@ -120,6 +124,7 @@ pub fn completed_response(
         was_duplicate: outcome.was_duplicate,
         workflow_task: None,
         activity_tasks: Vec::new(),
+        reset_history_event_id: 0,
     }
 }
 

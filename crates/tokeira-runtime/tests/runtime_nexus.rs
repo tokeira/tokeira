@@ -174,6 +174,7 @@ async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<
     let task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
             sdk_metadata: None,
@@ -239,6 +240,7 @@ async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
     let task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
             sdk_metadata: None,
@@ -320,6 +322,7 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
     let task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
             sdk_metadata: None,
@@ -394,6 +397,7 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
     let cancel_task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: cancel_task.token,
             identity: WorkerIdentity("worker".to_string()),
             sdk_metadata: None,
@@ -493,6 +497,7 @@ async fn nexus_schedule_to_start_times_out_via_scanner() -> Result<()> {
     let task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
             sdk_metadata: None,
@@ -604,6 +609,7 @@ async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
     let task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
             sdk_metadata: None,
@@ -696,6 +702,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
     let task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
             sdk_metadata: None,
@@ -767,6 +774,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
     let cancel_task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: cancel_task.token,
             identity: WorkerIdentity("worker".to_string()),
             sdk_metadata: None,
@@ -854,6 +862,7 @@ proptest! {
                 .expect("workflow task");
             runtime
                 .complete_workflow_task(WorkflowTaskCompletedRequest {
+                    client_discards_speculative_with_events: false,
                     token: task.token,
                     identity: WorkerIdentity("worker".to_string()),
                     sdk_metadata: None,
@@ -974,6 +983,7 @@ proptest! {
                 .expect("cancel wft");
             runtime
                 .complete_workflow_task(WorkflowTaskCompletedRequest {
+                    client_discards_speculative_with_events: false,
                     token: cancel_task.token,
                     identity: WorkerIdentity("worker".to_string()),
                     sdk_metadata: None,
@@ -1056,6 +1066,7 @@ async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
     let task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker".to_string()),
             sdk_metadata: None,
@@ -1151,6 +1162,7 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
     let task = poll_wft(&runtime, ns_control, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("control-worker".to_string()),
             sdk_metadata: None,
@@ -1670,6 +1682,7 @@ async fn close_workflow_with_callback(
     let task = poll_wft(runtime, namespace_id, "workflow-q").await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,

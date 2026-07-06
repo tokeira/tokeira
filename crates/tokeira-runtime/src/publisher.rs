@@ -1498,7 +1498,9 @@ where
                     queue,
                     logical_seq,
                     sticky_preferred,
+                    speculative,
                 } => {
+                    let _ = speculative;
                     self.broker
                         .publish_workflow_task(
                             DispatchableWorkflowTask {

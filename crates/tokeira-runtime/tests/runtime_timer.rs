@@ -188,6 +188,7 @@ async fn complete_with_commands(
 
     let _ = runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: workflow_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,

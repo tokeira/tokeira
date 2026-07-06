@@ -1747,6 +1747,7 @@ mod tests {
     fn drain_admission_classification_separates_external_from_inflight_commands() {
         let start = Command::Start(sample_start_request(None, None));
         let completion = Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: WorkflowTaskToken {
                 run_key: RunKey::new(),
                 logical_seq: LogicalTaskSeq(1),
@@ -2006,6 +2007,7 @@ mod tests {
             .publish(
                 run_key,
                 &[DispatchOp::EnqueueWorkflowTask {
+                    speculative: false,
                     queue: original_queue,
                     logical_seq: LogicalTaskSeq(1),
                     sticky_preferred: None,
@@ -2088,6 +2090,7 @@ mod tests {
             .publish(
                 RunKey::new(),
                 &[DispatchOp::EnqueueWorkflowTask {
+                    speculative: false,
                     queue: pinned_queue.clone(),
                     logical_seq: LogicalTaskSeq(1),
                     sticky_preferred: None,
@@ -2173,6 +2176,7 @@ mod tests {
             .publish(
                 RunKey::new(),
                 &[DispatchOp::EnqueueWorkflowTask {
+                    speculative: false,
                     queue: queue.clone(),
                     logical_seq: LogicalTaskSeq(1),
                     sticky_preferred: None,

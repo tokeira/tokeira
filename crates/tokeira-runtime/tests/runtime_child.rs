@@ -44,6 +44,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
     let parent_task = poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: parent_task.token,
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,
@@ -98,6 +99,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
     let child_task = poll_wft(&runtime, workflow_queue(namespace_id, "child-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: child_task.token,
             identity: WorkerIdentity("worker-child".to_string()),
             sdk_metadata: None,
@@ -177,6 +179,7 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
     let parent_task = poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: parent_task.token,
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,
@@ -244,6 +247,7 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
     let parent_task = poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: parent_task.token,
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,
@@ -314,6 +318,7 @@ async fn duplicate_child_start_delivers_failed_confirmation_to_parent() -> Resul
     let parent_task = poll_wft(&runtime, workflow_queue(namespace_id, "parent-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: parent_task.token,
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,
@@ -385,6 +390,7 @@ async fn start_parent_with_child(
     let parent_task = poll_wft(runtime, workflow_queue(namespace_id, "parent-q")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: parent_task.token,
             identity: WorkerIdentity("worker-parent".to_string()),
             sdk_metadata: None,

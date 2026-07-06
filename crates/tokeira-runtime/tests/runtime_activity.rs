@@ -574,6 +574,7 @@ async fn start_and_schedule_activity_with_version(
 
     let _ = runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: workflow_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,

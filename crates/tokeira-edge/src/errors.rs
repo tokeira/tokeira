@@ -292,6 +292,15 @@ impl From<anyhow::Error> for EdgeError {
         {
             return Self::NotFound("workflow update was aborted by closing workflow".to_string());
         }
+        // A completion referencing an unknown update with no resurrect
+        // payload already failed the WFT server-side; the call surfaces
+        // NotFound "update {id} wasn't found on the server…"
+        // (workflow_task_completed_handler.go:381 @ v1.31.0; spec
+        // speculative-wft Req 6.2 / K5). Wrong-state siblings ride the
+        // InvalidWorkflowCommand → BadRequest arm above.
+        if let Some(not_found) = value.downcast_ref::<tokeira_runtime::UpdateMessageNotFound>() {
+            return Self::NotFound(not_found.message.clone());
+        }
         // Any mutation against an already-closed run surfaces v1.31.0's
         // `ErrWorkflowCompleted`: NOT_FOUND with this exact message
         // (`consts/const.go:51 @ v1.31.0`) — asserted by type on

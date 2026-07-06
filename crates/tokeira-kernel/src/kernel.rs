@@ -34,13 +34,13 @@ use crate::{
         WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
         WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
     },
-    event::{ActivityResolution, HistoryEvent, HistoryEventKind},
+    event::{ActivityResolution, HistoryEvent, HistoryEventKind, UpdateEventOutcome},
     state::{
         ActivityPauseInfo, ActivityState, ChildWorkflowState,
         EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
         LoadedRun, ParentClosePolicy, PauseInfo, PendingExternalCancel, PendingExternalSignal,
         PendingNexusOperation, PendingUpdate, PendingWorkflowTask, RequestIdInfo, TimerState,
-        VersioningOverride, WorkflowState, WorkflowVersioningInfo,
+        VersioningOverride, WorkflowState, WorkflowTaskType, WorkflowVersioningInfo,
     },
     transition::{
         ActivityOp, CallbackCompletionOutcome, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp,
@@ -715,6 +715,11 @@ impl BasicKernel {
             builder.buffer(kind);
             return Ok(builder.finish());
         }
+        // A scheduled-not-started SPECULATIVE task converts to normal before
+        // the signal appends: Scheduled(real), then Signaled — spec
+        // speculative-wft K4/Req 4.1 (corpus: Scheduled(5), Signaled(6),
+        // Started(7)).
+        builder.materialize_scheduled_speculative();
         builder.emit(kind);
 
         // Insight: Tokeira keeps the "at most one outstanding workflow task"
@@ -768,7 +773,20 @@ impl BasicKernel {
         builder.state.admitted_updates.insert(req.update_id.clone());
 
         if builder.state.pending_workflow_task.is_none() {
-            builder.schedule_workflow_task();
+            // Owner amendment F3 (spec speculative-wft K2): buffered events
+            // with NO pending WFT at the update call site is an
+            // INCONSISTENCY, not a downgrade case — v1.31.0 treats a
+            // non-speculative schedule result here as
+            // `ErrWorkflowTaskStateInconsistent`
+            // (updateworkflow/api.go:180-186).
+            if !builder.state.buffered_events.is_empty() {
+                return Err(Reject::WorkflowTaskStateInconsistent);
+            }
+            // An update with no pending WFT creates a SPECULATIVE task: no
+            // persisted events, direct-to-matching dispatch; the completion
+            // decides drop vs late materialization
+            // (updateworkflow/api.go:171-186 @ v1.31.0).
+            builder.schedule_speculative_workflow_task();
         }
 
         Ok(builder.finish())
@@ -811,6 +829,10 @@ impl BasicKernel {
             builder.buffer(kind);
             return Ok(builder.finish());
         }
+        // Cancel-requested is an event-appending admission like a signal: a
+        // scheduled speculative task converts first so its Scheduled event
+        // precedes the appended event (spec speculative-wft K4).
+        builder.materialize_scheduled_speculative();
         builder.emit(kind);
 
         if builder.state.pending_workflow_task.is_none() {
@@ -1428,17 +1450,23 @@ impl BasicKernel {
 
         let mut builder = TransitionBuilder::new(state, req.now);
         let attempt = pending.attempt.max(1);
-        // Transient (attempt>1) start persists no WorkflowTaskStarted event: the started
-        // id is virtual (scheduled_event_id + 1) and last_event_id is unchanged
-        // (workflow_task_state_machine.go:480 @ v1.31.0). Conversion (rule ii): if new
-        // events landed after the virtual scheduling — the virtual scheduled id no longer
-        // equals last_event_id + 1 — convert back to a NORMAL attempt-1 task with real
-        // Scheduled + Started, since the frozen virtual suffix is now invalid
-        // (workflow_task_state_machine.go:559-576 @ v1.31.0).
-        let transient = attempt > 1;
+        // Transient (attempt>1) and SPECULATIVE starts persist no
+        // WorkflowTaskStarted event: the started id is virtual
+        // (scheduled_event_id + 1) and last_event_id is unchanged — v1.31.0
+        // suppresses the pair for both modes with one predicate
+        // (`!IsTransientWorkflowTask() && Type != SPECULATIVE`,
+        // workflow_task_state_machine.go:556-558 @ v1.31.0; spec
+        // speculative-wft, one predicate / three modes per Invariant I.2).
+        // Conversion (rule ii): if new events landed after the virtual
+        // scheduling — the virtual scheduled id no longer equals
+        // last_event_id + 1 — convert back to a NORMAL attempt-1 task with
+        // real Scheduled + Started, since the frozen virtual suffix is now
+        // invalid (workflow_task_state_machine.go:559-576 @ v1.31.0; the same
+        // branch also flips a speculative task's `Type` to NORMAL).
+        let suppressed = attempt > 1 || pending.task_type == WorkflowTaskType::Speculative;
         let new_events_since_schedule =
-            transient && pending.scheduled_event_id != builder.state.last_event_id + 1;
-        let (scheduled_event_id, started_event_id) = if transient && !new_events_since_schedule {
+            suppressed && pending.scheduled_event_id != builder.state.last_event_id + 1;
+        let (scheduled_event_id, started_event_id) = if suppressed && !new_events_since_schedule {
             (pending.scheduled_event_id, pending.scheduled_event_id + 1)
         } else if new_events_since_schedule {
             builder.state.workflow_task_attempt = 1;
@@ -1480,6 +1508,12 @@ impl BasicKernel {
         current.started_event_id = Some(started_event_id);
         current.started_at = Some(req.now);
         current.attempt = builder.state.workflow_task_attempt;
+        if new_events_since_schedule {
+            // The conversion branch persisted real Scheduled/Started — the
+            // task is normal from here on (`workflowTask.Type = NORMAL`,
+            // workflow_task_state_machine.go:564-566 @ v1.31.0).
+            current.task_type = WorkflowTaskType::Normal;
+        }
 
         if let Some(ttl) = req.sticky_ttl {
             // Poll-side affinity is a sync-match HINT only: no sticky queue
@@ -1594,6 +1628,83 @@ impl BasicKernel {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
+        // K3 (spec speculative-wft): a SPECULATIVE completion that is not a
+        // heartbeat and carries ONLY update rejections (an empty command set
+        // counts — nothing processed ≡ all-rejections) DROPS without trace:
+        // no events persist, the pending task clears, and the SDK rewinds via
+        // ResetHistoryEventId (`skipWorkflowTaskCompletedEvent`,
+        // workflow_task_state_machine.go:676-748 @ v1.31.0). The rejection
+        // messages arrive as kernel-owned `UpdateProtocolBody` values decoded
+        // at the edge (owner amendment F1) so "rejection-only" is classified
+        // without any proto dependency. The events-window guards the rewind:
+        // interleaved events appended since the last completed workflow task
+        // block the drop — none allowed without the client capability, up to
+        // 10 (`DiscardSpeculativeWorkflowTaskMaximumEventsCount`, pinned
+        // v1.31.0 default) with `discard_speculative_workflow_task_with_events`
+        // (`:725`, constants.go:2447 @ v1.31.0).
+        // Buffered events also block the drop (K4/Req 4.2): in v1.31.0 the
+        // buffering transaction's close already CONVERTED the speculative
+        // task to normal (`closeTransactionHandleSpeculativeWorkflowTask`,
+        // mutable_state_impl.go:7238-7251 @ v1.31.0), so its completion can
+        // never skip. Tokeira buffers without an intermediate transaction, so
+        // the equivalent check lands here: a rejection-only completion with a
+        // buffered signal materializes Scheduled/Started/Completed and the
+        // buffer flushes after — corpus shape 5 WTScheduled, 6 WTStarted,
+        // 7 WTCompleted, 8 Signaled
+        // (`TestStartedSpeculativeWorkflowTask_ConvertToNormalBecauseOf`
+        // `BufferedSignal`).
+        if pending.task_type == WorkflowTaskType::Speculative
+            && !req.force_new_workflow_task
+            && state.buffered_events.is_empty()
+            && req.commands.iter().all(|command| {
+                matches!(
+                    command,
+                    WorkflowCommand::ProtocolMessage {
+                        body: UpdateProtocolBody::Rejected { .. },
+                        ..
+                    }
+                )
+            })
+        {
+            let last_completed_event_id = state.previous_started_event_id + 1;
+            let interleaved_events = state.last_event_id - last_completed_event_id;
+            let window = if req.client_discards_speculative_with_events {
+                10
+            } else {
+                0
+            };
+            if interleaved_events <= window {
+                let mut builder = TransitionBuilder::new(state, req.now);
+                builder.request_dedupe_ops.push(RequestDedupeOp {
+                    request_id: tokeira_types::RequestId(format!(
+                        "wft-completed-{}-{}",
+                        req.token.logical_seq.0, req.token.attempt
+                    )),
+                });
+                // The rejections still resolve: each rejected update leaves
+                // the admitted set (no event — rejections are traceless) and
+                // the runtime notifies its waiters post-commit.
+                for command in req.commands {
+                    if let WorkflowCommand::ProtocolMessage {
+                        body: UpdateProtocolBody::Rejected { update_id, .. },
+                        ..
+                    } = command
+                    {
+                        builder.state.admitted_updates.remove(&update_id);
+                        builder.state.pending_updates.remove(&update_id);
+                    }
+                }
+                builder.state.pending_workflow_task = None;
+                builder.state.workflow_task_attempt = 1;
+                // K7: updates admitted while this task ran still need a
+                // delivery vehicle — schedule a fresh speculative task.
+                if !builder.state.admitted_updates.is_empty() {
+                    builder.schedule_speculative_workflow_task();
+                }
+                return Ok(builder.finish());
+            }
+        }
+
         let mut builder = TransitionBuilder::new(state, req.now);
 
         // Capture last_event_id before emitting the completion event.
@@ -1609,39 +1720,40 @@ impl BasicKernel {
         // With signals buffered during the started task the real ids equal the
         // virtual ones; if other events advanced history, fresh real ids are
         // assigned (v1.31.0 re-wires ids the same way at flush).
-        let (scheduled_event_id, started_event_id) = if pending.attempt > 1 {
-            // The materialized pair carries the task's ACTUAL schedule/start
-            // times, not the completion time — the worker already observed
-            // these timestamps on its poll response's synthesized transient
-            // events, and the corpus asserts the persisted WorkflowTaskStarted
-            // time equals what the worker saw (`workflowTask.ScheduledTime` /
-            // `workflowTask.StartedTime` in `AddWorkflowTaskCompletedEvent`,
-            // workflow_task_state_machine.go:768-800 @ v1.31.0).
-            let scheduled = builder.emit_at(
-                pending.scheduled_at,
-                HistoryEventKind::WorkflowTaskScheduled {
-                    logical_seq: pending.logical_seq,
-                    task_queue: builder.state.task_queue.clone(),
-                    workflow_task_timeout: builder.state.workflow_task_timeout,
-                    attempt: pending.attempt,
-                },
-            );
-            let started = builder.emit_at(
-                pending.started_at.unwrap_or(req.now),
-                HistoryEventKind::WorkflowTaskStarted {
-                    logical_seq: pending.logical_seq,
-                    scheduled_event_id: scheduled,
-                    attempt: pending.attempt,
-                    identity: req.identity.clone(),
-                    request_id: format!("transient-materialize-{}", pending.logical_seq.0),
-                    history_size_bytes: 0,
-                    suggest_continue_as_new: false,
-                },
-            );
-            (scheduled, started)
-        } else {
-            (pending.scheduled_event_id, started_event_id)
-        };
+        let (scheduled_event_id, started_event_id) =
+            if pending.attempt > 1 || pending.task_type == WorkflowTaskType::Speculative {
+                // The materialized pair carries the task's ACTUAL schedule/start
+                // times, not the completion time — the worker already observed
+                // these timestamps on its poll response's synthesized transient
+                // events, and the corpus asserts the persisted WorkflowTaskStarted
+                // time equals what the worker saw (`workflowTask.ScheduledTime` /
+                // `workflowTask.StartedTime` in `AddWorkflowTaskCompletedEvent`,
+                // workflow_task_state_machine.go:768-800 @ v1.31.0).
+                let scheduled = builder.emit_at(
+                    pending.scheduled_at,
+                    HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq: pending.logical_seq,
+                        task_queue: builder.state.task_queue.clone(),
+                        workflow_task_timeout: builder.state.workflow_task_timeout,
+                        attempt: pending.attempt,
+                    },
+                );
+                let started = builder.emit_at(
+                    pending.started_at.unwrap_or(req.now),
+                    HistoryEventKind::WorkflowTaskStarted {
+                        logical_seq: pending.logical_seq,
+                        scheduled_event_id: scheduled,
+                        attempt: pending.attempt,
+                        identity: req.identity.clone(),
+                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                        history_size_bytes: 0,
+                        suggest_continue_as_new: false,
+                    },
+                );
+                (scheduled, started)
+            } else {
+                (pending.scheduled_event_id, started_event_id)
+            };
 
         let wft_completed_event_id = builder.emit(HistoryEventKind::WorkflowTaskCompleted {
             logical_seq: req.token.logical_seq,
@@ -1727,6 +1839,19 @@ impl BasicKernel {
             && (flushed > 0 || pre_completion_last_event_id > started_event_id)
         {
             builder.schedule_workflow_task();
+        }
+
+        // K7 (spec speculative-wft): updates admitted while this task ran
+        // still need a delivery vehicle — v1.31.0 creates a SPECULATIVE task
+        // once the running task completes when admitted updates remain
+        // unsent; buffered-event/heartbeat triggers above already produced a
+        // NORMAL task instead (respondworkflowtaskcompleted/api.go:512-541
+        // @ v1.31.0).
+        if builder.state.is_open()
+            && builder.state.pending_workflow_task.is_none()
+            && !builder.state.admitted_updates.is_empty()
+        {
+            builder.schedule_speculative_workflow_task();
         }
 
         Ok(builder.finish())
@@ -2352,6 +2477,49 @@ impl BasicKernel {
         }
 
         let mut builder = TransitionBuilder::new(state, req.now);
+        // A started SPECULATIVE task persists Scheduled + Started late,
+        // immediately before the failed event — v1.31.0's
+        // `AddWorkflowTaskFailedEvent` creates "the corresponding
+        // WorkflowTaskScheduled and WorkflowTaskStarted events for
+        // speculative WT" first (workflow_task_state_machine.go:865-891
+        // @ v1.31.0; spec speculative-wft K4/K5 — the bad-update-message
+        // seam fails exactly these tasks). The retry below is then an
+        // ordinary transient attempt-2.
+        let (scheduled_event_id, started_event_id) =
+            if pending.task_type == WorkflowTaskType::Speculative {
+                let scheduled = builder.emit_at(
+                    pending.scheduled_at,
+                    HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq: pending.logical_seq,
+                        task_queue: builder.state.task_queue.clone(),
+                        workflow_task_timeout: builder.state.workflow_task_timeout,
+                        attempt: pending.attempt,
+                    },
+                );
+                let started = builder.emit_at(
+                    pending.started_at.unwrap_or(req.now),
+                    HistoryEventKind::WorkflowTaskStarted {
+                        logical_seq: pending.logical_seq,
+                        scheduled_event_id: scheduled,
+                        attempt: pending.attempt,
+                        identity: req.worker_identity.clone(),
+                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                        history_size_bytes: 0,
+                        suggest_continue_as_new: false,
+                    },
+                );
+                let current = builder
+                    .state
+                    .pending_workflow_task
+                    .as_mut()
+                    .expect("validated pending workflow task must still exist");
+                current.task_type = WorkflowTaskType::Normal;
+                current.scheduled_event_id = scheduled;
+                current.started_event_id = Some(started);
+                (scheduled, started)
+            } else {
+                (pending.scheduled_event_id, started_event_id)
+            };
         // Only the attempt-1 failure persists a WorkflowTaskFailed event; a
         // transient (attempt>1) failure writes nothing — the retry chain lives
         // off-history ("Only emit WorkflowTaskFailedEvent if workflow task is
@@ -2360,7 +2528,7 @@ impl BasicKernel {
         if pending.attempt == 1 {
             builder.emit(HistoryEventKind::WorkflowTaskFailed {
                 logical_seq: pending.logical_seq,
-                scheduled_event_id: pending.scheduled_event_id,
+                scheduled_event_id,
                 started_event_id,
                 failure_cause: req.failure_cause,
                 failure_details: req.failure_details,
@@ -2417,6 +2585,7 @@ impl BasicKernel {
             current.scheduled_event_id = virtual_scheduled_event_id;
             if !paused {
                 builder.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+                    speculative: false,
                     queue: QueueKey {
                         namespace_id: builder.state.namespace_id,
                         task_queue: builder.state.task_queue.clone(),
@@ -2477,15 +2646,30 @@ impl BasicKernel {
                 return Err(Reject::WorkflowTaskTokenMismatch);
             }
             let mut builder = TransitionBuilder::new(state, req.now);
-            // Always a REAL event: S2S deadlines exist only on sticky
-            // attempt-1 dispatches (schedule_workflow_task guards them),
-            // never on transient retries
+            // A SPECULATIVE scheduled task persists its Scheduled event NOW,
+            // immediately before the timed-out event — v1.31.0's
+            // `AddWorkflowTaskScheduleToStartTimeoutEvent` creates "the
+            // corresponding WorkflowTaskScheduled event for speculative WT"
+            // first (workflow_task_state_machine.go:270-305 @ v1.31.0; spec
+            // speculative-wft K4, Req 5.2/5.3). Fires for both the sticky
+            // deadline and the runtime's in-memory 5s normal-queue timer
+            // (`SpeculativeWorkflowTaskScheduleToStartTimeout`,
+            // workflow_task_timer.go:15-19 @ v1.31.0). No-op for a normal
+            // sticky task, whose Scheduled event is already real.
+            builder.materialize_scheduled_speculative();
+            let scheduled_event_id = builder
+                .state
+                .pending_workflow_task
+                .as_ref()
+                .map(|current| current.scheduled_event_id)
+                .unwrap_or(pending.scheduled_event_id);
+            // Always a REAL event
             // (`AddWorkflowTaskScheduleToStartTimeoutEvent` emits
             // WorkflowTaskTimedOut(scheduled, EmptyEventID, SCHEDULE_TO_START),
             // workflow_task_state_machine.go:270-305 @ v1.31.0).
             builder.emit(HistoryEventKind::WorkflowTaskTimedOut {
                 logical_seq: pending.logical_seq,
-                scheduled_event_id: pending.scheduled_event_id,
+                scheduled_event_id,
                 started_event_id: 0,
                 timeout_type: WorkflowTaskTimeoutType::ScheduleToStart,
             });
@@ -2533,13 +2717,59 @@ impl BasicKernel {
         }
 
         let mut builder = TransitionBuilder::new(state, req.now);
+        // A started SPECULATIVE task persists Scheduled + Started LATE, at
+        // its real schedule/start times, immediately before the timed-out
+        // event — v1.31.0's `AddWorkflowTaskTimedOutEvent` creates "the
+        // corresponding WorkflowTaskScheduled and WorkflowTaskStarted events
+        // for speculative WT" first (workflow_task_state_machine.go:934-960
+        // @ v1.31.0; spec speculative-wft K4, Req 5.1). Corpus shape:
+        // 5 WorkflowTaskScheduled, 6 WorkflowTaskStarted,
+        // 7 WorkflowTaskTimedOut, then the attempt-2 retry stays virtual
+        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+        let (scheduled_event_id, started_event_id) =
+            if pending.task_type == WorkflowTaskType::Speculative {
+                let scheduled = builder.emit_at(
+                    pending.scheduled_at,
+                    HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq: pending.logical_seq,
+                        task_queue: builder.state.task_queue.clone(),
+                        workflow_task_timeout: builder.state.workflow_task_timeout,
+                        attempt: pending.attempt,
+                    },
+                );
+                let started = builder.emit_at(
+                    pending.started_at.unwrap_or(req.now),
+                    HistoryEventKind::WorkflowTaskStarted {
+                        logical_seq: pending.logical_seq,
+                        scheduled_event_id: scheduled,
+                        attempt: pending.attempt,
+                        identity: WorkerIdentity(String::new()),
+                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                        history_size_bytes: 0,
+                        suggest_continue_as_new: false,
+                    },
+                );
+                // The events are durable now; the (about-to-be-replaced or
+                // paused-retained) task is no longer speculative.
+                let current = builder
+                    .state
+                    .pending_workflow_task
+                    .as_mut()
+                    .expect("validated pending workflow task must still exist");
+                current.task_type = WorkflowTaskType::Normal;
+                current.scheduled_event_id = scheduled;
+                current.started_event_id = Some(started);
+                (scheduled, started)
+            } else {
+                (pending.scheduled_event_id, started_event_id)
+            };
         // Only the attempt-1 timeout persists a WorkflowTaskTimedOut event; a
         // transient (attempt>1) timeout writes nothing
         // (workflow_task_state_machine.go:965-967 @ v1.31.0; Req B.3).
         if pending.attempt == 1 {
             builder.emit(HistoryEventKind::WorkflowTaskTimedOut {
                 logical_seq: pending.logical_seq,
-                scheduled_event_id: pending.scheduled_event_id,
+                scheduled_event_id,
                 started_event_id,
                 timeout_type: req.timeout_type,
             });
@@ -2601,6 +2831,11 @@ impl BasicKernel {
         if should_buffer(&builder.state, &fired) {
             builder.buffer(fired);
         } else {
+            // A fire while a speculative task is merely SCHEDULED converts it
+            // first — Scheduled(real) precedes TimerFired (spec
+            // speculative-wft K4; a K7 follow-up speculative task can coexist
+            // with running timers).
+            builder.materialize_scheduled_speculative();
             builder.emit(fired);
         }
         builder.state.timers.remove(&timer.timer_id);
@@ -2762,6 +2997,7 @@ impl BasicKernel {
             } => {
                 state.timers.remove(WORKFLOW_START_DELAY_TIMER_ID);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
                     logical_seq: *logical_seq,
                     scheduled_event_id: event.event_id,
@@ -2782,6 +3018,7 @@ impl BasicKernel {
                 ..
             } => {
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
                     logical_seq: *logical_seq,
                     scheduled_event_id: *scheduled_event_id,
@@ -2829,6 +3066,7 @@ impl BasicKernel {
                         .map(|pending| pending.attempt)
                         .unwrap_or(0);
                     state.pending_workflow_task = Some(PendingWorkflowTask {
+                        task_type: WorkflowTaskType::Normal,
                         schedule_to_start_deadline: None,
                         logical_seq: *logical_seq,
                         scheduled_event_id: *scheduled_event_id,
@@ -2858,6 +3096,7 @@ impl BasicKernel {
                     .map(|pending| pending.attempt)
                     .unwrap_or(0);
                 state.pending_workflow_task = Some(PendingWorkflowTask {
+                    task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
                     logical_seq: *logical_seq,
                     scheduled_event_id: *scheduled_event_id,
@@ -3140,6 +3379,7 @@ impl BasicKernel {
                 );
             }
             HistoryEventKind::WorkflowExecutionUpdateCompleted { update_id, .. }
+            | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { update_id, .. }
             | HistoryEventKind::WorkflowExecutionUpdateRejected { update_id, .. } => {
                 state.pending_updates.remove(update_id);
             }
@@ -4083,16 +4323,20 @@ fn apply_workflow_command(
             if !builder.state.pending_updates.contains_key(&update_id) {
                 return Err(Reject::UnknownUpdate(update_id));
             }
-            let accepted_event_id = builder
+            let (accepted_event_id, update_name) = builder
                 .state
                 .pending_updates
                 .get(&update_id)
-                .map(|update| update.accepted_event_id)
-                .unwrap_or(0);
-            builder.emit(HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                .map(|update| (update.accepted_event_id, update.name.clone()))
+                .unwrap_or_default();
+            // The legacy success-only completed variant is decode-only; every
+            // emitter writes the failure-capable V2 shape (spec
+            // speculative-wft K6).
+            builder.emit(HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
                 update_id: update_id.clone(),
-                result,
+                update_name,
                 accepted_event_id,
+                outcome: UpdateEventOutcome::Success(result),
             });
             builder.state.pending_updates.remove(&update_id);
             Ok(false)
@@ -4115,18 +4359,115 @@ fn apply_workflow_command(
                     update_id,
                     update_name,
                     input,
+                    sequencing_event_id,
                 } => {
-                    if builder.state.pending_updates.contains_key(&update_id) {
-                        return Err(Reject::DuplicateUpdateId(update_id));
+                    // Check order mirrors v1.31.0's `handleMessage` →
+                    // `OnProtocolMessage`: (1) unknown-id resolution
+                    // (resurrect or NotFound, registry.Find/TryResurrect,
+                    // workflow_task_completed_handler.go:375-390), then
+                    // (2) the state-machine check (`checkStateSet`,
+                    // update/update.go:648-656), then (3) message validation
+                    // (`validateAcceptanceMsg`, update/validation.go:62-68).
+                    // Spec speculative-wft K5/K6 + owner amendment F5.
+                    if !builder.state.pending_updates.contains_key(&update_id)
+                        && !builder.state.admitted_updates.contains(&update_id)
+                    {
+                        // Unknown update. When the worker echoed the original
+                        // request (non-empty handler name), RESURRECT it and
+                        // proceed as if admitted (`TryResurrect` rebuilds the
+                        // update from `Acceptance.accepted_request`,
+                        // update/registry.go:238-281 @ v1.31.0). Without the
+                        // payload the update is unrecoverable — exact wire
+                        // message from
+                        // workflow_task_completed_handler.go:381 @ v1.31.0.
+                        if update_name.is_empty() {
+                            return Err(Reject::BadUpdateMessage {
+                                message: format!(
+                                    "update {update_id} wasn't found on the server. This is most \
+                                     likely a transient error which will be resolved automatically \
+                                     by retries"
+                                ),
+                                not_found: true,
+                            });
+                        }
                     }
-                    // Move from admitted to pending on worker acceptance.
+                    if builder.state.pending_updates.contains_key(&update_id) {
+                        // Double accept. v1.31.0 renders the update's state
+                        // machine state: an id accepted earlier in THIS
+                        // completion is still ProvisionallyAccepted (commit
+                        // pending), one accepted by a previous WFT is
+                        // Accepted (`checkStateSet` + `state.String()`,
+                        // update/update.go:648-656 + state.go:27-55
+                        // @ v1.31.0). The corpus asserts the "invalid state
+                        // transition attempted" prefix
+                        // (TestValidateWorkerMessages "accept-twice").
+                        let accepted_this_transition = builder.history_events.iter().any(|event| {
+                            matches!(
+                                &event.kind,
+                                HistoryEventKind::WorkflowExecutionUpdateAccepted {
+                                    update_id: accepted_id,
+                                    ..
+                                } if *accepted_id == update_id
+                            )
+                        });
+                        let state_name = if accepted_this_transition {
+                            "ProvisionallyAccepted"
+                        } else {
+                            "Accepted"
+                        };
+                        return Err(Reject::BadUpdateMessage {
+                            message: format!(
+                                "invalid state transition attempted for Update {update_id}: \
+                                 received *update.Acceptance message while in state {state_name}"
+                            ),
+                            not_found: false,
+                        });
+                    }
+                    if sequencing_event_id == 0 {
+                        // Exact `validateAcceptanceMsg` rendering: `%T` of
+                        // `*updatepb.Acceptance` prints the proto package
+                        // name `update` (update/validation.go:9-16,62-68
+                        // @ v1.31.0).
+                        return Err(Reject::BadUpdateMessage {
+                            message: "invalid *update.Acceptance: \
+                                      accepted_request_sequencing_event_id is not set"
+                                .to_string(),
+                            not_found: false,
+                        });
+                    }
+                    if sequencing_event_id < 0
+                        || sequencing_event_id >= workflow_task_completed_event_id
+                    {
+                        // Owner amendment F5 (spec speculative-wft K6): the
+                        // value is worker-controlled and lands in a persisted
+                        // event, so tokeira additionally refuses negatives
+                        // and forward references beyond the delivering
+                        // task's ids (every legal anchor — the delivering
+                        // WFTScheduled id at most started_event_id — precedes
+                        // this completion's WorkflowTaskCompleted event, which
+                        // was already emitted/materialized). No v1.31.0
+                        // analogue message; invalid-argument flavor.
+                        return Err(Reject::BadUpdateMessage {
+                            message: format!(
+                                "invalid *update.Acceptance: \
+                                 accepted_request_sequencing_event_id {sequencing_event_id} \
+                                 references an event beyond the delivering workflow task"
+                            ),
+                            not_found: false,
+                        });
+                    }
+                    // Move from admitted to pending on worker acceptance
+                    // (resurrected ids are absent from the set; remove is a
+                    // no-op).
                     builder.state.admitted_updates.remove(&update_id);
                     let accepted_event_id =
                         builder.emit(HistoryEventKind::WorkflowExecutionUpdateAccepted {
                             update_id: update_id.clone(),
                             update_name: update_name.clone(),
                             input,
-                            accepted_request_sequencing_event_id: 0,
+                            // Worker-provided, recorded verbatim
+                            // (event_factory.go:424-440 @ v1.31.0; Req 7.1).
+                            accepted_request_sequencing_event_id: sequencing_event_id,
                         });
                     builder.state.pending_updates.insert(
                         update_id.clone(),
@@ -4137,19 +4478,59 @@ fn apply_workflow_command(
                         },
                     );
                 }
-                UpdateProtocolBody::Completed { update_id, result } => {
+                UpdateProtocolBody::Completed {
+                    update_id,
+                    result,
+                    failure,
+                } => {
                     if !builder.state.pending_updates.contains_key(&update_id) {
-                        return Err(Reject::UnknownUpdate(update_id));
+                        // v1.31.0 splits the not-accepted cases: an update the
+                        // task DELIVERED but the worker never accepted is in
+                        // state Sent — `checkStateSet` renders the
+                        // invalid-state-transition error (update/update.go:
+                        // 611-615,648-656; corpus "complete-without-accept");
+                        // an id the server never admitted is not in the
+                        // registry and a Response is NOT a resurrect source
+                        // (`TryResurrect` handles only Acceptance/Rejection,
+                        // update/registry.go:254-262) → NotFound
+                        // (workflow_task_completed_handler.go:381 @ v1.31.0).
+                        if builder.state.admitted_updates.contains(&update_id) {
+                            return Err(Reject::BadUpdateMessage {
+                                message: format!(
+                                    "invalid state transition attempted for Update {update_id}: \
+                                     received *update.Response message while in state Sent"
+                                ),
+                                not_found: false,
+                            });
+                        }
+                        return Err(Reject::BadUpdateMessage {
+                            message: format!(
+                                "update {update_id} wasn't found on the server. This is most \
+                                 likely a transient error which will be resolved automatically \
+                                 by retries"
+                            ),
+                            not_found: true,
+                        });
                     }
-                    builder.emit(HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                    let (accepted_event_id, update_name) = builder
+                        .state
+                        .pending_updates
+                        .get(&update_id)
+                        .map(|update| (update.accepted_event_id, update.name.clone()))
+                        .unwrap_or_default();
+                    // Failure-capable outcome (Req 7.2): a Response whose
+                    // Outcome is a Failure lands as Completed-with-failure —
+                    // the handler failed AFTER acceptance; it is not a
+                    // rejection (mutable_state_impl.go:5288-5378 @ v1.31.0).
+                    let outcome = match failure {
+                        Some(failure) => UpdateEventOutcome::Failure(failure),
+                        None => UpdateEventOutcome::Success(result),
+                    };
+                    builder.emit(HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
                         update_id: update_id.clone(),
-                        result,
-                        accepted_event_id: builder
-                            .state
-                            .pending_updates
-                            .get(&update_id)
-                            .map(|update| update.accepted_event_id)
-                            .unwrap_or(0),
+                        update_name,
+                        accepted_event_id,
+                        outcome,
                     });
                     builder.state.pending_updates.remove(&update_id);
                 }
@@ -4321,6 +4702,57 @@ impl TransitionBuilder {
         count
     }
 
+    /// Convert a SCHEDULED (not yet started) SPECULATIVE workflow task to
+    /// NORMAL because non-update history is about to append (spec
+    /// speculative-wft K4, Req 4.1): materialize its `WorkflowTaskScheduled`
+    /// event NOW — real id, original scheduled time and attempt — flip the
+    /// task mode, and rewire `scheduled_event_id` to the real id. Callers
+    /// invoke this BEFORE emitting their own event so the Scheduled event
+    /// precedes it, pinning the corpus ordering Scheduled(5), Signaled(6),
+    /// Started(7) (`TestScheduledSpeculativeWorkflowTask_ConvertToNormal`
+    /// `BecauseOfSignal`).
+    ///
+    /// v1.31.0 equivalent: any transaction close with a pending speculative
+    /// WFT converts it, and the conversion's WT events are deliberately
+    /// ordered ahead of the flushed buffer ("WT related events (WTScheduled,
+    /// in particular) need to go first",
+    /// `closeTransactionHandleSpeculativeWorkflowTask`,
+    /// mutable_state_impl.go:7238-7251 +
+    /// `convertSpeculativeWorkflowTaskToNormal`,
+    /// workflow_task_state_machine.go:1466-1530 @ v1.31.0 — the scheduled
+    /// event must land at the task's virtual id, hence before any other
+    /// append). A STARTED speculative task is untouched here: bufferable
+    /// events buffer against it and the completion/timeout paths late-
+    /// materialize both events.
+    ///
+    /// No-op for normal/transient or started tasks, so every pre-append site
+    /// can call it unconditionally.
+    fn materialize_scheduled_speculative(&mut self) {
+        let Some(pending) = self.state.pending_workflow_task.clone() else {
+            return;
+        };
+        if pending.task_type != WorkflowTaskType::Speculative || pending.started_event_id.is_some()
+        {
+            return;
+        }
+        let scheduled = self.emit_at(
+            pending.scheduled_at,
+            HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: pending.logical_seq,
+                task_queue: self.state.task_queue.clone(),
+                workflow_task_timeout: self.state.workflow_task_timeout,
+                attempt: pending.attempt,
+            },
+        );
+        let current = self
+            .state
+            .pending_workflow_task
+            .as_mut()
+            .expect("pending workflow task was just observed");
+        current.task_type = WorkflowTaskType::Normal;
+        current.scheduled_event_id = scheduled;
+    }
+
     /// Fail a started WFT with cause `ForceCloseCommand` as the first step of
     /// a forced workflow close (terminate / workflow timeout), so the close
     /// batch's first event is the resulting `WorkflowTaskFailed`
@@ -4344,9 +4776,44 @@ impl TransitionBuilder {
             self.state.pending_workflow_task = None;
             return;
         }
+        // A started SPECULATIVE task converts before it is force-failed:
+        // Scheduled + Started persist late so the Failed event references
+        // real ids — the same materialization v1.31.0's
+        // `AddWorkflowTaskFailedEvent` performs for speculative tasks
+        // (workflow_task_state_machine.go:865-891 @ v1.31.0; spec
+        // speculative-wft: started → convert then fail). A merely SCHEDULED
+        // speculative task never reaches here (no started id) and leaves no
+        // trace.
+        let (scheduled_event_id, started_event_id) =
+            if pending.task_type == WorkflowTaskType::Speculative {
+                let scheduled = self.emit_at(
+                    pending.scheduled_at,
+                    HistoryEventKind::WorkflowTaskScheduled {
+                        logical_seq: pending.logical_seq,
+                        task_queue: self.state.task_queue.clone(),
+                        workflow_task_timeout: self.state.workflow_task_timeout,
+                        attempt: pending.attempt,
+                    },
+                );
+                let started = self.emit_at(
+                    pending.started_at.unwrap_or(self.now),
+                    HistoryEventKind::WorkflowTaskStarted {
+                        logical_seq: pending.logical_seq,
+                        scheduled_event_id: scheduled,
+                        attempt: pending.attempt,
+                        identity: WorkerIdentity(String::new()),
+                        request_id: format!("transient-materialize-{}", pending.logical_seq.0),
+                        history_size_bytes: 0,
+                        suggest_continue_as_new: false,
+                    },
+                );
+                (scheduled, started)
+            } else {
+                (pending.scheduled_event_id, started_event_id)
+            };
         self.emit(HistoryEventKind::WorkflowTaskFailed {
             logical_seq: pending.logical_seq,
-            scheduled_event_id: pending.scheduled_event_id,
+            scheduled_event_id,
             started_event_id,
             failure_cause: WorkflowTaskFailedCause::ForceCloseCommand,
             failure_details: None,
@@ -4392,6 +4859,20 @@ impl TransitionBuilder {
     /// set the pending WFT on state, and push a dispatch op.
     /// No-ops if the workflow is paused.
     fn schedule_workflow_task(&mut self) {
+        self.schedule_workflow_task_typed(WorkflowTaskType::Normal);
+    }
+
+    /// Schedule a SPECULATIVE workflow task: nothing persists at
+    /// schedule/start — the scheduled id is virtual (last_event_id + 1,
+    /// like a transient task) and the completion decides drop vs late
+    /// materialization (`AddWorkflowTaskScheduledEvent(false, SPECULATIVE)`,
+    /// updateworkflow/api.go:176 + workflow_task_state_machine.go:309-410
+    /// @ v1.31.0; spec speculative-wft K2).
+    fn schedule_speculative_workflow_task(&mut self) {
+        self.schedule_workflow_task_typed(WorkflowTaskType::Speculative);
+    }
+
+    fn schedule_workflow_task_typed(&mut self, task_type: WorkflowTaskType) {
         if self.state.status == ExecutionStatus::Paused {
             return;
         }
@@ -4429,17 +4910,19 @@ impl TransitionBuilder {
         let schedule_to_start_deadline = sticky_dispatch
             .as_ref()
             .map(|sticky| self.now + sticky.schedule_to_start_timeout);
-        let scheduled_event_id = if self.state.workflow_task_attempt > 1 {
-            self.state.last_event_id + 1
-        } else {
-            self.emit(HistoryEventKind::WorkflowTaskScheduled {
-                logical_seq,
-                task_queue: dispatch_task_queue.clone(),
-                workflow_task_timeout: self.state.workflow_task_timeout,
-                attempt: self.state.workflow_task_attempt,
-            })
-        };
+        let scheduled_event_id =
+            if self.state.workflow_task_attempt > 1 || task_type == WorkflowTaskType::Speculative {
+                self.state.last_event_id + 1
+            } else {
+                self.emit(HistoryEventKind::WorkflowTaskScheduled {
+                    logical_seq,
+                    task_queue: dispatch_task_queue.clone(),
+                    workflow_task_timeout: self.state.workflow_task_timeout,
+                    attempt: self.state.workflow_task_attempt,
+                })
+            };
         self.state.pending_workflow_task = Some(PendingWorkflowTask {
+            task_type,
             logical_seq,
             scheduled_event_id,
             scheduled_at: self.now,
@@ -4462,6 +4945,7 @@ impl TransitionBuilder {
                 .sticky
                 .as_ref()
                 .map(|s| s.worker_identity.clone()),
+            speculative: task_type == WorkflowTaskType::Speculative,
         });
     }
 
@@ -4814,4 +5298,31 @@ pub enum Reject {
     // TODO(correctness): add richer rejection reasons for
     // updates, continue-as-new constraints, child workflow
     // resolution mismatches, and cancellation races.
+    /// Mutable state is inconsistent at the update call site: buffered
+    /// events exist with no pending workflow task — "no pending WFT implies
+    /// no buffered events"; v1.31.0 surfaces
+    /// `ErrWorkflowTaskStateInconsistent` (Unavailable "Workflow task state
+    /// is inconsistent.", updateworkflow/api.go:180-186; spec
+    /// speculative-wft owner amendment F3).
+    #[error("Workflow task state is inconsistent.")]
+    WorkflowTaskStateInconsistent,
+    /// A worker update protocol message on `RespondWorkflowTaskCompleted`
+    /// failed validation (spec speculative-wft K5, Req 6.1/6.2 + owner
+    /// amendment F5). Like [`Reject::InvalidCommandAttributes`], this aborts
+    /// the completion transition; the runtime then FAILS THE WORKFLOW TASK
+    /// with cause `BadUpdateWorkflowExecutionMessage` and errors the
+    /// completion call — v1.31.0 routes every bad update message through
+    /// `failWorkflowTask(BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE, causeErr)`
+    /// (workflow_task_completed_handler.go:375-425 @ v1.31.0).
+    ///
+    /// `message` is the v1.31.0 `causeErr` rendering, asserted by the corpus
+    /// as substrings: "update {id} wasn't found on the server…"
+    /// (workflow_task_completed_handler.go:381), "invalid state transition
+    /// attempted for Update {id}: …" (`checkStateSet`,
+    /// update/update.go:648-656), or the `validateAcceptanceMsg` shapes
+    /// (update/validation.go:62-68). `not_found` marks the unknown-update
+    /// case, which the spec (Req 6.2) surfaces as NotFound; the wrong-state
+    /// and bad-sequencing cases surface as InvalidArgument.
+    #[error("bad update workflow execution message: {message}")]
+    BadUpdateMessage { message: String, not_found: bool },
 }

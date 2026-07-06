@@ -323,7 +323,8 @@ fn event_type_for_kind(kind: &HistoryEventKind) -> i32 {
         HistoryEventKind::WorkflowExecutionUpdateAccepted { .. } => {
             E::WorkflowExecutionUpdateAccepted
         }
-        HistoryEventKind::WorkflowExecutionUpdateCompleted { .. } => {
+        HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
+        | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { .. } => {
             E::WorkflowExecutionUpdateCompleted
         }
         HistoryEventKind::WorkflowExecutionUpdateRejected { .. } => {
@@ -1405,7 +1406,12 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         } => Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(
             history::WorkflowExecutionUpdateAcceptedEventAttributes {
                 protocol_instance_id: update_id.clone(),
-                accepted_request_message_id: update_id.clone(),
+                // The server's outgoing message id for the update request is
+                // `"{update_id}/request"` (`outgoingMessageID`,
+                // update/update.go:451-454, recorded on the accepted event by
+                // event_factory.go:424-440 @ v1.31.0; spec speculative-wft
+                // Req 7.1).
+                accepted_request_message_id: format!("{update_id}/request"),
                 accepted_request_sequencing_event_id: *accepted_request_sequencing_event_id,
                 accepted_request: Some(proto_update::Request {
                     meta: Some(proto_update::Meta {
@@ -1436,6 +1442,40 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                         value: Some(proto_update::outcome::Value::Success(payloads_from_domain(
                             result,
                         ))),
+                    }),
+                    accepted_event_id: *accepted_event_id,
+                    ..Default::default()
+                },
+            )
+        }
+        // Failure-capable successor of the decode-only variant above (spec
+        // speculative-wft K6, Req 7.2): serializes to the SAME public event
+        // attributes, with the outcome's oneof carrying Success or Failure
+        // (`CreateWorkflowExecutionUpdateCompletedEvent` writes
+        // `Meta`, `Outcome`, `AcceptedEventId`, event_factory.go:442-456
+        // @ v1.31.0).
+        HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
+            update_id,
+            update_name: _,
+            accepted_event_id,
+            outcome,
+        } => {
+            let outcome_value = match outcome {
+                tokeira_kernel::UpdateEventOutcome::Success(result) => {
+                    proto_update::outcome::Value::Success(payloads_from_domain(result))
+                }
+                tokeira_kernel::UpdateEventOutcome::Failure(failure) => {
+                    proto_update::outcome::Value::Failure(payload_to_failure(failure))
+                }
+            };
+            Attributes::WorkflowExecutionUpdateCompletedEventAttributes(
+                history::WorkflowExecutionUpdateCompletedEventAttributes {
+                    meta: Some(proto_update::Meta {
+                        update_id: update_id.clone(),
+                        identity: String::new(),
+                    }),
+                    outcome: Some(proto_update::Outcome {
+                        value: Some(outcome_value),
                     }),
                     accepted_event_id: *accepted_event_id,
                     ..Default::default()
@@ -1599,6 +1639,11 @@ fn wft_failed_cause_i32(c: &WorkflowTaskFailedCause) -> i32 {
         WorkflowTaskFailedCause::ResetWorkflow => C::ResetWorkflow,
         WorkflowTaskFailedCause::ForceCloseCommand => C::ForceCloseCommand,
         WorkflowTaskFailedCause::GrpcMessageTooLarge => C::GrpcMessageTooLarge,
+        // `WORKFLOW_TASK_FAILED_CAUSE_BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE
+        // = 30` (failed_cause.proto; spec speculative-wft K5).
+        WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage => {
+            C::BadUpdateWorkflowExecutionMessage
+        }
     }) as i32
 }
 

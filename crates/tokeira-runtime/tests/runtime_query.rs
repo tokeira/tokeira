@@ -421,6 +421,7 @@ async fn quiesce_workflow(
         .expect("initial workflow task should be available");
     let _ = runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: started.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,

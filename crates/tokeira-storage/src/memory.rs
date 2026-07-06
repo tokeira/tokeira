@@ -1961,6 +1961,7 @@ mod tests {
             last_event_id: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
+                task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
                 logical_seq: LogicalTaskSeq(1),
                 scheduled_event_id: 1,
@@ -3045,6 +3046,7 @@ mod tests {
         transition
             .dispatch_ops
             .push(DispatchOp::EnqueueWorkflowTask {
+                speculative: false,
                 queue: sample_queue(TaskKind::Workflow),
                 logical_seq: LogicalTaskSeq(1),
                 sticky_preferred: None,

@@ -410,6 +410,7 @@ pub fn workflow_task_completed_request(
         worker_deployment_name: req.worker_deployment_name,
         sticky: req.sticky,
         commands: req.commands,
+        client_discards_speculative_with_events: req.client_discards_speculative_with_events,
         force_new_workflow_task: req.force_create_new_workflow_task,
         now: OffsetDateTime::now_utc(),
     })

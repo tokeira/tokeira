@@ -2868,6 +2868,7 @@ impl WorkflowService {
                                 update_id,
                                 update_name,
                                 input,
+                                ..
                             },
                         ..
                     } = cmd
@@ -2890,6 +2891,7 @@ impl WorkflowService {
                         was_duplicate: false,
                         workflow_task: None,
                         activity_tasks: Vec::new(),
+                        reset_history_event_id: 0,
                     });
                 }
 
@@ -2905,6 +2907,7 @@ impl WorkflowService {
                 let internal =
                     to_internal::workflow_task_completed_request(req).map_err(EdgeError::from)?;
                 let run_key = internal.token.run_key;
+                let speculative_token_started_event_id = internal.token.started_event_id;
                 let outcome = self
                     .runtime
                     .complete_workflow_task(internal)
@@ -2914,6 +2917,17 @@ impl WorkflowService {
                     .await;
 
                 let mut resp = from_internal::completed_response(outcome);
+                // Speculative DROP (spec speculative-wft E2): the completion
+                // committed but persisted nothing for this task — its virtual
+                // started id sits beyond the run's last event. The SDK rewinds
+                // to the last completed WFT's started event
+                // (respondworkflowtaskcompleted/api.go:770 @ v1.31.0).
+                if resp.last_event_id < speculative_token_started_event_id
+                    && let tokeira_kernel::LoadedRun::Existing(state) =
+                        self.repo.load_run(run_key).await.map_err(EdgeError::from)?
+                {
+                    resp.reset_history_event_id = state.previous_started_event_id;
+                }
 
                 if !eager_activity_specs.is_empty() {
                     let namespace_id =
@@ -5599,8 +5613,12 @@ async fn append_transient_suffix(
     let Some(pending) = state.pending_workflow_task.as_ref() else {
         return Ok(());
     };
-    // Transient = attempt>1 with a virtual (unpersisted) scheduled id.
-    if pending.attempt <= 1 || pending.scheduled_event_id != state.last_event_id + 1 {
+    // Virtual task = transient (attempt>1) or speculative (attempt-1 with
+    // the existence bit; spec speculative-wft E1) — both carry an
+    // unpersisted scheduled id one past the last real event.
+    let is_virtual =
+        pending.attempt > 1 || pending.task_type == tokeira_kernel::WorkflowTaskType::Speculative;
+    if !is_virtual || pending.scheduled_event_id != state.last_event_id + 1 {
         return Ok(());
     }
     // Only append when the read actually reached the end of persisted

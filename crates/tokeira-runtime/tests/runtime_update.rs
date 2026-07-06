@@ -47,6 +47,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
@@ -63,6 +64,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
                         update_id: "update-1".into(),
                         update_name: "set-value".into(),
                         input: payloads("input"),
+                        sequencing_event_id: 1,
                     },
                 },
                 WorkflowCommand::UpdateCompleted {
@@ -119,6 +121,7 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
@@ -135,6 +138,7 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
                         update_id: "update-1".into(),
                         update_name: "reject-me".into(),
                         input: payloads("input"),
+                        sequencing_event_id: 1,
                     },
                 },
                 WorkflowCommand::UpdateRejected {
@@ -191,6 +195,7 @@ async fn update_accepted_wait_returns_stage_without_outcome() -> Result<()> {
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
@@ -206,6 +211,7 @@ async fn update_accepted_wait_returns_stage_without_outcome() -> Result<()> {
                     update_id: "update-1".into(),
                     update_name: "accept-only".into(),
                     input: payloads("input"),
+                    sequencing_event_id: 1,
                 },
             }],
             force_new_workflow_task: false,
@@ -323,6 +329,7 @@ async fn poll_update_waits_for_history_stage_or_returns_reached_stage() -> Resul
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
@@ -338,6 +345,7 @@ async fn poll_update_waits_for_history_stage_or_returns_reached_stage() -> Resul
                     update_id: "update-1".into(),
                     update_name: "history-stage".into(),
                     input: payloads("input"),
+                    sequencing_event_id: 1,
                 },
             }],
             force_new_workflow_task: false,
@@ -397,6 +405,7 @@ async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
@@ -413,6 +422,7 @@ async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
                         update_id: "update-1".into(),
                         update_name: "restart-success".into(),
                         input: payloads("input"),
+                        sequencing_event_id: 1,
                     },
                 },
                 WorkflowCommand::UpdateCompleted {
@@ -455,9 +465,15 @@ async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
     let terminal_events = history
         .iter()
         .filter(|event| {
+            // The kernel now emits the failure-capable V2 completed shape
+            // (spec speculative-wft K6); the original variant stays
+            // decode-only.
             matches!(
                 &event.kind,
                 tokeira_kernel::HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                    update_id,
+                    ..
+                } | tokeira_kernel::HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
                     update_id,
                     ..
                 } if update_id == "update-1"
@@ -565,6 +581,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
@@ -581,6 +598,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
                         update_id: "update-1".into(),
                         update_name: "slow".into(),
                         input: payloads("input"),
+                        sequencing_event_id: 1,
                     },
                 },
                 WorkflowCommand::UpdateCompleted {
@@ -595,11 +613,12 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
 
     wait_for_history(&store, run_key, |history| {
         history.iter().any(|event| {
+            // V2 completed shape (spec speculative-wft K6).
             matches!(
                 &event.kind,
-                tokeira_kernel::HistoryEventKind::WorkflowExecutionUpdateCompleted {
+                tokeira_kernel::HistoryEventKind::WorkflowExecutionUpdateCompletedV2 {
                     update_id,
-                    result,
+                    outcome: tokeira_kernel::UpdateEventOutcome::Success(result),
                     ..
                 } if update_id == "update-1" && result == &payloads("late")
             )
@@ -641,6 +660,7 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
@@ -729,6 +749,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
     let task = poll_wft(&runtime, workflow_queue(namespace_id, "queue-a")).await?;
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: task.token,
             identity: WorkerIdentity("worker-a".into()),
             sdk_metadata: None,
@@ -745,6 +766,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
                         update_id: "update-1".into(),
                         update_name: "handler-a".into(),
                         input: payloads("input-1"),
+                        sequencing_event_id: 1,
                     },
                 },
                 WorkflowCommand::UpdateCompleted {
@@ -757,6 +779,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
                         update_id: "update-2".into(),
                         update_name: "handler-b".into(),
                         input: payloads("input-2"),
+                        sequencing_event_id: 1,
                     },
                 },
                 WorkflowCommand::UpdateCompleted {

@@ -139,6 +139,22 @@ pub struct QueryTimedOut;
 #[error("workflow update was aborted by closing workflow")]
 pub struct UpdateAbortedByClosingWorkflow;
 
+/// A worker completion referenced an update the server does not know and the
+/// message carried no resurrect payload. The workflow task was already failed
+/// with cause `BadUpdateWorkflowExecutionMessage`; the completion call
+/// surfaces NotFound with the exact message "update {id} wasn't found on the
+/// server. This is most likely a transient error which will be resolved
+/// automatically by retries" (`handleMessage`,
+/// workflow_task_completed_handler.go:381 @ v1.31.0; spec speculative-wft
+/// Req 6.2 / K5). Distinct from [`InvalidWorkflowCommand`], whose bad-message
+/// siblings map to INVALID_ARGUMENT.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("{message}")]
+pub struct UpdateMessageNotFound {
+    /// The v1.31.0 causeErr rendering, returned verbatim on the wire.
+    pub message: String,
+}
+
 /// Runtime could not resolve a requested workflow update.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum UpdateLifecycleError {

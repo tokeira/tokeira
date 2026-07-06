@@ -190,6 +190,7 @@ fn with_pending_wft(
     attempt: u32,
 ) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
+        task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
         logical_seq: LogicalTaskSeq(logical_seq),
         scheduled_event_id: state.last_event_id - 1,
@@ -1380,6 +1381,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
         .prop_map(move |commands| {
             let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
             let req = WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(30),
@@ -1463,6 +1465,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
         Just(()).prop_map(move |_| {
             let state = with_pending_wft(make_open_state(now), 42, Some(17), 1);
             let req = WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(42),
@@ -1494,6 +1497,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
             );
             let cancel_scheduled_event_id = state.activities["activity-1"].schedule_event_id;
             let req = WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(43),
@@ -1527,6 +1531,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 now,
             );
             let req = WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(44),
@@ -1559,6 +1564,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 &operation_id,
             );
             let req = WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(45),
@@ -1914,6 +1920,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(30),
@@ -1990,6 +1997,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(30),
@@ -2066,6 +2074,7 @@ proptest! {
         let activity_transition = kernel().apply(
             LoadedRun::Existing(activity_state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: activity_state.run_key,
                     logical_seq: LogicalTaskSeq(84),
@@ -2342,6 +2351,7 @@ proptest! {
             let transition = kernel().apply(
                 LoadedRun::Existing(state),
                 Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    client_discards_speculative_with_events: false,
                     token: WorkflowTaskToken {
                         run_key,
                         logical_seq: LogicalTaskSeq(logical_seq),
@@ -2853,6 +2863,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(94),
@@ -2887,6 +2898,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(95),
@@ -2956,6 +2968,7 @@ proptest! {
             kernel().apply(
                 LoadedRun::Existing(state.clone()),
                 Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    client_discards_speculative_with_events: false,
                     token: WorkflowTaskToken {
                         run_key: state.run_key,
                         logical_seq: LogicalTaskSeq(96),
@@ -3077,6 +3090,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(98),
@@ -3477,6 +3491,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(101),
@@ -3570,6 +3585,7 @@ fn property_23_request_cancel_activity_preserves_activity() {
         .apply(
             LoadedRun::Existing(state),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: RunKey::new(),
                     logical_seq: LogicalTaskSeq(92),
@@ -3617,6 +3633,7 @@ fn property_24_cancel_timer_removes_timer() {
         .apply(
             LoadedRun::Existing(state),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: RunKey::new(),
                     logical_seq: LogicalTaskSeq(93),
@@ -3663,6 +3680,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(30),
@@ -3744,6 +3762,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(32),
@@ -3886,6 +3905,7 @@ fn property_42_parent_close_policy_all_paths() {
                 .apply(
                     LoadedRun::Existing(started.clone()),
                     Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                        client_discards_speculative_with_events: false,
                         token: WorkflowTaskToken {
                             run_key: started.run_key,
                             logical_seq: LogicalTaskSeq(31),
@@ -3989,12 +4009,13 @@ proptest! {
         // tracks the update as admitted and schedules a WFT.
         prop_assert!(transition.next_state.admitted_updates.contains(&req.update_id));
         prop_assert!(!transition.next_state.pending_updates.contains_key(&req.update_id));
-        // First event should be WFT-Scheduled (no UpdateAccepted).
-        let is_scheduled = matches!(
-            transition.history_events[0].kind,
-            HistoryEventKind::WorkflowTaskScheduled { .. }
-        );
-        prop_assert!(is_scheduled);
+        // Feature: speculative-wft, Property P1 — with no pending WFT the
+        // delivery task is SPECULATIVE: no events persist and the ids are
+        // virtual (updateworkflow/api.go:171-186 @ v1.31.0).
+        prop_assert!(transition.history_events.is_empty());
+        let pending = transition.next_state.pending_workflow_task.as_ref().unwrap();
+        prop_assert_eq!(pending.task_type, tokeira_kernel::WorkflowTaskType::Speculative);
+        prop_assert_eq!(pending.scheduled_event_id, transition.next_state.last_event_id + 1);
     }
 
     #[test]
@@ -4036,6 +4057,7 @@ proptest! {
         let completed = kernel().apply(
             LoadedRun::Existing(started.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: token.clone(),
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
@@ -4060,6 +4082,7 @@ proptest! {
         let rejected = kernel().apply(
             LoadedRun::Existing(started),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token,
                 identity: WorkerIdentity("worker".into()),
                 sdk_metadata: None,
@@ -4088,6 +4111,7 @@ proptest! {
         let accepted = kernel().apply(
             LoadedRun::Existing(base.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: base.run_key,
                     logical_seq: LogicalTaskSeq(61),
@@ -4109,6 +4133,7 @@ proptest! {
                         update_id: "update-1".into(),
                         update_name: "handler".into(),
                         input,
+                        sequencing_event_id: 1,
                     },
                 }],
                 force_new_workflow_task: false,
@@ -4121,6 +4146,7 @@ proptest! {
         let completed = kernel().apply(
             LoadedRun::Existing(started.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: started.run_key,
                     logical_seq: LogicalTaskSeq(62),
@@ -4141,6 +4167,7 @@ proptest! {
                     body: UpdateProtocolBody::Completed {
                         update_id: "update-1".into(),
                         result,
+                        failure: None,
                     },
                 }],
                 force_new_workflow_task: false,
@@ -4153,6 +4180,7 @@ proptest! {
         let rejected = kernel().apply(
             LoadedRun::Existing(started.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: started.run_key,
                     logical_seq: LogicalTaskSeq(63),
@@ -4206,6 +4234,7 @@ fn property_57_close_clears_pending_updates() {
             .apply(
                 LoadedRun::Existing(started.clone()),
                 Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    client_discards_speculative_with_events: false,
                     token: WorkflowTaskToken {
                         run_key: started.run_key,
                         logical_seq: LogicalTaskSeq(64),
@@ -4279,6 +4308,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(80),
@@ -4325,6 +4355,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(81),
@@ -4489,6 +4520,7 @@ fn property_63_close_preserves_execution_options() {
             .apply(
                 LoadedRun::Existing(started.clone()),
                 Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    client_discards_speculative_with_events: false,
                     token: WorkflowTaskToken {
                         run_key: started.run_key,
                         logical_seq: LogicalTaskSeq(83),
@@ -4613,6 +4645,7 @@ fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
     };
     let wft = |commands: Vec<WorkflowCommand>| {
         Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token,
             identity: WorkerIdentity("worker".into()),
             sdk_metadata: None,
@@ -4737,6 +4770,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(90),
@@ -4910,6 +4944,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(84),
@@ -4954,6 +4989,7 @@ proptest! {
         let result = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(85),
@@ -4993,6 +5029,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
                 token: WorkflowTaskToken {
                     run_key: state.run_key,
                     logical_seq: LogicalTaskSeq(86),
@@ -5132,6 +5169,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
             .apply(
                 LoadedRun::Existing(started.clone()),
                 Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    client_discards_speculative_with_events: false,
                     token: WorkflowTaskToken {
                         run_key: started.run_key,
                         logical_seq: LogicalTaskSeq(87),
@@ -5314,6 +5352,7 @@ proptest! {
 
         let run_key = state.run_key;
         let req = WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: WorkflowTaskToken {
                 run_key,
                 logical_seq: LogicalTaskSeq(30),
@@ -5451,6 +5490,7 @@ proptest! {
             let rejected = kernel.apply(
                 LoadedRun::Existing(buffered.clone()),
                 Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    client_discards_speculative_with_events: false,
                     token: WorkflowTaskToken {
                         run_key,
                         logical_seq: LogicalTaskSeq(30),
@@ -5546,6 +5586,7 @@ proptest! {
 
 fn fail_workflow_completion_request(state: &WorkflowState) -> WorkflowTaskCompletedRequest {
     WorkflowTaskCompletedRequest {
+        client_discards_speculative_with_events: false,
         token: WorkflowTaskToken {
             run_key: state.run_key,
             logical_seq: LogicalTaskSeq(30),

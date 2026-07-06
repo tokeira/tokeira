@@ -898,6 +898,9 @@ pub fn wft_failed_cause_from_proto(value: i32) -> tokeira_kernel::WorkflowTaskFa
         Ok(P::NonDeterministicError) => K::NonDeterminismError,
         Ok(P::ForceCloseCommand) => K::ForceCloseCommand,
         Ok(P::GrpcMessageTooLarge) => K::GrpcMessageTooLarge,
+        // `WORKFLOW_TASK_FAILED_CAUSE_BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE
+        // = 30` (failed_cause.proto; spec speculative-wft K5).
+        Ok(P::BadUpdateWorkflowExecutionMessage) => K::BadUpdateWorkflowExecutionMessage,
         _ => K::WorkflowWorkerUnhandledFailure,
     }
 }
@@ -2229,7 +2232,13 @@ pub fn respond_completed_request_to_edge(
     for cmd in req.commands {
         match proto_command_to_workflow_command(cmd) {
             Ok(WorkflowCommand::ProtocolMessage { message_id, .. }) => {
-                // Resolve the body from the messages index.
+                // Resolve the body from the messages index. A command
+                // referencing an ABSENT message id fails the completion with
+                // v1.31.0's exact InvalidArgument ('ProtocolMessageCommand
+                // referenced absent message ID',
+                // workflow_task_completed_handler.go @ v1.31.0; spec
+                // speculative-wft Req 6.1) — surfaced by the edge core, which
+                // also fails the workflow task.
                 if let Some(msg) = messages_by_id.remove(&message_id) {
                     let body = msg
                         .body
@@ -2239,6 +2248,10 @@ pub fn respond_completed_request_to_edge(
                         message_id,
                         body: resolve_protocol_message_body(&body, msg.protocol_instance_id)?,
                     });
+                } else {
+                    return Err(ProtoConversionError::InvalidArgument(format!(
+                        "ProtocolMessageCommand referenced absent message ID {message_id}"
+                    )));
                 }
             }
             Ok(cmd) => commands.push(cmd),
@@ -2356,8 +2369,10 @@ pub fn respond_completed_request_to_edge(
 /// `Response`, and `Rejection` — each wrapped in a `prost_types::Any`.
 /// We match on the `type_url` suffix to determine which variant to decode.
 /// `Response` bodies carry an `Outcome` that can be either `Success` or
-/// `Failure`; a `Failure` outcome is mapped to `Rejected` because from the
-/// kernel's perspective both represent terminal negative outcomes.
+/// `Failure`; a `Failure` outcome is a COMPLETED update whose handler failed
+/// post-acceptance — NOT a rejection (rejections arrive as `Rejection`
+/// messages; spec speculative-wft Req 7.2,
+/// mutable_state_impl.go:5288-5378 @ v1.31.0).
 fn resolve_protocol_message_body(
     body_bytes: &[u8],
     protocol_instance_id: String,
@@ -2367,10 +2382,41 @@ fn resolve_protocol_message_body(
         .map_err(|_| ProtoConversionError::MissingField("ProtocolMessage body decode failed"))?;
     match any.type_url.as_str() {
         url if url.ends_with("update.v1.Acceptance") => {
+            let acceptance = tokeira_proto::public::temporal::api::update::v1::Acceptance::decode(
+                any.value.as_slice(),
+            )
+            .map_err(|_| {
+                ProtoConversionError::MissingField("update.v1.Acceptance decode failed")
+            })?;
+            // The embedded `accepted_request` is the worker's echo of the
+            // original request — v1.31.0's resurrect source (`TryResurrect`,
+            // update/registry.go:238-281). Decode its name/args as the
+            // FALLBACK; the edge core's registry hydration
+            // (workflow_service.rs) remains the primary source and
+            // overwrites these when the update is still registered.
+            let (update_name, input) = acceptance
+                .accepted_request
+                .and_then(|request| request.input)
+                .map(|input| {
+                    (
+                        input.name,
+                        input
+                            .args
+                            .as_ref()
+                            .map(payloads_to_domain)
+                            .unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_default();
             Ok(tokeira_kernel::UpdateProtocolBody::Accepted {
                 update_id: protocol_instance_id,
-                update_name: String::new(),
-                input: Payloads::default(),
+                update_name,
+                input,
+                // Worker-provided sequencing anchor, validated and recorded
+                // by the kernel (spec speculative-wft K6 + owner amendment
+                // F5; `validateAcceptanceMsg`, update/validation.go:62-68
+                // @ v1.31.0).
+                sequencing_event_id: acceptance.accepted_request_sequencing_event_id,
             })
         }
         url if url.ends_with("update.v1.Response") => {
@@ -2386,14 +2432,16 @@ fn resolve_protocol_message_body(
                 ) => Ok(tokeira_kernel::UpdateProtocolBody::Completed {
                     update_id: protocol_instance_id,
                     result: payloads_to_domain(&payloads),
+                    failure: None,
                 }),
                 Some(
                     tokeira_proto::public::temporal::api::update::v1::outcome::Value::Failure(
                         failure,
                     ),
-                ) => Ok(tokeira_kernel::UpdateProtocolBody::Rejected {
+                ) => Ok(tokeira_kernel::UpdateProtocolBody::Completed {
                     update_id: protocol_instance_id,
-                    failure: failure_to_payload(&failure),
+                    result: Payloads::default(),
+                    failure: Some(failure_to_payload(&failure)),
                 }),
                 None => Err(ProtoConversionError::MissingField(
                     "update.v1.Response missing outcome",
@@ -2943,6 +2991,10 @@ pub fn completed_response_to_proto(
     resp: RespondWorkflowTaskCompletedResponse,
 ) -> workflowservice::RespondWorkflowTaskCompletedResponse {
     workflowservice::RespondWorkflowTaskCompletedResponse {
+        // Speculative DROP rewind: non-zero only when the completed task
+        // persisted nothing (respondworkflowtaskcompleted/api.go:770 @
+        // v1.31.0; spec speculative-wft E2).
+        reset_history_event_id: resp.reset_history_event_id,
         workflow_task: resp.workflow_task.map(poll_response_to_proto),
         activity_tasks: resp
             .activity_tasks
@@ -4556,6 +4608,7 @@ pub fn proto_command_to_workflow_command(
                     update_id: String::new(),
                     update_name: String::new(),
                     input: Payloads::default(),
+                    sequencing_event_id: 0,
                 },
             })
         }

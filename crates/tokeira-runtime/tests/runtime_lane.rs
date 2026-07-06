@@ -58,6 +58,7 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
 
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: first_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,
@@ -329,6 +330,7 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
 
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: first_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,
@@ -484,6 +486,7 @@ async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Res
 
     runtime_after_restart
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: versioned_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,
@@ -541,6 +544,7 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
 
     runtime_after_restart
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: first_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,
@@ -636,6 +640,7 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
 
     runtime_before_restart
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: first_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,
@@ -848,6 +853,7 @@ async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
 
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: first_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,
@@ -941,6 +947,7 @@ async fn non_retryable_failure_is_terminal_without_successor() -> Result<()> {
 
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
             token: first_task.token,
             identity: WorkerIdentity("worker-a".to_string()),
             sdk_metadata: None,

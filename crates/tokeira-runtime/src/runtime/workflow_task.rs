@@ -527,6 +527,62 @@ where
             }
             .into());
         }
+        // Sibling of the invalid-command seam for bad update protocol
+        // messages (spec speculative-wft K5, Req 6.1/6.2): v1.31.0 routes
+        // every such message through `failWorkflowTask(
+        // BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE, causeErr)` — the WFT-failed
+        // event persists (dropped on a still-failing transient attempt,
+        // respondworkflowtaskcompleted/api.go:478-481) with the composed
+        // `wtFailedCause.Message()` server failure
+        // (`failure.NewServerFailure(wtFailedCause.Message(), false)`,
+        // api.go:1049-1059 @ v1.31.0), and the completion call errors with
+        // the causeErr: NotFound for the unknown-update case, InvalidArgument
+        // for the wrong-state / bad-sequencing cases (Req 6.2).
+        if let Err(error) = &result
+            && let Some(crate::lane::KernelRejected(tokeira_kernel::Reject::BadUpdateMessage {
+                message,
+                not_found,
+            })) = error.downcast_ref()
+        {
+            let message = message.clone();
+            let not_found = *not_found;
+            let cause = tokeira_kernel::WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage;
+            // Persisted rendering mirrors `workflowTaskFailedCause.Message()`
+            // ("{cause}: {causeErr}",
+            // workflow_task_completed_handler.go:1502-1510 @ v1.31.0).
+            let persisted_message = format!("{}: {}", cause.as_str(), message);
+            runtime_metrics::record_workflow_task_completed(OutcomeLabel::Rejected);
+            // Same transient-attempt drop rule as the invalid-command arm:
+            // attempt > 1 on a non-UnhandledCommand cause is dropped to time
+            // out instead of persisting a failure event (api.go:478-481
+            // @ v1.31.0).
+            let drop_without_failing = completion_token.attempt > 1;
+            if !drop_without_failing
+                && let Err(error) = self
+                    .submit_for_owned_shard(
+                        run_key,
+                        Command::WorkflowTaskFailed(tokeira_kernel::WorkflowTaskFailedRequest {
+                            logical_seq: completion_token.logical_seq,
+                            started_event_id: completion_token.started_event_id,
+                            failure_cause: cause,
+                            failure_details: Some(server_failure_payload(&persisted_message)),
+                            worker_identity: completion_identity,
+                            now: OffsetDateTime::now_utc(),
+                        }),
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    ?error,
+                    run_key = ?run_key,
+                    "failed to persist WFT failure for bad update message"
+                );
+            }
+            if not_found {
+                return Err(crate::errors::UpdateMessageNotFound { message }.into());
+            }
+            return Err(crate::errors::InvalidWorkflowCommand { message }.into());
+        }
         match &result {
             Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {
                 // A successfully completed WFT means the workflow observed the

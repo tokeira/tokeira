@@ -15,12 +15,12 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
 
 ## Phase 0 — Decision (blocking)
 
-- [ ] 0.1 Owner accepts Requirement 0 (speculative model + rider kernel changes). Record the
+- [x] 0.1 Owner accepts Requirement 0 **(DONE 2026-07-06 — accepted via owner-review.md; amendments F1-F5 recorded in requirements.md)** (speculative model + rider kernel changes). Record the
   acceptance date and any scope amendments in requirements.md before starting Phase K.
 
 ## Phase S — Harness skip hygiene (fork; independent, land before first full run)
 
-- [ ] S.1 Register the missing harness-class skips in
+- [x] S.1 Register the missing harness-class skips **(DONE — fork commit 9a9bd7bcb, all five entries plus the AdminService pair)** in
   `../temporal/tests/testcore/tokeira_conformance_skip.go`: CloseShard-class
   `TestScheduledSpeculativeWorkflowTask_LostUpdate` + `TestStartedSpeculativeWorkflowTask_LostUpdate`
   (nil-panic today); AdminClient-class `TestStartedSpeculativeWorkflowTask_TerminateWorkflow` +
@@ -30,10 +30,10 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
 
 ## Phase K — Kernel (raised; requires 0.1)
 
-- [ ] K.1 `PendingWorkflowTask.task_type: WorkflowTaskType { Normal, Speculative }` with
+- [x] K.1 `PendingWorkflowTask.task_type **(DONE — state.rs WorkflowTaskType + threaded)**: WorkflowTaskType { Normal, Speculative }` with
   `#[serde(default)]` (`state.rs:411-433`); thread through schedule/start/complete and the
   three-mode predicate (normal / transient / speculative, Invariant I.2). (Req 1.1)
-- [ ] K.2 `apply_update` speculative arm (`kernel.rs:727-770`): fires on no pending WFT AND no
+- [x] K.2 `apply_update` speculative arm **(DONE — schedule_speculative_workflow_task + F3 WorkflowTaskStateInconsistent guard)** (`kernel.rs:727-770`): fires on no pending WFT AND no
   buffered events → speculative task, no `WorkflowTaskScheduled`, virtual ids via the transient
   arm of `schedule_workflow_task` (`kernel.rs:4375-4446`); dispatch op marked speculative.
   **Owner amendment (F3): buffered events with NO pending WFT at the update call site is an
@@ -41,27 +41,27 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
   result here as `ErrWorkflowTaskStateInconsistent` (`updateworkflow/api.go:180-186`); the
   general buffered→normal downgrade rule applies only at the other schedule sites.** Cites `updateworkflow/api.go:171-186` +
   `workflow_task_state_machine.go:309-410 @ v1.31.0`. (Req 1.1-1.3)
-- [ ] K.3 Completion drop-vs-materialize in `apply_workflow_task_completed`: rejection-only +
+- [x] K.3 Completion drop-vs-materialize **(DONE — drop branch + events-window + capability threaded via WorkflowTaskCompletedRequest; buffered-events also block the drop)** in `apply_workflow_task_completed`: rejection-only +
   events-window (Req 3.3, capability `client_discards_speculative_with_events`, pinned max 10) →
   drop (zero events, pending task cleared, waiter outcomes still resolved); otherwise materialize
   Scheduled+Started late (reuse transient materialization) then Completed. Wire-message model:
   the completion command carries the message taxonomy so the kernel can see "only rejections".
   Cites `workflow_task_state_machine.go:676-748, 750-819 @ v1.31.0`. (Req 3.1, 3.3, 3.4)
-- [ ] K.4 Conversions: signal-while-scheduled → materialize Scheduled before the signal (Scheduled,
+- [x] K.4 Conversions: signal-while-scheduled **(DONE — materialize_scheduled_speculative helper on signal/cancel/timer paths + both timeout shapes; started-task fail/force-close also late-materialize)** → materialize Scheduled before the signal (Scheduled,
   Signaled, Started); signal-buffered-while-started → persist + convert at completion; timeout
   shapes per Req 5 (start-to-close: persist Scheduled/Started/TimedOut + attempt-2 transient;
   schedule-to-start: persist Scheduled/TimedOut + attempt reset 1 + real reschedule). Cites
   `workflow_task_state_machine.go:270-306, 934-990, 1466-1530 @ v1.31.0`. (Req 4.1, 4.2, 5)
-- [ ] K.5 `WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage` appended LAST
+- [x] K.5 `WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage` **(DONE — appended last; Reject::BadUpdateMessage{not_found} + runtime seam + NotFound edge mapping; resurrect via TryResurrect parity)** appended LAST
   (`command.rs:225-228` discipline); ProtocolMessage rejects (`UnknownUpdate`,
   `DuplicateUpdateId`, wrong-state) convert to K4-seam WFT failures instead of transition aborts.
   (Req 6.1, 6.2)
-- [ ] K.6 Event fidelity **(+ owner amendment F5: bounds-check the worker-provided sequencing
+- [x] K.6 Event fidelity **(DONE — sequencing id validated (zero + F5 bounds) and recorded; WorkflowExecutionUpdateCompletedV2 appended, old variant decode-only; serializer emits {update_id}/request + Meta.UpdateId)** **(+ owner amendment F5: bounds-check the worker-provided sequencing
   id; out-of-range → bad-update-message failure via K.5)**: `UpdateProtocolBody::Accepted`
   carries the worker sequencing id (drop
   the hardcoded 0 at `kernel.rs:4129`); append the failure-capable
   `WorkflowExecutionUpdateCompleted` outcome variant (old variant decode-only). (Req 7.1, 7.2)
-- [ ] K.7 Follow-up WFT: `apply_workflow_task_completed` schedules a speculative successor when
+- [x] K.7 Follow-up WFT **(DONE — speculative successor on the normal completion tail and inside the drop branch)**: `apply_workflow_task_completed` schedules a speculative successor when
   `admitted_updates` is non-empty after a non-failing, non-close completion (normal if buffered
   events/heartbeat). Cites `respondworkflowtaskcompleted/api.go:512-541 @ v1.31.0`. (Req 8)
 
@@ -86,15 +86,15 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
 
 ## Phase E — Edge
 
-- [ ] E.1 Poll synthesis: widen the transient-suffix predicate to speculative
+- [x] E.1 Poll synthesis **(DONE — suffix predicate widened to any virtual started id (transient OR speculative); GetHistory append_transient_suffix widened)**: widen the transient-suffix predicate to speculative
   (`from_internal.rs:47-76`; `append_transient_suffix`, `workflow_service.rs:5414`); anchor
   `Messages[].SequencingId.EventId` at the virtual scheduled id; `NextEventId` = virtual scheduled
   id; `PreviousStartedEventId` = last persisted WFT-started. (Req 2)
-- [ ] E.2 Completion wire: surface `ResetHistoryEventId` on the RespondWorkflowTaskCompleted
+- [x] E.2 Completion wire **(DONE — reset_history_event_id on the completion DTO/proto, drop detected via token-vs-last_event_id; capability consumed into the Req 3.3 window)**: surface `ResetHistoryEventId` on the RespondWorkflowTaskCompleted
   response (drop → `LastCompletedWorkflowTaskStartedEventId`, else 0); consume
   `client_discards_speculative_with_events` (`grpc/translate.rs:2312-2314`) into the Req 3.3
   window. (Req 3.2, 3.3)
-- [ ] E.3 Message plumbing: thread command-unreferenced messages through
+- [x] E.3 Message plumbing **(DONE — unreferenced-message splice landed in Tier 2.12 wave A; Response-with-Failure now decodes Completed-with-failure; absent message id -> exact InvalidArgument; serializer fixes with K.6)**: thread command-unreferenced messages through
   `to_internal::workflow_task_completed_request` (rejections + no-commands success shape); decode
   update `Response`-with-Failure as Completed-with-failure (fix `grpc/translate.rs:2342-2367`);
   serialize `accepted_request_message_id = "{update_id}/request"` and `Meta.UpdateId`
@@ -114,6 +114,10 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
   (`../temporal/tests/testcore/tokeira_metrics_bridge.go:41`). (Req 10.3)
 
 ## Phase T — Required tests
+
+> Progress note (2026-07-06): Phase-K landing included goldens (a)-(e) plus buffered-signal,
+> both timeout shapes, V2-failure-outcome, and explicit-fail-materializes in
+> `tests/golden_tests.rs`; T.1's P1-P6/G1/G2 coverage audit and T.2 remain open.
 
 - [ ] T.1 Kernel properties/goldens P1-P6, G1, G2 (`// Feature: speculative-wft, Property N`):
   no-persist schedule/start; drop-without-trace + waiter outcomes; late materialization ids;

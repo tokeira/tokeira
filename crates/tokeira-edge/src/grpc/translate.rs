@@ -154,6 +154,19 @@ fn activity_timeout_to_time(value: Option<&prost_types::Duration>) -> Option<tim
     proto_duration_to_time(value).filter(|duration| !duration.is_zero())
 }
 
+/// Translate the **workflow-task** timeout with the same "zero means unset"
+/// convention so the 10s default applies downstream: the Go SDK serializes the
+/// field as a present zero duration when the caller left it unset
+/// (`durationpb.New(0)`), and v1.31.0 replaces any non-positive value with the
+/// namespace default (`common.OverrideWorkflowTaskTimeout` @ v1.31.0). Mapping
+/// present-zero to `Some(ZERO)` put a zero task timeout on the
+/// WorkflowExecutionStarted event, which the SDK reads as its local-activity
+/// heartbeat budget — `0 × 0.8 = fire immediately`, a busy loop of empty
+/// force-created workflow tasks.
+fn workflow_task_timeout_to_time(value: Option<&prost_types::Duration>) -> Option<time::Duration> {
+    proto_duration_to_time(value).filter(|duration| duration.is_positive())
+}
+
 /// Normalized activity timeouts per v1.31.0 `validateAndNormalizeTimeouts`
 /// (`chasm/lib/activity/validator.go:142-206`): with ScheduleToClose set,
 /// ScheduleToStart/StartToClose default to it (and are capped by it);
@@ -986,7 +999,7 @@ pub fn start_request_to_edge(
             req.workflow_execution_timeout.as_ref(),
         ),
         workflow_run_timeout: workflow_timeout_to_time(req.workflow_run_timeout.as_ref()),
-        workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
+        workflow_task_timeout: workflow_task_timeout_to_time(req.workflow_task_timeout.as_ref()),
         retry_policy: req
             .retry_policy
             .as_ref()
@@ -2198,7 +2211,11 @@ pub fn respond_completed_request_to_edge(
     req: workflowservice::RespondWorkflowTaskCompletedRequest,
 ) -> Result<RespondWorkflowTaskCompletedRequest, ProtoConversionError> {
     // Index messages by ID so ProtocolMessage commands can
-    // look up their corresponding message body.
+    // look up their corresponding message body. The original request order
+    // is preserved separately: messages NOT referenced by any command are
+    // processed in request order (`msgs.TakeRemaining`,
+    // workflow_task_completed_handler.go @ v1.31.0).
+    let message_order: Vec<String> = req.messages.iter().map(|m| m.id.clone()).collect();
     let mut messages_by_id: std::collections::HashMap<String, _> = req
         .messages
         .into_iter()
@@ -2226,31 +2243,45 @@ pub fn respond_completed_request_to_edge(
         }
     }
 
-    // Remaining messages not referenced by commands go into
-    // the DTO's messages field for edge-layer processing.
-    let remaining_messages = messages_by_id
-        .into_values()
-        .map(|message| {
-            let body = message
+    // Messages not referenced by any PROTOCOL_MESSAGE command are still
+    // PROCESSED — the command is optional ordering sugar; v1.31.0 applies the
+    // leftovers in request order after the commands (`msgs.TakeRemaining`,
+    // workflow_task_completed_handler.go @ v1.31.0). The SDK routinely ships
+    // acceptance/rejection/response messages with ZERO commands. tokeira's
+    // kernel rejects commands after a close, and the corpus pins update
+    // events BEFORE the close event of the same completion
+    // (TestLastWorkflowTask_HasUpdateMessage: 5 UpdateAccepted,
+    // 6 WorkflowExecutionCompleted), so the leftovers splice in ahead of the
+    // first close command instead of strictly last.
+    let mut leftover_commands = Vec::new();
+    for id in &message_order {
+        if let Some(msg) = messages_by_id.remove(id) {
+            let body = msg
                 .body
                 .map(|body| body.encode_to_vec())
                 .unwrap_or_default();
-            Ok(ProtocolMessageDto {
-                id: message.id,
-                protocol_instance_id: message.protocol_instance_id,
-                body,
-                sequencing_event_id: match message.sequencing_id {
-                    Some(
-                        tokeira_proto::public::temporal::api::protocol::v1::message::SequencingId::EventId(event_id),
-                    ) => Some(event_id),
-                    Some(
-                        tokeira_proto::public::temporal::api::protocol::v1::message::SequencingId::CommandIndex(command_index),
-                    ) => Some(command_index),
-                    None => None,
-                },
-            })
+            leftover_commands.push(WorkflowCommand::ProtocolMessage {
+                message_id: msg.id,
+                body: resolve_protocol_message_body(&body, msg.protocol_instance_id)?,
+            });
+        }
+    }
+    let close_at = commands
+        .iter()
+        .position(|command| {
+            matches!(
+                command,
+                WorkflowCommand::CompleteWorkflow { .. }
+                    | WorkflowCommand::FailWorkflow { .. }
+                    | WorkflowCommand::CancelWorkflow { .. }
+                    | WorkflowCommand::ContinueAsNew { .. }
+            )
         })
-        .collect::<Result<Vec<_>, ProtoConversionError>>()?;
+        .unwrap_or(commands.len());
+    for (offset, command) in leftover_commands.into_iter().enumerate() {
+        commands.insert(close_at + offset, command);
+    }
+    let remaining_messages: Vec<ProtocolMessageDto> = Vec::new();
     let deployment_version = worker_deployment_version_from_options(
         req.deployment_options.as_ref(),
         "RespondWorkflowTaskCompletedRequest.deployment_options",
@@ -4015,7 +4046,7 @@ pub fn signal_with_start_request_to_edge(
             req.workflow_execution_timeout.as_ref(),
         ),
         workflow_run_timeout: workflow_timeout_to_time(req.workflow_run_timeout.as_ref()),
-        workflow_task_timeout: proto_duration_to_time(req.workflow_task_timeout.as_ref()),
+        workflow_task_timeout: workflow_task_timeout_to_time(req.workflow_task_timeout.as_ref()),
         retry_policy: req
             .retry_policy
             .as_ref()
@@ -4433,8 +4464,10 @@ pub fn proto_command_to_workflow_command(
                     .unwrap_or_default(),
                 workflow_execution_timeout: None,
                 workflow_run_timeout: workflow_timeout_to_time(attrs.workflow_run_timeout.as_ref()),
-                workflow_task_timeout: proto_duration_to_time(attrs.workflow_task_timeout.as_ref())
-                    .unwrap_or(time::Duration::seconds(10)),
+                workflow_task_timeout: workflow_task_timeout_to_time(
+                    attrs.workflow_task_timeout.as_ref(),
+                )
+                .unwrap_or(time::Duration::seconds(10)),
                 retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
             })
         }
@@ -4475,8 +4508,10 @@ pub fn proto_command_to_workflow_command(
                     attrs.workflow_execution_timeout.as_ref(),
                 ),
                 workflow_run_timeout: workflow_timeout_to_time(attrs.workflow_run_timeout.as_ref()),
-                workflow_task_timeout: proto_duration_to_time(attrs.workflow_task_timeout.as_ref())
-                    .unwrap_or(time::Duration::seconds(10)),
+                workflow_task_timeout: workflow_task_timeout_to_time(
+                    attrs.workflow_task_timeout.as_ref(),
+                )
+                .unwrap_or(time::Duration::seconds(10)),
                 retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
                 cron_schedule: non_empty(attrs.cron_schedule),
                 parent_close_policy: parent_close_policy_to_domain(attrs.parent_close_policy),
@@ -5587,6 +5622,28 @@ pub fn update_request_to_edge(
     })
 }
 
+/// v1.31.0's server-authored outcome for an update that was ACCEPTED but
+/// never completed before its workflow closed
+/// (`acceptedUpdateCompletedWorkflowFailure`,
+/// service/history/workflow/update/errors_failures.go:10-35 @ v1.31.0). The
+/// corpus asserts message, source, type, and non-retryability verbatim.
+pub(crate) fn accepted_update_completed_workflow_failure() -> failure_proto::Failure {
+    failure_proto::Failure {
+        message: "Workflow Update failed because the Workflow completed before the Update \
+                  completed."
+            .to_string(),
+        source: "Server".to_string(),
+        failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+            failure_proto::ApplicationFailureInfo {
+                r#type: "AcceptedUpdateCompletedWorkflow".to_string(),
+                non_retryable: true,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+}
+
 pub fn update_response_to_proto(
     resp: crate::translate::UpdateWorkflowExecutionResponse,
 ) -> workflowservice::UpdateWorkflowExecutionResponse {
@@ -5607,6 +5664,11 @@ pub fn update_response_to_proto(
                 ))),
             })
         }
+        Some(crate::translate::UpdateOutcomeDto::AcceptedRunClosed) => Some(update::Outcome {
+            value: Some(update::outcome::Value::Failure(
+                accepted_update_completed_workflow_failure(),
+            )),
+        }),
         None => None,
     };
 

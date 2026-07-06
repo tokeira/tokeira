@@ -283,6 +283,15 @@ impl From<anyhow::Error> for EdgeError {
         {
             return Self::WorkflowClosing;
         }
+        // A pre-accepted update aborted by its run closing with no successor
+        // surfaces v1.31.0's `update.AbortedByWorkflowClosingErr` — NotFound
+        // with this exact message (errors_failures.go:10-35 @ v1.31.0).
+        if value
+            .downcast_ref::<tokeira_runtime::UpdateAbortedByClosingWorkflow>()
+            .is_some()
+        {
+            return Self::NotFound("workflow update was aborted by closing workflow".to_string());
+        }
         // Any mutation against an already-closed run surfaces v1.31.0's
         // `ErrWorkflowCompleted`: NOT_FOUND with this exact message
         // (`consts/const.go:51 @ v1.31.0`) — asserted by type on

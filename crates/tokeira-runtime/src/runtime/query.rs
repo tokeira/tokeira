@@ -255,8 +255,24 @@ where
             .await?
             .ok_or_else(|| anyhow!("execution not found"))?;
 
+        // Dedupe by update id BEFORE admitting: an update already known
+        // durably (accepted/completed events, kernel-admitted state) attaches
+        // to the in-flight update or replays its outcome — repeated requests
+        // sharing an id get one update and one result, and never a second
+        // WFT (`FindOrCreate` attach + `GetUpdateOutcome` replay,
+        // registry.go:398-484 @ v1.31.0).
+        if self
+            .update_lifecycle_snapshot(run_key, execution.clone(), &update_id)
+            .await?
+            .is_some()
+        {
+            return self
+                .wait_for_update_stage(run_key, execution, update_id, wait_policy, timeout_after)
+                .await;
+        }
+
         let (wait_tx, wait_rx) = oneshot::channel::<UpdateResolution>();
-        self.update_registry.register(
+        let created = self.update_registry.register(
             run_key,
             update_id.clone(),
             update_name.clone(),
@@ -265,6 +281,20 @@ where
             wait_policy.clone(),
             wait_tx,
         );
+        if !created {
+            // Raced another caller registering the same id: our waiter is
+            // attached to the shared entry; the other caller admits.
+            return self
+                .wait_for_update_stage_with_receiver(
+                    run_key,
+                    execution,
+                    update_id,
+                    wait_policy,
+                    timeout_after,
+                    wait_rx,
+                )
+                .await;
+        }
 
         let command = Command::Update(UpdateRequest {
             update_id: update_id.clone(),
@@ -277,6 +307,21 @@ where
         let submit_result = self.submit(run_key, command).await;
         let commit_result = match submit_result {
             Ok(result) => result,
+            Err(error) if is_duplicate_update_reject(&error) => {
+                // Admission raced an earlier request for the same id that the
+                // snapshot pre-check missed. Our waiter is already attached;
+                // the earlier admission delivers the update.
+                return self
+                    .wait_for_update_stage_with_receiver(
+                        run_key,
+                        execution,
+                        update_id,
+                        wait_policy,
+                        timeout_after,
+                        wait_rx,
+                    )
+                    .await;
+            }
             Err(error) => {
                 self.update_registry.remove(run_key, &update_id);
                 return Err(error);
@@ -436,19 +481,65 @@ where
                     .await
             }
             Ok(Ok(UpdateResolution::Rejected { failure })) => {
-                let _ = failure;
-                self.snapshot_or_update_not_found(run_key, execution, &update_id)
-                    .await
+                // A rejection leaves NO durable trace (no history event), so
+                // the snapshot cannot be re-read — the resolution itself IS
+                // the outcome: COMPLETED stage carrying the rejection failure
+                // (WaitLifecycleStage rejection handling, update.go:141-239
+                // @ v1.31.0).
+                Ok(UpdateLifecycleSnapshot {
+                    workflow_execution: ExecutionRef {
+                        run_id: self.resolve_run_id_for_snapshot(run_key, &execution).await,
+                        ..execution
+                    },
+                    update_id: update_id.clone(),
+                    update_name: String::new(),
+                    stage: UpdateLifecycleStage::Completed,
+                    outcome: Some(UpdateOutcome::Rejected {
+                        accepted_event_id: 0,
+                        failure,
+                    }),
+                })
             }
-            Ok(Ok(UpdateResolution::RunClosed)) => {
-                Err(anyhow!("run closed before update completed"))
+            // Abort taxonomy per v1.31.0 (abort_reason.go:25-121): pre-accepted
+            // aborts surface as typed RPC errors (the edge maps them); an
+            // accepted update's close is a NON-error COMPLETED outcome with the
+            // server-authored completed-before failure.
+            Ok(Ok(UpdateResolution::AbortedByClosingWorkflow)) => {
+                Err(crate::errors::UpdateAbortedByClosingWorkflow.into())
             }
+            Ok(Ok(UpdateResolution::WorkflowContinuing)) => {
+                Err(crate::errors::WorkflowClosing.into())
+            }
+            Ok(Ok(UpdateResolution::AcceptedRunClosed)) => Ok(UpdateLifecycleSnapshot {
+                workflow_execution: ExecutionRef {
+                    run_id: self.resolve_run_id_for_snapshot(run_key, &execution).await,
+                    ..execution
+                },
+                update_id: update_id.clone(),
+                update_name: String::new(),
+                stage: UpdateLifecycleStage::Completed,
+                outcome: Some(UpdateOutcome::AcceptedRunClosed),
+            }),
             Ok(Err(_)) => Err(anyhow!("update response channel closed")),
             Err(_) => {
                 self.update_registry.clear_waiter(run_key, &update_id);
                 self.snapshot_or_update_not_found(run_key, execution, &update_id)
                     .await
             }
+        }
+    }
+
+    async fn resolve_run_id_for_snapshot(
+        &self,
+        run_key: RunKey,
+        execution: &ExecutionRef,
+    ) -> Option<tokeira_types::RunId> {
+        if execution.run_id.is_some() {
+            return execution.run_id;
+        }
+        match self.repo.load_run(run_key).await {
+            Ok(LoadedRun::Existing(state)) => Some(state.run_id),
+            _ => None,
         }
     }
 
@@ -539,6 +630,20 @@ where
         }
 
         if let Some((_accepted_event_id, update_name)) = accepted {
+            // An accepted-but-never-completed update on a CLOSED run resolves
+            // as COMPLETED with the server-authored completed-before failure —
+            // v1.31.0's registry rebuild aborts the rehydrated Accepted state
+            // with `acceptedUpdateCompletedWorkflowFailure` when the workflow
+            // is no longer running (registry.go:455-484 @ v1.31.0).
+            if !state.is_open() {
+                return Ok(Some(UpdateLifecycleSnapshot {
+                    workflow_execution: workflow_execution.clone(),
+                    update_id: update_id.to_string(),
+                    update_name,
+                    stage: UpdateLifecycleStage::Completed,
+                    outcome: Some(UpdateOutcome::AcceptedRunClosed),
+                }));
+            }
             return Ok(Some(UpdateLifecycleSnapshot {
                 workflow_execution: workflow_execution.clone(),
                 update_id: update_id.to_string(),
@@ -608,4 +713,13 @@ fn requested_stage(wait_policy: UpdateWaitPolicy) -> UpdateLifecycleStage {
         UpdateWaitPolicy::Accepted => UpdateLifecycleStage::Accepted,
         UpdateWaitPolicy::Completed => UpdateLifecycleStage::Completed,
     }
+}
+
+/// A kernel `DuplicateUpdateId` reject surfaced through the lane — the update
+/// id is already admitted or accepted on the run; the caller ATTACHES instead
+/// of erroring (`FindOrCreate` dedupe, registry.go:398-452 @ v1.31.0).
+fn is_duplicate_update_reject(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::KernelRejected>()
+        .is_some_and(|rejected| matches!(rejected.0, tokeira_kernel::Reject::DuplicateUpdateId(_)))
 }

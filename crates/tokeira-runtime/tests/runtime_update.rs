@@ -662,7 +662,13 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
         .await
         .unwrap()
         .expect_err("run close should fail caller");
-    assert!(error.to_string().contains("run closed"));
+    // v1.31.0's AbortedByWorkflowClosingErr: a pre-accepted update aborted by
+    // a successor-less close (errors_failures.go:10-35 @ v1.31.0).
+    assert!(
+        error
+            .to_string()
+            .contains("workflow update was aborted by closing workflow")
+    );
     Ok(())
 }
 

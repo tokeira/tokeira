@@ -1360,7 +1360,7 @@ impl BasicKernel {
         builder.emit(HistoryEventKind::WorkflowExecutionTimedOut {
             timeout_type: req.timeout_type,
             retry_state: req.retry_state,
-            new_execution_run_id: None,
+            new_execution_run_id: req.new_execution_run_id,
         });
         builder.close(ExecutionStatus::TimedOut);
 
@@ -4078,15 +4078,11 @@ fn apply_workflow_command(
             Ok(false)
         }
         WorkflowCommand::UpdateRejected { update_id, failure } => {
-            if !builder.state.pending_updates.contains_key(&update_id) {
-                return Err(Reject::UnknownUpdate(update_id));
-            }
-            builder.emit(HistoryEventKind::WorkflowExecutionUpdateRejected {
-                update_id: update_id.clone(),
-                failure,
-                rejected_request_message_id: update_id.clone(),
-                rejected_request_sequencing_event_id: 0,
-            });
+            // Same contract as the ProtocolMessage rejection body: no
+            // durable trace (v1.31.0 writes no rejection event — the SDK
+            // panics TMPRL1100 replaying one) and unknown ids are tolerated.
+            let _ = failure;
+            builder.state.admitted_updates.remove(&update_id);
             builder.state.pending_updates.remove(&update_id);
             Ok(false)
         }
@@ -4138,19 +4134,23 @@ fn apply_workflow_command(
                     builder.state.pending_updates.remove(&update_id);
                 }
                 UpdateProtocolBody::Rejected { update_id, failure } => {
-                    // A rejection can come for an admitted update (worker
-                    // rejects during validation) or a pending update.
-                    let was_admitted = builder.state.admitted_updates.remove(&update_id);
-                    let was_pending = builder.state.pending_updates.contains_key(&update_id);
-                    if !was_admitted && !was_pending {
-                        return Err(Reject::UnknownUpdate(update_id));
-                    }
-                    builder.emit(HistoryEventKind::WorkflowExecutionUpdateRejected {
-                        update_id: update_id.clone(),
-                        failure,
-                        rejected_request_message_id: update_id.clone(),
-                        rejected_request_sequencing_event_id: 0,
-                    });
+                    // A rejection leaves NO durable trace: v1.31.0 writes no
+                    // history event ("RejectWorkflowExecutionUpdate is a
+                    // no-op", mutable_state_impl.go; the SDK panics
+                    // TMPRL1100-nondeterministic on replaying any rejection
+                    // event) — the update simply vanishes from the admitted
+                    // set and the rejection outcome reaches waiters through
+                    // the runtime's transport resolution, off the event log.
+                    // The same update id is re-admittable afterwards
+                    // (rejected updates never count as completed,
+                    // registry.go:496-506 @ v1.31.0). A rejection for an
+                    // unknown or already-resolved update is tolerated as a
+                    // no-op: v1.31.0 resurrects the update from the
+                    // rejection's embedded request and resolves it without
+                    // error (TryResurrect, registry.go:455-484), which is
+                    // observably identical to ignoring it.
+                    let _ = failure;
+                    builder.state.admitted_updates.remove(&update_id);
                     builder.state.pending_updates.remove(&update_id);
                 }
             }

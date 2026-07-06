@@ -478,6 +478,15 @@ where
                                     event.event_id,
                                 );
                             }
+                            // An attempt-1 workflow task ending without a
+                            // completion re-arms update delivery: the
+                            // replacement task must carry still-unaccepted
+                            // updates again (transient attempt>1 retries are
+                            // covered by include_sent at the poll edge).
+                            HistoryEventKind::WorkflowTaskFailed { .. }
+                            | HistoryEventKind::WorkflowTaskTimedOut { .. } => {
+                                update_registry.reset_sent_for_run(message.run_key);
+                            }
                             HistoryEventKind::WorkflowExecutionUpdateCompleted {
                                 update_id,
                                 result,
@@ -515,7 +524,10 @@ where
                         workflow_timeout_tracking.remove(message.run_key);
                         wft_timeout_tracking.remove(message.run_key);
                         nexus_timeout_tracking.remove_all_for_run(message.run_key);
-                        update_registry.drain_for_run(message.run_key);
+                        update_registry.drain_for_run(
+                            message.run_key,
+                            close_continues_into_successor(&history_events),
+                        );
                     }
                     if new_state.closed_at.is_some()
                         && let Some((successor_run_id, fork_event_id)) =
@@ -1454,6 +1466,27 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         }
         HistoryEventKind::WorkflowExecutionCanceled { .. } => "WorkflowExecutionCanceled",
     }
+}
+
+/// Whether a close authored by this transition continues into a SUCCESSOR
+/// run — continue-as-new, or a retry/cron chain successor named on the close
+/// event. Distinguishes v1.31.0's `AbortReasonWorkflowContinuing` (in-flight
+/// updates abort RETRYABLE so a retried request lands on the new run) from
+/// `AbortReasonWorkflowCompleted` (abort_reason.go:25-121,
+/// respondworkflowtaskcompleted/api.go:681-700 @ v1.31.0).
+fn close_continues_into_successor(history_events: &[HistoryEvent]) -> bool {
+    history_events.iter().any(|event| match &event.kind {
+        HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => true,
+        HistoryEventKind::WorkflowExecutionFailed {
+            new_execution_run_id,
+            ..
+        }
+        | HistoryEventKind::WorkflowExecutionTimedOut {
+            new_execution_run_id,
+            ..
+        } => new_execution_run_id.is_some(),
+        _ => false,
+    })
 }
 
 /// Whether THIS transition authored the run's close — it appended a terminal

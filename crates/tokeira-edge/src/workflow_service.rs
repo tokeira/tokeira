@@ -509,6 +509,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     async fn pending_update_transports(
         &self,
         run_key: RunKey,
+        include_sent: bool,
     ) -> Result<Vec<PendingUpdateTransport>>;
 
     async fn resolve_update_transport(
@@ -2714,9 +2715,12 @@ impl WorkflowService {
         )
         .await;
 
+        // Each update ships to the worker exactly once; already-sent updates
+        // are re-included only on transient retry attempts (`Send` with
+        // includeAlreadySent = attempt > 1, update.go:404-540 @ v1.31.0).
         for update in self
             .runtime
-            .pending_update_transports(started.run_key)
+            .pending_update_transports(started.run_key, response.attempt > 1)
             .await
             .map_err(EdgeError::from)?
         {
@@ -3275,7 +3279,15 @@ impl WorkflowService {
                     build_id_based_versioning: true,
                     upsert_memo: false,
                     eager_workflow_start: false,
-                    sdk_metadata: false,
+                    // Gates every SDK lang-flag behavior (sdkFlags.tryUse
+                    // returns false without it — internal_flags.go @ sdk
+                    // v1.41.1), including SDKPriorityUpdateHandling: without
+                    // it the Go SDK REJECTS updates delivered before any
+                    // handler is registered instead of queueing them. The
+                    // round-trip it implies is already real: the completion's
+                    // sdk_metadata (lang_used_flags) persists on the
+                    // WorkflowTaskCompleted event and returns in history.
+                    sdk_metadata: true,
                     count_group_by_execution_status: true,
                     nexus: true,
                     server_scaled_deployments: false,

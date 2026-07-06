@@ -86,7 +86,7 @@ mod commit;
 mod lifecycle;
 mod membership;
 mod query;
-mod workflow_task;
+pub(crate) mod workflow_task;
 
 pub(crate) use activity::{
     ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry, exhausted_reason_to_retry_state,
@@ -648,6 +648,7 @@ where
         )));
         let workflow_timeout_scanner_cancel = CancellationToken::new();
         let workflow_timeout_scanner_handle = Some(tokio::spawn(run_workflow_timeout_scanner(
+            repo.clone(),
             workflow_timeout_tracking.clone(),
             lanes.clone(),
             lane_count,
@@ -921,9 +922,13 @@ where
         self.update_registry.clone()
     }
 
-    pub fn pending_update_transports(&self, run_key: RunKey) -> Vec<PendingUpdateTransport> {
+    pub fn pending_update_transports(
+        &self,
+        run_key: RunKey,
+        include_sent: bool,
+    ) -> Vec<PendingUpdateTransport> {
         self.update_registry
-            .drain_pending_updates(run_key)
+            .drain_pending_updates(run_key, include_sent)
             .into_iter()
             .map(
                 |(update_id, update_name, input, identity)| PendingUpdateTransport {

@@ -206,6 +206,7 @@ impl WorkflowRuntimeApi for FakeRuntime {
     async fn pending_update_transports(
         &self,
         _run_key: RunKey,
+        _include_sent: bool,
     ) -> Result<Vec<PendingUpdateTransport>> {
         unreachable!()
     }

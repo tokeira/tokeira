@@ -1117,7 +1117,11 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .inner
             .update_workflow_execution(&headers, edge_req)
             .await?;
-        debug!("update_workflow_execution success");
+        debug!(
+            stage = ?edge_resp.stage,
+            has_outcome = edge_resp.outcome.is_some(),
+            "update_workflow_execution success"
+        );
         Ok(Response::new(translate::update_response_to_proto(
             edge_resp,
         )))
@@ -2106,6 +2110,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 Some(update::Outcome {
                     value: Some(update::outcome::Value::Failure(
                         tokeira_proto::conversions::common::payload_to_failure(&failure),
+                    )),
+                }),
+                tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+            ),
+            Some(tokeira_runtime::UpdateOutcome::AcceptedRunClosed) => (
+                Some(update::Outcome {
+                    value: Some(update::outcome::Value::Failure(
+                        crate::grpc::translate::accepted_update_completed_workflow_failure(),
                     )),
                 }),
                 tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
@@ -3471,6 +3483,7 @@ mod tests {
         async fn pending_update_transports(
             &self,
             _run_key: tokeira_types::RunKey,
+            _include_sent: bool,
         ) -> Result<Vec<tokeira_runtime::PendingUpdateTransport>> {
             Ok(Vec::new())
         }
@@ -3639,6 +3652,7 @@ mod tests {
         async fn pending_update_transports(
             &self,
             _run_key: tokeira_types::RunKey,
+            _include_sent: bool,
         ) -> Result<Vec<tokeira_runtime::PendingUpdateTransport>> {
             Ok(Vec::new())
         }
@@ -3805,6 +3819,7 @@ mod tests {
         async fn pending_update_transports(
             &self,
             _run_key: tokeira_types::RunKey,
+            _include_sent: bool,
         ) -> Result<Vec<tokeira_runtime::PendingUpdateTransport>> {
             Ok(Vec::new())
         }

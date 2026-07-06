@@ -131,6 +131,14 @@ pub struct WorkflowNotReady {
 #[error("query timed out before a worker could process it")]
 pub struct QueryTimedOut;
 
+/// A pre-accepted (admitted/sent) update was aborted because its run closed
+/// with no successor — v1.31.0's `update.AbortedByWorkflowClosingErr`, a
+/// gRPC NotFound with this exact message (errors_failures.go:10-35 +
+/// abort_reason.go:25-121 @ v1.31.0).
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("workflow update was aborted by closing workflow")]
+pub struct UpdateAbortedByClosingWorkflow;
+
 /// Runtime could not resolve a requested workflow update.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum UpdateLifecycleError {

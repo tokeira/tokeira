@@ -1181,6 +1181,7 @@ fn arb_workflow_execution_timed_out_request(
         WorkflowExecutionTimedOutRequest {
             timeout_type,
             retry_state,
+            new_execution_run_id: None,
             now,
         }
     })
@@ -3920,6 +3921,7 @@ fn property_42_parent_close_policy_all_paths() {
                 WorkflowExecutionTimedOutRequest {
                     timeout_type: WorkflowTimeoutType::RunTimeout,
                     retry_state: RetryState::Timeout,
+                    new_execution_run_id: None,
                     now,
                 },
             )),
@@ -4239,6 +4241,7 @@ fn property_57_close_clears_pending_updates() {
             WorkflowExecutionTimedOutRequest {
                 timeout_type: WorkflowTimeoutType::RunTimeout,
                 retry_state: RetryState::Timeout,
+                new_execution_run_id: None,
                 now,
             },
         )),
@@ -4521,6 +4524,7 @@ fn property_63_close_preserves_execution_options() {
             WorkflowExecutionTimedOutRequest {
                 timeout_type: WorkflowTimeoutType::RunTimeout,
                 retry_state: RetryState::Timeout,
+                new_execution_run_id: None,
                 now,
             },
         )),
@@ -4654,6 +4658,7 @@ fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
             Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
                 timeout_type: WorkflowTimeoutType::RunTimeout,
                 retry_state: RetryState::Timeout,
+                new_execution_run_id: None,
                 now,
             })
         }
@@ -5162,6 +5167,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
             WorkflowExecutionTimedOutRequest {
                 timeout_type: WorkflowTimeoutType::RunTimeout,
                 retry_state: RetryState::Timeout,
+                new_execution_run_id: None,
                 now,
             },
         )),

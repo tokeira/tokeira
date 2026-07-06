@@ -823,6 +823,7 @@ fn make_timeout_request() -> WorkflowExecutionTimedOutRequest {
     WorkflowExecutionTimedOutRequest {
         timeout_type: WorkflowTimeoutType::RunTimeout,
         retry_state: RetryState::Timeout,
+        new_execution_run_id: None,
         now: now(),
     }
 }
@@ -5505,10 +5506,13 @@ fn update_rejected_happy_path() {
         )
         .unwrap();
 
-    assert!(matches!(
-        transition.history_events[1].kind,
+    // A rejection writes NO history event — v1.31.0's
+    // RejectWorkflowExecutionUpdate is a documented no-op, and the Go SDK
+    // panics TMPRL1100-nondeterministic replaying any rejection event.
+    assert!(!transition.history_events.iter().any(|event| matches!(
+        event.kind,
         HistoryEventKind::WorkflowExecutionUpdateRejected { .. }
-    ));
+    )));
     assert!(
         !transition
             .next_state
@@ -5553,10 +5557,10 @@ fn update_completed_unknown_update() {
 }
 
 #[test]
-fn update_rejected_unknown_update() {
+fn update_rejected_unknown_update_is_tolerated() {
     let state = make_open_state_with_started_wft();
     let pending = state.pending_workflow_task.clone().unwrap();
-    let reject = kernel()
+    let transition = kernel()
         .apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
@@ -5583,8 +5587,16 @@ fn update_rejected_unknown_update() {
                 now: now(),
             }),
         )
-        .unwrap_err();
-    assert_eq!(reject, Reject::UnknownUpdate("missing".into()));
+        .unwrap();
+    // A rejection for an unknown/already-resolved update is a no-op:
+    // v1.31.0 resurrects from the rejection's embedded request and resolves
+    // without error (TryResurrect, registry.go:455-484) — observably
+    // identical to ignoring it. Erroring here poisoned SDK retries that
+    // re-send a rejection for an update the server already dropped.
+    assert!(!transition.history_events.iter().any(|event| matches!(
+        event.kind,
+        HistoryEventKind::WorkflowExecutionUpdateRejected { .. }
+    )));
 }
 
 #[test]
@@ -5718,16 +5730,21 @@ fn protocol_message_rejected_body() {
             }),
         )
         .unwrap();
-    assert!(matches!(
-        transition.history_events[1].kind,
+    // A rejection writes NO history event — v1.31.0's
+    // RejectWorkflowExecutionUpdate is a documented no-op, and the Go SDK
+    // panics TMPRL1100-nondeterministic replaying any rejection event. The
+    // update just leaves the admitted/pending sets (re-admittable).
+    assert!(!transition.history_events.iter().any(|event| matches!(
+        event.kind,
         HistoryEventKind::WorkflowExecutionUpdateRejected { .. }
-    ));
+    )));
     assert!(
         !transition
             .next_state
             .pending_updates
             .contains_key("update-1")
     );
+    assert!(!transition.next_state.admitted_updates.contains("update-1"));
 }
 
 #[test]
@@ -6178,6 +6195,7 @@ fn dispatch_completion_callback_outcome_timed_out() {
             Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
                 timeout_type: WorkflowTimeoutType::RunTimeout,
                 retry_state: RetryState::Timeout,
+                new_execution_run_id: None,
                 now: now(),
             }),
         )

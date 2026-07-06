@@ -7,7 +7,8 @@
 //! holds the oneshot senders that bridge the gap between the API call and
 //! the lane's eventual `notify` — it is purely in-memory because the
 //! caller's connection lifetime, not durable state, determines how long
-//! the entry lives. When a run closes, `drain_for_run` sends `RunClosed`
+//! the entry lives. When a run closes, `drain_for_run` aborts each waiter
+//! per v1.31.0's abort matrix (closing / continuing / accepted-closed)
 //! to all waiting callers so they don't hang indefinitely.
 
 use std::{
@@ -54,6 +55,14 @@ pub enum UpdateOutcome {
         accepted_event_id: i64,
         failure: Payload,
     },
+    /// The workflow closed after accepting but before completing the update.
+    /// The edge renders v1.31.0's server-authored failure outcome verbatim
+    /// (`acceptedUpdateCompletedWorkflowFailure`: Message "Workflow Update
+    /// failed because the Workflow completed before the Update completed.",
+    /// Source "Server", ApplicationFailureInfo Type
+    /// "AcceptedUpdateCompletedWorkflow" NonRetryable,
+    /// errors_failures.go:10-35 @ v1.31.0).
+    AcceptedRunClosed,
 }
 
 /// How long the caller wants to wait.
@@ -101,12 +110,34 @@ pub enum UpdateTransportResolution {
     Rejected { failure: Payload },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum UpdateResolution {
-    Accepted { accepted_event_id: i64 },
-    Completed { result: Payloads },
-    Rejected { failure: Payload },
-    RunClosed,
+    Accepted {
+        accepted_event_id: i64,
+    },
+    Completed {
+        result: Payloads,
+    },
+    Rejected {
+        failure: Payload,
+    },
+    /// The run closed with NO successor while the update was still
+    /// admitted/sent — v1.31.0 aborts pre-accepted updates with
+    /// `AbortedByWorkflowClosingErr` (NotFound "workflow update was aborted
+    /// by closing workflow"; abort_reason.go:25-121 @ v1.31.0).
+    AbortedByClosingWorkflow,
+    /// The run closed INTO a successor (continue-as-new / retry / cron)
+    /// while the update was still admitted/sent — v1.31.0 aborts with the
+    /// retryable `consts.ErrWorkflowClosing` so a retried request lands the
+    /// update on the new run (`AbortReasonWorkflowContinuing`).
+    WorkflowContinuing,
+    /// The run closed after the worker ACCEPTED the update but before it
+    /// completed — NOT an error: the caller receives a COMPLETED stage with
+    /// the server-authored failure outcome "Workflow Update failed because
+    /// the Workflow completed before the Update completed."
+    /// (`acceptedUpdateCompletedWorkflowFailure`, errors_failures.go:10-35
+    /// @ v1.31.0).
+    AcceptedRunClosed,
 }
 
 #[derive(Debug)]
@@ -120,7 +151,14 @@ pub(crate) struct UpdateRegistryEntry {
     pub update_name: String,
     pub input: Payloads,
     pub identity: String,
-    pub waiter: Option<UpdateWaiter>,
+    pub waiters: Vec<UpdateWaiter>,
+    /// True once this update has been shipped to a worker on a workflow
+    /// task. A sent update is not re-offered on subsequent tasks — v1.31.0
+    /// sends Admitted-state updates exactly once (`needToSend`/`Send`,
+    /// update.go:404-540 @ v1.31.0), re-including already-sent updates only
+    /// on transient retry attempts. Reset when an attempt-1 WFT fails or
+    /// times out so the replacement task carries the update again.
+    pub sent: bool,
     /// True once the worker has accepted this update (the kernel moved it from
     /// `admitted_updates` to `pending_updates`). An accepted update has left the
     /// sendable set: it must not be re-offered as a fresh request message on a
@@ -147,6 +185,12 @@ impl UpdateRegistry {
         Self::default()
     }
 
+    /// Get-or-create the entry for an update and attach the caller's waiter.
+    /// Returns `true` when this call CREATED the entry (the caller must admit
+    /// the update to the kernel) and `false` when it attached to an
+    /// in-flight update — v1.31.0's `FindOrCreate` dedupe: every caller
+    /// sharing an update id shares one update and one outcome
+    /// (registry.go:398-452 @ v1.31.0).
     pub(crate) fn register(
         &self,
         run_key: RunKey,
@@ -156,19 +200,33 @@ impl UpdateRegistry {
         identity: String,
         wait_policy: UpdateWaitPolicy,
         tx: oneshot::Sender<UpdateResolution>,
-    ) {
-        self.inner.lock().unwrap().insert(
-            (run_key, update_id),
-            UpdateRegistryEntry {
-                update_name,
-                input,
-                identity,
-                waiter: Some(UpdateWaiter { wait_policy, tx }),
-                accepted: false,
-            },
-        );
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.entry((run_key, update_id)) {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                occupied
+                    .get_mut()
+                    .waiters
+                    .push(UpdateWaiter { wait_policy, tx });
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(UpdateRegistryEntry {
+                    update_name,
+                    input,
+                    identity,
+                    waiters: vec![UpdateWaiter { wait_policy, tx }],
+                    accepted: false,
+                    sent: false,
+                });
+                true
+            }
+        }
     }
 
+    /// Drop waiters whose callers have gone away (their receiver was
+    /// dropped, e.g. a soft-timeout return). Other callers sharing the
+    /// update keep waiting.
     pub(crate) fn clear_waiter(&self, run_key: RunKey, update_id: &str) {
         if let Some(entry) = self
             .inner
@@ -176,7 +234,7 @@ impl UpdateRegistry {
             .unwrap()
             .get_mut(&(run_key, update_id.to_string()))
         {
-            entry.waiter = None;
+            entry.waiters.retain(|waiter| !waiter.tx.is_closed());
         }
     }
 
@@ -193,23 +251,31 @@ impl UpdateRegistry {
             .unwrap()
             .get_mut(&(run_key, update_id.to_string()))
         {
-            entry.waiter = Some(UpdateWaiter { wait_policy, tx });
+            entry.waiters.push(UpdateWaiter { wait_policy, tx });
             true
         } else {
             false
         }
     }
 
+    /// Updates deliverable on a workflow task: never-accepted entries that
+    /// have not been sent yet — or, when `include_sent` is set (transient
+    /// retry attempts), also the already-sent ones. Returned entries are
+    /// marked sent.
     pub(crate) fn drain_pending_updates(
         &self,
         run_key: RunKey,
+        include_sent: bool,
     ) -> Vec<(String, String, Payloads, String)> {
         self.inner
             .lock()
             .unwrap()
-            .iter()
-            .filter(|((entry_run_key, _), entry)| *entry_run_key == run_key && !entry.accepted)
+            .iter_mut()
+            .filter(|((entry_run_key, _), entry)| {
+                *entry_run_key == run_key && !entry.accepted && (include_sent || !entry.sent)
+            })
             .map(|((_entry_run_key, update_id), entry)| {
+                entry.sent = true;
                 (
                     update_id.clone(),
                     entry.update_name.clone(),
@@ -218,6 +284,16 @@ impl UpdateRegistry {
                 )
             })
             .collect()
+    }
+
+    /// Re-arm delivery after an attempt-1 workflow task failed or timed out:
+    /// the replacement task must carry the still-unaccepted updates again.
+    pub(crate) fn reset_sent_for_run(&self, run_key: RunKey) {
+        for ((entry_run_key, _), entry) in self.inner.lock().unwrap().iter_mut() {
+            if *entry_run_key == run_key && !entry.accepted {
+                entry.sent = false;
+            }
+        }
     }
 
     pub(crate) fn notify(
@@ -233,12 +309,11 @@ impl UpdateRegistry {
             .remove(&(run_key, update_id.to_string()));
         match entry {
             Some(entry) => {
-                if let Some(waiter) = entry.waiter {
-                    let _ = waiter.tx.send(resolution);
-                    true
-                } else {
-                    false
+                let mut notified = false;
+                for waiter in entry.waiters {
+                    notified |= waiter.tx.send(resolution.clone()).is_ok();
                 }
+                notified
             }
             None => false,
         }
@@ -250,8 +325,7 @@ impl UpdateRegistry {
         update_id: &str,
         accepted_event_id: i64,
     ) -> bool {
-        let mut waiter_to_notify = None;
-        let mut remove_entry = false;
+        let mut waiters_to_notify = Vec::new();
         {
             let mut inner = self.inner.lock().unwrap();
             if let Some(entry) = inner.get_mut(&(run_key, update_id.to_string())) {
@@ -259,34 +333,33 @@ impl UpdateRegistry {
                 // a subsequent workflow task does not re-offer it (which would make
                 // the worker re-accept and trip the kernel's DuplicateUpdateId guard).
                 entry.accepted = true;
-                match entry
-                    .waiter
-                    .as_ref()
-                    .map(|waiter| waiter.wait_policy.clone())
-                {
-                    Some(UpdateWaitPolicy::Accepted) => {
-                        waiter_to_notify = entry.waiter.take();
-                        remove_entry = true;
-                    }
-                    Some(UpdateWaitPolicy::Completed) => {}
-                    Some(UpdateWaitPolicy::Unspecified | UpdateWaitPolicy::Admitted) | None => {
-                        remove_entry = true;
+                // Accepted-stage waiters resolve now; Completed-stage waiters
+                // keep waiting on the same entry. The entry itself is retained
+                // (accepted=true) so a close can still deliver the
+                // accepted-but-completed-before outcome to remaining waiters.
+                let mut kept = Vec::new();
+                for waiter in entry.waiters.drain(..) {
+                    match waiter.wait_policy {
+                        UpdateWaitPolicy::Accepted => waiters_to_notify.push(waiter),
+                        UpdateWaitPolicy::Completed => kept.push(waiter),
+                        UpdateWaitPolicy::Unspecified | UpdateWaitPolicy::Admitted => {}
                     }
                 }
-            }
-            if remove_entry {
-                inner.remove(&(run_key, update_id.to_string()));
+                entry.waiters = kept;
+                // The entry stays until terminal resolution (notify/drain):
+                // it is the dedupe anchor — a repeat request for an accepted
+                // update attaches here instead of re-admitting.
             }
         }
 
-        if let Some(waiter) = waiter_to_notify {
-            let _ = waiter
+        let mut notified = false;
+        for waiter in waiters_to_notify {
+            notified |= waiter
                 .tx
-                .send(UpdateResolution::Accepted { accepted_event_id });
-            true
-        } else {
-            false
+                .send(UpdateResolution::Accepted { accepted_event_id })
+                .is_ok();
         }
+        notified
     }
 
     pub(crate) fn remove(&self, run_key: RunKey, update_id: &str) {
@@ -296,7 +369,14 @@ impl UpdateRegistry {
             .remove(&(run_key, update_id.to_string()));
     }
 
-    pub(crate) fn drain_for_run(&self, run_key: RunKey) -> usize {
+    /// Abort every in-flight update for a closing run, resolving each waiter
+    /// per v1.31.0's abort matrix (abort_reason.go:25-121): accepted updates
+    /// get the non-error completed-before failure outcome regardless of the
+    /// close shape; admitted/sent updates get the retryable continuing abort
+    /// when the close created a successor run, else the closing-workflow
+    /// NotFound abort. `continuing` is true when the close authored a
+    /// successor (continue-as-new / retry / cron).
+    pub(crate) fn drain_for_run(&self, run_key: RunKey, continuing: bool) -> usize {
         let mut drained = Vec::new();
         {
             let mut inner = self.inner.lock().unwrap();
@@ -313,8 +393,15 @@ impl UpdateRegistry {
         }
         let count = drained.len();
         for entry in drained {
-            if let Some(waiter) = entry.waiter {
-                let _ = waiter.tx.send(UpdateResolution::RunClosed);
+            let resolution = if entry.accepted {
+                UpdateResolution::AcceptedRunClosed
+            } else if continuing {
+                UpdateResolution::WorkflowContinuing
+            } else {
+                UpdateResolution::AbortedByClosingWorkflow
+            };
+            for waiter in entry.waiters {
+                let _ = waiter.tx.send(resolution.clone());
             }
         }
         count
@@ -431,7 +518,7 @@ mod tests {
 
         // While Admitted (not yet accepted), the update must be offered to the worker.
         assert_eq!(
-            registry.drain_pending_updates(run_key).len(),
+            registry.drain_pending_updates(run_key, false).len(),
             1,
             "an admitted update should be offered to the worker"
         );
@@ -450,7 +537,7 @@ mod tests {
         // REGRESSION: an accepted update must not be re-offered on a subsequent WFT.
         // Today this returns the update, causing a double-accept → DuplicateUpdateId.
         assert!(
-            registry.drain_pending_updates(run_key).is_empty(),
+            registry.drain_pending_updates(run_key, false).is_empty(),
             "an accepted update must not be re-offered as a pending transport"
         );
     }
@@ -481,11 +568,17 @@ mod tests {
             tx2,
         );
 
-        assert_eq!(registry.drain_for_run(run_key), 2);
+        assert_eq!(registry.drain_for_run(run_key, false), 2);
         assert!(!registry.contains(run_key, "update-1"));
         assert!(!registry.contains(run_key, "update-2"));
-        assert!(matches!(rx1.await, Ok(UpdateResolution::RunClosed)));
-        assert!(matches!(rx2.await, Ok(UpdateResolution::RunClosed)));
+        assert!(matches!(
+            rx1.await,
+            Ok(UpdateResolution::AbortedByClosingWorkflow)
+        ));
+        assert!(matches!(
+            rx2.await,
+            Ok(UpdateResolution::AbortedByClosingWorkflow)
+        ));
     }
 
     // ── Property 1: Update command preserves caller
@@ -1046,8 +1139,8 @@ mod tests {
                     receivers.push((uid, rx));
                 }
 
-                let drained =
-                    registry.drain_for_run(run_key);
+                let drained = registry
+                    .drain_for_run(run_key, false);
                 prop_assert_eq!(drained, k);
 
                 // All entries removed.
@@ -1056,12 +1149,12 @@ mod tests {
                         .contains(run_key, uid));
                 }
 
-                // All callers got RunClosed.
+                // All callers got the closing abort.
                 for (_, rx) in receivers {
                     let got = rx.await.unwrap();
                     prop_assert!(matches!(
                         got,
-                        UpdateResolution::RunClosed
+                        UpdateResolution::AbortedByClosingWorkflow
                     ));
                 }
                 Ok(())
@@ -1150,13 +1243,13 @@ mod tests {
                 _ => {
                     // Run close (drain)
                     let n = registry
-                        .drain_for_run(run_key);
+                        .drain_for_run(run_key, false);
                     prop_assert_eq!(n, 1);
                     let got =
                         rx.blocking_recv().unwrap();
                     let is_closed = matches!(
                         got,
-                        UpdateResolution::RunClosed
+                        UpdateResolution::AbortedByClosingWorkflow
                     );
                     prop_assert!(is_closed);
                 }

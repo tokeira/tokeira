@@ -411,6 +411,25 @@ where
         let run_key = req.token.run_key;
         let completion_token = req.token.clone();
         let completion_identity = req.identity.clone();
+        // Rejections write NO history event (v1.31.0's
+        // RejectWorkflowExecutionUpdate is a documented no-op), so the lane's
+        // post-commit event scan cannot resolve their waiters — capture them
+        // before `req` moves and publish the rejection outcomes once the
+        // completion durably commits.
+        let rejected_updates: Vec<(String, tokeira_types::Payload)> = req
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                tokeira_kernel::WorkflowCommand::ProtocolMessage {
+                    body: tokeira_kernel::UpdateProtocolBody::Rejected { update_id, failure },
+                    ..
+                }
+                | tokeira_kernel::WorkflowCommand::UpdateRejected { update_id, failure } => {
+                    Some((update_id.clone(), failure.clone()))
+                }
+                _ => None,
+            })
+            .collect();
         let cron_continuation = self.cron_continuation_for_completion(run_key, &req).await?;
         // Retry is evaluated before cron (retry.go @ v1.31.0). The cron helper
         // already declines when a retry policy is present on a FailWorkflow, so
@@ -518,6 +537,16 @@ where
                     .lock()
                     .expect("close-attempt tracking lock")
                     .remove(&run_key);
+                // Publish rejection outcomes now that the completion is
+                // durable: the rejected update left the kernel's admitted set
+                // with no event, and its waiters resolve off the event log.
+                for (update_id, failure) in rejected_updates {
+                    self.update_registry.notify(
+                        run_key,
+                        &update_id,
+                        crate::update::UpdateResolution::Rejected { failure },
+                    );
+                }
                 runtime_metrics::record_workflow_task_completed(OutcomeLabel::Success);
             }
             Ok(CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. })
@@ -726,76 +755,8 @@ where
             Some(HistoryEventKind::WorkflowExecutionStarted { input, .. }) => input.clone(),
             _ => Payloads::default(),
         };
-        let backoff = retry_backoff(&policy, state.attempt);
-        let successor_run_key = RunKey::derive(state.namespace_id, &state.workflow_id, new_run_id);
-        // Chain origin propagates so execution-level timeouts and lineage queries
-        // span the whole retry chain, not just this hop.
-        let first_execution_run_id = Some(state.first_execution_run_id.unwrap_or(state.run_id));
-        let first_run_started_at = Some(state.first_run_started_at.unwrap_or(state.started_at));
-        // Root identity only propagates within a child lineage.
-        let (root_workflow_id, root_run_id) = if state.parent_run_key.is_some() {
-            (state.root_workflow_id.clone(), state.root_run_id)
-        } else {
-            (None, None)
-        };
-        let start_request = StartRequest {
-            run_key: successor_run_key,
-            namespace_id: state.namespace_id,
-            workflow_id: state.workflow_id.clone(),
-            run_id: new_run_id,
-            workflow_type: state.workflow_type.clone(),
-            task_queue: state.task_queue.clone(),
-            deployment: state.deployment.clone(),
-            build_id: state.build_id.clone(),
-            versioning_override: state.versioning_override().cloned(),
-            workflow_start_delay: Some(backoff),
-            completion_callbacks: state.completion_callbacks.clone(),
-            user_metadata: state.user_metadata.clone(),
-            links: Vec::new(),
-            on_conflict_options: None,
-            priority: state.priority.clone(),
-            input,
-            header: None,
-            memo: state.memo.clone(),
-            search_attributes: state.search_attributes.clone(),
-            workflow_execution_timeout: state.workflow_execution_timeout,
-            workflow_run_timeout: state.workflow_run_timeout,
-            workflow_task_timeout: state.workflow_task_timeout,
-            retry_policy: Some(policy),
-            conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
-            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
-            attempt: state.attempt + 1,
-            continued_execution_run_id: Some(state.run_id),
-            first_execution_run_id,
-            parent_run_key: None,
-            parent_workflow_id: None,
-            parent_run_id: None,
-            parent_namespace_id: None,
-            parent_initiated_event_id: 0,
-            root_workflow_id,
-            root_run_id,
-            original_execution_run_id: Some(
-                state.original_execution_run_id.unwrap_or(state.run_id),
-            ),
-            continued_failure: state.close_failure.clone(),
-            last_completion_result: state.close_result.clone(),
-            first_run_started_at,
-            request: RequestContext {
-                // Deterministic request id keyed on (predecessor, successor) so a
-                // replayed close dedupes to the same successor start instead of
-                // forking a duplicate run (mirrors the continue-as-new key).
-                request_id: tokeira_types::RequestId(format!(
-                    "workflow-retry:{}:{}",
-                    state.run_id.0, new_run_id.0
-                )),
-                caller_identity: None,
-                received_at: OffsetDateTime::now_utc(),
-            },
-            now: OffsetDateTime::now_utc(),
-            client_cron_schedule: None,
-            cron_schedule: None,
-            reserved_poller_identity: None,
-        };
+        let start_request = build_retry_successor_start(&state, &policy, input, new_run_id);
+        let successor_run_key = start_request.run_key;
         let shard_id = self.shard_id_for(successor_run_key).await;
         match self
             .submit(successor_run_key, Command::Start(start_request))
@@ -1069,7 +1030,7 @@ fn workflow_failure_is_retryable(failure: &Payload, non_retryable_types: &[Strin
 /// `maximum_interval` when set (`retry.go @ v1.31.0`). Wall-clock-free and
 /// deterministic, so the retry decision and the successor start compute the same
 /// delay without threading it through the kernel.
-fn retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
+pub(crate) fn retry_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1) as f64;
     let seconds =
         policy.initial_interval.as_seconds_f64() * policy.backoff_coefficient.powf(exponent);
@@ -1095,6 +1056,89 @@ fn server_failure_payload(message: &str) -> Payload {
         )),
         ..Default::default()
     })
+}
+
+/// Build the attempt-N+1 retry successor start from the CLOSED predecessor's
+/// state — shared by the WFT-completion failure path and the workflow-timeout
+/// scanner (a RUN timeout with attempts remaining also continues the retry
+/// chain, timer_queue_active_task_executor.go:713-796 @ v1.31.0). The
+/// successor inherits type/queue/input/policy/timeouts, chains its lineage
+/// (`continued_execution_run_id`, first-run identity), and delays its first
+/// workflow task by the recomputed backoff.
+pub(crate) fn build_retry_successor_start(
+    state: &tokeira_kernel::WorkflowState,
+    policy: &tokeira_types::RetryPolicy,
+    input: Payloads,
+    new_run_id: RunId,
+) -> StartRequest {
+    let backoff = retry_backoff(policy, state.attempt);
+    let successor_run_key = RunKey::derive(state.namespace_id, &state.workflow_id, new_run_id);
+    // Chain origin propagates so execution-level timeouts and lineage queries
+    // span the whole retry chain, not just this hop.
+    let first_execution_run_id = Some(state.first_execution_run_id.unwrap_or(state.run_id));
+    let first_run_started_at = Some(state.first_run_started_at.unwrap_or(state.started_at));
+    // Root identity only propagates within a child lineage.
+    let (root_workflow_id, root_run_id) = if state.parent_run_key.is_some() {
+        (state.root_workflow_id.clone(), state.root_run_id)
+    } else {
+        (None, None)
+    };
+    StartRequest {
+        run_key: successor_run_key,
+        namespace_id: state.namespace_id,
+        workflow_id: state.workflow_id.clone(),
+        run_id: new_run_id,
+        workflow_type: state.workflow_type.clone(),
+        task_queue: state.task_queue.clone(),
+        deployment: state.deployment.clone(),
+        build_id: state.build_id.clone(),
+        versioning_override: state.versioning_override().cloned(),
+        workflow_start_delay: Some(backoff),
+        completion_callbacks: state.completion_callbacks.clone(),
+        user_metadata: state.user_metadata.clone(),
+        links: Vec::new(),
+        on_conflict_options: None,
+        priority: state.priority.clone(),
+        input,
+        header: None,
+        memo: state.memo.clone(),
+        search_attributes: state.search_attributes.clone(),
+        workflow_execution_timeout: state.workflow_execution_timeout,
+        workflow_run_timeout: state.workflow_run_timeout,
+        workflow_task_timeout: state.workflow_task_timeout,
+        retry_policy: Some(policy.clone()),
+        conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+        reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+        attempt: state.attempt + 1,
+        continued_execution_run_id: Some(state.run_id),
+        first_execution_run_id,
+        parent_run_key: None,
+        parent_workflow_id: None,
+        parent_run_id: None,
+        parent_namespace_id: None,
+        parent_initiated_event_id: 0,
+        root_workflow_id,
+        root_run_id,
+        original_execution_run_id: Some(state.original_execution_run_id.unwrap_or(state.run_id)),
+        continued_failure: state.close_failure.clone(),
+        last_completion_result: state.close_result.clone(),
+        first_run_started_at,
+        request: RequestContext {
+            // Deterministic request id keyed on (predecessor, successor) so a
+            // replayed close dedupes to the same successor start instead of
+            // forking a duplicate run (mirrors the continue-as-new key).
+            request_id: tokeira_types::RequestId(format!(
+                "workflow-retry:{}:{}",
+                state.run_id.0, new_run_id.0
+            )),
+            caller_identity: None,
+            received_at: OffsetDateTime::now_utc(),
+        },
+        now: OffsetDateTime::now_utc(),
+        client_cron_schedule: None,
+        cron_schedule: None,
+        reserved_poller_identity: None,
+    }
 }
 
 #[cfg(test)]

@@ -217,6 +217,9 @@ pub fn update_response(
             accepted_event_id,
             failure,
         },
+        tokeira_runtime::UpdateOutcome::AcceptedRunClosed => {
+            crate::translate::UpdateOutcomeDto::AcceptedRunClosed
+        }
     });
     crate::translate::UpdateWorkflowExecutionResponse {
         update_ref: crate::translate::UpdateRefDto {

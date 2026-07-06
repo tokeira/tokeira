@@ -958,6 +958,12 @@ pub struct WorkflowExecutionTimedOutRequest {
     pub timeout_type: WorkflowTimeoutType,
     /// Retry decision outcome.
     pub retry_state: RetryState,
+    /// Run id of the retry successor when the run's retry policy continues
+    /// the chain past a RUN timeout (`new_execution_run_id` on the
+    /// `WorkflowExecutionTimedOut` event; the SDK's follow-runs machinery
+    /// keys on it). `None` on terminal timeouts.
+    #[serde(default)]
+    pub new_execution_run_id: Option<RunId>,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }

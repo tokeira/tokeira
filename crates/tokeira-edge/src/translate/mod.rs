@@ -823,6 +823,10 @@ pub enum UpdateOutcomeDto {
         accepted_event_id: i64,
         failure: Payload,
     },
+    /// Workflow closed after accepting but before completing the update;
+    /// serialized as v1.31.0's `acceptedUpdateCompletedWorkflowFailure`
+    /// (errors_failures.go:10-35 @ v1.31.0).
+    AcceptedRunClosed,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -380,8 +380,11 @@ where
     async fn pending_update_transports(
         &self,
         run_key: tokeira_types::RunKey,
+        include_sent: bool,
     ) -> Result<Vec<PendingUpdateTransport>> {
-        Ok(self.runtime.pending_update_transports(run_key))
+        Ok(self
+            .runtime
+            .pending_update_transports(run_key, include_sent))
     }
 
     async fn resolve_update_transport(

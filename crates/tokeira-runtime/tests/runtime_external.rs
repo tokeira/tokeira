@@ -63,6 +63,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
                 control: "ctl".into(),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -136,6 +137,7 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
                 control: "ctl".into(),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -215,6 +217,7 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
                 control: "ctl".into(),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -281,6 +284,7 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
                 control: "ctl".into(),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;

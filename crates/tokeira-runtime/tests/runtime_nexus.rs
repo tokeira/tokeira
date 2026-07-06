@@ -195,6 +195,7 @@ async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<
                 start_to_close_timeout: None,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -265,6 +266,7 @@ async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
                 start_to_close_timeout: None,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -343,6 +345,7 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
                 start_to_close_timeout: None,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -409,6 +412,7 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
             sticky: None,
             commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -518,6 +522,7 @@ async fn nexus_schedule_to_start_times_out_via_scanner() -> Result<()> {
                 start_to_close_timeout: None,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -630,6 +635,7 @@ async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
                 start_to_close_timeout: None,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -723,6 +729,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
                 start_to_close_timeout: None,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -786,6 +793,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             sticky: None,
             commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -883,6 +891,7 @@ proptest! {
                         start_to_close_timeout: None,
                     }],
                     force_new_workflow_task: false,
+                    delivered_update_ids: Vec::new(),
                     now: OffsetDateTime::now_utc(),
                 })
                 .await
@@ -995,6 +1004,7 @@ proptest! {
                 sticky: None,
                     commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
                     force_new_workflow_task: false,
+                    delivered_update_ids: Vec::new(),
                     now: OffsetDateTime::now_utc(),
                 })
                 .await
@@ -1087,6 +1097,7 @@ async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
                 start_to_close_timeout: None,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -1183,6 +1194,7 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
                 start_to_close_timeout: None,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -1694,6 +1706,7 @@ async fn close_workflow_with_callback(
             sticky: None,
             commands: vec![close],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;

@@ -72,6 +72,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
                 parent_close_policy: ParentClosePolicy::Terminate,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -113,6 +114,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
                 result: payloads("child-result"),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -193,6 +195,7 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
                 result: payloads("parent-done"),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -261,6 +264,7 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
                 result: payloads("parent-done"),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -346,6 +350,7 @@ async fn duplicate_child_start_delivers_failed_confirmation_to_parent() -> Resul
                 parent_close_policy: ParentClosePolicy::Terminate,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -418,6 +423,7 @@ async fn start_parent_with_child(
                 parent_close_policy,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;

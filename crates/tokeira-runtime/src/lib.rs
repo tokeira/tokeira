@@ -47,6 +47,7 @@ pub mod runtime;
 pub mod scanner;
 pub mod schedule;
 pub mod shard;
+pub mod speculative_timer;
 pub mod task_queue_config;
 pub mod timeout;
 pub mod update;

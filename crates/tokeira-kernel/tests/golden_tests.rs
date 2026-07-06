@@ -1225,6 +1225,7 @@ fn sticky_completion_dispatches_next_wft_sticky_then_s2s_times_out() {
                 }),
                 commands: vec![],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -2282,6 +2283,7 @@ fn wft_completed_paused_workflow_no_force_wft() {
                 sticky: None,
                 commands: vec![],
                 force_new_workflow_task: true,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -2317,6 +2319,7 @@ fn wft_completion_tracks_previous_started_event_id() {
                 sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -2704,6 +2707,7 @@ fn workflow_task_completed_with_activity_and_timer() {
                     },
                 ],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -2775,6 +2779,7 @@ fn workflow_task_completed_with_complete_workflow() {
                     result: payloads("done"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -2824,6 +2829,7 @@ fn workflow_task_completed_with_fail_workflow() {
                     failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -2911,6 +2917,7 @@ fn continue_as_new_closes_run() {
                 sticky: None,
                 commands: vec![command.clone()],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -2977,6 +2984,7 @@ fn continue_as_new_then_another_command() {
                     WorkflowCommand::RequestNewWorkflowTask,
                 ],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         ),
@@ -3135,6 +3143,7 @@ fn fail_workflow_with_retry_policy() {
                     failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -3178,6 +3187,7 @@ fn fail_workflow_without_retry_policy() {
                     failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -3717,6 +3727,7 @@ fn reject_wft_completed_no_pending() {
                 sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             })
         ),
@@ -3748,6 +3759,7 @@ fn reject_wft_completed_not_started() {
                 sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             })
         ),
@@ -3780,6 +3792,7 @@ fn reject_wft_completed_seq_mismatch() {
                 sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             })
         ),
@@ -3815,6 +3828,7 @@ fn reject_wft_completed_token_mismatch() {
                 sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             })
         ),
@@ -3892,6 +3906,7 @@ fn reject_duplicate_activity_id() {
                     heartbeat_timeout: None,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             })
         ),
@@ -3936,6 +3951,7 @@ fn reject_duplicate_timer_id() {
                     fire_at: now()
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             })
         ),
@@ -4215,6 +4231,7 @@ fn reject_commands_after_close() {
                     WorkflowCommand::RequestNewWorkflowTask,
                 ],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             })
         ),
@@ -4247,6 +4264,7 @@ fn cancel_workflow_command() {
                 sticky: None,
                 commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -4304,6 +4322,7 @@ fn cancel_workflow_then_another_command() {
                     WorkflowCommand::RequestNewWorkflowTask,
                 ],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         ),
@@ -4338,6 +4357,7 @@ fn request_cancel_activity() {
                     scheduled_event_id: 7,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -4392,6 +4412,7 @@ fn request_cancel_activity_started_sets_durable_cancel_requested() {
                     scheduled_event_id: 7,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -4442,6 +4463,7 @@ fn request_cancel_activity_unknown() {
                 scheduled_event_id: 999,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: now(),
         }),
     );
@@ -4505,6 +4527,7 @@ fn close_command_with_buffered_events_is_unhandled_command() {
                 result: payloads("done"),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: now(),
         }),
     );
@@ -4544,6 +4567,7 @@ fn cancel_timer() {
                     timer_id: "timer-1".into(),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -4586,6 +4610,7 @@ fn cancel_timer_unknown() {
                 timer_id: "missing".into(),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: now(),
         }),
     );
@@ -4640,6 +4665,7 @@ fn record_marker_missing_name_fails_wft() {
                 header: None,
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: now(),
         }),
     );
@@ -4698,6 +4724,7 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
                 sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -4787,6 +4814,7 @@ fn cancel_timer_fired_and_buffered_deletes_buffered_fired_event() {
                     timer_id: "timer-1".into(),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -4833,6 +4861,7 @@ fn request_cancel_activity_then_resolved_canceled() {
                     scheduled_event_id: 7,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -4929,6 +4958,7 @@ fn cancel_then_cancel_workflow_e2e() {
                 sticky: None,
                 commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5115,6 +5145,7 @@ fn start_child_workflow_happy_path() {
                     parent_close_policy: ParentClosePolicy::Terminate,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5280,6 +5311,7 @@ fn signal_external_workflow_happy_path() {
                     control: "ctl".into(),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5353,6 +5385,7 @@ fn request_cancel_external_workflow_happy_path() {
                     control: "ctl".into(),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5570,6 +5603,7 @@ fn update_completed_happy_path() {
                     result: payloads("done"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5621,6 +5655,7 @@ fn update_rejected_happy_path() {
                     failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5670,6 +5705,7 @@ fn update_completed_unknown_update() {
                     result: payloads("done"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5706,6 +5742,7 @@ fn update_rejected_unknown_update_is_tolerated() {
                     failure: payload("nope"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5755,6 +5792,7 @@ fn protocol_message_accepted_body() {
                     },
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5805,6 +5843,7 @@ fn protocol_message_completed_body() {
                     },
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5858,6 +5897,7 @@ fn protocol_message_rejected_body() {
                     },
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5919,6 +5959,7 @@ fn complete_workflow_clears_pending_updates() {
                     result: payloads("done"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -5959,6 +6000,7 @@ fn record_marker_happy_path() {
                     header: header.clone(),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -6017,6 +6059,7 @@ fn record_marker_after_close_rejected() {
                     },
                 ],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -6223,6 +6266,7 @@ fn close_via_wft(state: WorkflowState, commands: Vec<WorkflowCommand>) -> Transi
                 sticky: None,
                 commands,
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -6507,6 +6551,7 @@ fn schedule_nexus_operation_happy_path() {
                     start_to_close_timeout: None,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -6565,6 +6610,7 @@ fn schedule_nexus_operation_duplicate_rejected() {
                     start_to_close_timeout: None,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -6601,6 +6647,7 @@ fn cancel_nexus_operation_happy_path() {
                     scheduled_event_id: 12,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -6661,6 +6708,7 @@ fn cancel_nexus_operation_unknown() {
                     scheduled_event_id: 12,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -7125,6 +7173,7 @@ fn close_via_complete_clears_pending_nexus_operations() {
                     result: payloads("done"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now: now(),
             }),
         )
@@ -7373,6 +7422,7 @@ fn speculative_completion_request(
         sticky: None,
         commands,
         force_new_workflow_task: false,
+        delivered_update_ids: Vec::new(),
         now: now(),
     }
 }

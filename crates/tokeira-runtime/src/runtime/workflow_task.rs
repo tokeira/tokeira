@@ -289,32 +289,59 @@ where
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<WorkflowActivation>> {
-        let polled = match self
-            .broker
-            .poll_workflow_activation(&queue, &worker_identity, timeout_after)
-            .await?
-        {
-            Some(polled) => {
-                self.delivery_metrics.record_poll_success(&queue);
-                polled
-            }
-            None => {
-                self.delivery_metrics.record_poll_timeout(&queue);
-                return Ok(None);
-            }
-        };
+        let deadline = tokio::time::Instant::now() + timeout_after;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let polled = match self
+                .broker
+                .poll_workflow_activation(&queue, &worker_identity, remaining)
+                .await?
+            {
+                Some(polled) => {
+                    self.delivery_metrics.record_poll_success(&queue);
+                    polled
+                }
+                None => {
+                    self.delivery_metrics.record_poll_timeout(&queue);
+                    return Ok(None);
+                }
+            };
 
-        match polled {
-            WorkflowPollResult::Queued(offered, entered_at) => {
-                let started = self
-                    .start_polled_workflow_task(offered, entered_at, worker_identity)
-                    .await?;
-                Ok(Some(WorkflowActivation::WorkflowTask(started)))
+            match polled {
+                WorkflowPollResult::Queued(offered, entered_at) => {
+                    match self
+                        .start_polled_workflow_task(offered, entered_at, worker_identity.clone())
+                        .await
+                    {
+                        Ok(started) => {
+                            return Ok(Some(WorkflowActivation::WorkflowTask(started)));
+                        }
+                        // A broker entry that no longer matches the run's current
+                        // pending task — superseded by a schedule-to-start /
+                        // start-to-close timeout that reclaimed and rescheduled
+                        // it, or already started — is discarded (the poll already
+                        // removed it from the broker) and we re-poll for the fresh
+                        // task rather than surfacing a stale error to the worker.
+                        // This is the poll-side of Invariant I.1's "clear broker
+                        // in-flight" for a superseded speculative task (spec
+                        // speculative-wft R.2). A non-stale error propagates.
+                        Err(error) if is_stale_workflow_task_start(&error) => {
+                            tracing::debug!(
+                                ?error,
+                                "discarded superseded workflow task from broker; re-polling"
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                WorkflowPollResult::Started(started) => {
+                    return Ok(Some(WorkflowActivation::WorkflowTask(started)));
+                }
+                WorkflowPollResult::Query(query) => {
+                    return Ok(Some(WorkflowActivation::QueryTask(query)));
+                }
             }
-            WorkflowPollResult::Started(started) => {
-                Ok(Some(WorkflowActivation::WorkflowTask(started)))
-            }
-            WorkflowPollResult::Query(query) => Ok(Some(WorkflowActivation::QueryTask(query))),
         }
     }
 
@@ -411,6 +438,18 @@ where
         let run_key = req.token.run_key;
         let completion_token = req.token.clone();
         let completion_identity = req.identity.clone();
+        // A heartbeat completion (`ForceCreateNewWorkflowTask`) never re-sent
+        // the already-sent updates, so it must not reject-unprocessed them
+        // (Req 9 guard, workflow_task_completed_handler.go:229-231 @ v1.31.0).
+        let is_heartbeat_completion = req.force_new_workflow_task;
+        // Stamp the set of updates DELIVERED on this task (Sent, not yet
+        // accepted) so the kernel can reject-unprocessed the ones the worker
+        // ignored within the same completion transition, distinguishing them
+        // from updates admitted while the task ran (which ride the follow-up
+        // task — K7). Read now, before the commit processes the worker's
+        // accept/reject commands (spec speculative-wft Req 9).
+        let mut req = req;
+        req.delivered_update_ids = self.update_registry.sent_update_ids(run_key);
         // Rejections write NO history event (v1.31.0's
         // RejectWorkflowExecutionUpdate is a documented no-op), so the lane's
         // post-commit event scan cannot resolve their waiters — capture them
@@ -485,6 +524,13 @@ where
                 None => cause.as_str().to_string(),
             };
             runtime_metrics::record_workflow_task_completed(OutcomeLabel::Rejected);
+            // R.3: a server-decided WFT failure (invalid command) aborts Sent
+            // update waiters too — v1.31.0's `AbortReasonWorkflowTaskFailed`
+            // fires for every `wtFailedCause != nil` completion, not only bad
+            // update messages (respondworkflowtaskcompleted/api.go:454-460 @
+            // v1.31.0). Fired before the WFT-failed persist (see the bad-message
+            // arm) so it reads the still-Sent state.
+            self.update_registry.abort_sent_for_wft_failure(run_key);
             let is_unhandled_command =
                 cause == tokeira_kernel::WorkflowTaskFailedCause::UnhandledCommand;
             let drop_without_failing = completion_token.attempt > 1 && !is_unhandled_command;
@@ -552,6 +598,16 @@ where
             // workflow_task_completed_handler.go:1502-1510 @ v1.31.0).
             let persisted_message = format!("{}: {}", cause.as_str(), message);
             runtime_metrics::record_workflow_task_completed(OutcomeLabel::Rejected);
+            // R.3 (spec speculative-wft Req 6.3): a SERVER-decided WFT failure
+            // aborts every Sent update waiter with the non-retryable
+            // WorkflowNotReady `workflowTaskFailErr` — distinct from an explicit
+            // RespondWorkflowTaskFailed, which leaves the update admitted for
+            // redelivery (`AbortReasonWorkflowTaskFailed`, abort_reason.go:86-103
+            // @ v1.31.0; `TestValidateWorkerMessages`,
+            // `TestSpeculativeWorkflowTask_Fail`). Fired before the WFT-failed
+            // persist so the abort reads the still-Sent state — the persisted
+            // event's `reset_sent_for_run` would otherwise clear it first.
+            self.update_registry.abort_sent_for_wft_failure(run_key);
             // Same transient-attempt drop rule as the invalid-command arm:
             // attempt > 1 on a non-UnhandledCommand cause is dropped to time
             // out instead of persisting a failure event (api.go:478-481
@@ -602,6 +658,24 @@ where
                         &update_id,
                         crate::update::UpdateResolution::Rejected { failure },
                     );
+                }
+                // R.4 (spec speculative-wft Req 9): after a non-heartbeat
+                // completion that left the run open, updates the worker was
+                // sent but neither accepted nor rejected are auto-rejected with
+                // the server-authored `unprocessedUpdateFailure` and never
+                // redelivered (`rejectUnprocessedUpdates`,
+                // workflow_task_completed_handler.go:213-262 @ v1.31.0). Runs
+                // after the acceptance/rejection notifies above so the
+                // remaining Sent-not-accepted entries are exactly the ignored
+                // set. The kernel pruned the same ids from its admitted set in
+                // the completion transition (via `delivered_update_ids`) so the
+                // follow-up task carries only the mid-task admissions.
+                let run_still_open = match &result {
+                    Ok(CommitResult::Applied { new_state }) => new_state.closed_at.is_none(),
+                    _ => false,
+                };
+                if !is_heartbeat_completion && run_still_open {
+                    self.update_registry.reject_unprocessed(run_key);
                 }
                 runtime_metrics::record_workflow_task_completed(OutcomeLabel::Success);
             }
@@ -945,15 +1019,20 @@ where
             shard_epoch: self.current_shard_epoch(new_state.run_key).await?,
         };
         let shard_id = self.shard_id_for(new_state.run_key).await;
-        self.wft_timeout_tracking.insert(WftTimeoutEntry {
-            kind: WftTimeoutKind::StartToClose,
-            run_key: new_state.run_key,
-            shard_id,
-            logical_seq: pending.logical_seq,
-            started_event_id,
-            started_at: pending.started_at.unwrap_or(now),
-            workflow_task_timeout: new_state.workflow_task_timeout,
-        });
+        // A SPECULATIVE task's start-to-close is enforced by the precise
+        // in-memory timer the lane armed on this same WorkflowTaskStarted commit
+        // (spec speculative-wft R.2), so it is kept out of the coarse sweep.
+        if pending.task_type != tokeira_kernel::WorkflowTaskType::Speculative {
+            self.wft_timeout_tracking.insert(WftTimeoutEntry {
+                kind: WftTimeoutKind::StartToClose,
+                run_key: new_state.run_key,
+                shard_id,
+                logical_seq: pending.logical_seq,
+                started_event_id,
+                started_at: pending.started_at.unwrap_or(now),
+                workflow_task_timeout: new_state.workflow_task_timeout,
+            });
+        }
         self.delivery_metrics
             .record_latency(&offered.queue, entered_at.elapsed());
 
@@ -1009,15 +1088,19 @@ where
             shard_epoch: self.current_shard_epoch(state.run_key).await?,
         };
         let shard_id = self.shard_id_for(state.run_key).await;
-        self.wft_timeout_tracking.insert(WftTimeoutEntry {
-            kind: WftTimeoutKind::StartToClose,
-            run_key: state.run_key,
-            shard_id,
-            logical_seq: pending.logical_seq,
-            started_event_id,
-            started_at,
-            workflow_task_timeout: state.workflow_task_timeout,
-        });
+        // Speculative tasks use the precise in-memory timer (armed by the lane
+        // on the start commit), not the coarse sweep (spec speculative-wft R.2).
+        if pending.task_type != tokeira_kernel::WorkflowTaskType::Speculative {
+            self.wft_timeout_tracking.insert(WftTimeoutEntry {
+                kind: WftTimeoutKind::StartToClose,
+                run_key: state.run_key,
+                shard_id,
+                logical_seq: pending.logical_seq,
+                started_event_id,
+                started_at,
+                workflow_task_timeout: state.workflow_task_timeout,
+            });
+        }
         Ok(StartedWorkflowTask {
             run_key: state.run_key,
             run_id: state.run_id,
@@ -1112,6 +1195,23 @@ fn server_failure_payload(message: &str) -> Payload {
         )),
         ..Default::default()
     })
+}
+
+/// Whether a failed workflow-task START means the polled broker entry is stale —
+/// the run's current pending task is a different one (superseded by a timeout
+/// reschedule), already started, or gone. Such a task is discarded and the poll
+/// retries rather than surfacing the error to the worker (Invariant I.1).
+fn is_stale_workflow_task_start(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::lane::KernelRejected>()
+        .is_some_and(|rejected| {
+            matches!(
+                rejected.0,
+                tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
+                    | tokeira_kernel::Reject::WorkflowTaskAlreadyStarted { .. }
+                    | tokeira_kernel::Reject::NoPendingWorkflowTask
+            )
+        })
 }
 
 /// Build the attempt-N+1 retry successor start from the CLOSED predecessor's

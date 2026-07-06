@@ -64,10 +64,14 @@ pub struct WftTimeoutEntry {
 /// Shared in-memory tracking state for started workflow tasks.
 ///
 /// Cloning shares the underlying map; lanes, the scanner, and shard recovery all
-/// see one set.
+/// see one set. It also carries the [`SpeculativeTimerSet`] (behind a shared
+/// `OnceLock` backfilled once the lanes exist) so the lane's post-commit hook
+/// can arm/disarm the precise speculative timers through the same handle it
+/// already holds for the coarse sweep.
 #[derive(Clone, Default)]
 pub struct WftTimeoutTrackingState {
     inner: Arc<Mutex<HashMap<RunKey, WftTimeoutEntry>>>,
+    speculative: Arc<std::sync::OnceLock<crate::speculative_timer::SpeculativeTimerSet>>,
 }
 
 impl WftTimeoutTrackingState {
@@ -83,13 +87,54 @@ impl WftTimeoutTrackingState {
         self.inner.lock().unwrap().remove(&run_key);
     }
 
+    /// Install the precise speculative-timer set once the runtime's lanes exist
+    /// (construction-order backfill). Idempotent — a second install is ignored.
+    pub fn set_speculative(&self, timers: crate::speculative_timer::SpeculativeTimerSet) {
+        let _ = self.speculative.set(timers);
+    }
+
+    /// Arm (or re-arm) the precise in-memory timer for a run's SPECULATIVE task.
+    /// No-op when no timer set is installed (tests / sweep-only setups).
+    pub fn arm_speculative(
+        &self,
+        run_key: RunKey,
+        shard_id: ShardId,
+        logical_seq: LogicalTaskSeq,
+        started_event_id: i64,
+        deadline: OffsetDateTime,
+        kind: WftTimeoutKind,
+    ) {
+        if let Some(timers) = self.speculative.get() {
+            timers.arm(
+                run_key,
+                shard_id,
+                logical_seq,
+                started_event_id,
+                deadline,
+                kind,
+            );
+        }
+    }
+
+    /// Disarm a run's precise speculative timer (completion / failure /
+    /// conversion-to-normal / a non-speculative pending task).
+    pub fn disarm_speculative(&self, run_key: RunKey) {
+        if let Some(timers) = self.speculative.get() {
+            timers.disarm(run_key);
+        }
+    }
+
     /// Drop every entry for a shard on handoff; the new owner rebuilds them from
-    /// durable state during its sweep.
+    /// durable state during its sweep. Also disarms this shard's precise
+    /// speculative timers (re-derived on the new owner's sweep, F2).
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
         self.inner
             .lock()
             .unwrap()
             .retain(|_, entry| entry.shard_id != shard_id);
+        if let Some(timers) = self.speculative.get() {
+            timers.remove_all_for_shard(shard_id);
+        }
     }
 
     /// Snapshot all tracked entries; the scanner evaluates the copy without

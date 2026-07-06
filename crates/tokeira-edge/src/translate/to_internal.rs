@@ -412,6 +412,10 @@ pub fn workflow_task_completed_request(
         commands: req.commands,
         client_discards_speculative_with_events: req.client_discards_speculative_with_events,
         force_new_workflow_task: req.force_create_new_workflow_task,
+        // Filled by the runtime from its update registry before the commit
+        // (server-side RejectUnprocessed, Req 9); the edge cannot see the
+        // Sent set.
+        delivered_update_ids: Vec::new(),
         now: OffsetDateTime::now_utc(),
     })
 }

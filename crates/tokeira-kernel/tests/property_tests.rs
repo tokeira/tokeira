@@ -1399,6 +1399,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 sticky: None,
                 commands,
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             };
             (
@@ -1483,6 +1484,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 sticky: None,
                 commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             };
             (
@@ -1517,6 +1519,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     scheduled_event_id: cancel_scheduled_event_id,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             };
             (
@@ -1551,6 +1554,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     timer_id: "timer-1".into(),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             };
             (
@@ -1584,6 +1588,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     scheduled_event_id: 12,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             };
             (
@@ -1938,6 +1943,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -2015,6 +2021,7 @@ proptest! {
                 sticky: Some(tokeira_kernel::StickySpec { queue: tokeira_types::TaskQueueName(String::new()), schedule_to_start_timeout: sticky_ttl }),
                 commands: Vec::new(),
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -2106,6 +2113,7 @@ proptest! {
                     heartbeat_timeout: None,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -2369,6 +2377,7 @@ proptest! {
                 sticky: None,
                     commands: vec![],
                     force_new_workflow_task: false,
+                    delivered_update_ids: Vec::new(),
                     now,
                 }),
             ).unwrap();
@@ -2881,6 +2890,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -2916,6 +2926,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -2986,6 +2997,7 @@ proptest! {
                 sticky: None,
                     commands: vec![cmd, WorkflowCommand::RequestNewWorkflowTask],
                     force_new_workflow_task: false,
+                    delivered_update_ids: Vec::new(),
                     now,
                 }),
             ),
@@ -3110,6 +3122,7 @@ proptest! {
                     failure: payload("failed"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -3509,6 +3522,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -3603,6 +3617,7 @@ fn property_23_request_cancel_activity_preserves_activity() {
                 sticky: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity { scheduled_event_id }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         )
@@ -3653,6 +3668,7 @@ fn property_24_cancel_timer_removes_timer() {
                     timer_id: "timer-1".into(),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         )
@@ -3714,6 +3730,7 @@ proptest! {
                     parent_close_policy,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -3789,6 +3806,7 @@ proptest! {
                     control: "ctl".into(),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -3923,6 +3941,7 @@ fn property_42_parent_close_policy_all_paths() {
                         sticky: None,
                         commands: vec![command],
                         force_new_workflow_task: false,
+                        delivered_update_ids: Vec::new(),
                         now,
                     }),
                 )
@@ -4069,6 +4088,7 @@ proptest! {
                 sticky: None,
                 commands: vec![completed_cmd],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -4094,6 +4114,7 @@ proptest! {
                 sticky: None,
                 commands: vec![rejected_cmd],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -4137,6 +4158,7 @@ proptest! {
                     },
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -4171,6 +4193,7 @@ proptest! {
                     },
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -4204,6 +4227,7 @@ proptest! {
                     },
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -4252,6 +4276,7 @@ fn property_57_close_clears_pending_updates() {
                     sticky: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
+                    delivered_update_ids: Vec::new(),
                     now,
                 }),
             )
@@ -4326,6 +4351,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -4373,6 +4399,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -4538,6 +4565,7 @@ fn property_63_close_preserves_execution_options() {
                     sticky: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
+                    delivered_update_ids: Vec::new(),
                     now,
                 }),
             )
@@ -4657,6 +4685,7 @@ fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
             sticky: None,
             commands,
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now,
         })
     };
@@ -4790,6 +4819,7 @@ proptest! {
                     result: payloads("done"),
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -4962,6 +4992,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -5016,6 +5047,7 @@ proptest! {
                     start_to_close_timeout: None,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         );
@@ -5049,6 +5081,7 @@ proptest! {
                     scheduled_event_id: 12,
                 }],
                 force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
                 now,
             }),
         ).unwrap();
@@ -5187,6 +5220,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
                     sticky: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
+                    delivered_update_ids: Vec::new(),
                     now,
                 }),
             )
@@ -5370,6 +5404,7 @@ proptest! {
             sticky: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now,
         };
         let transition = kernel
@@ -5510,6 +5545,7 @@ proptest! {
                         result: payloads("done"),
                     }],
                     force_new_workflow_task: false,
+                    delivered_update_ids: Vec::new(),
                     now,
                 }),
             );
@@ -5606,6 +5642,7 @@ fn fail_workflow_completion_request(state: &WorkflowState) -> WorkflowTaskComple
             failure: payload("boom"),
         }],
         force_new_workflow_task: false,
+        delivered_update_ids: Vec::new(),
         now: fixed_now(),
     }
 }

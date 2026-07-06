@@ -600,6 +600,7 @@ async fn start_and_schedule_activity_with_version(
                 heartbeat_timeout: Some(Duration::seconds(20)),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;

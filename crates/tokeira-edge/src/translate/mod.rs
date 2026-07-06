@@ -833,6 +833,10 @@ pub enum UpdateOutcomeDto {
     /// serialized as v1.31.0's `acceptedUpdateCompletedWorkflowFailure`
     /// (errors_failures.go:10-35 @ v1.31.0).
     AcceptedRunClosed,
+    /// The worker completed its workflow task without processing this Sent
+    /// update; serialized as v1.31.0's server-authored `unprocessedUpdateFailure`
+    /// (errors_failures.go:18-25 @ v1.31.0; spec speculative-wft Req 9).
+    RejectedUnprocessed,
 }
 
 #[derive(Clone, Debug, PartialEq)]

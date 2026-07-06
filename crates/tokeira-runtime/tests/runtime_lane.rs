@@ -70,6 +70,7 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
             sticky: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -344,6 +345,7 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
                 result: Payloads::default(),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: start_time,
         })
         .await?;
@@ -500,6 +502,7 @@ async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Res
                 result: Payloads::default(),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: start_time + Duration::seconds(31),
         })
         .await?;
@@ -558,6 +561,7 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
                 result: Payloads::default(),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: start_time,
         })
         .await?;
@@ -658,6 +662,7 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
             }),
             commands: Vec::new(),
             force_new_workflow_task: true,
+            delivered_update_ids: Vec::new(),
             now: start_time,
         })
         .await?;
@@ -867,6 +872,7 @@ async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
                 failure: retryable_app_failure("BoomError"),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -961,6 +967,7 @@ async fn non_retryable_failure_is_terminal_without_successor() -> Result<()> {
                 failure: retryable_app_failure("FatalError"),
             }],
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;

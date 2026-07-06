@@ -2158,6 +2158,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 }),
                 tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
             ),
+            Some(tokeira_runtime::UpdateOutcome::RejectedUnprocessed) => (
+                Some(update::Outcome {
+                    value: Some(update::outcome::Value::Failure(
+                        crate::grpc::translate::unprocessed_update_failure(),
+                    )),
+                }),
+                tokeira_proto::enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32,
+            ),
             None => (None, update_lifecycle_stage_to_proto(result.stage)),
         };
 

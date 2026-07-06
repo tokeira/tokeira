@@ -225,6 +225,9 @@ pub fn update_response(
         tokeira_runtime::UpdateOutcome::AcceptedRunClosed => {
             crate::translate::UpdateOutcomeDto::AcceptedRunClosed
         }
+        tokeira_runtime::UpdateOutcome::RejectedUnprocessed => {
+            crate::translate::UpdateOutcomeDto::RejectedUnprocessed
+        }
     });
     crate::translate::UpdateWorkflowExecutionResponse {
         update_ref: crate::translate::UpdateRefDto {

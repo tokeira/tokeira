@@ -520,6 +520,31 @@ where
                 stage: UpdateLifecycleStage::Completed,
                 outcome: Some(UpdateOutcome::AcceptedRunClosed),
             }),
+            // The server failed the workflow task while this update was Sent
+            // (bad-message validation, not an explicit RespondWorkflowTaskFailed):
+            // v1.31.0 aborts with the non-retryable WorkflowNotReady
+            // `workflowTaskFailErr` (abort_reason.go:86-103 @ v1.31.0), which the
+            // edge maps to FAILED_PRECONDITION with `response` nil.
+            Ok(Ok(UpdateResolution::AbortedByWftFailure)) => Err(crate::errors::WorkflowNotReady {
+                message: "Unable to perform workflow execution update due to unexpected \
+                              workflow task failure.",
+            }
+            .into()),
+            // The worker completed its workflow task without processing this
+            // Sent update: the server auto-rejects it with the
+            // `unprocessedUpdateFailure` server outcome (Req 9). Like a normal
+            // rejection this is a COMPLETED-stage response with a failure
+            // outcome (no RPC error); the edge authors the failure proto.
+            Ok(Ok(UpdateResolution::RejectedUnprocessed)) => Ok(UpdateLifecycleSnapshot {
+                workflow_execution: ExecutionRef {
+                    run_id: self.resolve_run_id_for_snapshot(run_key, &execution).await,
+                    ..execution
+                },
+                update_id: update_id.clone(),
+                update_name: String::new(),
+                stage: UpdateLifecycleStage::Completed,
+                outcome: Some(UpdateOutcome::RejectedUnprocessed),
+            }),
             Ok(Err(_)) => Err(anyhow!("update response channel closed")),
             Err(_) => {
                 self.update_registry.clear_waiter(run_key, &update_id);

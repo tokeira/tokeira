@@ -311,6 +311,25 @@ impl From<anyhow::Error> for EdgeError {
         {
             return Self::NotFound("workflow execution already completed".to_string());
         }
+        // A workflow-task mutation whose token no longer matches the run's
+        // current task — the task was completed, timed out, or superseded — is
+        // v1.31.0's `ErrWorkflowTaskNotFound`: NOT_FOUND "Workflow task not
+        // found." (consts/const.go @ v1.31.0). Asserted verbatim by the
+        // speculative start-to-close timeout leaf, whose late completion races
+        // the in-memory timeout (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+        if value
+            .downcast_ref::<tokeira_runtime::KernelRejected>()
+            .is_some_and(|rejected| {
+                matches!(
+                    rejected.0,
+                    tokeira_kernel::Reject::WorkflowTaskSeqMismatch { .. }
+                        | tokeira_kernel::Reject::WorkflowTaskTokenMismatch
+                        | tokeira_kernel::Reject::WorkflowTaskNotStarted { .. }
+                )
+            })
+        {
+            return Self::NotFound("Workflow task not found.".to_string());
+        }
         match value.downcast::<tokeira_runtime::NotShardOwner>() {
             Ok(not_owner) => Self::NotShardOwner {
                 bundle_id: not_owner.bundle_id,

@@ -432,30 +432,70 @@ where
             Ok((commit_result, mut dispatch_ops, history_events)) => {
                 let mut reset_materialization_error = None;
                 if let CommitResult::Applied { new_state } = &commit_result {
-                    // Sticky raise S2/S3: a sticky-dispatched WFT carries a
-                    // schedule-to-start deadline; track it so the scanner can
-                    // fire the S2S timeout. Keyed by run — a later start
-                    // (which inserts the StartToClose entry) replaces it, and
-                    // a superseding transition's kernel reject drops it.
-                    if let Some(pending) = &new_state.pending_workflow_task
-                        && pending.started_event_id.is_none()
-                        && let Some(deadline) = pending.schedule_to_start_deadline
-                    {
-                        tracing::debug!(
-                            run_key = ?message.run_key,
-                            logical_seq = pending.logical_seq.0,
-                            ?deadline,
-                            "tracking sticky wft schedule-to-start deadline"
-                        );
-                        wft_timeout_tracking.insert(crate::wft_timeout::WftTimeoutEntry {
-                            run_key: message.run_key,
-                            shard_id,
-                            logical_seq: pending.logical_seq,
-                            started_event_id: 0,
-                            started_at: pending.scheduled_at,
-                            workflow_task_timeout: deadline - pending.scheduled_at,
-                            kind: crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
-                        });
+                    // Workflow-task timeout tracking, split by task type:
+                    //
+                    // A SPECULATIVE task's deadlines are enforced by PRECISE
+                    // in-memory timers (spec speculative-wft R.2) — the coarse
+                    // 1s sweep cannot meet the corpus's ~100ms firing margin.
+                    // Schedule-to-start while unstarted, start-to-close once a
+                    // worker starts it. Deadlines are absolute, so re-arming on
+                    // an unrelated commit for the same run is idempotent.
+                    //
+                    // A NON-speculative sticky task keeps the coarse sweep
+                    // (durable, long timeout, no tight race): its
+                    // schedule-to-start deadline is tracked so the scanner can
+                    // reroute it to the normal queue (sticky raise S2/S3). Any
+                    // non-speculative pending (or none) also DISARMS a stale
+                    // speculative timer left by a prior task on the run
+                    // (completion / conversion-to-normal / failure).
+                    match &new_state.pending_workflow_task {
+                        Some(pending)
+                            if pending.task_type
+                                == tokeira_kernel::WorkflowTaskType::Speculative =>
+                        {
+                            if let Some(started_at) = pending.started_at {
+                                wft_timeout_tracking.arm_speculative(
+                                    message.run_key,
+                                    shard_id,
+                                    pending.logical_seq,
+                                    pending.started_event_id.unwrap_or(0),
+                                    started_at + new_state.workflow_task_timeout,
+                                    crate::wft_timeout::WftTimeoutKind::StartToClose,
+                                );
+                            } else if let Some(deadline) = pending.schedule_to_start_deadline {
+                                wft_timeout_tracking.arm_speculative(
+                                    message.run_key,
+                                    shard_id,
+                                    pending.logical_seq,
+                                    0,
+                                    deadline,
+                                    crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
+                                );
+                            }
+                        }
+                        Some(pending) if pending.started_event_id.is_none() => {
+                            wft_timeout_tracking.disarm_speculative(message.run_key);
+                            if let Some(deadline) = pending.schedule_to_start_deadline {
+                                tracing::debug!(
+                                    run_key = ?message.run_key,
+                                    logical_seq = pending.logical_seq.0,
+                                    ?deadline,
+                                    "tracking sticky wft schedule-to-start deadline"
+                                );
+                                wft_timeout_tracking.insert(crate::wft_timeout::WftTimeoutEntry {
+                                    run_key: message.run_key,
+                                    shard_id,
+                                    logical_seq: pending.logical_seq,
+                                    started_event_id: 0,
+                                    started_at: pending.scheduled_at,
+                                    workflow_task_timeout: deadline - pending.scheduled_at,
+                                    kind: crate::wft_timeout::WftTimeoutKind::ScheduleToStart,
+                                });
+                            }
+                        }
+                        _ => {
+                            wft_timeout_tracking.disarm_speculative(message.run_key);
+                        }
                     }
                     for event in &history_events {
                         match &event.kind {

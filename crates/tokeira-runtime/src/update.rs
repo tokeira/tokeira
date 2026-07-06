@@ -63,6 +63,15 @@ pub enum UpdateOutcome {
     /// "AcceptedUpdateCompletedWorkflow" NonRetryable,
     /// errors_failures.go:10-35 @ v1.31.0).
     AcceptedRunClosed,
+    /// The update was delivered to a worker that completed its workflow task
+    /// without processing it — v1.31.0's server-side RejectUnprocessed rider
+    /// (spec speculative-wft Req 9). The edge renders the server-authored
+    /// `unprocessedUpdateFailure` verbatim (Message "Workflow Update is
+    /// rejected because it wasn't processed by worker. …", Source "Server",
+    /// ApplicationFailureInfo Type "UnprocessedUpdate" NonRetryable,
+    /// errors_failures.go:18-25 @ v1.31.0). Surfaces as a COMPLETED-stage
+    /// response with a failure outcome (no RPC error), never redelivered.
+    RejectedUnprocessed,
 }
 
 /// How long the caller wants to wait.
@@ -138,6 +147,23 @@ pub(crate) enum UpdateResolution {
     /// (`acceptedUpdateCompletedWorkflowFailure`, errors_failures.go:10-35
     /// @ v1.31.0).
     AcceptedRunClosed,
+    /// The SERVER failed the workflow task while this update was in the Sent
+    /// state (a bad-message validation failure decided during
+    /// RespondWorkflowTaskCompleted, not an explicit RespondWorkflowTaskFailed)
+    /// — v1.31.0's `AbortReasonWorkflowTaskFailed` for a Sent update aborts
+    /// with the non-retryable `workflowTaskFailErr`
+    /// (`serviceerror.WorkflowNotReady("Unable to perform workflow execution
+    /// update due to unexpected workflow task failure.")`, abort_reason.go:86-103
+    /// + errors_failures.go:14 @ v1.31.0). Surfaces as a FAILED_PRECONDITION
+    /// RPC error, with `response` nil.
+    AbortedByWftFailure,
+    /// The update was delivered but the completing worker ignored it — the
+    /// server auto-rejects it with the `unprocessedUpdateFailure` server
+    /// outcome (RejectUnprocessed, Req 9). The caller receives a COMPLETED
+    /// stage with a failure outcome and NO RPC error; never redelivered
+    /// (`rejectUnprocessedUpdates`, workflow_task_completed_handler.go:213-262
+    /// @ v1.31.0).
+    RejectedUnprocessed,
 }
 
 #[derive(Debug)]
@@ -170,12 +196,22 @@ pub(crate) struct UpdateRegistryEntry {
     /// guard, which is exactly the failure seen running the OpenAI sandbox agent's
     /// blocking `pause` update.
     pub accepted: bool,
+    /// Monotonic admission order within the registry. v1.31.0 sends updates to
+    /// the worker sorted by admitted time (`registry.Send` orders by
+    /// `admittedTime`, update/registry.go:341-348 @ v1.31.0), which the corpus
+    /// asserts (`TestUpdatesAreSentToWorkerInOrderOfAdmission`). The registry's
+    /// backing map has no stable order, so each entry records the sequence in
+    /// which it was admitted and `drain_pending_updates` sorts by it.
+    pub admitted_seq: u64,
 }
 
 /// In-memory registry of waiting update callers.
 #[derive(Clone, Default)]
 pub struct UpdateRegistry {
     inner: Arc<Mutex<HashMap<(RunKey, String), UpdateRegistryEntry>>>,
+    /// Monotonic counter stamped onto each entry at admission so the worker
+    /// sees updates in admission order (see `UpdateRegistryEntry::admitted_seq`).
+    next_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl UpdateRegistry {
@@ -211,6 +247,9 @@ impl UpdateRegistry {
                 false
             }
             std::collections::hash_map::Entry::Vacant(vacant) => {
+                let admitted_seq = self
+                    .next_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 vacant.insert(UpdateRegistryEntry {
                     update_name,
                     input,
@@ -218,6 +257,7 @@ impl UpdateRegistry {
                     waiters: vec![UpdateWaiter { wait_policy, tx }],
                     accepted: false,
                     sent: false,
+                    admitted_seq,
                 });
                 true
             }
@@ -267,7 +307,8 @@ impl UpdateRegistry {
         run_key: RunKey,
         include_sent: bool,
     ) -> Vec<(String, String, Payloads, String)> {
-        self.inner
+        let mut deliverable: Vec<(u64, String, String, Payloads, String)> = self
+            .inner
             .lock()
             .unwrap()
             .iter_mut()
@@ -277,11 +318,22 @@ impl UpdateRegistry {
             .map(|((_entry_run_key, update_id), entry)| {
                 entry.sent = true;
                 (
+                    entry.admitted_seq,
                     update_id.clone(),
                     entry.update_name.clone(),
                     entry.input.clone(),
                     entry.identity.clone(),
                 )
+            })
+            .collect();
+        // v1.31.0 delivers updates to the worker in admission order
+        // (`TestUpdatesAreSentToWorkerInOrderOfAdmission`); the backing map is
+        // unordered, so sort by the admission sequence recorded at register.
+        deliverable.sort_by_key(|(seq, _, _, _, _)| *seq);
+        deliverable
+            .into_iter()
+            .map(|(_, update_id, update_name, input, identity)| {
+                (update_id, update_name, input, identity)
             })
             .collect()
     }
@@ -294,6 +346,99 @@ impl UpdateRegistry {
                 entry.sent = false;
             }
         }
+    }
+
+    /// Ids of the updates delivered to a worker on the current workflow task
+    /// (sent, not yet accepted) — the "delivered set" the kernel needs to
+    /// distinguish updates the completing worker ignored (RejectUnprocessed,
+    /// Req 9) from updates admitted while the task ran (which ride the
+    /// follow-up task, K7). Read at completion-build time before the commit
+    /// processes the worker's accept/reject commands.
+    pub(crate) fn sent_update_ids(&self, run_key: RunKey) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((entry_run_key, _), entry)| {
+                *entry_run_key == run_key && entry.sent && !entry.accepted
+            })
+            .map(|((_entry_run_key, update_id), _)| update_id.clone())
+            .collect()
+    }
+
+    /// Abort in-flight waiters when the SERVER fails the workflow task while an
+    /// update was Sent — a bad-message validation failure decided during
+    /// RespondWorkflowTaskCompleted, NOT an explicit RespondWorkflowTaskFailed
+    /// (`AbortReasonWorkflowTaskFailed`, respondworkflowtaskcompleted/api.go:
+    /// 454-460 + abort_reason.go:86-103 @ v1.31.0). Each Sent, not-yet-accepted
+    /// update's waiters resolve with the non-retryable
+    /// [`UpdateResolution::AbortedByWftFailure`] (WorkflowNotReady on the wire).
+    ///
+    /// The registry entry is RETAINED and re-armed for delivery (`sent` reset):
+    /// tokeira records admitted updates durably in the kernel, so the update is
+    /// redelivered on the retry task, and a caller re-sending the same id
+    /// dedupes to this entry instead of re-admitting into a `DuplicateUpdateId`.
+    /// This differs from v1.31.0's non-durable registry (which drops the
+    /// aborted update) but matches its observable behaviour: the original
+    /// caller sees WorkflowNotReady, and a resend rides the redelivery
+    /// (`TestSpeculativeWorkflowTask_Fail`, `TestValidateWorkerMessages`).
+    /// Accepted updates are left untouched — they survive the WFT failure and
+    /// resume on replay.
+    pub(crate) fn abort_sent_for_wft_failure(&self, run_key: RunKey) -> usize {
+        let mut aborted_waiters = Vec::new();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            for ((entry_run_key, _), entry) in inner.iter_mut() {
+                if *entry_run_key == run_key && entry.sent && !entry.accepted {
+                    aborted_waiters.append(&mut entry.waiters);
+                    entry.sent = false;
+                }
+            }
+        }
+        let count = aborted_waiters.len();
+        for waiter in aborted_waiters {
+            let _ = waiter.tx.send(UpdateResolution::AbortedByWftFailure);
+        }
+        count
+    }
+
+    /// Server-side RejectUnprocessed (Req 9): after a non-heartbeat completion
+    /// that left the run open, every update the worker was sent but neither
+    /// accepted nor rejected is auto-rejected with the server-authored
+    /// `unprocessedUpdateFailure` and REMOVED (never redelivered)
+    /// (`rejectUnprocessedUpdates`, workflow_task_completed_handler.go:213-262;
+    /// `registry.go:297-316` @ v1.31.0). Runs post-commit, once the lane has
+    /// marked accepted updates `accepted` and removed completed/rejected ones,
+    /// so the remaining Sent, not-accepted entries are exactly the ignored set.
+    /// The kernel prunes these from its admitted set in the same completion
+    /// transition (via the delivered-ids passed on the request) so the two
+    /// stay consistent. Returns the rejected ids for tracing.
+    pub(crate) fn reject_unprocessed(&self, run_key: RunKey) -> Vec<String> {
+        let mut rejected = Vec::new();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let keys: Vec<(RunKey, String)> = inner
+                .iter()
+                .filter(|((entry_run_key, _), entry)| {
+                    *entry_run_key == run_key && entry.sent && !entry.accepted
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in keys {
+                if let Some(entry) = inner.remove(&key) {
+                    rejected.push((key.1, entry.waiters));
+                }
+            }
+        }
+        rejected
+            .into_iter()
+            .map(|(id, waiters)| {
+                for waiter in waiters {
+                    let _ = waiter.tx.send(UpdateResolution::RejectedUnprocessed);
+                }
+                id
+            })
+            .collect()
     }
 
     pub(crate) fn notify(

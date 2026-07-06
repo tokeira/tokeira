@@ -2233,12 +2233,16 @@ pub fn respond_completed_request_to_edge(
         match proto_command_to_workflow_command(cmd) {
             Ok(WorkflowCommand::ProtocolMessage { message_id, .. }) => {
                 // Resolve the body from the messages index. A command
-                // referencing an ABSENT message id fails the completion with
-                // v1.31.0's exact InvalidArgument ('ProtocolMessageCommand
-                // referenced absent message ID',
-                // workflow_task_completed_handler.go @ v1.31.0; spec
-                // speculative-wft Req 6.1) — surfaced by the edge core, which
-                // also fails the workflow task.
+                // referencing an ABSENT message id cannot be resolved here, so
+                // it is forwarded as an `UnresolvedMessage` sentinel: the kernel
+                // fails the workflow task with
+                // `BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE` and the runtime aborts
+                // the Sent update waiters, exactly as for every other bad update
+                // message (v1.31.0's 'ProtocolMessageCommand referenced absent
+                // message ID', workflow_task_completed_handler.go @ v1.31.0;
+                // spec speculative-wft Req 6.1). Routing it through the kernel
+                // seam keeps the caller-visible WorkflowNotReady abort uniform
+                // (`TestValidateWorkerMessages/command-reference-missed-message`).
                 if let Some(msg) = messages_by_id.remove(&message_id) {
                     let body = msg
                         .body
@@ -2249,9 +2253,10 @@ pub fn respond_completed_request_to_edge(
                         body: resolve_protocol_message_body(&body, msg.protocol_instance_id)?,
                     });
                 } else {
-                    return Err(ProtoConversionError::InvalidArgument(format!(
-                        "ProtocolMessageCommand referenced absent message ID {message_id}"
-                    )));
+                    commands.push(WorkflowCommand::ProtocolMessage {
+                        message_id: message_id.clone(),
+                        body: tokeira_kernel::UpdateProtocolBody::UnresolvedMessage { message_id },
+                    });
                 }
             }
             Ok(cmd) => commands.push(cmd),
@@ -5700,6 +5705,29 @@ pub(crate) fn accepted_update_completed_workflow_failure() -> failure_proto::Fai
     }
 }
 
+/// v1.31.0's server-authored outcome for an update the worker was sent but
+/// completed its workflow task without processing — server-side
+/// RejectUnprocessed (`unprocessedUpdateFailure`,
+/// service/history/workflow/update/errors_failures.go:18-25 @ v1.31.0; spec
+/// speculative-wft Req 9). The corpus asserts message, source, type, and
+/// non-retryability verbatim (`WorkerSkippedProcessing_RejectByServer`).
+pub(crate) fn unprocessed_update_failure() -> failure_proto::Failure {
+    failure_proto::Failure {
+        message: "Workflow Update is rejected because it wasn't processed by worker. Probably, \
+                  Workflow Update is not supported by the worker."
+            .to_string(),
+        source: "Server".to_string(),
+        failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+            failure_proto::ApplicationFailureInfo {
+                r#type: "UnprocessedUpdate".to_string(),
+                non_retryable: true,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+}
+
 pub fn update_response_to_proto(
     resp: crate::translate::UpdateWorkflowExecutionResponse,
 ) -> workflowservice::UpdateWorkflowExecutionResponse {
@@ -5724,6 +5752,9 @@ pub fn update_response_to_proto(
             value: Some(update::outcome::Value::Failure(
                 accepted_update_completed_workflow_failure(),
             )),
+        }),
+        Some(crate::translate::UpdateOutcomeDto::RejectedUnprocessed) => Some(update::Outcome {
+            value: Some(update::outcome::Value::Failure(unprocessed_update_failure())),
         }),
         None => None,
     };

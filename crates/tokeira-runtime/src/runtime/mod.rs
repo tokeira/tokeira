@@ -631,6 +631,15 @@ where
         // Share a slot the publisher captures now and we backfill once the
         // lanes are spawned, breaking the construction-order cycle.
         let shared_lanes = Arc::new(Mutex::new(Vec::with_capacity(lane_count)));
+        // Precise in-memory timers for speculative workflow tasks share the
+        // `shared_lanes` slot (backfilled below) to submit timeouts, and are
+        // installed into the WFT-timeout tracking so the lane's post-commit hook
+        // arms/disarms them through the handle it already holds (spec
+        // speculative-wft R.2).
+        wft_timeout_tracking.set_speculative(crate::speculative_timer::SpeculativeTimerSet::new(
+            shared_lanes.clone(),
+            lane_count,
+        ));
         let lanes: Vec<_> = (0..lane_count)
             .map(|lane_id| {
                 let publisher = RuntimeDispatchPublisher::new(
@@ -1765,6 +1774,7 @@ mod tests {
             sticky: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         });
 

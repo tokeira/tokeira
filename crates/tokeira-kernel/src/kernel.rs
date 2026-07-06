@@ -48,6 +48,13 @@ use crate::{
     },
 };
 
+/// Pinned schedule-to-start timeout for a SPECULATIVE workflow task dispatched
+/// on the normal task queue — v1.31.0's `SpeculativeWorkflowTaskScheduleToStart
+/// Timeout = 5 * time.Second` (chosen to match the sticky queue's 5s default so
+/// a lost speculative task reschedules a normal attempt-1 task,
+/// service/history/tasks/workflow_task_timer.go:14-19 @ v1.31.0).
+const SPECULATIVE_WFT_SCHEDULE_TO_START_TIMEOUT: Duration = Duration::seconds(5);
+
 /// Derive the completion-callback outcome from a run's terminal event.
 ///
 /// Mirrors v1.31.0's `GetNexusCompletion`, which switches on the workflow
@@ -1694,6 +1701,15 @@ impl BasicKernel {
                         builder.state.pending_updates.remove(&update_id);
                     }
                 }
+                // R.4 (Req 9): a dropped speculative task still reject-processes
+                // — every DELIVERED update the worker neither accepted nor
+                // rejected is removed from the admitted set (the runtime resolves
+                // its waiter with `unprocessedUpdateFailure` post-commit). Only
+                // updates admitted while the task ran (absent from the delivered
+                // set) remain to drive the follow-up task.
+                for update_id in &req.delivered_update_ids {
+                    builder.state.admitted_updates.remove(update_id);
+                }
                 builder.state.pending_workflow_task = None;
                 builder.state.workflow_task_attempt = 1;
                 // K7: updates admitted while this task ran still need a
@@ -1816,6 +1832,24 @@ impl BasicKernel {
         // v1.31.0 discards buffered events once the workflow finished
         // (`FlushBufferToCurrentBatch`, event_store.go:139 @ v1.31.0).
         let flushed = builder.flush_buffered();
+
+        // R.4 (spec speculative-wft Req 9): server-side RejectUnprocessed. On a
+        // non-heartbeat completion that left the run open, every update the
+        // worker was DELIVERED but neither accepted nor rejected is removed from
+        // the admitted set — the runtime resolves each waiter with the
+        // `unprocessedUpdateFailure` server outcome post-commit. Pruned BEFORE
+        // the follow-up-task decisions below so a task that only carried
+        // now-rejected updates schedules no zero-message successor; updates
+        // admitted while this task ran (absent from the delivered set) survive
+        // to drive the K7 follow-up. Heartbeat completions never re-sent the
+        // already-sent updates, so they are exempt
+        // (`rejectUnprocessedUpdates` guards, workflow_task_completed_handler.go
+        // :224-238 @ v1.31.0).
+        if !req.force_new_workflow_task && builder.state.is_open() {
+            for update_id in &req.delivered_update_ids {
+                builder.state.admitted_updates.remove(update_id);
+            }
+        }
 
         // Schedule a new WFT when the worker explicitly requests one
         // (heartbeat / local-activity keep-alive).
@@ -4554,6 +4588,22 @@ fn apply_workflow_command(
                     builder.state.admitted_updates.remove(&update_id);
                     builder.state.pending_updates.remove(&update_id);
                 }
+                UpdateProtocolBody::UnresolvedMessage { message_id } => {
+                    // A ProtocolMessageCommand referenced a message id absent
+                    // from the completion's message set. v1.31.0 fails the WFT
+                    // with `BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE` and the exact
+                    // InvalidArgument below; routed through the same seam as the
+                    // other bad update messages so the runtime persists the
+                    // WFT-failed and aborts the Sent update waiters uniformly
+                    // (Req 6.1/6.3; `TestValidateWorkerMessages/`
+                    // `command-reference-missed-message`).
+                    return Err(Reject::BadUpdateMessage {
+                        message: format!(
+                            "ProtocolMessageCommand referenced absent message ID {message_id}"
+                        ),
+                        not_found: false,
+                    });
+                }
             }
             Ok(false)
         }
@@ -4907,9 +4957,20 @@ impl TransitionBuilder {
             .as_ref()
             .map(|sticky| sticky.sticky_queue.clone())
             .unwrap_or_else(|| self.state.task_queue.clone());
-        let schedule_to_start_deadline = sticky_dispatch
-            .as_ref()
-            .map(|sticky| self.now + sticky.schedule_to_start_timeout);
+        let schedule_to_start_deadline = match sticky_dispatch.as_ref() {
+            Some(sticky) => Some(self.now + sticky.schedule_to_start_timeout),
+            // A speculative task dispatched on the NORMAL queue carries the
+            // pinned 5s schedule-to-start timeout so a task no worker picks up
+            // reschedules a normal attempt-1 task; the timed-out Scheduled event
+            // records the normal queue kind (SpeculativeWorkflowTaskSchedule
+            // ToStartTimeout = 5s, workflow_task_timer.go:14-19 @ v1.31.0; spec
+            // speculative-wft Req 5.3). The runtime arms this as an in-memory
+            // timer (no durable timer record).
+            None if task_type == WorkflowTaskType::Speculative => {
+                Some(self.now + SPECULATIVE_WFT_SCHEDULE_TO_START_TIMEOUT)
+            }
+            None => None,
+        };
         let scheduled_event_id =
             if self.state.workflow_task_attempt > 1 || task_type == WorkflowTaskType::Speculative {
                 self.state.last_event_id + 1

@@ -433,6 +433,7 @@ async fn quiesce_workflow(
             sticky: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
             now: OffsetDateTime::now_utc(),
         })
         .await?;

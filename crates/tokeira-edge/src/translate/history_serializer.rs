@@ -597,7 +597,16 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             attempt,
         } => Attributes::WorkflowTaskScheduledEventAttributes(
             history::WorkflowTaskScheduledEventAttributes {
-                task_queue: Some(task_queue_from_domain(task_queue)),
+                task_queue: Some({
+                    // v1.31.0's `CurrentTaskQueue()` stamps `Kind: NORMAL` on the
+                    // scheduled event's task queue (mutable_state_impl.go:1314-1327
+                    // @ v1.31.0). The corpus asserts it on the speculative task
+                    // materialized by a normal-queue schedule-to-start timeout
+                    // (`ScheduleToStartTimeoutOnNormalTaskQueue`, event 5 Kind=1).
+                    let mut tq = task_queue_from_domain(task_queue);
+                    tq.kind = tokeira_proto::enums::TaskQueueKind::Normal as i32;
+                    tq
+                }),
                 start_to_close_timeout: Some(to_proto_duration(*workflow_task_timeout)),
                 attempt: *attempt as i32,
             },

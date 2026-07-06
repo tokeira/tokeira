@@ -925,6 +925,17 @@ pub struct WorkflowTaskCompletedRequest {
     /// If true, the kernel schedules a new WFT even when no
     /// commands require one.
     pub force_new_workflow_task: bool,
+    /// Update ids the runtime DELIVERED to the worker on this task (Sent, not
+    /// yet accepted), stamped by the runtime from its update registry. After
+    /// processing the worker's accept/reject commands, any of these still in
+    /// `admitted_updates` is one the worker ignored — the kernel prunes it as
+    /// part of the server-side RejectUnprocessed (Req 9), so the follow-up task
+    /// carries only updates admitted while this task ran (K7). Updates admitted
+    /// mid-task are absent from this set and survive
+    /// (`rejectUnprocessedUpdates`, workflow_task_completed_handler.go:213-262
+    /// @ v1.31.0; spec speculative-wft Req 9).
+    #[serde(default)]
+    pub delivered_update_ids: Vec<String>,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }
@@ -1240,6 +1251,15 @@ pub enum UpdateProtocolBody {
     },
     /// The worker rejected the update.
     Rejected { update_id: String, failure: Payload },
+    /// A `ProtocolMessageCommand` referenced a message id that was not present
+    /// in the completion's message set. The edge cannot resolve a body, so it
+    /// forwards this sentinel; the kernel rejects the completion with
+    /// `BadUpdateWorkflowExecutionMessage` so it flows through the same
+    /// WFT-failure seam as every other bad update message (waiter abort +
+    /// InvalidArgument "…referenced absent message ID", Req 6.1;
+    /// workflow_task_completed_handler.go @ v1.31.0). Appended last —
+    /// postcard append-only discipline.
+    UnresolvedMessage { message_id: String },
 }
 
 /// Request from the timer scanner when a timer's deadline

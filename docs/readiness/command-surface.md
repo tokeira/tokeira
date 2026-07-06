@@ -53,8 +53,9 @@ These are operations invoked on the history engine that mutate workflow executio
 | 25 | `PauseActivity` | `Command::PauseActivity` | ✅ Implemented | F11. Sets ActivityPauseInfo, bumps stamp. |
 | 26 | `UnpauseActivity` | `Command::UnpauseActivity` | ✅ Implemented | F11. Clears pause, conditional dispatch. |
 | 27 | `ResetActivity` | `Command::ResetActivity` | ✅ Implemented | F11. Resets attempt, conditional dispatch. |
+| 28 | `ExecuteMultiOperation` (fresh-start leg) | `Command::StartAndUpdate` | ✅ Implemented | F7. Folds WorkflowExecutionStarted + update admission + WorkflowTaskScheduled into ONE transition (SignalWithStart atomicity precedent; `multioperation/api.go @ v1.31.0`). Attach paths reuse `Command::Update`. |
 
-**Top-level command coverage: 27/27 (100%)**
+**Top-level command coverage: 28/28 (100%)**
 
 ---
 
@@ -173,7 +174,7 @@ These Temporal history engine APIs are not kernel commands. Each exclusion has a
 | API | Rationale |
 |---|---|
 | `SignalWithStartWorkflowExecution` | Runtime composes Start + Signal. Not a kernel primitive. |
-| `ExecuteMultiOperation` | Runtime composes multiple operations. Not a kernel primitive. |
+| `ExecuteMultiOperation` | Runtime composes the Update-with-Start paths (dedup/attach/already-completed, wait-stage, error assembly). The fresh-start leg alone is the atomic `Command::StartAndUpdate` (Part 1 #28) — a raised kernel addition per the SignalWithStart precedent, not a general multi-op primitive. |
 
 ### Delivery-Layer Concerns
 | API | Rationale |

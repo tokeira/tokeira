@@ -27,7 +27,22 @@ where
     /// non-`Applied` outcome and on submit error, so a failed start never leaks
     /// a parked poller. Execution/run timeout tracking is registered only after
     /// the start is durably `Applied`.
-    pub async fn start_workflow(&self, mut request: StartRequest) -> Result<CommitResult> {
+    pub async fn start_workflow(&self, request: StartRequest) -> Result<CommitResult> {
+        self.start_workflow_inner(request, None).await
+    }
+
+    /// Start with an optional Update-with-Start fold: `Some(update_id)` swaps
+    /// the submitted command for `Command::StartAndUpdate` so the run creation
+    /// and the update admission commit in ONE transition (the fresh-start leg
+    /// of ExecuteMultiOperation; multioperation/api.go @ v1.31.0 admits the
+    /// update into the new run's registry before the persistence write). All
+    /// other start effects (reserved-poller sync match, timeout tracking) are
+    /// identical.
+    async fn start_workflow_inner(
+        &self,
+        mut request: StartRequest,
+        update_fold: Option<String>,
+    ) -> Result<CommitResult> {
         apply_client_cron_start_backoff(&mut request)?;
         // A delayed start (client start-delay or cron initial backoff) arms
         // the start-delay timer instead of scheduling a first WFT — there is
@@ -44,10 +59,14 @@ where
             request.reserved_poller_identity = Some(reserved.worker_identity().clone());
         }
 
-        let result = match self
-            .submit(request.run_key, Command::Start(request.clone()))
-            .await
-        {
+        let command = match update_fold {
+            Some(update_id) => Command::StartAndUpdate(tokeira_kernel::StartAndUpdateRequest {
+                start: request.clone(),
+                update_id,
+            }),
+            None => Command::Start(request.clone()),
+        };
+        let result = match self.submit(request.run_key, command).await {
             Ok(result) => result,
             Err(error) => {
                 if let Some(reserved) = reserved_poller {
@@ -282,6 +301,253 @@ where
     /// terminates then starts. Signalling an existing run tolerates a
     /// `Duplicate` commit as success because the signal request may be retried,
     /// whereas the start branches reject duplicates as unexpected.
+    /// Execute the composed Update-with-Start: exactly `[Start, Update]`.
+    ///
+    /// Decision ladder mirrors `multioperation/api.go @ v1.31.0`, consulting
+    /// the current/latest run BEFORE start adjudication: (1) an update id the
+    /// run already knows replays/attaches with NO mutation — durable outcomes
+    /// replay even on CLOSED workflows, and an in-flight update attaches even
+    /// under TERMINATE_EXISTING (the "given an accepted update, attach to it"
+    /// behavior); (2) request-id dedup and USE_EXISTING attach to the running
+    /// incumbent; (3) conflict-policy FAIL rejects the start leg; (4) fresh
+    /// starts fold run creation + update admission into ONE
+    /// `Command::StartAndUpdate` transition so a crash can never separate
+    /// them.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_multi_operation(
+        &self,
+        request: StartRequest,
+        update_id: String,
+        update_name: String,
+        update_input: Payloads,
+        update_request: RequestContext,
+        update_timeout: Duration,
+        wait_policy: UpdateWaitPolicy,
+    ) -> Result<MultiOperationResult> {
+        let current = ExecutionRef {
+            namespace_id: request.namespace_id,
+            workflow_id: request.workflow_id.clone(),
+            run_id: None,
+        };
+        let latest_run = match self.repo.resolve_execution(&current).await? {
+            Some(run_key) => Some(run_key),
+            None => {
+                self.repo
+                    .find_latest_run(request.namespace_id, &request.workflow_id)
+                    .await?
+            }
+        };
+        if let Some(run_key) = latest_run
+            && self
+                .update_lifecycle_snapshot(run_key, current.clone(), &update_id)
+                .await?
+                .is_some()
+        {
+            let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+                return Err(anyhow!("latest run vanished during update-with-start"));
+            };
+            let run_id = state.run_id;
+            let execution_status = state.status;
+            let update = self
+                .wait_for_update_stage(
+                    run_key,
+                    current.clone(),
+                    update_id,
+                    wait_policy,
+                    update_timeout,
+                )
+                .await
+                .map_err(|source| MultiOperationError::UpdateFailed {
+                    started: false,
+                    source,
+                })?;
+            return Ok(MultiOperationResult {
+                run_key,
+                run_id,
+                started: false,
+                execution_status,
+                update,
+            });
+        }
+
+        // Same bounded re-resolution loop as `start_workflow_with_policy`:
+        // a lost start race re-resolves against the committed incumbent.
+        const MAX_RESOLUTION_ATTEMPTS: usize = 5;
+        for _ in 0..MAX_RESOLUTION_ATTEMPTS {
+            let resolution = self
+                .resolve_conflict(
+                    request.namespace_id,
+                    &request.workflow_id,
+                    &request.request.request_id.0,
+                    request.conflict_policy,
+                    request.reuse_policy,
+                )
+                .await?;
+            match resolution {
+                ConflictResolution::Absent | ConflictResolution::ClosedAllowReuse => {
+                    match self
+                        .start_and_update_fresh(
+                            &request,
+                            &update_id,
+                            &update_name,
+                            &update_input,
+                            &update_request,
+                            update_timeout,
+                            wait_policy.clone(),
+                        )
+                        .await?
+                    {
+                        Some(result) => return Ok(result),
+                        None => continue,
+                    }
+                }
+                ConflictResolution::TerminateAndStart { run_key } => {
+                    self.terminate_existing_for_conflict(
+                        request.namespace_id,
+                        request.workflow_id.clone(),
+                        run_key,
+                        request.request.clone(),
+                    )
+                    .await?;
+                    match self
+                        .start_and_update_fresh(
+                            &request,
+                            &update_id,
+                            &update_name,
+                            &update_input,
+                            &update_request,
+                            update_timeout,
+                            wait_policy.clone(),
+                        )
+                        .await?
+                    {
+                        Some(result) => return Ok(result),
+                        None => continue,
+                    }
+                }
+                ConflictResolution::UseExisting { run_key, run_id }
+                | ConflictResolution::DedupRetried {
+                    run_key, run_id, ..
+                } => {
+                    let execution = ExecutionRef {
+                        namespace_id: request.namespace_id,
+                        workflow_id: request.workflow_id.clone(),
+                        run_id: Some(run_id),
+                    };
+                    let update = self
+                        .update_workflow(
+                            execution,
+                            update_id,
+                            update_name,
+                            update_input,
+                            update_request,
+                            update_timeout,
+                            wait_policy,
+                        )
+                        .await
+                        .map_err(|source| MultiOperationError::UpdateFailed {
+                            started: false,
+                            source,
+                        })?;
+                    return Ok(MultiOperationResult {
+                        run_key,
+                        run_id,
+                        started: false,
+                        execution_status: ExecutionStatus::Running,
+                        update,
+                    });
+                }
+                ConflictResolution::Rejected {
+                    run_key,
+                    run_id,
+                    reason,
+                } => {
+                    return Err(MultiOperationError::StartRejected {
+                        run_key,
+                        run_id,
+                        reason,
+                    }
+                    .into());
+                }
+            }
+        }
+        Err(anyhow!(
+            "update-with-start exceeded conflict resolution attempts"
+        ))
+    }
+
+    /// Fresh-start leg: register the update transport BEFORE the commit (the
+    /// registry carries the name/input the first WFT delivery needs; the
+    /// kernel folds only the id), submit the atomic `StartAndUpdate`, then
+    /// drive the update wait. Returns `None` on a lost start race so the
+    /// caller re-resolves.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_and_update_fresh(
+        &self,
+        request: &StartRequest,
+        update_id: &str,
+        update_name: &str,
+        update_input: &Payloads,
+        update_request: &RequestContext,
+        update_timeout: Duration,
+        wait_policy: UpdateWaitPolicy,
+    ) -> Result<Option<MultiOperationResult>> {
+        let (wait_tx, wait_rx) = oneshot::channel();
+        self.update_registry.register(
+            request.run_key,
+            update_id.to_string(),
+            update_name.to_string(),
+            update_input.clone(),
+            update_request.caller_identity.clone().unwrap_or_default(),
+            wait_policy.clone(),
+            wait_tx,
+        );
+        match self
+            .start_workflow_inner(request.clone(), Some(update_id.to_string()))
+            .await
+        {
+            Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {}
+            Ok(CommitResult::CurrentExecutionConflict { .. }) => {
+                self.update_registry.remove(request.run_key, update_id);
+                return Ok(None);
+            }
+            Ok(CommitResult::Conflict { reason }) => {
+                self.update_registry.remove(request.run_key, update_id);
+                return Err(anyhow!("update-with-start start conflicted: {reason}"));
+            }
+            Err(error) => {
+                self.update_registry.remove(request.run_key, update_id);
+                return Err(error);
+            }
+        }
+        let execution = ExecutionRef {
+            namespace_id: request.namespace_id,
+            workflow_id: request.workflow_id.clone(),
+            run_id: Some(request.run_id),
+        };
+        let update = self
+            .wait_for_update_stage_with_receiver(
+                request.run_key,
+                execution,
+                update_id.to_string(),
+                wait_policy,
+                update_timeout,
+                wait_rx,
+            )
+            .await
+            .map_err(|source| MultiOperationError::UpdateFailed {
+                started: true,
+                source,
+            })?;
+        Ok(Some(MultiOperationResult {
+            run_key: request.run_key,
+            run_id: request.run_id,
+            started: true,
+            execution_status: ExecutionStatus::Running,
+            update,
+        }))
+    }
+
     pub async fn signal_with_start_workflow(
         &self,
         mut request: SignalWithStartRequest,

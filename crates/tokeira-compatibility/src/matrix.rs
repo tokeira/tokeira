@@ -100,6 +100,20 @@ const MULTI_OPERATION_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface
     identifier: "WorkflowService.MultiOperation",
 }];
 const MULTI_OPERATION_RPCS: &[&str] = &["WorkflowService.ExecuteMultiOperation"];
+const MULTI_OPERATION_EVIDENCE: &[CompatibilityEvidence] = &[
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/src/grpc/translate.rs::multi_operation_shape_gate_rejects_non_start_update_pairs",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/src/grpc/translate.rs::multi_operation_start_conflict_keeps_already_exists_and_typed_detail",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/src/grpc/translate.rs::multi_operation_response_serializes_ordered_start_update_pair",
+    },
+];
 
 const NAMESPACE_MANAGEMENT_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
     kind: CompatibilitySurfaceKind::Rpc,
@@ -421,13 +435,13 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
     FeatureEntry {
         id: "multi-operation",
         name: "Multi-operation execution",
-        state: FeatureState::Unsupported,
+        state: FeatureState::Implemented,
         surfaces: MULTI_OPERATION_SURFACES,
         capability_field: None,
         dynamic_config_key: None,
         rpcs: MULTI_OPERATION_RPCS,
-        notes: "ExecuteMultiOperation is classified as a distinct unsupported batch-style API.",
-        evidence: &[],
+        notes: "ExecuteMultiOperation implements Update-with-Start ([Start, Update] only, per v1.31.0): atomic fresh-start admission via Command::StartAndUpdate, attach/dedup/already-completed paths, and the structured MultiOperationExecutionFailure error with the Aborted sibling.",
+        evidence: MULTI_OPERATION_EVIDENCE,
     },
     FeatureEntry {
         id: "namespace-management",

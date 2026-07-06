@@ -387,7 +387,7 @@ where
             .await
     }
 
-    async fn wait_for_update_stage(
+    pub(crate) async fn wait_for_update_stage(
         &self,
         run_key: RunKey,
         execution: ExecutionRef,
@@ -441,7 +441,7 @@ where
         .await
     }
 
-    async fn wait_for_update_stage_with_receiver(
+    pub(crate) async fn wait_for_update_stage_with_receiver(
         &self,
         run_key: RunKey,
         execution: ExecutionRef,
@@ -560,7 +560,7 @@ where
             })
     }
 
-    async fn update_lifecycle_snapshot(
+    pub(crate) async fn update_lifecycle_snapshot(
         &self,
         run_key: RunKey,
         execution: ExecutionRef,

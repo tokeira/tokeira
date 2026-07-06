@@ -926,6 +926,73 @@ pub struct SignalWithStartWorkflowExecutionResponse {
     pub started: bool,
 }
 
+/// Edge request for `ExecuteMultiOperation` — exactly the Update-with-Start
+/// `[Start, Update]` composition, the only operation list the RPC accepts at
+/// v1.31.0 (proto `ExecuteMultiOperationRequest.Operation` is a two-arm oneof;
+/// `workflow_handler.go:718-726 @ v1.31.0` rejects any other shape). Shape and
+/// per-operation field validation happen at the gRPC boundary
+/// (`multi_operation_request_to_edge`), so this DTO only exists for a
+/// composition that passed every pre-mutation gate (Req 1, Property 1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecuteMultiOperationRequest {
+    pub namespace: String,
+    /// The start leg (`operations[0]`), already through the standalone
+    /// start-request translation (standalone validation parity, Req 1.6).
+    pub start: StartWorkflowExecutionRequest,
+    /// The update leg (`operations[1]`), already through the standalone
+    /// update-request translation; `update_id` is defaulted to a fresh UUIDv4
+    /// when the client sent none, mirroring standalone update.
+    pub update: UpdateWorkflowExecutionRequest,
+    /// `Update.Request.Meta.identity`, threaded into the update leg's
+    /// `RequestContext.caller_identity` (the shared update DTO does not carry
+    /// identity; the admitted-update transport needs it).
+    pub update_identity: Option<String>,
+}
+
+/// Ordered Update-with-Start success payload: the start leg's
+/// `run_id`/`started`/`status` triple plus the update leg serialized exactly
+/// like standalone `UpdateWorkflowExecution` (Req 3;
+/// `workflow_handler.go:863-895 @ v1.31.0`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecuteMultiOperationResponse {
+    pub run_id: RunId,
+    /// Whether the start leg created a new run (false on attach/dedup/replay
+    /// paths — `multioperation/api.go @ v1.31.0`).
+    pub started: bool,
+    /// Execution status reported on the start response (proto
+    /// `StartWorkflowExecutionResponse.status`).
+    pub status: ExecutionStatus,
+    pub update: UpdateWorkflowExecutionResponse,
+}
+
+/// Success-or-per-operation-failure outcome of the edge Update-with-Start
+/// orchestration. A leg failure is data here — not an `EdgeError` — because
+/// the wire shape needs the failing leg's own typed error *plus* which sibling
+/// aborts; the gRPC layer serializes it as the top-level status carrying the
+/// `MultiOperationExecutionFailure` detail (Req 4;
+/// `serviceerror.MultiOperationExecution.Status()` @ v1.31.0).
+#[derive(Debug)]
+pub enum ExecuteMultiOperationOutcome {
+    Completed(ExecuteMultiOperationResponse),
+    Failed(MultiOperationFailure),
+}
+
+/// The failing leg of an Update-with-Start, carrying the same `EdgeError` the
+/// standalone RPC would surface so per-operation codes, messages, and details
+/// are preserved verbatim (Req 4.2, 4.6).
+#[derive(Debug)]
+pub enum MultiOperationFailure {
+    /// The START leg was rejected; the update leg aborts as the sibling.
+    Start(crate::errors::EdgeError),
+    /// The UPDATE leg failed. `started` records whether the start leg created
+    /// a run (its op serializes as code OK) or aborts as the sibling
+    /// (`MultiOperationError::UpdateFailed` in the runtime).
+    Update {
+        started: bool,
+        error: crate::errors::EdgeError,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DescribeTaskQueueRequest {
     pub namespace: String,

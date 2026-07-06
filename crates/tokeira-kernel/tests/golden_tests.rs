@@ -1069,6 +1069,57 @@ fn delayed_start_replay_reconstructs_timer_until_wft_is_scheduled() {
 }
 
 #[test]
+fn start_and_update_from_absent_is_one_transition() {
+    // Update-with-Start's fresh-start leg: ONE transition creates the run,
+    // admits the update, and schedules the first WFT (the delivery vehicle).
+    // NO update event is emitted — v1.31.0 writes none on this path and the
+    // corpus pins UWS histories starting exactly
+    // `1 WorkflowExecutionStarted / 2 WorkflowTaskScheduled`
+    // (multioperation/api.go @ v1.31.0; spec api-conformance-multi-operation).
+    let transition = kernel()
+        .apply(
+            LoadedRun::Absent,
+            Command::StartAndUpdate(tokeira_kernel::StartAndUpdateRequest {
+                start: make_start_request(),
+                update_id: "update-1".to_string(),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 2);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionStarted { .. }
+    ));
+    assert!(matches!(
+        transition.history_events[1].kind,
+        HistoryEventKind::WorkflowTaskScheduled { .. }
+    ));
+    assert!(transition.next_state.admitted_updates.contains("update-1"));
+    assert!(transition.next_state.pending_workflow_task.is_some());
+    assert!(
+        transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::EnqueueWorkflowTask { .. }))
+    );
+}
+
+#[test]
+fn start_and_update_rejects_existing_run() {
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state()),
+            Command::StartAndUpdate(tokeira_kernel::StartAndUpdateRequest {
+                start: make_start_request(),
+                update_id: "update-1".to_string(),
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(reject, Reject::RunAlreadyExists);
+}
+
+#[test]
 fn signal_with_start_from_absent() {
     let mut req = make_signal_with_start_request();
     let mut header = BTreeMap::new();

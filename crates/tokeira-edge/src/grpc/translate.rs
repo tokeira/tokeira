@@ -52,9 +52,9 @@ use tokeira_proto::{
     public::temporal::api::{
         activity::v1 as activity_proto, command::v1 as command, common::v1 as proto_common,
         compute::v1 as compute_proto, deployment::v1 as deployment_proto,
-        failure::v1 as failure_proto, namespace::v1 as namespace_proto,
-        replication::v1 as replication_proto, taskqueue::v1 as taskqueue_proto,
-        version::v1 as version_proto, workflow::v1 as workflow,
+        errordetails::v1 as errordetails_proto, failure::v1 as failure_proto,
+        namespace::v1 as namespace_proto, replication::v1 as replication_proto,
+        taskqueue::v1 as taskqueue_proto, version::v1 as version_proto, workflow::v1 as workflow,
     },
     workflowservice,
 };
@@ -76,6 +76,7 @@ use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, NamespaceId, Payloads, RetryPolicy,
     RunId, TaskKind, TaskQueueName, WorkflowId, WorkflowType,
 };
+use tonic::{Code, Status, metadata::MetadataMap};
 use uuid::Uuid;
 
 use crate::translate::{
@@ -85,14 +86,16 @@ use crate::translate::{
     DeleteWorkflowExecutionRequest as EdgeDeleteWorkflowExecutionRequest,
     DescribeTaskQueueRequest as EdgeDescribeTaskQueueRequest,
     DescribeTaskQueueResponse as EdgeDescribeTaskQueueResponse, DescribeWorkflowExecutionRequest,
-    Link as EdgeLink, LinkWorkflowEventReference, ListActivityExecutionsRequest,
-    ListActivityExecutionsResponse, ListNamespacesResponse as EdgeListNamespacesResponse,
+    ExecuteMultiOperationRequest as EdgeExecuteMultiOperationRequest,
+    ExecuteMultiOperationResponse as EdgeExecuteMultiOperationResponse, Link as EdgeLink,
+    LinkWorkflowEventReference, ListActivityExecutionsRequest, ListActivityExecutionsResponse,
+    ListNamespacesResponse as EdgeListNamespacesResponse,
     ListTaskQueuePartitionsRequest as EdgeListTaskQueuePartitionsRequest,
     ListTaskQueuePartitionsResponse as EdgeListTaskQueuePartitionsResponse,
-    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceDescription,
-    NamespaceStateUpdate, OnConflictOptions as EdgeOnConflictOptions, PollWorkflowTaskQueueRequest,
-    PollWorkflowTaskQueueResponse, Priority as EdgePriority, ProtocolMessageDto, QueryResultDto,
-    RegisterNamespaceRequest as EdgeRegisterNamespaceRequest,
+    ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, MultiOperationFailure,
+    NamespaceDescription, NamespaceStateUpdate, OnConflictOptions as EdgeOnConflictOptions,
+    PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse, Priority as EdgePriority,
+    ProtocolMessageDto, QueryResultDto, RegisterNamespaceRequest as EdgeRegisterNamespaceRequest,
     ResetWorkflowExecutionRequest as EdgeResetWorkflowExecutionRequest,
     ResetWorkflowExecutionResponse as EdgeResetWorkflowExecutionResponse,
     RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
@@ -5702,6 +5705,382 @@ fn update_lifecycle_stage_to_i32(stage: crate::translate::UpdateLifecycleStageDt
     }
 }
 
+// ── ExecuteMultiOperation (Update-with-Start) ──
+
+/// Exact v1.31.0 frontend messages for the Update-with-Start gates
+/// (`service/frontend/errors.go:81-83` and the `errMultiOp*` / `errUpdate*`
+/// constants @ v1.31.0 — the corpus asserts them verbatim).
+const MULTI_OP_NOT_START_AND_UPDATE: &str = "Operations have to be exactly [Start, Update].";
+const MULTI_OP_ABORTED: &str = "Operation was aborted.";
+const MULTI_OP_COULD_NOT_BE_EXECUTED: &str = "Update-with-Start could not be executed.";
+const MULTI_OP_NAMESPACE_MISMATCH: &str = "Operation namespace did not match request's namespace.";
+const MULTI_OP_START_CRON: &str = "CronSchedule is not allowed.";
+const MULTI_OP_START_EAGER: &str = "RequestEagerExecution is not supported.";
+const MULTI_OP_START_DELAY: &str = "WorkflowStartDelay is not supported.";
+const MULTI_OP_UPDATE_FIRST_EXECUTION_RUN_ID: &str = "FirstExecutionRunId is not allowed.";
+const MULTI_OP_UPDATE_RUN_ID: &str = "RunId is not allowed.";
+const MULTI_OP_WORKFLOW_ID_INCONSISTENT: &str =
+    "WorkflowId is not consistent with previous operation(s).";
+const UPDATE_META_NOT_SET: &str = "Update meta is not set on request.";
+const UPDATE_INPUT_NOT_SET: &str = "Update input is not set on request.";
+const UPDATE_NAME_NOT_SET: &str = "Update name is not set on request.";
+
+/// Pre-mutation validation failure for `ExecuteMultiOperation` (Req 1,
+/// Property 1: no runtime call happens once this is returned).
+#[derive(Debug, PartialEq, Eq)]
+pub enum MultiOperationRequestError {
+    /// The operation list is not exactly `[Start, Update]`. Serialized as a
+    /// PLAIN `INVALID_ARGUMENT` with NO multi-operation detail — the frontend
+    /// shape gate precedes per-operation status assembly
+    /// (`workflow_handler.go:718-726 @ v1.31.0`; errors.go:82).
+    Shape,
+    /// Per-operation validation failed
+    /// (`convertToHistoryMultiOperationRequest`, workflow_handler.go:766-785
+    /// @ v1.31.0): each failing op carries its own `INVALID_ARGUMENT`
+    /// message and a clean sibling aborts. At least one side is `Some`.
+    PerOperation {
+        start: Option<String>,
+        update: Option<String>,
+    },
+}
+
+/// Translate + validate the full Update-with-Start composition BEFORE any
+/// runtime call: the `[Start, Update]` shape gate, per-operation namespace
+/// match, the standalone start/update field validations (parity, Req 1.6),
+/// the operation-specific prohibitions, and start/update workflow-id
+/// consistency (Req 1.1-1.5).
+pub fn multi_operation_request_to_edge(
+    req: workflowservice::ExecuteMultiOperationRequest,
+) -> Result<EdgeExecuteMultiOperationRequest, MultiOperationRequestError> {
+    use workflowservice::execute_multi_operation_request::operation::Operation;
+
+    // Shape gate: exactly `[StartWorkflow, UpdateWorkflow]`, in this order
+    // (workflow_handler.go:718-726 @ v1.31.0). Matching the oneof
+    // exhaustively means any future operation arm falls into the same
+    // rejection until it is deliberately mapped.
+    let mut operations = req.operations.into_iter();
+    let (start_op, update_op) = match (operations.next(), operations.next(), operations.next()) {
+        (Some(first), Some(second), None) => match (first.operation, second.operation) {
+            (
+                Some(Operation::StartWorkflow(start_op)),
+                Some(Operation::UpdateWorkflow(update_op)),
+            ) => (start_op, update_op),
+            _ => return Err(MultiOperationRequestError::Shape),
+        },
+        _ => return Err(MultiOperationRequestError::Shape),
+    };
+
+    let namespace = req.namespace;
+
+    // ── Start leg: namespace gate → standalone start translation → the
+    //    three multi-op prohibitions, in the frontend's order
+    //    (workflow_handler.go:803-820 @ v1.31.0). ──
+    let start_workflow_id = start_op.workflow_id.clone();
+    let cron_schedule_set = !start_op.cron_schedule.is_empty();
+    let eager_execution_requested = start_op.request_eager_execution;
+    // `op.StartWorkflow.WorkflowStartDelay.AsDuration() > 0` — strictly
+    // positive; a zero/absent delay passes (workflow_handler.go:817).
+    let start_delay_positive = start_op
+        .workflow_start_delay
+        .as_ref()
+        .is_some_and(|delay| delay.seconds > 0 || delay.nanos > 0);
+
+    let mut start_error = None;
+    let mut start = None;
+    if !start_op.namespace.is_empty() && start_op.namespace != namespace {
+        start_error = Some(MULTI_OP_NAMESPACE_MISMATCH.to_owned());
+    } else {
+        // Standalone `StartWorkflowExecution` translation runs unchanged
+        // (field presence, cron-string validation, callback/link limits,
+        // conflict/reuse-policy defaulting) so parity is automatic (Req 1.6).
+        match start_request_to_edge(start_op) {
+            Err(error) => start_error = Some(error.to_string()),
+            Ok(mut dto) => {
+                if cron_schedule_set {
+                    start_error = Some(MULTI_OP_START_CRON.to_owned());
+                } else if eager_execution_requested {
+                    start_error = Some(MULTI_OP_START_EAGER.to_owned());
+                } else if start_delay_positive {
+                    start_error = Some(MULTI_OP_START_DELAY.to_owned());
+                } else {
+                    // The op-level namespace may be empty (only a non-empty
+                    // mismatch rejects); the composition always executes in
+                    // the request namespace.
+                    dto.namespace = namespace.clone();
+                    start = Some(dto);
+                }
+            }
+        }
+    }
+
+    // ── Update leg: namespace gate → standard update validation (meta/
+    //    input/name presence — `errUpdateMetaNotSet`/`errUpdateInputNotSet`/
+    //    `errUpdateNameNotSet`, errors.go @ v1.31.0 — plus the ADMITTED
+    //    wait-stage rejection standalone update issues) → the two multi-op
+    //    prohibitions (workflow_handler.go:833-842) → workflow-id
+    //    consistency, reported on the SECOND op
+    //    (workflow_handler.go:766-778). ──
+    let update_workflow_id = update_op
+        .workflow_execution
+        .as_ref()
+        .map(|execution| execution.workflow_id.clone());
+    let update_run_id_set = update_op
+        .workflow_execution
+        .as_ref()
+        .is_some_and(|execution| !execution.run_id.is_empty());
+    let first_execution_run_id_set = !update_op.first_execution_run_id.is_empty();
+    let update_meta = update_op
+        .request
+        .as_ref()
+        .and_then(|request| request.meta.as_ref());
+    let update_identity = update_meta
+        .map(|meta| meta.identity.clone())
+        .filter(|identity| !identity.is_empty());
+    let update_input = update_op
+        .request
+        .as_ref()
+        .and_then(|request| request.input.as_ref());
+    let admitted_wait = update_op.wait_policy.as_ref().is_some_and(|policy| {
+        policy.lifecycle_stage == enums::UpdateWorkflowExecutionLifecycleStage::Admitted as i32
+    });
+
+    let mut update_error = None;
+    let mut update = None;
+    if !update_op.namespace.is_empty() && update_op.namespace != namespace {
+        update_error = Some(MULTI_OP_NAMESPACE_MISMATCH.to_owned());
+    } else if update_meta.is_none() {
+        update_error = Some(UPDATE_META_NOT_SET.to_owned());
+    } else if update_input.is_none() {
+        update_error = Some(UPDATE_INPUT_NOT_SET.to_owned());
+    } else if update_input.is_some_and(|input| input.name.is_empty()) {
+        update_error = Some(UPDATE_NAME_NOT_SET.to_owned());
+    } else if admitted_wait {
+        // Same rejection standalone update issues for the ADMITTED stage,
+        // surfaced pre-mutation here (validate before mutate, Req 2.5).
+        update_error =
+            Some("UpdateWorkflowExecution does not support waiting for ADMITTED".to_owned());
+    } else if first_execution_run_id_set {
+        update_error = Some(MULTI_OP_UPDATE_FIRST_EXECUTION_RUN_ID.to_owned());
+    } else if update_run_id_set {
+        update_error = Some(MULTI_OP_UPDATE_RUN_ID.to_owned());
+    } else {
+        match update_request_to_edge(update_op) {
+            Err(error) => update_error = Some(error.to_string()),
+            Ok(mut dto) => {
+                if update_workflow_id.as_deref() != Some(start_workflow_id.as_str()) {
+                    update_error = Some(MULTI_OP_WORKFLOW_ID_INCONSISTENT.to_owned());
+                } else {
+                    if dto.update_id.is_empty() {
+                        // Mirror standalone update: an empty update id gets a
+                        // fresh UUIDv4 at admission.
+                        dto.update_id = Uuid::new_v4().to_string();
+                    }
+                    dto.namespace = namespace.clone();
+                    update = Some(dto);
+                }
+            }
+        }
+    }
+
+    match (start, update) {
+        (Some(start), Some(update)) => Ok(EdgeExecuteMultiOperationRequest {
+            namespace,
+            start,
+            update,
+            update_identity,
+        }),
+        _ => Err(MultiOperationRequestError::PerOperation {
+            start: start_error,
+            update: update_error,
+        }),
+    }
+}
+
+/// Serialize the ordered `[start_response, update_response]` pair (Req 3;
+/// workflow_handler.go:863-895 @ v1.31.0).
+pub fn multi_operation_response_to_proto(
+    resp: EdgeExecuteMultiOperationResponse,
+) -> workflowservice::ExecuteMultiOperationResponse {
+    use workflowservice::execute_multi_operation_response::{
+        Response, response::Response as ResponseVariant,
+    };
+
+    workflowservice::ExecuteMultiOperationResponse {
+        responses: vec![
+            Response {
+                response: Some(ResponseVariant::StartWorkflow(
+                    workflowservice::StartWorkflowExecutionResponse {
+                        run_id: resp.run_id.0.to_string(),
+                        started: resp.started,
+                        // `status` reflects the target run's current state —
+                        // load-bearing on the dedup/attach/already-completed
+                        // paths (proto StartWorkflowExecutionResponse.status
+                        // doc; multioperation/api.go @ v1.31.0). No response
+                        // link: the multi-op start response carries only
+                        // RunId/Started/Status.
+                        status: execution_status_to_proto(resp.status),
+                        ..Default::default()
+                    },
+                )),
+            },
+            Response {
+                // The update leg serializes exactly like standalone
+                // UpdateWorkflowExecution (outcome mapping incl. the
+                // AcceptedRunClosed server-authored failure).
+                response: Some(ResponseVariant::UpdateWorkflow(update_response_to_proto(
+                    resp.update,
+                ))),
+            },
+        ],
+    }
+}
+
+/// Serialize a pre-mutation validation failure (Req 1/4): the shape gate is a
+/// plain `INVALID_ARGUMENT`; per-operation failures build the structured
+/// `MultiOperationExecutionFailure` with the clean sibling aborted.
+pub fn multi_operation_request_error_to_status(error: MultiOperationRequestError) -> Status {
+    match error {
+        MultiOperationRequestError::Shape => {
+            Status::invalid_argument(MULTI_OP_NOT_START_AND_UPDATE)
+        }
+        MultiOperationRequestError::PerOperation { start, update } => {
+            let leg = |message: Option<String>| match message {
+                Some(message) => MultiOperationLeg::Failed(Status::invalid_argument(message)),
+                None => MultiOperationLeg::Aborted,
+            };
+            multi_operation_execution_failure_status([leg(start), leg(update)])
+        }
+    }
+}
+
+/// Serialize a post-validation leg failure (Req 4): the failing op carries the
+/// SAME status its standalone RPC would produce (typed details included); the
+/// sibling aborts — except a start leg that already durably applied, which
+/// serializes as code OK (`MultiOperationError::UpdateFailed{started}` in the
+/// runtime; multioperation/api.go @ v1.31.0).
+pub fn multi_operation_failure_to_status(failure: MultiOperationFailure) -> Status {
+    match failure {
+        MultiOperationFailure::Start(error) => multi_operation_execution_failure_status([
+            MultiOperationLeg::Failed(error.into()),
+            MultiOperationLeg::Aborted,
+        ]),
+        MultiOperationFailure::Update { started, error } => {
+            let start_leg = if started {
+                MultiOperationLeg::Ok
+            } else {
+                MultiOperationLeg::Aborted
+            };
+            multi_operation_execution_failure_status([
+                start_leg,
+                MultiOperationLeg::Failed(error.into()),
+            ])
+        }
+    }
+}
+
+/// One leg of a failed composition, pre-serialization. Tracking the sibling
+/// abort structurally (rather than by comparing codes) keeps a genuine
+/// `Aborted` failure on the failing op distinguishable from the sibling.
+enum MultiOperationLeg {
+    /// The op that actually failed, carrying its standalone gRPC status.
+    Failed(Status),
+    /// The non-failing sibling: code `Aborted`, message "Operation was
+    /// aborted.", one `MultiOperationExecutionAborted` detail
+    /// (proto failure/v1/message.proto; errors.go:83 @ v1.31.0).
+    Aborted,
+    /// A start leg that durably applied before the update leg failed:
+    /// code OK, empty message, no details.
+    Ok,
+}
+
+/// Assemble the top-level gRPC status: code = the FIRST op that actually
+/// failed (`service.proto:116-117 @ v1.31.0`), message "Update-with-Start
+/// could not be executed.", and ONE `MultiOperationExecutionFailure` detail
+/// carrying one `OperationStatus` per op in request order, riding the encoded
+/// `google.rpc.Status` trailer exactly like [`workflow_not_ready_status`]
+/// (crate::grpc::errors, errors.rs:146).
+fn multi_operation_execution_failure_status(legs: [MultiOperationLeg; 2]) -> Status {
+    let top_code = legs
+        .iter()
+        .find_map(|leg| match leg {
+            MultiOperationLeg::Failed(status) => Some(status.code()),
+            _ => None,
+        })
+        // Unreachable by construction (every caller supplies a Failed leg);
+        // Internal keeps the fallback honest rather than minting a fake OK.
+        .unwrap_or(Code::Internal);
+
+    let statuses = legs
+        .iter()
+        .map(|leg| match leg {
+            MultiOperationLeg::Failed(status) => {
+                errordetails_proto::multi_operation_execution_failure::OperationStatus {
+                    code: status.code() as i32,
+                    message: status.message().to_owned(),
+                    // The failing op's own typed details (e.g. the
+                    // WorkflowExecutionAlreadyStartedFailure Any) ride inside
+                    // its encoded google.rpc.Status trailer; re-parent them
+                    // onto the per-operation status (Req 4.2, 4.6).
+                    details: RpcStatus::decode(status.details())
+                        .map(|rpc_status| rpc_status.details)
+                        .unwrap_or_default(),
+                }
+            }
+            MultiOperationLeg::Aborted => {
+                errordetails_proto::multi_operation_execution_failure::OperationStatus {
+                    code: Code::Aborted as i32,
+                    message: MULTI_OP_ABORTED.to_owned(),
+                    details: vec![prost_types::Any {
+                        type_url:
+                            "type.googleapis.com/temporal.api.failure.v1.MultiOperationExecutionAborted"
+                                .to_owned(),
+                        value: failure_proto::MultiOperationExecutionAborted {}.encode_to_vec(),
+                    }],
+                }
+            }
+            MultiOperationLeg::Ok => {
+                errordetails_proto::multi_operation_execution_failure::OperationStatus {
+                    code: Code::Ok as i32,
+                    message: String::new(),
+                    details: Vec::new(),
+                }
+            }
+        })
+        .collect();
+
+    let failure_any = prost_types::Any {
+        type_url: "type.googleapis.com/temporal.api.errordetails.v1.MultiOperationExecutionFailure"
+            .to_owned(),
+        value: errordetails_proto::MultiOperationExecutionFailure { statuses }.encode_to_vec(),
+    };
+    let rpc_status = RpcStatus {
+        code: top_code as i32,
+        message: MULTI_OP_COULD_NOT_BE_EXECUTED.to_owned(),
+        details: vec![failure_any],
+    };
+    Status::with_details_and_metadata(
+        top_code,
+        MULTI_OP_COULD_NOT_BE_EXECUTED,
+        rpc_status.encode_to_vec().into(),
+        MetadataMap::new(),
+    )
+}
+
+/// Minimal `google.rpc.Status` mirror for the `grpc-status-details-bin`
+/// trailer — same rationale as the mirror in `grpc/errors.rs:146` (no
+/// temporal proto pulls `google/rpc/status.proto` into the build), but
+/// carrying `prost_types::Any` details directly because per-operation details
+/// are re-parented from the failing leg's own encoded status.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7914,5 +8293,421 @@ mod tests {
         let decoded = payload_to_failure(&corrupted);
         assert_eq!(decoded.message, "garbage bytes");
         assert!(decoded.failure_info.is_none());
+    }
+
+    // ── ExecuteMultiOperation (Update-with-Start) ──
+
+    fn multi_op_start(workflow_id: &str) -> workflowservice::StartWorkflowExecutionRequest {
+        workflowservice::StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: workflow_id.to_string(),
+            workflow_type: Some(proto_common::WorkflowType {
+                name: "wf-type".to_string(),
+            }),
+            task_queue: Some(taskqueue::TaskQueue {
+                name: "queue".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn multi_op_update(workflow_id: &str) -> workflowservice::UpdateWorkflowExecutionRequest {
+        use tokeira_proto::public::temporal::api::update::v1 as update;
+        workflowservice::UpdateWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_execution: Some(proto_common::WorkflowExecution {
+                workflow_id: workflow_id.to_string(),
+                run_id: String::new(),
+            }),
+            request: Some(update::Request {
+                meta: Some(update::Meta {
+                    update_id: String::new(),
+                    identity: "update-client".to_string(),
+                }),
+                input: Some(update::Input {
+                    header: None,
+                    name: "my-update".to_string(),
+                    args: None,
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn multi_op_request(
+        start: Option<workflowservice::StartWorkflowExecutionRequest>,
+        update: Option<workflowservice::UpdateWorkflowExecutionRequest>,
+    ) -> workflowservice::ExecuteMultiOperationRequest {
+        use workflowservice::execute_multi_operation_request::{Operation, operation};
+        let mut operations = Vec::new();
+        if let Some(start) = start {
+            operations.push(Operation {
+                operation: Some(operation::Operation::StartWorkflow(start)),
+            });
+        }
+        if let Some(update) = update {
+            operations.push(Operation {
+                operation: Some(operation::Operation::UpdateWorkflow(update)),
+            });
+        }
+        workflowservice::ExecuteMultiOperationRequest {
+            namespace: "default".to_string(),
+            operations,
+            ..Default::default()
+        }
+    }
+
+    /// Req 1.1: anything other than exactly `[Start, Update]` (in order) hits
+    /// the shape gate — a PLAIN INVALID_ARGUMENT with the exact frontend
+    /// message and NO multi-operation detail (workflow_handler.go:718-726).
+    #[test]
+    fn multi_operation_shape_gate_rejects_non_start_update_pairs() {
+        // Empty, start-only, and reversed-order compositions all reject.
+        let cases = vec![
+            multi_op_request(None, None),
+            multi_op_request(Some(multi_op_start("wf")), None),
+            multi_op_request(None, Some(multi_op_update("wf"))),
+            {
+                use workflowservice::execute_multi_operation_request::{Operation, operation};
+                workflowservice::ExecuteMultiOperationRequest {
+                    namespace: "default".to_string(),
+                    operations: vec![
+                        Operation {
+                            operation: Some(operation::Operation::UpdateWorkflow(multi_op_update(
+                                "wf",
+                            ))),
+                        },
+                        Operation {
+                            operation: Some(operation::Operation::StartWorkflow(multi_op_start(
+                                "wf",
+                            ))),
+                        },
+                    ],
+                    ..Default::default()
+                }
+            },
+        ];
+        for request in cases {
+            assert_eq!(
+                multi_operation_request_to_edge(request).unwrap_err(),
+                MultiOperationRequestError::Shape
+            );
+        }
+
+        let status = multi_operation_request_error_to_status(MultiOperationRequestError::Shape);
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "Operations have to be exactly [Start, Update]."
+        );
+        assert!(
+            status.details().is_empty(),
+            "the shape gate carries no MultiOperationExecutionFailure detail"
+        );
+    }
+
+    /// Req 1.2/1.4: each prohibited start field and a start-op namespace
+    /// mismatch produce that op's own message; the update sibling stays clean.
+    #[test]
+    fn multi_operation_start_restrictions_produce_per_op_errors() {
+        let mut cron = multi_op_start("wf");
+        cron.cron_schedule = "* * * * *".to_string();
+        let mut eager = multi_op_start("wf");
+        eager.request_eager_execution = true;
+        let mut delayed = multi_op_start("wf");
+        delayed.workflow_start_delay = Some(prost_types::Duration {
+            seconds: 5,
+            nanos: 0,
+        });
+        let mut foreign_namespace = multi_op_start("wf");
+        foreign_namespace.namespace = "other".to_string();
+
+        let cases = vec![
+            (cron, "CronSchedule is not allowed."),
+            (eager, "RequestEagerExecution is not supported."),
+            (delayed, "WorkflowStartDelay is not supported."),
+            (
+                foreign_namespace,
+                "Operation namespace did not match request's namespace.",
+            ),
+        ];
+        for (start, expected) in cases {
+            let error = multi_operation_request_to_edge(multi_op_request(
+                Some(start),
+                Some(multi_op_update("wf")),
+            ))
+            .unwrap_err();
+            assert_eq!(
+                error,
+                MultiOperationRequestError::PerOperation {
+                    start: Some(expected.to_string()),
+                    update: None,
+                }
+            );
+        }
+    }
+
+    /// Req 1.3/1.4/1.5: prohibited update fields, missing meta/input/name,
+    /// the ADMITTED wait-stage rejection, and start/update workflow-id
+    /// inconsistency all error the UPDATE op with the sibling clean.
+    #[test]
+    fn multi_operation_update_restrictions_produce_per_op_errors() {
+        use tokeira_proto::public::temporal::api::update::v1 as update;
+
+        let mut no_meta = multi_op_update("wf");
+        no_meta.request.as_mut().unwrap().meta = None;
+        let mut no_input = multi_op_update("wf");
+        no_input.request.as_mut().unwrap().input = None;
+        let mut unnamed = multi_op_update("wf");
+        unnamed
+            .request
+            .as_mut()
+            .unwrap()
+            .input
+            .as_mut()
+            .unwrap()
+            .name = String::new();
+        let mut admitted = multi_op_update("wf");
+        admitted.wait_policy = Some(update::WaitPolicy {
+            lifecycle_stage: enums::UpdateWorkflowExecutionLifecycleStage::Admitted as i32,
+        });
+        let mut first_run = multi_op_update("wf");
+        first_run.first_execution_run_id = "b4b3e1f0-0000-0000-0000-000000000000".to_string();
+        let mut pinned_run = multi_op_update("wf");
+        pinned_run.workflow_execution.as_mut().unwrap().run_id =
+            "b4b3e1f0-0000-0000-0000-000000000000".to_string();
+        let mut foreign_namespace = multi_op_update("wf");
+        foreign_namespace.namespace = "other".to_string();
+
+        let cases = vec![
+            (no_meta, "Update meta is not set on request."),
+            (no_input, "Update input is not set on request."),
+            (unnamed, "Update name is not set on request."),
+            (
+                admitted,
+                "UpdateWorkflowExecution does not support waiting for ADMITTED",
+            ),
+            (first_run, "FirstExecutionRunId is not allowed."),
+            (pinned_run, "RunId is not allowed."),
+            (
+                foreign_namespace,
+                "Operation namespace did not match request's namespace.",
+            ),
+            // Workflow-id mismatch is reported on the SECOND op; the start
+            // op aborts as the sibling (workflow_handler.go:766-778).
+            (
+                multi_op_update("other-wf"),
+                "WorkflowId is not consistent with previous operation(s).",
+            ),
+        ];
+        for (update_op, expected) in cases {
+            let error = multi_operation_request_to_edge(multi_op_request(
+                Some(multi_op_start("wf")),
+                Some(update_op),
+            ))
+            .unwrap_err();
+            assert_eq!(
+                error,
+                MultiOperationRequestError::PerOperation {
+                    start: None,
+                    update: Some(expected.to_string()),
+                }
+            );
+        }
+    }
+
+    /// Happy path: the composition translates, an empty update id defaults to
+    /// a fresh UUIDv4 (standalone-update parity), the update Meta.identity is
+    /// captured, and both legs execute in the request namespace.
+    #[test]
+    fn multi_operation_happy_path_translates_and_defaults_update_id() {
+        let edge = multi_operation_request_to_edge(multi_op_request(
+            Some(multi_op_start("wf")),
+            Some(multi_op_update("wf")),
+        ))
+        .expect("valid composition");
+
+        assert_eq!(edge.namespace, "default");
+        assert_eq!(edge.start.workflow_id, "wf");
+        assert_eq!(edge.start.namespace, "default");
+        assert_eq!(edge.update.workflow_id, "wf");
+        assert_eq!(edge.update.namespace, "default");
+        assert_eq!(edge.update.update_name, "my-update");
+        assert_eq!(edge.update_identity.as_deref(), Some("update-client"));
+        Uuid::parse_str(&edge.update.update_id).expect("empty update id defaults to a UUIDv4");
+    }
+
+    /// Req 4.1-4.5 for the validation class: the structured failure carries
+    /// one per-op status in request order, the clean sibling aborts with the
+    /// MultiOperationExecutionAborted detail, top-level code = the failing
+    /// op's, message "Update-with-Start could not be executed.".
+    #[test]
+    fn multi_operation_per_op_validation_error_serializes_structured_failure() {
+        let status =
+            multi_operation_request_error_to_status(MultiOperationRequestError::PerOperation {
+                start: Some("CronSchedule is not allowed.".to_string()),
+                update: None,
+            });
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "Update-with-Start could not be executed.");
+
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        assert_eq!(rpc_status.code, Code::InvalidArgument as i32);
+        let detail = &rpc_status.details[0];
+        assert_eq!(
+            detail.type_url,
+            "type.googleapis.com/temporal.api.errordetails.v1.MultiOperationExecutionFailure"
+        );
+        let failure =
+            errordetails_proto::MultiOperationExecutionFailure::decode(detail.value.as_slice())
+                .expect("decode MultiOperationExecutionFailure");
+        assert_eq!(failure.statuses.len(), 2);
+        assert_eq!(failure.statuses[0].code, Code::InvalidArgument as i32);
+        assert_eq!(failure.statuses[0].message, "CronSchedule is not allowed.");
+        assert!(failure.statuses[0].details.is_empty());
+        assert_eq!(failure.statuses[1].code, Code::Aborted as i32);
+        assert_eq!(failure.statuses[1].message, "Operation was aborted.");
+        assert_eq!(
+            failure.statuses[1].details[0].type_url,
+            "type.googleapis.com/temporal.api.failure.v1.MultiOperationExecutionAborted"
+        );
+    }
+
+    /// Req 4.2/4.4/4.6: a start-conflict failure keeps the standalone
+    /// AlreadyExists code AND its typed WorkflowExecutionAlreadyStartedFailure
+    /// detail on op0, aborts op1, and surfaces ALREADY_EXISTS top-level.
+    #[test]
+    fn multi_operation_start_conflict_keeps_already_exists_and_typed_detail() {
+        use tokeira_proto::public::temporal::api::errordetails::v1::WorkflowExecutionAlreadyStartedFailure;
+
+        let status = multi_operation_failure_to_status(MultiOperationFailure::Start(
+            crate::errors::EdgeError::WorkflowStartRejected {
+                message: "Workflow execution is already running. WorkflowId: wf, RunId: r."
+                    .to_string(),
+                run_id: "run-123".to_string(),
+            },
+        ));
+        assert_eq!(status.code(), Code::AlreadyExists);
+        assert_eq!(status.message(), "Update-with-Start could not be executed.");
+
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        let failure = errordetails_proto::MultiOperationExecutionFailure::decode(
+            rpc_status.details[0].value.as_slice(),
+        )
+        .expect("decode MultiOperationExecutionFailure");
+        assert_eq!(failure.statuses[0].code, Code::AlreadyExists as i32);
+        let start_detail = &failure.statuses[0].details[0];
+        assert_eq!(
+            start_detail.type_url,
+            "type.googleapis.com/temporal.api.errordetails.v1.WorkflowExecutionAlreadyStartedFailure"
+        );
+        let already_started =
+            WorkflowExecutionAlreadyStartedFailure::decode(start_detail.value.as_slice())
+                .expect("decode WorkflowExecutionAlreadyStartedFailure");
+        assert_eq!(already_started.run_id, "run-123");
+        assert_eq!(failure.statuses[1].code, Code::Aborted as i32);
+    }
+
+    /// `UpdateFailed{started: true}`: the start leg durably applied, so op0
+    /// serializes as code OK (empty message, no details) while op1 carries
+    /// the update's own error and drives the top-level code.
+    #[test]
+    fn multi_operation_update_failure_after_started_start_serializes_ok_sibling() {
+        let status = multi_operation_failure_to_status(MultiOperationFailure::Update {
+            started: true,
+            error: crate::errors::EdgeError::NotFound(
+                "workflow update was aborted by closing workflow".to_string(),
+            ),
+        });
+        assert_eq!(status.code(), Code::NotFound);
+
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        let failure = errordetails_proto::MultiOperationExecutionFailure::decode(
+            rpc_status.details[0].value.as_slice(),
+        )
+        .expect("decode MultiOperationExecutionFailure");
+        assert_eq!(failure.statuses[0].code, Code::Ok as i32);
+        assert!(failure.statuses[0].message.is_empty());
+        assert!(failure.statuses[0].details.is_empty());
+        assert_eq!(failure.statuses[1].code, Code::NotFound as i32);
+        assert_eq!(
+            failure.statuses[1].message,
+            "workflow update was aborted by closing workflow"
+        );
+
+        // started: false — the start leg never applied, so it aborts and the
+        // top-level code is still the update's.
+        let status = multi_operation_failure_to_status(MultiOperationFailure::Update {
+            started: false,
+            error: crate::errors::EdgeError::WorkflowClosing,
+        });
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        let failure = errordetails_proto::MultiOperationExecutionFailure::decode(
+            rpc_status.details[0].value.as_slice(),
+        )
+        .expect("decode MultiOperationExecutionFailure");
+        assert_eq!(failure.statuses[0].code, Code::Aborted as i32);
+        assert_eq!(failure.statuses[1].code, Code::ResourceExhausted as i32);
+        // The typed ResourceExhaustedFailure detail survives re-parenting.
+        assert_eq!(
+            failure.statuses[1].details[0].type_url,
+            "type.googleapis.com/temporal.api.errordetails.v1.ResourceExhaustedFailure"
+        );
+    }
+
+    /// Req 3: the success response is exactly `[start, update]` in order,
+    /// with `started`/`status` from the path taken.
+    #[test]
+    fn multi_operation_response_serializes_ordered_start_update_pair() {
+        use workflowservice::execute_multi_operation_response::response::Response as ResponseVariant;
+
+        let run_id = tokeira_types::RunId::new();
+        let resp =
+            multi_operation_response_to_proto(crate::translate::ExecuteMultiOperationResponse {
+                run_id,
+                started: false,
+                status: ExecutionStatus::Completed,
+                update: crate::translate::UpdateWorkflowExecutionResponse {
+                    update_ref: crate::translate::UpdateRefDto {
+                        workflow_id: "wf".to_string(),
+                        run_id: run_id.0.to_string(),
+                        update_id: "upd-1".to_string(),
+                    },
+                    stage: crate::translate::UpdateLifecycleStageDto::Completed,
+                    outcome: Some(crate::translate::UpdateOutcomeDto::Completed {
+                        accepted_event_id: 5,
+                        result: Payloads::default(),
+                    }),
+                },
+            });
+
+        assert_eq!(resp.responses.len(), 2);
+        match resp.responses[0].response.as_ref().expect("start response") {
+            ResponseVariant::StartWorkflow(start) => {
+                assert_eq!(start.run_id, run_id.0.to_string());
+                assert!(!start.started);
+                assert_eq!(
+                    start.status,
+                    enums::WorkflowExecutionStatus::Completed as i32
+                );
+            }
+            other => panic!("responses[0] must be the start response, got {other:?}"),
+        }
+        match resp.responses[1]
+            .response
+            .as_ref()
+            .expect("update response")
+        {
+            ResponseVariant::UpdateWorkflow(update) => {
+                assert_eq!(
+                    update.stage,
+                    enums::UpdateWorkflowExecutionLifecycleStage::Completed as i32
+                );
+                assert_eq!(update.update_ref.as_ref().unwrap().update_id, "upd-1");
+            }
+            other => panic!("responses[1] must be the update response, got {other:?}"),
+        }
     }
 }

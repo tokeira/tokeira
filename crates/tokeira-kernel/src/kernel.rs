@@ -26,9 +26,9 @@ use crate::{
         ExternalSignalResult, FieldChange, NexusOperationResolvedRequest,
         NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
         ResetActivityRequest, ResetRequest, ResetStickyRequest, RetryContinuation, RetryState,
-        ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartRequest,
-        StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest, TerminateRequest,
-        TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
+        ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartAndUpdateRequest,
+        StartRequest, StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest,
+        TerminateRequest, TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
         UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
         UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
         WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
@@ -157,6 +157,7 @@ impl Kernel for BasicKernel {
         match command {
             Command::Start(req) => self.apply_start(loaded, req),
             Command::SignalWithStart(req) => self.apply_signal_with_start(loaded, req),
+            Command::StartAndUpdate(req) => self.apply_start_and_update(loaded, req),
             Command::Update(req) => self.apply_update(loaded, req),
             Command::Signal(req) => self.apply_signal(loaded, req),
             Command::Cancel(req) => self.apply_cancel(loaded, req),
@@ -661,6 +662,25 @@ impl BasicKernel {
             builder.schedule_workflow_task();
         }
         Ok(builder.finish())
+    }
+
+    /// Create a workflow with an update admitted in the SAME transition —
+    /// Update-with-Start's fresh-start leg (`Command::StartAndUpdate`,
+    /// raised + accepted in `.kiro/specs/api-conformance-multi-operation`;
+    /// the `SignalWithStart` atomicity precedent). The start applies exactly
+    /// as a standalone start (same events, same first WFT); the admission is
+    /// pure state — v1.31.0 writes no update event here, and the first
+    /// workflow task delivers the update
+    /// (`workflowLeaseCallback` admission before the persistence write,
+    /// multioperation/api.go @ v1.31.0).
+    fn apply_start_and_update(
+        &self,
+        loaded: LoadedRun,
+        req: StartAndUpdateRequest,
+    ) -> Result<Transition, Reject> {
+        let mut transition = self.apply_start(loaded, req.start)?;
+        transition.next_state.admitted_updates.insert(req.update_id);
+        Ok(transition)
     }
 
     /// Deliver an external signal to a running workflow.

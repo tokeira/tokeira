@@ -20,7 +20,6 @@ only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
 
 | RPC | Service | How it stubs | Owning spec | Spec implemented |
 |-----|---------|--------------|-------------|------------------|
-| `ExecuteMultiOperation` | Workflow | `unimplemented` | `api-conformance-multi-operation` | No (0/15) |
 | `DeprecateNamespace` | Workflow | `unimplemented` | `api-conformance-namespace-full` | No (0/15) |
 | `DeleteNamespace` | Operator | `unimplemented` | `api-conformance-namespace-full` | No (0/15) |
 | `RemoveSearchAttributes` | Operator | `unimplemented` | — (no spec) | No spec |
@@ -62,7 +61,6 @@ This list is **minimal and complete** when:
 
 | Entry | supported.md feature area |
 |-------|---------------------------|
-| `ExecuteMultiOperation` | Workflow lifecycle |
 | `DeprecateNamespace`, `DeleteNamespace` | Namespaces |
 | `RemoveSearchAttributes` | Search attributes (operator) |
 | `AddOrUpdateRemoteCluster`, `RemoveRemoteCluster`, `ListClusters` | Remote-cluster registry |
@@ -81,3 +79,5 @@ area has an RPC answering `UNIMPLEMENTED` that is absent from this list.
   with `FailedPrecondition` when unconfigured); they are tracked under `worker-deployments`.
 - The activity by-ID RPCs (`RecordActivityTaskHeartbeatById`, etc.) are **not** here — they were
   implemented via `api-conformance-activity-by-id`.
+- `ExecuteMultiOperation` is **not** here — implemented (Update-with-Start) via
+  `api-conformance-multi-operation`.

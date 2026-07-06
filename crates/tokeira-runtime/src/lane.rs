@@ -1330,6 +1330,7 @@ fn command_type_name(command: &Command) -> &'static str {
     match command {
         Command::Start(_) => "Start",
         Command::SignalWithStart(_) => "SignalWithStart",
+        Command::StartAndUpdate(_) => "StartAndUpdate",
         Command::Update(_) => "Update",
         Command::Signal(_) => "Signal",
         Command::Cancel(_) => "Cancel",
@@ -1374,6 +1375,12 @@ fn reserved_start_has_direct_delivery(command: &Command) -> bool {
         command,
         Command::Start(StartRequest {
             reserved_poller_identity: Some(_),
+            ..
+        }) | Command::StartAndUpdate(tokeira_kernel::StartAndUpdateRequest {
+            start: StartRequest {
+                reserved_poller_identity: Some(_),
+                ..
+            },
             ..
         })
     )

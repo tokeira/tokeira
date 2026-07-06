@@ -1167,11 +1167,15 @@ async fn describe_namespace_missing_returns_not_found() {
 }
 
 #[tokio::test]
-async fn register_namespace_invalid_names_return_invalid_argument() {
+async fn register_namespace_name_rule_matches_v1_31_0() {
     let store = Arc::new(InMemoryStore::default());
     let grpc = build_grpc(store).await;
 
-    for namespace in ["", "bad namespace", "bad!"] {
+    // v1.31.0 applies NO character-set restriction to namespace names — its
+    // registry tests use names with spaces, and the conformance corpus
+    // registers parenthesised subtest-derived names
+    // (namespace_handler.go @ v1.31.0). Only empty and over-length reject.
+    for namespace in ["", "x".repeat(1001).as_str()] {
         let err = grpc
             .register_namespace(Request::new(workflowservice::RegisterNamespaceRequest {
                 namespace: namespace.to_string(),
@@ -1180,6 +1184,14 @@ async fn register_namespace_invalid_names_return_invalid_argument() {
             .await
             .expect_err("invalid namespace should fail");
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+    for namespace in ["ok namespace", "Suite-Leaf-(with_policy_Fail)-and_accept"] {
+        grpc.register_namespace(Request::new(workflowservice::RegisterNamespaceRequest {
+            namespace: namespace.to_string(),
+            ..Default::default()
+        }))
+        .await
+        .expect("v1.31.0 accepts these names");
     }
 }
 

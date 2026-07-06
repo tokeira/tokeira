@@ -254,6 +254,47 @@ pub enum StartRejectReason {
     ReuseAllowFailedOnly,
 }
 
+/// Result of the composed Update-with-Start (`ExecuteMultiOperation`,
+/// exactly `[Start, Update]`): both legs' outcomes plus whether the start
+/// created a new run (`multioperation/api.go @ v1.31.0`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiOperationResult {
+    pub run_key: RunKey,
+    pub run_id: RunId,
+    /// Whether the start leg created a new run (false on attach/dedup/replay).
+    pub started: bool,
+    /// Execution status reported on the start response.
+    pub execution_status: ExecutionStatus,
+    /// The update leg's lifecycle snapshot (stage + outcome).
+    pub update: UpdateLifecycleSnapshot,
+}
+
+/// The failing leg of an Update-with-Start, so the edge can serialize the
+/// per-operation `MultiOperationExecutionFailure`: the failing op carries its
+/// own error, the sibling carries Aborted + `MultiOperationExecutionAborted`,
+/// the top-level code is the first failing op's, and the message is
+/// "Update-with-Start could not be executed."
+/// (`serviceerror.MultiOperationExecution.Status()` @ v1.31.0).
+#[derive(Debug, thiserror::Error)]
+pub enum MultiOperationError {
+    /// The START leg was rejected by conflict/reuse policy; the update leg
+    /// aborts as the sibling.
+    #[error("update-with-start start leg rejected: {reason:?}")]
+    StartRejected {
+        run_key: RunKey,
+        run_id: RunId,
+        reason: StartRejectReason,
+    },
+    /// The UPDATE leg failed. `started` records whether the start leg
+    /// created a run (its op serializes OK) or aborts as the sibling.
+    #[error("update-with-start update leg failed: {source}")]
+    UpdateFailed {
+        started: bool,
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SignalWithStartResult {
     Started {

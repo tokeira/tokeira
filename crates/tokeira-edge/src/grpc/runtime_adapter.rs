@@ -10,12 +10,12 @@ use tokeira_kernel::{
 use tokeira_runtime::{
     ActivityTokenResolutionError, CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion,
     DeploymentPage, DeploymentRegistry, DeploymentView, DescribeVersion, ListDeployments,
-    PendingUpdateTransport, QueryResult, RegisterPolledDeployment, RegistryError,
-    ResetWorkflowResult, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping,
-    SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
-    TaskQueueVersioningView, TokeiraRuntime, UpdateComputeConfig, UpdateLifecycleSnapshot,
-    UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig,
-    VersionMetadataView, VersionView,
+    MultiOperationResult, PendingUpdateTransport, QueryResult, RegisterPolledDeployment,
+    RegistryError, ResetWorkflowResult, SetCurrent, SetCurrentOutcome, SetManager,
+    SetManagerOutcome, SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult,
+    StartedActivityTask, TaskQueueVersioningView, TokeiraRuntime, UpdateComputeConfig,
+    UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
+    ValidateComputeConfig, VersionMetadataView, VersionView,
 };
 use tokeira_storage::{CommitResult, ConflictToken, DeploymentKey, RunRepository};
 use tokeira_types::{ActivityTaskToken, ExecutionRef, Payload, Payloads, RequestContext, RunKey};
@@ -353,6 +353,31 @@ where
         self.runtime
             .update_workflow(
                 execution,
+                update_id,
+                update_name,
+                input,
+                request,
+                timeout,
+                wait_policy,
+            )
+            .await
+    }
+
+    async fn execute_multi_operation(
+        &self,
+        start: StartRequest,
+        update_id: String,
+        update_name: String,
+        input: Payloads,
+        request: RequestContext,
+        timeout: std::time::Duration,
+        wait_policy: UpdateWaitPolicy,
+    ) -> Result<MultiOperationResult> {
+        let timeout: time::Duration =
+            time::Duration::try_from(timeout).map_err(|_| anyhow!("invalid timeout"))?;
+        self.runtime
+            .execute_multi_operation(
+                start,
                 update_id,
                 update_name,
                 input,

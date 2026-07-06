@@ -1230,9 +1230,45 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn execute_multi_operation(
         &self,
-        _request: Request<workflowservice::ExecuteMultiOperationRequest>,
+        request: Request<workflowservice::ExecuteMultiOperationRequest>,
     ) -> Result<Response<workflowservice::ExecuteMultiOperationResponse>, Status> {
-        Err(Status::unimplemented("execute_multi_operation"))
+        let headers = metadata_to_header_map(request.metadata());
+        // Validate the whole composition BEFORE any runtime call (Req 1 /
+        // Property 1): the `[Start, Update]` shape gate returns a plain
+        // INVALID_ARGUMENT, per-operation failures return the structured
+        // `MultiOperationExecutionFailure` (workflow_handler.go:718-726,
+        // 766-785 @ v1.31.0).
+        let edge_req = translate::multi_operation_request_to_edge(request.into_inner())
+            .map_err(translate::multi_operation_request_error_to_status)?;
+        debug!(
+            workflow_id = %edge_req.start.workflow_id,
+            update_id = %edge_req.update.update_id,
+            update_name = %edge_req.update.update_name,
+            "execute_multi_operation"
+        );
+        match self
+            .inner
+            .execute_multi_operation(&headers, edge_req)
+            .await?
+        {
+            crate::translate::ExecuteMultiOperationOutcome::Completed(edge_resp) => {
+                debug!(
+                    run_id = %edge_resp.run_id.0,
+                    started = edge_resp.started,
+                    "execute_multi_operation success"
+                );
+                Ok(Response::new(translate::multi_operation_response_to_proto(
+                    edge_resp,
+                )))
+            }
+            // A post-validation leg failure: top-level code = the failing
+            // op's code, message "Update-with-Start could not be executed.",
+            // per-op statuses (failing op's own error + Aborted/OK sibling)
+            // in the MultiOperationExecutionFailure detail (Req 4).
+            crate::translate::ExecuteMultiOperationOutcome::Failed(failure) => {
+                Err(translate::multi_operation_failure_to_status(failure))
+            }
+        }
     }
     async fn get_workflow_execution_history_reverse(
         &self,

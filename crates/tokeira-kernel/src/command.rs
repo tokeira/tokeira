@@ -25,6 +25,9 @@ pub enum Command {
     Start(StartRequest),
     /// Create a workflow and deliver a signal atomically.
     SignalWithStart(SignalWithStartRequest),
+    /// Create a workflow with an update admitted atomically
+    /// (Update-with-Start's fresh-start leg).
+    StartAndUpdate(StartAndUpdateRequest),
     /// Deliver a synchronous update to the workflow.
     Update(UpdateRequest),
     /// Deliver an asynchronous signal to the workflow.
@@ -455,6 +458,24 @@ pub struct StartRequest {
     pub cron_schedule: Option<String>,
     /// Worker identity reserved by the runtime for synchronous first-WFT delivery.
     pub reserved_poller_identity: Option<WorkerIdentity>,
+}
+
+/// Request to create a brand-new workflow with an update already admitted —
+/// the fresh-start leg of Update-with-Start (`ExecuteMultiOperation`). One
+/// command = one transition = one commit: a crash can never leave a started
+/// run without its update or an admitted update without its run (the
+/// `Command::SignalWithStart` atomicity precedent; raised and accepted in
+/// `.kiro/specs/api-conformance-multi-operation`). Admission is pure state —
+/// v1.31.0 writes NO update event on this path (the corpus pins UWS histories
+/// starting `1 WorkflowExecutionStarted / 2 WorkflowTaskScheduled` with no
+/// admitted event), and the first workflow task is the delivery vehicle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StartAndUpdateRequest {
+    /// The start leg, applied exactly as a standalone start.
+    pub start: StartRequest,
+    /// Update id admitted into the new run's `admitted_updates` within the
+    /// same transition.
+    pub update_id: String,
 }
 
 /// Request to create a brand-new workflow and immediately deliver a signal.

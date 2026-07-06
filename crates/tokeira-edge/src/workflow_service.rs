@@ -35,16 +35,16 @@ use tokeira_runtime::{
     ActivityTokenResolutionError, BatchError, BatchOperationEntry, BatchOperationStore,
     BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry, CreateDeployment,
     CreateVersion, DeleteDeployment, DeleteVersion, DeploymentPage, DeploymentView,
-    DescribeVersion, InMemoryBroker, ListDeployments, NexusTaskBroker, NexusTaskToken,
-    OverlapDecision, OverlapPolicy, PendingUpdateTransport, QueryResult, RegisterPolledDeployment,
-    ResetWorkflowResult, ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent,
-    SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome,
-    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, StartedWorkflowTask,
-    TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView, UpdateComputeConfig,
-    UpdateLifecycleError, UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution,
-    UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView, VersionView, VersioningRuleStore,
-    WorkerRegistry, WorkflowActivation, WorkflowExecution, WorkflowExecutionStatus,
-    compute_matching_times, decide_overlap, schedule_workflow_id,
+    DescribeVersion, InMemoryBroker, ListDeployments, MultiOperationError, MultiOperationResult,
+    NexusTaskBroker, NexusTaskToken, OverlapDecision, OverlapPolicy, PendingUpdateTransport,
+    QueryResult, RegisterPolledDeployment, ResetWorkflowResult, ScheduleActionResult,
+    SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome,
+    SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
+    StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView,
+    UpdateComputeConfig, UpdateLifecycleError, UpdateLifecycleSnapshot, UpdateMetadata,
+    UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView,
+    VersionView, VersioningRuleStore, WorkerRegistry, WorkflowActivation, WorkflowExecution,
+    WorkflowExecutionStatus, compute_matching_times, decide_overlap, schedule_workflow_id,
 };
 use tokeira_storage::{
     ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
@@ -73,32 +73,34 @@ use crate::{
         CountActivityExecutionsRequest, CountActivityExecutionsResponse,
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
         DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest, DescribeTaskQueueResponse,
-        DescribeWorkflowExecutionRequest, ListActivityExecutionsRequest,
+        DescribeWorkflowExecutionRequest, ExecuteMultiOperationOutcome,
+        ExecuteMultiOperationRequest, ExecuteMultiOperationResponse, ListActivityExecutionsRequest,
         ListActivityExecutionsResponse, ListNamespacesResponse as EdgeListNamespacesResponse,
         ListTaskQueuePartitionsRequest, ListTaskQueuePartitionsResponse,
-        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, NamespaceCapabilities,
-        NamespaceDescription, NamespaceStateUpdate, PauseWorkflowExecutionRequest,
-        PauseWorkflowExecutionResponse, PollActivityTaskQueueRequest,
-        PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse,
-        ProtocolMessageDto, QueryResultDto, QueryWorkflowRequest, QueryWorkflowResponse,
-        RecordActivityTaskHeartbeatByIdRequest, RecordActivityTaskHeartbeatByIdResponse,
-        RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
-        RegisterNamespaceRequest, RequestCancelWorkflowExecutionRequest,
-        RequestCancelWorkflowExecutionResponse, ResetWorkflowExecutionRequest,
-        ResetWorkflowExecutionResponse, RespondActivityTaskCanceledByIdRequest,
-        RespondActivityTaskCanceledByIdResponse, RespondActivityTaskCanceledRequest,
-        RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedByIdRequest,
-        RespondActivityTaskCompletedByIdResponse, RespondActivityTaskCompletedRequest,
-        RespondActivityTaskCompletedResponse, RespondActivityTaskFailedByIdRequest,
-        RespondActivityTaskFailedByIdResponse, RespondActivityTaskFailedRequest,
-        RespondActivityTaskFailedResponse, RespondWorkflowTaskCompletedRequest,
-        RespondWorkflowTaskCompletedResponse, SignalWithStartWorkflowExecutionRequest,
-        SignalWithStartWorkflowExecutionResponse, SignalWorkflowExecutionRequest,
-        SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
-        StartWorkflowExecutionResponse, SystemCapabilities, SystemInfo, TaskQueueConfig,
-        TaskQueuePartition, TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
-        UnpauseWorkflowExecutionRequest, UnpauseWorkflowExecutionResponse,
-        UpdateActivityOptionsRequest, UpdateActivityOptionsResponse, UpdateNamespaceRequest,
+        ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, MultiOperationFailure,
+        NamespaceCapabilities, NamespaceDescription, NamespaceStateUpdate,
+        PauseWorkflowExecutionRequest, PauseWorkflowExecutionResponse,
+        PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest,
+        PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto, QueryWorkflowRequest,
+        QueryWorkflowResponse, RecordActivityTaskHeartbeatByIdRequest,
+        RecordActivityTaskHeartbeatByIdResponse, RecordActivityTaskHeartbeatRequest,
+        RecordActivityTaskHeartbeatResponse, RegisterNamespaceRequest,
+        RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
+        ResetWorkflowExecutionRequest, ResetWorkflowExecutionResponse,
+        RespondActivityTaskCanceledByIdRequest, RespondActivityTaskCanceledByIdResponse,
+        RespondActivityTaskCanceledRequest, RespondActivityTaskCanceledResponse,
+        RespondActivityTaskCompletedByIdRequest, RespondActivityTaskCompletedByIdResponse,
+        RespondActivityTaskCompletedRequest, RespondActivityTaskCompletedResponse,
+        RespondActivityTaskFailedByIdRequest, RespondActivityTaskFailedByIdResponse,
+        RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
+        RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
+        SignalWithStartWorkflowExecutionRequest, SignalWithStartWorkflowExecutionResponse,
+        SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
+        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, SystemCapabilities,
+        SystemInfo, TaskQueueConfig, TaskQueuePartition, TerminateWorkflowExecutionRequest,
+        TerminateWorkflowExecutionResponse, UnpauseWorkflowExecutionRequest,
+        UnpauseWorkflowExecutionResponse, UpdateActivityOptionsRequest,
+        UpdateActivityOptionsResponse, UpdateNamespaceRequest,
         UpdateWorkflowExecutionOptionsRequest, UpdateWorkflowExecutionOptionsResponse,
         UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse, VersioningOverrideChange,
         WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
@@ -494,6 +496,32 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         timeout: std::time::Duration,
         wait_policy: UpdateWaitPolicy,
     ) -> Result<UpdateLifecycleSnapshot>;
+
+    /// Execute the composed Update-with-Start (`ExecuteMultiOperation`,
+    /// exactly `[Start, Update]` — `multioperation/api.go @ v1.31.0`).
+    /// Defaulted so workflow-task-only test doubles need no change; the
+    /// runtime adapter overrides it.
+    async fn execute_multi_operation(
+        &self,
+        start: StartRequest,
+        update_id: String,
+        update_name: String,
+        input: Payloads,
+        request: RequestContext,
+        timeout: std::time::Duration,
+        wait_policy: UpdateWaitPolicy,
+    ) -> Result<MultiOperationResult> {
+        let _ = (
+            start,
+            update_id,
+            update_name,
+            input,
+            request,
+            timeout,
+            wait_policy,
+        );
+        Err(anyhow!("execute_multi_operation is not implemented"))
+    }
 
     async fn poll_workflow_update(
         &self,
@@ -3892,6 +3920,149 @@ impl WorkflowService {
         .await
     }
 
+    /// Execute the composed Update-with-Start: exactly `[Start, Update]`
+    /// against one workflow id (`ExecuteMultiOperation` @ v1.31.0).
+    ///
+    /// Shape and per-operation field validation already happened at the gRPC
+    /// boundary (validate before mutate, Req 1 / Property 1); this mirrors
+    /// [`signal_with_start_workflow_execution`](Self::signal_with_start_workflow_execution)'s
+    /// structure — interceptor begin, local-route check, start translation —
+    /// then delegates path selection to the runtime composition. A
+    /// post-validation leg failure surfaces as
+    /// [`ExecuteMultiOperationOutcome::Failed`] rather than an `EdgeError`
+    /// because the wire shape needs the failing leg's own status *plus* the
+    /// aborted sibling (`MultiOperationExecutionFailure`, Req 4).
+    pub async fn execute_multi_operation(
+        &self,
+        headers: &HeaderMap,
+        req: ExecuteMultiOperationRequest,
+    ) -> EdgeResult<ExecuteMultiOperationOutcome> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "execute_multi_operation",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                // No dedicated multi-operation Action exists: the composition
+                // is authorized as its opening start leg, matching how the
+                // request routes by `operations[0].workflow_id`.
+                let ctx = self
+                    .interceptors
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::StartWorkflowExecution,
+                        false,
+                    )
+                    .await?;
+
+                ensure_local(
+                    self.router
+                        .route_workflow(&req.namespace, &req.start.workflow_id)
+                        .await?,
+                )?;
+
+                let workflow_id = req.start.workflow_id.clone();
+                let internal = to_internal::start_request(
+                    req.start,
+                    &ctx.request_id,
+                    Some(self.versioning_rule_store.as_ref()),
+                );
+
+                // Wait-policy defaulting mirrors standalone update
+                // (`update_workflow_execution` above): Unspecified waits for
+                // Completed; ADMITTED was already rejected at translation, so
+                // hitting it here is a defensive rejection, not a new path.
+                let wait_policy = match req.update.wait_policy {
+                    crate::translate::UpdateWaitPolicyDto::Unspecified
+                    | crate::translate::UpdateWaitPolicyDto::Completed => {
+                        UpdateWaitPolicy::Completed
+                    }
+                    crate::translate::UpdateWaitPolicyDto::Accepted => UpdateWaitPolicy::Accepted,
+                    crate::translate::UpdateWaitPolicyDto::Admitted => {
+                        return Err(EdgeError::BadRequest(
+                            "UpdateWorkflowExecution does not support waiting for ADMITTED"
+                                .to_string(),
+                        ));
+                    }
+                };
+                // Same per-update RequestContext shape as standalone update,
+                // plus the update `Meta.identity` threaded into
+                // `caller_identity` (v1.31.0 records the update's identity on
+                // the admitted transport, not the start identity).
+                let update_request = RequestContext {
+                    request_id: tokeira_types::RequestId(uuid::Uuid::new_v4().to_string()),
+                    caller_identity: req.update_identity,
+                    received_at: time::OffsetDateTime::now_utc(),
+                };
+
+                match self
+                    .runtime
+                    .execute_multi_operation(
+                        internal,
+                        req.update.update_id,
+                        req.update.update_name,
+                        req.update.input,
+                        update_request,
+                        req.update.timeout,
+                        wait_policy,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        let last_event_id =
+                            read_last_event_id(self.repo.as_ref(), result.run_key).await?;
+                        self.notify_history_run_key(result.run_key, last_event_id)
+                            .await;
+                        Ok(ExecuteMultiOperationOutcome::Completed(
+                            ExecuteMultiOperationResponse {
+                                run_id: result.run_id,
+                                started: result.started,
+                                status: result.execution_status,
+                                update: from_internal::update_response(result.update),
+                            },
+                        ))
+                    }
+                    Err(error) => match error.downcast::<MultiOperationError>() {
+                        // Start leg rejected by conflict/reuse policy: op0
+                        // carries the SAME `WorkflowExecutionAlreadyStarted`
+                        // error standalone start produces for that reason
+                        // (Req 4.2); op1 aborts as the sibling.
+                        Ok(MultiOperationError::StartRejected { run_id, reason, .. }) => {
+                            Ok(ExecuteMultiOperationOutcome::Failed(
+                                MultiOperationFailure::Start(EdgeError::WorkflowStartRejected {
+                                    message: start_reject_message(reason, &workflow_id, run_id),
+                                    run_id: run_id.0.to_string(),
+                                }),
+                            ))
+                        }
+                        // Update leg failed: run its source through the same
+                        // anyhow→EdgeError pipeline standalone update uses so
+                        // typed aborts (NotFound closing-abort,
+                        // ResourceExhausted WorkflowClosing) keep their codes
+                        // and details (Req 4.6).
+                        Ok(MultiOperationError::UpdateFailed { started, source }) => Ok(
+                            ExecuteMultiOperationOutcome::Failed(MultiOperationFailure::Update {
+                                started,
+                                error: map_update_lifecycle_error(
+                                    source,
+                                    &req.namespace,
+                                    &workflow_id,
+                                ),
+                            }),
+                        ),
+                        // Anything else is a plain edge failure with no
+                        // structured multi-operation detail, matching the
+                        // frontend, which only wraps per-operation errors.
+                        Err(error) => Err(EdgeError::from(error)),
+                    },
+                }
+            },
+        )
+        .await
+    }
+
     // ── Activity endpoints ──
 
     pub async fn poll_activity_task_queue(
@@ -5734,11 +5905,16 @@ fn task_queue_versioning_view_to_edge(
     }
 }
 
+/// v1.31.0 applies NO character-set restriction to namespace names — its own
+/// registry tests register names with spaces, and the conformance corpus
+/// derives per-leaf namespaces from Go subtest names containing parentheses.
+/// `RegisterNamespace` validates only retention + already-exists
+/// (namespace_handler.go @ v1.31.0); the frontend caps the name length at
+/// `MaxIDLengthLimit` (default 1000). The previous alnum+`_-` rule here was
+/// stricter than ground truth and failed every parenthesised subtest
+/// namespace.
 fn is_valid_namespace_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    !name.is_empty() && name.len() <= 1000
 }
 
 impl From<serde_json::Error> for EdgeError {

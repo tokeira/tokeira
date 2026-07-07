@@ -1653,6 +1653,9 @@ fn wft_failed_cause_i32(c: &WorkflowTaskFailedCause) -> i32 {
         WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage => {
             C::BadUpdateWorkflowExecutionMessage
         }
+        WorkflowTaskFailedCause::BadStartChildExecutionAttributes => {
+            C::BadStartChildExecutionAttributes
+        }
     }) as i32
 }
 

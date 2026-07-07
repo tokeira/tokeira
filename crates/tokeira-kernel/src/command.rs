@@ -236,6 +236,15 @@ pub enum WorkflowTaskFailedCause {
     /// speculative-wft K5). Appended LAST per the postcard positional
     /// discipline above.
     BadUpdateWorkflowExecutionMessage,
+    /// `RespondWorkflowTaskCompleted`: a `StartChildWorkflowExecution` command
+    /// with invalid attributes — e.g. targeting the reserved internal
+    /// per-namespace worker task queue
+    /// (`WORKFLOW_TASK_FAILED_CAUSE_BAD_START_CHILD_EXECUTION_ATTRIBUTES`,
+    /// `ValidateStartChildExecutionAttributes` + `CheckInternalPerNsTaskQueue`
+    /// Allowed`, command_attr_validator.go + task_queues.go @ v1.31.0;
+    /// TestStartChildWorkflowWithInternalTaskQueue_Blocked). Appended LAST per
+    /// the postcard positional discipline above.
+    BadStartChildExecutionAttributes,
 }
 
 impl WorkflowTaskFailedCause {
@@ -266,6 +275,7 @@ impl WorkflowTaskFailedCause {
             Self::ForceCloseCommand => "ForceCloseCommand",
             Self::GrpcMessageTooLarge => "GrpcMessageTooLarge",
             Self::BadUpdateWorkflowExecutionMessage => "BadUpdateWorkflowExecutionMessage",
+            Self::BadStartChildExecutionAttributes => "BadStartChildExecutionAttributes",
         }
     }
 }

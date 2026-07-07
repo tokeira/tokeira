@@ -4120,6 +4120,21 @@ fn apply_workflow_command(
             } else {
                 task_queue
             };
+            // A child may not target the reserved internal per-namespace worker
+            // task queue — v1.31.0 fails the WFT with
+            // BAD_START_CHILD_EXECUTION_ATTRIBUTES (CheckInternalPerNsTaskQueue
+            // Allowed with no internal parent component, task_queues.go:24-43 @
+            // v1.31.0; TestStartChildWorkflowWithInternalTaskQueue_Blocked).
+            if task_queue.0 == PER_NS_WORKER_TASK_QUEUE {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::BadStartChildExecutionAttributes,
+                    message: Some(format!(
+                        "unable to schedule child workflow on the internal per-namespace task \
+                         queue: {}",
+                        task_queue.0
+                    )),
+                });
+            }
             // Inherit parent's namespace when the child's is nil (empty
             // string from the SDK means "same namespace as parent").
             let namespace_id = if namespace_id.0.is_nil() {
@@ -4704,6 +4719,11 @@ fn apply_workflow_command(
 /// the runtime's direct-construct activity-start path can buffer with the same
 /// sentinel when a WFT is started.
 pub const BUFFERED_EVENT_ID: i64 = -123;
+
+/// The engine's reserved internal per-namespace worker task queue
+/// (`primitives.PerNSWorkerTaskQueue`, common/primitives/task_queues.go:12 @
+/// v1.31.0). A child workflow may not target it.
+const PER_NS_WORKER_TASK_QUEUE: &str = "temporal-sys-per-ns-tq";
 
 /// v1.31.0's `MaximumBufferedEventsBatch` default (`constants.go:2340`): the
 /// per-run cap on events buffered during a started WFT. Exceeding it force-closes

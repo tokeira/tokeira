@@ -64,6 +64,12 @@ pub enum HistoryEventKind {
         parent_workflow_id: Option<WorkflowId>,
         parent_run_id: Option<RunId>,
         parent_namespace_id: Option<NamespaceId>,
+        /// Parent namespace NAME (`namespace-<uuid>`), carried alongside
+        /// `parent_namespace_id` because Tokeira derives the id by hashing the
+        /// name (one-way) — SDKs/UI consume `parent_workflow_namespace` (the
+        /// name) while the server matches on `parent_workflow_namespace_id`.
+        #[serde(default)]
+        parent_namespace_name: Option<String>,
         parent_initiated_event_id: i64,
         #[serde(default)]
         root_workflow_id: Option<WorkflowId>,
@@ -316,6 +322,12 @@ pub enum HistoryEventKind {
         child_run_id: RunId,
         workflow_type: WorkflowType,
         initiated_event_id: i64,
+        #[serde(default)]
+        namespace_id: Option<NamespaceId>,
+        #[serde(default)]
+        namespace: Option<String>,
+        #[serde(default)]
+        header: Option<Headers>,
     },
     /// The child workflow could not be started (e.g. already
     /// exists).

@@ -545,6 +545,8 @@ pub struct SignalWithStartRequest {
     pub parent_workflow_id: Option<WorkflowId>,
     pub parent_run_id: Option<RunId>,
     pub parent_namespace_id: Option<NamespaceId>,
+    #[serde(default)]
+    pub parent_namespace_name: Option<String>,
     pub parent_initiated_event_id: i64,
     pub root_workflow_id: Option<WorkflowId>,
     pub root_run_id: Option<RunId>,

@@ -2230,9 +2230,13 @@ pub fn respond_completed_request_to_edge(
         .map(|m| (m.id.clone(), m))
         .collect();
 
+    // The completing worker's namespace: child commands that omit their own
+    // namespace inherit it (workflow_task_completed_handler.go @ v1.31.0).
+    let request_namespace = req.namespace.clone();
+
     let mut commands = Vec::new();
     for cmd in req.commands {
-        match proto_command_to_workflow_command(cmd) {
+        match proto_command_to_workflow_command(cmd, &request_namespace) {
             Ok(WorkflowCommand::ProtocolMessage { message_id, .. }) => {
                 // Resolve the body from the messages index. A command
                 // referencing an ABSENT message id cannot be resolved here, so
@@ -4361,6 +4365,7 @@ fn is_close_event(event_type: i32) -> bool {
 #[allow(deprecated)]
 pub fn proto_command_to_workflow_command(
     cmd: command::Command,
+    default_namespace: &str,
 ) -> Result<WorkflowCommand, ProtoConversionError> {
     use command::command::Attributes;
 
@@ -4541,10 +4546,18 @@ pub fn proto_command_to_workflow_command(
                     .ok_or(ProtoConversionError::MissingField(
                         "StartChildWorkflowExecutionCommandAttributes.task_queue",
                     ))?;
+            // A child command that omits `namespace` inherits the parent's
+            // namespace (the WFT-completing worker's namespace). tokeira derives
+            // the namespace id by hashing the name, so an empty name would hash
+            // to a bogus id and leave every downstream ChildWorkflowExecution*
+            // event's `.Namespace`/`.NamespaceId` empty
+            // (`TestChildWorkflowExecution` asserts both against the parent's).
+            let child_namespace = non_empty(attrs.namespace)
+                .unwrap_or_else(|| default_namespace.to_string());
             Ok(WorkflowCommand::StartChildWorkflow {
                 child_workflow_id: WorkflowId(attrs.workflow_id),
-                namespace_id: namespace_name_to_domain(&attrs.namespace),
-                namespace: non_empty(attrs.namespace),
+                namespace_id: namespace_name_to_domain(&child_namespace),
+                namespace: non_empty(child_namespace),
                 workflow_type: WorkflowType(
                     attrs
                         .workflow_type
@@ -7771,7 +7784,7 @@ mod tests {
         let err = proto_command_to_workflow_command(command::Command {
             attributes: None,
             ..Default::default()
-        })
+        }, "")
         .expect_err("missing attributes should fail");
 
         match err {
@@ -8313,7 +8326,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        let edge = proto_command_to_workflow_command(proto_cmd).unwrap();
+        let edge = proto_command_to_workflow_command(proto_cmd, "").unwrap();
         match edge {
             WorkflowCommand::FailWorkflow { failure } => {
                 assert_eq!(

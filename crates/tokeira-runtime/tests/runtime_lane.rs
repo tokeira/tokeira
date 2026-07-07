@@ -1200,6 +1200,7 @@ fn signal_with_start_request(
         parent_workflow_id: start.parent_workflow_id,
         parent_run_id: start.parent_run_id,
         parent_namespace_id: start.parent_namespace_id,
+        parent_namespace_name: None,
         parent_initiated_event_id: start.parent_initiated_event_id,
         root_workflow_id: start.root_workflow_id,
         root_run_id: start.root_run_id,

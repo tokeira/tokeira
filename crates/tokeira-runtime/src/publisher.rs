@@ -412,47 +412,78 @@ where
             reserved_poller_identity: None,
         };
 
-        let result = self
-            .pick_lane(child_run_key)
-            .submit(child_run_key, Command::Start(start_request))
-            .await;
-        let confirmation = match result {
-            Ok(CommitResult::Applied { .. }) => {
-                tracing::debug!(
-                    ?child_workflow_id,
-                    ?child_run_key,
-                    ?child_run_id,
-                    task_queue = %task_queue_name,
-                    "child workflow started successfully"
-                );
-                ChildStartResult::Started {
-                    child_run_id,
-                    workflow_type,
+        // A running same-id conflict is resolved by the child's conflict policy,
+        // mirroring v1.31.0 ResolveWorkflowIDConflictPolicy
+        // (workflow_id_dedup.go:83-107): FAIL — the default child policy —
+        // records StartChildWorkflowExecutionFailed(WORKFLOW_ALREADY_EXISTS),
+        // while TERMINATE_EXISTING — migrated from the deprecated
+        // TERMINATE_IF_RUNNING reuse policy — terminates the running incumbent
+        // and starts a fresh child run (terminateWorkflowAction, :202-231). The
+        // raw start reports CurrentExecutionConflict only while the incumbent is
+        // OPEN (memory.rs), so terminating it frees the current-execution slot
+        // for the retry.
+        let terminate_on_conflict = matches!(
+            conflict_policy,
+            tokeira_kernel::WorkflowIdConflictPolicy::TerminateExisting
+        );
+        let mut terminated_incumbent = false;
+        let confirmation = loop {
+            let result = self
+                .pick_lane(child_run_key)
+                .submit(child_run_key, Command::Start(start_request.clone()))
+                .await;
+            match result {
+                Ok(CommitResult::Applied { .. }) => {
+                    tracing::debug!(
+                        ?child_workflow_id,
+                        ?child_run_key,
+                        ?child_run_id,
+                        task_queue = %task_queue_name,
+                        "child workflow started successfully"
+                    );
+                    break ChildStartResult::Started {
+                        child_run_id,
+                        workflow_type: workflow_type.clone(),
+                    };
                 }
-            }
-            Ok(CommitResult::Conflict { reason }) => {
-                tracing::warn!(?child_workflow_id, %reason, "child workflow start conflict");
-                ChildStartResult::Failed { cause: reason }
-            }
-            Ok(CommitResult::CurrentExecutionConflict {
-                existing_run_key, ..
-            }) => {
-                tracing::warn!(
-                    ?child_workflow_id,
-                    ?existing_run_key,
-                    "child workflow start hit an existing current execution"
-                );
-                ChildStartResult::Failed {
-                    cause: format!("current execution already exists: {existing_run_key:?}"),
+                Ok(CommitResult::CurrentExecutionConflict {
+                    existing_run_key, ..
+                }) => {
+                    if terminate_on_conflict && !terminated_incumbent {
+                        terminated_incumbent = true;
+                        self.terminate_conflicting_incumbent(existing_run_key, child_run_id)
+                            .await;
+                        continue;
+                    }
+                    tracing::warn!(
+                        ?child_workflow_id,
+                        ?existing_run_key,
+                        "child workflow start hit a running duplicate workflow id"
+                    );
+                    break ChildStartResult::Failed {
+                        cause: "WORKFLOW_ALREADY_EXISTS".to_string(),
+                    };
                 }
-            }
-            Ok(CommitResult::Duplicate) => ChildStartResult::Failed {
-                cause: "duplicate start request".to_string(),
-            },
-            Err(error) => {
-                tracing::warn!(?child_workflow_id, ?error, "child workflow start error");
-                ChildStartResult::Failed {
-                    cause: error.to_string(),
+                Ok(CommitResult::Conflict { reason }) => {
+                    // A closed-run reuse-policy rejection (RejectDuplicate /
+                    // AllowDuplicateFailedOnly) also surfaces to the parent as
+                    // WORKFLOW_ALREADY_EXISTS (generateWorkflowAlreadyStartedError,
+                    // workflow_id_dedup.go:233-249).
+                    tracing::warn!(?child_workflow_id, %reason, "child workflow start conflict");
+                    break ChildStartResult::Failed {
+                        cause: "WORKFLOW_ALREADY_EXISTS".to_string(),
+                    };
+                }
+                Ok(CommitResult::Duplicate) => {
+                    break ChildStartResult::Failed {
+                        cause: "WORKFLOW_ALREADY_EXISTS".to_string(),
+                    };
+                }
+                Err(error) => {
+                    tracing::warn!(?child_workflow_id, ?error, "child workflow start error");
+                    break ChildStartResult::Failed {
+                        cause: error.to_string(),
+                    };
                 }
             }
         };
@@ -474,6 +505,35 @@ where
                 child_workflow_id = ?child_workflow_id,
                 "failed to deliver child start confirmation"
             );
+        }
+    }
+
+    /// Terminate the running incumbent a TERMINATE_IF_RUNNING child start is
+    /// displacing, so the retried start claims the current-execution slot.
+    /// Mirrors v1.31.0 terminateWorkflowAction (workflow_id_dedup.go:202-231):
+    /// the terminate runs under the history-service identity and does NOT
+    /// consume the start's request id — a distinct id keeps the terminate
+    /// idempotent while the start's id stays free to author the new run's
+    /// WorkflowExecutionStarted event.
+    async fn terminate_conflicting_incumbent(&self, run_key: RunKey, new_run_id: RunId) {
+        let command = Command::Terminate(TerminateRequest {
+            reason: "TerminateIfRunning WorkflowIdReusePolicy".to_string(),
+            details: None,
+            identity: "history-service".to_string(),
+            request: RequestContext {
+                request_id: RequestId(format!("conflict-terminate:{run_key:?}:{new_run_id:?}")),
+                caller_identity: Some("history-service".to_string()),
+                received_at: OffsetDateTime::now_utc(),
+            },
+            now: OffsetDateTime::now_utc(),
+        });
+        if let Err(error) = self.pick_lane(run_key).submit(run_key, command).await {
+            let message = error.to_string();
+            if message.contains("kernel rejected") || message.contains("not found") {
+                tracing::debug!(?error, ?run_key, "conflicting child incumbent already closed");
+            } else {
+                tracing::warn!(?error, ?run_key, "failed to terminate conflicting child incumbent");
+            }
         }
     }
 

@@ -278,7 +278,7 @@ proptest! {
         match &cmd {
             WorkflowCommand::ScheduleActivity { .. } => {
                 let proto = workflow_command_to_proto(&cmd).unwrap();
-                let roundtrip = proto_command_to_workflow_command(proto).unwrap();
+                let roundtrip = proto_command_to_workflow_command(proto, "").unwrap();
                 // v1.31.0 ensure-defaults the activity retry policy on decode —
                 // activities always carry one (`EnsureDefaults`; see
                 // `grpc/translate.rs` `activity_retry_policy_with_defaults`). The
@@ -302,7 +302,7 @@ proptest! {
             | WorkflowCommand::RequestCancelExternalWorkflowExecution { .. }
             | WorkflowCommand::CancelNexusOperation { .. } => {
                 let proto = workflow_command_to_proto(&cmd).unwrap();
-                let roundtrip = proto_command_to_workflow_command(proto).unwrap();
+                let roundtrip = proto_command_to_workflow_command(proto, "").unwrap();
                 match (&roundtrip, &cmd) {
                     (
                         WorkflowCommand::FailWorkflow { failure: actual },
@@ -326,7 +326,7 @@ proptest! {
                 let proto = workflow_command_to_proto(&cmd).unwrap();
                 // ProtocolMessage commands produce a placeholder that
                 // the edge layer resolves from the messages field.
-                let result = proto_command_to_workflow_command(proto);
+                let result = proto_command_to_workflow_command(proto, "");
                 prop_assert!(result.is_ok());
             }
             WorkflowCommand::UpdateCompleted { .. }
@@ -390,7 +390,7 @@ proptest! {
         cmd in arb_schedule_activity_command()
     ) {
         let proto = workflow_command_to_proto(&cmd).unwrap();
-        let roundtrip = proto_command_to_workflow_command(proto).unwrap();
+        let roundtrip = proto_command_to_workflow_command(proto, "").unwrap();
         // The eager-execution flag must survive the round-trip. The retry policy
         // is ensure-defaulted on decode (v1.31.0: activities always carry one),
         // so compare against the authored command with that default filled in.

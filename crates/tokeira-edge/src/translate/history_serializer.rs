@@ -390,9 +390,10 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             parent_workflow_id,
             parent_run_id,
             parent_namespace_id,
+            parent_namespace_name,
             parent_initiated_event_id,
-            root_workflow_id: _,
-            root_run_id: _,
+            root_workflow_id,
+            root_run_id,
             original_execution_run_id,
             continued_failure,
             last_completion_result,
@@ -405,6 +406,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 workflow_type: Some(proto_common::WorkflowType {
                     name: workflow_type.0.clone(),
                 }),
+                parent_workflow_namespace: parent_namespace_name.clone().unwrap_or_default(),
                 parent_workflow_namespace_id: parent_namespace_id
                     .map(|id| id.0.to_string())
                     .unwrap_or_default(),
@@ -412,6 +414,12 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                     proto_common::WorkflowExecution {
                         workflow_id: workflow_id.0.clone(),
                         run_id: opt_run_id(parent_run_id),
+                    }
+                }),
+                root_workflow_execution: root_workflow_id.as_ref().map(|workflow_id| {
+                    proto_common::WorkflowExecution {
+                        workflow_id: workflow_id.0.clone(),
+                        run_id: opt_run_id(root_run_id),
                     }
                 }),
                 parent_initiated_event_id: *parent_initiated_event_id,
@@ -956,8 +964,13 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             child_run_id,
             workflow_type,
             initiated_event_id,
+            namespace_id,
+            namespace,
+            header,
         } => Attributes::ChildWorkflowExecutionStartedEventAttributes(
             history::ChildWorkflowExecutionStartedEventAttributes {
+                namespace: namespace.clone().unwrap_or_default(),
+                namespace_id: namespace_id.map(|id| id.0.to_string()).unwrap_or_default(),
                 initiated_event_id: *initiated_event_id,
                 workflow_execution: Some(proto_common::WorkflowExecution {
                     workflow_id: child_workflow_id.0.clone(),
@@ -966,7 +979,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 workflow_type: Some(proto_common::WorkflowType {
                     name: workflow_type.0.clone(),
                 }),
-                ..Default::default()
+                header: header.as_ref().map(headers_from_domain),
             },
         ),
         HistoryEventKind::StartChildWorkflowExecutionFailed {
@@ -1859,6 +1872,7 @@ mod tests {
                             parent_workflow_id: None,
                             parent_run_id: None,
                             parent_namespace_id: None,
+                            parent_namespace_name: None,
                             parent_initiated_event_id: 0,
                             root_workflow_id: None,
                             root_run_id: None,
@@ -2027,6 +2041,9 @@ mod tests {
                         child_run_id: crid,
                         workflow_type: WorkflowType(wt),
                         initiated_event_id: iei,
+                        namespace_id: None,
+                        namespace: None,
+                        header: None,
                     }
                 },
             ),
@@ -2361,6 +2378,7 @@ mod tests {
                 parent_workflow_id: None,
                 parent_run_id: None,
                 parent_namespace_id: None,
+                parent_namespace_name: None,
                 parent_initiated_event_id: 0,
                 root_workflow_id: None,
                 root_run_id: None,
@@ -2470,6 +2488,7 @@ mod tests {
                 parent_workflow_id: None,
                 parent_run_id: None,
                 parent_namespace_id: None,
+                parent_namespace_name: None,
                 parent_initiated_event_id: 0,
                 root_workflow_id: None,
                 root_run_id: None,
@@ -2545,6 +2564,7 @@ mod tests {
                 parent_workflow_id: None,
                 parent_run_id: None,
                 parent_namespace_id: None,
+                parent_namespace_name: None,
                 parent_initiated_event_id: 0,
                 root_workflow_id: None,
                 root_run_id: None,
@@ -2594,6 +2614,7 @@ mod tests {
                 parent_workflow_id: None,
                 parent_run_id: None,
                 parent_namespace_id: None,
+                parent_namespace_name: None,
                 parent_initiated_event_id: 0,
                 root_workflow_id: None,
                 root_run_id: None,
@@ -3190,6 +3211,7 @@ mod tests {
                 parent_workflow_id,
                 parent_run_id,
                 parent_namespace_id,
+                parent_namespace_name: None,
                 parent_initiated_event_id,
                 root_workflow_id: None,
                 root_run_id: None,

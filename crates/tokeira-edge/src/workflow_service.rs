@@ -5823,9 +5823,17 @@ fn validate_namespace_state_update(deleted: bool, target: NamespaceStateUpdate) 
 }
 
 fn namespace_to_description(namespace: ResolvedNamespace) -> NamespaceDescription {
+    // Report the namespace's real id. Tokeira derives it by hashing the name
+    // (the same value `resolve_namespace_id` returns and every history event
+    // carries), so Describe/List must surface it rather than the unset stored
+    // id — otherwise callers that read `NamespaceInfo.Id` (e.g. to compare
+    // against a child event's `NamespaceId`) see an empty string.
+    let namespace_id = namespace
+        .namespace_id
+        .or_else(|| Some(to_internal::namespace_id_for(&namespace.name).0.to_string()));
     NamespaceDescription {
         name: namespace.name,
-        namespace_id: namespace.namespace_id,
+        namespace_id,
         is_global: namespace.is_global,
         visibility_enabled: namespace.visibility_enabled,
         deleted: namespace.deleted,

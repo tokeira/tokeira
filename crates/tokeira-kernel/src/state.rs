@@ -98,6 +98,11 @@ pub struct WorkflowState {
     pub parent_run_id: Option<RunId>,
     /// Parent namespace if this execution is a child.
     pub parent_namespace_id: Option<NamespaceId>,
+    /// Parent namespace NAME if this execution is a child, retained so a
+    /// retry/continue-as-new/cron successor still authors the parent namespace
+    /// name on its own `WorkflowExecutionStarted` event.
+    #[serde(default)]
+    pub parent_namespace_name: Option<String>,
     /// Parent initiation event ID if this execution is a child.
     pub parent_initiated_event_id: i64,
     /// Canonical root workflow ID for this run, authored from the start event
@@ -594,6 +599,11 @@ pub struct ChildWorkflowState {
     pub namespace: Option<String>,
     /// Workflow type of the child, retained for terminal events.
     pub workflow_type: WorkflowType,
+    /// Header the child was started with, retained so the
+    /// `ChildWorkflowExecutionStarted` event on the parent carries it
+    /// (child_workflow_execution_started_event @ v1.31.0).
+    #[serde(default)]
+    pub header: Option<Headers>,
     /// Run ID assigned to the child, once started.
     pub child_run_id: Option<RunId>,
     /// Event ID of the initiation event in the parent's
@@ -1009,6 +1019,7 @@ mod tests {
             parent_workflow_id: None,
             parent_run_id: None,
             parent_namespace_id: None,
+            parent_namespace_name: None,
             parent_initiated_event_id: 0,
             root_workflow_id: None,
             root_run_id: None,

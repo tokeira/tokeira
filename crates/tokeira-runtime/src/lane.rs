@@ -776,9 +776,18 @@ where
                             // A child run closing must notify its parent so the
                             // parent can resolve the pending child future. Skip
                             // when the close is a reset fork (handled above) —
-                            // that is a new lineage, not a child completion.
+                            // that is a new lineage, not a child completion — and
+                            // skip when the close continues into a successor
+                            // (retry/cron/CaN, new_execution_run_id set): the
+                            // parent is notified only when the chain finally ends
+                            // with NewExecutionRunId=="" (MaximumAttemptsReached),
+                            // so a retrying child's non-final failure does not
+                            // resolve the parent's future early
+                            // (transfer_queue_active_task_executor.go:387,422 @
+                            // v1.31.0; TestRetryFailChildWorkflowExecution).
                             if let Some(parent_run_key) = new_state.parent_run_key
                                 && extract_reset_metadata(&history_events).is_none()
+                                && !close_continues_into_successor(&history_events)
                             {
                                 let maybe_resolution = match new_state.status {
                                     tokeira_types::ExecutionStatus::Completed => {
@@ -978,12 +987,23 @@ where
                                         attempt: 1,
                                         continued_execution_run_id: Some(new_state.run_id),
                                         first_execution_run_id,
-                                        parent_run_key: None,
-                                        parent_workflow_id: None,
-                                        parent_run_id: None,
-                                        parent_namespace_id: None,
-                                        parent_namespace_name: None,
-                                        parent_initiated_event_id: 0,
+                                        // A child that retries / continues-as-new /
+                                        // cron-restarts is still a child of the same
+                                        // parent: propagate the parent linkage so the
+                                        // successor's own WorkflowExecutionStarted event
+                                        // authors ParentWorkflowNamespace/Execution and
+                                        // the parent is notified only once the whole
+                                        // chain ends (NewExecutionRunId==""). A top-level
+                                        // run carries None here and stays parentless.
+                                        parent_run_key: new_state.parent_run_key,
+                                        parent_workflow_id: new_state.parent_workflow_id.clone(),
+                                        parent_run_id: new_state.parent_run_id,
+                                        parent_namespace_id: new_state.parent_namespace_id,
+                                        parent_namespace_name: new_state
+                                            .parent_namespace_name
+                                            .clone(),
+                                        parent_initiated_event_id: new_state
+                                            .parent_initiated_event_id,
                                         root_workflow_id,
                                         root_run_id,
                                         original_execution_run_id: Some(
@@ -2355,6 +2375,7 @@ mod tests {
             parent_workflow_id: None,
             parent_run_id: None,
             parent_namespace_id: None,
+            parent_namespace_name: None,
             parent_initiated_event_id: 0,
             root_workflow_id: None,
             root_run_id: None,

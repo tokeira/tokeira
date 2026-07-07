@@ -67,20 +67,20 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
 
 ## Phase R — Runtime
 
-- [ ] R.1 Direct dispatch: speculative dispatch op bypasses durable backlog, publishes straight to
+- [x] R.1 Direct dispatch **(DONE d1f49d7f — sticky-first with immediate normal-queue fallback when no sticky poller waits (publisher probes waiter counts; normal queue carried on the op); empty sticky worker_task_queue tolerated as clear-stickiness; broker grace-demotion exemption deferred — the precise in-memory timer reclaims a lost task before the 5s grace window)**: speculative dispatch op bypasses durable backlog, publishes straight to
   the broker — sticky first, normal-queue fallback on sticky-unavailable, other errors logged
   only; zero-message dispatch suppressed. Cites `updateworkflow/api.go:218-252 @ v1.31.0`.
   (Req 1.4, 1.5)
-- [ ] R.2 In-memory timers: 5s pinned normal-queue schedule-to-start, sticky schedule-to-start,
+- [x] R.2 In-memory timers **(DONE 87d2ce05 — precise per-run tokio timers (SpeculativeTimerSet): 5s pinned normal-queue STS stamped by the kernel, sticky STS, start-to-close; armed/disarmed by the lane post-commit hook (absolute deadlines, idempotent re-arm = stale guard); poll discards superseded broker entries and re-polls (I.1); stale completions surface "Workflow task not found."; F2 re-arm-on-load DEFERRED — needs sweep queries to carry task_type/deadlines, not exercised by the single-node corpus, tracked for T.2)**: 5s pinned normal-queue schedule-to-start, sticky schedule-to-start,
   **plus re-arm-on-load (owner amendment F2): shard sweep/load re-derives the timer from a
   persisted pending speculative task (STS if scheduled, start-to-close if started),**
   start-to-close for the started speculative task; stale-guard invalidation when the tracked task
   changes; **rollback bookkeeping** — on kernel drop, disarm timers, clear broker in-flight,
   keep sticky consistent (Invariant I.1). (Req 3.5, 5.3)
-- [ ] R.3 Waiter semantics: bad-message WFT failure aborts in-flight waiters with WorkflowNotReady
+- [x] R.3 Waiter semantics **(DONE 87d2ce05 — abort_sent_for_wft_failure on both server-decided failure arms (bad-message + invalid-command), entry retained for redelivery (durable admitted set); absent-message-id routed through the kernel BadUpdateMessage seam via UpdateProtocolBody::UnresolvedMessage so the abort is uniform; TestValidateWorkerMessages 10/0/0)**: bad-message WFT failure aborts in-flight waiters with WorkflowNotReady
   (exact string); explicit RespondWorkflowTaskFailed keeps the update admitted + redelivers;
   resurrect-from-AcceptedRequest. (Req 6.3, 6.4)
-- [ ] R.4 RejectUnprocessed: after a successful non-heartbeat completion, auto-reject Sent-state
+- [x] R.4 RejectUnprocessed **(DONE 87d2ce05 — runtime stamps delivered_update_ids pre-commit; kernel prunes them from admitted_updates before the K7 follow-up decision; runtime resolves waiters with RejectedUnprocessed (unprocessedUpdateFailure authored at the edge); admission-order drain via admitted_seq)**: after a successful non-heartbeat completion, auto-reject Sent-state
   updates with the exact `unprocessedUpdateFailure`; no redelivery; a second update admitted
   mid-WFT gets its own fresh speculative WFT. (Req 9)
 
@@ -102,7 +102,7 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
 
 ## Phase M — Metrics
 
-- [ ] M.1 **(F4 resolved 2026-07-06: the four metric-asserting leaves count samples only —
+- [x] M.1 **(DONE 3d9109a9 — kernel emits RecordSpeculativeOutcome (commit on materialize / rollback on drop) and RecordSpeculativeTimeout dispatch ops; publisher resolves the namespace NAME and counts namespace-labelled commits/rollbacks + timer task_requests/start_to_close_timeout tagged TimerActiveTaskSpeculativeWorkflowTaskTimeout.)** **(F4 resolved 2026-07-06: the four metric-asserting leaves count samples only —
   `speculativeWorkflowTaskOutcomes` iterates `capture.Metric(name)` with no tag inspection
   (update_workflow_test.go:35-45); reason tags NOT required. The start-to-close leaf's
   `operation == TimerActiveTaskSpeculativeWorkflowTaskTimeout` tag assertion
@@ -110,7 +110,7 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
   `speculative_workflow_task_commits` / `_rollbacks` at the
   completion seam; timer-task metrics tagged `TimerActiveTaskSpeculativeWorkflowTaskTimeout` on
   the start-to-close firing. (Req 10.1, 10.2)
-- [ ] M.2 Fork bridge: add the `tokeiraMetricRename` entries
+- [x] M.2 Fork bridge **(DONE fork b4befe147 — four rename entries)**: add the `tokeiraMetricRename` entries
   (`../temporal/tests/testcore/tokeira_metrics_bridge.go:41`). (Req 10.3)
 
 ## Phase T — Required tests
@@ -130,7 +130,7 @@ postcard-persisted enum/event variants — `cargo test --workspace` in every bar
 
 ## Phase C — Conformance checkpoint (operator-invoked)
 
-- [ ] C.1 Run `cargo +nightly fmt --all --check`, `cargo lint`, `cargo test-lint`,
+- [x] C.1 **(DONE 2026-07-07 — all gated leaves flipped: TestWorkflowUpdateSuite 69/0/11 CLEAN, TestUpdateWorkflowSdkSuite 6/0/0 CLEAN, TestUpdateWithStartSuite 37/0/5 CLEAN; QueryFailureClearsWFContext closed via the consistent-query buffer capacity 1 + ErrConsistentQueryBufferExceeded (10710ec1), AbortUpdates via rejection-wins-over-close-abort pre-claim; workspace tests + 3x stress + all-tier regression in the Tier 2.12 land bar)** Run `cargo +nightly fmt --all --check`, `cargo lint`, `cargo test-lint`,
   `cargo test --workspace`. Then drive `TestWorkflowUpdateSuite` against a running `tokeirad`
   (skips from S.1 in place) and flip the ~36 gated leaves:
   - **Cluster 3 (accept/complete + anchoring, 13):** TestEmptySpeculativeWorkflowTask_AcceptComplete

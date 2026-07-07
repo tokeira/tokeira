@@ -514,6 +514,37 @@ impl UpdateRegistry {
             .remove(&(run_key, update_id.to_string()));
     }
 
+    /// Remove an update's registry entry and return its waiters, WITHOUT
+    /// resolving them. Used to pre-claim a worker-rejected update before its
+    /// completion commits so that a close in the SAME workflow task cannot
+    /// abort it first: v1.31.0 applies the rejection as an effect and only the
+    /// close-abort touches still-pending updates, so a rejected-and-closed
+    /// update reports its rejection, not `AbortedByClosingWorkflow`
+    /// (`TestCompleteWorkflow_AbortUpdates/update_rejected_*`). The caller
+    /// resolves the returned waiters once the completion durably commits.
+    pub(crate) fn take_entry_waiters(&self, run_key: RunKey, update_id: &str) -> Vec<UpdateWaiter> {
+        self.inner
+            .lock()
+            .unwrap()
+            .remove(&(run_key, update_id.to_string()))
+            .map(|entry| entry.waiters)
+            .unwrap_or_default()
+    }
+
+    /// Resolve a pre-claimed set of waiters (from [`take_entry_waiters`]) with
+    /// `resolution`. Returns whether any waiter was still listening.
+    pub(crate) fn resolve_waiters(
+        &self,
+        waiters: Vec<UpdateWaiter>,
+        resolution: UpdateResolution,
+    ) -> bool {
+        let mut notified = false;
+        for waiter in waiters {
+            notified |= waiter.tx.send(resolution.clone()).is_ok();
+        }
+        notified
+    }
+
     /// Abort every in-flight update for a closing run, resolving each waiter
     /// per v1.31.0's abort matrix (abort_reason.go:25-121): accepted updates
     /// get the non-error completed-before failure outcome regardless of the

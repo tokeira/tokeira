@@ -5564,6 +5564,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::AlreadyExists(_) => "already_exists",
         EdgeError::ResourceExhausted(_) => "resource_exhausted",
         EdgeError::WorkflowClosing => "resource_exhausted",
+        EdgeError::ConsistentQueryBufferExceeded => "resource_exhausted",
         EdgeError::WorkflowNotReady(_) => "failed_precondition",
         EdgeError::QueryFailed { .. } => "invalid_argument",
         EdgeError::QueryTimedOut => "deadline_exceeded",

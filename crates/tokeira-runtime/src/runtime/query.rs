@@ -185,7 +185,11 @@ where
                         QueryDispatchPathLabel::Buffered,
                         QueryDispatchOutcomeLabel::Rejected,
                     );
-                    anyhow!("too many buffered queries for run {:?}", run_key)
+                    // v1.31.0's `ErrConsistentQueryBufferExceeded` — the edge
+                    // renders RESOURCE_EXHAUSTED with cause BUSY_WORKFLOW and
+                    // this exact message (queryworkflow/api.go:191-194
+                    // @ v1.31.0).
+                    anyhow::Error::new(crate::errors::ConsistentQueryBufferExceeded)
                 })?;
             runtime_metrics::record_query_dispatch(
                 QueryDispatchPathLabel::Buffered,

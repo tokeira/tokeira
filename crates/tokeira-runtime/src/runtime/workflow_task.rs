@@ -469,6 +469,22 @@ where
                 _ => None,
             })
             .collect();
+        // Pre-claim each rejected update's waiters BEFORE the commit, so a close
+        // command in the SAME completion cannot abort them first via the lane's
+        // post-commit `drain_for_run`: v1.31.0 applies the rejection as an effect
+        // and only the close-abort touches still-pending updates, so a
+        // rejected-and-closed update reports its worker rejection, not
+        // `AbortedByClosingWorkflow` (`TestCompleteWorkflow_AbortUpdates/`
+        // `update_rejected_*`). The held waiters are resolved once the
+        // completion durably commits.
+        let held_rejections: Vec<(tokeira_types::Payload, Vec<crate::update::UpdateWaiter>)> =
+            rejected_updates
+                .into_iter()
+                .map(|(update_id, failure)| {
+                    let waiters = self.update_registry.take_entry_waiters(run_key, &update_id);
+                    (failure, waiters)
+                })
+                .collect();
         let cron_continuation = self.cron_continuation_for_completion(run_key, &req).await?;
         // Retry is evaluated before cron (retry.go @ v1.31.0). The cron helper
         // already declines when a retry policy is present on a FailWorkflow, so
@@ -649,13 +665,13 @@ where
                     .lock()
                     .expect("close-attempt tracking lock")
                     .remove(&run_key);
-                // Publish rejection outcomes now that the completion is
-                // durable: the rejected update left the kernel's admitted set
-                // with no event, and its waiters resolve off the event log.
-                for (update_id, failure) in rejected_updates {
-                    self.update_registry.notify(
-                        run_key,
-                        &update_id,
+                // Publish rejection outcomes now that the completion is durable:
+                // the rejected update left the kernel's admitted set with no
+                // event, and its waiters were pre-claimed above so the close
+                // drain could not abort them first.
+                for (failure, waiters) in held_rejections {
+                    self.update_registry.resolve_waiters(
+                        waiters,
                         crate::update::UpdateResolution::Rejected { failure },
                     );
                 }

@@ -131,6 +131,20 @@ pub struct WorkflowNotReady {
 #[error("query timed out before a worker could process it")]
 pub struct QueryTimedOut;
 
+/// A query could not be buffered because the run's consistent-query buffer is
+/// at capacity — v1.31.0's `consts.ErrConsistentQueryBufferExceeded`:
+/// RESOURCE_EXHAUSTED with cause BUSY_WORKFLOW, scope NAMESPACE, and this
+/// exact message (queryworkflow/api.go:191-194 + consts/const.go:72-77
+/// @ v1.31.0; buffer capacity `history.MaxBufferedQueryCount` default 1,
+/// constants.go:2477-2480). The corpus asserts type and message
+/// (`TestSpeculativeWorkflowTask_QueryFailureClearsWFContext`).
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error(
+    "consistent query buffer is full, this may be caused by too many queries and workflow not \
+     able to process query fast enough"
+)]
+pub struct ConsistentQueryBufferExceeded;
+
 /// A pre-accepted (admitted/sent) update was aborted because its run closed
 /// with no successor — v1.31.0's `update.AbortedByWorkflowClosingErr`, a
 /// gRPC NotFound with this exact message (errors_failures.go:10-35 +

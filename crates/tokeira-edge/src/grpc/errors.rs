@@ -15,6 +15,11 @@ impl From<EdgeError> for Status {
             EdgeError::AlreadyExists(message) => Status::already_exists(message),
             EdgeError::ResourceExhausted(message) => Status::resource_exhausted(message),
             EdgeError::WorkflowClosing => workflow_closing_status(),
+            EdgeError::ConsistentQueryBufferExceeded => busy_workflow_resource_exhausted_status(
+                "consistent query buffer is full, this may be caused by too many queries and \
+                 workflow not able to process query fast enough"
+                    .to_owned(),
+            ),
             EdgeError::WorkflowNotReady(message) => workflow_not_ready_status(message),
             EdgeError::QueryFailed { message, failure } => query_failed_status(message, failure),
             EdgeError::QueryTimedOut => Status::deadline_exceeded(err_static(
@@ -196,13 +201,24 @@ fn query_failed_status(message: String, failure: Option<tokeira_types::Payload>)
 }
 
 fn workflow_closing_status() -> Status {
+    busy_workflow_resource_exhausted_status(
+        "workflow operation can not be applied because workflow is closing".to_owned(),
+    )
+}
+
+/// Build a RESOURCE_EXHAUSTED status carrying a `ResourceExhaustedFailure`
+/// detail with cause BUSY_WORKFLOW and scope NAMESPACE — the shape shared by
+/// v1.31.0's `ErrWorkflowClosing` and `ErrConsistentQueryBufferExceeded`
+/// (consts/const.go:62-77 @ v1.31.0). The Go SDK reconstructs
+/// `serviceerror.ResourceExhausted` — including the Cause the corpus asserts —
+/// from the `google.rpc.Status` detail in the trailer.
+fn busy_workflow_resource_exhausted_status(message: String) -> Status {
     use prost::Message as _;
     use tokeira_proto::public::temporal::api::{
         enums::v1::{ResourceExhaustedCause, ResourceExhaustedScope},
         errordetails::v1::ResourceExhaustedFailure,
     };
 
-    let message = "workflow operation can not be applied because workflow is closing".to_owned();
     let failure = ResourceExhaustedFailure {
         cause: ResourceExhaustedCause::BusyWorkflow as i32,
         scope: ResourceExhaustedScope::Namespace as i32,

@@ -25,7 +25,14 @@ use tokio::sync::oneshot;
 use crate::QueryResult;
 use tokeira_observability::QueryBufferOutcomeLabel;
 
-const MAX_BUFFERED_QUERIES_PER_RUN: usize = 256;
+/// Per-run consistent-query buffer capacity — v1.31.0's
+/// `history.MaxBufferedQueryCount` default of **1**
+/// (`len(queryReg.GetBufferedIDs()) >= MaxBufferedQueryCount()` →
+/// `ErrConsistentQueryBufferExceeded`, queryworkflow/api.go:191-194 +
+/// constants.go:2477-2480 @ v1.31.0). The corpus overflows a two-query race and
+/// asserts exactly one gets the buffer-full ResourceExhausted
+/// (`TestSpeculativeWorkflowTask_QueryFailureClearsWFContext`).
+const MAX_BUFFERED_QUERIES_PER_RUN: usize = 1;
 
 /// Buffered query plus the consistency barrier it must observe before a worker
 /// is allowed to evaluate it.
@@ -57,6 +64,19 @@ impl BufferedQueryRegistry {
         }
         queries.push_back(query);
         Ok(())
+    }
+
+    /// Buffer without the capacity gate — test-only, to exercise the
+    /// multi-entry drain semantics that a raised `MaxBufferedQueryCount`
+    /// (dynamic config in v1.31.0) would reach in production.
+    #[cfg(test)]
+    fn buffer_unchecked(&self, run_key: RunKey, query: BufferedQuery) {
+        self.inner
+            .lock()
+            .expect("buffered query registry poisoned")
+            .entry(run_key)
+            .or_default()
+            .push_back(query);
     }
 
     pub fn drain_satisfied(&self, run_key: RunKey, observable_barrier: i64) -> Vec<BufferedQuery> {
@@ -152,9 +172,9 @@ mod tests {
     fn drain_satisfied_only_returns_queries_at_or_below_barrier() {
         let registry = BufferedQueryRegistry::default();
         let run_key = RunKey::new();
-        registry.buffer(run_key, query(1, 1)).unwrap();
-        registry.buffer(run_key, query(2, 3)).unwrap();
-        registry.buffer(run_key, query(3, 2)).unwrap();
+        registry.buffer_unchecked(run_key, query(1, 1));
+        registry.buffer_unchecked(run_key, query(2, 3));
+        registry.buffer_unchecked(run_key, query(3, 2));
 
         let drained = registry.drain_satisfied(run_key, 2);
         let ids: Vec<_> = drained.into_iter().map(|query| query.query_id).collect();

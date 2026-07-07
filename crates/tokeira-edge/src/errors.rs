@@ -40,6 +40,17 @@ pub enum EdgeError {
     #[error("workflow operation can not be applied because workflow is closing")]
     WorkflowClosing,
 
+    /// v1.31.0's `consts.ErrConsistentQueryBufferExceeded`: a query overflowed
+    /// the run's consistent-query buffer (capacity 1). RESOURCE_EXHAUSTED with
+    /// cause BUSY_WORKFLOW, scope NAMESPACE, and this exact message — the
+    /// corpus asserts type and message (consts/const.go:72-77 +
+    /// queryworkflow/api.go:191-194 @ v1.31.0).
+    #[error(
+        "consistent query buffer is full, this may be caused by too many queries and workflow \
+         not able to process query fast enough"
+    )]
+    ConsistentQueryBufferExceeded,
+
     /// v1.31.0's `serviceerror.WorkflowNotReady`: a query arrived while the
     /// workflow cannot serve one (closed before any WFT started, first WFT
     /// still pending on backoff past the query deadline, or the WFT stuck
@@ -179,6 +190,7 @@ impl EdgeError {
             EdgeError::AlreadyExists(_) => StatusCode::CONFLICT,
             EdgeError::ResourceExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowClosing => StatusCode::TOO_MANY_REQUESTS,
+            EdgeError::ConsistentQueryBufferExceeded => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::WorkflowNotReady(_) => StatusCode::PRECONDITION_FAILED,
             EdgeError::QueryFailed { .. } => StatusCode::BAD_REQUEST,
             EdgeError::QueryTimedOut => StatusCode::REQUEST_TIMEOUT,
@@ -212,6 +224,7 @@ impl EdgeError {
             EdgeError::AlreadyExists(_) => "already_exists",
             EdgeError::ResourceExhausted(_) => "resource_exhausted",
             EdgeError::WorkflowClosing => "workflow_closing",
+            EdgeError::ConsistentQueryBufferExceeded => "consistent_query_buffer_exceeded",
             EdgeError::WorkflowNotReady(_) => "workflow_not_ready",
             EdgeError::QueryFailed { .. } => "query_failed",
             EdgeError::QueryTimedOut => "query_timed_out",
@@ -274,6 +287,15 @@ impl From<anyhow::Error> for EdgeError {
             .is_some()
         {
             return Self::QueryTimedOut;
+        }
+        // A query overflowing the run's consistent-query buffer surfaces
+        // v1.31.0's `ErrConsistentQueryBufferExceeded` (queryworkflow/api.go:
+        // 191-194 + consts/const.go:72-77).
+        if value
+            .downcast_ref::<tokeira_runtime::ConsistentQueryBufferExceeded>()
+            .is_some()
+        {
+            return Self::ConsistentQueryBufferExceeded;
         }
         // The close-attempted signal gate surfaces v1.31.0's
         // `ErrWorkflowClosing` (signal_workflow_util.go:63-70).

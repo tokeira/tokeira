@@ -1712,6 +1712,14 @@ impl BasicKernel {
                 }
                 builder.state.pending_workflow_task = None;
                 builder.state.workflow_task_attempt = 1;
+                // M.1: the speculative task was discarded without a trace —
+                // count a rollback (SpeculativeWorkflowTaskRollbacks @ v1.31.0).
+                builder
+                    .dispatch_ops
+                    .push(DispatchOp::RecordSpeculativeOutcome {
+                        namespace_id: builder.state.namespace_id,
+                        committed: false,
+                    });
                 // K7: updates admitted while this task ran still need a
                 // delivery vehicle — schedule a fresh speculative task.
                 if !builder.state.admitted_updates.is_empty() {
@@ -1886,6 +1894,20 @@ impl BasicKernel {
             && !builder.state.admitted_updates.is_empty()
         {
             builder.schedule_speculative_workflow_task();
+        }
+
+        // M.1: a speculative task that reached the materialize path (rather than
+        // the rejection-only drop at the top) committed into history — count a
+        // commit (SpeculativeWorkflowTaskCommits @ v1.31.0). Keyed off the
+        // ORIGINAL task type, which the completion's late materialization has
+        // already converted to Normal in state.
+        if pending.task_type == WorkflowTaskType::Speculative {
+            builder
+                .dispatch_ops
+                .push(DispatchOp::RecordSpeculativeOutcome {
+                    namespace_id: builder.state.namespace_id,
+                    committed: true,
+                });
         }
 
         Ok(builder.finish())
@@ -2732,6 +2754,16 @@ impl BasicKernel {
                 builder.state.pending_workflow_task = None;
                 builder.schedule_workflow_task();
             }
+            // M.1: a speculative schedule-to-start timeout counts one timer-task
+            // request (no start-to-close counter) with the operation tag.
+            if pending.task_type == WorkflowTaskType::Speculative {
+                builder
+                    .dispatch_ops
+                    .push(DispatchOp::RecordSpeculativeTimeout {
+                        namespace_id: builder.state.namespace_id,
+                        start_to_close: false,
+                    });
+            }
             return Ok(builder.finish());
         }
 
@@ -2838,6 +2870,17 @@ impl BasicKernel {
             // SDK state machine sees the correct Scheduled→Started sequence.
             builder.state.pending_workflow_task = None;
             builder.schedule_workflow_task();
+        }
+        // M.1: a speculative start-to-close timeout counts a timer-task request
+        // AND the start-to-close timeout, both with the operation tag
+        // (`TestSpeculativeWorkflowTask_StartToCloseTimeout`).
+        if pending.task_type == WorkflowTaskType::Speculative {
+            builder
+                .dispatch_ops
+                .push(DispatchOp::RecordSpeculativeTimeout {
+                    namespace_id: builder.state.namespace_id,
+                    start_to_close: true,
+                });
         }
         Ok(builder.finish())
     }

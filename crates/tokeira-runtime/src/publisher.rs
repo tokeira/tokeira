@@ -245,6 +245,17 @@ where
         }
     }
 
+    /// Resolve a namespace id to its registered NAME for metric labelling (M.1)
+    /// — the fork's metric bridge filters the speculative-WFT counters on the
+    /// namespace name. Returns `None` when no resolver is wired (unit tests),
+    /// which drops the metric rather than mislabelling it.
+    async fn resolve_namespace_name(&self, namespace_id: NamespaceId) -> Option<String> {
+        self.namespace_resolver
+            .as_ref()?
+            .name_for_id(namespace_id)
+            .await
+    }
+
     /// Whether a live workflow poller is currently parked on `queue`. Used to
     /// decide the speculative-task sticky→normal fallback (R.1): a sticky queue
     /// with no waiter means the sticky worker is gone, so the task is published
@@ -1550,6 +1561,33 @@ where
                             Some(&self.delivery_metrics),
                         )
                         .await;
+                }
+                DispatchOp::RecordSpeculativeOutcome {
+                    namespace_id,
+                    committed,
+                } => {
+                    // M.1: the kernel is metric-free, so it signals a speculative
+                    // completion's commit/rollback outcome as a post-commit op we
+                    // count here (renamed to Temporal's speculative_workflow_task
+                    // _commits / _rollbacks by the fork's metric bridge). The
+                    // counter is labelled with the namespace NAME the corpus
+                    // filters on.
+                    if let Some(namespace) = self.resolve_namespace_name(*namespace_id).await {
+                        crate::metrics::record_speculative_workflow_task_outcome(
+                            &namespace, *committed,
+                        );
+                    }
+                }
+                DispatchOp::RecordSpeculativeTimeout {
+                    namespace_id,
+                    start_to_close,
+                } => {
+                    // M.1: a speculative in-memory timer applied its timeout —
+                    // count the timer-task request (+ start-to-close timeout),
+                    // both tagged with the operation the corpus filters on.
+                    if let Some(namespace) = self.resolve_namespace_name(*namespace_id).await {
+                        crate::metrics::record_speculative_timer_fired(&namespace, *start_to_close);
+                    }
                 }
                 DispatchOp::EnqueueActivityTask { .. } => {
                     if let DispatchOp::EnqueueActivityTask {

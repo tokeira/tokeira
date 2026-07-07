@@ -106,7 +106,10 @@ impl SpeculativeTimerSet {
             // a lost race with the worker's completion is a no-op reject. The
             // fired entry stays in the map until the resulting commit's lane hook
             // disarms it (or a re-arm / handoff evicts it) — a spent timer is
-            // inert.
+            // inert. The M.1 timer-task metrics are emitted by the kernel's
+            // timeout handler (which knows the namespace and whether the timeout
+            // applied), routed out as a post-commit op — see
+            // `DispatchOp::RecordSpeculativeTimeout`.
             let _ = lane
                 .submit(
                     run_key,

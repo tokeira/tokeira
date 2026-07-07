@@ -24,6 +24,27 @@ pub const QUERY_BUFFER_WAIT_SECONDS: &str = "tokeira_runtime_query_buffer_wait_s
 pub const WORKFLOW_TASK_STARTED_TOTAL: &str = "tokeira_runtime_workflow_task_started_total";
 pub const WORKFLOW_TASK_COMPLETED_TOTAL: &str = "tokeira_runtime_workflow_task_completed_total";
 pub const WORKFLOW_TASK_TIMED_OUT_TOTAL: &str = "tokeira_runtime_workflow_task_timed_out_total";
+/// Speculative workflow task that MATERIALIZED into history (worker returned
+/// commands, heartbeat, interleaved events, or an update acceptance) — the
+/// bridge renames this to Temporal's `speculative_workflow_task_commits`
+/// (metric_defs.go:940 @ v1.31.0; spec speculative-wft M.1).
+pub const SPECULATIVE_WFT_COMMITS_TOTAL: &str =
+    "tokeira_runtime_speculative_workflow_task_commits_total";
+/// Speculative workflow task that was DISCARDED without a trace (rejection-only
+/// completion in the drop window) — renamed to Temporal's
+/// `speculative_workflow_task_rollbacks` (metric_defs.go:941 @ v1.31.0).
+pub const SPECULATIVE_WFT_ROLLBACKS_TOTAL: &str =
+    "tokeira_runtime_speculative_workflow_task_rollbacks_total";
+/// One in-memory speculative-WFT timer task processed — renamed to Temporal's
+/// generic `task_requests`, tagged `operation=TimerActiveTaskSpeculative
+/// WorkflowTaskTimeout` (queues/metrics.go:93-97 @ v1.31.0).
+pub const SPECULATIVE_TIMER_TASK_REQUESTS_TOTAL: &str =
+    "tokeira_runtime_speculative_timer_task_requests_total";
+/// A speculative workflow task that timed out on its START-to-close deadline —
+/// renamed to Temporal's `start_to_close_timeout`, same operation tag
+/// (metric_defs.go:964 + timer_queue_active_task_executor.go:424-437 @ v1.31.0).
+pub const SPECULATIVE_START_TO_CLOSE_TIMEOUT_TOTAL: &str =
+    "tokeira_runtime_speculative_start_to_close_timeout_total";
 pub const ACTIVITY_TASK_STARTED_TOTAL: &str = "tokeira_runtime_activity_task_started_total";
 pub const ACTIVITY_TASK_COMPLETED_TOTAL: &str = "tokeira_runtime_activity_task_completed_total";
 pub const ACTIVITY_TASK_FAILED_TOTAL: &str = "tokeira_runtime_activity_task_failed_total";
@@ -238,6 +259,46 @@ pub fn record_workflow_task_completed(outcome: OutcomeLabel) {
 
 pub fn record_workflow_task_timed_out(outcome: OutcomeLabel) {
     counter!(WORKFLOW_TASK_TIMED_OUT_TOTAL, "outcome" => outcome.as_str()).increment(1);
+}
+
+/// v1.31.0's `metrics.TaskTypeTimerActiveTaskSpeculativeWorkflowTaskTimeout`
+/// operation tag (metric_defs.go:597 @ v1.31.0), the value the corpus filters
+/// the timer-task metrics on.
+const SPECULATIVE_TIMER_OPERATION: &str = "TimerActiveTaskSpeculativeWorkflowTaskTimeout";
+
+/// Record a speculative workflow task's commit-vs-rollback outcome at
+/// completion (spec speculative-wft M.1): a materialized task commits, a
+/// dropped (discarded) task rolls back. Count-only — v1.31.0's reason tags are
+/// not asserted by the corpus (F4). `namespace` is the namespace NAME, which
+/// the fork's metric bridge filters on.
+pub fn record_speculative_workflow_task_outcome(namespace: &str, committed: bool) {
+    if committed {
+        counter!(SPECULATIVE_WFT_COMMITS_TOTAL, "namespace" => namespace.to_owned()).increment(1);
+    } else {
+        counter!(SPECULATIVE_WFT_ROLLBACKS_TOTAL, "namespace" => namespace.to_owned()).increment(1);
+    }
+}
+
+/// Record that an in-memory speculative-WFT timer fired and applied its timeout
+/// (spec speculative-wft M.1). Every firing counts a timer-task request; a
+/// start-to-close firing also counts the start-to-close timeout. Both carry the
+/// namespace label and the `TimerActiveTaskSpeculativeWorkflowTaskTimeout`
+/// operation tag the corpus filters on.
+pub fn record_speculative_timer_fired(namespace: &str, start_to_close: bool) {
+    counter!(
+        SPECULATIVE_TIMER_TASK_REQUESTS_TOTAL,
+        "namespace" => namespace.to_owned(),
+        "operation" => SPECULATIVE_TIMER_OPERATION,
+    )
+    .increment(1);
+    if start_to_close {
+        counter!(
+            SPECULATIVE_START_TO_CLOSE_TIMEOUT_TOTAL,
+            "namespace" => namespace.to_owned(),
+            "operation" => SPECULATIVE_TIMER_OPERATION,
+        )
+        .increment(1);
+    }
 }
 
 pub fn record_activity_task_started(outcome: OutcomeLabel) {

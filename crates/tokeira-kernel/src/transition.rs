@@ -101,6 +101,29 @@ pub enum DispatchOp {
         /// never via a backlog row.
         speculative: bool,
     },
+    /// Observability side-effect: a speculative workflow task completion
+    /// resolved as a COMMIT (materialized into history) or a ROLLBACK
+    /// (discarded without a trace). The kernel is metric-free, so it emits the
+    /// outcome as a post-commit op the runtime counts
+    /// (`SpeculativeWorkflowTaskCommits`/`Rollbacks`,
+    /// workflow_task_state_machine.go:676-746 @ v1.31.0; spec speculative-wft
+    /// M.1). `namespace_id` lets the runtime label the counter; carries no
+    /// authoritative state.
+    RecordSpeculativeOutcome {
+        namespace_id: NamespaceId,
+        committed: bool,
+    },
+    /// Observability side-effect: a speculative workflow task's in-memory timer
+    /// fired and applied its timeout. `start_to_close` distinguishes the
+    /// start-to-close timeout (also counts `start_to_close_timeout`) from the
+    /// schedule-to-start timeout; both count a timer-task request tagged
+    /// `TimerActiveTaskSpeculativeWorkflowTaskTimeout`
+    /// (timer_queue_active_task_executor.go:401-456 @ v1.31.0; spec
+    /// speculative-wft M.1).
+    RecordSpeculativeTimeout {
+        namespace_id: NamespaceId,
+        start_to_close: bool,
+    },
     /// Place an activity task on the task queue for a worker
     /// to pick up.
     EnqueueActivityTask {

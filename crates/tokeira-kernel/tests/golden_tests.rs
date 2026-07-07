@@ -7488,7 +7488,15 @@ fn speculative_rejection_only_completion_drops_without_trace() {
     assert_eq!(dropped.next_state.previous_started_event_id, 3);
     assert!(dropped.next_state.pending_workflow_task.is_none());
     assert!(!dropped.next_state.admitted_updates.contains("update-1"));
-    assert!(dropped.dispatch_ops.is_empty());
+    // The drop carries no dispatch except the M.1 rollback metric op.
+    assert_eq!(dropped.dispatch_ops.len(), 1);
+    assert!(matches!(
+        dropped.dispatch_ops[0],
+        DispatchOp::RecordSpeculativeOutcome {
+            committed: false,
+            ..
+        }
+    ));
 
     // K7 follow-up: a second update admitted while the task ran keeps a
     // delivery vehicle — the drop schedules a fresh speculative task.
@@ -7517,13 +7525,22 @@ fn speculative_rejection_only_completion_drops_without_trace() {
     );
     assert_eq!(follow_up.scheduled_event_id, 5);
     assert!(dropped.next_state.admitted_updates.contains("update-2"));
-    assert!(matches!(
-        dropped.dispatch_ops[0],
+    // The drop still rolls back (M.1) and, because another update remains
+    // admitted, schedules a fresh speculative follow-up (K7).
+    assert!(dropped.dispatch_ops.iter().any(|op| matches!(
+        op,
         DispatchOp::EnqueueWorkflowTask {
             speculative: true,
             ..
         }
-    ));
+    )));
+    assert!(dropped.dispatch_ops.iter().any(|op| matches!(
+        op,
+        DispatchOp::RecordSpeculativeOutcome {
+            committed: false,
+            ..
+        }
+    )));
 }
 
 // Feature: speculative-wft, Golden (c) / P3 / design G1 — an accept+complete

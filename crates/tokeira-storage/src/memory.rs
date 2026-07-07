@@ -3050,6 +3050,7 @@ mod tests {
                 queue: sample_queue(TaskKind::Workflow),
                 logical_seq: LogicalTaskSeq(1),
                 sticky_preferred: None,
+                normal_task_queue: None,
             });
         transition
             .dispatch_ops

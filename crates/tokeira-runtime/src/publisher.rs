@@ -245,6 +245,20 @@ where
         }
     }
 
+    /// Whether a live workflow poller is currently parked on `queue`. Used to
+    /// decide the speculative-task sticky→normal fallback (R.1): a sticky queue
+    /// with no waiter means the sticky worker is gone, so the task is published
+    /// on the normal queue instead of waiting out the schedule-to-start timeout.
+    async fn has_workflow_poller(&self, queue: &QueueKey) -> bool {
+        self.broker
+            .workflow_waiter_counts()
+            .await
+            .get(queue)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    }
+
     async fn resolve_child_run_key(
         &self,
         namespace_id: NamespaceId,
@@ -1498,16 +1512,39 @@ where
                     queue,
                     logical_seq,
                     sticky_preferred,
+                    normal_task_queue,
                     speculative,
                 } => {
                     let _ = speculative;
+                    let redirected = self.redirected_queue(queue);
+                    // R.1: a SPECULATIVE task dispatched sticky-first falls back
+                    // to the normal queue immediately when no sticky poller is
+                    // waiting, so a lost sticky worker does not strand the update
+                    // behind the 5s schedule-to-start timeout
+                    // (`StickyWorkerUnavailable` → swap to normal + retry,
+                    // updateworkflow/api.go:224-233 @ v1.31.0). Normal-queue
+                    // fallback drops the sticky preference; the in-memory
+                    // schedule-to-start timer still guards the normal dispatch.
+                    let (final_queue, final_sticky) = if *speculative
+                        && sticky_preferred.is_some()
+                        && !self.has_workflow_poller(&redirected).await
+                        && let Some(normal_name) = normal_task_queue
+                    {
+                        let normal = self.redirected_queue(&QueueKey {
+                            task_queue: normal_name.clone(),
+                            ..queue.clone()
+                        });
+                        (normal, None)
+                    } else {
+                        (redirected, sticky_preferred.clone())
+                    };
                     self.broker
                         .publish_workflow_task(
                             DispatchableWorkflowTask {
                                 run_key,
-                                queue: self.redirected_queue(queue),
+                                queue: final_queue,
                                 logical_seq: *logical_seq,
-                                sticky_preferred: sticky_preferred.clone(),
+                                sticky_preferred: final_sticky,
                                 sticky_expires_at: None,
                             },
                             Some(&self.delivery_metrics),

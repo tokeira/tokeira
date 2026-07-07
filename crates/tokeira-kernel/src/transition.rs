@@ -86,6 +86,14 @@ pub enum DispatchOp {
         queue: QueueKey,
         logical_seq: tokeira_types::LogicalTaskSeq,
         sticky_preferred: Option<tokeira_types::WorkerIdentity>,
+        /// The run's NORMAL task queue, always carried alongside the (possibly
+        /// sticky) dispatch `queue`. A speculative task dispatched sticky-first
+        /// falls back to this queue immediately when no sticky poller is
+        /// available, rather than waiting out the schedule-to-start timeout
+        /// (`StickyWorkerUnavailable` swap, updateworkflow/api.go:226-233 @
+        /// v1.31.0; spec speculative-wft R1). Equal to `queue.task_queue` for a
+        /// normal dispatch.
+        normal_task_queue: Option<tokeira_types::TaskQueueName>,
         /// A SPECULATIVE task bypasses the durable backlog and publishes
         /// straight to the broker (direct add-to-matching, no transfer task —
         /// updateworkflow/api.go:218-252 @ v1.31.0; spec speculative-wft R1).

@@ -2629,6 +2629,7 @@ impl BasicKernel {
                     },
                     logical_seq: pending.logical_seq,
                     sticky_preferred,
+                    normal_task_queue: Some(builder.state.task_queue.clone()),
                 });
             }
         }
@@ -5006,6 +5007,7 @@ impl TransitionBuilder {
                 .sticky
                 .as_ref()
                 .map(|s| s.worker_identity.clone()),
+            normal_task_queue: Some(self.state.task_queue.clone()),
             speculative: task_type == WorkflowTaskType::Speculative,
         });
     }

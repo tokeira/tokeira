@@ -2401,6 +2401,7 @@ mod tests {
     fn sample_dispatch_ops(namespace_id: NamespaceId) -> SmallVec<[DispatchOp; 4]> {
         smallvec![DispatchOp::EnqueueWorkflowTask {
             speculative: false,
+            normal_task_queue: None,
             queue: QueueKey {
                 namespace_id,
                 task_queue: TaskQueueName("queue-a".to_string()),

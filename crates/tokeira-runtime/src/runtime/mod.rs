@@ -2018,6 +2018,7 @@ mod tests {
                 run_key,
                 &[DispatchOp::EnqueueWorkflowTask {
                     speculative: false,
+                    normal_task_queue: None,
                     queue: original_queue,
                     logical_seq: LogicalTaskSeq(1),
                     sticky_preferred: None,
@@ -2101,6 +2102,7 @@ mod tests {
                 RunKey::new(),
                 &[DispatchOp::EnqueueWorkflowTask {
                     speculative: false,
+                    normal_task_queue: None,
                     queue: pinned_queue.clone(),
                     logical_seq: LogicalTaskSeq(1),
                     sticky_preferred: None,
@@ -2187,6 +2189,7 @@ mod tests {
                 RunKey::new(),
                 &[DispatchOp::EnqueueWorkflowTask {
                     speculative: false,
+                    normal_task_queue: None,
                     queue: queue.clone(),
                     logical_seq: LogicalTaskSeq(1),
                     sticky_preferred: None,

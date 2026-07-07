@@ -154,7 +154,7 @@ pub(crate) enum UpdateResolution {
     /// with the non-retryable `workflowTaskFailErr`
     /// (`serviceerror.WorkflowNotReady("Unable to perform workflow execution
     /// update due to unexpected workflow task failure.")`, abort_reason.go:86-103
-    /// + errors_failures.go:14 @ v1.31.0). Surfaces as a FAILED_PRECONDITION
+    /// and errors_failures.go:14 @ v1.31.0). Surfaces as a FAILED_PRECONDITION
     /// RPC error, with `response` nil.
     AbortedByWftFailure,
     /// The update was delivered but the completing worker ignored it — the

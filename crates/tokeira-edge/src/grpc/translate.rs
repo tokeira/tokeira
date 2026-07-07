@@ -1188,16 +1188,18 @@ fn sticky_spec_from_attributes(
     let Some(attrs) = attrs else {
         return Ok(None);
     };
-    let Some(queue) = attrs.worker_task_queue.as_ref() else {
-        return Err(ProtoConversionError::MissingField(
-            "RespondWorkflowTaskCompletedRequest.sticky_attributes.worker_task_queue",
-        ));
+    // v1.31.0 treats a missing `worker_task_queue` (or an empty queue name) as
+    // "clear stickiness", NOT an error: `StickyAttributes.WorkerTaskQueue == nil`
+    // → `ClearStickyTaskQueue`, and `SetStickyTaskQueue("")` leaves stickiness
+    // unset (respondworkflowtaskcompleted/api.go:324-340 +
+    // mutable_state_impl.go:1328-1339 @ v1.31.0). A worker completing a
+    // speculative task without a sticky queue — e.g. a follow-up task delivered
+    // inline in the completion response — simply drops its affinity, so this
+    // must not fail the completion (`WorkerSkippedProcessing_RejectByServer`).
+    let queue_name = match attrs.worker_task_queue.as_ref() {
+        Some(queue) if !queue.name.is_empty() => queue.name.clone(),
+        _ => return Ok(None),
     };
-    if queue.name.is_empty() {
-        return Err(ProtoConversionError::MissingField(
-            "RespondWorkflowTaskCompletedRequest.sticky_attributes.worker_task_queue.name",
-        ));
-    }
     // v1.31.0 defaults an unset sticky schedule-to-start timeout to 5s
     // (`stickyScheduleToStartTimeout` handling in matching); 30s was the old
     // tokeira TTL default and is kept — no corpus leaf pins the default.
@@ -1207,7 +1209,7 @@ fn sticky_spec_from_attributes(
     )?
     .unwrap_or(time::Duration::seconds(30));
     Ok(Some(tokeira_kernel::StickySpec {
-        queue: tokeira_types::TaskQueueName(queue.name.clone()),
+        queue: tokeira_types::TaskQueueName(queue_name),
         schedule_to_start_timeout,
     }))
 }
@@ -7230,24 +7232,26 @@ mod tests {
     }
 
     #[test]
-    fn respond_completed_request_rejects_sticky_attributes_without_task_queue() {
-        let status = proto_conversion_status(
-            respond_completed_request_to_edge(
-                workflowservice::RespondWorkflowTaskCompletedRequest {
-                    sticky_attributes: Some(taskqueue::StickyExecutionAttributes {
-                        worker_task_queue: None,
-                        schedule_to_start_timeout: Some(prost_types::Duration {
-                            seconds: 1,
-                            nanos: 0,
-                        }),
+    fn respond_completed_request_clears_sticky_when_worker_task_queue_absent() {
+        // v1.31.0 treats a nil worker_task_queue as "clear stickiness", not an
+        // error (respondworkflowtaskcompleted/api.go:324-340 @ v1.31.0): the
+        // completion succeeds with no sticky spec. A worker returning a
+        // speculative follow-up task inline may omit the sticky queue
+        // (`WorkerSkippedProcessing_RejectByServer`).
+        let edge = respond_completed_request_to_edge(
+            workflowservice::RespondWorkflowTaskCompletedRequest {
+                sticky_attributes: Some(taskqueue::StickyExecutionAttributes {
+                    worker_task_queue: None,
+                    schedule_to_start_timeout: Some(prost_types::Duration {
+                        seconds: 1,
+                        nanos: 0,
                     }),
-                    ..Default::default()
-                },
-            )
-            .unwrap_err(),
-        );
-
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("nil worker_task_queue clears stickiness rather than failing");
+        assert!(edge.sticky.is_none());
     }
 
     #[test]

@@ -775,32 +775,55 @@ where
             next_activity.started_identity = Some(worker_identity.clone());
 
             // Emit ActivityTaskStarted so the SDK's activity state machine
-            // sees the required Scheduled → Started → Completed sequence.
-            let started_event_id = next_state.last_event_id + 1;
-            next_state.last_event_id = started_event_id;
-            next_activity.started_event_id = Some(started_event_id);
+            // sees the required Scheduled → Started → Completed sequence — UNLESS
+            // a workflow task is currently started, in which case the event
+            // buffers: the worker's history view is frozen, so it is held on
+            // state and flushed (reordered before its resolution) when the WFT
+            // closes (`bufferEvent`, event_store.go:263 @ v1.31.0;
+            // TestBufferedEventsOutOfOrder). The activity task still dispatches —
+            // its token is keyed on the scheduled event id, not the started id —
+            // and the matching resolution buffers in the kernel, wired to this
+            // event's real id at flush.
+            let started_activity_kind = HistoryEventKind::ActivityTaskStarted {
+                activity_id: task.activity_id.clone(),
+                scheduled_event_id: current.schedule_event_id,
+                attempt: current.attempt,
+                identity: worker_identity.clone(),
+                request_id: format!("activity-start-{}-{}", task.activity_id, current.attempt),
+                last_failure: current.last_failure.clone(),
+            };
+            let workflow_task_started = state
+                .pending_workflow_task
+                .as_ref()
+                .is_some_and(|pending| pending.started_event_id.is_some());
+            let started_history_events = if workflow_task_started {
+                next_activity.started_event_id = Some(tokeira_kernel::BUFFERED_EVENT_ID);
+                next_state
+                    .buffered_events
+                    .push(tokeira_kernel::BufferedEvent {
+                        admitted_at: now,
+                        kind: started_activity_kind,
+                    });
+                SmallVec::new()
+            } else {
+                let started_event_id = next_state.last_event_id + 1;
+                next_state.last_event_id = started_event_id;
+                next_activity.started_event_id = Some(started_event_id);
+                smallvec![HistoryEvent {
+                    event_id: started_event_id,
+                    happened_at: now,
+                    kind: started_activity_kind,
+                }]
+            };
 
             next_state
                 .activities
                 .insert(task.activity_id.clone(), next_activity.clone());
 
-            let started_event = HistoryEvent {
-                event_id: started_event_id,
-                happened_at: now,
-                kind: HistoryEventKind::ActivityTaskStarted {
-                    activity_id: task.activity_id.clone(),
-                    scheduled_event_id: current.schedule_event_id,
-                    attempt: current.attempt,
-                    identity: worker_identity.clone(),
-                    request_id: format!("activity-start-{}-{}", task.activity_id, current.attempt),
-                    last_failure: current.last_failure.clone(),
-                },
-            };
-
             let transition = Transition {
                 expected_seq: state.transition_seq,
                 next_state,
-                history_events: smallvec![started_event],
+                history_events: started_history_events,
                 request_dedupe_ops: SmallVec::new(),
                 activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
                 timer_ops: SmallVec::new(),

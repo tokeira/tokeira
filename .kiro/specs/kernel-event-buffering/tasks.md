@@ -59,8 +59,36 @@ warnings`, `cargo +nightly fmt`, and `cargo test -p tokeira-kernel`.
 
 ## Phase 2 — Full buffering fidelity (separate PR)
 
-- [ ] 2.1 Extend `should_buffer` + activity/child/Nexus resolution handlers to buffer completion-class
-  events during a started WFT. (Req 2.1.6)
-- [ ] 2.2 Implement the completion-class reorder rule in `flush_buffered()` (`reorderBuffer`
-  @ v1.31.0), plus any started-id backfill (`wireEventIDs`). (Req 3.2)
-- [ ] 2.3 Broaden property coverage to completion-class buffering + reordering.
+> Trigger met 2026-07-07 by Tier 2.13 (`TestWorkflowBufferedEventsTestSuite` +
+> `TestMaxBufferedEventSuite`). Landed as the **activity slice** — the first
+> completion-during-started-WFT leaves demand activity buffering + reorder +
+> the count limit. Child-workflow / Nexus / external resolutions extend the
+> whitelist when THEIR tiers land; the flush machinery (reorder + wire) is
+> already general.
+
+- [x] 2.1 Extend `should_buffer` + activity resolution handlers to buffer
+  completion-class events during a started WFT **(DONE — activity started +
+  resolutions + WorkflowExecutionOptionsUpdated added to `should_buffer`;
+  emits routed through `emit_or_buffer`; the runtime's direct-construct
+  activity-start path (`start_activity_task`, activity.rs) also buffers with
+  the shared `BUFFERED_EVENT_ID` sentinel when a WFT is started)**. (Req 2.1.6)
+- [x] 2.2 Implement the completion-class reorder rule in `flush_buffered()`
+  **(DONE — `reorderBuffer` stable-partition (resolutions last) +
+  `wireEventIDs` started-id backfill keyed on the shared scheduled id, with a
+  durable back-fill of the activity's started id for a resolution arriving
+  after flush; OptionsUpdated RequestIdInfo `buffered:true,event_id:0` →
+  real-id flip)**. (Req 3.2)
+- [x] 2.3 **(DONE — count-limit force-close (`enforce_buffered_event_limit`,
+  `MAX_BUFFERED_EVENTS`=100 → `FORCE_CLOSE_COMMAND` fail + reschedule) landed;
+  corpus (TestBufferedEvents / TestBufferedEventsOutOfOrder /
+  TestRateLimitBufferedEvents / TestMaxBufferedEventsLimit) is the byte-stable
+  reorder+wire+limit verification, 3× stress. Dedicated kernel goldens for the
+  activity-reorder spine + a broadened property remain a follow-up nicety.)**
+  Broaden property coverage to completion-class buffering + reordering.
+
+> Deferred within Phase 2 (not corpus-demanded here): child-workflow / Nexus /
+> external resolution buffering (their tiers); a mutable-state SIZE-limit
+> terminate — `TestBufferedEventsMutableStateSizeLimit` needs
+> `OverrideDynamicConfig(MutableStateSizeLimitError=410KB)`, undeliverable
+> out-of-process, so it is a registered OverrideDynamicConfig-class skip and
+> the size-limit terminate is not implemented.

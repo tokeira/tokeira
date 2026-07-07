@@ -720,6 +720,10 @@ impl BasicKernel {
             // and the flush-on-close path schedules the follow-up delivery
             // (Req 2.2).
             builder.buffer(kind);
+            // A signal flood that pushes the buffer over the count limit
+            // force-closes the started WFT (v1.31.0
+            // closeTransactionHandleBufferedEventsLimit).
+            builder.enforce_buffered_event_limit();
             return Ok(builder.finish());
         }
         // A scheduled-not-started SPECULATIVE task converts to normal before
@@ -1343,20 +1347,26 @@ impl BasicKernel {
         // UseExisting start attaches to this run) authors this options-updated
         // event and must appear in request_id_infos (Req 5.3).
         let attached_request_id_for_map = req.attached_request_id.clone();
-        builder.emit(HistoryEventKind::WorkflowExecutionOptionsUpdated {
-            versioning_override: req.versioning_override.clone(),
-            completion_callbacks: completion_callbacks.clone(),
-            attached_completion_callbacks: attached_completion_callbacks.clone(),
-            attached_links: req.attached_links.clone(),
-            attached_request_id: req.attached_request_id,
-        });
+        // Buffers to BUFFERED_EVENT_ID when a WFT is started; the RequestIdInfo
+        // then reports `buffered:true, event_id:0` until the flush wires the
+        // real id and clears the flag (Describe assertion in TestBufferedEvents:
+        // {Buffered:true, EventId:0} → {Buffered:false, EventId:14}).
+        let options_event_id =
+            builder.emit_or_buffer(HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                versioning_override: req.versioning_override.clone(),
+                completion_callbacks: completion_callbacks.clone(),
+                attached_completion_callbacks: attached_completion_callbacks.clone(),
+                attached_links: req.attached_links.clone(),
+                attached_request_id: req.attached_request_id,
+            });
         if let Some(attached_request_id) = attached_request_id_for_map {
+            let buffered = options_event_id == BUFFERED_EVENT_ID;
             builder.state.request_id_infos.insert(
                 attached_request_id,
                 RequestIdInfo {
-                    event_id: builder.state.last_event_id,
+                    event_id: if buffered { 0 } else { options_event_id },
                     event_type: EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
-                    buffered: false,
+                    buffered,
                 },
             );
         }
@@ -1933,7 +1943,11 @@ impl BasicKernel {
             .ok_or_else(|| Reject::UnknownActivity(activity_id.to_string()))?;
 
         let mut builder = TransitionBuilder::new(state, now);
-        let started_event_id = builder.emit(HistoryEventKind::ActivityTaskStarted {
+        // Buffers to `BUFFERED_EVENT_ID` when a WFT is started (the worker's
+        // history view is frozen); the resolution event stores that sentinel as
+        // its `started_event_id` and the flush wires the real id once this
+        // ActivityTaskStarted is emitted (TestBufferedEventsOutOfOrder).
+        let started_event_id = builder.emit_or_buffer(HistoryEventKind::ActivityTaskStarted {
             activity_id: activity_id.to_string(),
             scheduled_event_id: activity.schedule_event_id,
             attempt: activity.attempt,
@@ -1970,7 +1984,7 @@ impl BasicKernel {
         let mut builder = TransitionBuilder::new(state, req.now);
         match req.resolution {
             ActivityResolution::Completed { result } => {
-                builder.emit(HistoryEventKind::ActivityTaskCompleted {
+                builder.emit_or_buffer(HistoryEventKind::ActivityTaskCompleted {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
@@ -1982,7 +1996,7 @@ impl BasicKernel {
                 failure,
                 retry_state,
             } => {
-                builder.emit(HistoryEventKind::ActivityTaskFailed {
+                builder.emit_or_buffer(HistoryEventKind::ActivityTaskFailed {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
@@ -1999,7 +2013,7 @@ impl BasicKernel {
                 retry_state,
                 failure,
             } => {
-                builder.emit(HistoryEventKind::ActivityTaskTimedOut {
+                builder.emit_or_buffer(HistoryEventKind::ActivityTaskTimedOut {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
@@ -2009,7 +2023,7 @@ impl BasicKernel {
                 });
             }
             ActivityResolution::Canceled { details } => {
-                builder.emit(HistoryEventKind::ActivityTaskCanceled {
+                builder.emit_or_buffer(HistoryEventKind::ActivityTaskCanceled {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id: activity.schedule_event_id,
                     started_event_id: activity.started_event_id.unwrap_or(0),
@@ -4007,7 +4021,8 @@ fn apply_workflow_command(
                 // payload and wake the workflow
                 // (workflow_task_completed_handler.go:651-665; the constant
                 // `activityCancellationMsgActivityNotStarted` at :48
-                // @ v1.31.0).
+                // @ v1.31.0). Command-generated inline event — never buffered
+                // (the completing WFT already cleared its pending task).
                 builder.emit(HistoryEventKind::ActivityTaskCanceled {
                     activity_id: activity.activity_id.clone(),
                     scheduled_event_id,
@@ -4681,6 +4696,22 @@ fn apply_workflow_command(
 /// `WorkflowExecutionCancelRequested`; Phase 2 extends it to
 /// activity/child/Nexus completion-class events per the full predicate
 /// (spec: kernel-event-buffering Req 2.1).
+/// Sentinel event id stamped on a bufferable event that has not yet been
+/// flushed — mirrors v1.31.0's `common.BufferedEventID` (`-123`). A resolution
+/// event whose matching `*Started` also buffered carries this in its
+/// `started_event_id` until [`TransitionBuilder::flush_buffered`] back-patches
+/// the real id (`wireEventIDs`, event_store.go:339-406 @ v1.31.0). Public so
+/// the runtime's direct-construct activity-start path can buffer with the same
+/// sentinel when a WFT is started.
+pub const BUFFERED_EVENT_ID: i64 = -123;
+
+/// v1.31.0's `MaximumBufferedEventsBatch` default (`constants.go:2340`): the
+/// per-run cap on events buffered during a started WFT. Exceeding it force-closes
+/// the started task (`closeTransactionHandleBufferedEventsLimit`,
+/// mutable_state_impl.go:8202-8231 @ v1.31.0). Pinned as a constant — the corpus
+/// leaf relies on this default, not an override (`TestMaxBufferedEventsLimit`).
+const MAX_BUFFERED_EVENTS: usize = 100;
+
 fn should_buffer(state: &WorkflowState, kind: &HistoryEventKind) -> bool {
     let workflow_task_started = state
         .pending_workflow_task
@@ -4699,6 +4730,39 @@ fn should_buffer(state: &WorkflowState, kind: &HistoryEventKind) -> bool {
             // can still win by deleting the buffered fired event
             // (`GetAndRemoveTimerFireEvent` @ v1.31.0).
             | HistoryEventKind::TimerFired { .. }
+            // Phase 2 activity slice (spec kernel-event-buffering Req 2.1;
+            // trigger met by TestBufferedEvents / TestBufferedEventsOutOfOrder /
+            // TestMaxBufferedEventsLimit): activity start + resolution events
+            // buffer during a started WFT and flush after it, with the
+            // resolution events reordered to the end (`bufferEvent` default
+            // branch, event_store.go:263-318 @ v1.31.0). Child-workflow / Nexus
+            // / external resolutions extend this whitelist when their tiers
+            // demand it — the flush machinery already handles the general case.
+            | HistoryEventKind::ActivityTaskStarted { .. }
+            | HistoryEventKind::ActivityTaskCompleted { .. }
+            | HistoryEventKind::ActivityTaskFailed { .. }
+            | HistoryEventKind::ActivityTaskTimedOut { .. }
+            | HistoryEventKind::ActivityTaskCanceled { .. }
+            // WorkflowExecutionOptionsUpdated buffers too (drives the
+            // TestBufferedEvents RequestIdInfo{Buffered:true} → {Buffered:false,
+            // EventId:14} flip on flush).
+            | HistoryEventKind::WorkflowExecutionOptionsUpdated { .. }
+    )
+}
+
+/// A buffered event of the completion/resolution class — v1.31.0's
+/// `reorderBuffer` bucket that sorts AFTER all other buffered events on flush
+/// (event_store.go:413-443 @ v1.31.0), so a resolution always lands after its
+/// matching `*Started`. Currently the activity resolution events (Phase 2
+/// activity slice); child-workflow / Nexus terminal events join here when their
+/// tiers land.
+fn is_buffered_resolution_class(kind: &HistoryEventKind) -> bool {
+    matches!(
+        kind,
+        HistoryEventKind::ActivityTaskCompleted { .. }
+            | HistoryEventKind::ActivityTaskFailed { .. }
+            | HistoryEventKind::ActivityTaskTimedOut { .. }
+            | HistoryEventKind::ActivityTaskCanceled { .. }
     )
 }
 
@@ -4773,27 +4837,165 @@ impl TransitionBuilder {
             });
     }
 
+    /// Emit an event immediately, OR buffer it when a workflow task is started
+    /// and the event is bufferable ([`should_buffer`]). Returns the assigned
+    /// real event id, or [`BUFFERED_EVENT_ID`] when buffered — so a caller that
+    /// records a started-event id (e.g. `ActivityTaskStarted`) stores the
+    /// sentinel and the flush wires the real id into the matching resolution
+    /// event. Mirrors v1.31.0's `EventStore::add` split (real id + latest batch
+    /// vs `BufferedEventID` + buffer batch, event_store.go:74-93 @ v1.31.0).
+    fn emit_or_buffer(&mut self, kind: HistoryEventKind) -> i64 {
+        if should_buffer(&self.state, &kind) {
+            self.buffer(kind);
+            BUFFERED_EVENT_ID
+        } else {
+            self.emit(kind)
+        }
+    }
+
     /// Drain `buffered_events` into history in admission order, assigning
     /// contiguous event ids continuing from the last emitted event, and
     /// return how many events were flushed. Called at every WFT-close site
     /// (completed / failed / timed-out / forced close). Flushed events keep
     /// their admission timestamps (v1.31.0 buffered events are fully formed
     /// at admission except the id; `EventStore::add`, event_store.go:74).
-    /// Phase 1 has no completion-class buffered events, so admission order is
-    /// the final order (`reorderBuffer` is Phase 2; event_store.go:411).
+    /// The flush applies v1.31.0's `reorderBuffer` (event_store.go:413-443):
+    /// a stable partition that moves completion/resolution-class events
+    /// ([`is_buffered_resolution_class`]) after all other buffered events, so a
+    /// resolution always follows its matching `*Started`. Ids are assigned in
+    /// that order (`FlushBufferToCurrentBatch` allocates AFTER reordering,
+    /// event_store.go:131-168), then `wireEventIDs` (event_store.go:339-406)
+    /// back-patches each resolution's `started_event_id` from the real id its
+    /// buffered `*Started` just received (keyed by the shared scheduled id).
+    /// A buffered `WorkflowExecutionOptionsUpdated` flips its `RequestIdInfo`
+    /// from `buffered:true, event_id:0` to the real id here (`TestBufferedEvents`).
     fn flush_buffered(&mut self) -> usize {
         let buffered = std::mem::take(&mut self.state.buffered_events);
         let count = buffered.len();
-        for event in buffered {
+        if count == 0 {
+            return 0;
+        }
+        // reorderBuffer: non-resolution events first (admission order), then
+        // resolution events (admission order) — a stable two-way partition.
+        let (mut ordered, resolutions): (
+            Vec<crate::state::BufferedEvent>,
+            Vec<crate::state::BufferedEvent>,
+        ) = buffered
+            .into_iter()
+            .partition(|event| !is_buffered_resolution_class(&event.kind));
+        ordered.extend(resolutions);
+
+        // scheduled_event_id -> real started event id, for events whose
+        // `*Started` also buffered in this batch (they precede resolutions).
+        let mut started_by_scheduled: std::collections::HashMap<i64, i64> =
+            std::collections::HashMap::new();
+        for event in ordered {
             let event_id = self.state.last_event_id + 1;
             self.state.last_event_id = event_id;
+            let mut kind = event.kind;
+            match &mut kind {
+                HistoryEventKind::ActivityTaskStarted {
+                    activity_id,
+                    scheduled_event_id,
+                    ..
+                } => {
+                    started_by_scheduled.insert(*scheduled_event_id, event_id);
+                    // Back-fill the durable activity's started id so a resolution
+                    // arriving AFTER this flush (activity still running when the
+                    // WFT closed) references the real id, not the sentinel.
+                    if let Some(activity) = self.state.activities.get_mut(&*activity_id)
+                        && activity.started_event_id == Some(BUFFERED_EVENT_ID)
+                    {
+                        activity.started_event_id = Some(event_id);
+                    }
+                }
+                HistoryEventKind::ActivityTaskCompleted {
+                    scheduled_event_id,
+                    started_event_id,
+                    ..
+                }
+                | HistoryEventKind::ActivityTaskFailed {
+                    scheduled_event_id,
+                    started_event_id,
+                    ..
+                }
+                | HistoryEventKind::ActivityTaskTimedOut {
+                    scheduled_event_id,
+                    started_event_id,
+                    ..
+                }
+                | HistoryEventKind::ActivityTaskCanceled {
+                    scheduled_event_id,
+                    started_event_id,
+                    ..
+                } => {
+                    if let Some(real_started) = started_by_scheduled.get(scheduled_event_id) {
+                        *started_event_id = *real_started;
+                    }
+                }
+                HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                    attached_request_id: Some(request_id),
+                    ..
+                } => {
+                    if let Some(info) = self.state.request_id_infos.get_mut(request_id) {
+                        info.event_id = event_id;
+                        info.buffered = false;
+                    }
+                }
+                _ => {}
+            }
             self.history_events.push(HistoryEvent {
                 event_id,
                 happened_at: event.admitted_at,
-                kind: event.kind,
+                kind,
             });
         }
         count
+    }
+
+    /// v1.31.0's `closeTransactionHandleBufferedEventsLimit`
+    /// (mutable_state_impl.go:8202-8231): when the buffered batch exceeds
+    /// [`MAX_BUFFERED_EVENTS`] while a workflow task is started, force-fail that
+    /// task with `FORCE_CLOSE_COMMAND`, flush the buffered batch, and schedule a
+    /// fresh normal task to redeliver it. The workflow SURVIVES and every
+    /// buffered event is preserved — distinct from a size-limit terminate
+    /// (`TestMaxBufferedEventsLimit` / `TestRateLimitBufferedEvents`: exactly
+    /// one `WorkflowTaskFailed(FORCE_CLOSE_COMMAND)`, all 101 signals delivered).
+    /// Returns true if it fired. Call at the end of a buffering transition.
+    fn enforce_buffered_event_limit(&mut self) -> bool {
+        if self.state.buffered_events.len() <= MAX_BUFFERED_EVENTS {
+            return false;
+        }
+        let Some(pending) = self.state.pending_workflow_task.clone() else {
+            return false;
+        };
+        let Some(started_event_id) = pending.started_event_id else {
+            return false;
+        };
+        // Only an attempt-1 task persists a WorkflowTaskFailed event (transient
+        // retries write none — workflow_task_state_machine.go:892-895 @ v1.31.0).
+        if pending.attempt == 1 {
+            self.emit(HistoryEventKind::WorkflowTaskFailed {
+                logical_seq: pending.logical_seq,
+                scheduled_event_id: pending.scheduled_event_id,
+                started_event_id,
+                failure_cause: WorkflowTaskFailedCause::ForceCloseCommand,
+                failure_details: None,
+                identity: WorkerIdentity("history-service".to_string()),
+                base_run_id: None,
+                new_run_id: None,
+                fork_event_version: None,
+                fork_event_id: None,
+            });
+        }
+        // Flush after the WFT-failed event, then schedule a fresh normal
+        // attempt-1 task to redeliver the buffered batch (failWorkflowTask then
+        // ScheduleWorkflowTask, mutable_state_impl.go:8220-8223).
+        self.flush_buffered();
+        self.state.workflow_task_attempt = 1;
+        self.state.pending_workflow_task = None;
+        self.schedule_workflow_task();
+        true
     }
 
     /// Convert a SCHEDULED (not yet started) SPECULATIVE workflow task to

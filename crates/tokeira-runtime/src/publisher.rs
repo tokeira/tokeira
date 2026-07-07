@@ -56,6 +56,33 @@ use crate::{
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+/// Owned child-start parameters carried from a `DispatchOp::StartChildWorkflow`
+/// into the spawned orchestration task — the parent linkage plus the child
+/// configuration threaded onto the child's own `StartRequest`.
+struct StartChildDispatch {
+    child_workflow_id: WorkflowId,
+    namespace_id: NamespaceId,
+    workflow_type: tokeira_types::WorkflowType,
+    task_queue: TaskQueueName,
+    input: Payloads,
+    parent_run_key: RunKey,
+    parent_workflow_id: WorkflowId,
+    parent_run_id: RunId,
+    parent_namespace_id: NamespaceId,
+    parent_root_workflow_id: Option<WorkflowId>,
+    parent_root_run_id: Option<RunId>,
+    initiated_event_id: i64,
+    header: Option<tokeira_types::Headers>,
+    memo: Memo,
+    search_attributes: SearchAttributes,
+    workflow_execution_timeout: Option<Duration>,
+    workflow_run_timeout: Option<Duration>,
+    workflow_task_timeout: Duration,
+    retry_policy: Option<tokeira_types::RetryPolicy>,
+    cron_schedule: Option<String>,
+    reuse_policy: tokeira_kernel::WorkflowIdReusePolicy,
+}
+
 /// [`DispatchPublisher`] that forwards dispatch ops to
 /// the runtime's in-memory brokers.
 pub struct RuntimeDispatchPublisher<R> {
@@ -285,24 +312,54 @@ where
             .await
     }
 
-    async fn handle_start_child_workflow(
-        &self,
-        child_workflow_id: WorkflowId,
-        namespace_id: NamespaceId,
-        workflow_type: tokeira_types::WorkflowType,
-        task_queue: TaskQueueName,
-        input: Payloads,
-        parent_run_key: RunKey,
-        parent_workflow_id: WorkflowId,
-        parent_run_id: RunId,
-        parent_namespace_id: NamespaceId,
-        parent_root_workflow_id: Option<WorkflowId>,
-        parent_root_run_id: Option<RunId>,
-        initiated_event_id: i64,
-    ) {
+    async fn handle_start_child_workflow(&self, spec: StartChildDispatch) {
+        let StartChildDispatch {
+            child_workflow_id,
+            namespace_id,
+            workflow_type,
+            task_queue,
+            input,
+            parent_run_key,
+            parent_workflow_id,
+            parent_run_id,
+            parent_namespace_id,
+            parent_root_workflow_id,
+            parent_root_run_id,
+            initiated_event_id,
+            header,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+            retry_policy,
+            cron_schedule,
+            reuse_policy,
+        } = spec;
         let child_run_id = RunId::new();
         let child_run_key = RunKey::derive(namespace_id, &child_workflow_id, child_run_id);
         let task_queue_name = task_queue.0.clone();
+        // A TERMINATE_IF_RUNNING reuse policy migrates to a TERMINATE_EXISTING
+        // conflict on the child start: a running same-id child is terminated
+        // and a fresh run started, rather than failing the start
+        // (workflow_id_dedup.go:251-262 @ v1.31.0;
+        // TestChildWorkflowExecution_AlreadyRunning_TerminateIfRunningStartsNewChild).
+        let (conflict_policy, effective_reuse_policy) = match reuse_policy {
+            tokeira_kernel::WorkflowIdReusePolicy::TerminateIfRunning => (
+                tokeira_kernel::WorkflowIdConflictPolicy::TerminateExisting,
+                tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            ),
+            other => (tokeira_kernel::WorkflowIdConflictPolicy::Fail, other),
+        };
+        // The child's root execution is the top-level ancestor: inherit the
+        // parent's root, or — when the parent is itself top-level (no root) —
+        // the parent execution IS the root (event_factory.go:78 +
+        // mutable_state_impl.go:2855-2856 @ v1.31.0).
+        let root_workflow_id = parent_root_workflow_id.or_else(|| Some(parent_workflow_id.clone()));
+        let root_run_id = parent_root_run_id.or(Some(parent_run_id));
+        // The child's WorkflowExecutionStarted carries the PARENT namespace by
+        // NAME; resolve it from the parent namespace id.
+        let parent_namespace_name = self.resolve_namespace_name(parent_namespace_id).await;
         let start_request = StartRequest {
             run_key: child_run_key,
             namespace_id,
@@ -320,15 +377,15 @@ where
             on_conflict_options: None,
             priority: None,
             input,
-            header: None,
-            memo: Memo::default(),
-            search_attributes: SearchAttributes::default(),
-            workflow_execution_timeout: None,
-            workflow_run_timeout: None,
-            workflow_task_timeout: Duration::seconds(10),
-            retry_policy: None,
-            conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
-            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            header,
+            memo,
+            search_attributes,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+            retry_policy,
+            conflict_policy,
+            reuse_policy: effective_reuse_policy,
             attempt: 1,
             continued_execution_run_id: None,
             first_execution_run_id: None,
@@ -336,9 +393,10 @@ where
             parent_workflow_id: Some(parent_workflow_id),
             parent_run_id: Some(parent_run_id),
             parent_namespace_id: Some(parent_namespace_id),
+            parent_namespace_name,
             parent_initiated_event_id: initiated_event_id,
-            root_workflow_id: parent_root_workflow_id,
-            root_run_id: parent_root_run_id,
+            root_workflow_id,
+            root_run_id,
             original_execution_run_id: None,
             continued_failure: None,
             last_completion_result: None,
@@ -350,7 +408,7 @@ where
             },
             now: OffsetDateTime::now_utc(),
             client_cron_schedule: None,
-            cron_schedule: None,
+            cron_schedule,
             reserved_poller_identity: None,
         };
 
@@ -1640,37 +1698,42 @@ where
                     parent_root_workflow_id,
                     parent_root_run_id,
                     initiated_event_id,
+                    header,
+                    memo,
+                    search_attributes,
+                    workflow_execution_timeout,
+                    workflow_run_timeout,
+                    workflow_task_timeout,
+                    retry_policy,
+                    cron_schedule,
+                    reuse_policy,
                 } => {
                     let publisher = RuntimeDispatchPublisher::clone(self);
-                    let child_workflow_id = child_workflow_id.clone();
-                    let workflow_type = workflow_type.clone();
-                    let task_queue = task_queue.clone();
-                    let input = input.clone();
-                    let parent_workflow_id = parent_workflow_id.clone();
-                    let parent_run_id = *parent_run_id;
-                    let parent_namespace_id = *parent_namespace_id;
-                    let parent_root_workflow_id = parent_root_workflow_id.clone();
-                    let parent_root_run_id = *parent_root_run_id;
-                    let namespace_id = *namespace_id;
-                    let parent_run_key = *parent_run_key;
-                    let initiated_event_id = *initiated_event_id;
+                    let spec = StartChildDispatch {
+                        child_workflow_id: child_workflow_id.clone(),
+                        namespace_id: *namespace_id,
+                        workflow_type: workflow_type.clone(),
+                        task_queue: task_queue.clone(),
+                        input: input.clone(),
+                        parent_run_key: *parent_run_key,
+                        parent_workflow_id: parent_workflow_id.clone(),
+                        parent_run_id: *parent_run_id,
+                        parent_namespace_id: *parent_namespace_id,
+                        parent_root_workflow_id: parent_root_workflow_id.clone(),
+                        parent_root_run_id: *parent_root_run_id,
+                        initiated_event_id: *initiated_event_id,
+                        header: header.clone(),
+                        memo: memo.clone(),
+                        search_attributes: search_attributes.clone(),
+                        workflow_execution_timeout: *workflow_execution_timeout,
+                        workflow_run_timeout: *workflow_run_timeout,
+                        workflow_task_timeout: *workflow_task_timeout,
+                        retry_policy: retry_policy.clone(),
+                        cron_schedule: cron_schedule.clone(),
+                        reuse_policy: *reuse_policy,
+                    };
                     tokio::spawn(async move {
-                        publisher
-                            .handle_start_child_workflow(
-                                child_workflow_id,
-                                namespace_id,
-                                workflow_type,
-                                task_queue,
-                                input,
-                                parent_run_key,
-                                parent_workflow_id,
-                                parent_run_id,
-                                parent_namespace_id,
-                                parent_root_workflow_id,
-                                parent_root_run_id,
-                                initiated_event_id,
-                            )
-                            .await;
+                        publisher.handle_start_child_workflow(spec).await;
                     });
                 }
                 DispatchOp::TerminateChild {

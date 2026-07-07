@@ -696,7 +696,7 @@ fn extract_reuse_policy(value: i32) -> tokeira_kernel::WorkflowIdReusePolicy {
             tokeira_kernel::WorkflowIdReusePolicy::RejectDuplicate
         }
         Some(enums::WorkflowIdReusePolicy::TerminateIfRunning) => {
-            tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate
+            tokeira_kernel::WorkflowIdReusePolicy::TerminateIfRunning
         }
         _ => tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
     }
@@ -4577,6 +4577,7 @@ pub fn proto_command_to_workflow_command(
                 retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
                 cron_schedule: non_empty(attrs.cron_schedule),
                 parent_close_policy: parent_close_policy_to_domain(attrs.parent_close_policy),
+                reuse_policy: extract_reuse_policy(attrs.workflow_id_reuse_policy),
             })
         }
         Some(Attributes::SignalExternalWorkflowExecutionCommandAttributes(attrs)) => {
@@ -4821,6 +4822,7 @@ pub fn workflow_command_to_proto(
             retry_policy,
             cron_schedule,
             parent_close_policy,
+            reuse_policy: _,
         } => Some(Attributes::StartChildWorkflowExecutionCommandAttributes(
             command::StartChildWorkflowExecutionCommandAttributes {
                 namespace: namespace

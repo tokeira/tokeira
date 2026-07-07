@@ -2,11 +2,13 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    ExecutionStatus, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestId, RunId, RunKey,
-    SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId, WorkflowType,
+    ExecutionStatus, Headers, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestId,
+    RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId,
+    WorkflowType,
 };
 
 use crate::{
+    command::WorkflowIdReusePolicy,
     event::HistoryEvent,
     state::{ActivityState, CompletionCallback, TimerState, WorkflowState},
 };
@@ -159,6 +161,20 @@ pub enum DispatchOp {
         parent_root_workflow_id: Option<WorkflowId>,
         parent_root_run_id: Option<RunId>,
         initiated_event_id: i64,
+        // Child start configuration threaded from the StartChildWorkflow
+        // command onto the child's own StartRequest, so the child run carries
+        // the parent-specified header/memo/search-attributes/timeouts/retry/cron
+        // (v1.31.0's `startWorkflow` copies these from the initiated
+        // attributes, transfer_queue_active_task_executor.go:1606-1685).
+        header: Option<Headers>,
+        memo: Memo,
+        search_attributes: SearchAttributes,
+        workflow_execution_timeout: Option<Duration>,
+        workflow_run_timeout: Option<Duration>,
+        workflow_task_timeout: Duration,
+        retry_policy: Option<RetryPolicy>,
+        cron_schedule: Option<String>,
+        reuse_policy: WorkflowIdReusePolicy,
     },
     /// Forcibly terminate a child workflow (parent close
     /// policy).

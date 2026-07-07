@@ -4109,6 +4109,7 @@ fn apply_workflow_command(
             retry_policy,
             cron_schedule,
             parent_close_policy,
+            reuse_policy,
         } => {
             if builder.state.children.contains_key(&child_workflow_id) {
                 return Err(Reject::DuplicateChildWorkflowId(child_workflow_id));
@@ -4142,6 +4143,13 @@ fn apply_workflow_command(
             } else {
                 namespace_id
             };
+            // Clone the child config so both the durable Initiated event and
+            // the dispatch op (which builds the child's StartRequest) carry it.
+            let dispatch_header = header.clone();
+            let dispatch_memo = memo.clone();
+            let dispatch_search_attributes = search_attributes.clone();
+            let dispatch_retry_policy = retry_policy.clone();
+            let dispatch_cron_schedule = cron_schedule.clone();
             let initiated_event_id =
                 builder.emit(HistoryEventKind::StartChildWorkflowExecutionInitiated {
                     workflow_task_completed_event_id,
@@ -4187,6 +4195,15 @@ fn apply_workflow_command(
                 parent_root_workflow_id: builder.state.root_workflow_id.clone(),
                 parent_root_run_id: builder.state.root_run_id,
                 initiated_event_id,
+                header: dispatch_header,
+                memo: dispatch_memo,
+                search_attributes: dispatch_search_attributes,
+                workflow_execution_timeout,
+                workflow_run_timeout,
+                workflow_task_timeout,
+                retry_policy: dispatch_retry_policy,
+                cron_schedule: dispatch_cron_schedule,
+                reuse_policy,
             });
             Ok(false)
         }

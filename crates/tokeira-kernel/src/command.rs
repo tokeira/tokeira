@@ -364,11 +364,18 @@ pub enum WorkflowIdConflictPolicy {
 }
 
 /// Policy for handling workflow ID reuse with closed workflows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkflowIdReusePolicy {
+    /// v1.31.0's default reuse policy (`ALLOW_DUPLICATE`).
+    #[default]
     AllowDuplicate,
     AllowDuplicateFailedOnly,
     RejectDuplicate,
+    /// Deprecated `TERMINATE_IF_RUNNING`: terminate a currently-running
+    /// same-id execution and start a new run. Migrated on the start path to a
+    /// TERMINATE_EXISTING conflict policy (workflow_id_dedup.go:251-262 @
+    /// v1.31.0). Appended LAST per postcard positional discipline.
+    TerminateIfRunning,
 }
 
 /// Request to create a brand-new workflow execution.
@@ -448,6 +455,11 @@ pub struct StartRequest {
     pub parent_run_id: Option<RunId>,
     /// Parent namespace if this start creates a child workflow.
     pub parent_namespace_id: Option<NamespaceId>,
+    /// Parent namespace NAME, authored onto the child's WorkflowExecutionStarted
+    /// as `ParentWorkflowNamespace` (the corpus asserts the name, not the id).
+    /// Resolved by the runtime child orchestrator; `None` for top-level starts.
+    #[serde(default)]
+    pub parent_namespace_name: Option<String>,
     /// Event ID of the parent initiation event for child starts.
     pub parent_initiated_event_id: i64,
     /// Root workflow ID authored onto the start event when the source run has
@@ -1393,6 +1405,11 @@ pub enum WorkflowCommand {
         retry_policy: Option<RetryPolicy>,
         cron_schedule: Option<String>,
         parent_close_policy: ParentClosePolicy,
+        /// Reuse policy for the child workflow id. The deprecated
+        /// `TERMINATE_IF_RUNNING` migrates to a TERMINATE_EXISTING conflict on
+        /// the child start (workflow_id_dedup.go:251-262 @ v1.31.0).
+        #[serde(default)]
+        reuse_policy: WorkflowIdReusePolicy,
     },
     /// Send a signal to an external workflow.
     SignalExternalWorkflowExecution {

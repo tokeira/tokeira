@@ -1233,6 +1233,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                     retry_policy: None,
                     cron_schedule: None,
                     parent_close_policy: tokeira_kernel::ParentClosePolicy::Terminate,
+                    reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
                 }
             }),
         (arb_small_string(), arb_payloads(),).prop_map(|(target_workflow_id, input)| {

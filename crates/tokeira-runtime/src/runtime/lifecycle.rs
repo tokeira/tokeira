@@ -975,7 +975,12 @@ where
         }
 
         Ok(match reuse_policy {
-            WorkflowIdReusePolicy::AllowDuplicate => ConflictResolution::ClosedAllowReuse,
+            // TerminateIfRunning governs a RUNNING conflict (migrated to a
+            // TERMINATE_EXISTING conflict policy before the kernel start); a
+            // CLOSED-run conflict simply allows reuse, like AllowDuplicate.
+            WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::TerminateIfRunning => {
+                ConflictResolution::ClosedAllowReuse
+            }
             WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
                 if matches!(
                     state.status,

@@ -121,6 +121,7 @@ pub fn start_request(
         parent_workflow_id: None,
         parent_run_id: None,
         parent_namespace_id: None,
+        parent_namespace_name: None,
         parent_initiated_event_id: 0,
         root_workflow_id: None,
         root_run_id: None,

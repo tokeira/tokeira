@@ -776,6 +776,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     parent_workflow_id: None,
                     parent_run_id: None,
                     parent_namespace_id: None,
+                    parent_namespace_name: None,
                     parent_initiated_event_id: 0,
                     root_workflow_id: None,
                     root_run_id: None,
@@ -1347,6 +1348,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                             retry_policy: None,
                             cron_schedule: None,
                             parent_close_policy,
+                            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
                         }]
                     }
                 ),
@@ -3728,6 +3730,7 @@ proptest! {
                     retry_policy: None,
                     cron_schedule: None,
                     parent_close_policy,
+                    reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),

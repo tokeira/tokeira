@@ -1094,6 +1094,7 @@ fn arb_continue_as_new_command() -> impl Strategy<Value = WorkflowCommand> {
                 workflow_run_timeout,
                 workflow_task_timeout,
             )| WorkflowCommand::ContinueAsNew {
+                header: None,
                 new_run_id: RunId::new(),
                 workflow_type: WorkflowType(workflow_type),
                 task_queue: TaskQueueName(task_queue),
@@ -1631,6 +1632,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     true,
                 );
                 let req = ChildResolvedRequest {
+                    resolved_run_id: None,
                     child_workflow_id: WorkflowId(child_workflow_id),
                     resolution,
                     now,
@@ -2950,13 +2952,15 @@ proptest! {
                     ..
                 },
                 WorkflowCommand::ContinueAsNew {
+                    header: None,
                     new_run_id: expected_new_run_id,
                     workflow_type: expected_workflow_type,
                     task_queue: expected_task_queue,
                     input: expected_input,
                     memo: expected_memo,
                     search_attributes: expected_search_attributes,
-                    workflow_execution_timeout: expected_execution_timeout,
+                    // Inherited from the run, not the command — see below.
+                    workflow_execution_timeout: _expected_execution_timeout,
                     workflow_run_timeout: expected_run_timeout,
                     workflow_task_timeout: expected_task_timeout,
                     ..
@@ -2968,7 +2972,9 @@ proptest! {
                 prop_assert_eq!(input, expected_input);
                 prop_assert_eq!(memo, expected_memo);
                 prop_assert_eq!(search_attributes, expected_search_attributes);
-                prop_assert_eq!(workflow_execution_timeout, expected_execution_timeout);
+                // The execution timeout is inherited from the run (the chain's
+                // first-run deadline), not carried on the CaN command.
+                prop_assert_eq!(workflow_execution_timeout, &state.workflow_execution_timeout);
                 prop_assert_eq!(workflow_run_timeout, expected_run_timeout);
                 prop_assert_eq!(workflow_task_timeout, expected_task_timeout);
             }
@@ -3323,6 +3329,7 @@ proptest! {
                 true,
             )),
             Command::ChildResolved(ChildResolvedRequest {
+                resolved_run_id: None,
                 child_workflow_id: WorkflowId("child-1".into()),
                 resolution: ChildResolution::Completed {
                     result: Payloads::default(),
@@ -3765,6 +3772,7 @@ proptest! {
         let transition = kernel().apply(
             LoadedRun::Existing(state),
             Command::ChildResolved(ChildResolvedRequest {
+                resolved_run_id: None,
                 child_workflow_id: WorkflowId(child_workflow_id.clone()),
                 resolution,
                 now,
@@ -3978,6 +3986,7 @@ fn property_42_parent_close_policy_all_paths() {
             }),
             wf_close(WorkflowCommand::CancelWorkflow { details: None }),
             wf_close(WorkflowCommand::ContinueAsNew {
+                header: None,
                 new_run_id: RunId::new(),
                 workflow_type: WorkflowType("next".into()),
                 task_queue: TaskQueueName("queue".into()),
@@ -4313,6 +4322,7 @@ fn property_57_close_clears_pending_updates() {
         }),
         wf_close(WorkflowCommand::CancelWorkflow { details: None }),
         wf_close(WorkflowCommand::ContinueAsNew {
+            header: None,
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("next".into()),
             task_queue: TaskQueueName("queue".into()),
@@ -4602,6 +4612,7 @@ fn property_63_close_preserves_execution_options() {
         }),
         wf_close(WorkflowCommand::CancelWorkflow { details: None }),
         wf_close(WorkflowCommand::ContinueAsNew {
+            header: None,
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("next".into()),
             task_queue: TaskQueueName("queue".into()),
@@ -4704,6 +4715,7 @@ fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
         }]),
         CloseKind::Canceled => wft(vec![WorkflowCommand::CancelWorkflow { details: None }]),
         CloseKind::ContinuedAsNew => wft(vec![WorkflowCommand::ContinueAsNew {
+            header: None,
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("wf".into()),
             task_queue: TaskQueueName("queue".into()),
@@ -5257,6 +5269,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
         }),
         wf_close(WorkflowCommand::CancelWorkflow { details: None }),
         wf_close(WorkflowCommand::ContinueAsNew {
+            header: None,
             new_run_id: RunId::new(),
             workflow_type: WorkflowType("next".into()),
             task_queue: TaskQueueName("queue".into()),

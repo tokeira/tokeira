@@ -245,6 +245,16 @@ pub enum WorkflowTaskFailedCause {
     /// TestStartChildWorkflowWithInternalTaskQueue_Blocked). Appended LAST per
     /// the postcard positional discipline above.
     BadStartChildExecutionAttributes,
+    /// `RespondWorkflowTaskCompleted`: a `ContinueAsNewWorkflowExecution`
+    /// command with invalid attributes — e.g. targeting the reserved internal
+    /// per-namespace worker task queue
+    /// (`WORKFLOW_TASK_FAILED_CAUSE_BAD_CONTINUE_AS_NEW_ATTRIBUTES`,
+    /// `ValidateContinueAsNewWorkflowExecutionAttributes` +
+    /// `CheckInternalPerNsTaskQueueAllowed`, command_attr_validator.go +
+    /// task_queue_validator.go @ v1.31.0;
+    /// TestContinueAsNewWithInternalTaskQueue_Blocked). Appended LAST per the
+    /// postcard positional discipline above.
+    BadContinueAsNewAttributes,
 }
 
 impl WorkflowTaskFailedCause {
@@ -276,6 +286,7 @@ impl WorkflowTaskFailedCause {
             Self::GrpcMessageTooLarge => "GrpcMessageTooLarge",
             Self::BadUpdateWorkflowExecutionMessage => "BadUpdateWorkflowExecutionMessage",
             Self::BadStartChildExecutionAttributes => "BadStartChildExecutionAttributes",
+            Self::BadContinueAsNewAttributes => "BadContinueAsNewAttributes",
         }
     }
 }
@@ -1091,6 +1102,13 @@ pub enum ChildStartResult {
 pub struct ChildResolvedRequest {
     /// Workflow ID of the child.
     pub child_workflow_id: WorkflowId,
+    /// Run ID of the child run that actually resolved. Differs from the run the
+    /// child STARTED on when the child continued-as-new before closing — the
+    /// parent's `ChildWorkflowExecution*` event must reference the final run
+    /// (`TestChildWorkflowWithContinueAsNew`). `None` falls back to the stored
+    /// started run id.
+    #[serde(default)]
+    pub resolved_run_id: Option<RunId>,
     /// How the child was resolved.
     pub resolution: ChildResolution,
     /// Wall-clock time the command was accepted.
@@ -1370,6 +1388,8 @@ pub enum WorkflowCommand {
         workflow_run_timeout: Option<Duration>,
         workflow_task_timeout: Duration,
         retry_policy: Option<RetryPolicy>,
+        #[serde(default)]
+        header: Option<Headers>,
     },
     /// Cancel the workflow (cooperative cancellation
     /// completed). Closes the run.

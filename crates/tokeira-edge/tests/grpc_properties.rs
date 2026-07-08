@@ -1201,6 +1201,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                         workflow_run_timeout: None,
                         workflow_task_timeout: time::Duration::seconds(10),
                         retry_policy: None,
+                        header: None,
                     }
                 }
             ),

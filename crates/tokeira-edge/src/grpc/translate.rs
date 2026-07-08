@@ -4500,13 +4500,17 @@ pub fn proto_command_to_workflow_command(
             })
         }
         Some(Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(attrs)) => {
-            let task_queue =
-                attrs
-                    .task_queue
-                    .as_ref()
-                    .ok_or(ProtoConversionError::MissingField(
-                        "ContinueAsNewWorkflowExecutionCommandAttributes.task_queue",
-                    ))?;
+            // A CaN command that omits task_queue / workflow_type inherits them
+            // from the previous execution (v1.31.0 ValidateContinueAsNew
+            // WorkflowExecutionAttributes: "Inherit … from previous execution if
+            // not provided", command_attr_validator.go:397-430). The kernel
+            // defaults an empty task queue / workflow type to the current run's,
+            // so an absent one passes through as empty here.
+            let task_queue = attrs
+                .task_queue
+                .as_ref()
+                .map(task_queue_to_domain)
+                .unwrap_or_default();
             Ok(WorkflowCommand::ContinueAsNew {
                 new_run_id: RunId::new(),
                 workflow_type: WorkflowType(
@@ -4516,7 +4520,7 @@ pub fn proto_command_to_workflow_command(
                         .map(|workflow_type| workflow_type.name.clone())
                         .unwrap_or_default(),
                 ),
-                task_queue: task_queue_to_domain(task_queue),
+                task_queue,
                 input: attrs
                     .input
                     .as_ref()
@@ -4536,16 +4540,21 @@ pub fn proto_command_to_workflow_command(
                 )
                 .unwrap_or(time::Duration::seconds(10)),
                 retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
+                header: attrs.header.as_ref().map(headers_to_domain),
             })
         }
         Some(Attributes::StartChildWorkflowExecutionCommandAttributes(attrs)) => {
-            let task_queue =
-                attrs
-                    .task_queue
-                    .as_ref()
-                    .ok_or(ProtoConversionError::MissingField(
-                        "StartChildWorkflowExecutionCommandAttributes.task_queue",
-                    ))?;
+            // A child command that omits `task_queue` inherits the parent's
+            // (v1.31.0 ValidateStartChildExecutionAttributes: "Inherit taskqueue
+            // from parent workflow execution if not provided", command_attr_
+            // validator.go:80-89 — normalizes against parentInfo.TaskQueue). The
+            // kernel defaults an empty child task queue to the parent's, so an
+            // absent command task queue passes through as empty here.
+            let task_queue = attrs
+                .task_queue
+                .as_ref()
+                .map(task_queue_to_domain)
+                .unwrap_or_default();
             // A child command that omits `namespace` inherits the parent's
             // namespace (the WFT-completing worker's namespace). tokeira derives
             // the namespace id by hashing the name, so an empty name would hash
@@ -4565,7 +4574,7 @@ pub fn proto_command_to_workflow_command(
                         .map(|workflow_type| workflow_type.name.clone())
                         .unwrap_or_default(),
                 ),
-                task_queue: task_queue_to_domain(task_queue),
+                task_queue,
                 input: attrs
                     .input
                     .as_ref()

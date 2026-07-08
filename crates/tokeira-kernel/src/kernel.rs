@@ -118,6 +118,33 @@ fn positive_start_delay(delay: Option<time::Duration>) -> Option<time::Duration>
     delay.filter(|delay| *delay > time::Duration::ZERO)
 }
 
+/// Minimal interval between continue-as-new generations, the v1.31.0
+/// `WorkflowIdReuseMinimalInterval` default (1s). Not an override — the DEFAULT.
+const CONTINUE_AS_NEW_MIN_INTERVAL: time::Duration = time::Duration::seconds(1);
+
+/// v1.31.0 `ContinueAsNewMinBackoff` (mutable_state_impl.go:2675-2695): throttle
+/// a rapid continue-as-new so each generation lives at least
+/// `WorkflowIdReuseMinimalInterval`, preventing tight CaN loops. When the
+/// predecessor's lifetime plus the command's own backoff is under that minimum,
+/// the successor's first workflow task is delayed by `min_interval - lifetime`
+/// (so it fires ~`min_interval` after the predecessor started). A generation
+/// terminated during that window shows only `WorkflowExecutionStarted` — the
+/// WFT is pending on the delay timer, not yet scheduled
+/// (`TestChildWorkflowWithContinueAsNewParentTerminate`,
+/// `TestContinueAsNewRunExecutionTimeout`).
+fn continue_as_new_min_backoff(
+    command_backoff: Option<time::Duration>,
+    lifetime: time::Duration,
+) -> Option<time::Duration> {
+    let lifetime = lifetime.max(time::Duration::ZERO);
+    let backoff = command_backoff.unwrap_or(time::Duration::ZERO);
+    if lifetime + backoff < CONTINUE_AS_NEW_MIN_INTERVAL {
+        Some(CONTINUE_AS_NEW_MIN_INTERVAL - lifetime)
+    } else {
+        command_backoff
+    }
+}
+
 /// Pure transition engine.
 ///
 /// Given a loaded run state and one validated command, the
@@ -2132,13 +2159,17 @@ impl BasicKernel {
             .cloned()
             .ok_or_else(|| Reject::UnknownChild(req.child_workflow_id.clone()))?;
 
+        // The run that actually resolved — the final run of a continue-as-new
+        // chain when the child continued before closing, else the started run.
+        let resolved_run_id = req.resolved_run_id.or(child.child_run_id);
+
         match req.resolution {
             ChildResolution::Completed { result } => {
                 builder.emit(HistoryEventKind::ChildWorkflowExecutionCompleted {
                     child_workflow_id: child.child_workflow_id.clone(),
                     namespace_id: child.namespace_id,
                     namespace: child.namespace.clone(),
-                    child_run_id: child.child_run_id,
+                    child_run_id: resolved_run_id,
                     workflow_type: child.workflow_type.clone(),
                     result,
                     initiated_event_id: child.initiated_event_id,
@@ -2150,7 +2181,7 @@ impl BasicKernel {
                     child_workflow_id: child.child_workflow_id.clone(),
                     namespace_id: child.namespace_id,
                     namespace: child.namespace.clone(),
-                    child_run_id: child.child_run_id,
+                    child_run_id: resolved_run_id,
                     workflow_type: child.workflow_type.clone(),
                     retry_state: RetryState::RetryPolicyNotSet,
                     failure,
@@ -2163,7 +2194,7 @@ impl BasicKernel {
                     child_workflow_id: child.child_workflow_id.clone(),
                     namespace_id: child.namespace_id,
                     namespace: child.namespace.clone(),
-                    child_run_id: child.child_run_id,
+                    child_run_id: resolved_run_id,
                     workflow_type: child.workflow_type.clone(),
                     details: None,
                     initiated_event_id: child.initiated_event_id,
@@ -3625,6 +3656,9 @@ fn emit_cron_continue_as_new(
         last_completion_result,
         backoff_start_interval: Some(cron.first_workflow_task_backoff),
         cron_schedule: Some(cron.cron_schedule.clone()),
+        // Cron successors are server-initiated (no worker command re-supplying
+        // the header); a stored per-run header is not tracked, so none flows.
+        header: None,
     });
     builder.close(ExecutionStatus::ContinuedAsNew);
 }
@@ -3904,10 +3938,13 @@ fn apply_workflow_command(
             input,
             memo,
             search_attributes,
-            workflow_execution_timeout,
+            // The execution timeout is always inherited from the chain, never
+            // taken from the command (v1.31.0's ContinueAsNew has no such field).
+            workflow_execution_timeout: _,
             workflow_run_timeout,
             workflow_task_timeout,
             retry_policy,
+            header,
         } => {
             // A close command with buffered events is an UnhandledCommand:
             // the workflow must observe the buffered events before closing
@@ -3921,6 +3958,54 @@ fn apply_workflow_command(
                     message: None,
                 });
             }
+            // Inherit task queue / workflow type from the current run when the
+            // command omits them (v1.31.0 ValidateContinueAsNewWorkflow
+            // ExecutionAttributes, command_attr_validator.go:397-430).
+            let task_queue = if task_queue.0.is_empty() {
+                builder.state.task_queue.clone()
+            } else {
+                task_queue
+            };
+            let workflow_type = if workflow_type.0.is_empty() {
+                builder.state.workflow_type.clone()
+            } else {
+                workflow_type
+            };
+            // The workflow EXECUTION timeout is fixed at the chain's first run
+            // and always inherited — v1.31.0's ContinueAsNew command carries no
+            // execution-timeout field, so the deadline spans the whole
+            // continue-as-new chain (anchored on first_run_started_at). Without
+            // this the successor loses the deadline and the chain never times
+            // out (TestContinueAsNewRunExecutionTimeout).
+            let workflow_execution_timeout = builder.state.workflow_execution_timeout;
+            // A CaN successor may not target the reserved internal per-namespace
+            // worker task queue — v1.31.0 fails the WFT with
+            // BAD_CONTINUE_AS_NEW_ATTRIBUTES (CheckInternalPerNsTaskQueueAllowed
+            // with no internal parent component, task_queue_validator.go:64-84 @
+            // v1.31.0; TestContinueAsNewWithInternalTaskQueue_Blocked).
+            if task_queue.0 == PER_NS_WORKER_TASK_QUEUE {
+                return Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::BadContinueAsNewAttributes,
+                    message: Some(format!(
+                        "unable to schedule workflow on the internal per-namespace task queue: {}",
+                        task_queue.0
+                    )),
+                });
+            }
+            // Throttle rapid CaN so each generation lives at least the minimal
+            // interval — the successor's first WFT is delayed accordingly.
+            // Lifetime is measured from the run's EXECUTION time (start + its
+            // own first-WFT backoff), not its start, so a generation whose WFT
+            // only became available after its own delay still yields a fresh
+            // backoff for the next generation (v1.31.0 uses ExecutionTime,
+            // mutable_state_impl.go:2678-2679).
+            let execution_time = builder.state.started_at
+                + builder
+                    .state
+                    .workflow_start_delay
+                    .unwrap_or(time::Duration::ZERO);
+            let backoff_start_interval =
+                continue_as_new_min_backoff(None, builder.now - execution_time);
             builder.emit(HistoryEventKind::WorkflowExecutionContinuedAsNew {
                 workflow_task_completed_event_id,
                 new_run_id,
@@ -3938,8 +4023,9 @@ fn apply_workflow_command(
                 initiator: ContinueAsNewInitiator::Workflow,
                 failure: None,
                 last_completion_result: None,
-                backoff_start_interval: None,
+                backoff_start_interval,
                 cron_schedule: None,
+                header,
             });
             builder.close(ExecutionStatus::ContinuedAsNew);
             builder.apply_parent_close_policy();

@@ -55,8 +55,24 @@ pub fn history_event_to_proto(event: &HistoryEvent) -> history::HistoryEvent {
         user_metadata: event_user_metadata(event),
         links: event_links(event),
         worker_may_ignore: event_worker_may_ignore(event),
+        task_id: event_task_id(event),
         ..Default::default()
     }
+}
+
+/// A strictly increasing, globally-monotonic sortable id for an event.
+///
+/// Temporal assigns each event a shard-global `TaskId` from the persistence
+/// task-id generator; tokeira has no such counter, so it synthesizes one from
+/// the event's durable wall-clock time plus its in-run event id. `event_id`
+/// strictly increases within a run (breaking ties when several events share a
+/// `happened_at`), and `happened_at` advances across continue-as-new
+/// generations — the CaN min-backoff guarantees a ~1s gap, far larger than any
+/// per-run event count — so the id is monotonic across the whole run chain, not
+/// just within one run (`TestWorkflowContinueAsNewTaskID` asserts strictly
+/// increasing task ids WITHOUT resetting the floor between runs).
+fn event_task_id(event: &HistoryEvent) -> i64 {
+    (event.happened_at.unix_timestamp_nanos() as i64).saturating_add(event.event_id)
 }
 
 /// Whether the worker may skip this event during replay without failing.
@@ -551,6 +567,9 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             last_completion_result,
             backoff_start_interval,
             cron_schedule: _,
+            // The CaN event proto has no header field — it is authored on the
+            // successor run's WorkflowExecutionStarted instead.
+            header: _,
             workflow_task_completed_event_id,
         } => Attributes::WorkflowExecutionContinuedAsNewEventAttributes(
             history::WorkflowExecutionContinuedAsNewEventAttributes {
@@ -1666,6 +1685,7 @@ fn wft_failed_cause_i32(c: &WorkflowTaskFailedCause) -> i32 {
         WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage => {
             C::BadUpdateWorkflowExecutionMessage
         }
+        WorkflowTaskFailedCause::BadContinueAsNewAttributes => C::BadContinueAsNewAttributes,
         WorkflowTaskFailedCause::BadStartChildExecutionAttributes => {
             C::BadStartChildExecutionAttributes
         }
@@ -3347,6 +3367,7 @@ mod tests {
                     last_completion_result: last_result.clone(),
                     backoff_start_interval: None,
                     cron_schedule: None,
+                    header: None,
                 },
             };
             let proto = history_event_to_proto(&event);

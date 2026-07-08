@@ -601,6 +601,11 @@ pub enum HistoryEventKind {
         backoff_start_interval: Option<Duration>,
         #[serde(default)]
         cron_schedule: Option<String>,
+        /// Header carried into the successor run's `WorkflowExecutionStarted`
+        /// (the CaN event itself has no header field in the proto — this is
+        /// retained so the runtime authors it on the successor start).
+        #[serde(default)]
+        header: Option<Headers>,
     },
     /// The workflow was canceled via a `CancelWorkflow`
     /// workflow command (cooperative cancellation completed).

@@ -838,6 +838,7 @@ fn make_timeout_request() -> WorkflowExecutionTimedOutRequest {
 
 fn make_continue_as_new_command() -> WorkflowCommand {
     WorkflowCommand::ContinueAsNew {
+        header: None,
         new_run_id: RunId::new(),
         workflow_type: WorkflowType("wf-next".into()),
         task_queue: TaskQueueName("queue-next".into()),
@@ -2878,6 +2879,7 @@ fn continue_as_new_closes_run() {
         expected_task_timeout,
     ) = match &command {
         WorkflowCommand::ContinueAsNew {
+            header: None,
             new_run_id,
             workflow_type,
             task_queue,
@@ -2956,10 +2958,13 @@ fn continue_as_new_closes_run() {
             && *input == expected_input
             && *memo == expected_memo
             && *search_attributes == expected_search_attributes
-            && *workflow_execution_timeout == expected_execution_timeout
+            // The execution timeout is inherited from the run, not taken from
+            // the CaN command (v1.31.0 has no execution-timeout field on CaN).
+            && *workflow_execution_timeout == state.workflow_execution_timeout
             && *workflow_run_timeout == expected_run_timeout
             && *workflow_task_timeout == expected_task_timeout
     ));
+    let _ = expected_execution_timeout;
 }
 
 #[test]
@@ -5233,6 +5238,7 @@ fn child_resolved_completed() {
         .apply(
             LoadedRun::Existing(state),
             Command::ChildResolved(ChildResolvedRequest {
+                resolved_run_id: None,
                 child_workflow_id: WorkflowId("child-1".into()),
                 resolution: ChildResolution::Completed {
                     result: payloads("done"),

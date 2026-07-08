@@ -827,6 +827,11 @@ where
                                     let command = tokeira_kernel::Command::ChildResolved(
                                         tokeira_kernel::ChildResolvedRequest {
                                             child_workflow_id: new_state.workflow_id.clone(),
+                                            // The run that actually closed — the
+                                            // final continue-as-new generation,
+                                            // which the parent's resolution event
+                                            // must reference.
+                                            resolved_run_id: Some(new_state.run_id),
                                             resolution,
                                             now: time::OffsetDateTime::now_utc(),
                                         },
@@ -876,6 +881,7 @@ where
                                             retry_policy,
                                             backoff_start_interval,
                                             cron_schedule,
+                                            header,
                                             ..
                                         } => Some((
                                             *new_run_id,
@@ -890,6 +896,7 @@ where
                                             retry_policy.clone(),
                                             *backoff_start_interval,
                                             cron_schedule.clone(),
+                                            header.clone(),
                                         )),
                                         _ => None,
                                     });
@@ -906,6 +913,7 @@ where
                                     retry_policy,
                                     backoff_start_interval,
                                     cron_schedule,
+                                    header,
                                 )) = successor_event
                                 {
                                     // Carry the chain's origin forward: the
@@ -973,7 +981,7 @@ where
                                         on_conflict_options: None,
                                         priority: new_state.priority.clone(),
                                         input,
-                                        header: None,
+                                        header,
                                         memo,
                                         search_attributes,
                                         workflow_execution_timeout,
@@ -2270,6 +2278,7 @@ mod tests {
                         last_completion_result: None,
                         backoff_start_interval: None,
                         cron_schedule: None,
+                        header: None,
                         workflow_task_completed_event_id: 0,
                     },
                 }]

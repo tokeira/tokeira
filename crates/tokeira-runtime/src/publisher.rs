@@ -297,17 +297,25 @@ where
             > 0
     }
 
+    /// Resolve the child's CURRENT execution for a parent-close-policy op
+    /// (terminate / request-cancel). The `first_run_id` recorded at initiation
+    /// is the lineage anchor, NOT the target run: a child that continued-as-new
+    /// must have its LATEST generation terminated/cancelled, so resolution keys
+    /// on the workflow id's current execution rather than the started run
+    /// (v1.31.0 targets `{WorkflowId}` with `FirstExecutionRunId` as an
+    /// across-runs guard, transfer_queue_active_task_executor.go:1878-1883;
+    /// TestChildWorkflowWithContinueAsNewParentTerminate).
     async fn resolve_child_run_key(
         &self,
         namespace_id: NamespaceId,
         child_workflow_id: &WorkflowId,
-        child_run_id: RunId,
+        _first_run_id: RunId,
     ) -> Result<Option<RunKey>> {
         self.repo
             .resolve_execution(&ExecutionRef {
                 namespace_id,
                 workflow_id: child_workflow_id.clone(),
-                run_id: Some(child_run_id),
+                run_id: None,
             })
             .await
     }

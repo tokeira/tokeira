@@ -350,24 +350,20 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
         })
         .await?;
 
+    // v1.31.0 cron closes the run with its real outcome — `WorkflowExecutionCompleted`
+    // carrying `new_execution_run_id` — not a `WorkflowExecutionContinuedAsNew`. The
+    // delayed cron backoff now lives on the successor's start event, not the close.
     let history = store.read_history(predecessor.run_key, 0, 16).await?;
     let successor_run_id = history
         .iter()
         .find_map(|event| match &event.kind {
-            HistoryEventKind::WorkflowExecutionContinuedAsNew {
-                new_run_id,
-                initiator,
-                backoff_start_interval,
-                cron_schedule,
+            HistoryEventKind::WorkflowExecutionCompleted {
+                new_execution_run_id: Some(new_run_id),
                 ..
-            } if *initiator == tokeira_kernel::ContinueAsNewInitiator::CronSchedule => {
-                assert_eq!(*backoff_start_interval, Some(Duration::seconds(40)));
-                assert_eq!(cron_schedule.as_deref(), Some("* * * * *"));
-                Some(*new_run_id)
-            }
+            } => Some(*new_run_id),
             _ => None,
         })
-        .expect("cron completion should author a continue-as-new successor event");
+        .expect("cron completion should close as Completed naming the successor run");
     let successor_key = RunKey::derive(namespace_id, &workflow_id, successor_run_id);
 
     let successor = wait_for_existing_run(&store, successor_key).await?;
@@ -566,21 +562,17 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
         })
         .await?;
 
+    // The reloaded runtime must close the cron run with its real outcome
+    // (`WorkflowExecutionCompleted` naming the successor), matching v1.31.0's
+    // model rather than authoring a `WorkflowExecutionContinuedAsNew`.
     let history = store.read_history(predecessor.run_key, 0, 16).await?;
     let successor_run_id = history
         .iter()
         .find_map(|event| match &event.kind {
-            HistoryEventKind::WorkflowExecutionContinuedAsNew {
-                new_run_id,
-                initiator,
-                backoff_start_interval,
-                cron_schedule,
+            HistoryEventKind::WorkflowExecutionCompleted {
+                new_execution_run_id: Some(new_run_id),
                 ..
-            } if *initiator == tokeira_kernel::ContinueAsNewInitiator::CronSchedule => {
-                assert_eq!(*backoff_start_interval, Some(Duration::seconds(40)));
-                assert_eq!(cron_schedule.as_deref(), Some("* * * * *"));
-                Some(*new_run_id)
-            }
+            } => Some(*new_run_id),
             _ => None,
         })
         .expect("cron completion should author a successor after runtime reload");

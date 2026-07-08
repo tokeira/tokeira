@@ -474,11 +474,13 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
         HistoryEventKind::WorkflowExecutionCompleted {
             workflow_task_completed_event_id,
             result,
+            new_execution_run_id,
         } => {
             Attributes::WorkflowExecutionCompletedEventAttributes(
                 history::WorkflowExecutionCompletedEventAttributes {
                     result: Some(payloads_from_domain(result)),
                     workflow_task_completed_event_id: *workflow_task_completed_event_id,
+                    new_execution_run_id: opt_run_id(new_execution_run_id),
                     ..Default::default()
                 },
             )
@@ -1917,6 +1919,7 @@ mod tests {
                 HistoryEventKind::WorkflowExecutionCompleted {
                     workflow_task_completed_event_id: 4,
                     result: r,
+                    new_execution_run_id: None,
                 }
             }),
             (arb_failure_payload(), arb_retry_state(), 0u32..5).prop_map(|(failure, rs, att)| {

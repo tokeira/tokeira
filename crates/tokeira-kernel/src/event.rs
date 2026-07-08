@@ -569,6 +569,15 @@ pub enum HistoryEventKind {
     WorkflowExecutionCompleted {
         workflow_task_completed_event_id: i64,
         result: Payloads,
+        /// Run ID of the cron successor when this completed run has a cron
+        /// schedule; `None` for a plain completion. Mirrors the field on
+        /// `WorkflowExecutionFailed`/`TimedOut` and the proto's
+        /// `new_execution_run_id` (`WorkflowExecutionCompletedEventAttributes`;
+        /// cron closes with the real outcome event carrying the successor,
+        /// `workflow_task_completed_handler.go:730-738 @ v1.31.0`, not
+        /// ContinueAsNew).
+        #[serde(default)]
+        new_execution_run_id: Option<RunId>,
     },
     /// The workflow failed with an application-level error.
     WorkflowExecutionFailed {

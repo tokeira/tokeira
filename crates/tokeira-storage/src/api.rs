@@ -769,6 +769,9 @@ pub struct WorkflowTimeoutSweepEntry {
     pub workflow_run_timeout: Option<time::Duration>,
     /// When this run started.
     pub started_at: OffsetDateTime,
+    /// First-workflow-task backoff, so the run-timeout anchor
+    /// (`started_at + workflow_start_delay`) survives shard recovery.
+    pub workflow_start_delay: Option<time::Duration>,
     /// When the first run in the chain started.
     pub first_run_started_at: Option<OffsetDateTime>,
     /// Whether the run has a retry policy configured.

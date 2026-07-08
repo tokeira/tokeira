@@ -488,17 +488,56 @@ pub fn compute_next_times(
 /// (`common/util.go:550 @ v1.31.0`). Tokeira uses the same observable shape by
 /// feeding this delay into the existing durable delayed-start timer path.
 pub fn cron_initial_backoff(cron: &str, now: OffsetDateTime) -> Result<Duration, ScheduleError> {
+    // A brand-new cron start schedules from `now` itself — the scheduled anchor and
+    // the reference clock coincide.
+    cron_backoff_for_next_schedule(cron, now, now)
+}
+
+/// Backoff from `now` to the next cron fire, anchored on `scheduled_time`.
+///
+/// Mirrors v1.31.0 `GetBackoffForNextSchedule` (`common/backoff/cron.go`): starting
+/// from the closing run's scheduled (execution) time, advance the schedule until the
+/// first fire strictly after `now`, then round the remaining interval UP to whole
+/// seconds. Anchoring on `scheduled_time` (rather than `now + interval`) keeps a run
+/// that outlived one or more intervals — e.g. a cron run that hit its run timeout —
+/// aligned to the schedule's phase instead of drifting by the run's lifetime.
+pub fn cron_backoff_for_next_schedule(
+    cron: &str,
+    scheduled_time: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<Duration, ScheduleError> {
+    let next = if now < scheduled_time {
+        scheduled_time
+    } else {
+        let mut candidate = cron_next(cron, scheduled_time)?;
+        while candidate < now {
+            candidate = cron_next(cron, candidate)?;
+        }
+        candidate
+    };
+    // roundedInterval := time.Second * Ceil(interval.Seconds()), clamped non-negative.
+    let secs = (next - now).as_seconds_f64().ceil() as i64;
+    Ok(Duration::seconds(secs.max(0)))
+}
+
+/// The next scheduled fire strictly after `t`, mirroring robfig's `Schedule.Next`.
+///
+/// `@every <duration>` drops the sub-second remainder of `t` and adds the interval
+/// (robfig `ConstantDelaySchedule.Next`); standard cron advances to the next whole
+/// minute after `t` and scans forward for the first calendar match.
+fn cron_next(cron: &str, t: OffsetDateTime) -> Result<OffsetDateTime, ScheduleError> {
     if let Some(interval) = parse_every_descriptor(cron)? {
-        return Ok(interval);
+        let floored = t - Duration::nanoseconds(i64::from(t.nanosecond()));
+        return Ok(floored + interval);
     }
     let spec = compile_standard_cron(cron)?;
-    let next_minute = now.unix_timestamp() - i64::from(now.second()) + 60;
+    let next_minute = t.unix_timestamp() - i64::from(t.second()) + 60;
     let mut candidate = OffsetDateTime::from_unix_timestamp(next_minute)
         .map_err(|_| ScheduleError::InvalidArgument("invalid CronSchedule.".to_string()))?;
-    let end = now + Duration::days(366);
+    let end = t + Duration::days(366);
     while candidate <= end {
         if calendar_matches(&spec, candidate) {
-            return Ok(candidate - now);
+            return Ok(candidate);
         }
         candidate += Duration::minutes(1);
     }
@@ -1547,6 +1586,49 @@ mod tests {
         assert_eq!(
             cron_initial_backoff("@every 1h30m", now).unwrap(),
             Duration::minutes(90)
+        );
+    }
+
+    #[test]
+    fn cron_backoff_anchors_on_scheduled_time_after_a_long_run() {
+        // v1.31.0 `GetBackoffForNextSchedule` anchors on the closing run's scheduled
+        // time and advances the schedule past `now`, so a run that outlived one or
+        // more intervals continues on the schedule's phase rather than `now + interval`.
+        // A minute-aligned scheduled instant, so calendar-cron boundaries fall on
+        // whole minutes from it.
+        let scheduled = OffsetDateTime::from_unix_timestamp(1_700_000_040).unwrap();
+        // A run that closed 5s after it was scheduled (a cron run that hit a 5s run
+        // timeout) targets the next `@every 3s` boundary — +6 — giving a 1s backoff.
+        assert_eq!(
+            cron_backoff_for_next_schedule(
+                "@every 3s",
+                scheduled,
+                scheduled + Duration::seconds(5),
+            )
+            .unwrap(),
+            Duration::seconds(1)
+        );
+        // A run that closed promptly still targets the next boundary — +3 — with the
+        // remaining sub-interval rounded UP to a whole second.
+        assert_eq!(
+            cron_backoff_for_next_schedule(
+                "@every 3s",
+                scheduled,
+                scheduled + Duration::milliseconds(400),
+            )
+            .unwrap(),
+            Duration::seconds(3)
+        );
+        // Calendar crons anchor the same way: a run scheduled on a minute boundary
+        // that ran 90s lands on the boundary two minutes on (+120), a 30s backoff.
+        assert_eq!(
+            cron_backoff_for_next_schedule(
+                "* * * * *",
+                scheduled,
+                scheduled + Duration::seconds(90),
+            )
+            .unwrap(),
+            Duration::seconds(30)
         );
     }
 

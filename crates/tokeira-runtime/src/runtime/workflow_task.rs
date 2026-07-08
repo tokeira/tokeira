@@ -504,6 +504,15 @@ where
             Some(RetryContinuation::Retry { new_run_id }) => Some(*new_run_id),
             _ => None,
         };
+        // A cron completion/failure closes with its real outcome carrying this
+        // successor id; the runtime starts the cron successor after the close
+        // commits (the same derived-effect posture as the retry successor).
+        let cron_successor = cron_continuation
+            .as_ref()
+            .map(|cron| (cron.new_run_id, cron.cron_schedule.clone(), cron.input.clone()));
+        // Anchor the cron backoff on the completion time (`req.now`), captured before
+        // `req` moves into the command below.
+        let completion_now = req.now;
         let command = match (retry_continuation, cron_continuation) {
             (Some(retry_continuation), _) => Command::WorkflowTaskCompletedWithRetry {
                 request: req,
@@ -716,6 +725,20 @@ where
                 "failed to start workflow retry successor",
             );
         }
+        // Start the cron successor once the predecessor's real-outcome close is
+        // durable — same derived-effect posture as retry.
+        if let (Ok(CommitResult::Applied { .. }), Some((new_run_id, cron_schedule, input))) =
+            (&result, cron_successor)
+            && let Err(error) = self
+                .start_cron_successor(run_key, new_run_id, cron_schedule, input, completion_now)
+                .await
+        {
+            tracing::error!(
+                ?error,
+                predecessor_run_key = ?run_key,
+                "failed to start workflow cron successor",
+            );
+        }
         result
     }
 
@@ -918,6 +941,7 @@ where
                         workflow_execution_timeout: new_state.workflow_execution_timeout,
                         workflow_run_timeout: new_state.workflow_run_timeout,
                         started_at: new_state.started_at,
+                        workflow_start_delay: new_state.workflow_start_delay,
                         first_run_started_at: new_state.first_run_started_at,
                         has_retry_policy: new_state.retry_policy.is_some(),
                     });
@@ -932,6 +956,76 @@ where
                 existing_run_key, ..
             } => Err(anyhow!(
                 "retry successor current-execution conflict: {existing_run_key:?}"
+            )),
+        }
+    }
+
+    /// Start the cron successor after a cron run's real-outcome close commits
+    /// (complete / fail). The successor carries the predecessor's failure (if it
+    /// failed) as `continued_failure` and the last SUCCESSFUL completion result:
+    /// a completion sets `close_result`, so it becomes the successor's
+    /// `last_completion_result`; a failure leaves `close_result` empty, so the
+    /// previously-carried result flows through instead. Derived-effect posture:
+    /// the close stands even if the successor start fails; `cron-successor:*` is
+    /// a deterministic request id so a re-drive dedupes.
+    async fn start_cron_successor(
+        &self,
+        predecessor_run_key: RunKey,
+        new_run_id: RunId,
+        cron_schedule: String,
+        input: Payloads,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let LoadedRun::Existing(state) = self.repo.load_run(predecessor_run_key).await? else {
+            return Err(anyhow!("predecessor run not found for cron successor"));
+        };
+        let continued_failure = state.close_failure.clone();
+        let last_completion_result = state
+            .close_result
+            .clone()
+            .or_else(|| state.last_completion_result.clone());
+        let start_request = build_cron_successor_start(
+            &state,
+            cron_schedule,
+            input,
+            new_run_id,
+            now,
+            OffsetDateTime::now_utc(),
+            continued_failure,
+            last_completion_result,
+        )
+        .map_err(|error| anyhow!("invalid cron schedule on continuation: {error:?}"))?;
+        let successor_run_key = start_request.run_key;
+        let shard_id = self.shard_id_for(successor_run_key).await;
+        match self
+            .submit(successor_run_key, Command::Start(start_request))
+            .await?
+        {
+            CommitResult::Applied { new_state } => {
+                if new_state.workflow_execution_timeout.is_some()
+                    || new_state.workflow_run_timeout.is_some()
+                {
+                    self.workflow_timeout_tracking.insert(WorkflowTimeoutEntry {
+                        run_key: new_state.run_key,
+                        shard_id,
+                        workflow_execution_timeout: new_state.workflow_execution_timeout,
+                        workflow_run_timeout: new_state.workflow_run_timeout,
+                        started_at: new_state.started_at,
+                        workflow_start_delay: new_state.workflow_start_delay,
+                        first_run_started_at: new_state.first_run_started_at,
+                        has_retry_policy: new_state.retry_policy.is_some(),
+                    });
+                }
+                Ok(())
+            }
+            CommitResult::Duplicate => Ok(()),
+            CommitResult::Conflict { reason } => {
+                Err(anyhow!("cron successor start conflicted: {reason}"))
+            }
+            CommitResult::CurrentExecutionConflict {
+                existing_run_key, ..
+            } => Err(anyhow!(
+                "cron successor current-execution conflict: {existing_run_key:?}"
             )),
         }
     }
@@ -1318,6 +1412,117 @@ pub(crate) fn build_retry_successor_start(
         cron_schedule: None,
         reserved_poller_identity: None,
     }
+}
+
+/// The `Failure` payload a cron run's timeout hands to its successor, so the
+/// SDK's `GetLastError` renders `"workflow timeout (type: StartToClose)"`. A
+/// workflow run timeout surfaces to the workflow-failure layer as
+/// `TIMEOUT_TYPE_START_TO_CLOSE` (retry.go / mutable_state_impl.go @ v1.31.0).
+pub(crate) fn workflow_run_timeout_failure() -> tokeira_types::Payload {
+    use tokeira_proto::failure::{Failure, TimeoutFailureInfo, failure::FailureInfo};
+    tokeira_proto::conversions::common::failure_to_payload(&Failure {
+        message: "workflow timeout".to_string(),
+        failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+            timeout_type: tokeira_proto::enums::TimeoutType::StartToClose as i32,
+            ..Default::default()
+        })),
+        ..Default::default()
+    })
+}
+
+/// Build the cron successor start after a cron run closes (complete / fail /
+/// run-timeout). The successor is a SEPARATE run — v1.31.0 records the real
+/// outcome event on the predecessor with `NewExecutionRunId` and starts the
+/// successor via `handleCron` (workflow_task_completed_handler.go:730-738 +
+/// SetupNewWorkflowForRetryOrCron @ v1.31.0), NOT a ContinueAsNew. Its first WFT
+/// is delayed to the next cron trigger, its `Initiator` is `CRON_SCHEDULE`, it
+/// inherits the chain deadline + parent linkage, and it carries the caller-
+/// supplied `continued_failure` (the run's failure / timeout, so `GetLastError`
+/// reports it) and `last_completion_result` (the last SUCCESSFUL result).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_cron_successor_start(
+    state: &tokeira_kernel::WorkflowState,
+    cron_schedule: String,
+    input: Payloads,
+    new_run_id: RunId,
+    now: OffsetDateTime,
+    execution_started_at: OffsetDateTime,
+    continued_failure: Option<tokeira_types::Payload>,
+    last_completion_result: Option<Payloads>,
+) -> Result<StartRequest, crate::schedule::ScheduleError> {
+    // v1.31.0 anchors the next cron fire on the CLOSING run's scheduled (execution)
+    // time and rounds up to the next whole second, so a run that outlived one or more
+    // intervals still lands on the schedule's phase rather than `now + interval`
+    // (`common/backoff/cron.go` `GetBackoffForNextSchedule`).
+    let scheduled_time = state.started_at + state.workflow_start_delay.unwrap_or(Duration::ZERO);
+    let backoff = crate::schedule::cron_backoff_for_next_schedule(&cron_schedule, scheduled_time, now)?;
+    let successor_run_key = RunKey::derive(state.namespace_id, &state.workflow_id, new_run_id);
+    let first_execution_run_id = Some(state.first_execution_run_id.unwrap_or(state.run_id));
+    let first_run_started_at = Some(state.first_run_started_at.unwrap_or(state.started_at));
+    let (root_workflow_id, root_run_id) = if state.parent_run_key.is_some() {
+        (state.root_workflow_id.clone(), state.root_run_id)
+    } else {
+        (None, None)
+    };
+    Ok(StartRequest {
+        run_key: successor_run_key,
+        namespace_id: state.namespace_id,
+        workflow_id: state.workflow_id.clone(),
+        run_id: new_run_id,
+        workflow_type: state.workflow_type.clone(),
+        task_queue: state.task_queue.clone(),
+        deployment: state.deployment.clone(),
+        build_id: state.build_id.clone(),
+        versioning_override: state.versioning_override().cloned(),
+        workflow_start_delay: Some(backoff),
+        completion_callbacks: state.completion_callbacks.clone(),
+        user_metadata: state.user_metadata.clone(),
+        links: Vec::new(),
+        on_conflict_options: None,
+        priority: state.priority.clone(),
+        input,
+        header: None,
+        memo: state.memo.clone(),
+        search_attributes: state.search_attributes.clone(),
+        workflow_execution_timeout: state.workflow_execution_timeout,
+        workflow_run_timeout: state.workflow_run_timeout,
+        workflow_task_timeout: state.workflow_task_timeout,
+        retry_policy: state.retry_policy.clone(),
+        conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+        reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+        initiator: Some(tokeira_kernel::ContinueAsNewInitiator::CronSchedule),
+        attempt: 1,
+        continued_execution_run_id: Some(state.run_id),
+        first_execution_run_id,
+        parent_run_key: state.parent_run_key,
+        parent_workflow_id: state.parent_workflow_id.clone(),
+        parent_run_id: state.parent_run_id,
+        parent_namespace_id: state.parent_namespace_id,
+        parent_namespace_name: state.parent_namespace_name.clone(),
+        parent_initiated_event_id: state.parent_initiated_event_id,
+        root_workflow_id,
+        root_run_id,
+        original_execution_run_id: Some(state.original_execution_run_id.unwrap_or(state.run_id)),
+        continued_failure,
+        last_completion_result,
+        first_run_started_at,
+        request: RequestContext {
+            request_id: tokeira_types::RequestId(format!(
+                "cron-successor:{}:{}",
+                state.run_id.0, new_run_id.0
+            )),
+            caller_identity: None,
+            received_at: execution_started_at,
+        },
+        // The successor's `WorkflowExecutionStarted` time — and thus its start-delay
+        // timer anchor — is the caller-provided execution start (wall-clock for a
+        // completion successor; the precise timeout deadline for a timeout successor,
+        // so the next fire lands on the schedule's phase free of scan jitter).
+        now: execution_started_at,
+        client_cron_schedule: None,
+        cron_schedule: Some(cron_schedule),
+        reserved_poller_identity: None,
+    })
 }
 
 #[cfg(test)]

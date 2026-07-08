@@ -156,6 +156,7 @@ where
             workflow_execution_timeout: entry.workflow_execution_timeout,
             workflow_run_timeout: entry.workflow_run_timeout,
             started_at: entry.started_at,
+            workflow_start_delay: entry.workflow_start_delay,
             first_run_started_at: entry.first_run_started_at,
             has_retry_policy: entry.has_retry_policy,
         });

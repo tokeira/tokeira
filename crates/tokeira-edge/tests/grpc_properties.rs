@@ -1101,6 +1101,7 @@ fn arb_summary() -> impl Strategy<Value = WorkflowExecutionSummary> {
                 status,
                 start_time: start_time
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
+                execution_time: None,
                 close_time: close_time
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
                 history_length: 0,

@@ -110,6 +110,7 @@ where
                 workflow_execution_timeout: request.workflow_execution_timeout,
                 workflow_run_timeout: request.workflow_run_timeout,
                 started_at: request.now,
+                workflow_start_delay: request.workflow_start_delay,
                 first_run_started_at: request.first_run_started_at,
                 has_retry_policy: request.retry_policy.is_some(),
             });

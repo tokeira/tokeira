@@ -22,6 +22,10 @@ pub struct WorkflowExecutionSummary {
     pub task_queue: String,
     pub status: ExecutionStatus,
     pub start_time: Option<OffsetDateTime>,
+    /// Scheduled first-workflow-task time (`start_time + FirstWorkflowTaskBackoff`);
+    /// distinct from `start_time` for cron/delayed/retry starts (v1.31.0
+    /// `WorkflowExecutionInfo.execution_time`).
+    pub execution_time: Option<OffsetDateTime>,
     pub close_time: Option<OffsetDateTime>,
     pub history_length: i64,
     pub state_transition_count: i64,

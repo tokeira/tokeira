@@ -289,6 +289,7 @@ fn map_summary(row: crate::types::ExecutionRow) -> WorkflowExecutionSummary {
         task_queue: row.task_queue.0,
         status: row.status,
         start_time: Some(row.start_time),
+        execution_time: row.execution_time,
         close_time: row.close_time,
         history_length: row.history_length,
         state_transition_count: row.state_transition_count,

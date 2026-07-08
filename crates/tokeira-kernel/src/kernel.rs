@@ -3623,48 +3623,6 @@ fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
     Ok(state)
 }
 
-/// Process a single workflow command produced by the worker during
-/// WFT completion. Each command maps to one or more history events
-/// and side-effect ops. Returns `true` if the command closed the
-/// run, which tells the caller to reject any subsequent commands
-/// in the batch.
-fn emit_cron_continue_as_new(
-    builder: &mut TransitionBuilder,
-    workflow_task_completed_event_id: i64,
-    cron: &CronContinuation,
-    failure: Option<tokeira_types::Payload>,
-    last_completion_result: Option<tokeira_types::Payloads>,
-) {
-    // Temporal creates cron successors through the continue-as-new path and
-    // records the first-WFT backoff on that successor start
-    // (`service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:1383`,
-    // `service/history/workflow/mutable_state_impl.go:2601 @ v1.31.0`).
-    // Runtime computes the calendar delay; the kernel makes the successor
-    // identity and delay authoritative by writing them into history.
-    builder.emit(HistoryEventKind::WorkflowExecutionContinuedAsNew {
-        workflow_task_completed_event_id,
-        new_run_id: cron.new_run_id,
-        workflow_type: builder.state.workflow_type.clone(),
-        task_queue: builder.state.task_queue.clone(),
-        input: cron.input.clone(),
-        memo: builder.state.memo.clone(),
-        search_attributes: builder.state.search_attributes.clone(),
-        workflow_execution_timeout: builder.state.workflow_execution_timeout,
-        workflow_run_timeout: builder.state.workflow_run_timeout,
-        workflow_task_timeout: builder.state.workflow_task_timeout,
-        retry_policy: builder.state.retry_policy.clone(),
-        initiator: ContinueAsNewInitiator::CronSchedule,
-        failure,
-        last_completion_result,
-        backoff_start_interval: Some(cron.first_workflow_task_backoff),
-        cron_schedule: Some(cron.cron_schedule.clone()),
-        // Cron successors are server-initiated (no worker command re-supplying
-        // the header); a stored per-run header is not tracked, so none flows.
-        header: None,
-    });
-    builder.close(ExecutionStatus::ContinuedAsNew);
-}
-
 fn apply_workflow_command(
     builder: &mut TransitionBuilder,
     command: WorkflowCommand,
@@ -3842,23 +3800,17 @@ fn apply_workflow_command(
                     message: None,
                 });
             }
-            if let Some(cron) = cron_continuation {
-                builder.state.close_result = Some(result.clone());
-                emit_cron_continue_as_new(
-                    builder,
-                    workflow_task_completed_event_id,
-                    cron,
-                    None,
-                    Some(result),
-                );
-            } else {
-                builder.state.close_result = Some(result.clone());
-                builder.emit(HistoryEventKind::WorkflowExecutionCompleted {
-                    workflow_task_completed_event_id,
-                    result,
-                });
-                builder.close(ExecutionStatus::Completed);
-            }
+            // A cron run closes with its REAL outcome carrying the successor
+            // run id (`WorkflowExecutionCompleted.NewExecutionRunId`), NOT a
+            // ContinueAsNew — the successor is a separate run the runtime starts
+            // post-commit (workflow_task_completed_handler.go:730-738 @ v1.31.0).
+            builder.state.close_result = Some(result.clone());
+            builder.emit(HistoryEventKind::WorkflowExecutionCompleted {
+                workflow_task_completed_event_id,
+                result,
+                new_execution_run_id: cron_continuation.map(|cron| cron.new_run_id),
+            });
+            builder.close(ExecutionStatus::Completed);
             builder.apply_parent_close_policy();
             Ok(true)
         }
@@ -3903,20 +3855,21 @@ fn apply_workflow_command(
                 });
                 builder.close(ExecutionStatus::Failed);
             } else if let Some(cron) = cron_continuation {
-                // A failed cron run carries its failure onto the successor while
-                // preserving the last SUCCESSFUL completion result — v1.31.0's
-                // cron ContinueAsNew records `LastCompletionResult` (the last
-                // success, carried forward) and `Failure` (this run's failure)
-                // independently (mutable_state_impl.go:2560-2601 @ v1.31.0;
+                // A failed cron run closes as WorkflowExecutionFailed carrying the
+                // successor run id (NOT ContinueAsNew); the successor is started
+                // separately by the runtime and carries this failure as its
+                // continued_failure + the last SUCCESSFUL completion result
+                // (workflow_task_completed_handler.go:788,handleCron @ v1.31.0;
                 // TestCronWorkflowCompletionStates case 3 reads both).
-                let carried_result = builder.state.last_completion_result.clone();
-                emit_cron_continue_as_new(
-                    builder,
+                builder.state.close_failure = Some(failure.clone());
+                builder.emit(HistoryEventKind::WorkflowExecutionFailed {
                     workflow_task_completed_event_id,
-                    cron,
-                    Some(failure),
-                    carried_result,
-                );
+                    failure,
+                    retry_state: RetryState::InProgress,
+                    attempt,
+                    new_execution_run_id: Some(cron.new_run_id),
+                });
+                builder.close(ExecutionStatus::Failed);
             } else {
                 // Terminal failure with neither retry nor cron. A run with a
                 // retry policy but no runtime-supplied continuation is

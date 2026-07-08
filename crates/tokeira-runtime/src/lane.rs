@@ -645,6 +645,7 @@ where
                                             .workflow_execution_timeout,
                                         workflow_run_timeout: successor_state.workflow_run_timeout,
                                         started_at: successor_state.started_at,
+                                        workflow_start_delay: successor_state.workflow_start_delay,
                                         first_run_started_at: successor_state.first_run_started_at,
                                         has_retry_policy: successor_state.retry_policy.is_some(),
                                     },
@@ -1092,6 +1093,8 @@ where
                                                             workflow_run_timeout: new_state
                                                                 .workflow_run_timeout,
                                                             started_at: new_state.started_at,
+                                                            workflow_start_delay: new_state
+                                                                .workflow_start_delay,
                                                             first_run_started_at: new_state
                                                                 .first_run_started_at,
                                                             has_retry_policy: new_state
@@ -1604,7 +1607,13 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
 fn close_continues_into_successor(history_events: &[HistoryEvent]) -> bool {
     history_events.iter().any(|event| match &event.kind {
         HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => true,
-        HistoryEventKind::WorkflowExecutionFailed {
+        // A cron run closes with its real outcome (Completed/Failed/TimedOut)
+        // carrying the successor run id, not a ContinueAsNew.
+        HistoryEventKind::WorkflowExecutionCompleted {
+            new_execution_run_id,
+            ..
+        }
+        | HistoryEventKind::WorkflowExecutionFailed {
             new_execution_run_id,
             ..
         }
@@ -1823,6 +1832,7 @@ mod tests {
                 tokeira_kernel::HistoryEventKind::WorkflowExecutionCompleted {
                     workflow_task_completed_event_id: 0,
                     result: Payloads::default(),
+                    new_execution_run_id: None,
                 }
             } else {
                 tokeira_kernel::HistoryEventKind::WorkflowExecutionSignaled {
@@ -2306,6 +2316,7 @@ mod tests {
                     kind: tokeira_kernel::HistoryEventKind::WorkflowExecutionCompleted {
                         result: Payloads::default(),
                         workflow_task_completed_event_id: 0,
+                        new_execution_run_id: None,
                     },
                 }]
             };

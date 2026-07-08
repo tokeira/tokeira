@@ -5075,7 +5075,7 @@ fn workflow_execution_info_from_summary(
         task_queue: value.task_queue,
         status: execution_status_to_proto(value.status),
         start_time: value.start_time.map(to_proto_timestamp),
-        execution_time: None,
+        execution_time: value.execution_time.map(to_proto_timestamp),
         close_time: value.close_time.map(to_proto_timestamp),
         history_length: value.history_length,
         state_transition_count: value.state_transition_count,

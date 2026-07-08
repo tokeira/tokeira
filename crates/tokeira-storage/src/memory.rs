@@ -1021,6 +1021,7 @@ impl RunRepository for InMemoryStore {
                 workflow_execution_timeout: state.workflow_execution_timeout,
                 workflow_run_timeout: state.workflow_run_timeout,
                 started_at: state.started_at,
+                workflow_start_delay: state.workflow_start_delay,
                 first_run_started_at: state.first_run_started_at,
                 has_retry_policy: state.retry_policy.is_some(),
             });

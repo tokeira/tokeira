@@ -882,6 +882,8 @@ where
                                             backoff_start_interval,
                                             cron_schedule,
                                             header,
+                                            initiator,
+                                            last_completion_result,
                                             ..
                                         } => Some((
                                             *new_run_id,
@@ -897,6 +899,8 @@ where
                                             *backoff_start_interval,
                                             cron_schedule.clone(),
                                             header.clone(),
+                                            *initiator,
+                                            last_completion_result.clone(),
                                         )),
                                         _ => None,
                                     });
@@ -914,6 +918,8 @@ where
                                     backoff_start_interval,
                                     cron_schedule,
                                     header,
+                                    initiator,
+                                    successor_last_completion_result,
                                 )) = successor_event
                                 {
                                     // Carry the chain's origin forward: the
@@ -992,6 +998,11 @@ where
                                             tokeira_kernel::WorkflowIdConflictPolicy::Fail,
                                         reuse_policy:
                                             tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+                                        // The successor's Initiator is carried from
+                                        // its close event: WORKFLOW for an explicit
+                                        // continue-as-new, CRON_SCHEDULE for a cron
+                                        // restart.
+                                        initiator: Some(initiator),
                                         attempt: 1,
                                         continued_execution_run_id: Some(new_state.run_id),
                                         first_execution_run_id,
@@ -1020,7 +1031,13 @@ where
                                                 .unwrap_or(new_state.run_id),
                                         ),
                                         continued_failure: new_state.close_failure.clone(),
-                                        last_completion_result: new_state.close_result.clone(),
+                                        // Cron carries the last SUCCESSFUL result
+                                        // forward even across a failed run; the
+                                        // authoritative value is on the CaN event
+                                        // (this run's result on complete, the
+                                        // carried-forward result on failure), not
+                                        // `close_result` (None on failure).
+                                        last_completion_result: successor_last_completion_result,
                                         first_run_started_at,
                                         request: tokeira_types::RequestContext {
                                             // Deterministic request id keyed on

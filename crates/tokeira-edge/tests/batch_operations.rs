@@ -436,6 +436,7 @@ async fn seed_workflow(
     let queue = TaskQueueName("queue".to_string());
     runtime
         .start_workflow_with_policy(StartRequest {
+            initiator: None,
             run_key,
             namespace_id,
             workflow_id: WorkflowId(workflow_id.to_string()),

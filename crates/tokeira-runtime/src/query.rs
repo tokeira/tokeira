@@ -97,6 +97,7 @@ mod tests {
     fn start_request(ns: NamespaceId, wf_id: &str) -> StartRequest {
         let run_id = RunId::new();
         StartRequest {
+            initiator: None,
             run_key: RunKey::new(),
             namespace_id: ns,
             workflow_id: WorkflowId(wf_id.into()),

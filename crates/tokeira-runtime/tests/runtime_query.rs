@@ -351,6 +351,7 @@ async fn start_workflow(
     let run_id = tokeira_types::RunId::new();
     let result = runtime
         .start_workflow(StartRequest {
+            initiator: None,
             run_key: tokeira_types::RunKey::new(),
             namespace_id,
             workflow_id,

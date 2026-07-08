@@ -3178,6 +3178,7 @@ mod tests {
                 1,
                 fixed_now(),
                 HistoryEventKind::WorkflowExecutionStarted {
+                    initiator: None,
                     workflow_type: base_state.workflow_type.clone(),
                     task_queue: base_state.task_queue.clone(),
                     input: tokeira_types::Payloads::default(),
@@ -3325,6 +3326,7 @@ mod tests {
                 1,
                 fixed_now(),
                 HistoryEventKind::WorkflowExecutionStarted {
+                    initiator: None,
                     workflow_type: base_state.workflow_type.clone(),
                     task_queue: base_state.task_queue.clone(),
                     input: tokeira_types::Payloads::default(),
@@ -3396,6 +3398,7 @@ mod tests {
                     1,
                     fixed_now(),
                     HistoryEventKind::WorkflowExecutionStarted {
+                        initiator: None,
                         workflow_type: base_state.workflow_type.clone(),
                         task_queue: base_state.task_queue.clone(),
                         input: tokeira_types::Payloads::default(),
@@ -3502,6 +3505,7 @@ mod tests {
                         1,
                         fixed_now(),
                         HistoryEventKind::WorkflowExecutionStarted {
+                            initiator: None,
                             workflow_type: base_state.workflow_type.clone(),
                             task_queue: base_state.task_queue.clone(),
                             input: tokeira_types::Payloads::default(),

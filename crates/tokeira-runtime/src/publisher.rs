@@ -394,6 +394,8 @@ where
             retry_policy,
             conflict_policy,
             reuse_policy: effective_reuse_policy,
+            // A child start is a fresh execution, not a CaN/retry/cron successor.
+            initiator: None,
             attempt: 1,
             continued_execution_run_id: None,
             first_execution_run_id: None,

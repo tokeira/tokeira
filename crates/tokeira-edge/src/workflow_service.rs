@@ -2051,6 +2051,8 @@ impl WorkflowService {
             retry_policy: entry.action.start_workflow.retry_policy.clone(),
             conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
             reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            // A Schedule action starts a fresh execution (Initiator UNSPECIFIED).
+            initiator: None,
             deployment: None,
             build_id,
             versioning_override: None,
@@ -6151,6 +6153,7 @@ mod tests {
         let run_id = RunId::new();
         let result = runtime
             .start_workflow(StartRequest {
+                initiator: None,
                 run_key: RunKey::new(),
                 namespace_id,
                 workflow_id: workflow_id.clone(),

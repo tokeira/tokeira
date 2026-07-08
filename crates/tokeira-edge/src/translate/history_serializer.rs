@@ -399,6 +399,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             continued_execution_run_id,
             first_execution_run_id,
             retry_policy,
+            initiator,
             attempt,
             workflow_execution_timeout,
             workflow_run_timeout,
@@ -450,6 +451,11 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 first_execution_run_id: opt_run_id(first_execution_run_id),
                 cron_schedule: cron_schedule.clone().unwrap_or_default(),
                 retry_policy: retry_policy.as_ref().map(retry_policy_to_proto),
+                // None (fresh client start) → CONTINUE_AS_NEW_INITIATOR_UNSPECIFIED (0).
+                initiator: initiator
+                    .as_ref()
+                    .map(continue_as_new_initiator_i32)
+                    .unwrap_or_default(),
                 attempt: *attempt as i32,
                 workflow_execution_timeout: to_opt_proto_duration(*workflow_execution_timeout),
                 workflow_run_timeout: to_opt_proto_duration(*workflow_run_timeout),
@@ -1870,6 +1876,7 @@ mod tests {
                 .prop_map(
                     |(wt, tq, input, rid, cont, first, rp, att, wet, wrt, wtt)| {
                         HistoryEventKind::WorkflowExecutionStarted {
+                            initiator: None,
                             workflow_type: WorkflowType(wt),
                             task_queue: TaskQueueName(tq),
                             input,
@@ -2376,6 +2383,7 @@ mod tests {
             event_id: 1,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowExecutionStarted {
+                initiator: None,
                 workflow_type: WorkflowType("MyWorkflow".to_string()),
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
@@ -2465,6 +2473,7 @@ mod tests {
             event_id: 1,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowExecutionStarted {
+                initiator: None,
                 workflow_type: WorkflowType("MyWorkflow".to_string()),
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
@@ -2562,6 +2571,7 @@ mod tests {
             event_id: 1,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowExecutionStarted {
+                initiator: None,
                 workflow_type: WorkflowType("ScheduledWorkflow".to_string()),
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
@@ -2612,6 +2622,7 @@ mod tests {
             event_id: 1,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowExecutionStarted {
+                initiator: None,
                 workflow_type: WorkflowType("NormalWorkflow".to_string()),
                 task_queue: TaskQueueName("default".to_string()),
                 input: Payloads::default(),
@@ -3209,6 +3220,7 @@ mod tests {
             event_id: 1,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowExecutionStarted {
+                initiator: None,
                 workflow_type: WorkflowType("W".to_string()),
                 task_queue: TaskQueueName("q".to_string()),
                 input: Payloads::default(),

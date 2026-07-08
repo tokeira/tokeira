@@ -1158,6 +1158,8 @@ where
         retry_policy: entry.action.start_workflow.retry_policy.clone(),
         conflict_policy: WorkflowIdConflictPolicy::Fail,
         reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+        // A Schedule action starts a fresh execution (Initiator UNSPECIFIED).
+        initiator: None,
         deployment: None,
         build_id,
         versioning_override: None,

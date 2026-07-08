@@ -3018,6 +3018,7 @@ mod tests {
     ) -> StartRequest {
         let run_id = tokeira_types::RunId::new();
         StartRequest {
+            initiator: None,
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
             workflow_id: WorkflowId("workflow-timeout".to_string()),

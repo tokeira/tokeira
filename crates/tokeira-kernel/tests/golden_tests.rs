@@ -92,6 +92,7 @@ fn request_context(id: &str) -> RequestContext {
 fn make_start_request() -> StartRequest {
     let run_id = RunId::new();
     StartRequest {
+        initiator: None,
         run_key: RunKey::new(),
         namespace_id: NamespaceId::new(),
         workflow_id: WorkflowId("workflow".into()),
@@ -143,6 +144,7 @@ fn make_start_request() -> StartRequest {
 fn make_signal_with_start_request() -> SignalWithStartRequest {
     let start = make_start_request();
     SignalWithStartRequest {
+        initiator: None,
         run_key: start.run_key,
         namespace_id: start.namespace_id,
         workflow_id: start.workflow_id,
@@ -292,6 +294,7 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
             1,
             started_at,
             HistoryEventKind::WorkflowExecutionStarted {
+                initiator: None,
                 workflow_type: start.workflow_type.clone(),
                 task_queue: start.task_queue.clone(),
                 input: start.input.clone(),
@@ -388,6 +391,7 @@ fn replay_history_reconstructs_activity_and_timer_state() {
             1,
             t0,
             HistoryEventKind::WorkflowExecutionStarted {
+                initiator: None,
                 workflow_type: start.workflow_type.clone(),
                 task_queue: start.task_queue.clone(),
                 input: start.input.clone(),
@@ -483,6 +487,7 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
             1,
             t0,
             HistoryEventKind::WorkflowExecutionStarted {
+                initiator: None,
                 workflow_type: start.workflow_type.clone(),
                 task_queue: start.task_queue.clone(),
                 input: start.input.clone(),

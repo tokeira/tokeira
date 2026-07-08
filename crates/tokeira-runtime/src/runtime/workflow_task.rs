@@ -1281,6 +1281,9 @@ pub(crate) fn build_retry_successor_start(
         retry_policy: Some(policy.clone()),
         conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
         reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+        // The attempt-N+1 run was created by the workflow-retry chain, so its
+        // WorkflowExecutionStarted.Initiator is RETRY.
+        initiator: Some(tokeira_kernel::ContinueAsNewInitiator::Retry),
         attempt: state.attempt + 1,
         continued_execution_run_id: Some(state.run_id),
         first_execution_run_id,

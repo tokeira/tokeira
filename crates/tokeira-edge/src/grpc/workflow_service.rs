@@ -5363,6 +5363,7 @@ mod tests {
         run_id: RunId,
     ) {
         let start = StartRequest {
+            initiator: None,
             run_key,
             namespace_id: namespace_id_for("default"),
             workflow_id: WorkflowId("wf".to_string()),

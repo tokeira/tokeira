@@ -1397,6 +1397,7 @@ fn start_request(
 ) -> StartRequest {
     let run_id = RunId::new();
     StartRequest {
+        initiator: None,
         run_key: RunKey::new(),
         namespace_id,
         workflow_id,

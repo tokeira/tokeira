@@ -451,6 +451,10 @@ pub struct StartRequest {
     pub on_conflict_options: Option<OnConflictOptions>,
     /// Matching priority metadata for tasks derived from this workflow.
     pub priority: Option<Priority>,
+    /// Why this run was created — authored onto its
+    /// `WorkflowExecutionStarted.Initiator`. `None` for a fresh client start.
+    #[serde(default)]
+    pub initiator: Option<ContinueAsNewInitiator>,
     /// Current retry attempt number (1-based).
     pub attempt: u32,
     /// Run ID of the previous run if this is a continue-as-new
@@ -548,6 +552,8 @@ pub struct SignalWithStartRequest {
     pub user_metadata: Option<UserMetadata>,
     pub links: Vec<Link>,
     pub priority: Option<Priority>,
+    #[serde(default)]
+    pub initiator: Option<ContinueAsNewInitiator>,
     pub cron_schedule: Option<String>,
     pub attempt: u32,
     pub continued_execution_run_id: Option<RunId>,

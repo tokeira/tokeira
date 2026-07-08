@@ -492,6 +492,7 @@ impl BasicKernel {
             continued_execution_run_id: req.continued_execution_run_id,
             first_execution_run_id: req.first_execution_run_id,
             retry_policy: req.retry_policy,
+            initiator: req.initiator,
             attempt: req.attempt,
             workflow_execution_timeout: req.workflow_execution_timeout,
             workflow_run_timeout: req.workflow_run_timeout,
@@ -651,6 +652,7 @@ impl BasicKernel {
             continued_execution_run_id: req.continued_execution_run_id,
             first_execution_run_id: req.first_execution_run_id,
             retry_policy: req.retry_policy,
+            initiator: req.initiator,
             attempt: req.attempt,
             workflow_execution_timeout: req.workflow_execution_timeout,
             workflow_run_timeout: req.workflow_run_timeout,
@@ -3901,12 +3903,19 @@ fn apply_workflow_command(
                 });
                 builder.close(ExecutionStatus::Failed);
             } else if let Some(cron) = cron_continuation {
+                // A failed cron run carries its failure onto the successor while
+                // preserving the last SUCCESSFUL completion result — v1.31.0's
+                // cron ContinueAsNew records `LastCompletionResult` (the last
+                // success, carried forward) and `Failure` (this run's failure)
+                // independently (mutable_state_impl.go:2560-2601 @ v1.31.0;
+                // TestCronWorkflowCompletionStates case 3 reads both).
+                let carried_result = builder.state.last_completion_result.clone();
                 emit_cron_continue_as_new(
                     builder,
                     workflow_task_completed_event_id,
                     cron,
                     Some(failure),
-                    None,
+                    carried_result,
                 );
             } else {
                 // Terminal failure with neither retry nor cron. A run with a

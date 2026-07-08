@@ -746,6 +746,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                 let now = fixed_now();
                 let run_id = RunId::new();
                 StartRequest {
+                    initiator: None,
                     run_key: RunKey::new(),
                     namespace_id: NamespaceId::new(),
                     workflow_id: WorkflowId("workflow".into()),
@@ -2589,6 +2590,7 @@ proptest! {
             event_id: 1,
             happened_at: now,
             kind: HistoryEventKind::WorkflowExecutionStarted {
+                initiator: None,
                 workflow_type: WorkflowType("wf".to_string()),
                 task_queue: TaskQueueName("queue".to_string()),
                 input: Payloads::default(),

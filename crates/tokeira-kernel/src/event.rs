@@ -57,6 +57,12 @@ pub enum HistoryEventKind {
         continued_execution_run_id: Option<RunId>,
         first_execution_run_id: Option<RunId>,
         retry_policy: Option<RetryPolicy>,
+        /// Why this run was created: `None` for a fresh client start
+        /// (serializes to `CONTINUE_AS_NEW_INITIATOR_UNSPECIFIED`), else the
+        /// continue-as-new / retry / cron initiator carried from the successor's
+        /// close event onto its `WorkflowExecutionStarted.Initiator`.
+        #[serde(default)]
+        initiator: Option<ContinueAsNewInitiator>,
         attempt: u32,
         workflow_execution_timeout: Option<Duration>,
         workflow_run_timeout: Option<Duration>,

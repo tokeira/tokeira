@@ -1110,6 +1110,7 @@ fn start_request(
 ) -> StartRequest {
     let run_id = tokeira_types::RunId::new();
     StartRequest {
+        initiator: None,
         run_key: tokeira_types::RunKey::new(),
         namespace_id,
         workflow_id,
@@ -1169,6 +1170,7 @@ fn signal_with_start_request(
 ) -> SignalWithStartRequest {
     let start = start_request(namespace_id, workflow_id, request_id);
     SignalWithStartRequest {
+        initiator: None,
         run_key: start.run_key,
         namespace_id: start.namespace_id,
         workflow_id: start.workflow_id,

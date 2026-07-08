@@ -98,6 +98,15 @@ pub fn start_request(
         retry_policy: req.retry_policy,
         conflict_policy: req.conflict_policy,
         reuse_policy: req.reuse_policy,
+        // A fresh client start is UNSPECIFIED unless it carries a cron schedule,
+        // in which case its own WorkflowExecutionStarted.Initiator is
+        // CRON_SCHEDULE (v1.31.0 first cron run; TestCronWorkflowCompletionStates
+        // asserts `Initiator:3` on the initial run). Successors set their own.
+        initiator: req
+            .cron_schedule
+            .as_deref()
+            .filter(|cron| !cron.is_empty())
+            .map(|_| tokeira_kernel::ContinueAsNewInitiator::CronSchedule),
         deployment,
         build_id,
         versioning_override: req
@@ -186,6 +195,15 @@ pub fn signal_with_start_request(
         retry_policy: req.retry_policy,
         conflict_policy: req.conflict_policy,
         reuse_policy: req.reuse_policy,
+        // A fresh client start is UNSPECIFIED unless it carries a cron schedule,
+        // in which case its own WorkflowExecutionStarted.Initiator is
+        // CRON_SCHEDULE (v1.31.0 first cron run; TestCronWorkflowCompletionStates
+        // asserts `Initiator:3` on the initial run). Successors set their own.
+        initiator: req
+            .cron_schedule
+            .as_deref()
+            .filter(|cron| !cron.is_empty())
+            .map(|_| tokeira_kernel::ContinueAsNewInitiator::CronSchedule),
         header: req.header,
         attempt: 1,
         workflow_start_delay: req.workflow_start_delay,

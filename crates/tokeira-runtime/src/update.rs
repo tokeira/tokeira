@@ -1541,6 +1541,7 @@ mod tests {
         let run_id = RunId::new();
         let result = runtime
             .start_workflow(StartRequest {
+                initiator: None,
                 run_key,
                 namespace_id: ns,
                 workflow_id: WorkflowId(wf_id.into()),

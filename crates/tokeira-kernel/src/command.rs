@@ -675,6 +675,13 @@ pub struct ResetRequest {
     pub fork_event_id: i64,
     /// Pre-assigned run ID for the new (reset) run.
     pub new_run_id: RunId,
+    /// Exclude signals from the post-fork event reapply (derived from
+    /// `ResetReapplyType`/`ResetReapplyExcludeTypes`, resetworkflow/api.go:199-219).
+    #[serde(default)]
+    pub reapply_exclude_signal: bool,
+    /// Exclude updates from the post-fork event reapply.
+    #[serde(default)]
+    pub reapply_exclude_update: bool,
     /// Human-readable reason for the reset.
     pub reason: String,
     /// Caller-supplied request context for dedupe and tracing.

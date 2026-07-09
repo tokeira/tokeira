@@ -4018,6 +4018,23 @@ pub fn reset_request_to_edge(
             "ResetWorkflowExecutionRequest.workflow_execution",
         ))?;
 
+    // Map the deprecated ResetReapplyType to the exclude set and union any explicit
+    // ResetReapplyExcludeTypes (resetworkflow/api.go:199-219 @ v1.31.0):
+    // ALL_ELIGIBLE(3)/UNSPECIFIED(0) -> {}, SIGNAL(1) -> {UPDATE}, NONE(2) ->
+    // {SIGNAL,UPDATE}; exclude-type SIGNAL=1, UPDATE=2.
+    let (mut reapply_exclude_signal, mut reapply_exclude_update) = match req.reset_reapply_type {
+        1 => (false, true),
+        2 => (true, true),
+        _ => (false, false),
+    };
+    for exclude in &req.reset_reapply_exclude_types {
+        match exclude {
+            1 => reapply_exclude_signal = true,
+            2 => reapply_exclude_update = true,
+            _ => {}
+        }
+    }
+
     Ok(EdgeResetWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
@@ -4025,6 +4042,8 @@ pub fn reset_request_to_edge(
         reason: req.reason,
         workflow_task_finish_event_id: req.workflow_task_finish_event_id,
         request_id: non_empty(req.request_id),
+        reapply_exclude_signal,
+        reapply_exclude_update,
     })
 }
 

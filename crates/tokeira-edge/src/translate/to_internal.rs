@@ -545,6 +545,8 @@ pub fn reset_request(req: ResetWorkflowExecutionRequest, request_id: &RequestId)
     ResetRequest {
         fork_event_id: req.workflow_task_finish_event_id,
         new_run_id: RunId::new(),
+        reapply_exclude_signal: req.reapply_exclude_signal,
+        reapply_exclude_update: req.reapply_exclude_update,
         reason: req.reason,
         request: RequestContext {
             request_id: CoreRequestId(

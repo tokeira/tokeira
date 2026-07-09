@@ -895,6 +895,10 @@ pub struct ResetWorkflowExecutionRequest {
     pub reason: String,
     pub workflow_task_finish_event_id: i64,
     pub request_id: Option<String>,
+    /// Post-fork reapply exclusion, computed from the proto's `reset_reapply_type`
+    /// + `reset_reapply_exclude_types` (resetworkflow/api.go:199-219).
+    pub reapply_exclude_signal: bool,
+    pub reapply_exclude_update: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

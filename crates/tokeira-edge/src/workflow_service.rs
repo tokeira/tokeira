@@ -1806,6 +1806,9 @@ impl WorkflowService {
                 ResetRequest {
                     fork_event_id,
                     new_run_id,
+                    // Batch reset does not model reapply exclusion yet (UNSUPPORTED_FIELDS).
+                    reapply_exclude_signal: false,
+                    reapply_exclude_update: false,
                     reason,
                     request: batch_request_context(ctx),
                     now: OffsetDateTime::now_utc(),

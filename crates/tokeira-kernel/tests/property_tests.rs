@@ -466,6 +466,8 @@ fn arb_reset_request(
         .prop_map(move |(fork_event_id, reason, request_id)| ResetRequest {
             fork_event_id,
             new_run_id: RunId::new(),
+            reapply_exclude_signal: false,
+            reapply_exclude_update: false,
             reason,
             request: request_context(&request_id, now),
             now,

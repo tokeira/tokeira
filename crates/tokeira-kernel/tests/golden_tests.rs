@@ -753,6 +753,8 @@ fn make_reset_request() -> ResetRequest {
     ResetRequest {
         fork_event_id: 5,
         new_run_id: RunId::new(),
+        reapply_exclude_signal: false,
+        reapply_exclude_update: false,
         reason: "operator reset".into(),
         request: request_context("reset-req"),
         now: now(),

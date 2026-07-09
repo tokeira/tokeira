@@ -2588,6 +2588,7 @@ impl BasicKernel {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
+        let is_reset = req.failure_cause == WorkflowTaskFailedCause::ResetWorkflow;
         let mut builder = TransitionBuilder::new(state, req.now);
         // A started SPECULATIVE task persists Scheduled + Started late,
         // immediately before the failed event — v1.31.0's
@@ -2650,6 +2651,53 @@ impl BasicKernel {
                 fork_event_version: None,
                 fork_event_id: None,
             });
+        }
+        // A reset-cause WFT failure re-drives the run from the fork point. The
+        // reset successor was replayed from the copied prefix, which reconstructs
+        // each pending activity's STATE but not its dispatch; re-enqueue every
+        // not-started pending activity so it is pollable on the reset run —
+        // v1.31.0's post-reset `taskRefresher.Refresh` regenerates exactly these
+        // activity transfer tasks (state_rebuilder.go:141 @ v1.31.0).
+        if is_reset {
+            let dispatch_revision = builder
+                .state
+                .versioning_info
+                .as_ref()
+                .map(|info| info.revision_number)
+                .unwrap_or_default();
+            let pending_activities: Vec<_> = builder
+                .state
+                .activities
+                .values()
+                .filter(|activity| activity.started_at.is_none())
+                .cloned()
+                .collect();
+            for activity in pending_activities {
+                builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+                    queue: QueueKey {
+                        namespace_id: builder.state.namespace_id,
+                        task_queue: activity.task_queue.clone(),
+                        task_kind: tokeira_types::TaskKind::Activity,
+                        deployment: activity
+                            .deployment
+                            .clone()
+                            .or_else(|| builder.state.deployment.clone()),
+                        build_id: activity
+                            .build_id
+                            .clone()
+                            .or_else(|| builder.state.build_id.clone()),
+                    },
+                    activity_id: activity.activity_id.clone(),
+                    input: activity.input.clone(),
+                    schedule_event_id: activity.schedule_event_id,
+                    attempt: activity.attempt,
+                    dispatch_revision,
+                    schedule_to_close_timeout: activity.schedule_to_close_timeout,
+                    schedule_to_start_timeout: activity.schedule_to_start_timeout,
+                    start_to_close_timeout: activity.start_to_close_timeout,
+                    heartbeat_timeout: activity.heartbeat_timeout,
+                });
+            }
         }
         // Buffered events flush immediately after the WFT-failed event, before
         // the retry re-dispatch (`failWorkflowTask` fails then flushes,

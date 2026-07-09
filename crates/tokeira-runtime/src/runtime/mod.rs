@@ -218,6 +218,8 @@ pub enum StartWorkflowResult {
         run_key: RunKey,
         run_id: RunId,
         mutation_metadata: MutationMetadata,
+        /// First WFT committed as started for inline eager delivery.
+        eager_workflow_task: Option<StartedWorkflowTask>,
     },
     UsedExisting {
         run_key: RunKey,
@@ -231,6 +233,8 @@ pub enum StartWorkflowResult {
         run_key: RunKey,
         run_id: RunId,
         execution_status: ExecutionStatus,
+        /// Still-live first WFT reconstructed for an eager request-id retry.
+        eager_workflow_task: Option<StartedWorkflowTask>,
     },
     Rejected {
         run_key: RunKey,
@@ -1467,6 +1471,7 @@ mod tests {
         }
 
         let run_key = request.run_key;
+        let mut eager_retry = request.clone();
         let result = runtime.start_workflow(request).await.unwrap();
         assert!(matches!(result, CommitResult::Applied { .. }));
         let started = poller.await.unwrap();
@@ -1498,6 +1503,158 @@ mod tests {
             history.get(2).map(|event| &event.kind),
             Some(HistoryEventKind::WorkflowTaskStarted { identity, .. }) if identity == &worker
         ));
+        assert!(!history[0].kind.eager_execution_accepted());
+
+        // Feature: edge-eager-dispatch, Properties 5/6. A duplicate may flip
+        // its request flag, but the original event-1 decision remains
+        // authoritative and prevents a false-history/true-response mismatch.
+        eager_retry.eager_execution_accepted = true;
+        eager_retry.request.caller_identity = Some("late-eager-worker".to_string());
+        let retried = runtime
+            .start_workflow_with_policy(eager_retry)
+            .await
+            .unwrap();
+        assert!(matches!(
+            retried,
+            StartWorkflowResult::Deduped {
+                eager_workflow_task: None,
+                ..
+            }
+        ));
+        assert_eq!(repo.read_history(run_key, 0, 16).await.unwrap(), history);
+    }
+
+    #[tokio::test]
+    async fn eager_start_with_positive_backoff_commits_without_inline_task() {
+        // Feature: edge-eager-dispatch, Properties 2/5. A positive first-WFT
+        // backoff is decided before the commit so a durable start cannot be
+        // followed by a response-construction failure for a nonexistent WFT.
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let mut request = sample_start_request(None, None);
+        request.request.caller_identity = Some("eager-worker".to_string());
+        request.eager_execution_accepted = true;
+        request.workflow_start_delay = Some(Duration::seconds(5));
+
+        let result = runtime
+            .start_workflow_with_policy(request.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            StartWorkflowResult::Started {
+                eager_workflow_task: None,
+                ..
+            }
+        ));
+
+        let history = repo.read_history(request.run_key, 0, 16).await.unwrap();
+        assert!(!history[0].kind.eager_execution_accepted());
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.kind, HistoryEventKind::WorkflowTaskStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn eager_start_retry_reconstructs_live_task_and_omits_expired() {
+        // Feature: edge-eager-dispatch, Property 6: Request-ID retry reconstruction.
+        // v1.31.0 returns the first eager WFT only while attempt 1 remains live;
+        // reconstructing an elapsed task before the coarse timeout sweep runs
+        // would hand the SDK an already-invalid token.
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let mut request = sample_start_request(None, None);
+        let accepted_at = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
+        request.now = accepted_at;
+        request.request.received_at = accepted_at;
+        request.request.caller_identity = Some("eager-worker".to_string());
+        request.workflow_task_timeout = Duration::seconds(10);
+        request.eager_execution_accepted = true;
+
+        let first = runtime
+            .start_workflow_with_policy(request.clone())
+            .await
+            .unwrap();
+        let first_task = match first {
+            StartWorkflowResult::Started {
+                eager_workflow_task: Some(task),
+                ..
+            } => task,
+            other => panic!("expected fresh eager task, got {other:?}"),
+        };
+        assert_eq!(first_task.token.started_event_id, 3);
+        assert_eq!(first_task.token.attempt, 1);
+        let LoadedRun::Existing(before_state) = repo.load_run(request.run_key).await.unwrap()
+        else {
+            panic!("fresh eager start should exist");
+        };
+        let before_history = repo
+            .read_history(request.run_key, 0, usize::MAX)
+            .await
+            .unwrap();
+
+        let immediate = runtime
+            .start_workflow_with_policy(request.clone())
+            .await
+            .unwrap();
+        let retry_task = match immediate {
+            StartWorkflowResult::Deduped {
+                eager_workflow_task: Some(task),
+                ..
+            } => task,
+            other => panic!("expected deduped eager task, got {other:?}"),
+        };
+        assert_eq!(retry_task, first_task);
+        let LoadedRun::Existing(immediate_state) = repo.load_run(request.run_key).await.unwrap()
+        else {
+            panic!("deduped eager start should still exist");
+        };
+        assert_eq!(immediate_state.transition_seq, before_state.transition_seq);
+        assert_eq!(
+            repo.read_history(request.run_key, 0, usize::MAX)
+                .await
+                .unwrap(),
+            before_history
+        );
+
+        request.now = accepted_at + request.workflow_task_timeout;
+        let retried = runtime
+            .start_workflow_with_policy(request.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            retried,
+            StartWorkflowResult::Deduped {
+                eager_workflow_task: None,
+                ..
+            }
+        ));
+
+        let LoadedRun::Existing(after_state) = repo.load_run(request.run_key).await.unwrap() else {
+            panic!("deduped eager start should still exist");
+        };
+        let after_history = repo
+            .read_history(request.run_key, 0, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(after_state.transition_seq, before_state.transition_seq);
+        assert_eq!(after_history, before_history);
     }
 
     #[tokio::test]
@@ -3078,6 +3235,7 @@ mod tests {
             },
             now: OffsetDateTime::now_utc(),
             cron_schedule: None,
+            eager_execution_accepted: false,
             reserved_poller_identity: None,
         }
     }

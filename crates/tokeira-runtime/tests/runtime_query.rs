@@ -400,6 +400,7 @@ async fn start_workflow(
             },
             now: OffsetDateTime::now_utc(),
             cron_schedule: None,
+            eager_execution_accepted: false,
             reserved_poller_identity: None,
         })
         .await?;

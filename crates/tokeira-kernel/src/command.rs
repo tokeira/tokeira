@@ -504,6 +504,14 @@ pub struct StartRequest {
     /// Schedule ID that triggered this start, if any. This is serialized as
     /// Temporal's legacy `cron_schedule` marker for schedule-originated runs.
     pub cron_schedule: Option<String>,
+    /// Runtime-admitted eager-start decision before the kernel's safety clamp.
+    ///
+    /// The kernel may preserve `true` only when this same transition starts the
+    /// first workflow task for an inline worker. It never promotes `false`
+    /// (`service/history/api/startworkflow/api.go` and
+    /// `service/history/historybuilder/event_factory.go @ v1.31.0`).
+    #[serde(default)]
+    pub eager_execution_accepted: bool,
     /// Worker identity reserved by the runtime for synchronous first-WFT delivery.
     pub reserved_poller_identity: Option<WorkerIdentity>,
 }

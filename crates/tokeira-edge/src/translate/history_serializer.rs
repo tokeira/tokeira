@@ -103,7 +103,8 @@ fn opt_string(s: &Option<String>) -> String {
 
 fn event_user_metadata(event: &HistoryEvent) -> Option<proto_sdk::UserMetadata> {
     match &event.kind {
-        HistoryEventKind::WorkflowExecutionStarted { user_metadata, .. } => {
+        HistoryEventKind::WorkflowExecutionStarted { user_metadata, .. }
+        | HistoryEventKind::WorkflowExecutionStartedV2 { user_metadata, .. } => {
             user_metadata.as_ref().map(user_metadata_to_proto)
         }
         _ => None,
@@ -112,7 +113,8 @@ fn event_user_metadata(event: &HistoryEvent) -> Option<proto_sdk::UserMetadata> 
 
 fn event_links(event: &HistoryEvent) -> Vec<proto_common::Link> {
     match &event.kind {
-        HistoryEventKind::WorkflowExecutionStarted { links, .. } => {
+        HistoryEventKind::WorkflowExecutionStarted { links, .. }
+        | HistoryEventKind::WorkflowExecutionStartedV2 { links, .. } => {
             links.iter().map(link_to_proto).collect()
         }
         HistoryEventKind::WorkflowExecutionSignaled { links, .. } => {
@@ -260,7 +262,8 @@ fn pause_marker(marker_name: &str, identity: &str, reason: &str, request_id: &st
 fn event_type_for_kind(kind: &HistoryEventKind) -> i32 {
     use tokeira_proto::enums::EventType as E;
     let et = match kind {
-        HistoryEventKind::WorkflowExecutionStarted { .. } => E::WorkflowExecutionStarted,
+        HistoryEventKind::WorkflowExecutionStarted { .. }
+        | HistoryEventKind::WorkflowExecutionStartedV2 { .. } => E::WorkflowExecutionStarted,
         HistoryEventKind::WorkflowExecutionCompleted { .. } => E::WorkflowExecutionCompleted,
         HistoryEventKind::WorkflowExecutionFailed { .. } => E::WorkflowExecutionFailed,
         HistoryEventKind::WorkflowExecutionTimedOut { .. } => E::WorkflowExecutionTimedOut,
@@ -418,6 +421,44 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             versioning_info: _,
             worker_deployment_name: _,
             priority,
+            ..
+        }
+        | HistoryEventKind::WorkflowExecutionStartedV2 {
+            workflow_type,
+            task_queue,
+            input,
+            header,
+            workflow_start_delay,
+            completion_callbacks,
+            user_metadata: _,
+            links: _,
+            memo,
+            search_attributes,
+            request_id: _,
+            identity,
+            continued_execution_run_id,
+            first_execution_run_id,
+            retry_policy,
+            initiator,
+            attempt,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+            parent_workflow_id,
+            parent_run_id,
+            parent_namespace_id,
+            parent_namespace_name,
+            parent_initiated_event_id,
+            root_workflow_id,
+            root_run_id,
+            original_execution_run_id,
+            continued_failure,
+            last_completion_result,
+            cron_schedule,
+            versioning_info: _,
+            worker_deployment_name: _,
+            priority,
+            ..
         } => Attributes::WorkflowExecutionStartedEventAttributes(
             history::WorkflowExecutionStartedEventAttributes {
                 workflow_type: Some(proto_common::WorkflowType {
@@ -468,6 +509,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                     .map(completion_callback_to_proto)
                     .collect(),
                 priority: priority.as_ref().map(priority_to_proto),
+                eager_execution_accepted: event.kind.eager_execution_accepted(),
                 ..Default::default()
             },
         ),
@@ -2433,6 +2475,56 @@ mod tests {
                 assert_eq!(attrs.workflow_type.unwrap().name, "MyWorkflow");
                 let timeout = attrs.workflow_task_timeout.unwrap();
                 assert_eq!(timeout.seconds, 10);
+                assert!(!attrs.eager_execution_accepted);
+            }
+            other => panic!("unexpected attributes: {other:?}"),
+        }
+
+        let eager = HistoryEvent {
+            event_id: 1,
+            happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            kind: HistoryEventKind::WorkflowExecutionStartedV2 {
+                initiator: None,
+                workflow_type: WorkflowType("MyWorkflow".to_string()),
+                task_queue: TaskQueueName("default".to_string()),
+                input: Payloads::default(),
+                header: None,
+                workflow_start_delay: None,
+                completion_callbacks: Vec::new(),
+                user_metadata: None,
+                links: Vec::new(),
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
+                request_id: "req-1".to_string(),
+                identity: "client".to_string(),
+                continued_execution_run_id: None,
+                first_execution_run_id: None,
+                retry_policy: None,
+                attempt: 1,
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: time::Duration::seconds(10),
+                parent_workflow_id: None,
+                parent_run_id: None,
+                parent_namespace_id: None,
+                parent_namespace_name: None,
+                parent_initiated_event_id: 0,
+                root_workflow_id: None,
+                root_run_id: None,
+                original_execution_run_id: None,
+                continued_failure: None,
+                last_completion_result: None,
+                cron_schedule: None,
+                versioning_info: None,
+                worker_deployment_name: None,
+                priority: None,
+                eager_execution_accepted: true,
+            },
+        };
+        let eager_proto = history_event_to_proto(&eager);
+        match eager_proto.attributes.unwrap() {
+            Attributes::WorkflowExecutionStartedEventAttributes(attrs) => {
+                assert!(attrs.eager_execution_accepted);
             }
             other => panic!("unexpected attributes: {other:?}"),
         }

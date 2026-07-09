@@ -14,21 +14,34 @@
 //! *open* run) and `WorkflowIdReusePolicy` (against the *latest closed* run).
 use super::*;
 
+/// Temporal v1.31.0's eager-workflow-start compatibility value is enabled by
+/// default. Keeping it pinned avoids an operator setting changing API behaviour
+/// (`common/dynamicconfig/constants.go @ v1.31.0`).
+const ENABLE_EAGER_WORKFLOW_START: bool = true;
+
+#[derive(Debug)]
+struct StartCommitOutcome {
+    commit_result: CommitResult,
+    eager_workflow_task: Option<StartedWorkflowTask>,
+}
+
 impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + 'static,
 {
     /// Start a new workflow execution.
     ///
-    /// Before committing, this optimistically reserves a workflow-task poller so
-    /// that, on a successful start, the first workflow task can be handed
-    /// directly to a waiting worker (eager start) instead of round-tripping
-    /// through the broker. The reservation is returned to the broker on every
-    /// non-`Applied` outcome and on submit error, so a failed start never leaks
-    /// a parked poller. Execution/run timeout tracking is registered only after
-    /// the start is durably `Applied`.
+    /// This low-level entry point cannot return an eager task, so it disables
+    /// public eager admission. It may still reserve a parked broker poller for
+    /// the independent synchronous-match optimisation. That reservation is
+    /// returned on every non-`Applied` outcome and submit error, so a failed
+    /// start never leaks a poller. Execution/run timeout tracking begins only
+    /// after the start is durably `Applied`.
     pub async fn start_workflow(&self, request: StartRequest) -> Result<CommitResult> {
-        self.start_workflow_inner(request, None).await
+        Ok(self
+            .start_workflow_inner(request, None, false)
+            .await?
+            .commit_result)
     }
 
     /// Start with an optional Update-with-Start fold: `Some(update_id)` swaps
@@ -42,15 +55,36 @@ where
         &self,
         mut request: StartRequest,
         update_fold: Option<String>,
-    ) -> Result<CommitResult> {
-        apply_client_cron_start_backoff(&mut request)?;
+        allow_eager_response: bool,
+    ) -> Result<StartCommitOutcome> {
+        prepare_start_request(&mut request, allow_eager_response)?;
+        self.start_workflow_prepared(request, update_fold).await
+    }
+
+    async fn start_workflow_prepared(
+        &self,
+        mut request: StartRequest,
+        update_fold: Option<String>,
+    ) -> Result<StartCommitOutcome> {
         // A delayed start (client start-delay or cron initial backoff) arms
         // the start-delay timer instead of scheduling a first WFT — there is
         // nothing to hand a reserved poller, so do not reserve one (the
         // sync-match delivery path requires a pending WFT and would
         // otherwise fail the whole Start RPC with "workflow task missing
         // after reserved start").
-        let reserved_poller = if request.workflow_start_delay.is_none() {
+        let has_positive_backoff = request
+            .workflow_start_delay
+            .is_some_and(|delay| delay > Duration::ZERO);
+        let eager_worker_identity = request.eager_execution_accepted.then(|| {
+            // Temporal passes the request identity straight into the eager
+            // WorkflowTaskStarted event; the proto string may be empty
+            // (create_workflow_util.go @ v1.31.0).
+            WorkerIdentity(request.request.caller_identity.clone().unwrap_or_default())
+        });
+        // Runtime admission owns this direct-delivery identity; never trust a
+        // pre-populated value from an internal caller.
+        request.reserved_poller_identity = eager_worker_identity.clone();
+        let reserved_poller = if eager_worker_identity.is_none() && !has_positive_backoff {
             self.try_reserve_start_poller(&request).await
         } else {
             None
@@ -75,30 +109,8 @@ where
                 return Err(error);
             }
         };
-        match (&result, reserved_poller) {
-            (CommitResult::Applied { new_state }, Some(reserved)) => {
-                // The run is durably started; a failed sync-match delivery
-                // must not fail the Start RPC. The broker-enqueue op was
-                // suppressed for a reserved start, so recovery is the WFT
-                // start-to-close timeout scanner (the tracking entry is
-                // inserted before delivery) or, on a shard handover, the new
-                // owner's sweep reconstructing it from committed state.
-                if let Err(error) = self
-                    .deliver_reserved_start_workflow_task(new_state, reserved)
-                    .await
-                {
-                    tracing::warn!(
-                        ?error,
-                        run_key = ?request.run_key,
-                        "reserved-start sync-match delivery failed; WFT timeout scanner will recover"
-                    );
-                }
-            }
-            (_, Some(reserved)) => {
-                self.broker.return_reserved_poller(reserved).await;
-            }
-            (_, None) => {}
-        }
+        // Register run-level deadlines before response materialization: task
+        // token construction is fallible after the authoritative commit.
         if matches!(result, CommitResult::Applied { .. })
             && (request.workflow_execution_timeout.is_some()
                 || request.workflow_run_timeout.is_some())
@@ -115,7 +127,41 @@ where
                 has_retry_policy: request.retry_policy.is_some(),
             });
         }
-        Ok(result)
+
+        let eager_workflow_task = match (&result, eager_worker_identity, reserved_poller) {
+            (CommitResult::Applied { new_state }, Some(worker_identity), None) => Some(
+                self.started_workflow_task_from_state(new_state, false, worker_identity)
+                    .await?,
+            ),
+            (CommitResult::Applied { new_state }, None, Some(reserved)) => {
+                // The run is durably started; a failed sync-match delivery
+                // must not fail the Start RPC. The broker-enqueue op was
+                // suppressed for a reserved start, so recovery is the WFT
+                // start-to-close timeout scanner (the tracking entry is
+                // inserted before delivery) or, on a shard handover, the new
+                // owner's sweep reconstructing it from committed state.
+                if let Err(error) = self
+                    .deliver_reserved_start_workflow_task(new_state, reserved)
+                    .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        run_key = ?request.run_key,
+                        "reserved-start sync-match delivery failed; WFT timeout scanner will recover"
+                    );
+                }
+                None
+            }
+            (_, _, Some(reserved)) => {
+                self.broker.return_reserved_poller(reserved).await;
+                None
+            }
+            (_, _, None) => None,
+        };
+        Ok(StartCommitOutcome {
+            commit_result: result,
+            eager_workflow_task,
+        })
     }
 
     /// Start a workflow, first resolving any WorkflowId conflict/reuse policy.
@@ -129,8 +175,12 @@ where
     /// so a dedupe hit indicates an unexpected racing start for the same run key.
     pub async fn start_workflow_with_policy(
         &self,
-        request: StartRequest,
+        mut request: StartRequest,
     ) -> Result<StartWorkflowResult> {
+        // v1.31.0 applies the effective first-WFT backoff before eager gating
+        // and conflict handling, including the request-id retry path
+        // (service/history/api/startworkflow/api.go:137-158 @ v1.31.0).
+        prepare_start_request(&mut request, true)?;
         // Bounded re-resolution loop. `resolve_conflict` is a pre-check that can
         // race a concurrent start: N starts for the same workflow id can all see
         // "absent" and proceed, then collide at commit. The loser's commit returns
@@ -153,12 +203,17 @@ where
                 .await?;
             match resolution {
                 ConflictResolution::Absent | ConflictResolution::ClosedAllowReuse => {
-                    match self.start_workflow(request.clone()).await? {
+                    let StartCommitOutcome {
+                        commit_result,
+                        eager_workflow_task,
+                    } = self.start_workflow_prepared(request.clone(), None).await?;
+                    match commit_result {
                         CommitResult::Applied { new_state } => {
                             return Ok(StartWorkflowResult::Started {
                                 run_key: request.run_key,
                                 run_id: request.run_id,
                                 mutation_metadata: mutation_metadata(&new_state),
+                                eager_workflow_task,
                             });
                         }
                         CommitResult::Duplicate => {
@@ -188,12 +243,17 @@ where
                         request.request.clone(),
                     )
                     .await?;
-                    match self.start_workflow(request.clone()).await? {
+                    let StartCommitOutcome {
+                        commit_result,
+                        eager_workflow_task,
+                    } = self.start_workflow_prepared(request.clone(), None).await?;
+                    match commit_result {
                         CommitResult::Applied { new_state } => {
                             return Ok(StartWorkflowResult::Started {
                                 run_key: request.run_key,
                                 run_id: request.run_id,
                                 mutation_metadata: mutation_metadata(&new_state),
+                                eager_workflow_task,
                             });
                         }
                         CommitResult::Duplicate => {
@@ -225,10 +285,14 @@ where
                     run_id,
                     execution_status,
                 } => {
+                    let eager_workflow_task = self
+                        .reconstruct_retried_eager_workflow_task(run_key, &request)
+                        .await?;
                     return Ok(StartWorkflowResult::Deduped {
                         run_key,
                         run_id,
                         execution_status,
+                        eager_workflow_task,
                     });
                 }
             }
@@ -237,6 +301,55 @@ where
             "workflow start for {:?} did not converge after {MAX_RESOLUTION_ATTEMPTS} conflict-resolution attempts",
             request.run_key
         ))
+    }
+
+    /// Rebuild the first eager WFT for an idempotent start retry without
+    /// authoring another transition.
+    ///
+    /// Temporal returns it only while event 3 remains the started first
+    /// attempt (`respondToRetriedRequest`, startworkflow/api.go:538-576 @
+    /// v1.31.0). Tokeira additionally checks the absolute deadline because its
+    /// non-speculative timeout sweep is coarse: elapsed work is no longer live
+    /// even if the timeout transition lands on the next scan.
+    async fn reconstruct_retried_eager_workflow_task(
+        &self,
+        run_key: RunKey,
+        request: &StartRequest,
+    ) -> Result<Option<StartedWorkflowTask>> {
+        if !request.eager_execution_accepted {
+            return Ok(None);
+        }
+        let start_event = self.repo.read_history(run_key, 0, 1).await?;
+        if !start_event
+            .first()
+            .is_some_and(|event| event.kind.eager_execution_accepted())
+        {
+            // A duplicate request may change its eager flag. Event 1 records
+            // the original admission decision, so request shape alone must not
+            // turn a non-eager sync match into an eager response.
+            return Ok(None);
+        }
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Ok(None);
+        };
+        let Some(pending) = state.pending_workflow_task.as_ref() else {
+            return Ok(None);
+        };
+        let Some(started_at) = pending.started_at else {
+            return Ok(None);
+        };
+        if pending.started_event_id != Some(3)
+            || pending.attempt != 1
+            || request.now >= started_at + state.workflow_task_timeout
+        {
+            return Ok(None);
+        }
+
+        let worker_identity =
+            WorkerIdentity(request.request.caller_identity.clone().unwrap_or_default());
+        self.started_workflow_task_from_state(&state, false, worker_identity)
+            .await
+            .map(Some)
     }
 
     async fn apply_start_on_conflict_options(
@@ -504,15 +617,24 @@ where
             wait_tx,
         );
         match self
-            .start_workflow_inner(request.clone(), Some(update_id.to_string()))
+            .start_workflow_inner(request.clone(), Some(update_id.to_string()), false)
             .await
         {
-            Ok(CommitResult::Applied { .. } | CommitResult::Duplicate) => {}
-            Ok(CommitResult::CurrentExecutionConflict { .. }) => {
+            Ok(StartCommitOutcome {
+                commit_result: CommitResult::Applied { .. } | CommitResult::Duplicate,
+                ..
+            }) => {}
+            Ok(StartCommitOutcome {
+                commit_result: CommitResult::CurrentExecutionConflict { .. },
+                ..
+            }) => {
                 self.update_registry.remove(request.run_key, update_id);
                 return Ok(None);
             }
-            Ok(CommitResult::Conflict { reason }) => {
+            Ok(StartCommitOutcome {
+                commit_result: CommitResult::Conflict { reason },
+                ..
+            }) => {
                 self.update_registry.remove(request.run_key, update_id);
                 return Err(anyhow!("update-with-start start conflicted: {reason}"));
             }
@@ -860,13 +982,13 @@ where
         let reset_reason = request.reason.clone();
         let reset_now = request.now;
         let successor_run_id = request.new_run_id;
-        match self
-            .submit(run_key, Command::Reset(request))
-            .await?
-        {
+        match self.submit(run_key, Command::Reset(request)).await? {
             CommitResult::Applied { .. } => {}
             CommitResult::Duplicate => {
-                return Err(anyhow!("unexpected duplicate reset commit for {:?}", run_key));
+                return Err(anyhow!(
+                    "unexpected duplicate reset commit for {:?}",
+                    run_key
+                ));
             }
             CommitResult::Conflict { reason } => return Err(anyhow!("conflict: {reason}")),
             CommitResult::CurrentExecutionConflict {
@@ -1118,6 +1240,26 @@ where
     }
 }
 
+fn prepare_start_request(request: &mut StartRequest, allow_eager_response: bool) -> Result<()> {
+    apply_client_cron_start_backoff(request)?;
+    request.eager_execution_accepted = eager_workflow_start_is_accepted(
+        request.eager_execution_accepted,
+        allow_eager_response && ENABLE_EAGER_WORKFLOW_START,
+        request.workflow_start_delay,
+    );
+    Ok(())
+}
+
+fn eager_workflow_start_is_accepted(
+    requested: bool,
+    enabled: bool,
+    first_workflow_task_backoff: Option<Duration>,
+) -> bool {
+    requested
+        && enabled
+        && first_workflow_task_backoff.is_none_or(|backoff| backoff <= Duration::ZERO)
+}
+
 fn apply_client_cron_start_backoff(request: &mut StartRequest) -> Result<()> {
     let Some(cron_schedule) = request.client_cron_schedule.as_deref() else {
         return Ok(());
@@ -1142,4 +1284,36 @@ fn apply_client_cron_signal_backoff(request: &mut SignalWithStartRequest) -> Res
     }
     request.workflow_start_delay = Some(cron_initial_backoff(cron_schedule, request.now)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        // Feature: edge-eager-dispatch, Property 2: Runtime eager admission.
+        fn eager_workflow_start_admission_matches_truth_table(
+            requested in any::<bool>(),
+            enabled in any::<bool>(),
+            backoff_case in 0u8..4,
+        ) {
+            let backoff = match backoff_case {
+                0 => None,
+                1 => Some(Duration::seconds(-1)),
+                2 => Some(Duration::ZERO),
+                _ => Some(Duration::seconds(1)),
+            };
+
+            prop_assert_eq!(
+                eager_workflow_start_is_accepted(requested, enabled, backoff),
+                requested
+                    && enabled
+                    && backoff.is_none_or(|duration| duration <= Duration::ZERO)
+            );
+        }
+    }
 }

@@ -649,6 +649,105 @@ pub enum HistoryEventKind {
         /// Success result or post-acceptance handler failure.
         outcome: UpdateEventOutcome,
     },
+    /// Current workflow-start event shape, appended rather than changing
+    /// [`Self::WorkflowExecutionStarted`] because postcard enum payloads are
+    /// positional and carry no field count. The legacy variant remains
+    /// decode-only; all newly-authored starts use this variant.
+    ///
+    /// Both variants serialize to Temporal's
+    /// `EVENT_TYPE_WORKFLOW_EXECUTION_STARTED`. This variant additionally
+    /// persists whether the server accepted inline execution of the first WFT
+    /// (`WorkflowExecutionStartedEventAttributes.eager_execution_accepted`,
+    /// `service/history/historybuilder/event_factory.go @ v1.31.0`).
+    WorkflowExecutionStartedV2 {
+        /// Workflow type selected by the start request.
+        workflow_type: WorkflowType,
+        /// Task queue that receives workflow tasks for this run.
+        task_queue: TaskQueueName,
+        /// Arguments supplied to the workflow function.
+        input: Payloads,
+        /// Start headers recorded for SDK replay.
+        header: Option<Headers>,
+        /// Unindexed workflow memo at start.
+        memo: Memo,
+        /// Indexed search attributes at start.
+        search_attributes: SearchAttributes,
+        /// Idempotency key that authored this start event.
+        request_id: String,
+        /// Identity of the start caller.
+        identity: String,
+        /// Immediately preceding run in this execution chain.
+        continued_execution_run_id: Option<RunId>,
+        /// First run in this execution chain.
+        first_execution_run_id: Option<RunId>,
+        /// Workflow retry policy inherited by this run.
+        retry_policy: Option<RetryPolicy>,
+        /// Why this run was created; `None` for a fresh client start.
+        initiator: Option<ContinueAsNewInitiator>,
+        /// One-based retry attempt for this run.
+        attempt: u32,
+        /// Timeout spanning the entire execution chain.
+        workflow_execution_timeout: Option<Duration>,
+        /// Timeout applying to this run only.
+        workflow_run_timeout: Option<Duration>,
+        /// Start-to-close timeout for each workflow task.
+        workflow_task_timeout: Duration,
+        /// Parent workflow ID for a child execution.
+        parent_workflow_id: Option<WorkflowId>,
+        /// Parent run ID for a child execution.
+        parent_run_id: Option<RunId>,
+        /// Parent namespace ID for a child execution.
+        parent_namespace_id: Option<NamespaceId>,
+        /// Parent namespace name carried separately from its one-way-derived ID.
+        parent_namespace_name: Option<String>,
+        /// Parent history event that initiated this child.
+        parent_initiated_event_id: i64,
+        /// Root workflow ID for a child execution lineage.
+        root_workflow_id: Option<WorkflowId>,
+        /// Root run ID for a child execution lineage.
+        root_run_id: Option<RunId>,
+        /// Original run ID used by reset and execution-lineage APIs.
+        original_execution_run_id: Option<RunId>,
+        /// Failure inherited from a predecessor run.
+        continued_failure: Option<Payload>,
+        /// Successful result inherited from a predecessor run.
+        last_completion_result: Option<Payloads>,
+        /// Cron expression associated with this execution chain.
+        cron_schedule: Option<String>,
+        /// Delay before the first workflow task becomes eligible.
+        workflow_start_delay: Option<Duration>,
+        /// Completion callbacks registered with the workflow.
+        completion_callbacks: Vec<CompletionCallback>,
+        /// UI-facing summary and details captured at start.
+        user_metadata: Option<UserMetadata>,
+        /// Links attached to the start event.
+        links: Vec<Link>,
+        /// Matching priority attached to derived tasks.
+        priority: Option<Priority>,
+        /// Worker-versioning state captured at start.
+        versioning_info: Option<WorkflowVersioningInfo>,
+        /// Worker Deployment name associated with the run.
+        worker_deployment_name: Option<String>,
+        /// Whether the first WFT was accepted and started inline with run creation.
+        eager_execution_accepted: bool,
+    },
+}
+
+impl HistoryEventKind {
+    /// Return whether this event durably records accepted eager workflow start.
+    ///
+    /// The legacy started-event variant predates the field and therefore maps
+    /// to `false`. Non-start events also return `false`, allowing storage and
+    /// wire projections to consume both persisted generations without guessing.
+    pub fn eager_execution_accepted(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkflowExecutionStartedV2 {
+                eager_execution_accepted: true,
+                ..
+            }
+        )
+    }
 }
 
 /// Outcome recorded on [`HistoryEventKind::WorkflowExecutionUpdateCompletedV2`]

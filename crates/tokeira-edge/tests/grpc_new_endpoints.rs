@@ -1050,7 +1050,8 @@ async fn discovery_and_namespace_reads_via_grpc() {
         .expect("get system info should succeed")
         .into_inner();
     assert!(!system.server_version.is_empty());
-    assert!(system.capabilities.is_some());
+    let capabilities = system.capabilities.expect("system capabilities");
+    assert!(capabilities.eager_workflow_start);
 
     let cluster = grpc
         .get_cluster_info(Request::new(workflowservice::GetClusterInfoRequest {}))

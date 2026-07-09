@@ -137,6 +137,7 @@ fn make_start_request() -> StartRequest {
         now: now(),
         client_cron_schedule: None,
         cron_schedule: None,
+        eager_execution_accepted: false,
         reserved_poller_identity: None,
     }
 }
@@ -374,6 +375,9 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
 
     let state = kernel.replay_history_prefix(ctx, &events).unwrap();
 
+    // Pre-Tier-3.18 histories use the decode-only V1 shape and therefore
+    // cannot claim that the first WFT was accepted inline.
+    assert!(!events[0].kind.eager_execution_accepted());
     assert_eq!(state.pending_workflow_task, None);
     assert_eq!(state.next_workflow_task_seq, LogicalTaskSeq(2));
     assert_eq!(state.transition_seq, TransitionSeq::ZERO);
@@ -939,7 +943,7 @@ fn start_from_absent() {
     assert_eq!(transition.history_events.len(), 2);
     assert!(matches!(
         transition.history_events[0].kind,
-        HistoryEventKind::WorkflowExecutionStarted { .. }
+        HistoryEventKind::WorkflowExecutionStartedV2 { .. }
     ));
     assert!(matches!(
         transition.history_events[1].kind,
@@ -960,6 +964,88 @@ fn start_from_absent() {
 }
 
 #[test]
+fn accepted_eager_start_authors_atomic_started_history() {
+    let mut req = make_start_request();
+    req.eager_execution_accepted = true;
+    req.reserved_poller_identity = Some(WorkerIdentity("eager-worker".to_string()));
+
+    let transition = kernel()
+        .apply(LoadedRun::Absent, Command::Start(req))
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 3);
+    assert!(matches!(
+        &transition.history_events[0],
+        HistoryEvent {
+            event_id: 1,
+            kind: HistoryEventKind::WorkflowExecutionStartedV2 {
+                eager_execution_accepted: true,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &transition.history_events[1],
+        HistoryEvent {
+            event_id: 2,
+            kind: HistoryEventKind::WorkflowTaskScheduled { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &transition.history_events[2],
+        HistoryEvent {
+            event_id: 3,
+            kind: HistoryEventKind::WorkflowTaskStarted { identity, .. },
+            ..
+        } if identity == &WorkerIdentity("eager-worker".to_string())
+    ));
+}
+
+#[test]
+fn eager_candidate_without_inline_worker_is_clamped_false() {
+    let mut req = make_start_request();
+    req.eager_execution_accepted = true;
+
+    let transition = kernel()
+        .apply(LoadedRun::Absent, Command::Start(req))
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 2);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionStartedV2 {
+            eager_execution_accepted: false,
+            ..
+        }
+    ));
+    assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn eager_candidate_with_positive_backoff_is_clamped_false() {
+    let mut req = make_start_request();
+    req.eager_execution_accepted = true;
+    req.reserved_poller_identity = Some(WorkerIdentity("eager-worker".to_string()));
+    req.workflow_start_delay = Some(Duration::seconds(30));
+
+    let transition = kernel()
+        .apply(LoadedRun::Absent, Command::Start(req))
+        .unwrap();
+
+    assert_eq!(transition.history_events.len(), 1);
+    assert!(matches!(
+        transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionStartedV2 {
+            eager_execution_accepted: false,
+            ..
+        }
+    ));
+    assert!(transition.next_state.pending_workflow_task.is_none());
+}
+
+#[test]
 fn delayed_start_commits_without_initial_wft_and_records_internal_timer() {
     let mut req = make_start_request();
     req.workflow_start_delay = Some(Duration::seconds(30));
@@ -970,7 +1056,7 @@ fn delayed_start_commits_without_initial_wft_and_records_internal_timer() {
     assert_eq!(transition.history_events.len(), 1);
     assert!(matches!(
         transition.history_events[0].kind,
-        HistoryEventKind::WorkflowExecutionStarted { .. }
+        HistoryEventKind::WorkflowExecutionStartedV2 { .. }
     ));
     assert!(transition.next_state.pending_workflow_task.is_none());
     assert!(transition.dispatch_ops.is_empty());
@@ -1106,7 +1192,7 @@ fn start_and_update_from_absent_is_one_transition() {
     assert_eq!(transition.history_events.len(), 2);
     assert!(matches!(
         transition.history_events[0].kind,
-        HistoryEventKind::WorkflowExecutionStarted { .. }
+        HistoryEventKind::WorkflowExecutionStartedV2 { .. }
     ));
     assert!(matches!(
         transition.history_events[1].kind,
@@ -1153,7 +1239,7 @@ fn signal_with_start_from_absent() {
     assert_eq!(transition.history_events.len(), 3);
     assert!(matches!(
         transition.history_events[0].kind,
-        HistoryEventKind::WorkflowExecutionStarted { .. }
+        HistoryEventKind::WorkflowExecutionStartedV2 { .. }
     ));
     assert!(matches!(
         transition.history_events[1].kind,
@@ -1164,9 +1250,10 @@ fn signal_with_start_from_absent() {
         HistoryEventKind::WorkflowTaskScheduled { .. }
     ));
     match &transition.history_events[0].kind {
-        HistoryEventKind::WorkflowExecutionStarted {
+        HistoryEventKind::WorkflowExecutionStartedV2 {
             header: actual_header,
             links: actual_links,
+            eager_execution_accepted: false,
             ..
         } => {
             assert_eq!(actual_header, &Some(Headers(header.clone())));
@@ -7313,7 +7400,8 @@ fn golden_message_too_large_terminate_history() {
     let kinds: Vec<&'static str> = history
         .iter()
         .map(|event| match &event.kind {
-            HistoryEventKind::WorkflowExecutionStarted { .. } => "WorkflowExecutionStarted",
+            HistoryEventKind::WorkflowExecutionStarted { .. }
+            | HistoryEventKind::WorkflowExecutionStartedV2 { .. } => "WorkflowExecutionStarted",
             HistoryEventKind::WorkflowTaskScheduled { .. } => "WorkflowTaskScheduled",
             HistoryEventKind::WorkflowTaskStarted { .. } => "WorkflowTaskStarted",
             HistoryEventKind::WorkflowTaskFailed { .. } => "WorkflowTaskFailed",

@@ -5413,6 +5413,7 @@ mod tests {
             now: OffsetDateTime::now_utc(),
             cron_schedule: None,
             reserved_poller_identity: None,
+            eager_execution_accepted: false,
         };
 
         let transition = BasicKernel

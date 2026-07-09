@@ -794,6 +794,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     now,
                     client_cron_schedule: None,
                     cron_schedule: None,
+                    eager_execution_accepted: false,
                     reserved_poller_identity: None,
                 }
             },
@@ -1709,7 +1710,7 @@ proptest! {
     fn property_1_start_field_pass_through(req in arb_start_request()) {
         let transition = kernel().apply(LoadedRun::Absent, Command::Start(req.clone())).unwrap();
         let started = match &transition.history_events[0].kind {
-            HistoryEventKind::WorkflowExecutionStarted {
+            HistoryEventKind::WorkflowExecutionStartedV2 {
                 continued_execution_run_id,
                 first_execution_run_id,
                 retry_policy,
@@ -1786,7 +1787,7 @@ proptest! {
             event_cron_schedule,
             event_versioning_override,
         ) = match &transition.history_events[0].kind {
-            HistoryEventKind::WorkflowExecutionStarted {
+            HistoryEventKind::WorkflowExecutionStartedV2 {
                 workflow_start_delay,
                 completion_callbacks,
                 user_metadata,
@@ -1852,7 +1853,7 @@ proptest! {
             .map(|event| &event.kind)
             .collect::<Vec<_>>();
 
-        prop_assert_eq!(matches!(event_kinds[0], HistoryEventKind::WorkflowExecutionStarted { .. }), true);
+        prop_assert_eq!(matches!(event_kinds[0], HistoryEventKind::WorkflowExecutionStartedV2 { .. }), true);
         prop_assert_eq!(matches!(event_kinds[1], HistoryEventKind::WorkflowTaskScheduled { .. }), true);
         prop_assert_eq!(
             matches!(
@@ -1872,6 +1873,44 @@ proptest! {
         prop_assert_eq!(pending.scheduled_event_id, 2);
         prop_assert_eq!(pending.started_event_id, Some(3));
         prop_assert_eq!(transition.next_state.previous_started_event_id, 0);
+        prop_assert_eq!(transition.history_events[0].kind.eager_execution_accepted(), false);
+    }
+
+    #[test]
+    fn eager_start_acceptance_clamp_is_one_way(
+        mut req in arb_start_request(),
+        candidate in any::<bool>(),
+        delay_seconds in prop::option::of(0i64..4),
+        inline_worker in any::<bool>(),
+    ) {
+        // Feature: edge-eager-dispatch, Property 3: Kernel acceptance clamp.
+        // The durable marker is true iff the runtime admitted eager start and
+        // this transition has both an immediately eligible WFT and its inline
+        // worker identity.
+        req.eager_execution_accepted = candidate;
+        req.workflow_start_delay = delay_seconds.map(Duration::seconds);
+        req.reserved_poller_identity = inline_worker
+            .then(|| WorkerIdentity("inline-worker".to_string()));
+
+        let transition = kernel()
+            .apply(LoadedRun::Absent, Command::Start(req))
+            .unwrap();
+        let expected = candidate
+            && delay_seconds.is_none_or(|seconds| seconds == 0)
+            && inline_worker;
+
+        prop_assert_eq!(
+            transition.history_events[0]
+                .kind
+                .eager_execution_accepted(),
+            expected
+        );
+        if expected {
+            prop_assert_eq!(transition.history_events.len(), 3);
+            prop_assert_eq!(transition.history_events[0].event_id, 1);
+            prop_assert_eq!(transition.history_events[1].event_id, 2);
+            prop_assert_eq!(transition.history_events[2].event_id, 3);
+        }
     }
 
     #[test]
@@ -2744,7 +2783,7 @@ proptest! {
         prop_assert_eq!(transition.next_state.root_run_id, Some(expected_run_id));
 
         match &transition.history_events[0].kind {
-            HistoryEventKind::WorkflowExecutionStarted {
+            HistoryEventKind::WorkflowExecutionStartedV2 {
                 root_workflow_id,
                 root_run_id,
                 ..

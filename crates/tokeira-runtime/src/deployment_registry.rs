@@ -2653,6 +2653,7 @@ mod tests {
             },
             now: OffsetDateTime::UNIX_EPOCH,
             cron_schedule: None,
+            eager_execution_accepted: false,
             reserved_poller_identity: None,
         };
         let transition = BasicKernel

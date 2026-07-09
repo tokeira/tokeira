@@ -1231,6 +1231,7 @@ where
         now: actual_time,
         client_cron_schedule: None,
         cron_schedule: Some(schedule_id.0.clone()),
+        eager_execution_accepted: false,
         reserved_poller_identity: None,
     };
 

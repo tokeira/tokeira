@@ -813,13 +813,18 @@ where
         }
 
         let start_event = self.repo.read_history(run_key, 0, 1).await?;
-        let Some(HistoryEventKind::WorkflowExecutionStarted {
-            input,
-            cron_schedule: Some(cron_schedule),
-            ..
-        }) = start_event.first().map(|event| &event.kind)
-        else {
-            return Ok(None);
+        let (input, cron_schedule) = match start_event.first().map(|event| &event.kind) {
+            Some(HistoryEventKind::WorkflowExecutionStarted {
+                input,
+                cron_schedule: Some(cron_schedule),
+                ..
+            })
+            | Some(HistoryEventKind::WorkflowExecutionStartedV2 {
+                input,
+                cron_schedule: Some(cron_schedule),
+                ..
+            }) => (input, cron_schedule),
+            _ => return Ok(None),
         };
         if cron_schedule.is_empty() {
             return Ok(None);
@@ -921,7 +926,8 @@ where
         };
         let start_event = self.repo.read_history(predecessor_run_key, 0, 1).await?;
         let input = match start_event.first().map(|event| &event.kind) {
-            Some(HistoryEventKind::WorkflowExecutionStarted { input, .. }) => input.clone(),
+            Some(HistoryEventKind::WorkflowExecutionStarted { input, .. })
+            | Some(HistoryEventKind::WorkflowExecutionStartedV2 { input, .. }) => input.clone(),
             _ => Payloads::default(),
         };
         let start_request = build_retry_successor_start(&state, &policy, input, new_run_id);
@@ -1174,7 +1180,7 @@ where
         })
     }
 
-    async fn started_workflow_task_from_state(
+    pub(super) async fn started_workflow_task_from_state(
         &self,
         state: &WorkflowState,
         is_sticky_match: bool,
@@ -1183,13 +1189,13 @@ where
         let pending = state
             .pending_workflow_task
             .clone()
-            .ok_or_else(|| anyhow!("workflow task missing after reserved start"))?;
+            .ok_or_else(|| anyhow!("workflow task missing after direct start"))?;
         let started_event_id = pending
             .started_event_id
-            .ok_or_else(|| anyhow!("reserved workflow task missing started_event_id"))?;
+            .ok_or_else(|| anyhow!("direct-start workflow task missing started_event_id"))?;
         let started_at = pending
             .started_at
-            .ok_or_else(|| anyhow!("reserved workflow task missing started_at"))?;
+            .ok_or_else(|| anyhow!("direct-start workflow task missing started_at"))?;
         let token = WorkflowTaskToken {
             run_key: state.run_key,
             logical_seq: pending.logical_seq,
@@ -1410,6 +1416,7 @@ pub(crate) fn build_retry_successor_start(
         now: OffsetDateTime::now_utc(),
         client_cron_schedule: None,
         cron_schedule: None,
+        eager_execution_accepted: false,
         reserved_poller_identity: None,
     }
 }
@@ -1521,6 +1528,7 @@ pub(crate) fn build_cron_successor_start(
         now: execution_started_at,
         client_cron_schedule: None,
         cron_schedule: Some(cron_schedule),
+        eager_execution_accepted: false,
         reserved_poller_identity: None,
     })
 }

@@ -2913,16 +2913,16 @@ pub fn poll_response_to_proto(
         .payload
         .history
         .first()
-        .and_then(|ev| {
-            if let tokeira_kernel::event::HistoryEventKind::WorkflowExecutionStarted {
-                ref workflow_type,
+        .and_then(|ev| match &ev.kind {
+            tokeira_kernel::event::HistoryEventKind::WorkflowExecutionStarted {
+                workflow_type,
                 ..
-            } = ev.kind
-            {
-                Some(workflow_type.0.clone())
-            } else {
-                None
             }
+            | tokeira_kernel::event::HistoryEventKind::WorkflowExecutionStartedV2 {
+                workflow_type,
+                ..
+            } => Some(workflow_type.0.clone()),
+            _ => None,
         })
         .unwrap_or_default();
 
@@ -3555,7 +3555,9 @@ pub fn namespace_to_proto(
             data: std::collections::BTreeMap::new(),
             id: namespace.namespace_id.unwrap_or_default(),
             capabilities: Some(namespace_proto::namespace_info::Capabilities {
-                eager_workflow_start: false,
+                // Namespace capability mirrors the v1.31.0 enabled default
+                // (namespace_handler.go:862 @ v1.31.0).
+                eager_workflow_start: true,
                 sync_update: true,
                 async_update: true,
                 // temporal-api-v1.62-sync accepts RecordWorkerHeartbeat as a
@@ -7444,11 +7446,14 @@ mod tests {
             .unwrap()
             .capabilities
             .unwrap()
-            .standalone_activities
         };
         // The capability tracks the server-uniform flag (Req 13.4), not a constant.
-        assert!(describe(true));
-        assert!(!describe(false));
+        let enabled = describe(true);
+        assert!(enabled.standalone_activities);
+        assert!(enabled.eager_workflow_start);
+        let disabled = describe(false);
+        assert!(!disabled.standalone_activities);
+        assert!(disabled.eager_workflow_start);
     }
 
     #[test]

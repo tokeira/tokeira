@@ -6,10 +6,10 @@ This spec implements Eager Dispatch — an optimization where the server returns
 
 Eager dispatch has two independent paths:
 
-1. **Eager workflow task on `StartWorkflowExecution`**: When the caller sets `request_eager_execution=true` and is a compatible poller on the workflow's task queue, the first workflow task is claimed from the `InMemoryBroker` and returned inline in `StartWorkflowExecutionResponse.eager_workflow_task`.
+1. **Eager workflow task on `StartWorkflowExecution`**: When the caller sets `request_eager_execution=true`, eager workflow start is enabled, and the first workflow task has no backoff, the runtime commits the first workflow task as started in the run-creation transition and returns it inline in `StartWorkflowExecutionResponse.eager_workflow_task`. Temporal v1.31.0 does not require a server-observed active poller; the caller is the intended worker.
 2. **Eager activity tasks on `RespondWorkflowTaskCompleted`**: When the completing worker sets `return_new_workflow_task=true` and the workflow task completion schedules activities, eligible activity tasks are claimed from the `InMemoryActivityBroker` and returned inline in `RespondWorkflowTaskCompletedResponse.activity_tasks`. The activity commands must carry `request_eager_execution=true` to be eligible.
 
-Both paths require the broker to support an atomic "claim" operation that removes a task from the ready queue before any normal poller can take it. If the eager response fails to reach the client (connection drop), the claimed task is recovered by the existing WFT/activity timeout mechanism — the task times out and gets rescheduled by the scanner.
+The workflow-start path does not put correctness weight on the broker: the kernel's existing reserved-start path authors `WorkflowExecutionStarted`, `WorkflowTaskScheduled`, and `WorkflowTaskStarted` in one transition. The activity path retains its targeted broker claim. If an eager response fails to reach the client, the existing workflow-task or activity timeout mechanism recovers the already-authoritative pending work.
 
 The edge layer already has a partial eager pattern: `respond_workflow_task_completed` builds an inline query-only WFT via `build_eager_query_workflow_task` when `return_new_workflow_task=true` and buffered queries exist. This spec extends that pattern to cover the two proto-defined eager dispatch paths.
 
@@ -18,7 +18,7 @@ Dependencies: Features 1 (poll response fidelity) and 2 (failure object complete
 The implementation is organized into three phases:
 - Phase 1: Eager workflow task on `StartWorkflowExecution`
 - Phase 2: Eager activity tasks on `RespondWorkflowTaskCompleted`
-- Phase 3: Broker coordination (atomic claim, re-enqueue safety)
+- Phase 3: Activity/direct broker coordination and timeout recovery
 
 ## Glossary
 
@@ -27,13 +27,22 @@ The implementation is organized into three phases:
 - **Kernel**: The pure state-machine in `tokeira-kernel` that computes all workflow state transitions with zero I/O.
 - **InMemoryBroker**: The in-memory workflow task broker in `tokeira-runtime/src/broker.rs` that queues `DispatchableWorkflowTask` entries by `QueueKey` (namespace, task_queue), with sticky/general tiers and `Notify`-based long-poll wake.
 - **InMemoryActivityBroker**: The in-memory activity task broker in `tokeira-runtime/src/broker.rs` that queues `DispatchableActivityTask` entries by `QueueKey`.
-- **PollerRegistry**: The `PollerRegistry` in `tokeira-edge/src/poller_registry.rs` that tracks active long-poll registrations by `QueueKey` and `WorkerIdentity`, with RAII cleanup when polls complete or time out.
 - **Eager_Workflow_Task**: A `PollWorkflowTaskQueueResponse` returned inline in `StartWorkflowExecutionResponse.eager_workflow_task`, containing the first workflow task for a just-started workflow.
 - **Eager_Activity_Task**: A `PollActivityTaskQueueResponse` returned inline in `RespondWorkflowTaskCompletedResponse.activity_tasks`, containing an activity task scheduled by the just-completed workflow task.
+- **Eager_Acceptance**: The runtime-owned, pre-gated decision that eager workflow start is enabled and the first WFT can be started inline. The kernel records this decision and may only clamp it to `false` when the transition does not actually start the WFT inline.
 - **Atomic_Claim**: A broker operation that removes a task from the ready queue in a single lock acquisition, preventing the task from being delivered to a normal poller concurrently.
-- **Compatible_Poller**: A worker that has an active `PollerRegistry` entry on the same `QueueKey` as the workflow being started, making it eligible to receive an eager workflow task.
 - **Poll_Response**: The proto `PollWorkflowTaskQueueResponse` or `PollActivityTaskQueueResponse` returned to SDK workers.
 - **QueueKey**: The (namespace_id, task_queue, versioning) tuple used to key broker queues.
+
+## Target State and Ground Truth
+
+- Wire request/response shape comes from `proto/upstream/temporal/api/workflowservice/v1/request_response.proto`; durable acceptance is field 38, `eager_execution_accepted`, in `proto/upstream/temporal/api/history/v1/message.proto`.
+- `service/history/api/startworkflow/api.go @ v1.31.0` pre-gates the request flag: disabled eager start and first-WFT backoff force it to `false`; an immediate request-id retry returns the still-started first WFT, while a retry after fallback does not.
+- `service/history/historybuilder/event_factory.go @ v1.31.0` copies the already-gated flag into `WorkflowExecutionStarted.eager_execution_accepted`; the event builder does not own the config decision.
+- `service/history/api/create_workflow_util.go @ v1.31.0` schedules and starts the accepted first WFT while creating the run. Tokeira matches that observable result through its existing `reserved_poller_identity` start branch, without requiring a live `PollerRegistry` entry.
+- Current Tokeira code incorrectly gates eager start on `PollerRegistry::has_active_poller`, claims after publication, omits the durable history flag, and always omits the eager task on request-id dedup. Tier 3.18's six leaves therefore fail at the missing eager task.
+
+The pinned v1.31.0 eager-enable default is a constant `true`, not a new operator knob. Feature-mode testing may inject the disabled value into the pure admission decision, but the default server path remains enabled.
 
 ## Requirements
 
@@ -50,27 +59,36 @@ The implementation is organized into three phases:
 1. WHEN a `StartWorkflowExecutionRequest` proto is received with `request_eager_execution` set to `true`, THE Edge_Layer SHALL preserve the flag in the internal `StartWorkflowExecutionRequest` struct.
 2. WHEN a `StartWorkflowExecutionRequest` proto is received with `request_eager_execution` set to `false` or unset, THE Edge_Layer SHALL set the internal flag to `false`.
 
-### Requirement 2: Compatible Poller Check
+### Requirement 2: Eager Acceptance Decision
 
-**User Story:** As a Tokeira developer, I want the edge layer to determine whether the calling worker is a compatible poller on the workflow's task queue, so that eager workflow tasks are only returned to workers that can execute them.
+**User Story:** As a Tokeira developer, I want the runtime to decide eager acceptance before the start transition, so that history and the inline response always describe the same outcome.
 
 #### Acceptance Criteria
 
-1. WHEN `request_eager_execution` is `true` on a `StartWorkflowExecution` request, THE Edge_Layer SHALL check the `PollerRegistry` for an active poller matching the request's (identity, namespace, task_queue) combination. The `PollerRegistry` is the authoritative source for active poll registrations — it is populated by the live long-poll path and cleaned up when polls complete or time out.
-2. WHEN the PollerRegistry contains a matching active poller for the caller, THE Edge_Layer SHALL consider the caller a Compatible_Poller and proceed with eager dispatch.
-3. WHEN the PollerRegistry does not contain a matching active poller for the caller, THE Edge_Layer SHALL skip eager dispatch and return the response without an `eager_workflow_task` field.
+1. WHEN `request_eager_execution` is `true`, eager workflow start is enabled, and the effective first-WFT backoff is zero, THE Runtime SHALL set the kernel-facing `eager_execution_accepted` value to `true`.
+2. WHEN eager workflow start is accepted, THE Runtime SHALL identify the request's caller as the inline worker for the atomic start transition.
+3. WHEN `request_eager_execution` is `false` or eager workflow start is disabled, THE Runtime SHALL set `eager_execution_accepted` to `false`.
+4. WHEN the effective first-WFT backoff is positive, THE Runtime SHALL set `eager_execution_accepted` to `false`.
+5. THE Runtime SHALL NOT require an active `PollerRegistry` entry to accept eager workflow start.
+6. IF `eager_execution_accepted` reaches the Kernel without both a zero first-WFT backoff and an inline worker identity, THEN THE Kernel SHALL clamp the recorded value to `false`.
+7. THE Kernel SHALL NOT promote a runtime-supplied `false` acceptance decision to `true`.
+8. WHEN an internal start path does not originate from an accepted eager `StartWorkflowExecution` request, THE Runtime SHALL set `eager_execution_accepted` to `false`.
 
-### Requirement 3: Eager Workflow Task Claim and Return
+### Requirement 3: Atomic Eager Workflow Start and Return
 
 **User Story:** As an SDK user, I want `StartWorkflowExecutionResponse` to include the first workflow task inline when I set `request_eager_execution=true`, so that my worker can begin executing the workflow immediately without a separate poll round-trip.
 
 #### Acceptance Criteria
 
-1. WHEN a workflow is successfully started with `request_eager_execution=true` and the caller is a Compatible_Poller, THE Edge_Layer SHALL attempt to claim the first workflow task from the InMemoryBroker using an Atomic_Claim operation on the workflow's task queue.
-2. WHEN the Atomic_Claim succeeds, THE Edge_Layer SHALL build a complete `PollWorkflowTaskQueueResponse` from the claimed task and return it in the `eager_workflow_task` field of `StartWorkflowExecutionResponse`.
-3. WHEN the Atomic_Claim fails (task not yet published, already taken by a poller, or queue empty), THE Edge_Layer SHALL return the `StartWorkflowExecutionResponse` without an `eager_workflow_task` field (the task will be delivered via normal polling).
-4. THE Eager_Workflow_Task SHALL use the same task token encoding as a normally polled workflow task.
-5. THE Eager_Workflow_Task SHALL include all fields required by a complete `PollWorkflowTaskQueueResponse`: `task_token`, `started_event_id`, `previous_started_event_id`, `attempt`, `scheduled_time`, `started_time`, history payload, and workflow metadata.
+1. WHEN a new workflow is started with `eager_execution_accepted=true`, THE Kernel SHALL author `WorkflowExecutionStarted`, `WorkflowTaskScheduled`, and `WorkflowTaskStarted` in the same transition.
+2. WHEN the accepted start transition commits, THE Runtime SHALL return the committed started WFT directly to the Edge.
+3. WHEN eager workflow start is accepted, THE Runtime SHALL NOT publish and re-claim the first WFT through the InMemoryBroker.
+4. WHEN eager execution is not accepted, THE Runtime SHALL preserve normal workflow-task dispatch behavior and return no eager WFT.
+5. THE Eager_Workflow_Task SHALL use the same task token encoding as a normally polled workflow task.
+6. THE Eager_Workflow_Task SHALL include all fields required by a complete `PollWorkflowTaskQueueResponse`: `task_token`, `started_event_id`, `previous_started_event_id`, `attempt`, `scheduled_time`, `started_time`, history payload, and workflow metadata.
+7. WHEN a successful fresh-start response carries an eager WFT, THE authoritative `WorkflowExecutionStarted` event SHALL record `eager_execution_accepted=true`.
+8. WHEN a successful fresh-start response carries no eager WFT, THE authoritative `WorkflowExecutionStarted` event SHALL record `eager_execution_accepted=false`.
+9. WHEN a non-eager start synchronously matches a parked normal poller, THE authoritative `WorkflowExecutionStarted` event SHALL record `eager_execution_accepted=false`.
 
 ### Requirement 4: StartWorkflowExecutionResponse Proto Translation
 
@@ -80,6 +98,8 @@ The implementation is organized into three phases:
 
 1. WHEN the internal `StartWorkflowExecutionResponse` contains an `eager_workflow_task`, THE proto translation function SHALL populate the `eager_workflow_task` field on the proto response using the same serialization path as `poll_workflow_task_queue_response_to_proto`.
 2. WHEN the internal `StartWorkflowExecutionResponse` does not contain an `eager_workflow_task`, THE proto translation function SHALL leave the `eager_workflow_task` field unset on the proto response.
+3. WHEN history contains `WorkflowExecutionStarted.eager_execution_accepted=true`, THE history serializer SHALL populate proto field 38 with `true` in both the inline response and later history reads.
+4. WHEN history contains the legacy `WorkflowExecutionStarted` event shape, THE history serializer SHALL emit `eager_execution_accepted=false`.
 
 ---
 
@@ -130,9 +150,9 @@ The implementation is organized into three phases:
 
 ## Phase 3: Broker Coordination
 
-### Requirement 9: InMemoryBroker Targeted Claim for Workflow Tasks
+### Requirement 9: InMemoryBroker Targeted Claim for Direct Workflow Tasks
 
-**User Story:** As a Tokeira developer, I want the InMemoryBroker to support a targeted claim operation that removes a specific workflow task (identified by run_key) from the ready queue without blocking, so that the eager dispatch path claims the just-started workflow's task and not an unrelated workflow's task.
+**User Story:** As a Tokeira developer, I want the InMemoryBroker to retain a targeted claim operation for non-start direct-delivery paths, so that those paths never claim an unrelated workflow's task.
 
 #### Acceptance Criteria
 
@@ -160,16 +180,38 @@ The implementation is organized into three phases:
 
 #### Acceptance Criteria
 
-1. WHEN an Eager_Workflow_Task is claimed and returned to the client, THE Runtime SHALL rely on the existing WFT timeout mechanism to detect non-completion: if the worker does not call `RespondWorkflowTaskCompleted` within the `workflow_task_timeout`, the WFT timeout scanner SHALL reschedule the workflow task.
+1. WHEN an Eager_Workflow_Task is committed as started and returned to the client, THE Runtime SHALL rely on the existing WFT start-to-close timeout mechanism to detect non-completion and reschedule the workflow task.
 2. WHEN an Eager_Activity_Task is claimed and returned to the client, THE Runtime SHALL rely on the existing activity timeout mechanisms (schedule-to-start, start-to-close, schedule-to-close) to detect non-completion and reschedule the activity task.
 3. THE eager dispatch path SHALL NOT introduce any new timeout or re-enqueue mechanism — the existing scanner-based recovery is sufficient because eagerly claimed tasks are indistinguishable from normally polled tasks once claimed.
 
-### Requirement 12: Claim Timing and Publish Ordering
+### Requirement 12: Authoritative Commit and Publish Ordering
 
-**User Story:** As a Tokeira developer, I want the eager claim to happen after the runtime has published the task to the broker, so that the claim always targets a task that exists in the ready queue.
+**User Story:** As a Tokeira developer, I want every eager response to be derived from committed authoritative state, so that a lost broker entry or response cannot lose work.
 
 #### Acceptance Criteria
 
-1. WHEN the Edge_Layer attempts an eager workflow task claim after `start_workflow`, THE claim SHALL occur after the runtime's `start_workflow_with_policy` has committed the transition and the dispatch publisher has published the workflow task to the InMemoryBroker.
+1. WHEN eager workflow start is accepted, THE Runtime SHALL commit the run and started first WFT before constructing `StartWorkflowExecutionResponse`.
 2. WHEN the Edge_Layer attempts eager activity task claims after `complete_workflow_task`, THE claims SHALL occur after the runtime's `complete_workflow_task` has committed the transition and the dispatch publisher has published the activity tasks to the InMemoryActivityBroker.
-3. IF the dispatch publisher has not yet published the task at claim time (race condition), THE Atomic_Claim SHALL return `None` and the task will be delivered via normal polling.
+3. IF the activity dispatch publisher has not yet published an eager-eligible activity at claim time, THEN THE Atomic_Claim SHALL return `None`.
+4. WHEN an eager activity claim returns `None`, THE Runtime SHALL leave the authoritative pending activity eligible for normal polling.
+
+### Requirement 13: Request-ID Retry Fidelity
+
+**User Story:** As an SDK user, I want a retried eager start to return the same still-live first WFT, so that transport retries do not discard the eager optimization or duplicate work.
+
+#### Acceptance Criteria
+
+1. WHEN an eager `StartWorkflowExecution` request is retried with the same request ID, the authoritative start event records `eager_execution_accepted=true`, and the first WFT remains started with `started_event_id=3`, `attempt=1`, and an unexpired start-to-close deadline, THE Runtime SHALL return that WFT in `eager_workflow_task`.
+2. WHEN the same start request is retried after the first WFT timed out, its start-to-close deadline elapsed, or it fell back to a later attempt, THE Runtime SHALL omit `eager_workflow_task`.
+3. WHEN an eager start is retried, THE Runtime SHALL NOT author a second workflow start or workflow-task-start transition.
+4. WHEN a duplicate request changes `request_eager_execution` from false to true but the authoritative start event records `eager_execution_accepted=false`, THE Runtime SHALL omit `eager_workflow_task`.
+
+### Requirement 14: Capability Advertisement
+
+**User Story:** As an SDK user, I want the server to advertise eager workflow start when it implements the behaviour, so that SDK eager dispatchers actually request the feature.
+
+#### Acceptance Criteria
+
+1. WHERE the pinned eager-workflow-start default is enabled, THE `GetSystemInfo` response SHALL report `capabilities.eager_workflow_start=true`.
+2. WHERE the pinned eager-workflow-start default is enabled, THE namespace capability response SHALL report `eager_workflow_start=true`.
+3. WHEN Tier 3.18 passes clean, THE compatibility matrix SHALL classify eager workflow start as `Implemented` with corpus evidence.

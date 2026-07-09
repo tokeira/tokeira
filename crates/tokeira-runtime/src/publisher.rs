@@ -419,6 +419,7 @@ where
             now: OffsetDateTime::now_utc(),
             client_cron_schedule: None,
             cron_schedule,
+            eager_execution_accepted: false,
             reserved_poller_identity: None,
         };
 

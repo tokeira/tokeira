@@ -372,10 +372,11 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
     let successor_history = store.read_history(successor_key, 0, 1).await?;
     assert!(matches!(
         successor_history.first().map(|event| &event.kind),
-        Some(HistoryEventKind::WorkflowExecutionStarted {
+        Some(HistoryEventKind::WorkflowExecutionStartedV2 {
             continued_execution_run_id,
             cron_schedule,
             workflow_start_delay,
+            eager_execution_accepted: false,
             ..
         }) if *continued_execution_run_id == Some(predecessor.run_id)
             && cron_schedule.as_deref() == Some("* * * * *")
@@ -584,10 +585,11 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
     let successor_history = store.read_history(successor_key, 0, 1).await?;
     assert!(matches!(
         successor_history.first().map(|event| &event.kind),
-        Some(HistoryEventKind::WorkflowExecutionStarted {
+        Some(HistoryEventKind::WorkflowExecutionStartedV2 {
             continued_execution_run_id,
             cron_schedule,
             workflow_start_delay,
+            eager_execution_accepted: false,
             ..
         }) if *continued_execution_run_id == Some(predecessor.run_id)
             && cron_schedule.as_deref() == Some("* * * * *")
@@ -895,9 +897,10 @@ async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
     let successor_history = store.read_history(successor_key, 0, 1).await?;
     assert!(matches!(
         successor_history.first().map(|event| &event.kind),
-        Some(HistoryEventKind::WorkflowExecutionStarted {
+        Some(HistoryEventKind::WorkflowExecutionStartedV2 {
             continued_execution_run_id,
             attempt,
+            eager_execution_accepted: false,
             ..
         }) if *continued_execution_run_id == Some(predecessor.run_id) && *attempt == 2
     ));
@@ -1151,6 +1154,7 @@ fn start_request(
         now: OffsetDateTime::now_utc(),
         client_cron_schedule: None,
         cron_schedule: None,
+        eager_execution_accepted: false,
         reserved_poller_identity: None,
     }
 }

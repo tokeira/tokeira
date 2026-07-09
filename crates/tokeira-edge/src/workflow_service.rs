@@ -2097,6 +2097,7 @@ impl WorkflowService {
             client_cron_schedule: None,
             cron_schedule: Some(schedule_id.0.clone()),
             reserved_poller_identity: None,
+            eager_execution_accepted: false,
         };
         let outcome = self
             .runtime
@@ -2384,8 +2385,6 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let eager_requested = req.request_eager_execution;
-                let eager_identity = req.identity.clone().map(WorkerIdentity);
                 let namespace = req.namespace.clone();
                 let workflow_id = req.workflow_id.clone();
                 let ctx = self
@@ -2405,13 +2404,6 @@ impl WorkflowService {
                     &ctx.request_id,
                     Some(self.versioning_rule_store.as_ref()),
                 );
-                let eager_queue = tokeira_types::QueueKey {
-                    namespace_id: internal.namespace_id,
-                    task_queue: internal.task_queue.clone(),
-                    task_kind: TaskKind::Workflow,
-                    deployment: internal.deployment.clone(),
-                    build_id: internal.build_id.clone(),
-                };
                 let outcome = self
                     .runtime
                     .start_workflow_with_policy(internal.clone())
@@ -2419,7 +2411,9 @@ impl WorkflowService {
                     .map_err(EdgeError::from)?;
                 match outcome {
                     StartWorkflowResult::Started {
-                        mutation_metadata, ..
+                        mutation_metadata,
+                        eager_workflow_task,
+                        ..
                     } => {
                         self.notify_history_run_key(
                             internal.run_key,
@@ -2436,23 +2430,14 @@ impl WorkflowService {
                                 new_run_id: None,
                             },
                         );
-                        if eager_requested
-                            && let Some(identity) = eager_identity
-                            && self
-                                .poller_registry
-                                .has_active_poller(&eager_queue, &identity)
-                            && let Some(started) = self
-                                .runtime
-                                .try_claim_workflow_task(eager_queue, internal.run_key, identity)
-                                .await
-                                .map_err(EdgeError::from)?
-                        {
-                            response.eager_workflow_task = Some(
+                        response.eager_workflow_task = match eager_workflow_task {
+                            Some(started) => Some(
                                 from_internal::poll_response(started, self.repo.as_ref())
                                     .await
                                     .map_err(EdgeError::from)?,
-                            );
-                        }
+                            ),
+                            None => None,
+                        };
                         Ok(response)
                     }
                     StartWorkflowResult::UsedExisting { run_key, run_id } => {
@@ -2491,12 +2476,21 @@ impl WorkflowService {
                         run_key,
                         run_id,
                         execution_status,
+                        eager_workflow_task,
                     } => {
                         // A retried start whose RequestId already authored this run's
                         // WorkflowExecutionStarted: v1.31.0 respondToRetriedRequest returns the
                         // existing run with Started=true and the incumbent's Status
                         // (startworkflow/api.go:332-336, 563/567). The EventRef self-link to
                         // event 1 is synthesised by the proto layer from run_id.
+                        let eager_workflow_task = match eager_workflow_task {
+                            Some(started) => Some(
+                                from_internal::poll_response(started, self.repo.as_ref())
+                                    .await
+                                    .map_err(EdgeError::from)?,
+                            ),
+                            None => None,
+                        };
                         Ok(StartWorkflowExecutionResponse {
                             run_key,
                             run_id,
@@ -2505,7 +2499,7 @@ impl WorkflowService {
                             started: true,
                             status: execution_status,
                             attached_request_id: None,
-                            eager_workflow_task: None,
+                            eager_workflow_task,
                         })
                     }
                     StartWorkflowResult::Rejected { run_id, reason, .. } => {
@@ -3338,7 +3332,9 @@ impl WorkflowService {
                     encoded_failure_attributes: true,
                     build_id_based_versioning: true,
                     upsert_memo: false,
-                    eager_workflow_start: false,
+                    // v1.31.0 advertises this capability unconditionally from
+                    // GetSystemInfo (workflow_handler.go:3385 @ v1.31.0).
+                    eager_workflow_start: true,
                     // Gates every SDK lang-flag behavior (sdkFlags.tryUse
                     // returns false without it — internal_flags.go @ sdk
                     // v1.41.1), including SDKPriorityUpdateHandling: without
@@ -6059,7 +6055,7 @@ mod tests {
         BacklogConfig, InMemoryBroker, LaneConfig, TimerScannerConfig, TokeiraRuntime,
         UpdateLifecycleStage, UpdateWaitPolicy, WorkflowTimeoutScannerConfig,
     };
-    use tokeira_storage::{CommitResult, InMemoryStore};
+    use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
     use tokeira_types::{
         ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext, RequestId, RunId,
         RunKey, SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
@@ -6149,7 +6145,7 @@ mod tests {
             encoded_failure_attributes: true,
             build_id_based_versioning: true,
             upsert_memo: false,
-            eager_workflow_start: false,
+            eager_workflow_start: true,
             sdk_metadata: false,
             count_group_by_execution_status: true,
             nexus: true,
@@ -6279,6 +6275,7 @@ mod tests {
                 now: OffsetDateTime::now_utc(),
                 cron_schedule: None,
                 reserved_poller_identity: None,
+                eager_execution_accepted: false,
             })
             .await?;
         assert!(matches!(result, CommitResult::Applied { .. }));
@@ -6371,6 +6368,65 @@ mod tests {
             run_id: None,
             now: None,
         }
+    }
+
+    // Feature: edge-eager-dispatch, Properties 2/4/5. The v1.31.0 caller is
+    // the intended eager worker; server-observed long-poll registration is not
+    // an admission condition (service/history/api/startworkflow/api.go and
+    // create_workflow_util.go @ v1.31.0).
+    #[tokio::test]
+    async fn eager_start_does_not_require_registered_poller() -> Result<()> {
+        let (service, runtime, _namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        let workflow_id = WorkflowId("eager-without-poller".to_string());
+        let mut request = start_request_for(
+            &workflow_id,
+            tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+            "eager-start-request",
+        );
+        request.request_eager_execution = true;
+        let retry = request.clone();
+
+        let response = service
+            .start_workflow_execution(&HeaderMap::new(), request)
+            .await?;
+
+        assert!(response.eager_workflow_task.is_some());
+        let history = runtime
+            .repo()
+            .read_history(response.run_key, 0, usize::MAX)
+            .await?;
+        assert_eq!(
+            history[0].kind.eager_execution_accepted(),
+            response.eager_workflow_task.is_some()
+        );
+        let retried = service
+            .start_workflow_execution(&HeaderMap::new(), retry)
+            .await?;
+        assert_eq!(retried.run_id, response.run_id);
+        assert!(retried.eager_workflow_task.is_some());
+
+        let non_eager_workflow_id = WorkflowId("non-eager-history-agreement".to_string());
+        let non_eager = service
+            .start_workflow_execution(
+                &HeaderMap::new(),
+                start_request_for(
+                    &non_eager_workflow_id,
+                    tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+                    "non-eager-start-request",
+                ),
+            )
+            .await?;
+        assert!(non_eager.eager_workflow_task.is_none());
+        let non_eager_history = runtime
+            .repo()
+            .read_history(non_eager.run_key, 0, usize::MAX)
+            .await?;
+        assert_eq!(
+            non_eager_history[0].kind.eager_execution_accepted(),
+            non_eager.eager_workflow_task.is_some()
+        );
+        Ok(())
     }
 
     // Conformance: a UseExisting start that attaches to a running incumbent
@@ -6599,7 +6655,7 @@ mod tests {
 
         assert!(capabilities.signal_and_query_header);
         assert!(capabilities.build_id_based_versioning);
-        assert!(!capabilities.eager_workflow_start);
+        assert!(capabilities.eager_workflow_start);
     }
 
     #[test]

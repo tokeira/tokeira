@@ -150,6 +150,9 @@ pub fn start_request(
         client_cron_schedule: req.cron_schedule.clone(),
         cron_schedule: req.cron_schedule,
         reserved_poller_identity: None,
+        // The runtime owns final admission (pinned enable + effective
+        // first-WFT backoff); the edge only preserves the caller's candidate.
+        eager_execution_accepted: req.request_eager_execution,
     }
 }
 
@@ -1017,6 +1020,7 @@ mod tests {
         let non_eager = start_request(dto.clone(), &RequestId::new("req"), Some(&store));
         assert_eq!(non_eager.deployment, None);
         assert_eq!(non_eager.build_id, Some(BuildId("rule-build".to_string())));
+        assert!(!non_eager.eager_execution_accepted);
 
         dto.request_eager_execution = true;
         let eager = start_request(dto, &RequestId::new("req"), Some(&store));
@@ -1025,6 +1029,7 @@ mod tests {
             Some(DeploymentId("eager-deployment".to_string()))
         );
         assert_eq!(eager.build_id, Some(BuildId("eager-build".to_string())));
+        assert!(eager.eager_execution_accepted);
     }
 
     #[test]

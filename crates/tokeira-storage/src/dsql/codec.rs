@@ -144,6 +144,7 @@ mod tests {
 
     use proptest::prelude::*;
     use time::OffsetDateTime;
+    use tokeira_kernel::HistoryEventKind;
     use tokeira_types::{
         ArchetypeId, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payload, ProjectionCursor,
         RunId, RunKey, SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
@@ -152,6 +153,122 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    // Encoded by `encode_history_events` at f27ee1d9, before the append-only
+    // started-event V2 variant existed. Keeping literal bytes avoids a shadow
+    // legacy type that could accidentally evolve with the production enum.
+    const LEGACY_WORKFLOW_EXECUTION_STARTED_V1: &[u8] = &[
+        1, 2, 228, 30, 1, 0, 0, 0, 0, 0, 0, 0, 0, 16, 102, 105, 120, 116, 117, 114, 101, 45, 119,
+        111, 114, 107, 102, 108, 111, 119, 13, 102, 105, 120, 116, 117, 114, 101, 45, 113, 117,
+        101, 117, 101, 0, 0, 0, 0, 15, 102, 105, 120, 116, 117, 114, 101, 45, 114, 101, 113, 117,
+        101, 115, 116, 14, 102, 105, 120, 116, 117, 114, 101, 45, 119, 111, 114, 107, 101, 114, 0,
+        0, 0, 0, 1, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    #[test]
+    fn legacy_workflow_started_fixture_decodes_and_v2_round_trips() {
+        // Feature: edge-eager-dispatch, Property 7: Legacy started-event decoding.
+        // The immediate pre-Tier-3.18 bytes remain readable as non-eager V1,
+        // while the appended V2 shape durably round-trips an accepted marker.
+        let mut decoded = decode_history_events(LEGACY_WORKFLOW_EXECUTION_STARTED_V1).unwrap();
+        assert_eq!(decoded.len(), 1);
+        let legacy = decoded.pop().unwrap();
+        assert!(matches!(
+            &legacy.kind,
+            HistoryEventKind::WorkflowExecutionStarted { .. }
+        ));
+        assert!(!legacy.kind.eager_execution_accepted());
+
+        let HistoryEvent {
+            event_id,
+            happened_at,
+            kind:
+                HistoryEventKind::WorkflowExecutionStarted {
+                    workflow_type,
+                    task_queue,
+                    input,
+                    header,
+                    memo,
+                    search_attributes,
+                    request_id,
+                    identity,
+                    continued_execution_run_id,
+                    first_execution_run_id,
+                    retry_policy,
+                    initiator,
+                    attempt,
+                    workflow_execution_timeout,
+                    workflow_run_timeout,
+                    workflow_task_timeout,
+                    parent_workflow_id,
+                    parent_run_id,
+                    parent_namespace_id,
+                    parent_namespace_name,
+                    parent_initiated_event_id,
+                    root_workflow_id,
+                    root_run_id,
+                    original_execution_run_id,
+                    continued_failure,
+                    last_completion_result,
+                    cron_schedule,
+                    workflow_start_delay,
+                    completion_callbacks,
+                    user_metadata,
+                    links,
+                    priority,
+                    versioning_info,
+                    worker_deployment_name,
+                },
+        } = legacy
+        else {
+            unreachable!("legacy fixture kind was asserted above")
+        };
+        let current = HistoryEvent {
+            event_id,
+            happened_at,
+            kind: HistoryEventKind::WorkflowExecutionStartedV2 {
+                workflow_type,
+                task_queue,
+                input,
+                header,
+                memo,
+                search_attributes,
+                request_id,
+                identity,
+                continued_execution_run_id,
+                first_execution_run_id,
+                retry_policy,
+                initiator,
+                attempt,
+                workflow_execution_timeout,
+                workflow_run_timeout,
+                workflow_task_timeout,
+                parent_workflow_id,
+                parent_run_id,
+                parent_namespace_id,
+                parent_namespace_name,
+                parent_initiated_event_id,
+                root_workflow_id,
+                root_run_id,
+                original_execution_run_id,
+                continued_failure,
+                last_completion_result,
+                cron_schedule,
+                workflow_start_delay,
+                completion_callbacks,
+                user_metadata,
+                links,
+                priority,
+                versioning_info,
+                worker_deployment_name,
+                eager_execution_accepted: true,
+            },
+        };
+        let encoded = encode_history_events(std::slice::from_ref(&current)).unwrap();
+        let round_trip = decode_history_events(&encoded).unwrap();
+        assert_eq!(round_trip, vec![current]);
+        assert!(round_trip[0].kind.eager_execution_accepted());
+    }
 
     proptest! {
         #[test]

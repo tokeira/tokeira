@@ -269,7 +269,7 @@ impl BasicKernel {
         events: &[HistoryEvent],
     ) -> Result<WorkflowState, Reject> {
         let first = events.first().ok_or(Reject::InvalidReplayHistory)?;
-        let HistoryEventKind::WorkflowExecutionStarted {
+        let (HistoryEventKind::WorkflowExecutionStarted {
             workflow_type,
             task_queue,
             memo,
@@ -297,7 +297,36 @@ impl BasicKernel {
             worker_deployment_name,
             request_id,
             ..
-        } = &first.kind
+        }
+        | HistoryEventKind::WorkflowExecutionStartedV2 {
+            workflow_type,
+            task_queue,
+            memo,
+            search_attributes,
+            retry_policy,
+            attempt,
+            first_execution_run_id,
+            original_execution_run_id,
+            workflow_execution_timeout,
+            workflow_run_timeout,
+            workflow_task_timeout,
+            parent_run_id,
+            parent_namespace_id,
+            parent_namespace_name,
+            parent_initiated_event_id,
+            root_workflow_id,
+            root_run_id,
+            last_completion_result,
+            workflow_start_delay,
+            completion_callbacks,
+            user_metadata,
+            links,
+            priority,
+            versioning_info,
+            worker_deployment_name,
+            request_id,
+            ..
+        }) = &first.kind
         else {
             return Err(Reject::InvalidReplayHistory);
         };
@@ -404,6 +433,15 @@ impl BasicKernel {
         }
         // Captured before the started-event emit below moves the request id.
         let start_request_id = req.request.request_id.0.clone();
+        // The runtime owns the positive admission decision, but the kernel
+        // refuses to persist it unless this exact transition can atomically
+        // start the first WFT for an inline worker. This is intentionally a
+        // one-way clamp: a rejected candidate can never become accepted here
+        // (`startworkflow/api.go:144-157` and `create_workflow_util.go`
+        // @ v1.31.0).
+        let eager_execution_accepted = req.eager_execution_accepted
+            && positive_start_delay(req.workflow_start_delay).is_none()
+            && req.reserved_poller_identity.is_some();
 
         let canonical_root_workflow_id = req
             .root_workflow_id
@@ -482,7 +520,7 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        builder.emit(HistoryEventKind::WorkflowExecutionStarted {
+        builder.emit(HistoryEventKind::WorkflowExecutionStartedV2 {
             workflow_type: req.workflow_type,
             task_queue: req.task_queue,
             input: req.input,
@@ -517,6 +555,7 @@ impl BasicKernel {
             priority: req.priority,
             versioning_info: initial_versioning_info,
             worker_deployment_name: None,
+            eager_execution_accepted,
         });
         // The starting request id authors the WorkflowExecutionStarted event
         // (just emitted, so it is `last_event_id`). Recorded for
@@ -643,7 +682,7 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        builder.emit(HistoryEventKind::WorkflowExecutionStarted {
+        builder.emit(HistoryEventKind::WorkflowExecutionStartedV2 {
             workflow_type: req.workflow_type,
             task_queue: req.task_queue,
             input: req.input,
@@ -678,6 +717,9 @@ impl BasicKernel {
             priority: req.priority,
             versioning_info: initial_versioning_info,
             worker_deployment_name: None,
+            // Signal-with-start has no eager-execution request field and does
+            // not reserve an inline first-WFT worker.
+            eager_execution_accepted: false,
         });
         builder.emit(HistoryEventKind::WorkflowExecutionSignaled {
             signal_name: req.signal_name,
@@ -3202,7 +3244,8 @@ impl BasicKernel {
 
     fn apply_replayed_event(&self, state: &mut WorkflowState, event: &HistoryEvent) {
         match &event.kind {
-            HistoryEventKind::WorkflowExecutionStarted { .. } => {}
+            HistoryEventKind::WorkflowExecutionStarted { .. }
+            | HistoryEventKind::WorkflowExecutionStartedV2 { .. } => {}
             HistoryEventKind::WorkflowExecutionSignaled { .. } => {}
             HistoryEventKind::WorkflowExecutionCancelRequested { .. } => {
                 state.cancel_requested = true;

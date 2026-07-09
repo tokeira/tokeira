@@ -316,11 +316,18 @@ pub(crate) async fn run_workflow_timeout_scanner<R: tokeira_storage::RunReposito
                         if retry_successor.is_none()
                             && matches!(violation, WorkflowTimeoutViolation::RunTimeout)
                             && let Ok(events) = repo.read_history(entry.run_key, 0, 1).await
-                            && let Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted {
-                                cron_schedule: Some(cron),
-                                input,
-                                ..
-                            }) = events.first().map(|event| &event.kind)
+                            && let Some(
+                                tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted {
+                                    cron_schedule: Some(cron),
+                                    input,
+                                    ..
+                                }
+                                | tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 {
+                                    cron_schedule: Some(cron),
+                                    input,
+                                    ..
+                                },
+                            ) = events.first().map(|event| &event.kind)
                             && !cron.is_empty()
                             && let Ok(tokeira_kernel::LoadedRun::Existing(state)) =
                                 repo.load_run(entry.run_key).await
@@ -427,7 +434,8 @@ async fn start_timeout_retry_successor<R: tokeira_storage::RunRepository + 'stat
         .ok()
         .and_then(|events| events.first().map(|event| event.kind.clone()))
     {
-        Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted { input, .. }) => input,
+        Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted { input, .. })
+        | Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 { input, .. }) => input,
         _ => tokeira_types::Payloads::default(),
     };
     let start_request = crate::runtime::workflow_task::build_retry_successor_start(

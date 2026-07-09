@@ -2,310 +2,279 @@
 
 ## Overview
 
-Eager dispatch is a latency optimization that returns a workflow task or activity task inline with the gRPC response that triggered it, eliminating a separate poll round-trip. This design covers two independent paths:
+Eager dispatch returns work inline with the RPC that made it ready. This design covers two independent paths:
 
-1. **Eager WFT on `StartWorkflowExecution`**: After `runtime.start_workflow_with_policy` commits and the dispatch publisher publishes the first WFT to the `InMemoryBroker`, the edge start handler attempts a non-blocking `try_claim_workflow_task(&queue_key, run_key)` on the broker. If the claim succeeds and the caller is a compatible poller (verified via `PollerRegistry`), the claimed task is built into a `PollWorkflowTaskQueueResponse` and returned in `StartWorkflowExecutionResponse.eager_workflow_task`.
+1. **Eager workflow start.** `StartWorkflowExecution(request_eager_execution=true)` is pre-gated by the runtime. When enabled and free of first-WFT backoff, the existing reserved-start kernel branch commits `WorkflowExecutionStarted`, `WorkflowTaskScheduled`, and `WorkflowTaskStarted` together. The runtime builds the inline poll response from that committed state; the workflow broker is not part of the correctness path.
+2. **Eager activity dispatch.** Eager-eligible activities authored by `RespondWorkflowTaskCompleted` are committed first, published as a derived effect, then targeted-claimed from the activity broker for the inline response.
 
-2. **Eager activity tasks on `RespondWorkflowTaskCompleted`**: After `runtime.complete_workflow_task` commits and the dispatch publisher publishes activity tasks to the `InMemoryActivityBroker`, the edge complete handler attempts non-blocking `try_claim_activity_task(&queue_key, run_key, activity_id)` calls for each eager-eligible activity command. Claimed tasks are built into `PollActivityTaskQueueResponse` entries and returned in `RespondWorkflowTaskCompletedResponse.activity_tasks`.
+Wire shape comes from `proto/upstream/`. Behaviour is grounded in `service/history/api/startworkflow/api.go`, `service/history/api/create_workflow_util.go`, and `service/history/historybuilder/event_factory.go @ v1.31.0`. In particular, the API handler decides acceptance and the history event records that already-gated decision. A server-observed active poller is not an acceptance condition.
 
-Both paths reuse the existing poll response building and task token encoding. No new timeout or recovery mechanisms are introduced — eagerly claimed tasks are indistinguishable from normally polled tasks once claimed, so the existing WFT timeout scanner and activity timeout scanners handle recovery if the client drops.
+## Dependencies and Non-Goals
 
-The edge layer already has a partial eager pattern: `build_eager_query_workflow_task` builds an inline query-only WFT when `return_new_workflow_task=true` and buffered queries exist. This spec extends that pattern to the two proto-defined eager dispatch paths.
+- Poll response fidelity and task-token encoding remain owned by the existing poll path.
+- Workflow-task start-to-close recovery and activity timeout recovery remain unchanged.
+- The eager-enable value is the pinned v1.31.0 default `true`; this work does not add an operator configuration knob.
+- `WorkflowCommand::ScheduleActivity.request_eager_execution` is eager **activity** dispatch and remains distinct from workflow-start acceptance.
+- Targeted workflow-broker claims remain available for non-start direct-delivery paths, but eager workflow start no longer depends on them.
 
 ## Architecture
 
 ```mermaid
 sequenceDiagram
-    participant SDK as SDK Client
-    participant Edge as Edge Layer
+    participant SDK as SDK caller / worker
+    participant Edge as Compatibility edge
     participant Runtime as Runtime
-    participant WFBroker as InMemoryBroker
-    participant ABroker as InMemoryActivityBroker
-    participant PReg as PollerRegistry
+    participant Kernel as Pure kernel
+    participant Repo as Run repository
+    participant ABroker as Activity broker
 
-    Note over SDK,PReg: Path 1: Eager WFT on StartWorkflow
+    Note over SDK,Repo: Path 1 — eager workflow start
     SDK->>Edge: StartWorkflowExecution(request_eager_execution=true)
-    Edge->>PReg: has_active_poller(queue_key, identity)
-    PReg-->>Edge: active poller found
-    Edge->>Runtime: start_workflow_with_policy(req)
-    Runtime-->>Edge: Started { run_key, run_id }
-    Note over Runtime,WFBroker: Dispatch publisher publishes WFT
-    Edge->>WFBroker: try_claim_workflow_task(queue_key, run_key)
-    WFBroker-->>Edge: Some(DispatchableWorkflowTask)
-    Edge->>Edge: build PollWorkflowTaskQueueResponse
+    Edge->>Runtime: StartRequest(eager_execution_accepted=true candidate)
+    Runtime->>Runtime: apply pinned enable policy and first-WFT backoff
+    Runtime->>Kernel: Start(candidate + inline worker identity)
+    Kernel->>Kernel: clamp false unless inline start is possible
+    Kernel-->>Repo: one transition: WES / WFT scheduled / WFT started
+    Repo-->>Runtime: committed state
+    Runtime->>Runtime: build StartedWorkflowTask from committed state
+    Runtime-->>Edge: Started { eager_workflow_task: Some(...) }
     Edge-->>SDK: StartWorkflowExecutionResponse { eager_workflow_task }
 
-    Note over SDK,ABroker: Path 2: Eager Activities on CompleteWFT
-    SDK->>Edge: RespondWorkflowTaskCompleted(commands with eager activities)
-    Edge->>Runtime: complete_workflow_task(req)
-    Runtime-->>Edge: CommitResult::Applied
-    Note over Runtime,ABroker: Dispatch publisher publishes activity tasks
-    loop For each eager-eligible activity (up to max)
-        Edge->>ABroker: try_claim_activity_task(queue_key, run_key, activity_id)
-        ABroker-->>Edge: Some(DispatchableActivityTask)
-        Edge->>Edge: build PollActivityTaskQueueResponse
-    end
+    Note over SDK,ABroker: Path 2 — eager activities
+    SDK->>Edge: RespondWorkflowTaskCompleted(eager activity commands)
+    Edge->>Runtime: complete_workflow_task
+    Runtime->>Kernel: completion transition
+    Kernel-->>Repo: committed pending activities
+    Runtime->>ABroker: derived publications
+    Edge->>ABroker: targeted activity claims
     Edge-->>SDK: RespondWorkflowTaskCompletedResponse { activity_tasks }
 ```
 
-The `try_claim_*` methods are simple non-blocking targeted claim operations: acquire the broker's `Mutex`, scan the ready queue for the requested identity, remove the matching entry from the queue and dedup set, release the lock, return. They never wake pollers and never block.
+The workflow-start path structurally subsumes Temporal's `task_already_dispatched` denial race: the first WFT is either committed as started for the inline caller or remains on the normal dispatch path. There is no publish-then-reclaim window.
 
 ## Components and Interfaces
 
-### Broker Layer (`tokeira-runtime/src/broker.rs`)
+### Runtime Admission and Start Preparation
 
-Two new public methods on existing structs:
+The edge faithfully threads `request_eager_execution`. The runtime converts that request into the kernel-facing `eager_execution_accepted` candidate using the pinned enable value. After applying client-cron/start-delay normalization, it clamps the candidate to false when the effective first-WFT backoff is positive.
 
-```rust
-impl InMemoryBroker {
-    /// Targeted non-blocking claim of a specific workflow task by run_key.
-    /// Scans the general-tier ready queue for `queue` and removes the task
-    /// matching `run_key`. Returns `None` if no matching task is found.
-    /// Removes the task from the deduplication set.
-    /// Does not wake any waiting pollers.
-    pub async fn try_claim_workflow_task(
-        &self,
-        queue: &QueueKey,
-        run_key: RunKey,
-    ) -> Option<DispatchableWorkflowTask>;
-}
+For an accepted start, the runtime sets `reserved_poller_identity` to the request caller's identity without consulting `PollerRegistry` or reserving a parked broker poller. This reuses the kernel's existing atomic direct-start mechanism while keeping active-poller liveness out of the public acceptance contract. Non-eager starts may continue using the existing broker-reserved sync-match optimisation.
 
-impl InMemoryActivityBroker {
-    /// Targeted non-blocking claim of a specific activity task by
-    /// (run_key, activity_id). Scans the ready queue for `queue` and
-    /// removes the task matching the identity. Returns `None` if no
-    /// matching task is found. Removes from dedup set.
-    /// Does not wake any waiting pollers.
-    pub async fn try_claim_activity_task(
-        &self,
-        queue: &QueueKey,
-        run_key: RunKey,
-        activity_id: &str,
-    ) -> Option<DispatchableActivityTask>;
-}
-```
+### Kernel Start Event and Clamp
 
-Both scan the `VecDeque` for the matching task (by `run_key` for WFT, by `(run_key, activity_id)` for activities), remove it with `VecDeque::remove`, and clear the dedup entry. This is O(n) in queue depth but eager dispatch is a latency optimization on the fast path — the queue is typically short (just-published task is at the front or near it).
+`StartRequest` gains an `eager_execution_accepted: bool` input. The kernel never promotes it to true. It records true only when:
 
-### Compatible Poller Check (`tokeira-edge/src/poller_registry.rs`)
+- the runtime supplied true;
+- `positive_start_delay(workflow_start_delay)` is absent; and
+- `reserved_poller_identity` is present, so this transition actually starts the first WFT.
 
-The existing `PollerRegistry` already tracks active pollers by `QueueKey` with RAII-based `PollerGuard` cleanup. A new convenience method:
+If any condition is absent, the kernel records false and follows the existing delayed or normally dispatched start branch.
 
-```rust
-impl PollerRegistry {
-    /// Returns true if any active poller with the given identity is
-    /// registered on the specified queue. Used by the eager WFT path
-    /// to verify the caller is actually polling on the workflow's queue.
-    pub fn has_active_poller(
-        &self,
-        queue: &QueueKey,
-        worker_identity: &WorkerIdentity,
-    ) -> bool;
-}
-```
+The persisted history enum uses postcard's positional encoding. Adding a field in place to `WorkflowExecutionStarted` is unsafe: the old variant has no encoded field count, so a new decoder would consume EOF or the next event byte instead of invoking `#[serde(default)]`. The design therefore preserves `WorkflowExecutionStarted` byte-for-byte as a legacy decode shape and appends `WorkflowExecutionStartedV2` as the new emitted variant. Both serialize to Temporal event type `WORKFLOW_EXECUTION_STARTED`; V1 maps `eager_execution_accepted=false`, while V2 carries the durable bool.
 
-This iterates the `pollers(queue)` list and checks if any entry's `identity` matches. The `PollerRegistry` is the authoritative source for active poll registrations — it is populated by the live long-poll path and cleaned up when polls complete or time out. `WorkerRegistry` is NOT used for this check because it tracks version/build metadata, not active poll liveness.
+This follows the existing `WorkflowExecutionUpdateCompletedV2` compatibility precedent. A pre-change byte fixture proves that the immediate pre-Tier-3.18 V1 batch still decodes; a V2 round trip guards the new encoding.
 
-### Edge Layer — Start Handler (`tokeira-edge/src/workflow_service.rs`)
+### Runtime Result and Request-ID Retry
 
-`start_workflow_execution` gains an eager dispatch tail after the `Started` branch:
+`StartWorkflowResult::Started` and `StartWorkflowResult::Deduped` carry an optional `StartedWorkflowTask`.
 
-1. Check `request_eager_execution` flag on the request.
-2. If true, call `self.poller_registry.has_active_poller(&queue_key, &identity)`.
-3. If compatible, call `self.broker.try_claim_workflow_task(&queue_key, run_key)` — targeted by the just-started workflow's `run_key`.
-4. If claimed, build a `PollWorkflowTaskQueueResponse` using `from_internal::poll_response` (same path as normal polling) and attach it to the response.
+- A fresh accepted start builds the task from the just-committed state.
+- An immediate same-request-ID retry loads event 1 and the existing run, then returns the task only when the event records `eager_execution_accepted=true`, the current pending WFT is still the first started WFT (`started_event_id == 3`, `attempt == 1`), and its start-to-close deadline has not elapsed.
+- After timeout/fallback, after the deadline elapses even if the coarse scanner has not yet authored the timeout, or when no such task exists, the deduped response omits the eager task.
 
-### Edge Layer — Complete Handler (`tokeira-edge/src/workflow_service.rs`)
+Reconstruction reads authoritative run state and history. It never depends on a broker entry and never authors another transition.
 
-`respond_workflow_task_completed` gains an eager activity dispatch tail after the commit:
+### Edge Translation and Capability Advertisement
 
-1. Collect eager-eligible activity commands (those with `request_eager_execution=true`).
-2. For each eligible command (up to the configured max), call `activity_broker.try_claim_activity_task(&queue_key, run_key, &activity_id)` — targeted by the specific activity's identity.
-3. For each claimed task, build a `PollActivityTaskQueueResponse` using `from_internal::poll_activity_response` (same path as normal polling).
-4. Attach the list to the response.
+The edge removes the `PollerRegistry::has_active_poller` gate and the post-publication workflow-broker claim. It maps the runtime's optional started task through the normal `from_internal::poll_response` path.
 
-### DTO Changes
+History serialization handles both started-event variants:
 
-**`StartWorkflowExecutionRequest`** (translate/mod.rs): Add `request_eager_execution: bool` and `identity: Option<String>` (identity is already present but needs threading).
+- legacy `WorkflowExecutionStarted` -> proto `eager_execution_accepted=false`;
+- `WorkflowExecutionStartedV2` -> the persisted value.
 
-**`StartWorkflowExecutionResponse`** (translate/mod.rs): Add `eager_workflow_task: Option<PollWorkflowTaskQueueResponse>`.
+Because the v1.31.0 default is enabled and Tier 3.18 exercises the behaviour, `GetSystemInfo.capabilities.eager_workflow_start` and namespace capabilities report true. The compatibility matrix moves to `Implemented` only after the suite is clean.
 
-**`RespondWorkflowTaskCompletedResponse`** (translate/mod.rs): Add `activity_tasks: Vec<PollActivityTaskQueueResponse>`.
+### Activity Broker Path
 
-**`ScheduleActivityTask` command** (kernel): The `request_eager_execution` flag needs to be threaded through the command representation.
+The activity path retains `try_claim_activity_task(queue, run_key, activity_id)`. Claims occur only after the completion transition and derived publication. A failed claim leaves correctness in the authoritative pending activity and normal polling remains the fallback.
 
-### Proto Translation (`tokeira-edge/src/grpc/translate.rs`)
-
-**`start_response_to_proto`**: Serialize the optional `eager_workflow_task` using the existing `poll_response_to_proto` function.
-
-**`completed_response_to_proto`**: Serialize the `activity_tasks` list using the existing `poll_activity_response_to_proto` function (to be extracted or reused from the activity poll path).
-
-**`start_request_to_edge`**: Parse `request_eager_execution` from the proto request.
-
-### Configuration
-
-A new config field on the edge layer for the maximum number of eager activity tasks per completion response. Default: 3.
-
-```rust
-pub struct EagerDispatchConfig {
-    /// Maximum number of activity tasks returned inline per
-    /// RespondWorkflowTaskCompleted response.
-    pub max_eager_activity_tasks_per_response: usize,
-}
-```
+`try_claim_workflow_task` remains a supported direct-delivery primitive for callers other than eager workflow start. Its targeted-removal and dedup-set invariants remain covered.
 
 ## Data Models
 
-### Existing Types (Unchanged)
+### Kernel Start Request
 
-- `DispatchableWorkflowTask` — the broker entry for workflow tasks, keyed by `(RunKey, LogicalTaskSeq)`.
-- `DispatchableActivityTask` — the broker entry for activity tasks, keyed by `(RunKey, activity_id, attempt)`.
-- `WorkflowTaskToken` — the serde-serialized task token containing `run_key`, `logical_seq`, `started_event_id`, `attempt`, `shard_epoch`.
-- `QueueKey` — the `(namespace_id, task_queue, task_kind, deployment, build_id)` tuple used to key broker queues.
-- `WorkerRegistrationKey` — the `(worker_identity, namespace_id, task_queue)` tuple used to key the worker registry.
-
-### Modified Types
-
-**`StartWorkflowExecutionRequest`** (edge DTO):
 ```rust
-pub struct StartWorkflowExecutionRequest {
-    // ... existing fields ...
-    pub request_eager_execution: bool,
+pub struct StartRequest {
+    // existing fields
+    pub eager_execution_accepted: bool,
 }
 ```
 
-**`StartWorkflowExecutionResponse`** (edge DTO):
+All non-eager and internally derived start constructors set this field to false. The public workflow-start translator supplies the pre-gated candidate.
+
+### Durable Started Event
+
 ```rust
-pub struct StartWorkflowExecutionResponse {
-    // ... existing fields ...
-    pub eager_workflow_task: Option<PollWorkflowTaskQueueResponse>,
+pub enum HistoryEventKind {
+    WorkflowExecutionStarted {
+        // unchanged legacy fields; decode-only after this change
+    },
+    // appended last in the enum
+    WorkflowExecutionStartedV2 {
+        // same semantic fields
+        eager_execution_accepted: bool,
+    },
 }
 ```
 
-**`RespondWorkflowTaskCompletedResponse`** (edge DTO):
+No new `WorkflowState` field or storage table is required. The acceptance value is authoritative in event 1, and the pending started WFT already exists in durable state.
+
+### Runtime Start Result
+
 ```rust
-pub struct RespondWorkflowTaskCompletedResponse {
-    // ... existing fields ...
-    pub activity_tasks: Vec<PollActivityTaskQueueResponse>,
+pub enum StartWorkflowResult {
+    Started {
+        run_key: RunKey,
+        run_id: RunId,
+        mutation_metadata: MutationMetadata,
+        eager_workflow_task: Option<StartedWorkflowTask>,
+    },
+    Deduped {
+        run_key: RunKey,
+        run_id: RunId,
+        execution_status: ExecutionStatus,
+        eager_workflow_task: Option<StartedWorkflowTask>,
+    },
+    // unchanged remaining variants
 }
 ```
-
-No new storage tables or persistent state. The broker's in-memory `HashMap<QueueKey, VecDeque<...>>` and `HashSet` dedup structures are the only data touched, and they already exist.
-
 
 ## Correctness Properties
 
-*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+### Property 1: Request flag preservation
 
-### Property 1: request_eager_execution flag preservation
-
-*For any* `StartWorkflowExecutionRequest` proto with `request_eager_execution` set to any boolean value, translating to the internal DTO and back should preserve the flag value exactly.
+*For any* `StartWorkflowExecutionRequest`, proto-to-edge translation SHALL preserve `request_eager_execution` exactly.
 
 **Validates: Requirements 1.1, 1.2**
 
-### Property 2: Compatible poller lookup correctness
+### Property 2: Runtime eager admission
 
-*For any* `(QueueKey, WorkerIdentity)` pair, `PollerRegistry::has_active_poller` SHALL return `true` if and only if an active poller with that identity is currently registered on that queue (via a live `PollerGuard`).
+*For any* requested flag, enable value, and effective first-WFT backoff, runtime admission SHALL yield true exactly when requested and enabled and the backoff is not positive; it SHALL not depend on `PollerRegistry` state.
 
-**Validates: Requirements 2.2, 2.3**
+**Validates: Requirements 2.1, 2.3, 2.4, 2.5**
 
-### Property 3: Workflow broker targeted claim correctness
+### Property 3: Kernel acceptance clamp
 
-*For any* sequence of workflow tasks published to the `InMemoryBroker` on a given `QueueKey`, calling `try_claim_workflow_task(queue, run_key)` SHALL return `Some(task)` only when a task matching that `run_key` exists in the general ready queue (removing it from both the ready queue and the deduplication set), and SHALL return `None` without blocking when no matching task exists. Tasks for other `run_key` values SHALL remain in the queue.
+*For any* runtime-supplied acceptance value, start delay, and optional inline worker identity, the kernel SHALL record true only when the supplied value is true, the delay is not positive, and the identity is present; it SHALL never promote false to true.
 
-**Validates: Requirements 9.1, 9.2, 9.3, 9.4**
+**Validates: Requirements 2.6, 2.7, 3.1, 3.7, 3.8**
 
-### Property 4: Activity broker targeted claim correctness
+### Property 4: Atomic eager-start history
 
-*For any* sequence of activity tasks published to the `InMemoryActivityBroker` on a given `QueueKey`, calling `try_claim_activity_task(queue, run_key, activity_id)` SHALL return `Some(task)` only when a task matching that `(run_key, activity_id)` exists in the ready queue (removing it from both the ready queue and the deduplication set), and SHALL return `None` without blocking when no matching task exists. Tasks for other identities SHALL remain in the queue.
+*For any* accepted fresh start, the committed transition SHALL contain a V2 started event with `eager_execution_accepted=true`, a scheduled first WFT, and a started first WFT in that order, with no workflow-broker publication required for delivery.
 
-**Validates: Requirements 10.1, 10.2, 10.3, 10.4**
+**Validates: Requirements 3.1, 3.2, 3.3, 12.1**
 
-### Property 5: Eager activity task limit enforcement
+### Property 5: Inline response/history agreement
 
-*For any* number of eager-eligible activity commands in a `RespondWorkflowTaskCompletedRequest`, the number of activity tasks returned in the response SHALL never exceed `max_eager_activity_tasks_per_response`.
+*For any* successful fresh start response, `eager_workflow_task.is_some()` SHALL equal the effective `eager_execution_accepted` value serialized from committed event 1.
+
+**Validates: Requirements 3.7, 3.8, 4.1, 4.2, 4.3**
+
+### Property 6: Request-ID retry reconstruction
+
+*For any* deduped eager start, the runtime SHALL return an eager task exactly when authoritative event 1 records eager acceptance, the pending WFT remains started with event ID 3 and attempt 1, and its deadline remains live, without changing transition sequence or history.
+
+**Validates: Requirements 13.1, 13.2, 13.3, 13.4**
+
+### Property 7: Legacy started-event decoding
+
+*For the recorded pre-Tier-3.18 V1 history bytes*, decoding SHALL preserve the legacy event and serialize it with `eager_execution_accepted=false`; newly encoded V2 events SHALL round-trip their bool.
+
+**Validates: Requirements 4.3, 4.4**
+
+### Property 8: Activity targeted-claim correctness
+
+*For any* sequence of activity tasks, `try_claim_activity_task` SHALL remove only the requested `(run_key, activity_id)` entry and its dedup key, leaving all other entries available.
+
+**Validates: Requirements 6.1, 6.2, 6.3, 10.1, 10.2, 10.3, 10.4**
+
+### Property 9: Eager activity limit
+
+*For any* count of eager-eligible activity commands, the inline response SHALL contain no more than the configured maximum.
 
 **Validates: Requirements 7.1, 7.2**
 
-### Property 6: Eager activity flag threading through commands
+### Property 10: Eager activity flag preservation
 
-*For any* `ScheduleActivityTask` command with `request_eager_execution` set to any boolean value, translating through the internal command representation SHALL preserve the flag value exactly.
+*For any* `ScheduleActivityTask` command, translation SHALL preserve `request_eager_execution` exactly.
 
 **Validates: Requirements 5.1, 5.2, 5.3**
 
-### Property 7: Start response proto translation preserves eager_workflow_task
+### Property 11: Response translation fidelity
 
-*For any* internal `StartWorkflowExecutionResponse`, the proto translation SHALL set the `eager_workflow_task` field if and only if the internal response contains `Some(eager_workflow_task)`.
+*For any* internal start or WFT-completion response, proto translation SHALL preserve the presence/count of eager workflow/activity tasks.
 
-**Validates: Requirements 4.1, 4.2**
+**Validates: Requirements 4.1, 4.2, 8.1, 8.2**
 
-### Property 8: Complete response proto translation preserves activity_tasks
+### Property 12: Claimed tasks are excluded from normal polling
 
-*For any* internal `RespondWorkflowTaskCompletedResponse`, the proto translation SHALL populate the `activity_tasks` repeated field with exactly the same number of entries as the internal response's `activity_tasks` list.
+*For any* broker task successfully targeted-claimed, a later normal poll SHALL not return that same broker entry.
 
-**Validates: Requirements 8.1, 8.2**
+**Validates: Requirements 9.2, 9.4, 10.2, 10.4**
 
-### Property 9: Claimed task is not delivered to normal pollers
+### Property 13: Workflow broker targeted-claim correctness
 
-*For any* workflow task published to the `InMemoryBroker`, if `try_claim_workflow_task` returns `Some(task)`, then a subsequent `poll_workflow_task` on the same queue SHALL NOT return that task.
+*For any* sequence of workflow tasks in the general broker tier, `try_claim_workflow_task(queue, run_key)` SHALL remove only the requested run's task and dedup key, leaving all other tasks available.
 
-**Validates: Requirements 9.2, 9.4**
+**Validates: Requirements 9.1, 9.2, 9.3, 9.4**
 
-### Property 10: Claimed activity task is not delivered to normal pollers
+### Property 14: Capability agreement
 
-*For any* activity task published to the `InMemoryActivityBroker`, if `try_claim_activity_task` returns `Some(task)`, then a subsequent `poll_activity_task` on the same queue SHALL NOT return that task.
+*For any* server boot using the pinned eager-enable default, system and namespace capabilities SHALL both advertise the same enabled value used by runtime admission.
 
-**Validates: Requirements 10.2, 10.4**
+**Validates: Requirements 14.1, 14.2**
 
 ## Error Handling
 
-### Claim Failures
-
-Both `try_claim_workflow_task` and `try_claim_activity_task` return `Option` — they never error. A `None` result means the task was not available (race with a poller, not yet published, or queue empty). The edge handler treats `None` as a no-op: the response is returned without the eager field, and the task will be delivered via normal polling.
-
-### Proto Translation Errors
-
-If `serde_json::to_vec` fails when encoding the task token for an eagerly claimed task, the error is logged and the eager field is omitted from the response. The claimed task is effectively lost from the broker, but the existing WFT/activity timeout scanner will detect the non-completion and reschedule it.
-
-### Connection Drop After Eager Response
-
-If the gRPC response containing an eager task fails to reach the client (connection drop, client crash), the claimed task is never completed. The existing timeout scanners handle recovery:
-- WFT timeout scanner reschedules the workflow task after `workflow_task_timeout`.
-- Activity timeout scanners reschedule the activity after `schedule_to_start_timeout` or `start_to_close_timeout`.
-
-No special error handling is needed because eagerly claimed tasks are indistinguishable from normally polled tasks once claimed.
-
-### Incompatible Poller
-
-If the caller is not a compatible poller (no active `PollerRegistry` entry for the queue and identity), the eager dispatch path is skipped entirely. The response is returned without the eager field. This is not an error — it's the expected behavior for clients that don't actively poll on the workflow's task queue.
+| Condition | Behaviour |
+|---|---|
+| Eager disabled or not requested | Start normally; event records false; response omits eager WFT. |
+| Positive first-WFT backoff | Kernel clamps false; start-delay path remains authoritative. |
+| Missing inline identity despite a true candidate | Kernel clamps false; no inconsistent accepted event is authored. |
+| Immediate request-ID retry | Return the authoritative first started WFT without mutation. |
+| Retry after deadline/timeout/fallback | Return the deduped start response without an eager WFT, even before the coarse timeout scanner authors its transition. |
+| Eager response lost after commit | Start-to-close timeout recovery reschedules from durable pending state. |
+| Activity targeted claim misses | Omit that inline activity; normal polling remains available. |
 
 ## Testing Strategy
 
-### Property-Based Tests (using `proptest`)
+### Property-Based Tests
 
-Each correctness property maps to a property-based test with minimum 100 iterations:
+- Runtime admission truth table (Property 2), including disabled, `Duration::ZERO`, and positive backoff.
+- Kernel clamp and atomic event sequence (Properties 3 and 4).
+- Existing broker, activity-limit, flag, translation, and capability properties (Properties 8-14).
 
-- **Broker claim tests** (Properties 3, 4, 9, 10): Generate random `QueueKey` values and task sequences, publish to the broker, perform targeted claims, and verify the invariants. These are pure in-memory operations — fast and deterministic.
-- **PollerRegistry tests** (Property 2): Generate random queue/identity pairs, register/unregister active pollers, verify `has_active_poller` correctness. The registry already has RAII semantics via `PollerGuard`; extend the existing suite.
-- **Proto translation tests** (Properties 1, 6, 7, 8): Generate random DTO instances, translate to/from proto, verify field preservation.
-- **Limit enforcement** (Property 5): Generate random counts of eager-eligible commands, verify the response never exceeds the configured maximum.
+Every property test runs at least 100 cases and carries `// Feature: edge-eager-dispatch, Property N`.
 
-Tag format: `Feature: edge-eager-dispatch, Property {N}: {title}`
+### Fixed Golden and Unit Tests
 
-### Unit Tests
+- Decode a byte literal generated by the pre-Tier-3.18 DSQL history codec and assert the V1 event maps to accepted=false.
+- Round-trip a V2 accepted event.
+- Assert the exact fresh accepted history prefix is events 1/2/3.
+- Assert client cron/start delay clamps acceptance false.
+- Assert a live request-ID retry returns the same event-3/attempt-1 task without mutation, while an elapsed retry omits it.
+- Assert every internal start constructor supplies false.
+- Assert `GetSystemInfo` and namespace capability flags are true.
 
-- `try_claim_workflow_task` on an empty queue returns `None`.
-- `try_claim_workflow_task` does not wake waiting pollers (use a `Notify` listener to verify no wake).
-- `try_claim_activity_task` does not wake waiting pollers.
-- `start_response_to_proto` with `eager_workflow_task: None` leaves the proto field unset.
-- `completed_response_to_proto` with empty `activity_tasks` produces an empty repeated field.
-- `EagerDispatchConfig` default value is 3.
+### Integration and Functional Tests
 
-### Integration Tests
-
-- Start a workflow with `request_eager_execution=true` and a registered compatible poller → response contains `eager_workflow_task` with valid task token and history.
-- Start a workflow with `request_eager_execution=true` but no registered poller → response has no `eager_workflow_task`.
-- Complete a WFT with eager-eligible activity commands → response contains `activity_tasks`.
-- Complete a WFT with more eager-eligible activities than the configured max → response contains exactly `max` activity tasks.
-- Claim an eager WFT, don't complete it → WFT timeout scanner reschedules it.
-- Claim an eager activity, don't complete it → activity timeout scanner reschedules it.
+- Fresh eager start returns a complete task whose event 1 records accepted=true.
+- No active long poll is required.
+- A dropped eager task times out and is delivered through normal matching.
+- An immediate same-request retry returns the same live first WFT; a post-timeout retry omits it.
+- Workflow retry successors are not themselves eager.
+- Temporal `TestEagerWorkflowTestSuite` passes clean except the cited `OverrideDynamicConfig(WorkflowIdReuseMinimalInterval=0)` leaf, which is a classified skip.
+- Earlier clean workflow, WFT-timeout, retry, conflict-policy, history, and activity cohorts remain green.

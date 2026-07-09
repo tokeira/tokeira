@@ -82,6 +82,20 @@ const EAGER_WORKFLOW_START_SURFACES: &[CompatibilitySurface] = &[CompatibilitySu
     kind: CompatibilitySurfaceKind::ResponseField,
     identifier: "WorkflowService.StartWorkflowExecutionResponse.eager_workflow_task",
 }];
+const EAGER_WORKFLOW_START_EVIDENCE: &[CompatibilityEvidence] = &[
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "Temporal functional corpus TestEagerWorkflowTestSuite @ v1.31.0: 5 pass / 0 fail / 1 classified skip (3 consecutive runs)",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/src/workflow_service.rs::eager_start_does_not_require_registered_poller",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-storage/src/dsql/codec.rs::legacy_workflow_started_fixture_decodes_and_v2_round_trips",
+    },
+];
 const EMPTY_RPCS: &[&str] = &[];
 
 const LEGACY_VISIBILITY_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
@@ -413,13 +427,13 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
     FeatureEntry {
         id: "eager-workflow-start",
         name: "Eager workflow start",
-        state: FeatureState::Experimental,
+        state: FeatureState::Implemented,
         surfaces: EAGER_WORKFLOW_START_SURFACES,
         capability_field: Some("eager_workflow_start"),
-        dynamic_config_key: Some("compat.eager_workflow_start"),
+        dynamic_config_key: None,
         rpcs: EMPTY_RPCS,
-        notes: "Eager start is a response-shape feature on StartWorkflowExecution rather than a standalone RPC.",
-        evidence: &[],
+        notes: "StartWorkflowExecution atomically commits and returns the first WFT when eager execution is requested and no first-WFT backoff applies. Fresh and immediate request-id retry responses derive from authoritative started-task state; the v1.31.0 enabled default is pinned as a constant rather than an operator knob.",
+        evidence: EAGER_WORKFLOW_START_EVIDENCE,
     },
     FeatureEntry {
         id: "legacy-visibility",

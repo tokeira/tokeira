@@ -1059,6 +1059,7 @@ where
                                         now: OffsetDateTime::now_utc(),
                                         client_cron_schedule: None,
                                         cron_schedule,
+                                        eager_execution_accepted: false,
                                         reserved_poller_identity: None,
                                     };
                                     let publisher = publisher.clone();
@@ -1509,7 +1510,8 @@ fn reserved_start_has_direct_delivery(command: &Command) -> bool {
 
 fn history_event_type_name(event: &HistoryEvent) -> &'static str {
     match &event.kind {
-        HistoryEventKind::WorkflowExecutionStarted { .. } => "WorkflowExecutionStarted",
+        HistoryEventKind::WorkflowExecutionStarted { .. }
+        | HistoryEventKind::WorkflowExecutionStartedV2 { .. } => "WorkflowExecutionStarted",
         HistoryEventKind::WorkflowExecutionSignaled { .. } => "WorkflowExecutionSignaled",
         HistoryEventKind::WorkflowExecutionCancelRequested { .. } => {
             "WorkflowExecutionCancelRequested"

@@ -835,30 +835,76 @@ where
             .resolve_execution(&execution)
             .await?
             .ok_or_else(|| anyhow!("execution not found"))?;
+        // v1.31.0 resets the BASE run but supersedes and terminates the chain's
+        // CURRENT run when it is a DIFFERENT, still-running run
+        // (`workflow_resetter.go` terminateWorkflow, identity=IdentityResetter). The
+        // base==current-running case is already handled by `apply_reset` terminating
+        // the base. The running current is the OPEN-execution pointer — NOT
+        // `find_latest_run`, whose `started_at` ordering is unreliable for a reset
+        // successor (its start time is replayed from the base's prefix, so it looks
+        // older than the original run it superseded). Resolve it BEFORE the fork so
+        // the freshly materialized successor does not become the pointer first.
+        let current_run_key = self
+            .repo
+            .resolve_execution(&ExecutionRef {
+                namespace_id: execution.namespace_id,
+                workflow_id: execution.workflow_id.clone(),
+                run_id: None,
+            })
+            .await?;
         let successor_run_key = RunKey::derive(
             execution.namespace_id,
             &execution.workflow_id,
             request.new_run_id,
         );
+        let reset_reason = request.reason.clone();
+        let reset_now = request.now;
+        let successor_run_id = request.new_run_id;
         match self
-            .submit(run_key, Command::Reset(request.clone()))
+            .submit(run_key, Command::Reset(request))
             .await?
         {
-            CommitResult::Applied { .. } => Ok(ResetWorkflowResult {
-                successor_run_key,
-                successor_run_id: request.new_run_id,
-            }),
-            CommitResult::Duplicate => Err(anyhow!(
-                "unexpected duplicate reset commit for {:?}",
-                run_key
-            )),
-            CommitResult::Conflict { reason } => Err(anyhow!("conflict: {reason}")),
+            CommitResult::Applied { .. } => {}
+            CommitResult::Duplicate => {
+                return Err(anyhow!("unexpected duplicate reset commit for {:?}", run_key));
+            }
+            CommitResult::Conflict { reason } => return Err(anyhow!("conflict: {reason}")),
             CommitResult::CurrentExecutionConflict {
                 existing_run_key, ..
-            } => Err(anyhow!(
-                "current execution already exists: {existing_run_key:?}"
-            )),
+            } => {
+                return Err(anyhow!(
+                    "current execution already exists: {existing_run_key:?}"
+                ));
+            }
         }
+        // Terminate the current run iff it is distinct from the base and still open.
+        if let Some(current_run_key) = current_run_key
+            && current_run_key != run_key
+            && let tokeira_kernel::LoadedRun::Existing(current) =
+                self.repo.load_run(current_run_key).await?
+            && current.is_open()
+        {
+            let terminate = tokeira_kernel::TerminateRequest {
+                reason: reset_reason,
+                details: None,
+                identity: "reset".to_string(),
+                request: RequestContext {
+                    request_id: tokeira_types::RequestId(format!(
+                        "reset-terminate:{}",
+                        successor_run_id.0
+                    )),
+                    caller_identity: None,
+                    received_at: reset_now,
+                },
+                now: reset_now,
+            };
+            self.submit(current_run_key, Command::Terminate(terminate))
+                .await?;
+        }
+        Ok(ResetWorkflowResult {
+            successor_run_key,
+            successor_run_id,
+        })
     }
 
     /// Decide how a start/signal-with-start should proceed given the target

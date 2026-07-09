@@ -337,6 +337,7 @@ impl BasicKernel {
             attempt: *attempt,
             first_execution_run_id: *first_execution_run_id,
             original_execution_run_id: *original_execution_run_id,
+            reset_run_id: None,
             parent_run_key: ctx.parent_run_key,
             parent_workflow_id: ctx.parent_workflow_id,
             parent_run_id: *parent_run_id,
@@ -445,6 +446,7 @@ impl BasicKernel {
             attempt: req.attempt,
             first_execution_run_id: req.first_execution_run_id,
             original_execution_run_id: req.original_execution_run_id.or(Some(req.run_id)),
+            reset_run_id: None,
             parent_run_key: req.parent_run_key,
             parent_workflow_id: req.parent_workflow_id.clone(),
             parent_run_id: req.parent_run_id,
@@ -605,6 +607,7 @@ impl BasicKernel {
             attempt: req.attempt,
             first_execution_run_id: req.first_execution_run_id,
             original_execution_run_id: req.original_execution_run_id.or(Some(req.run_id)),
+            reset_run_id: None,
             parent_run_key: req.parent_run_key,
             parent_workflow_id: req.parent_workflow_id.clone(),
             parent_run_id: req.parent_run_id,
@@ -1299,7 +1302,16 @@ impl BasicKernel {
     /// Fork the workflow history at a prior event, closing this run
     /// and pointing to a new run that will replay from the fork point.
     fn apply_reset(&self, loaded: LoadedRun, req: ResetRequest) -> Result<Transition, Reject> {
-        let state = expect_open(loaded)?;
+        // Reset forks a run regardless of its status — v1.31.0 routinely resets a
+        // CLOSED run to an earlier point (workflow_resetter.go replays the base
+        // branch with no open-check). Only the fork matters here; terminating the
+        // current run (if it is running) is handled below and is skipped when the
+        // base is already closed.
+        let state = match loaded {
+            LoadedRun::Existing(state) => state,
+            LoadedRun::Absent => return Err(Reject::MissingRun),
+        };
+        let was_open = state.is_open();
 
         if req.fork_event_id <= 0 {
             return Err(Reject::ResetConstraintViolation {
@@ -1327,6 +1339,11 @@ impl BasicKernel {
         let base_run_id = state.run_id;
 
         let mut builder = TransitionBuilder::new(state, req.now);
+        // The base run of a reset records the run it was reset INTO
+        // (`ExecutionInfo.ResetRunId`, mutable_state_impl.go:1010 @ v1.31.0),
+        // surfaced via DescribeMutableState. This holds whether the base is the
+        // run being terminated (base == current, running) or a closed base.
+        builder.state.reset_run_id = Some(req.new_run_id);
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -1342,21 +1359,26 @@ impl BasicKernel {
             fork_event_version: None,
             fork_event_id: Some(req.fork_event_id),
         });
-        builder.close(ExecutionStatus::Terminated);
+        // A RUNNING base (base == current, running) is terminated by the reset;
+        // a base that is already closed keeps its terminal status — only the
+        // `ResetRunId` link (set above) is recorded. Child parent-close-policy is
+        // NOT applied on reset: v1.31.0 reconnects the base's children onto the new
+        // run rather than terminating them.
+        if was_open {
+            builder.close(ExecutionStatus::Terminated);
 
-        let activities = std::mem::take(&mut builder.state.activities);
-        for (activity_id, _) in activities {
-            builder
-                .activity_ops
-                .push(ActivityOp::Delete { activity_id });
+            let activities = std::mem::take(&mut builder.state.activities);
+            for (activity_id, _) in activities {
+                builder
+                    .activity_ops
+                    .push(ActivityOp::Delete { activity_id });
+            }
+
+            let timers = std::mem::take(&mut builder.state.timers);
+            for (timer_id, _) in timers {
+                builder.timer_ops.push(TimerOp::Delete { timer_id });
+            }
         }
-
-        let timers = std::mem::take(&mut builder.state.timers);
-        for (timer_id, _) in timers {
-            builder.timer_ops.push(TimerOp::Delete { timer_id });
-        }
-
-        builder.apply_parent_close_policy();
 
         Ok(builder.finish())
     }
@@ -2572,11 +2594,22 @@ impl BasicKernel {
             .pending_workflow_task
             .clone()
             .ok_or(Reject::NoPendingWorkflowTask)?;
-        let started_event_id = pending
-            .started_event_id
-            .ok_or(Reject::WorkflowTaskNotStarted {
-                logical_seq: pending.logical_seq.0,
-            })?;
+        let is_reset = req.failure_cause == WorkflowTaskFailedCause::ResetWorkflow;
+        // A reset boundary can fail a fork-point WFT that is scheduled-not-started
+        // (the copied prefix ends at its `WorkflowTaskScheduled`): v1.31.0
+        // synthesizes its `WorkflowTaskStarted` first (`AddWorkflowTaskStartedEvent`,
+        // workflow_resetter.go:532 @ v1.31.0). Every other caller requires an
+        // already-started task.
+        let reset_synthesize_started = is_reset && pending.started_event_id.is_none();
+        let started_event_id = match pending.started_event_id {
+            Some(id) => id,
+            None if reset_synthesize_started => 0,
+            None => {
+                return Err(Reject::WorkflowTaskNotStarted {
+                    logical_seq: pending.logical_seq.0,
+                });
+            }
+        };
 
         if pending.logical_seq != req.logical_seq {
             return Err(Reject::WorkflowTaskSeqMismatch {
@@ -2584,11 +2617,10 @@ impl BasicKernel {
                 got: req.logical_seq.0,
             });
         }
-        if started_event_id != req.started_event_id {
+        if !reset_synthesize_started && started_event_id != req.started_event_id {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
-        let is_reset = req.failure_cause == WorkflowTaskFailedCause::ResetWorkflow;
         let mut builder = TransitionBuilder::new(state, req.now);
         // A started SPECULATIVE task persists Scheduled + Started late,
         // immediately before the failed event — v1.31.0's
@@ -2630,6 +2662,28 @@ impl BasicKernel {
                 current.scheduled_event_id = scheduled;
                 current.started_event_id = Some(started);
                 (scheduled, started)
+            } else if reset_synthesize_started {
+                // The fork-point WFT's Scheduled event lives in the replayed prefix;
+                // synthesize only its Started, then the failed event below fails it.
+                let started = builder.emit_at(
+                    req.now,
+                    HistoryEventKind::WorkflowTaskStarted {
+                        logical_seq: pending.logical_seq,
+                        scheduled_event_id: pending.scheduled_event_id,
+                        attempt: pending.attempt,
+                        identity: req.worker_identity.clone(),
+                        request_id: format!("reset-materialize-{}", pending.logical_seq.0),
+                        history_size_bytes: 0,
+                        suggest_continue_as_new: false,
+                    },
+                );
+                let current = builder
+                    .state
+                    .pending_workflow_task
+                    .as_mut()
+                    .expect("validated pending workflow task must still exist");
+                current.started_event_id = Some(started);
+                (pending.scheduled_event_id, started)
             } else {
                 (pending.scheduled_event_id, started_event_id)
             };
@@ -2704,7 +2758,11 @@ impl BasicKernel {
         // `service/history/workflow/util.go:26 @ v1.31.0`).
         let flushed = builder.flush_buffered();
         let paused = builder.state.status == ExecutionStatus::Paused;
-        if flushed > 0 && !paused {
+        // A reset re-drives from the fork point on a FRESH normal attempt-1 task
+        // with a real `WorkflowTaskScheduled` (v1.31.0 `ScheduleWorkflowTask` after
+        // the reset failure, workflow_resetter.go:243) — never the transient
+        // attempt-2 retry the ordinary WFT-failure path takes.
+        if (flushed > 0 || is_reset) && !paused {
             // Events buffered during the WFT invalidate any continuously-failing
             // (transient) suffix: v1.31.0 resets the next task to a NORMAL,
             // attempt-1 task with a REAL WorkflowTaskScheduled — the flushed events

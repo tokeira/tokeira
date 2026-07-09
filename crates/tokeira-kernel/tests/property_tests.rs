@@ -152,6 +152,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         attempt: 2,
         first_execution_run_id: Some(RunId::new()),
         original_execution_run_id: None,
+        reset_run_id: None,
         parent_run_key: None,
         parent_workflow_id: None,
         parent_run_id: None,
@@ -964,6 +965,11 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
 }
 
 fn arb_wft_failed_cause() -> impl Strategy<Value = WorkflowTaskFailedCause> {
+    // Worker-reported RespondWorkflowTaskFailed causes only. `ResetWorkflow` is a
+    // SYSTEM cause authored internally by the reset flow (it re-drives from the fork
+    // point on a fresh normal task rather than a transient retry), so it never
+    // reaches this worker-failure path and is excluded from the transient-model
+    // properties (reset is covered by golden_tests + the reset conformance suites).
     prop_oneof![
         Just(WorkflowTaskFailedCause::NonDeterminismError),
         Just(WorkflowTaskFailedCause::BadScheduleActivityAttributes),
@@ -972,7 +978,6 @@ fn arb_wft_failed_cause() -> impl Strategy<Value = WorkflowTaskFailedCause> {
         Just(WorkflowTaskFailedCause::BadRequestCancelActivityAttributes),
         Just(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
         Just(WorkflowTaskFailedCause::BadSignalWorkflowExecutionAttributes),
-        Just(WorkflowTaskFailedCause::ResetWorkflow),
     ]
 }
 

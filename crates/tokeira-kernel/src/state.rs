@@ -90,6 +90,10 @@ pub struct WorkflowState {
     pub first_execution_run_id: Option<RunId>,
     /// Run ID of the original execution in the chain.
     pub original_execution_run_id: Option<RunId>,
+    /// Run ID this run was reset INTO, if it has been reset. Set on the BASE run
+    /// of a reset; surfaced as `ExecutionInfo.ResetRunId` via DescribeMutableState
+    /// (`UpdateResetRunID`, mutable_state_impl.go:1010 @ v1.31.0).
+    pub reset_run_id: Option<RunId>,
     /// Parent run identity if this execution is a child.
     pub parent_run_key: Option<RunKey>,
     /// Parent workflow identity if this execution is a child.
@@ -1015,6 +1019,7 @@ mod tests {
             attempt: 1,
             first_execution_run_id: Some(RunId::new()),
             original_execution_run_id: None,
+            reset_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
             parent_run_id: None,

@@ -5721,27 +5721,49 @@ fn is_close_history_event(kind: &HistoryEventKind) -> bool {
 }
 
 fn validate_reset_target(history: &[HistoryEvent], fork_event_id: i64) -> EdgeResult<()> {
-    let Some(event) = history.iter().find(|event| event.event_id == fork_event_id) else {
+    // v1.31.0 accepts any `WorkflowTaskFinishEventId ∈ [2, NextEventID-1]`
+    // (resetworkflow/api.go:61-64) that resolves to a pending workflow task: the
+    // resetter rebuilds to `finish - 1` and requires a WFT there, i.e. the id must
+    // fall in some WFT's `[WorkflowTaskScheduled+1, WorkflowTaskStarted+1]` range
+    // (workflow_resetter.go:520-529). A `finish` inside that range but not itself a
+    // WFT event (e.g. a `WorkflowExecutionSignaled` between Scheduled and Started)
+    // is valid — it forks before the signal and re-drives the same task.
+    let last_event_id = history.last().map(|event| event.event_id).unwrap_or(0);
+    if fork_event_id < 2 || fork_event_id > last_event_id {
         return Err(EdgeError::BadRequest(format!(
-            "reset target event_id {} not found",
-            fork_event_id
-        )));
-    };
-
-    if !matches!(
-        event.kind,
-        HistoryEventKind::WorkflowTaskCompleted { .. }
-            | HistoryEventKind::WorkflowTaskFailed { .. }
-            | HistoryEventKind::WorkflowTaskTimedOut { .. }
-            | HistoryEventKind::WorkflowTaskStarted { .. }
-    ) {
-        return Err(EdgeError::BadRequest(format!(
-            "reset target event_id {} must be a workflow task completed/failed/timed out/started event",
-            fork_event_id
+            "reset target event_id {fork_event_id} must be in range [2, {last_event_id}]",
         )));
     }
 
-    Ok(())
+    let mut scheduled: Option<i64> = None;
+    for event in history {
+        match event.kind {
+            HistoryEventKind::WorkflowTaskScheduled { .. } => {
+                // A trailing scheduled-not-started task only covers `[Scheduled+1]`.
+                if scheduled.is_some_and(|s| fork_event_id == s + 1) {
+                    return Ok(());
+                }
+                scheduled = Some(event.event_id);
+            }
+            HistoryEventKind::WorkflowTaskStarted { .. } => {
+                if let Some(s) = scheduled
+                    && fork_event_id >= s + 1
+                    && fork_event_id <= event.event_id + 1
+                {
+                    return Ok(());
+                }
+                scheduled = None;
+            }
+            _ => {}
+        }
+    }
+    if scheduled.is_some_and(|s| fork_event_id == s + 1) {
+        return Ok(());
+    }
+
+    Err(EdgeError::BadRequest(format!(
+        "reset target event_id {fork_event_id} does not resolve to a workflow task boundary",
+    )))
 }
 
 fn batch_request_context(ctx: &BatchDispatchContext) -> RequestContext {

@@ -335,6 +335,7 @@ fn sample_state(run_key: RunKey) -> WorkflowState {
         attempt: 1,
         first_execution_run_id: None,
         original_execution_run_id: None,
+        reset_run_id: None,
         parent_run_key: None,
         parent_workflow_id: None,
         parent_run_id: None,

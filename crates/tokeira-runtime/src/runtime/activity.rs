@@ -1352,6 +1352,7 @@ mod tests {
             attempt: 1,
             first_execution_run_id: Some(RunId::new()),
             original_execution_run_id: None,
+            reset_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
             parent_run_id: None,

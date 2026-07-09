@@ -691,9 +691,12 @@ where
                             // path authors the failure and re-dispatches a fresh
                             // task. Submitted off-lane: the successor may hash to
                             // the very lane running this activation.
-                            if let Some(pending) = successor_state.pending_workflow_task.as_ref()
-                                && let Some(started_event_id) = pending.started_event_id
-                            {
+                            if let Some(pending) = successor_state.pending_workflow_task.as_ref() {
+                                // The fork-point WFT may be scheduled-not-started
+                                // (the copied prefix ended at its Scheduled event) —
+                                // pass 0 and let the kernel synthesize its Started
+                                // before failing it (reset_synthesize_started).
+                                let started_event_id = pending.started_event_id.unwrap_or(0);
                                 let command = tokeira_kernel::Command::WorkflowTaskFailed(
                                     tokeira_kernel::WorkflowTaskFailedRequest {
                                         logical_seq: pending.logical_seq,
@@ -2408,6 +2411,7 @@ mod tests {
             attempt: 1,
             first_execution_run_id: None,
             original_execution_run_id: None,
+            reset_run_id: None,
             parent_run_key: None,
             parent_workflow_id: None,
             parent_run_id: None,

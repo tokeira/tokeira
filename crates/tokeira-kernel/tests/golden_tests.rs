@@ -250,6 +250,7 @@ fn make_open_state() -> WorkflowState {
         attempt: 1,
         first_execution_run_id: Some(RunId::new()),
         original_execution_run_id: None,
+        reset_run_id: None,
         parent_run_key: None,
         parent_workflow_id: None,
         parent_run_id: None,
@@ -1771,7 +1772,11 @@ fn reset_cleans_up_activities_and_timers() {
 }
 
 #[test]
-fn reset_applies_parent_close_policy() {
+fn reset_does_not_apply_parent_close_policy() {
+    // v1.31.0 reconnects the base run's children onto the reset run rather than
+    // terminating them (workflow_resetter.go child reconnection); reset must NOT
+    // run parent-close-policy — a `Terminate` child is neither terminated nor
+    // dropped by the fork.
     let state = with_child(
         make_open_state(),
         "child-1",
@@ -1786,12 +1791,13 @@ fn reset_applies_parent_close_policy() {
         )
         .unwrap();
 
-    assert!(transition.next_state.children.is_empty());
-    assert!(transition.dispatch_ops.iter().any(|op| matches!(
-        op,
-        DispatchOp::TerminateChild { child_workflow_id, .. }
-            if child_workflow_id == &WorkflowId("child-1".into())
-    )));
+    assert!(
+        !transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::TerminateChild { .. }))
+    );
+    assert!(!transition.next_state.children.is_empty());
 }
 
 #[test]
@@ -1853,14 +1859,18 @@ fn reset_rejects_absent_run() {
 }
 
 #[test]
-fn reset_rejects_closed_run() {
-    let reject = kernel()
-        .apply(
-            LoadedRun::Existing(make_closed_state()),
-            Command::Reset(make_reset_request()),
-        )
-        .unwrap_err();
-    assert_eq!(reject, Reject::RunClosed(ExecutionStatus::Completed));
+fn reset_accepts_closed_run() {
+    // v1.31.0 resets CLOSED runs — the fork happens regardless of the base's
+    // status (workflow_resetter.go has no open-check). The base keeps its terminal
+    // status and records only the `ResetRunId` link; the successor is materialized
+    // by the runtime.
+    let req = make_reset_request();
+    let new_run_id = req.new_run_id;
+    let transition = kernel()
+        .apply(LoadedRun::Existing(make_closed_state()), Command::Reset(req))
+        .unwrap();
+    assert_eq!(transition.next_state.status, ExecutionStatus::Completed);
+    assert_eq!(transition.next_state.reset_run_id, Some(new_run_id));
 }
 
 #[test]

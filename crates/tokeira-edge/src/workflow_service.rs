@@ -745,6 +745,18 @@ impl ExecutionResolver for InMemoryExecutionResolver {
     }
 }
 
+/// The subset of a run's internal mutable state exposed by the AdminService's
+/// `DescribeMutableState` — only what the reset conformance suite reads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MutableStateSummary {
+    /// The run's raw execution status.
+    pub status: ExecutionStatus,
+    /// The run this run was reset into, if any (`ExecutionInfo.ResetRunId`).
+    pub reset_run_id: Option<RunId>,
+    /// The original run of the chain (`ExecutionInfo.OriginalExecutionRunId`).
+    pub original_execution_run_id: Option<RunId>,
+}
+
 #[derive(Clone)]
 pub struct WorkflowService {
     runtime: Arc<dyn WorkflowRuntimeApi>,
@@ -3844,14 +3856,24 @@ impl WorkflowService {
                     .map_err(EdgeError::from)?;
                 validate_reset_target(&history, req.workflow_task_finish_event_id)?;
 
+                // Reset targets the RESOLVED base run explicitly. A no-run-id reset
+                // of a closed current resolves via `find_latest_run` above, but the
+                // request itself carries no run id — pass the resolved run's id so
+                // the runtime does not re-resolve open-only (which would miss a
+                // closed base).
+                let base_run_id = match self
+                    .repo
+                    .load_run(run_key)
+                    .await
+                    .map_err(EdgeError::from)?
+                {
+                    tokeira_kernel::LoadedRun::Existing(state) => Some(state.run_id),
+                    tokeira_kernel::LoadedRun::Absent => None,
+                };
                 let execution = ExecutionRef {
                     namespace_id: to_internal::namespace_id_for(&req.namespace),
                     workflow_id: tokeira_types::WorkflowId(req.workflow_id.clone()),
-                    run_id: req
-                        .run_id
-                        .as_deref()
-                        .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                        .map(RunId),
+                    run_id: base_run_id,
                 };
                 let internal = to_internal::reset_request(req, &ctx.request_id);
                 let outcome = self
@@ -5490,6 +5512,35 @@ impl WorkflowService {
         Err(EdgeError::WorkflowNotFound {
             namespace: namespace.to_string(),
             workflow_id: workflow_id.to_string(),
+        })
+    }
+
+    /// Read the internal mutable-state summary a run — its raw status and the
+    /// `ResetRunId` link — for the AdminService's `DescribeMutableState`. Only the
+    /// fields the reset conformance suite reads are surfaced; this is deliberately
+    /// not the full persistence image.
+    pub async fn describe_mutable_state(
+        &self,
+        namespace: &str,
+        workflow_id: &str,
+        run_id: Option<&str>,
+    ) -> EdgeResult<MutableStateSummary> {
+        let run_key = self
+            .resolve_execution_run_key(namespace, workflow_id, run_id)
+            .await?;
+        let state = match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
+            tokeira_kernel::LoadedRun::Existing(state) => state,
+            tokeira_kernel::LoadedRun::Absent => {
+                return Err(EdgeError::WorkflowNotFound {
+                    namespace: namespace.to_string(),
+                    workflow_id: workflow_id.to_string(),
+                });
+            }
+        };
+        Ok(MutableStateSummary {
+            status: state.status,
+            reset_run_id: state.reset_run_id,
+            original_execution_run_id: state.original_execution_run_id,
         })
     }
 

@@ -158,6 +158,18 @@ pub mod temporal {
             }
         }
     }
+    // Server-internal surface. tokeira serves only the AdminService's
+    // DescribeMutableState (reset conformance); see the proto for the wire-compat
+    // rationale.
+    pub mod server {
+        pub mod api {
+            pub mod adminservice {
+                pub mod v1 {
+                    tonic::include_proto!("temporal.server.api.adminservice.v1");
+                }
+            }
+        }
+    }
 }
 
 /// File descriptor set for the public API surface.
@@ -172,6 +184,10 @@ pub use temporal::api::{
     operatorservice::v1 as operatorservice, taskqueue::v1 as taskqueue, workflow::v1 as workflow,
     workflowservice::v1 as workflowservice,
 };
+pub use temporal::server::api::adminservice::v1 as adminservice;
+
+/// Fully-qualified gRPC service name for the (minimal) AdminService.
+pub const ADMIN_SERVICE_NAME: &str = "temporal.server.api.adminservice.v1.AdminService";
 
 /// Fully-qualified gRPC service name.
 pub const WORKFLOW_SERVICE_NAME: &str = "temporal.api.workflowservice.v1.WorkflowService";

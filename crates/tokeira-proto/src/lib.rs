@@ -36,5 +36,6 @@ pub mod connect {
 
 pub use internal::{admin, controller, runtime};
 pub use public::{
-    common, enums, failure, history, operatorservice, taskqueue, workflow, workflowservice,
+    adminservice, common, enums, failure, history, operatorservice, taskqueue, workflow,
+    workflowservice,
 };

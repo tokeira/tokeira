@@ -765,7 +765,13 @@ impl RunRepository for InMemoryStore {
             parent_workflow_id: base_state.parent_workflow_id.clone(),
             first_run_started_at: base_state.first_run_started_at,
         };
-        let successor_state = kernel.replay_history_prefix(replay_ctx, &copied_history)?;
+        let mut successor_state = kernel.replay_history_prefix(replay_ctx, &copied_history)?;
+        // The reset run points back to the chain's origin: inherit the base's
+        // `OriginalExecutionRunId` (or the base itself when the base is the origin),
+        // so repeated resets all reference the same original run.
+        successor_state.original_execution_run_id = base_state
+            .original_execution_run_id
+            .or(Some(base_state.run_id));
 
         store.history.insert(successor_run_key, copied_history);
         store

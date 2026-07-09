@@ -60,8 +60,8 @@ use tokeira_edge::{
     WorkflowExecutionDescription, WorkflowService,
     conformance::{WireCoverageLayer, WireCoverageRecorder},
     grpc::{
-        operator_service::OperatorServiceGrpc, runtime_adapter::RuntimeAdapter,
-        workflow_service::WorkflowServiceGrpc,
+        admin_service::AdminServiceGrpc, operator_service::OperatorServiceGrpc,
+        runtime_adapter::RuntimeAdapter, workflow_service::WorkflowServiceGrpc,
     },
     handle_nexus_callback,
     operator_service::{ClusterInfo, OperatorApi, SearchAttributeDefinition},
@@ -1106,8 +1106,11 @@ where
                 background_cancel.clone(),
             );
         }
-        WorkflowServiceGrpc::new(workflow_service).with_chasm_activity(activity_bridge)
+        WorkflowServiceGrpc::new(workflow_service.clone()).with_chasm_activity(activity_bridge)
     };
+    // Minimal AdminService (DescribeMutableState) shares the WorkflowService's
+    // run repository — the reset conformance suite reads a run's ResetRunId/status.
+    let admin_grpc = AdminServiceGrpc::new(workflow_service);
     let operator_grpc = OperatorServiceGrpc::new(operator_service);
 
     let reflection = tonic_reflection::server::Builder::configure()
@@ -1165,6 +1168,7 @@ where
                     .layer(WireCoverageLayer::new(recorder))
                     .add_service(workflow_grpc.into_service())
                     .add_service(operator_grpc.into_service())
+                    .add_service(admin_grpc.into_service())
                     .add_service(reflection)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
                     .await
@@ -1176,6 +1180,7 @@ where
                     .layer(GrpcWebLayer::new())
                     .add_service(workflow_grpc.into_service())
                     .add_service(operator_grpc.into_service())
+                    .add_service(admin_grpc.into_service())
                     .add_service(reflection)
                     .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal)
                     .await

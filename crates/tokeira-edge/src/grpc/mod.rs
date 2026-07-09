@@ -1,3 +1,4 @@
+pub mod admin_service;
 pub mod errors;
 pub mod metadata;
 pub mod operator_service;

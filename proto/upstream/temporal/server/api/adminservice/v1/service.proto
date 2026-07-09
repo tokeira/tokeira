@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package temporal.server.api.adminservice.v1;
+
+import "temporal/api/common/v1/message.proto";
+import "temporal/api/enums/v1/workflow.proto";
+
+// Minimal AdminService surface for tokeira.
+//
+// tokeira serves only `DescribeMutableState`, which the reset conformance suite
+// (`TestWorkflowResetTestSuite`) uses to read a run's INTERNAL `ResetRunId` link
+// and raw execution status — bookkeeping the public `WorkflowService` surface
+// does not expose. The message and field numbers below MATCH the real
+// `temporal.server.api.{adminservice,persistence}.v1` protos so the response is
+// wire-compatible with the harness's client (protobuf decodes by field number);
+// every other `WorkflowMutableState` field is intentionally omitted and defaults
+// on the client. This deliberately avoids pulling the full persistence proto's
+// dependency closure into tokeira's build.
+
+// Mirrors `temporal.server.api.persistence.v1.WorkflowExecutionInfo`
+// (only the fields the corpus reads).
+message WorkflowExecutionInfo {
+  string reset_run_id = 97;
+  string original_execution_run_id = 99;
+}
+
+// Mirrors `temporal.server.api.persistence.v1.WorkflowExecutionState`.
+message WorkflowExecutionState {
+  temporal.api.enums.v1.WorkflowExecutionStatus status = 4;
+}
+
+// Mirrors `temporal.server.api.persistence.v1.WorkflowMutableState`.
+message WorkflowMutableState {
+  WorkflowExecutionInfo execution_info = 7;
+  WorkflowExecutionState execution_state = 8;
+}
+
+message DescribeMutableStateRequest {
+  string namespace = 1;
+  temporal.api.common.v1.WorkflowExecution execution = 2;
+  bool skip_force_reload = 3;
+  string archetype = 4;
+  uint32 archetype_id = 5;
+}
+
+message DescribeMutableStateResponse {
+  string shard_id = 1;
+  string history_addr = 2;
+  WorkflowMutableState cache_mutable_state = 3;
+  WorkflowMutableState database_mutable_state = 4;
+}
+
+service AdminService {
+  rpc DescribeMutableState(DescribeMutableStateRequest) returns (DescribeMutableStateResponse);
+}

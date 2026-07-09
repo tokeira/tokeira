@@ -5168,7 +5168,7 @@ fn continue_as_new_behavior_to_proto(value: ContinueAsNewVersioningBehavior) -> 
     }
 }
 
-fn execution_status_to_proto(value: ExecutionStatus) -> i32 {
+pub(crate) fn execution_status_to_proto(value: ExecutionStatus) -> i32 {
     use enums::WorkflowExecutionStatus as Proto;
 
     match value {

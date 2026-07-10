@@ -60,3 +60,9 @@ tokeirad.log
 # `git rm --cached tokeira.code-workspace` stopped tracking it at commit
 # <SHA after next commit>.
 /tokeira.code-workspace
+
+# Claude Code session-local state
+.claude/settings.local.json
+.claude/worktrees/
+.claude/launch.json
+.claude/wf-*.js

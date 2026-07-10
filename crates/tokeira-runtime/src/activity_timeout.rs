@@ -33,8 +33,7 @@ use tokeira_kernel::{
 use tokeira_observability::OutcomeLabel;
 use tokeira_proto::{
     conversions::common::{failure_to_payload, payloads_from_domain},
-    public::temporal::api::enums::v1 as enums_proto,
-    public::temporal::api::failure::v1 as failure_proto,
+    public::temporal::api::{enums::v1 as enums_proto, failure::v1 as failure_proto},
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{Payload, Payloads, RunKey, ShardId};

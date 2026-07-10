@@ -7,9 +7,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::{ProvenanceStamp, check_binding};
 
-use crate::apply::deployment_identity;
-use crate::envelope_store;
-use crate::platform;
+use crate::{apply::deployment_identity, envelope_store, platform};
 
 pub async fn plan(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());

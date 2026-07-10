@@ -4582,8 +4582,8 @@ pub fn proto_command_to_workflow_command(
             // to a bogus id and leave every downstream ChildWorkflowExecution*
             // event's `.Namespace`/`.NamespaceId` empty
             // (`TestChildWorkflowExecution` asserts both against the parent's).
-            let child_namespace = non_empty(attrs.namespace)
-                .unwrap_or_else(|| default_namespace.to_string());
+            let child_namespace =
+                non_empty(attrs.namespace).unwrap_or_else(|| default_namespace.to_string());
             Ok(WorkflowCommand::StartChildWorkflow {
                 child_workflow_id: WorkflowId(attrs.workflow_id),
                 namespace_id: namespace_name_to_domain(&child_namespace),
@@ -7814,10 +7814,13 @@ mod tests {
 
     #[test]
     fn command_without_attributes_returns_missing_field() {
-        let err = proto_command_to_workflow_command(command::Command {
-            attributes: None,
-            ..Default::default()
-        }, "")
+        let err = proto_command_to_workflow_command(
+            command::Command {
+                attributes: None,
+                ..Default::default()
+            },
+            "",
+        )
         .expect_err("missing attributes should fail");
 
         match err {

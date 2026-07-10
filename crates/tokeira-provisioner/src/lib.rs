@@ -518,7 +518,9 @@ mod tests {
             .expect("checkpoint present");
         assert_eq!(env.binding.as_ref(), Some(&a), "re-pinned to A");
         assert_eq!(
-            env.integrity.as_ref().map(|m| m.provisioner_version.as_str()),
+            env.integrity
+                .as_ref()
+                .map(|m| m.provisioner_version.as_str()),
             Some("1.0.0"),
             "A's integrity manifest restored with A's binding"
         );

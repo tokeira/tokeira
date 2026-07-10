@@ -20,10 +20,9 @@ use tokeira_provisioner::{
     UpgradeDecision, evaluate_upgrade,
 };
 
-use crate::apply::deployment_identity;
-use crate::envelope_store;
-use crate::init::running_integrity_manifest;
-use crate::platform;
+use crate::{
+    apply::deployment_identity, envelope_store, init::running_integrity_manifest, platform,
+};
 
 pub async fn upgrade(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now()); // B
@@ -75,9 +74,7 @@ pub async fn upgrade(deployment_dir: &Path) -> Result<()> {
         .save(&envelope, &version)
         .await
         .context("failed to commit the atomic ownership transfer")?;
-    println!(
-        "ownership transferred — [A final] checkpoint captured, operation marker open"
-    );
+    println!("ownership transferred — [A final] checkpoint captured, operation marker open");
 
     // ── Apply B's plan (dispatched by platform). Migrations would run here on a schema change. ──
     let project_name = deployment_identity(&envelope.deployment_id);
@@ -90,7 +87,10 @@ pub async fn upgrade(deployment_dir: &Path) -> Result<()> {
         .save(&envelope, &version)
         .await
         .context("failed to close the operation marker")?;
-    println!("upgrade complete — now bound to version {}", running.version);
+    println!(
+        "upgrade complete — now bound to version {}",
+        running.version
+    );
     Ok(())
 }
 
@@ -101,10 +101,7 @@ pub async fn upgrade(deployment_dir: &Path) -> Result<()> {
 /// launcher's bound-class verification (`tkr`, task 9.1) checks the installed
 /// `tkp` against it, so a stale Day-0 manifest would permanently fail every
 /// post-upgrade bound launch.
-fn transfer_ownership(
-    envelope: &mut DeploymentStateEnvelope,
-    to: ProvenanceStamp,
-) -> Result<()> {
+fn transfer_ownership(envelope: &mut DeploymentStateEnvelope, to: ProvenanceStamp) -> Result<()> {
     let operation_id = format!("upgrade-{}", Utc::now().timestamp_millis());
     envelope.begin_upgrade(to, operation_id, Utc::now());
     envelope.integrity = Some(

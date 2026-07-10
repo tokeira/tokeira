@@ -17,10 +17,11 @@ use chrono::Utc;
 use tokeira_local_deployment::LocalConfig;
 use tokeira_provisioner::ProvenanceStamp;
 
-use crate::config_history;
-use crate::envelope_store;
-use crate::gate::{GateOutcome, evaluate_gate};
-use crate::platform;
+use crate::{
+    config_history, envelope_store,
+    gate::{GateOutcome, evaluate_gate},
+    platform,
+};
 
 pub async fn apply(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -54,7 +55,10 @@ pub async fn apply(deployment_dir: &Path) -> Result<()> {
     // The deployment identity seeds the compose-syn `Cx`; it was set at `init`.
     let project_name = deployment_identity(&envelope.deployment_id);
     let change_count = platform::infra_apply(deployment_dir, &project_name).await?;
-    println!("[{}] infra apply: {change_count} change(s)", resolved.label());
+    println!(
+        "[{}] infra apply: {change_count} change(s)",
+        resolved.label()
+    );
 
     // ── Re-stamp the envelope ──
     // A config apply keeps the engine identity and advances the config revision
@@ -76,7 +80,10 @@ pub async fn apply(deployment_dir: &Path) -> Result<()> {
     println!(
         "envelope: config_revision now {} (config {})",
         envelope.config_revision,
-        envelope.effective_config_ref.as_deref().unwrap_or("default")
+        envelope
+            .effective_config_ref
+            .as_deref()
+            .unwrap_or("default")
     );
     Ok(())
 }
@@ -154,7 +161,9 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        apply(tmp.path()).await.expect("apply proceeds under DevIterate");
+        apply(tmp.path())
+            .await
+            .expect("apply proceeds under DevIterate");
 
         let (after, _) = store.load().await.unwrap();
         assert_eq!(after.config_revision, 5, "config_revision advanced by one");

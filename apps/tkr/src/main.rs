@@ -73,9 +73,7 @@ async fn main() -> Result<()> {
     // the mutation).
     let mut selected = cli.deployment.clone();
     if let Some(target) = mutation_target(&cli.command, selected.as_deref()) {
-        if let Some(pinned) =
-            deployment_lock::enforce_mutation(&deployments, target.as_deref())?
-        {
+        if let Some(pinned) = deployment_lock::enforce_mutation(&deployments, target.as_deref())? {
             selected = Some(pinned);
         }
     }
@@ -208,9 +206,9 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
         },
         Command::Deployment { action } => match action {
             DeploymentAction::Destroy { name, .. } => Some(Some(name.clone())),
-            DeploymentAction::Apply
-            | DeploymentAction::Upgrade
-            | DeploymentAction::Rollback => Some(selected()),
+            DeploymentAction::Apply | DeploymentAction::Upgrade | DeploymentAction::Rollback => {
+                Some(selected())
+            }
             _ => None,
         },
         _ => None,
@@ -353,10 +351,16 @@ mod tests {
             }
         ));
         for (args, ok) in [
-            (["tkr", "deployment", "describe"], DeploymentAction::Describe),
+            (
+                ["tkr", "deployment", "describe"],
+                DeploymentAction::Describe,
+            ),
             (["tkr", "deployment", "apply"], DeploymentAction::Apply),
             (["tkr", "deployment", "upgrade"], DeploymentAction::Upgrade),
-            (["tkr", "deployment", "rollback"], DeploymentAction::Rollback),
+            (
+                ["tkr", "deployment", "rollback"],
+                DeploymentAction::Rollback,
+            ),
         ] {
             let parsed = Cli::try_parse_from(args).unwrap().command;
             assert!(

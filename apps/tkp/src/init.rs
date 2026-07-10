@@ -28,9 +28,7 @@ use tokeira_provisioner::{
     sha256_hex,
 };
 
-use crate::apply::load_local_config;
-use crate::config_history;
-use crate::envelope_store;
+use crate::{apply::load_local_config, config_history, envelope_store};
 
 pub async fn init(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -76,8 +74,7 @@ pub async fn init(deployment_dir: &Path) -> Result<()> {
 /// launcher verifies a retrieved binary against it before execution (task 4.2).
 pub(crate) fn running_integrity_manifest() -> Result<IntegrityManifest> {
     let exe = std::env::current_exe().context("failed to locate the running binary")?;
-    let bytes =
-        std::fs::read(&exe).with_context(|| format!("failed to read {}", exe.display()))?;
+    let bytes = std::fs::read(&exe).with_context(|| format!("failed to read {}", exe.display()))?;
     let version = tokeira_build_info::TOKEIRA_VERSION.to_string();
     Ok(IntegrityManifest {
         provisioner_version: version.clone(),
@@ -112,10 +109,11 @@ mod tests {
     async fn init_refuses_an_already_initialized_deployment() {
         let tmp = tempfile::tempdir().unwrap();
         init(tmp.path()).await.expect("first init succeeds");
-        let err = init(tmp.path())
-            .await
-            .expect_err("second init refuses");
-        assert!(err.to_string().contains("already initialized"), "unexpected: {err}");
+        let err = init(tmp.path()).await.expect_err("second init refuses");
+        assert!(
+            err.to_string().contains("already initialized"),
+            "unexpected: {err}"
+        );
     }
 
     // Property 14 (task 14.1): configuration refinement (repeated same-engine
@@ -126,7 +124,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         init(tmp.path()).await.expect("init");
         let (after_init, _) = envelope_store(tmp.path()).load().await.unwrap();
-        let engine_hash = after_init.binding.as_ref().unwrap().source_tree_hash.clone();
+        let engine_hash = after_init
+            .binding
+            .as_ref()
+            .unwrap()
+            .source_tree_hash
+            .clone();
 
         // Two successive config applies (same binary → same engine).
         crate::apply::apply(tmp.path()).await.expect("apply 1");
@@ -138,7 +141,10 @@ mod tests {
             engine_hash,
             "the engine source_tree_hash is unchanged by config refinement"
         );
-        assert_eq!(after.config_revision, 2, "config_revision advanced per apply");
+        assert_eq!(
+            after.config_revision, 2,
+            "config_revision advanced per apply"
+        );
         assert!(
             after.effective_config_ref.is_some(),
             "apply records the effective config ref (task 14.2)"

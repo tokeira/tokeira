@@ -20,8 +20,10 @@
 //! external-metadata verification and the two-binary rollback re-exec (the
 //! retained-`A` reconcile phase) are follow-ons.
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{Context, Result, bail};
 use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, Target};
@@ -155,7 +157,8 @@ fn verify_against_manifest(path: &Path, envelope: &DeploymentStateEnvelope) -> R
              (was it initialized by `tkp init`?)"
         )
     })?;
-    let bytes = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     // tkr and the tkp it launches run on the same host, so the launcher's own
     // compile target names the descriptor the installed tkp must match.
     let target = Target(env!("TKR_TARGET").to_string());
@@ -248,11 +251,17 @@ mod tests {
         let dev = envelope_with(Some(BuildMode::Dev));
         let unstamped = envelope_with(None);
 
-        assert_eq!(resolve_class("upgrade", &versioned), LaunchClass::CandidateUpgrade);
+        assert_eq!(
+            resolve_class("upgrade", &versioned),
+            LaunchClass::CandidateUpgrade
+        );
         assert_eq!(resolve_class("rollback", &versioned), LaunchClass::Rollback);
         assert_eq!(resolve_class("apply", &versioned), LaunchClass::Bound);
         assert_eq!(resolve_class("apply", &dev), LaunchClass::DevCandidate);
-        assert_eq!(resolve_class("apply", &unstamped), LaunchClass::DevCandidate);
+        assert_eq!(
+            resolve_class("apply", &unstamped),
+            LaunchClass::DevCandidate
+        );
 
         // Read-only verbs are never gated — regardless of the binding, so a
         // versioned-bound deployment with a missing/mismatched tkp can still be
@@ -271,17 +280,35 @@ mod tests {
         let unstamped = envelope_with(None);
 
         // Bound + Rollback both launch the manifest-recorded binary → verified.
-        assert!(requires_manifest_verification(LaunchClass::Bound, &versioned));
-        assert!(requires_manifest_verification(LaunchClass::Rollback, &versioned));
+        assert!(requires_manifest_verification(
+            LaunchClass::Bound,
+            &versioned
+        ));
+        assert!(requires_manifest_verification(
+            LaunchClass::Rollback,
+            &versioned
+        ));
         // Candidate-upgrade cannot verify against the manifest (B unrecorded);
         // read-only never gates; dev launches are permissive.
-        assert!(!requires_manifest_verification(LaunchClass::CandidateUpgrade, &versioned));
-        assert!(!requires_manifest_verification(LaunchClass::ReadOnly, &versioned));
-        assert!(!requires_manifest_verification(LaunchClass::DevCandidate, &dev));
+        assert!(!requires_manifest_verification(
+            LaunchClass::CandidateUpgrade,
+            &versioned
+        ));
+        assert!(!requires_manifest_verification(
+            LaunchClass::ReadOnly,
+            &versioned
+        ));
+        assert!(!requires_manifest_verification(
+            LaunchClass::DevCandidate,
+            &dev
+        ));
         // Dev/unstamped bindings skip verification even for rollback — dev
         // rebuilds change the hash every build; tkp's gate governs downstream.
         assert!(!requires_manifest_verification(LaunchClass::Rollback, &dev));
-        assert!(!requires_manifest_verification(LaunchClass::Rollback, &unstamped));
+        assert!(!requires_manifest_verification(
+            LaunchClass::Rollback,
+            &unstamped
+        ));
     }
 
     fn manifest_for(sha: &str, target: &str) -> IntegrityManifest {
@@ -314,7 +341,10 @@ mod tests {
         // Same target, different digest → aborts.
         env.integrity = Some(manifest_for(&sha256_hex(b"other-bytes"), host_target));
         let err = verify_against_manifest(&bin, &env).expect_err("mismatch aborts");
-        assert!(err.to_string().contains("integrity check failed"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("integrity check failed"),
+            "unexpected: {err}"
+        );
 
         // A matching digest recorded under a DIFFERENT target does not vouch for
         // this host's binary — target-scoped, not any-artifact (Req 7.2).
@@ -323,7 +353,10 @@ mod tests {
             "some-other-triple",
         ));
         let err = verify_against_manifest(&bin, &env).expect_err("wrong target aborts");
-        assert!(err.to_string().contains("integrity check failed"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("integrity check failed"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
@@ -333,6 +366,9 @@ mod tests {
         std::fs::write(&bin, b"x").unwrap();
         let env = envelope_with(Some(BuildMode::Versioned)); // no integrity
         let err = verify_against_manifest(&bin, &env).expect_err("no manifest aborts");
-        assert!(err.to_string().contains("no integrity manifest"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("no integrity manifest"),
+            "unexpected: {err}"
+        );
     }
 }

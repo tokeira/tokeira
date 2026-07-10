@@ -18,11 +18,12 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
-use crate::apply::{config_ref, deployment_identity};
-use crate::config_history;
-use crate::envelope_store;
-use crate::gate::{GateOutcome, evaluate_gate};
-use crate::platform;
+use crate::{
+    apply::{config_ref, deployment_identity},
+    config_history, envelope_store,
+    gate::{GateOutcome, evaluate_gate},
+    platform,
+};
 
 pub async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -77,7 +78,10 @@ pub async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()> {
 
     let project_name = deployment_identity(&envelope.deployment_id);
     let change_count = platform::infra_apply(deployment_dir, &project_name).await?;
-    println!("[{}] revert reconcile: {change_count} change(s)", resolved.label());
+    println!(
+        "[{}] revert reconcile: {change_count} change(s)",
+        resolved.label()
+    );
 
     // ── Re-stamp: a forward config revision whose content equals `to_revision` ──
     envelope.binding = Some(running);
@@ -135,7 +139,10 @@ mod tests {
         let err = revert(tmp.path(), 1)
             .await
             .expect_err("no snapshot for revision 1 → refuse");
-        assert!(err.to_string().contains("not retained"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("not retained"),
+            "unexpected: {err}"
+        );
     }
 
     #[tokio::test]
@@ -169,7 +176,10 @@ mod tests {
 
         // The live config source now holds revision 1's content...
         let restored = std::fs::read_to_string(tmp.path().join("deployment.toml")).unwrap();
-        assert!(restored.contains("one"), "reverted to revision 1's config: {restored}");
+        assert!(
+            restored.contains("one"),
+            "reverted to revision 1's config: {restored}"
+        );
         // ...and the counter advanced forward (monotonic).
         let (after, _) = envelope_store(tmp.path()).load().await.unwrap();
         assert_eq!(after.config_revision, 3, "revert is a forward revision");

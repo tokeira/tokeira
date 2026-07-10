@@ -545,10 +545,18 @@ async fn start_timeout_cron_successor(
         }
         Ok(tokeira_storage::CommitResult::Duplicate) => {}
         Ok(other) => {
-            tracing::warn!(?other, ?new_run_id, "timeout cron successor start not applied");
+            tracing::warn!(
+                ?other,
+                ?new_run_id,
+                "timeout cron successor start not applied"
+            );
         }
         Err(error) => {
-            tracing::warn!(?error, ?new_run_id, "failed to start timeout cron successor");
+            tracing::warn!(
+                ?error,
+                ?new_run_id,
+                "failed to start timeout cron successor"
+            );
         }
     }
 }

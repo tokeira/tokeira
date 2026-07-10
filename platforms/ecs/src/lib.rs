@@ -22,9 +22,7 @@ use tokeira_iac as iac;
 use tokeira_orchestrator::{
     Ops, PlatformConfig, PortMapping, Result, ServiceReplicas, StorageKind,
 };
-use tokeira_state::{
-    CasStore, DeploymentStore, S3StateStore, StateBackend, StateError, Validate,
-};
+use tokeira_state::{CasStore, DeploymentStore, S3StateStore, StateBackend, StateError, Validate};
 
 pub use config::EcsConfig;
 

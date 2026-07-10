@@ -132,7 +132,10 @@ mod tests {
         // Snapshot revision 1 as a LOCAL deployment (deployment.toml).
         std::fs::write(tmp.path().join("deployment.toml"), b"LOCAL-TOML").unwrap();
         snapshot(tmp.path(), 1).unwrap();
-        assert!(is_retained(tmp.path(), 1), "retained under the local basename");
+        assert!(
+            is_retained(tmp.path(), 1),
+            "retained under the local basename"
+        );
 
         // The deployment becomes compose-syn (a `.tkd` appears with real content).
         std::fs::write(tmp.path().join("definition.tkd"), b"REAL-TKD").unwrap();

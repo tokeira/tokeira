@@ -6,9 +6,7 @@
 //! across its whole B-delete → re-pin → A-reconcile sequence (12.2), so no writer
 //! interleaves at the handoff.
 
-use std::path::Path;
-use std::process;
-use std::time::Duration;
+use std::{path::Path, process, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -97,8 +95,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[tokio::test]
     async fn runs_body_under_the_lock_and_releases() {
@@ -130,7 +130,10 @@ mod tests {
         let err = with_operation_lock(tmp.path(), "test", || async { Ok(()) })
             .await
             .expect_err("a held lock refuses");
-        assert!(err.to_string().contains("operation lock"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("operation lock"),
+            "unexpected: {err}"
+        );
     }
 
     // Fix for the "lease lapses mid-operation" finding: an operation that outlives

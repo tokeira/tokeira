@@ -17,10 +17,12 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
-use crate::apply::deployment_identity;
-use crate::envelope_store;
-use crate::gate::{GateOutcome, evaluate_gate};
-use crate::platform;
+use crate::{
+    apply::deployment_identity,
+    envelope_store,
+    gate::{GateOutcome, evaluate_gate},
+    platform,
+};
 
 pub async fn destroy(deployment_dir: &Path, yes: bool) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -61,7 +63,10 @@ pub async fn destroy(deployment_dir: &Path, yes: bool) -> Result<()> {
     let resolved = platform::detect(deployment_dir);
     let project_name = deployment_identity(&envelope.deployment_id);
     let removed = platform::infra_destroy(deployment_dir, &project_name).await?;
-    println!("[{}] infra destroy: {removed} resource(s) removed", resolved.label());
+    println!(
+        "[{}] infra destroy: {removed} resource(s) removed",
+        resolved.label()
+    );
 
     // ── Record the teardown ──
     // Retain the engine identity (it authored the empty state); clear the
@@ -73,7 +78,10 @@ pub async fn destroy(deployment_dir: &Path, yes: bool) -> Result<()> {
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after destroy")?;
-    println!("envelope: torn down (config_revision {} retained)", envelope.config_revision);
+    println!(
+        "envelope: torn down (config_revision {} retained)",
+        envelope.config_revision
+    );
     Ok(())
 }
 
@@ -98,7 +106,10 @@ mod tests {
         let err = destroy(tmp.path(), false)
             .await
             .expect_err("destroy without --yes refuses");
-        assert!(err.to_string().contains("irreversible"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("irreversible"),
+            "unexpected: {err}"
+        );
     }
 
     #[tokio::test]
@@ -127,11 +138,16 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        destroy(tmp.path(), true).await.expect("local destroy succeeds");
+        destroy(tmp.path(), true)
+            .await
+            .expect("local destroy succeeds");
 
         let (after, _) = store.load().await.unwrap();
         assert_eq!(after.config_revision, 3, "config_revision retained");
-        assert!(after.effective_config_ref.is_none(), "effective config ref cleared");
+        assert!(
+            after.effective_config_ref.is_none(),
+            "effective config ref cleared"
+        );
         assert!(after.binding.is_some(), "engine identity retained");
     }
 }

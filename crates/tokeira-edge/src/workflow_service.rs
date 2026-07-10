@@ -3860,15 +3860,11 @@ impl WorkflowService {
                 // request itself carries no run id — pass the resolved run's id so
                 // the runtime does not re-resolve open-only (which would miss a
                 // closed base).
-                let base_run_id = match self
-                    .repo
-                    .load_run(run_key)
-                    .await
-                    .map_err(EdgeError::from)?
-                {
-                    tokeira_kernel::LoadedRun::Existing(state) => Some(state.run_id),
-                    tokeira_kernel::LoadedRun::Absent => None,
-                };
+                let base_run_id =
+                    match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
+                        tokeira_kernel::LoadedRun::Existing(state) => Some(state.run_id),
+                        tokeira_kernel::LoadedRun::Absent => None,
+                    };
                 let execution = ExecutionRef {
                     namespace_id: to_internal::namespace_id_for(&req.namespace),
                     workflow_id: tokeira_types::WorkflowId(req.workflow_id.clone()),

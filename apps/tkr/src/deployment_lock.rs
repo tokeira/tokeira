@@ -20,8 +20,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::deployment_dir::{DeploymentResolver, METADATA_JSON};
-use crate::metadata::{self, DeploymentMetadata};
+use crate::{
+    deployment_dir::{DeploymentResolver, METADATA_JSON},
+    metadata::{self, DeploymentMetadata},
+};
 
 const LOCK_FILE: &str = "lock.toml";
 
@@ -45,7 +47,10 @@ fn lock_path(root: &Path) -> PathBuf {
 /// silently transferring.
 pub fn fingerprint(meta: &DeploymentMetadata) -> String {
     let canonical = format!("{}|{:?}|{:?}", meta.id, meta.platform, meta.storage);
-    format!("sha256:{}", tokeira_provisioner::sha256_hex(canonical.as_bytes()))
+    format!(
+        "sha256:{}",
+        tokeira_provisioner::sha256_hex(canonical.as_bytes())
+    )
 }
 
 /// Read the active lock, if any.
@@ -232,7 +237,10 @@ mod tests {
 
         // Mutations refuse (fail closed) while the record is unreadable...
         let err = enforce_mutation(&r, Some("prod")).expect_err("corrupt lock fails closed");
-        assert!(err.to_string().contains("invalid deployment lock"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("invalid deployment lock"),
+            "unexpected: {err}"
+        );
 
         // ...but the documented recovery command still works.
         let cleared = unlock(&r).expect("unlock clears a corrupt lock file");
@@ -248,7 +256,10 @@ mod tests {
         lock(&r, Some("prod")).unwrap();
         r.remove("prod").unwrap();
         let err = enforce_mutation(&r, Some("prod")).expect_err("vanished lock fails closed");
-        assert!(err.to_string().contains("no longer exists"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("no longer exists"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

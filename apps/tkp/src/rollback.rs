@@ -18,10 +18,12 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
-use crate::apply::deployment_identity;
-use crate::envelope_store;
-use crate::gate::{GateOutcome, evaluate_gate};
-use crate::platform;
+use crate::{
+    apply::deployment_identity,
+    envelope_store,
+    gate::{GateOutcome, evaluate_gate},
+    platform,
+};
 
 pub async fn rollback(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -85,7 +87,10 @@ pub async fn rollback(deployment_dir: &Path) -> Result<()> {
         .save(&envelope, &version)
         .await
         .context("failed to commit the re-pin to A")?;
-    println!("re-pinned to A (version {}); rollback marker open", to_a.version);
+    println!(
+        "re-pinned to A (version {}); rollback marker open",
+        to_a.version
+    );
 
     // ── A forward-reconciles toward its retained prior configuration revision ──
     let project_name = deployment_identity(&envelope.deployment_id);

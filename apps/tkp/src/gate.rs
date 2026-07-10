@@ -26,10 +26,7 @@ pub enum GateOutcome {
 
 /// Evaluate the binding gate for a deployment's `recorded` provenance (`None`
 /// when unstamped) against the `running` provisioner.
-pub fn evaluate_gate(
-    recorded: Option<&ProvenanceStamp>,
-    running: &ProvenanceStamp,
-) -> GateOutcome {
+pub fn evaluate_gate(recorded: Option<&ProvenanceStamp>, running: &ProvenanceStamp) -> GateOutcome {
     let verdict = check_binding(recorded, running);
     match verdict {
         BindingVerdict::Match => GateOutcome::Proceed {
@@ -85,7 +82,10 @@ mod tests {
         let s = stamp(BuildMode::Versioned, "1.0.0", "h");
         assert!(matches!(
             evaluate_gate(Some(&s), &s),
-            GateOutcome::Proceed { authoritative: true, .. }
+            GateOutcome::Proceed {
+                authoritative: true,
+                ..
+            }
         ));
     }
 
@@ -95,7 +95,10 @@ mod tests {
         let running = stamp(BuildMode::Dev, "0", "hB");
         assert!(matches!(
             evaluate_gate(Some(&recorded), &running),
-            GateOutcome::Proceed { authoritative: false, .. }
+            GateOutcome::Proceed {
+                authoritative: false,
+                ..
+            }
         ));
     }
 
@@ -105,7 +108,10 @@ mod tests {
         let running = stamp(BuildMode::Versioned, "1.0.0", "hB");
         assert!(matches!(
             evaluate_gate(Some(&recorded), &running),
-            GateOutcome::Refuse { verdict: BindingVerdict::Mismatch, .. }
+            GateOutcome::Refuse {
+                verdict: BindingVerdict::Mismatch,
+                ..
+            }
         ));
     }
 
@@ -114,7 +120,10 @@ mod tests {
         let running = stamp(BuildMode::Versioned, "1.0.0", "hA");
         assert!(matches!(
             evaluate_gate(None, &running),
-            GateOutcome::Refuse { verdict: BindingVerdict::Unknown, .. }
+            GateOutcome::Refuse {
+                verdict: BindingVerdict::Unknown,
+                ..
+            }
         ));
     }
 
@@ -124,7 +133,10 @@ mod tests {
         let running = stamp(BuildMode::Dev, "1.0.0", "hA");
         assert!(matches!(
             evaluate_gate(Some(&recorded), &running),
-            GateOutcome::Refuse { verdict: BindingVerdict::ModeRegression, .. }
+            GateOutcome::Refuse {
+                verdict: BindingVerdict::ModeRegression,
+                ..
+            }
         ));
     }
 }

@@ -541,9 +541,17 @@ where
         if let Err(error) = self.pick_lane(run_key).submit(run_key, command).await {
             let message = error.to_string();
             if message.contains("kernel rejected") || message.contains("not found") {
-                tracing::debug!(?error, ?run_key, "conflicting child incumbent already closed");
+                tracing::debug!(
+                    ?error,
+                    ?run_key,
+                    "conflicting child incumbent already closed"
+                );
             } else {
-                tracing::warn!(?error, ?run_key, "failed to terminate conflicting child incumbent");
+                tracing::warn!(
+                    ?error,
+                    ?run_key,
+                    "failed to terminate conflicting child incumbent"
+                );
             }
         }
     }

@@ -170,8 +170,8 @@ impl OperationLock {
         let ttl = ChronoDuration::from_std(ttl)
             .map_err(|e| StateError::Other(anyhow::anyhow!("invalid lock ttl: {e}")))?;
         let (current, version) = self.read_lease().await?;
-        let current =
-            current.ok_or_else(|| StateError::LockLost("operation lock no longer exists".into()))?;
+        let current = current
+            .ok_or_else(|| StateError::LockLost("operation lock no longer exists".into()))?;
         if current.token != guard.token || current.released {
             return Err(StateError::LockLost(
                 "operation lock was taken over by another holder".into(),
@@ -296,7 +296,10 @@ mod tests {
         let lock = lock(tmp.path());
         let guard = lock.acquire("worker-a", ttl()).await.unwrap();
         assert_eq!(guard.holder, "worker-a");
-        assert_ne!(guard.token, "old-token", "a fresh token is minted on takeover");
+        assert_ne!(
+            guard.token, "old-token",
+            "a fresh token is minted on takeover"
+        );
     }
 
     #[tokio::test]

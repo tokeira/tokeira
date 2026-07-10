@@ -252,7 +252,10 @@ impl DescribeReport {
     }
 
     fn print_human(&self, deployment_dir: &Path) {
-        println!("tkp describe — deployment at {}\n", deployment_dir.display());
+        println!(
+            "tkp describe — deployment at {}\n",
+            deployment_dir.display()
+        );
 
         println!("Running provisioner");
         println!("  version           {}", self.running.version);
@@ -285,13 +288,20 @@ impl DescribeReport {
             ),
             None => println!("  recorded          unstamped (Unknown)"),
         }
-        let mark = if self.binding.proceeds { "proceeds" } else { "REFUSES" };
+        let mark = if self.binding.proceeds {
+            "proceeds"
+        } else {
+            "REFUSES"
+        };
         let auth = if self.binding.authoritative {
             " (authoritative)"
         } else {
             ""
         };
-        println!("  verdict           {} — {mark}{auth}\n", self.binding.verdict);
+        println!(
+            "  verdict           {} — {mark}{auth}\n",
+            self.binding.verdict
+        );
 
         match &self.integrity {
             Some(i) => println!(
@@ -304,11 +314,19 @@ impl DescribeReport {
         println!("State heads");
         println!(
             "  infra             {}",
-            if self.infra_head_present { "present" } else { "none" }
+            if self.infra_head_present {
+                "present"
+            } else {
+                "none"
+            }
         );
         println!(
             "  runtime           {}\n",
-            if self.runtime_head_present { "present" } else { "none" }
+            if self.runtime_head_present {
+                "present"
+            } else {
+                "none"
+            }
         );
 
         println!(

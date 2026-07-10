@@ -10,8 +10,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use tokeira_compose::{ComposeError, ComposePlatform};
-use tokeira_compose_syn::adapter::{TkdConfig, TkdDeployment};
-use tokeira_compose_syn::context::Cx;
+use tokeira_compose_syn::{
+    adapter::{TkdConfig, TkdDeployment},
+    context::Cx,
+};
 use tokeira_iac::{Change, ModuleSelection};
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::{Deployment, InfraEngine};
@@ -65,7 +67,12 @@ pub(crate) fn load_tkd_config(deployment_dir: &Path, project_name: &str) -> Resu
 pub async fn infra_plan(deployment_dir: &Path, project_name: &str) -> Result<Vec<Change>> {
     match detect(deployment_dir) {
         Platform::Local => {
-            plan_infra(LocalDeployment, load_local_config(deployment_dir)?, deployment_dir).await
+            plan_infra(
+                LocalDeployment,
+                load_local_config(deployment_dir)?,
+                deployment_dir,
+            )
+            .await
         }
         Platform::ComposeSyn => {
             let config = load_tkd_config(deployment_dir, project_name)?;
@@ -83,7 +90,12 @@ pub async fn infra_plan(deployment_dir: &Path, project_name: &str) -> Result<Vec
 pub async fn infra_apply(deployment_dir: &Path, project_name: &str) -> Result<usize> {
     match detect(deployment_dir) {
         Platform::Local => {
-            apply_infra(LocalDeployment, load_local_config(deployment_dir)?, deployment_dir).await
+            apply_infra(
+                LocalDeployment,
+                load_local_config(deployment_dir)?,
+                deployment_dir,
+            )
+            .await
         }
         Platform::ComposeSyn => {
             let config = load_tkd_config(deployment_dir, project_name)?;
@@ -102,7 +114,12 @@ pub async fn infra_apply(deployment_dir: &Path, project_name: &str) -> Result<us
 pub async fn infra_destroy(deployment_dir: &Path, project_name: &str) -> Result<usize> {
     match detect(deployment_dir) {
         Platform::Local => {
-            destroy_infra(LocalDeployment, load_local_config(deployment_dir)?, deployment_dir).await
+            destroy_infra(
+                LocalDeployment,
+                load_local_config(deployment_dir)?,
+                deployment_dir,
+            )
+            .await
         }
         Platform::ComposeSyn => {
             let config = load_tkd_config(deployment_dir, project_name)?;

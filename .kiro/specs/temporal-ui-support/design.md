@@ -476,32 +476,39 @@ Static struct returned by `GetSystemInfo`. Capabilities reflect what tokeirad ac
 
 ### `PollerInfo` and `PollerRegistry` (new)
 
-Tracks active pollers for `DescribeTaskQueue`. The `LongPollGate` is only a concurrency semaphore — it does not track poller identity, timestamps, or per-queue state. A new `PollerRegistry` is needed:
+Tracks recently observed pollers for `DescribeTaskQueue`. The `LongPollGate` is only a concurrency semaphore — it does not track poller identity, timestamps, or per-queue state. Temporal v1.31.0 retains poller history by identity for the `PollerHistoryTTL` default of five minutes (`service/matching/poller_history.go` and `common/dynamicconfig/constants.go:479 @ v1.31.0`), so the edge registry mirrors that diagnostic lifetime without making it authoritative state:
 
 ```rust
-/// Tracks active pollers per task queue for DescribeTaskQueue.
+/// Tracks recently observed pollers per task queue for DescribeTaskQueue.
 #[derive(Clone, Default)]
 pub struct PollerRegistry {
-    inner: Arc<RwLock<HashMap<QueueKey, Vec<ActivePoller>>>>,
+    inner: Arc<RwLock<HashMap<QueueKey, HashMap<WorkerIdentity, ActivePoller>>>>,
 }
 
 struct ActivePoller {
-    identity: String,
-    registered_at: OffsetDateTime,
-    task_kind: TaskKind,  // Workflow or Activity
+    identity: WorkerIdentity,
+    last_accessed_at: OffsetDateTime,
 }
 
 impl PollerRegistry {
-    /// Register a poller when a poll request begins. Returns a guard
-    /// that deregisters on drop.
-    pub async fn register(&self, queue: &QueueKey, identity: &str) -> PollerGuard;
+    /// Record poll admission and return a finalizer for non-cancelled completion.
+    pub fn register(&self, queue: QueueKey, identity: WorkerIdentity) -> PollerGuard;
 
-    /// List active pollers for a task queue.
-    pub async fn pollers(&self, queue: &QueueKey) -> Vec<PollerInfo>;
+    /// List identities observed within the five-minute history TTL.
+    pub fn pollers(&self, queue: &QueueKey) -> Vec<ActivePoller>;
+}
+
+impl PollerGuard {
+    /// Refresh the identity after a task result or long-poll timeout.
+    pub fn completed(self);
 }
 ```
 
-The `PollerGuard` is an RAII guard that removes the poller entry when the poll request completes (either with a task or timeout). The gRPC handlers for `PollWorkflowTaskQueue` and `PollActivityTaskQueue` call `registry.register()` at entry and hold the guard for the duration of the poll.
+`register()` records the admission observation unconditionally. After the runtime poll future resolves — either with a task or the normal empty long-poll timeout result — the handler calls `PollerGuard::completed()` to refresh `last_access_time`. If tonic cancels the handler by dropping the future, the guard drops without side effects and the completion observation is not written. This is the Rust mapping of v1.31.0's `ctx.Err() != context.Canceled` completion guard (`service/matching/task_queue_partition_manager.go:617-621 @ v1.31.0`): deadline expiry refreshes; client/worker cancellation does not. Repeated polls deduplicate by identity, while `pollers()` prunes observations at the five-minute boundary.
+
+Tokeira sorts returned pollers by identity for stable operator output. This is not part of Temporal compatibility: v1.31.0 iterates its poller-history cache in unspecified order and promises no ordering (`service/matching/poller_history.go @ v1.31.0`).
+
+Temporal also removes an identity eagerly when `CancelOutstandingWorkerPolls` reports worker shutdown (`service/matching/matching_engine.go:1194-1206 @ v1.31.0`). Tokeira does not currently expose that matching-internal shutdown path, so a stopped worker may remain visible for at most the TTL. This is a bounded diagnostic deviation, not correctness state; it should be removed if a later compatibility surface adds explicit worker-shutdown notification.
 
 `WorkflowService` gains a `poller_registry: PollerRegistry` field. `DescribeTaskQueue` delegates to `poller_registry.pollers()`.
 
@@ -572,11 +579,11 @@ sequence.
 
 **Validates: Requirements 9.1, 9.2, 9.4**
 
-### Property 6: Describe task queue lists all pollers
+### Property 6: Describe task queue lists recent pollers
 
-*For any* set of workers polling a task queue, calling `describe_task_queue` SHALL return a pollers list containing an entry for each active poller with matching identity.
+*For any* set of worker identities observed on a task queue within the five-minute TTL, calling `describe_task_queue` SHALL return exactly one poller per identity with its latest admission or non-cancelled completion time; a cancelled completion SHALL NOT advance that time, and identities at or beyond the TTL SHALL be absent.
 
-**Validates: Requirements 11.1**
+**Validates: Requirements 11.1, 11.2, 11.4, 11.5, 11.6**
 
 ### Property 7: Signal-with-start conditional behavior
 

@@ -184,6 +184,7 @@ proptest! {
             })
         );
         prop_assert_eq!(info.history_length, edge.history_length);
+        prop_assert_eq!(info.history_size_bytes, edge.history_size_bytes);
         prop_assert_eq!(info.state_transition_count, edge.state_transition_count);
         prop_assert_eq!(
             info.memo.expect("memo").fields.len(),
@@ -903,6 +904,7 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
             prop::option::of(0i64..4_000_000_000i64),
             prop::option::of(0i64..4_000_000_000i64),
             0i64..1000i64,
+            0i64..1_000_000i64,
             0i64..1000i64,
             arb_memo(),
             arb_search_attributes(),
@@ -918,6 +920,7 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                     start_time,
                     close_time,
                     history_length,
+                    history_size_bytes,
                     state_transition_count,
                     memo,
                     search_attributes,
@@ -948,6 +951,7 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                     user_metadata: None,
                 },
                 history_length,
+                history_size_bytes,
                 state_transition_count,
                 parent_namespace_id: None,
                 parent_workflow_id: None,

@@ -116,6 +116,7 @@ impl StoreExecutionResolver {
                     user_metadata: None,
                 },
                 history_length: state.last_event_id,
+                history_size_bytes: 0,
                 state_transition_count: state.transition_seq.0 as i64,
                 parent_namespace_id: state
                     .parent_namespace_id

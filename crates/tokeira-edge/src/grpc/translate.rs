@@ -5027,6 +5027,10 @@ fn workflow_execution_info_from_description(
         close_time: value.close_time.map(to_proto_timestamp),
         execution_duration,
         history_length: value.history_length,
+        // Temporal reads this from execution statistics
+        // (`service/history/api/describeworkflow/api.go:126 @ v1.31.0`); the
+        // resolver supplies Tokeira's history-authoritative equivalent.
+        history_size_bytes: value.history_size_bytes,
         state_transition_count: value.state_transition_count,
         parent_namespace_id: value.parent_namespace_id.clone().unwrap_or_default(),
         parent_execution: value.parent_workflow_id.as_ref().map(|workflow_id| {
@@ -7720,6 +7724,7 @@ mod tests {
                 user_metadata: None,
             },
             history_length: 1,
+            history_size_bytes: 128,
             state_transition_count: 1,
             parent_namespace_id: None,
             parent_workflow_id: None,

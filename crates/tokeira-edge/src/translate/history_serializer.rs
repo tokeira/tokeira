@@ -38,10 +38,25 @@ use tokeira_proto::{
 /// proto-encoded bytes representing a
 /// `temporal.api.history.v1.History` message.
 pub fn serialize_history(events: &[HistoryEvent]) -> Vec<u8> {
-    let proto = history::History {
+    history_to_proto(events).encode_to_vec()
+}
+
+/// Return the public protobuf-encoded size of a complete history.
+///
+/// Temporal v1.31.0 reads `WorkflowExecutionInfo.history_size_bytes` from a
+/// denormalized execution-statistics counter (`service/history/api/
+/// describeworkflow/api.go:126 @ v1.31.0`). Tokeira derives the value from
+/// authoritative committed history on Describe instead, using the same public
+/// representation returned by `GetWorkflowExecutionHistory` so the count is
+/// meaningful to clients rather than tied to an internal storage codec.
+pub fn serialized_history_size_bytes(events: &[HistoryEvent]) -> i64 {
+    i64::try_from(history_to_proto(events).encoded_len()).unwrap_or(i64::MAX)
+}
+
+fn history_to_proto(events: &[HistoryEvent]) -> history::History {
+    history::History {
         events: events.iter().map(history_event_to_proto).collect(),
-    };
-    proto.encode_to_vec()
+    }
 }
 
 /// Convert a single kernel `HistoryEvent` to its proto
@@ -2281,6 +2296,14 @@ mod tests {
             prop_assert_eq!(proto.event_type, decoded.event_type);
             prop_assert_eq!(proto.attributes, decoded.attributes);
             prop_assert_eq!(proto.links, decoded.links);
+
+            let events = std::slice::from_ref(&event);
+            let history_bytes = serialize_history(events);
+            prop_assert_eq!(
+                serialized_history_size_bytes(events),
+                i64::try_from(history_bytes.len()).expect("test history length fits in i64")
+            );
+            prop_assert!(serialized_history_size_bytes(events) > 0);
         }
     }
 

@@ -2666,7 +2666,7 @@ impl WorkflowService {
                 )?;
 
                 let _permit = self.long_polls.acquire().await?;
-                let _poller = self.poller_registry.register(
+                let poller = self.poller_registry.register(
                     queue_key_for_poll(
                         &req.namespace,
                         &req.task_queue,
@@ -2712,8 +2712,13 @@ impl WorkflowService {
                         internal.worker_identity.clone(),
                         internal.timeout,
                     )
-                    .await
-                    .map_err(EdgeError::from)?;
+                    .await;
+                // Reaching this point distinguishes a matched task, long-poll
+                // timeout, or runtime error from tonic cancellation, which
+                // drops the handler future before this finalizer can run
+                // (`task_queue_partition_manager.go:617-621 @ v1.31.0`).
+                poller.completed();
+                let activation = activation.map_err(EdgeError::from)?;
 
                 match activation {
                     Some(WorkflowActivation::WorkflowTask(started)) => {
@@ -4114,7 +4119,7 @@ impl WorkflowService {
                 )?;
 
                 let _permit = self.long_polls.acquire().await?;
-                let _poller = self.poller_registry.register(
+                let poller = self.poller_registry.register(
                     queue_key_for_poll(
                         &req.namespace,
                         &req.task_queue,
@@ -4128,8 +4133,13 @@ impl WorkflowService {
                 let started = self
                     .runtime
                     .poll_activity_task(internal.queue, internal.worker_identity, internal.timeout)
-                    .await
-                    .map_err(EdgeError::from)?;
+                    .await;
+                // A normal empty result is the long-poll timeout path and must
+                // refresh, while client cancellation drops the future before
+                // this explicit completion (`task_queue_partition_manager.go:
+                // 617-621 @ v1.31.0`).
+                poller.completed();
+                let started = started.map_err(EdgeError::from)?;
 
                 match started {
                     Some(started) => Ok(Some(
@@ -5969,7 +5979,7 @@ fn collect_eager_activity_specs(
 fn active_poller_to_edge(poller: ActivePoller) -> crate::translate::PollerInfo {
     crate::translate::PollerInfo {
         identity: poller.identity.0,
-        last_access_time: Some(poller.registered_at),
+        last_access_time: Some(poller.last_accessed_at),
         rate_per_second: 0.0,
     }
 }

@@ -143,13 +143,16 @@ These semantics are verified against `service/frontend/workflow_handler.go`,
 
 ### Requirement 11: Task Queue Description — DescribeTaskQueue
 
-**User Story:** As a UI user, I want to view task queue details including active pollers, so that I can monitor worker health.
+**User Story:** As a UI user, I want to view task queue details including recently observed pollers, so that I can monitor worker health.
 
 #### Acceptance Criteria
 
-1. WHEN a DescribeTaskQueue request is received, THE WorkflowServiceGrpc SHALL return a DescribeTaskQueueResponse containing the list of active pollers for the specified task queue.
-2. WHEN no workers are polling the specified task queue, THE WorkflowServiceGrpc SHALL return an empty pollers list.
+1. WHEN a DescribeTaskQueue request is received, THE WorkflowServiceGrpc SHALL return one poller entry per worker identity observed on the specified task queue during the preceding five minutes.
+2. WHEN no worker identity has been observed on the specified task queue during the preceding five minutes, THE WorkflowServiceGrpc SHALL return an empty pollers list.
 3. THE WorkflowServiceGrpc SHALL pass the request through Edge_Interceptors for authorization before returning the response.
+4. WHEN the same worker identity polls repeatedly, THE WorkflowServiceGrpc SHALL return one entry whose last_access_time reflects its latest poll observation.
+5. WHEN a poll returns a task or reaches its long-poll deadline, THE Edge_Layer SHALL refresh that identity's last_access_time at poll completion.
+6. WHEN client or worker cancellation drops an outstanding poll, THE Edge_Layer SHALL NOT refresh last_access_time at poll completion.
 
 ### Requirement 12: Signal-With-Start — SignalWithStartWorkflowExecution
 

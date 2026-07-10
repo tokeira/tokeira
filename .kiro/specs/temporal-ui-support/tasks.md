@@ -242,16 +242,20 @@ deletion portions of Tasks 8 and 13 while preserving the historical completion r
 
 - [x] 16. Implement Tier 3 — DescribeTaskQueue
   - [x] 16.1 Create `PollerRegistry` in `tokeira-edge`
-    - Implement `PollerRegistry` with `register()` (returns RAII `PollerGuard`) and `pollers()` methods
-    - `PollerGuard` removes the poller entry on drop when the poll request completes
-    - Store `HashMap<QueueKey, Vec<ActivePoller>>` with identity and registered_at timestamp
+    - Implement `PollerRegistry` with `register()` (returns a `PollerGuard` completion finalizer) and `pollers()` methods
+    - Key observations by worker identity, retain them for the v1.31.0 five-minute `PollerHistoryTTL`, and prune expired identities on read
+    - Record `last_access_time` at poll admission; consume the guard through `completed()` to refresh after a task result or long-poll timeout
+    - Leave guard drop side-effect-free so client/worker cancellation cannot refresh or re-add the identity, matching v1.31.0's `ctx.Err() != context.Canceled` guard
+    - Document that Tokeira lacks v1.31.0's `CancelOutstandingWorkerPolls` eager-removal path, so a shut-down worker can remain visible until the TTL expires
+    - Store `HashMap<QueueKey, HashMap<WorkerIdentity, ActivePoller>>` with identity and last_accessed_at timestamp
     - Add `poller_registry: PollerRegistry` field to `WorkflowService`
-    - _Requirements: 11.1, 11.2_
+    - _Requirements: 11.1, 11.2, 11.4, 11.5, 11.6_
 
   - [x] 16.2 Wire `PollerRegistry` into poll handlers
     - In `PollWorkflowTaskQueue` and `PollActivityTaskQueue` gRPC handlers, call `poller_registry.register()` at entry and hold the guard for the duration of the poll
+    - Call `completed()` only after the runtime poll future resolves, so matched tasks and long-poll timeouts refresh while future-drop cancellation does not
     - Create `PollerRegistry` in `main.rs` and pass to `WorkflowService`
-    - _Requirements: 11.1_
+    - _Requirements: 11.1, 11.5, 11.6_
 
   - [x] 16.3 Implement `describe_task_queue` edge method and gRPC handler
     - Add `describe_task_queue(&self, headers: &HeaderMap, req: DescribeTaskQueueRequest) -> EdgeResult<DescribeTaskQueueResponse>` to `WorkflowService`
@@ -261,11 +265,11 @@ deletion portions of Tasks 8 and 13 while preserving the historical completion r
     - Wire the gRPC handler to replace the `Status::unimplemented` stub
     - _Requirements: 11.1, 11.2, 11.3_
 
-  - [ ] 16.4 Write property test for describe task queue lists all pollers (Property 6)
-    - Generate at least 100 poller sets, register them, and verify
-      `describe_task_queue` returns every active identity.
+  - [x] 16.4 Write property test for describe task queue lists recent pollers (Property 6)
+    - Generate at least 100 poller histories, including repeated identities and expired observations, and verify `describe_task_queue` returns each recent identity exactly once with its latest timestamp.
+    - Add deterministic cancellation/completion tests proving cancellation preserves the admission time while a normal completion advances it
     - Tag: `// Feature: temporal-ui-support, Property 6: describe task queue pollers`
-    - _Requirements: 11.1_
+    - _Requirements: 11.1, 11.2, 11.4, 11.5, 11.6_
 
 - [x] 17. Update public exports in `tokeira-edge/src/lib.rs`
   - Ensure all new DTOs, traits, and types are re-exported from `lib.rs`

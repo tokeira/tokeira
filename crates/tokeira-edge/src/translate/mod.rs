@@ -378,6 +378,8 @@ pub struct WorkflowExecutionDescription {
     pub execution_time: OffsetDateTime,
     pub execution_config: ExecutionConfigDescription,
     pub history_length: i64,
+    /// Protobuf-encoded size of the committed public history returned to SDKs.
+    pub history_size_bytes: i64,
     pub state_transition_count: i64,
     pub parent_namespace_id: Option<String>,
     pub parent_workflow_id: Option<WorkflowId>,

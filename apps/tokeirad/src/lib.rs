@@ -1622,14 +1622,17 @@ where
 
         match self.repo.load_run(run_key).await? {
             LoadedRun::Existing(state) => {
-                // Describe surfaces the run's external-payload statistics
-                // (describeworkflow/api.go:166 @ v1.31.0). tokeira derives them
-                // from committed history on read — history is the authority, so
-                // no denormalized counter can drift.
-                let (external_payload_count, external_payload_size_bytes) =
-                    tokeira_edge::translate::external_payload_stats(
-                        &self.repo.read_history(run_key, 0, usize::MAX).await?,
+                // Describe surfaces history size and external-payload statistics
+                // (`describeworkflow/api.go:126,166 @ v1.31.0`). Tokeira derives
+                // both from the full committed history on read — history remains
+                // authoritative and no denormalized counter can drift.
+                let history = self.repo.read_history(run_key, 0, usize::MAX).await?;
+                let history_size_bytes =
+                    tokeira_edge::translate::history_serializer::serialized_history_size_bytes(
+                        &history,
                     );
+                let (external_payload_count, external_payload_size_bytes) =
+                    tokeira_edge::translate::external_payload_stats(&history);
                 Ok(Some(WorkflowExecutionDescription {
                     namespace: namespace.to_string(),
                     workflow_id: state.workflow_id.0,
@@ -1654,6 +1657,7 @@ where
                         user_metadata: None,
                     },
                     history_length: state.last_event_id,
+                    history_size_bytes,
                     state_transition_count: state.transition_seq.0 as i64,
                     parent_namespace_id: state
                         .parent_namespace_id

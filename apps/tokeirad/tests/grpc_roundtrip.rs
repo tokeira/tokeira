@@ -103,6 +103,7 @@ async fn grpc_roundtrip_start_describe_and_reflection() -> Result<()> {
         tokeira_proto::enums::WorkflowExecutionStatus::Running as i32
     );
     assert!(info.history_length > 0);
+    assert!(info.history_size_bytes > 0);
     assert!(info.state_transition_count > 0);
     assert!(info.memo.is_some());
     assert!(info.search_attributes.is_some());
@@ -948,6 +949,9 @@ where
             return Ok(None);
         };
 
+        let history = self.repo.read_history(run_key, 0, usize::MAX).await?;
+        let history_size_bytes =
+            tokeira_edge::translate::history_serializer::serialized_history_size_bytes(&history);
         match self.repo.load_run(run_key).await? {
             LoadedRun::Existing(state) => Ok(Some(WorkflowExecutionDescription {
                 namespace: namespace.to_string(),
@@ -968,6 +972,7 @@ where
                     user_metadata: None,
                 },
                 history_length: state.last_event_id,
+                history_size_bytes,
                 state_transition_count: state.transition_seq.0 as i64,
                 parent_namespace_id: state
                     .parent_namespace_id

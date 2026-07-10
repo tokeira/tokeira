@@ -6,7 +6,7 @@
 //! the previous and next row states. The conservation invariant (net delta
 //! is zero for transitions, +1 for inserts) is validated by property tests.
 
-use tokeira_types::RunKey;
+use tokeira_types::{RunKey, VisibilityLifecycleState};
 
 use crate::types::{ExecutionRow, RollupDelta, RollupDimension};
 
@@ -22,16 +22,19 @@ pub fn stripe_for(run_key: RunKey) -> i32 {
 
 /// Compute the rollup counter deltas between a previous and next row state.
 ///
-/// For each tracked dimension, if the value changed, emits a −1 for the old
-/// value and a +1 for the new value. If `previous` is `None` (new row),
-/// only +1 deltas are emitted.
+/// Deleted rows are retained as version fences but do not belong to any rollup.
+/// For each tracked dimension this therefore emits a −1 when a visible row is
+/// tombstoned, a +1 when a visible row is first inserted, and the usual old/new
+/// pair when a visible dimension changes.
 pub fn compute_rollup_deltas(
     previous: Option<&ExecutionRow>,
     next: &ExecutionRow,
 ) -> Vec<RollupDelta> {
     let mut out = Vec::new();
-    let archetype_id = next.archetype_id;
     let stripe = stripe_for(next.run_key);
+    let previous_is_visible =
+        previous.is_some_and(|row| row.lifecycle_state != VisibilityLifecycleState::Deleted);
+    let next_is_visible = next.lifecycle_state != VisibilityLifecycleState::Deleted;
 
     for (dimension, next_value) in [
         // The status dimension keys off the generic `status_keyword` (archetype-
@@ -51,28 +54,32 @@ pub fn compute_rollup_deltas(
             RollupDimension::TaskQueue => row.task_queue.0.clone(),
         });
 
-        if let Some(previous_value) = previous_value {
-            if previous_value == next_value {
-                continue;
-            }
+        if previous_is_visible
+            && let Some(previous_row) = previous
+            && let Some(previous_value) = previous_value.as_ref()
+            && (!next_is_visible || previous_value != &next_value)
+        {
             out.push(RollupDelta {
-                namespace_id: next.namespace_id,
-                archetype_id,
+                namespace_id: previous_row.namespace_id,
+                archetype_id: previous_row.archetype_id,
                 dimension,
-                value: previous_value,
+                value: previous_value.clone(),
                 stripe,
                 delta: -1,
             });
         }
 
-        out.push(RollupDelta {
-            namespace_id: next.namespace_id,
-            archetype_id,
-            dimension,
-            value: next_value,
-            stripe,
-            delta: 1,
-        });
+        if next_is_visible && (!previous_is_visible || previous_value.as_ref() != Some(&next_value))
+        {
+            out.push(RollupDelta {
+                namespace_id: next.namespace_id,
+                archetype_id: next.archetype_id,
+                dimension,
+                value: next_value,
+                stripe,
+                delta: 1,
+            });
+        }
     }
 
     out

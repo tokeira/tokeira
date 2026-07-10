@@ -19,6 +19,26 @@ use super::*;
 /// (`common/dynamicconfig/constants.go @ v1.31.0`).
 const ENABLE_EAGER_WORKFLOW_START: bool = true;
 
+fn workflow_deletion_termination(request: &DeleteWorkflowRequest) -> TerminateRequest {
+    let mut terminate_context = request.request.clone();
+    // This internal termination has its own stable dedupe identity: reusing an
+    // arbitrary client request id could collide with an earlier signal/update
+    // and leave the run open forever. Temporal authors both values in the
+    // history service (`service/history/api/deleteworkflow/api.go @ v1.31.0`).
+    terminate_context.request_id = tokeira_types::RequestId(format!(
+        "delete-workflow-execution:{}",
+        terminate_context.request_id.0
+    ));
+    terminate_context.caller_identity = Some("history-service".to_owned());
+    TerminateRequest {
+        reason: "Delete workflow execution".to_owned(),
+        details: None,
+        identity: "history-service".to_owned(),
+        request: terminate_context,
+        now: request.now,
+    }
+}
+
 #[derive(Debug)]
 struct StartCommitOutcome {
     commit_result: CommitResult,
@@ -872,6 +892,124 @@ where
         self.submit(run_key, Command::Terminate(request)).await
     }
 
+    /// Terminate an open workflow if necessary, then authoritatively delete the
+    /// exact run selected by the edge.
+    ///
+    /// Temporal v1.31.0 terminates an open target with reason `Delete workflow
+    /// execution`, identity `history-service`, and `deleteAfterTerminate=true`
+    /// before its durable delete task removes visibility/current/mutable/history
+    /// (`service/history/api/deleteworkflow/api.go @ v1.31.0`). Tokeira keeps
+    /// the semantic split: the ordinary kernel transition records termination;
+    /// the repository performs the subsequent operational purge.
+    pub async fn delete_workflow(
+        &self,
+        run_key: RunKey,
+        request: DeleteWorkflowRequest,
+    ) -> Result<WorkflowDeletion> {
+        let mut conflicts = 0;
+        loop {
+            let state = match self.repo.load_run(run_key).await? {
+                LoadedRun::Existing(state) => state,
+                LoadedRun::Absent => return Err(WorkflowDeletionNotFound { run_key }.into()),
+            };
+
+            if state.status.is_open() {
+                match self
+                    .submit(
+                        run_key,
+                        Command::Terminate(workflow_deletion_termination(&request)),
+                    )
+                    .await
+                {
+                    Ok(_) => continue,
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::lane::KernelRejected>()
+                            .is_some_and(|rejected| {
+                                matches!(rejected.0, tokeira_kernel::Reject::RunClosed(_))
+                            }) =>
+                    {
+                        // Another serialized command closed the run first. A
+                        // fresh load decides whether it is now deletable.
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let (bundle, epoch) = {
+                let owner = self.shard_owner.read().unwrap();
+                let bundle = execution_home_bundle(
+                    state.namespace_id.0.as_bytes(),
+                    state.workflow_id.0.as_bytes(),
+                    owner.shard_count(),
+                );
+                let local_epoch = owner
+                    .epoch_of(bundle)
+                    .ok_or_else(|| NotShardOwner::local(bundle, ShardEpoch::ZERO))?;
+                if self.runtime_drain.is_draining() || !owner.is_active(bundle) {
+                    return Err(NotShardOwner::local(bundle, local_epoch).into());
+                }
+                let commit_epoch = if self.config.controller_managed_placement {
+                    local_epoch
+                } else {
+                    ShardEpoch::ZERO
+                };
+                (bundle, commit_epoch)
+            };
+
+            match self
+                .repo
+                .delete_run_for_bundle(
+                    run_key,
+                    bundle,
+                    DeleteRunRequest {
+                        expected_seq: state.transition_seq,
+                        deleted_at: request.now,
+                    },
+                    epoch,
+                )
+                .await?
+            {
+                DeleteRunResult::Deleted { tombstone } => {
+                    self.cleanup_deleted_run(run_key).await;
+                    return Ok(WorkflowDeletion { tombstone });
+                }
+                DeleteRunResult::NotFound => {
+                    return Err(WorkflowDeletionNotFound { run_key }.into());
+                }
+                DeleteRunResult::Conflict { reason } => {
+                    if conflicts >= self.config.max_occ_retries {
+                        return Err(anyhow!(
+                            "workflow deletion OCC retries exhausted for {run_key:?}: {reason}"
+                        ));
+                    }
+                    conflicts += 1;
+                }
+            }
+        }
+    }
+
+    async fn cleanup_deleted_run(&self, run_key: RunKey) {
+        self.workflow_timeout_tracking.remove(run_key);
+        self.wft_timeout_tracking.remove(run_key);
+        self.wft_timeout_tracking.disarm_speculative(run_key);
+        self.activity_tracking.remove_all_for_run(run_key);
+        self.nexus_timeout_tracking.remove_all_for_run(run_key);
+        self.completion_callback_tracking
+            .remove_all_for_run(run_key);
+        self.update_registry.drain_for_run(run_key, false);
+        self.buffered_queries
+            .fail_run_queries(run_key, "workflow execution was deleted");
+        self.close_attempt_tracking
+            .lock()
+            .expect("close-attempt tracking lock")
+            .remove(&run_key);
+        self.broker.remove_run(run_key).await;
+        self.activity_broker.remove_run(run_key).await;
+        self.nexus_task_broker.remove_run(run_key).await;
+    }
+
     /// Apply an `UpdateWorkflowExecutionOptions` change to a running execution as a
     /// per-run `UpdateExecutionOptions` transition (the same kernel command the
     /// UseExisting-conflict attach path uses, but carrying only the `versioning_override`
@@ -1337,8 +1475,200 @@ fn apply_client_cron_signal_backoff(request: &mut SignalWithStartRequest) -> Res
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use proptest::prelude::*;
+    use tokeira_storage::{InMemoryStore, RunRepository};
+    use tokeira_types::{
+        ExecutionRef, Memo, NamespaceId, Payloads, RequestContext, RequestId, RunId, RunKey,
+        SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
+    };
+
+    fn deletion_start_request() -> StartRequest {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let run_id = RunId::new();
+        StartRequest {
+            initiator: None,
+            run_key: RunKey::new(),
+            namespace_id: NamespaceId::new(),
+            workflow_id: WorkflowId("delete-workflow".to_string()),
+            run_id,
+            workflow_type: WorkflowType("DeleteWorkflow".to_string()),
+            task_queue: TaskQueueName("workflow-q".to_string()),
+            deployment: None,
+            build_id: None,
+            versioning_override: None,
+            workflow_start_delay: None,
+            client_cron_schedule: None,
+            completion_callbacks: Vec::new(),
+            user_metadata: None,
+            links: Vec::new(),
+            on_conflict_options: None,
+            priority: None,
+            input: Payloads::default(),
+            header: None,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: Duration::seconds(10),
+            retry_policy: None,
+            conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            attempt: 1,
+            continued_execution_run_id: None,
+            first_execution_run_id: None,
+            parent_run_key: None,
+            parent_workflow_id: None,
+            parent_run_id: None,
+            parent_namespace_id: None,
+            parent_namespace_name: None,
+            parent_initiated_event_id: 0,
+            root_workflow_id: None,
+            root_run_id: None,
+            original_execution_run_id: Some(run_id),
+            continued_failure: None,
+            last_completion_result: None,
+            first_run_started_at: None,
+            request: RequestContext {
+                request_id: RequestId("start-delete".to_string()),
+                caller_identity: Some("client".to_string()),
+                received_at: now,
+            },
+            now,
+            cron_schedule: None,
+            eager_execution_accepted: false,
+            reserved_poller_identity: None,
+        }
+    }
+
+    fn deletion_runtime(repo: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
+        TokeiraRuntime::new(
+            repo,
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        )
+    }
+
+    fn deletion_request(request_id: &str) -> DeleteWorkflowRequest {
+        DeleteWorkflowRequest {
+            request: RequestContext {
+                request_id: RequestId(request_id.to_string()),
+                caller_identity: Some("operator".to_string()),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            now: OffsetDateTime::UNIX_EPOCH + Duration::seconds(5),
+        }
+    }
+
+    #[test]
+    fn workflow_deletion_uses_temporal_termination_reason_and_identity() {
+        let request = deletion_request("delete-1");
+        let termination = workflow_deletion_termination(&request);
+
+        assert_eq!(termination.reason, "Delete workflow execution");
+        assert_eq!(termination.identity, "history-service");
+        assert!(termination.details.is_none());
+        assert_eq!(
+            termination.request.request_id.0,
+            "delete-workflow-execution:delete-1"
+        );
+        assert_eq!(
+            termination.request.caller_identity.as_deref(),
+            Some("history-service")
+        );
+        assert_eq!(termination.now, request.now);
+    }
+
+    #[tokio::test]
+    async fn running_workflow_deletion_terminates_then_purges() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = deletion_runtime(repo.clone());
+        let start = deletion_start_request();
+        let run_key = start.run_key;
+        let execution = ExecutionRef {
+            namespace_id: start.namespace_id,
+            workflow_id: start.workflow_id.clone(),
+            run_id: Some(start.run_id),
+        };
+        runtime.start_workflow(start).await.unwrap();
+
+        let deletion = runtime
+            .delete_workflow(run_key, deletion_request("delete-running"))
+            .await
+            .unwrap();
+
+        // Start=1, internal termination=2, tombstone=3.
+        assert_eq!(deletion.tombstone.transition_seq, TransitionSeq(3));
+        assert_eq!(
+            deletion.tombstone.context.lifecycle_state,
+            tokeira_types::VisibilityLifecycleState::Deleted
+        );
+        assert_eq!(
+            deletion.tombstone.context.execution_status,
+            ExecutionStatus::Terminated
+        );
+        assert!(matches!(
+            repo.load_run(run_key).await.unwrap(),
+            LoadedRun::Absent
+        ));
+        assert!(
+            repo.read_history(run_key, 0, usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(repo.resolve_execution(&execution).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn closed_workflow_deletion_does_not_add_termination_transition() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = deletion_runtime(repo.clone());
+        let start = deletion_start_request();
+        let run_key = start.run_key;
+        let execution = ExecutionRef {
+            namespace_id: start.namespace_id,
+            workflow_id: start.workflow_id.clone(),
+            run_id: Some(start.run_id),
+        };
+        runtime.start_workflow(start).await.unwrap();
+        runtime
+            .terminate_workflow(
+                execution,
+                TerminateRequest {
+                    reason: "operator termination".to_string(),
+                    details: None,
+                    identity: "operator".to_string(),
+                    request: RequestContext {
+                        request_id: RequestId("terminate-before-delete".to_string()),
+                        caller_identity: Some("operator".to_string()),
+                        received_at: OffsetDateTime::UNIX_EPOCH,
+                    },
+                    now: OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
+                },
+            )
+            .await
+            .unwrap();
+        let LoadedRun::Existing(before) = repo.load_run(run_key).await.unwrap() else {
+            panic!("terminated run should remain until deletion");
+        };
+
+        let deletion = runtime
+            .delete_workflow(run_key, deletion_request("delete-closed"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            deletion.tombstone.transition_seq,
+            before.transition_seq.next(),
+            "closed deletion adds only its tombstone version"
+        );
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]

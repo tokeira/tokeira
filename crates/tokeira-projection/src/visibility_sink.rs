@@ -46,8 +46,8 @@ where
     async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()> {
         self.store.upsert_execution(row).await
     }
-    async fn delete_execution(&self, run_key: tokeira_types::RunKey) -> Result<()> {
-        self.store.delete_execution(run_key).await
+    async fn apply_deletion(&self, tombstone: &ProjectionRecord) -> Result<()> {
+        self.store.apply_deletion(tombstone).await
     }
     async fn upsert_search_attr_index(
         &self,
@@ -144,6 +144,11 @@ where
 {
     async fn apply(&self, record: &ProjectionRecord, _partition_id: u32) -> Result<()> {
         let started = std::time::Instant::now();
+        if record.context.lifecycle_state == tokeira_types::VisibilityLifecycleState::Deleted {
+            self.store.apply_deletion(record).await?;
+            projection_metrics::record_sink_write_duration(record.partition_id, started.elapsed());
+            return Ok(());
+        }
         let previous = self.store.get_row(record.run_key).await;
         if !visibility_version_is_newer(
             previous.as_ref(),
@@ -161,42 +166,7 @@ where
         // earlier stale `status`/`close_time`) exercised. `previous` is still
         // consulted below to retire search-attribute index entries this snapshot
         // dropped and to compute rollup deltas.
-        let mut row = ExecutionRow {
-            run_key: record.run_key,
-            namespace_id: record.context.namespace_id,
-            archetype_id: record.context.archetype_id,
-            business_id: record.context.business_id.clone(),
-            workflow_id: record.context.workflow_id.clone(),
-            run_id: record.context.run_id,
-            authority_epoch: record.context.authority_epoch,
-            source_transition_seq: record.transition_seq,
-            status_keyword: record.context.status_keyword.clone(),
-            lifecycle_state: record.context.lifecycle_state,
-            workflow_type: record.context.workflow_type.clone(),
-            task_queue: record.context.task_queue.clone(),
-            status: record.context.execution_status,
-            start_time: record.context.start_time,
-            update_time: record.context.update_time,
-            execution_time: record.context.execution_time,
-            close_time: record.context.close_time,
-            history_length: record.context.history_length,
-            execution_duration: record.context.execution_duration,
-            state_transition_count: record.context.state_transition_count,
-            history_size_bytes: record.context.history_size_bytes,
-            parent_workflow_id: record.context.parent_workflow_id.clone(),
-            parent_run_id: record.context.parent_run_id,
-            root_workflow_id: record
-                .context
-                .root_workflow_id
-                .clone()
-                .unwrap_or_else(|| record.context.workflow_id.clone()),
-            root_run_id: record.context.root_run_id.unwrap_or(record.context.run_id),
-            memo: record.context.memo.clone(),
-            search_attributes: record.context.search_attributes.clone(),
-            transition_count: record.context.transition_count,
-            search_attr_generation: record.context.search_attr_generation,
-            search_attr_version: 0,
-        };
+        let mut row = ExecutionRow::from_projection_record(record);
         let search_patch = record.context.search_attributes.clone();
 
         self.store.upsert_execution(&row).await?;
@@ -911,6 +881,165 @@ mod tests {
                         rollup.groups.iter().filter(|g| g.count != 0).map(|g| g.count).sum();
                     prop_assert_eq!(rollup_total, live);
                 }
+                Ok(())
+            })?;
+        }
+    }
+
+    // Feature: temporal-ui-support, Property 11: visibility tombstone monotonicity
+    // A deletion is a retained version fence: older snapshots and duplicate
+    // delivery cannot resurrect query, index, or rollup membership.
+    // **Validates: Requirements 9.5**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn prop_visibility_tombstone_monotonicity(
+            delivery in proptest::collection::vec(0u8..4, 0..16),
+            delete_position in 0usize..20,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let namespace_id = NamespaceId(Uuid::from_u128(1));
+                let store = InMemoryVisibilityStore::default();
+                store
+                    .register_attr(
+                        namespace_id,
+                        "CustomKeyword".to_string(),
+                        SearchAttrType::Keyword,
+                    )
+                    .await
+                    .unwrap();
+                let sink = VisibilitySink::new(store.clone());
+
+                let first = record_with_search_attr(
+                    namespace_id,
+                    SearchAttrValue::Keyword("blue".to_string()),
+                );
+                let mut second = first.clone();
+                second.transition_seq = TransitionSeq(2);
+                second.context.transition_count = 2;
+                second.context.state_transition_count = 2;
+                second.context.search_attr_generation = 2;
+
+                let mut tombstone = second.clone();
+                tombstone.transition_seq = TransitionSeq(3);
+                tombstone.context.lifecycle_state = VisibilityLifecycleState::Deleted;
+                tombstone.context.execution_status = ExecutionStatus::Terminated;
+                tombstone.context.status_keyword = "Terminated".to_string();
+                tombstone.context.close_time = Some(
+                    OffsetDateTime::from_unix_timestamp(20).unwrap(),
+                );
+                tombstone.context.update_time =
+                    OffsetDateTime::from_unix_timestamp(20).unwrap();
+                tombstone.context.transition_count = 3;
+                tombstone.context.state_transition_count = 3;
+                tombstone.context.search_attr_generation = 3;
+                tombstone.context.memo = Memo::default();
+                tombstone.context.search_attributes = SearchAttributes::default();
+
+                // Establish the pre-delete index/rollup membership, then deliver
+                // arbitrary stale snapshots, retries, and the tombstone in a
+                // generated order. The explicit final retry proves convergence
+                // even when the generated position precedes every stale record.
+                sink.apply(&first, 0).await.unwrap();
+                let mut delivery = delivery.clone();
+                delivery.insert(delete_position.min(delivery.len()), 2);
+                for item in delivery {
+                    let record = match item {
+                        0 => &first,
+                        1 => &second,
+                        2 => &tombstone,
+                        _ => &tombstone,
+                    };
+                    sink.apply(record, 0).await.unwrap();
+                }
+                sink.apply(&tombstone, 0).await.unwrap();
+                sink.apply(&first, 0).await.unwrap();
+
+                let row = store.get_row(first.run_key).await.unwrap();
+                prop_assert_eq!(row.lifecycle_state, VisibilityLifecycleState::Deleted);
+                prop_assert_eq!(row.source_transition_seq, TransitionSeq(3));
+                prop_assert!(row.search_attributes.0.is_empty());
+
+                let page = PageBounds { limit: 10, after: None };
+                let filter = CompiledFilter::default();
+                let listed = store
+                    .list_executions(namespace_id, &filter, SortOrder::Default, &page)
+                    .await
+                    .unwrap();
+                prop_assert!(listed.rows.is_empty());
+                let counted = store
+                    .count_executions(namespace_id, &filter, None)
+                    .await
+                    .unwrap();
+                prop_assert_eq!(counted.total_count, 0);
+                let grouped = store
+                    .count_executions(
+                        namespace_id,
+                        &filter,
+                        Some(GroupByField::System(
+                            crate::types::SystemField::ExecutionStatus,
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                prop_assert_eq!(grouped.total_count, 0);
+                prop_assert!(grouped.groups.is_empty());
+                for dimension in [
+                    RollupDimension::ExecutionStatus,
+                    RollupDimension::WorkflowType,
+                    RollupDimension::TaskQueue,
+                ] {
+                    let rollup = store
+                        .count_from_rollup(
+                            namespace_id,
+                            ArchetypeId::WORKFLOW,
+                            dimension,
+                        )
+                        .await
+                        .unwrap();
+                    prop_assert_eq!(rollup.total_count, 0);
+                    prop_assert!(nonzero_map(&rollup).is_empty());
+                }
+
+                // A newer visible probe with no attributes makes stale index
+                // residue observable. If deletion had only hidden the row, the
+                // CustomKeyword filter would incorrectly match this probe.
+                let mut probe = tombstone.clone();
+                probe.transition_seq = TransitionSeq(4);
+                probe.context.lifecycle_state = VisibilityLifecycleState::Open;
+                probe.context.execution_status = ExecutionStatus::Running;
+                probe.context.status_keyword = "Running".to_string();
+                probe.context.close_time = None;
+                probe.context.transition_count = 4;
+                probe.context.state_transition_count = 4;
+                probe.context.search_attr_generation = 4;
+                sink.apply(&probe, 0).await.unwrap();
+                let indexed_filter = CompiledFilter {
+                    archetype: None,
+                    expr: Some(FilterExpr::Compare {
+                        field: FieldRef::Custom {
+                            name: "CustomKeyword".to_string(),
+                            attr_id: AttrId(1),
+                            attr_type: SearchAttrType::Keyword,
+                        },
+                        op: crate::types::CompareOp::Eq,
+                        value: crate::types::FilterValue::String("blue".to_string()),
+                    }),
+                };
+                let indexed = store
+                    .list_executions(
+                        namespace_id,
+                        &indexed_filter,
+                        SortOrder::Default,
+                        &page,
+                    )
+                    .await
+                    .unwrap();
+                prop_assert!(indexed.rows.is_empty());
                 Ok(())
             })?;
         }

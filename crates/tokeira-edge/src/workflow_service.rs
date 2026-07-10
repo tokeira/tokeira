@@ -34,17 +34,18 @@ use tokeira_kernel::{
 use tokeira_runtime::{
     ActivityTokenResolutionError, BatchError, BatchOperationEntry, BatchOperationStore,
     BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry, CreateDeployment,
-    CreateVersion, DeleteDeployment, DeleteVersion, DeploymentPage, DeploymentView,
-    DescribeVersion, InMemoryBroker, ListDeployments, MultiOperationError, MultiOperationResult,
-    NexusTaskBroker, NexusTaskToken, OverlapDecision, OverlapPolicy, PendingUpdateTransport,
-    QueryResult, RegisterPolledDeployment, ResetWorkflowResult, ScheduleActionResult,
-    SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome,
-    SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
-    StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView,
-    UpdateComputeConfig, UpdateLifecycleError, UpdateLifecycleSnapshot, UpdateMetadata,
-    UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView,
-    VersionView, VersioningRuleStore, WorkerRegistry, WorkflowActivation, WorkflowExecution,
-    WorkflowExecutionStatus, compute_matching_times, decide_overlap, schedule_workflow_id,
+    CreateVersion, DeleteDeployment, DeleteVersion, DeleteWorkflowRequest, DeploymentPage,
+    DeploymentView, DescribeVersion, InMemoryBroker, ListDeployments, MultiOperationError,
+    MultiOperationResult, NexusTaskBroker, NexusTaskToken, OverlapDecision, OverlapPolicy,
+    PendingUpdateTransport, QueryResult, RegisterPolledDeployment, ResetWorkflowResult,
+    ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager,
+    SetManagerOutcome, SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult,
+    StartedActivityTask, StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore,
+    TaskQueueVersioningView, UpdateComputeConfig, UpdateLifecycleError, UpdateLifecycleSnapshot,
+    UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig,
+    VersionMetadataView, VersionView, VersioningRuleStore, WorkerRegistry, WorkflowActivation,
+    WorkflowDeletion, WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus,
+    compute_matching_times, decide_overlap, schedule_workflow_id,
 };
 use tokeira_storage::{
     ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
@@ -432,6 +433,19 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         run_key: RunKey,
         req: TerminateRequest,
     ) -> Result<WorkflowMutationOutcome>;
+
+    /// Delete one already-resolved run through the authoritative runtime path.
+    ///
+    /// The default preserves isolation for test doubles that never exercise
+    /// deletion; the production runtime adapter overrides it.
+    async fn delete_workflow(
+        &self,
+        run_key: RunKey,
+        request: DeleteWorkflowRequest,
+    ) -> Result<WorkflowDeletion> {
+        let _ = (run_key, request);
+        Err(anyhow!("delete_workflow is not implemented"))
+    }
 
     /// Apply an `UpdateWorkflowExecutionOptions` change (currently the
     /// `versioning_override`) to a running execution. Defaults to unimplemented so test
@@ -1739,7 +1753,7 @@ impl WorkflowService {
         &self,
         ctx: &BatchDispatchContext,
         workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
-        identity: String,
+        _identity: String,
     ) -> EdgeResult<()> {
         ensure_local(
             self.router
@@ -1747,33 +1761,21 @@ impl WorkflowService {
                 .await?,
         )?;
         let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
-        let loaded = self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
-        let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
-            return Err(EdgeError::WorkflowNotFound {
-                namespace: ctx.namespace_name.clone(),
-                workflow_id: workflow_ref.workflow_id.clone(),
-            });
-        };
-        if state.status.is_open() {
-            let outcome = self
-                .runtime
-                .terminate_workflow(
-                    run_key,
-                    TerminateRequest {
-                        reason: "deleted via batch operation".to_string(),
-                        details: None,
-                        identity,
-                        request: batch_request_context(ctx),
-                        now: OffsetDateTime::now_utc(),
-                    },
-                )
-                .await
-                .map_err(EdgeError::from)?;
-            self.notify_history_run_key(run_key, outcome.last_event_id)
-                .await;
-        }
+        let deletion = self
+            .runtime
+            .delete_workflow(
+                run_key,
+                DeleteWorkflowRequest {
+                    request: batch_request_context(ctx),
+                    now: OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .map_err(|error| {
+                map_workflow_deletion_error(error, &ctx.namespace_name, &workflow_ref.workflow_id)
+            })?;
         self.visibility
-            .delete_execution(run_key)
+            .apply_deletion(deletion.tombstone)
             .await
             .map_err(EdgeError::from)
     }
@@ -3770,42 +3772,26 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-
-                let loaded = self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
-                let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
-                    return Err(EdgeError::WorkflowNotFound {
-                        namespace: req.namespace,
-                        workflow_id: req.workflow_id,
-                    });
-                };
-
-                if state.status.is_open() {
-                    let outcome = self
-                        .runtime
-                        .terminate_workflow(
-                            run_key,
-                            TerminateRequest {
-                                reason: "deleted via delete_workflow_execution".to_string(),
-                                details: None,
-                                identity: "temporal-ui".to_string(),
-                                request: RequestContext {
-                                    request_id: tokeira_types::RequestId(
-                                        ctx.request_id.as_str().to_string(),
-                                    ),
-                                    caller_identity: None,
-                                    received_at: OffsetDateTime::now_utc(),
-                                },
-                                now: OffsetDateTime::now_utc(),
+                let now = OffsetDateTime::now_utc();
+                let deletion = self
+                    .runtime
+                    .delete_workflow(
+                        run_key,
+                        DeleteWorkflowRequest {
+                            request: RequestContext {
+                                request_id: RequestId(ctx.request_id.as_str().to_string()),
+                                caller_identity: None,
+                                received_at: ctx.received_at,
                             },
-                        )
-                        .await
-                        .map_err(EdgeError::from)?;
-                    self.notify_history_run_key(run_key, outcome.last_event_id)
-                        .await;
-                }
-
+                            now,
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        map_workflow_deletion_error(error, &req.namespace, &req.workflow_id)
+                    })?;
                 self.visibility
-                    .delete_execution(run_key)
+                    .apply_deletion(deletion.tombstone)
                     .await
                     .map_err(EdgeError::from)
             },
@@ -5793,7 +5779,7 @@ fn validate_reset_target(history: &[HistoryEvent], fork_event_id: i64) -> EdgeRe
             }
             HistoryEventKind::WorkflowTaskStarted { .. } => {
                 if let Some(s) = scheduled
-                    && fork_event_id >= s + 1
+                    && fork_event_id > s
                     && fork_event_id <= event.event_id + 1
                 {
                     return Ok(());
@@ -5818,6 +5804,20 @@ fn batch_request_context(ctx: &BatchDispatchContext) -> RequestContext {
         caller_identity: Some(ctx.identity.clone()),
         received_at: ctx.edge_context.received_at,
     }
+}
+
+fn map_workflow_deletion_error(
+    error: anyhow::Error,
+    namespace: &str,
+    workflow_id: &str,
+) -> EdgeError {
+    if error.downcast_ref::<WorkflowDeletionNotFound>().is_some() {
+        return EdgeError::WorkflowNotFound {
+            namespace: namespace.to_string(),
+            workflow_id: workflow_id.to_string(),
+        };
+    }
+    EdgeError::from(error)
 }
 
 fn batch_error_to_edge(

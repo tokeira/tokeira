@@ -200,8 +200,8 @@ where
         })
     }
 
-    async fn delete_execution(&self, run_key: tokeira_types::RunKey) -> Result<()> {
-        self.store.delete_execution(run_key).await
+    async fn apply_deletion(&self, tombstone: tokeira_storage::ProjectionRecord) -> Result<()> {
+        self.store.apply_deletion(&tombstone).await
     }
 
     async fn unknown_search_attribute(

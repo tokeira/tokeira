@@ -2179,6 +2179,16 @@ mod tests {
             self.commit_transition(run_key, transition, epoch).await
         }
 
+        async fn delete_run_for_bundle(
+            &self,
+            _run_key: RunKey,
+            _execution_home_bundle: ShardId,
+            _request: tokeira_storage::DeleteRunRequest,
+            _epoch: ShardEpoch,
+        ) -> Result<tokeira_storage::DeleteRunResult> {
+            Err(anyhow!("unused"))
+        }
+
         async fn materialize_reset_successor(
             &self,
             _base_run_key: RunKey,

@@ -14,6 +14,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
+use tokeira_storage::ProjectionRecord;
 use tokeira_types::{
     ArchetypeId, ExecutionStatus, Memo, NamespaceId, ProjectionCursor, RunId, RunKey,
     SearchAttrValue, SearchAttributes, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
@@ -206,6 +207,50 @@ pub struct ExecutionRow {
 }
 
 impl ExecutionRow {
+    /// Construct the workflow compatibility row carried by a projection record.
+    ///
+    /// Projection records are complete post-transition images, so this conversion
+    /// deliberately does not consult an earlier row. That prevents fields omitted
+    /// by an update-style conversion from surviving into a newer version.
+    pub(crate) fn from_projection_record(record: &ProjectionRecord) -> Self {
+        Self {
+            run_key: record.run_key,
+            namespace_id: record.context.namespace_id,
+            archetype_id: record.context.archetype_id,
+            business_id: record.context.business_id.clone(),
+            workflow_id: record.context.workflow_id.clone(),
+            run_id: record.context.run_id,
+            authority_epoch: record.context.authority_epoch,
+            source_transition_seq: record.transition_seq,
+            status_keyword: record.context.status_keyword.clone(),
+            lifecycle_state: record.context.lifecycle_state,
+            workflow_type: record.context.workflow_type.clone(),
+            task_queue: record.context.task_queue.clone(),
+            status: record.context.execution_status,
+            start_time: record.context.start_time,
+            update_time: record.context.update_time,
+            execution_time: record.context.execution_time,
+            close_time: record.context.close_time,
+            history_length: record.context.history_length,
+            execution_duration: record.context.execution_duration,
+            state_transition_count: record.context.state_transition_count,
+            history_size_bytes: record.context.history_size_bytes,
+            parent_workflow_id: record.context.parent_workflow_id.clone(),
+            parent_run_id: record.context.parent_run_id,
+            root_workflow_id: record
+                .context
+                .root_workflow_id
+                .clone()
+                .unwrap_or_else(|| record.context.workflow_id.clone()),
+            root_run_id: record.context.root_run_id.unwrap_or(record.context.run_id),
+            memo: record.context.memo.clone(),
+            search_attributes: record.context.search_attributes.clone(),
+            transition_count: record.context.transition_count,
+            search_attr_generation: record.context.search_attr_generation,
+            search_attr_version: 0,
+        }
+    }
+
     /// Mirror a workflow visibility snapshot into the legacy workflow query row.
     ///
     /// During task 23 the storage contract moves to archetype-neutral

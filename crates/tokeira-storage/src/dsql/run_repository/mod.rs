@@ -17,19 +17,20 @@ use tokeira_kernel::{
     TimerOp, Transition, WorkflowState,
 };
 use tokeira_types::{
-    ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads,
-    QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName,
-    TransitionSeq, VisibilityLifecycleState, WorkerIdentity, WorkflowId, dsql_spread_uuid,
+    BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads, QueueKey,
+    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
+    WorkerIdentity, WorkflowId, dsql_spread_uuid,
 };
 use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::{
     ActivitySweepEntry, BacklogEntry, CommitResult, CompletionCallbackSweepEntry,
-    CurrentExecutionConflictPolicy, DbClass, DispatchableActivityTask, DispatchableWorkflowTask,
-    DueTimer, NexusSweepEntry, ProjectionContext, RequestRecord, RunRepository,
-    TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
-    WorkflowTimeoutSweepEntry, metrics, workflow_is_open_and_pinned_to_version,
+    CurrentExecutionConflictPolicy, DbClass, DeleteRunRequest, DeleteRunResult,
+    DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
+    ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
+    WorkerDeploymentVersionKey, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
+    metrics, workflow_is_open_and_pinned_to_version, workflow_projection_context,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -84,6 +85,7 @@ macro_rules! record_dsql_commit_operation {
 
 mod activity;
 mod commit;
+mod delete;
 mod dispatch;
 mod leases;
 mod load;
@@ -477,6 +479,17 @@ impl RunRepository for DsqlRunRepository {
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
         self.do_commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+            .await
+    }
+
+    async fn delete_run_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
+        request: DeleteRunRequest,
+        epoch: ShardEpoch,
+    ) -> Result<DeleteRunResult> {
+        self.do_delete_run_for_bundle(run_key, execution_home_bundle, request, epoch)
             .await
     }
 

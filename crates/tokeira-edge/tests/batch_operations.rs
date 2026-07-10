@@ -25,17 +25,18 @@ use tokeira_kernel::{
 use tokeira_runtime::{
     BacklogConfig, BatchOperationEntry, BatchOperationParams, BatchOperationState,
     BatchOperationStore, BatchOperationType, BatchProgressCounters, BatchResetTarget,
-    BufferedQueryRegistry, InMemoryBroker, JobId, LaneConfig, PendingUpdateTransport, QueryResult,
-    ResetWorkflowResult, ScheduleStore, SignalWithStartResult, StartWorkflowResult,
-    TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot, UpdateTransportResolution,
-    UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry, WorkflowExecutionRef,
-    WorkflowTimeoutScannerConfig,
+    BufferedQueryRegistry, DeleteWorkflowRequest, InMemoryBroker, JobId, LaneConfig,
+    PendingUpdateTransport, QueryResult, ResetWorkflowResult, ScheduleStore, SignalWithStartResult,
+    StartWorkflowResult, TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot,
+    UpdateTransportResolution, UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry,
+    WorkflowDeletion, WorkflowExecutionRef, WorkflowTimeoutScannerConfig,
 };
-use tokeira_storage::InMemoryStore;
+use tokeira_storage::{InMemoryStore, ProjectionContext, ProjectionRecord};
 use tokeira_types::{
-    ActivityTaskToken, BuildId, ExecutionRef, ExecutionStatus, Memo, Payload, Payloads, QueueKey,
-    RequestContext, RequestId as DomainRequestId, RunId, RunKey, SearchAttributes, TaskKind,
-    TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    ActivityTaskToken, ArchetypeId, BuildId, ExecutionRef, ExecutionStatus, Memo, Payload,
+    Payloads, QueueKey, RequestContext, RequestId as DomainRequestId, RunId, RunKey,
+    SearchAttributes, TaskKind, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
+    WorkerIdentity, WorkflowId, WorkflowType,
 };
 use tokio::sync::{Mutex, Notify};
 
@@ -191,6 +192,56 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         })
         .await;
         Ok(outcome())
+    }
+
+    async fn delete_workflow(
+        &self,
+        run_key: RunKey,
+        _request: DeleteWorkflowRequest,
+    ) -> Result<WorkflowDeletion> {
+        self.record(RecordedCall::Terminate {
+            run_key,
+            identity: "history-service".to_string(),
+        })
+        .await;
+        let run_id = RunId::new();
+        Ok(WorkflowDeletion {
+            tombstone: ProjectionRecord {
+                partition_id: 0,
+                fanout: 1,
+                run_key,
+                transition_seq: TransitionSeq(2),
+                context: ProjectionContext {
+                    archetype_id: ArchetypeId::WORKFLOW,
+                    namespace_id: namespace_id_for("default"),
+                    business_id: "deleted".to_string(),
+                    authority_epoch: 0,
+                    status_keyword: "Terminated".to_string(),
+                    lifecycle_state: VisibilityLifecycleState::Deleted,
+                    workflow_id: WorkflowId("deleted".to_string()),
+                    run_id,
+                    workflow_type: WorkflowType("test".to_string()),
+                    task_queue: TaskQueueName("queue".to_string()),
+                    execution_status: ExecutionStatus::Terminated,
+                    start_time: time::OffsetDateTime::UNIX_EPOCH,
+                    update_time: time::OffsetDateTime::UNIX_EPOCH,
+                    execution_time: None,
+                    close_time: Some(time::OffsetDateTime::UNIX_EPOCH),
+                    history_length: 0,
+                    execution_duration: Some(0),
+                    state_transition_count: 2,
+                    transition_count: 2,
+                    history_size_bytes: 0,
+                    parent_workflow_id: None,
+                    parent_run_id: None,
+                    root_workflow_id: Some(WorkflowId("deleted".to_string())),
+                    root_run_id: Some(run_id),
+                    search_attr_generation: 2,
+                    memo: Memo::default(),
+                    search_attributes: SearchAttributes::default(),
+                },
+            },
+        })
     }
 
     async fn cancel_workflow(
@@ -354,8 +405,8 @@ impl VisibilityApi for ScriptedVisibility {
         })
     }
 
-    async fn delete_execution(&self, run_key: RunKey) -> Result<()> {
-        self.deleted.lock().await.push(run_key);
+    async fn apply_deletion(&self, tombstone: tokeira_storage::ProjectionRecord) -> Result<()> {
+        self.deleted.lock().await.push(tombstone.run_key);
         Ok(())
     }
 }

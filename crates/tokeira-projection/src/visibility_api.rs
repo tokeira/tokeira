@@ -8,9 +8,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
-use tokeira_types::{
-    ArchetypeId, ExecutionStatus, Memo, NamespaceId, RunId, RunKey, SearchAttributes,
-};
+use tokeira_storage::ProjectionRecord;
+use tokeira_types::{ArchetypeId, ExecutionStatus, Memo, NamespaceId, RunId, SearchAttributes};
 
 /// Summary of a single workflow execution for list/count responses.
 #[derive(Clone, Debug, PartialEq)]
@@ -151,7 +150,8 @@ pub trait VisibilityApi: Send + Sync + 'static {
         req: CountActivityExecutionsRequest,
     ) -> Result<CountActivityExecutionsResponse>;
 
-    async fn delete_execution(&self, run_key: RunKey) -> Result<()>;
+    /// Apply the durable deletion tombstone produced by authoritative storage.
+    async fn apply_deletion(&self, tombstone: ProjectionRecord) -> Result<()>;
 
     /// Probe the namespace's registered search attributes (system predefined +
     /// custom-registered) for any key in `keys` that is NOT registered, returning
@@ -221,7 +221,7 @@ impl VisibilityApi for EmptyVisibilityApi {
         })
     }
 
-    async fn delete_execution(&self, _run_key: RunKey) -> Result<()> {
+    async fn apply_deletion(&self, _tombstone: ProjectionRecord) -> Result<()> {
         Ok(())
     }
 }

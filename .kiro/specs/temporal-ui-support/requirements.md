@@ -112,14 +112,23 @@ This feature enables the Temporal UI to connect to tokeirad, either through the 
 
 ### Requirement 9: Workflow Deletion — DeleteWorkflowExecution
 
-**User Story:** As a UI user, I want to delete a workflow execution from the UI, so that I can clean up completed or failed workflows.
+**User Story:** As a UI user, I want to delete a workflow execution from the UI, so that its authoritative state, history, and visibility record are removed.
 
 #### Acceptance Criteria
 
-1. WHEN a DeleteWorkflowExecution request is received for a closed workflow execution, THE WorkflowServiceGrpc SHALL remove the execution from the visibility store and return a successful response.
-2. WHEN a DeleteWorkflowExecution request is received for a running workflow execution, THE WorkflowServiceGrpc SHALL terminate the execution before deleting it.
-3. WHEN a DeleteWorkflowExecution request is received for a workflow execution that does not exist, THE WorkflowServiceGrpc SHALL return a gRPC NOT_FOUND status.
-4. THE WorkflowServiceGrpc SHALL pass the request through Edge_Interceptors for authorization before returning the response.
+1. WHEN a valid DeleteWorkflowExecution request identifies an existing closed workflow execution, THE WorkflowServiceGrpc SHALL arrange deletion of that run's authoritative mutable state, event history, current-execution pointer when it names that run, and derived visibility data, and SHALL return an empty successful response.
+2. WHEN a valid DeleteWorkflowExecution request identifies an existing running workflow execution, THE WorkflowServiceGrpc SHALL terminate that run with the workflow-deletion reason and history-service identity before arranging the same deletion as for a closed execution.
+3. WHEN a DeleteWorkflowExecution request omits `run_id`, THE WorkflowServiceGrpc SHALL target the current execution identified by the request's namespace and `workflow_id` rather than selecting an older run after the current-execution pointer has been deleted.
+4. WHEN deletion of a workflow execution has completed, THE WorkflowServiceGrpc SHALL return gRPC NOT_FOUND with no response for both DescribeWorkflowExecution and GetWorkflowExecutionHistory requests that identify the deleted run.
+5. WHEN deletion of a workflow execution has completed, THE Visibility_Store SHALL exclude the deleted run from ListWorkflowExecutions results, including in the presence of an older delayed visibility update for that run.
+6. WHEN a DeleteWorkflowExecution request identifies a workflow execution that does not exist, THE WorkflowServiceGrpc SHALL return a gRPC NOT_FOUND status.
+7. WHEN a DeleteWorkflowExecution request omits the execution, contains an empty `workflow_id`, or contains a non-empty malformed `run_id`, THE WorkflowServiceGrpc SHALL return a gRPC INVALID_ARGUMENT status.
+8. THE WorkflowServiceGrpc SHALL pass the request through Edge_Interceptors for authorization before returning the response.
+
+These semantics are verified against `service/frontend/workflow_handler.go`,
+`service/frontend/validators.go`, `service/history/api/deleteworkflow/api.go`,
+`service/history/transfer_queue_task_executor_base.go`, and
+`service/history/shard/context_impl.go` at Temporal server v1.31.0.
 
 ### Requirement 10: Workflow Reset — ResetWorkflowExecution
 

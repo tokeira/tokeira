@@ -11,7 +11,7 @@
 
 **Source audit:** `reference/temporal_api_audit.md`
 
-**Last updated:** 2026-05-29
+**Last updated:** 2026-07-10
 
 ---
 
@@ -296,7 +296,7 @@ These RPCs are already Partial and will reach Implemented through the field-leve
 | RequestCancelWorkflowExecution | Partial | spec 3 (start-fields covers cancel propagation) |
 | TerminateWorkflowExecution | Partial | spec 3 |
 | ResetWorkflowExecution | Partial | existing handler (conformance testing) |
-| DeleteWorkflowExecution | Partial | existing handler (conformance testing) |
+| DeleteWorkflowExecution | Implemented | `temporal-ui-support` Requirement 9; Tier 3.19 corpus evidence |
 | GetWorkflowExecutionHistory | Partial | spec 5 (activity-events improves event fidelity) |
 | GetWorkflowExecutionHistoryReverse | Partial | spec 5 |
 | PollWorkflowTaskQueue | Partial | spec 4 (wft-completion covers sticky) |

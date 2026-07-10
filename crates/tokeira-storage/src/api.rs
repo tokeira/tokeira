@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -63,6 +63,38 @@ pub enum CommitResult {
     /// A request with the same dedupe key was already
     /// committed. The caller can short-circuit.
     Duplicate,
+}
+
+/// Inputs to one authoritative workflow-run deletion.
+///
+/// Deletion is operational cleanup rather than a kernel transition, but it is
+/// fenced by the same per-run sequence used for normal commits. `deleted_at` is
+/// supplied by the runtime so projection output remains deterministic in tests
+/// and storage never invents request time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeleteRunRequest {
+    /// Durable transition sequence observed immediately before deletion.
+    pub expected_seq: TransitionSeq,
+    /// Admission time recorded on the deletion visibility tombstone.
+    pub deleted_at: OffsetDateTime,
+}
+
+/// Result of attempting an authoritative workflow-run deletion.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeleteRunResult {
+    /// The run was purged and the returned tombstone was durably appended to
+    /// the projection log in the same semantic write.
+    Deleted {
+        /// Versioned deletion image for synchronous and background projection.
+        tombstone: ProjectionRecord,
+    },
+    /// The target run did not exist when the fenced deletion was admitted.
+    NotFound,
+    /// The sequence or shard-epoch fence no longer matched durable state.
+    Conflict {
+        /// Diagnostic reason; callers reload the same run and retry.
+        reason: String,
+    },
 }
 
 /// Encoded byte length for Worker Deployment conflict tokens.
@@ -530,6 +562,21 @@ pub trait RunRepository: Send + Sync {
         transition: Transition,
         epoch: ShardEpoch,
     ) -> Result<CommitResult>;
+
+    /// Atomically purge one run under OCC and execution-home shard fencing.
+    ///
+    /// A successful implementation must append the returned deletion
+    /// tombstone and remove the run's mutable state, history, current pointer
+    /// (only when it still names this run), and run-owned dispatch/sweep rows as
+    /// one semantic write. A mismatch returns [`DeleteRunResult::Conflict`]
+    /// without exposing a partial purge.
+    async fn delete_run_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
+        request: DeleteRunRequest,
+        epoch: ShardEpoch,
+    ) -> Result<DeleteRunResult>;
 
     /// Materialize a reset successor by copying the base run's committed
     /// history prefix through `fork_event_id` and deriving the successor state
@@ -1003,6 +1050,97 @@ fn unix_epoch() -> OffsetDateTime {
     OffsetDateTime::UNIX_EPOCH
 }
 
+/// Build the complete post-transition workflow visibility image used by both
+/// storage backends.
+///
+/// Keeping this producer in storage prevents the in-memory and DSQL logs from
+/// drifting on fields whose omission would freeze stale visibility values.
+pub(crate) fn workflow_projection_context(state: &WorkflowState) -> Result<ProjectionContext> {
+    projection_context(
+        state,
+        if state.status.is_open() {
+            VisibilityLifecycleState::Open
+        } else {
+            VisibilityLifecycleState::Closed
+        },
+        state.closed_at.unwrap_or(state.started_at),
+        false,
+    )
+}
+
+/// Build the non-queryable high-water visibility image for a deleted run.
+///
+/// Identity and ordering fields survive so an older delayed projection cannot
+/// recreate the row. User memo and search attributes are deliberately erased.
+pub(crate) fn deleted_workflow_projection_context(
+    state: &WorkflowState,
+    deleted_at: OffsetDateTime,
+) -> Result<ProjectionContext> {
+    projection_context(state, VisibilityLifecycleState::Deleted, deleted_at, true)
+}
+
+fn projection_context(
+    state: &WorkflowState,
+    lifecycle_state: VisibilityLifecycleState,
+    update_time: OffsetDateTime,
+    redact_user_data: bool,
+) -> Result<ProjectionContext> {
+    let transition_count = i64::try_from(state.transition_seq.0).map_err(|_| {
+        anyhow!(
+            "workflow transition sequence {} exceeds visibility i64 range",
+            state.transition_seq.0
+        )
+    })?;
+    let execution_duration = state
+        .closed_at
+        .map(|closed_at| (closed_at - state.started_at).whole_nanoseconds() as i64);
+
+    Ok(ProjectionContext {
+        archetype_id: ArchetypeId::WORKFLOW,
+        namespace_id: state.namespace_id,
+        business_id: state.workflow_id.0.clone(),
+        // The workflow producer does not yet carry a namespace failover
+        // version. Transition sequence therefore remains its monotonic fence.
+        authority_epoch: 0,
+        status_keyword: format!("{:?}", state.status),
+        lifecycle_state,
+        workflow_id: state.workflow_id.clone(),
+        run_id: state.run_id,
+        workflow_type: state.workflow_type.clone(),
+        task_queue: state.task_queue.clone(),
+        execution_status: state.status,
+        start_time: state.started_at,
+        update_time,
+        // v1.31.0 derives ExecutionTime from start plus first-WFT backoff
+        // (`mutable_state_impl.go:2859 @ v1.31.0`).
+        execution_time: Some(state.started_at + state.workflow_start_delay.unwrap_or_default()),
+        close_time: state.closed_at,
+        history_length: state.last_event_id,
+        execution_duration,
+        state_transition_count: transition_count,
+        transition_count,
+        history_size_bytes: 0,
+        parent_workflow_id: state.parent_workflow_id.clone(),
+        parent_run_id: state.parent_run_id,
+        root_workflow_id: state
+            .root_workflow_id
+            .clone()
+            .or_else(|| Some(state.workflow_id.clone())),
+        root_run_id: state.root_run_id.or(Some(state.run_id)),
+        search_attr_generation: state.transition_seq.0,
+        memo: if redact_user_data {
+            Memo::default()
+        } else {
+            state.memo.clone()
+        },
+        search_attributes: if redact_user_data {
+            SearchAttributes::default()
+        } else {
+            state.search_attributes.clone()
+        },
+    })
+}
+
 /// One row in the projection log, carrying the complete visibility image for a transition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectionRecord {
@@ -1256,6 +1394,18 @@ where
     ) -> Result<CommitResult> {
         (**self)
             .commit_transition_for_bundle(run_key, execution_home_bundle, transition, epoch)
+            .await
+    }
+
+    async fn delete_run_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
+        request: DeleteRunRequest,
+        epoch: ShardEpoch,
+    ) -> Result<DeleteRunResult> {
+        (**self)
+            .delete_run_for_bundle(run_key, execution_home_bundle, request, epoch)
             .await
     }
 

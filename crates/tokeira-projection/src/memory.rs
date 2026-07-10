@@ -12,16 +12,20 @@ use std::{
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use tokeira_types::{ArchetypeId, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
+use tokeira_storage::ProjectionRecord;
+use tokeira_types::{
+    ArchetypeId, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue, VisibilityLifecycleState,
+};
 use tokio::sync::Mutex;
 
 use crate::{
+    rollup::compute_rollup_deltas,
     store::VisibilityStore,
     types::{
         AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
         FilterExpr, FilterValue, GroupByField, ListResult, PageBounds, PageToken, RollupCounter,
         RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField, VisibilitySnapshot,
-        text_search_tokens,
+        text_search_tokens, visibility_version_is_newer,
     },
 };
 
@@ -87,103 +91,36 @@ impl VisibilityStore for InMemoryVisibilityStore {
         Ok(())
     }
 
-    async fn delete_execution(&self, run_key: RunKey) -> Result<()> {
+    async fn apply_deletion(&self, tombstone: &ProjectionRecord) -> Result<()> {
+        if tombstone.context.lifecycle_state != VisibilityLifecycleState::Deleted {
+            bail!("visibility deletion requires a Deleted projection record");
+        }
+
         let mut inner = self.inner.lock().await;
-        let Some(row) = inner.rows.remove(&run_key) else {
+        let previous = inner.rows.get(&tombstone.run_key).cloned();
+        if !visibility_version_is_newer(
+            previous.as_ref(),
+            tombstone.context.authority_epoch,
+            tombstone.transition_seq,
+        ) {
             return Ok(());
-        };
-
-        let attr_ids: Vec<_> = inner
-            .sa_current
-            .keys()
-            .filter_map(|(candidate_run_key, attr_id)| {
-                if *candidate_run_key == run_key {
-                    Some(*attr_id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for attr_id in attr_ids {
-            let Some(previous) = inner.sa_current.remove(&(run_key, attr_id)) else {
-                continue;
-            };
-            match previous {
-                SearchAttrValue::Keyword(v) => {
-                    if let Some(set) = inner
-                        .sa_keyword_idx
-                        .get_mut(&(row.namespace_id, attr_id, v))
-                    {
-                        set.remove(&run_key);
-                    }
-                }
-                SearchAttrValue::KeywordList(values) => {
-                    for v in values {
-                        if let Some(set) =
-                            inner
-                                .sa_keyword_list_idx
-                                .get_mut(&(row.namespace_id, attr_id, v))
-                        {
-                            set.remove(&run_key);
-                        }
-                    }
-                }
-                SearchAttrValue::Int(v) => {
-                    if let Some(set) = inner.sa_int_idx.get_mut(&(row.namespace_id, attr_id, v)) {
-                        set.remove(&run_key);
-                    }
-                }
-                SearchAttrValue::Bool(v) => {
-                    if let Some(set) = inner.sa_bool_idx.get_mut(&(row.namespace_id, attr_id, v)) {
-                        set.remove(&run_key);
-                    }
-                }
-                SearchAttrValue::Double(v) => {
-                    if let Some(set) = inner.sa_double_idx.get_mut(&(
-                        row.namespace_id,
-                        attr_id,
-                        format!("{v:.17}"),
-                    )) {
-                        set.remove(&run_key);
-                    }
-                }
-                SearchAttrValue::Datetime(v) => {
-                    if let Some(set) = inner.sa_datetime_idx.get_mut(&(
-                        row.namespace_id,
-                        attr_id,
-                        v.unix_timestamp_nanos(),
-                    )) {
-                        set.remove(&run_key);
-                    }
-                }
-                SearchAttrValue::Text(v) => {
-                    for token in Self::index_text(&v) {
-                        if let Some(set) =
-                            inner
-                                .sa_text_idx
-                                .get_mut(&(row.namespace_id, attr_id, token))
-                        {
-                            set.remove(&run_key);
-                        }
-                    }
-                }
-            }
         }
 
-        for (dimension, value) in [
-            (RollupDimension::ExecutionStatus, row.status_keyword.clone()),
-            (RollupDimension::WorkflowType, row.workflow_type.0),
-            (RollupDimension::TaskQueue, row.task_queue.0),
-        ] {
-            let key = (row.namespace_id, row.archetype_id, dimension, value);
-            if let Some(count) = inner.rollups.get_mut(&key) {
-                *count -= 1;
-                if *count <= 0 {
-                    inner.rollups.remove(&key);
-                }
-            }
+        if let Some(previous) = previous.as_ref() {
+            remove_run_search_attributes(&mut inner, previous);
         }
+        let row = ExecutionRow::from_projection_record(tombstone);
+        apply_rollup_deltas(&mut inner, &compute_rollup_deltas(previous.as_ref(), &row));
+        let snapshot = row.to_snapshot();
+        inner.snapshots.insert(
+            (
+                snapshot.namespace_id,
+                snapshot.archetype_id,
+                snapshot.run_key,
+            ),
+            snapshot,
+        );
+        inner.rows.insert(row.run_key, row);
 
         Ok(())
     }
@@ -330,19 +267,7 @@ impl VisibilityStore for InMemoryVisibilityStore {
 
     async fn accumulate_rollup(&self, entries: &[RollupDelta]) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        for entry in entries {
-            // The in-memory store aggregates per `(namespace, archetype, dimension,
-            // value)` and ignores `stripe` — striping is a DSQL hot-row concern.
-            *inner
-                .rollups
-                .entry((
-                    entry.namespace_id,
-                    entry.archetype_id,
-                    entry.dimension,
-                    entry.value.clone(),
-                ))
-                .or_insert(0) += entry.delta;
-        }
+        apply_rollup_deltas(&mut inner, entries);
         Ok(())
     }
 
@@ -495,6 +420,108 @@ impl VisibilityStore for InMemoryVisibilityStore {
     }
 }
 
+fn remove_run_search_attributes(inner: &mut VisibilityState, row: &ExecutionRow) {
+    let attr_ids: Vec<_> = inner
+        .sa_current
+        .keys()
+        .filter_map(|(candidate_run_key, attr_id)| {
+            (*candidate_run_key == row.run_key).then_some(*attr_id)
+        })
+        .collect();
+
+    for attr_id in attr_ids {
+        let Some(previous) = inner.sa_current.remove(&(row.run_key, attr_id)) else {
+            continue;
+        };
+        match previous {
+            SearchAttrValue::Keyword(value) => {
+                if let Some(set) = inner
+                    .sa_keyword_idx
+                    .get_mut(&(row.namespace_id, attr_id, value))
+                {
+                    set.remove(&row.run_key);
+                }
+            }
+            SearchAttrValue::KeywordList(values) => {
+                for value in values {
+                    if let Some(set) =
+                        inner
+                            .sa_keyword_list_idx
+                            .get_mut(&(row.namespace_id, attr_id, value))
+                    {
+                        set.remove(&row.run_key);
+                    }
+                }
+            }
+            SearchAttrValue::Int(value) => {
+                if let Some(set) = inner
+                    .sa_int_idx
+                    .get_mut(&(row.namespace_id, attr_id, value))
+                {
+                    set.remove(&row.run_key);
+                }
+            }
+            SearchAttrValue::Bool(value) => {
+                if let Some(set) = inner
+                    .sa_bool_idx
+                    .get_mut(&(row.namespace_id, attr_id, value))
+                {
+                    set.remove(&row.run_key);
+                }
+            }
+            SearchAttrValue::Double(value) => {
+                if let Some(set) = inner.sa_double_idx.get_mut(&(
+                    row.namespace_id,
+                    attr_id,
+                    format!("{value:.17}"),
+                )) {
+                    set.remove(&row.run_key);
+                }
+            }
+            SearchAttrValue::Datetime(value) => {
+                if let Some(set) = inner.sa_datetime_idx.get_mut(&(
+                    row.namespace_id,
+                    attr_id,
+                    value.unix_timestamp_nanos(),
+                )) {
+                    set.remove(&row.run_key);
+                }
+            }
+            SearchAttrValue::Text(value) => {
+                for token in InMemoryVisibilityStore::index_text(&value) {
+                    if let Some(set) =
+                        inner
+                            .sa_text_idx
+                            .get_mut(&(row.namespace_id, attr_id, token))
+                    {
+                        set.remove(&row.run_key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn apply_rollup_deltas(inner: &mut VisibilityState, entries: &[RollupDelta]) {
+    for entry in entries {
+        // The in-memory store aggregates without stripes because striping only
+        // mitigates DSQL hot-row contention. Removing zero counters keeps grouped
+        // count responses free of empty groups after a tombstone is applied.
+        let key = (
+            entry.namespace_id,
+            entry.archetype_id,
+            entry.dimension,
+            entry.value.clone(),
+        );
+        let next = inner.rollups.get(&key).copied().unwrap_or_default() + entry.delta;
+        if next <= 0 {
+            inner.rollups.remove(&key);
+        } else {
+            inner.rollups.insert(key, next);
+        }
+    }
+}
+
 fn sort_rows(rows: &mut [ExecutionRow], sort: SortOrder) {
     rows.sort_by(|a, b| match sort {
         SortOrder::Default => b
@@ -531,6 +558,11 @@ fn matches_filter(
     row: &ExecutionRow,
     filter: &CompiledFilter,
 ) -> Result<bool> {
+    // Deletion tombstones remain stored as version high-water marks but must
+    // never reappear through any list/count filter, including an empty filter.
+    if row.lifecycle_state == VisibilityLifecycleState::Deleted {
+        return Ok(false);
+    }
     // Forced archetype scope (Requirement 13.1): a row outside the query's
     // archetype is never visible, regardless of the user expression.
     if let Some(archetype) = filter.archetype

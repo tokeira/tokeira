@@ -716,66 +716,7 @@ async fn insert_projection_log(
 ) -> Result<()> {
     // Projection log rows are grouped per transition. Visibility sinks can
     // replay the projection stream without rereading workflow state/history.
-    let context = ProjectionContext {
-        archetype_id: ArchetypeId::WORKFLOW,
-        namespace_id: state.namespace_id,
-        business_id: state.workflow_id.0.clone(),
-        // Workflows run under a single namespace authority. Unlike the CHASM node
-        // path — whose `VersionedTransition` carries a `namespace_failover_version` —
-        // the kernel workflow path plumbs no failover version, so `authority_epoch`
-        // is a constant 0 and the sink's monotonic ordering reduces to
-        // `source_transition_seq` (the per-run transition seq, set below), which is
-        // strictly increasing per run. If namespace failover versioning later reaches
-        // the workflow path, this field becomes that version; the sink already
-        // compares the pair `(authority_epoch, source_transition_seq)`, so the
-        // ordering contract does not change.
-        authority_epoch: 0,
-        // `status_keyword`/`lifecycle_state` are the archetype-neutral encoding the
-        // visibility query layer reads back. The keyword is the `ExecutionStatus`
-        // Debug name and MUST stay in lockstep with
-        // `tokeira_projection::types::{workflow_status_keyword, workflow_status_from_keyword}`
-        // on the read side. The producer cannot call those helpers — `tokeira-projection`
-        // depends on `tokeira-storage`, so a reverse dependency would cycle — so this
-        // cross-crate contract is held by convention, not the type system; change one
-        // side and you must change the other. `lifecycle_state` is OPEN iff the status
-        // is non-terminal (`is_open()` ⇒ Running/Paused); the six terminal statuses
-        // (Completed, Failed, Cancelled, Terminated, ContinuedAsNew, TimedOut) are
-        // CLOSED, matching v1.31.0 list/count OPEN-vs-CLOSED semantics (only the
-        // RUNNING-equivalent state is open upstream).
-        status_keyword: format!("{:?}", state.status),
-        lifecycle_state: if state.status.is_open() {
-            VisibilityLifecycleState::Open
-        } else {
-            VisibilityLifecycleState::Closed
-        },
-        workflow_id: state.workflow_id.clone(),
-        run_id: state.run_id,
-        workflow_type: state.workflow_type.clone(),
-        task_queue: state.task_queue.clone(),
-        execution_status: state.status,
-        start_time: state.started_at,
-        update_time: state.closed_at.unwrap_or(state.started_at),
-        // v1.31.0 ExecutionTime = StartTime + FirstWorkflowTaskBackoff
-        // (mutable_state_impl.go:2859); tokeira carries that backoff (client
-        // start delay / workflow-retry backoff) as `workflow_start_delay`.
-        execution_time: Some(state.started_at + state.workflow_start_delay.unwrap_or_default()),
-        close_time: state.closed_at,
-        history_length: state.last_event_id,
-        execution_duration: projection_execution_duration(state),
-        state_transition_count: convert::i64_from_u64(state.transition_seq.0, "transition_seq")?,
-        transition_count: convert::i64_from_u64(state.transition_seq.0, "transition_seq")?,
-        history_size_bytes: 0,
-        parent_workflow_id: state.parent_workflow_id.clone(),
-        parent_run_id: state.parent_run_id,
-        root_workflow_id: state
-            .root_workflow_id
-            .clone()
-            .or_else(|| Some(state.workflow_id.clone())),
-        root_run_id: state.root_run_id.or(Some(state.run_id)),
-        search_attr_generation: state.transition_seq.0,
-        memo: state.memo.clone(),
-        search_attributes: state.search_attributes.clone(),
-    };
+    let context = workflow_projection_context(state)?;
     sqlx::query(
         "INSERT INTO projection_log
          (partition_id, fanout, run_key, transition_seq, context_data, ops_data, created_at)
@@ -796,9 +737,4 @@ async fn insert_projection_log(
     .execute(&mut **tx)
     .await?;
     Ok(())
-}
-
-fn projection_execution_duration(state: &WorkflowState) -> Option<i64> {
-    let close_time = state.closed_at?;
-    Some((close_time - state.started_at).whole_nanoseconds() as i64)
 }

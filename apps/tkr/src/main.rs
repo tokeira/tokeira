@@ -72,10 +72,10 @@ async fn main() -> Result<()> {
     // re-read the `.latest` sentinel (which could change between the check and
     // the mutation).
     let mut selected = cli.deployment.clone();
-    if let Some(target) = mutation_target(&cli.command, selected.as_deref()) {
-        if let Some(pinned) = deployment_lock::enforce_mutation(&deployments, target.as_deref())? {
-            selected = Some(pinned);
-        }
+    if let Some(target) = mutation_target(&cli.command, selected.as_deref())
+        && let Some(pinned) = deployment_lock::enforce_mutation(&deployments, target.as_deref())?
+    {
+        selected = Some(pinned);
     }
     let selected = selected.as_deref();
 

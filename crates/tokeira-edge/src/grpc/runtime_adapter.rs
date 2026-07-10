@@ -9,13 +9,13 @@ use tokeira_kernel::{
 };
 use tokeira_runtime::{
     ActivityTokenResolutionError, CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion,
-    DeploymentPage, DeploymentRegistry, DeploymentView, DescribeVersion, ListDeployments,
-    MultiOperationResult, PendingUpdateTransport, QueryResult, RegisterPolledDeployment,
-    RegistryError, ResetWorkflowResult, SetCurrent, SetCurrentOutcome, SetManager,
-    SetManagerOutcome, SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult,
-    StartedActivityTask, TaskQueueVersioningView, TokeiraRuntime, UpdateComputeConfig,
-    UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
-    ValidateComputeConfig, VersionMetadataView, VersionView,
+    DeleteWorkflowRequest, DeploymentPage, DeploymentRegistry, DeploymentView, DescribeVersion,
+    ListDeployments, MultiOperationResult, PendingUpdateTransport, QueryResult,
+    RegisterPolledDeployment, RegistryError, ResetWorkflowResult, SetCurrent, SetCurrentOutcome,
+    SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome, SignalWithStartResult,
+    StartWorkflowResult, StartedActivityTask, TaskQueueVersioningView, TokeiraRuntime,
+    UpdateComputeConfig, UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution,
+    UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView, VersionView, WorkflowDeletion,
 };
 use tokeira_storage::{CommitResult, ConflictToken, DeploymentKey, RunRepository};
 use tokeira_types::{ActivityTaskToken, ExecutionRef, Payload, Payloads, RequestContext, RunKey};
@@ -270,6 +270,14 @@ where
         let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
         let result = self.runtime.terminate_workflow(execution, req).await?;
         commit_result_to_outcome(result)
+    }
+
+    async fn delete_workflow(
+        &self,
+        run_key: RunKey,
+        request: DeleteWorkflowRequest,
+    ) -> Result<WorkflowDeletion> {
+        self.runtime.delete_workflow(run_key, request).await
     }
 
     async fn update_workflow_execution_options(

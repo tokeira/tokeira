@@ -4,8 +4,8 @@
 //! without external dependencies. It is a reference model for behaviour, not a
 //! template for a production engine. Key indexing structures: `execution_index`
 //! maps `(namespace, workflow_id, run_id)` → `RunKey`, `current_open` tracks
-//! the single open run per workflow, and `latest_run` ordering is derived from
-//! `started_at` + `transition_seq`.
+//! the single open run per workflow, and `current_execution` retains the exact
+//! current pointer after close without falling back to an older surviving run.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -21,9 +21,8 @@ use tokeira_kernel::{
     Transition, WorkflowState,
 };
 use tokeira_types::{
-    ArchetypeId, ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor,
-    QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, VisibilityLifecycleState,
-    WorkflowId,
+    ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor, QueueKey,
+    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId,
 };
 use tokio::sync::Mutex;
 
@@ -31,13 +30,14 @@ use crate::{
     api::{
         ActivitySweepEntry, BacklogEntry, BudgetAllocationResult, BundleLease, CommitResult,
         CompletionCallbackSweepEntry, ConflictToken, ConnectionDirector, ControlRepository,
-        CurrentExecutionConflictPolicy, DbClass, DbPermit, DeploymentCasResult, DeploymentKey,
-        DeploymentName, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
-        GenerationAdvanceResult, LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch,
-        ProjectionContext, ProjectionLog, ProjectionRecord, RequestRecord, RunRepository,
-        StoredWorkerDeployment, TransitionAuditRecord, WftTimeoutSweepEntry,
+        CurrentExecutionConflictPolicy, DbClass, DbPermit, DeleteRunRequest, DeleteRunResult,
+        DeploymentCasResult, DeploymentKey, DeploymentName, DispatchableActivityTask,
+        DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult, LeaseOutcome, LeaseRepository,
+        NexusSweepEntry, ProjectionBatch, ProjectionLog, ProjectionRecord, RequestRecord,
+        RunRepository, StoredWorkerDeployment, TransitionAuditRecord, WftTimeoutSweepEntry,
         WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkflowTimeoutSweepEntry,
-        workflow_is_open_and_pinned_to_version,
+        deleted_workflow_projection_context, workflow_is_open_and_pinned_to_version,
+        workflow_projection_context,
     },
     metrics as storage_metrics,
 };
@@ -64,6 +64,13 @@ struct StoreState {
     /// Closed workflows are removed from this map, but remain present in
     /// `latest_run` and `execution_index` equivalents below.
     current_open: HashMap<(NamespaceId, String), RunKey>,
+    /// Current run per workflow, retained after close until a successor starts
+    /// or the pointed-to run is explicitly deleted.
+    ///
+    /// DSQL persists the same distinction in `current_execution.is_open`.
+    /// Keeping a pointer here prevents deleting the newest run from exposing an
+    /// arbitrary older survivor through `find_latest_run`.
+    current_execution: HashMap<(NamespaceId, String), RunKey>,
     /// Durable run lookup by full execution identity.
     ///
     /// This mirrors the DSQL explicit-run path: older closed runs remain
@@ -212,16 +219,9 @@ impl RunRepository for InMemoryStore {
     ) -> Result<Option<RunKey>> {
         let store = self.inner.lock().await;
         Ok(store
-            .runs
-            .values()
-            .filter(|state| state.namespace_id == namespace_id && state.workflow_id == *workflow_id)
-            .max_by(|left, right| {
-                left.started_at
-                    .cmp(&right.started_at)
-                    .then_with(|| left.transition_seq.0.cmp(&right.transition_seq.0))
-                    .then_with(|| left.last_event_id.cmp(&right.last_event_id))
-            })
-            .map(|state| state.run_key))
+            .current_execution
+            .get(&(namespace_id, workflow_id.0.clone()))
+            .copied())
     }
 
     #[tracing::instrument(name = "storage.load_run", skip(self), fields(run_key = %run_key.0))]
@@ -607,6 +607,12 @@ impl RunRepository for InMemoryStore {
             run_key,
         );
 
+        if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
+            store
+                .current_execution
+                .insert(workflow_key.clone(), run_key);
+        }
+
         if state.status.is_open() {
             store.current_open.insert(workflow_key.clone(), run_key);
         } else if store.current_open.get(&workflow_key) == Some(&run_key) {
@@ -622,58 +628,7 @@ impl RunRepository for InMemoryStore {
             fanout: 1,
             run_key,
             transition_seq: state.transition_seq,
-            context: ProjectionContext {
-                archetype_id: ArchetypeId::WORKFLOW,
-                namespace_id: state.namespace_id,
-                business_id: state.workflow_id.0.clone(),
-                // Mirror the DSQL producer's visibility encoding so the in-memory
-                // reference store stays byte-aligned with it (see
-                // `dsql::run_repository::commit::insert_projection_log` for the full
-                // rationale): `authority_epoch` is a constant 0 because the workflow
-                // path carries no namespace failover version, leaving
-                // `source_transition_seq` as the monotonic ordering key; and the
-                // `status_keyword` Debug name must stay in lockstep with
-                // `tokeira_projection::types::workflow_status_from_keyword` (no shared
-                // helper — `tokeira-projection` depends on this crate). `lifecycle_state`
-                // is OPEN iff non-terminal, CLOSED for the six terminal statuses, per
-                // v1.31.0 OPEN-vs-CLOSED list/count semantics.
-                authority_epoch: 0,
-                status_keyword: format!("{:?}", state.status),
-                lifecycle_state: if state.status.is_open() {
-                    VisibilityLifecycleState::Open
-                } else {
-                    VisibilityLifecycleState::Closed
-                },
-                workflow_id: state.workflow_id.clone(),
-                run_id: state.run_id,
-                workflow_type: state.workflow_type.clone(),
-                task_queue: state.task_queue.clone(),
-                execution_status: state.status,
-                start_time: state.started_at,
-                update_time: state.closed_at.unwrap_or(state.started_at),
-                // v1.31.0 ExecutionTime = StartTime + FirstWorkflowTaskBackoff
-                // (mutable_state_impl.go:2859); tokeira carries that backoff (client
-                // start delay / workflow-retry backoff) as `workflow_start_delay`.
-                execution_time: Some(
-                    state.started_at + state.workflow_start_delay.unwrap_or_default(),
-                ),
-                close_time: state.closed_at,
-                history_length: state.last_event_id,
-                execution_duration: projection_execution_duration(&state),
-                state_transition_count: state.transition_seq.0 as i64,
-                transition_count: state.transition_seq.0 as i64,
-                history_size_bytes: 0,
-                parent_workflow_id: state.parent_workflow_id.clone(),
-                parent_run_id: state.parent_run_id,
-                root_workflow_id: state
-                    .root_workflow_id
-                    .clone()
-                    .or_else(|| Some(state.workflow_id.clone())),
-                root_run_id: state.root_run_id.or(Some(state.run_id)),
-                search_attr_generation: state.transition_seq.0,
-                memo: state.memo.clone(),
-                search_attributes: state.search_attributes.clone(),
-            },
+            context: workflow_projection_context(&state)?,
         });
 
         if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
@@ -701,6 +656,125 @@ impl RunRepository for InMemoryStore {
         // check when epoch != ShardEpoch::ZERO, so forwarding the real epoch is
         // sufficient to close the race.
         self.commit_transition(run_key, transition, epoch).await
+    }
+
+    #[tracing::instrument(
+        name = "storage.delete_run_for_bundle",
+        skip(self),
+        fields(
+            run_key = %run_key.0,
+            bundle = execution_home_bundle.0,
+            expected_seq = request.expected_seq.0,
+            epoch = epoch.0
+        )
+    )]
+    async fn delete_run_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
+        request: DeleteRunRequest,
+        epoch: ShardEpoch,
+    ) -> Result<DeleteRunResult> {
+        let mut store = self.inner.lock().await;
+        let Some(state) = store.runs.get(&run_key).cloned() else {
+            return Ok(DeleteRunResult::NotFound);
+        };
+
+        let derived_bundle = tokeira_types::execution_home_bundle(
+            state.namespace_id.0.as_bytes(),
+            state.workflow_id.0.as_bytes(),
+            Self::effective_shard_count(&store),
+        );
+        if derived_bundle != execution_home_bundle {
+            return Ok(DeleteRunResult::Conflict {
+                reason: format!(
+                    "execution-home bundle mismatch for {run_key:?}: expected {derived_bundle:?}, got {execution_home_bundle:?}"
+                ),
+            });
+        }
+
+        if epoch != ShardEpoch::ZERO {
+            match store.bundle_leases.get(&execution_home_bundle) {
+                Some((_owner, current_epoch, _endpoint)) if *current_epoch == epoch => {}
+                Some((_owner, current_epoch, _endpoint)) => {
+                    return Ok(DeleteRunResult::Conflict {
+                        reason: format!(
+                            "stale shard epoch {epoch:?} for shard {execution_home_bundle:?}; current {current_epoch:?}"
+                        ),
+                    });
+                }
+                None => {
+                    return Ok(DeleteRunResult::Conflict {
+                        reason: format!(
+                            "no active lease for shard {execution_home_bundle:?} at epoch {epoch:?}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        if state.transition_seq != request.expected_seq {
+            return Ok(DeleteRunResult::Conflict {
+                reason: format!(
+                    "expected seq {:?}, found {:?}",
+                    request.expected_seq, state.transition_seq
+                ),
+            });
+        }
+        if state.status.is_open() {
+            return Ok(DeleteRunResult::Conflict {
+                reason: "workflow must be closed before authoritative deletion".to_owned(),
+            });
+        }
+
+        let tombstone_seq = state.transition_seq.next();
+        let mut tombstone_state = state.clone();
+        tombstone_state.transition_seq = tombstone_seq;
+        let tombstone = ProjectionRecord {
+            partition_id: partition_for(run_key),
+            fanout: 1,
+            run_key,
+            transition_seq: tombstone_seq,
+            context: deleted_workflow_projection_context(&tombstone_state, request.deleted_at)?,
+        };
+        // The tombstone and purge share this lock acquisition. No reader can
+        // observe the run removed without its anti-resurrection record present.
+        store.projection_log.push(tombstone.clone());
+
+        let workflow_key = (state.namespace_id, state.workflow_id.0.clone());
+        if store.current_open.get(&workflow_key) == Some(&run_key) {
+            store.current_open.remove(&workflow_key);
+        }
+        if store.current_execution.get(&workflow_key) == Some(&run_key) {
+            store.current_execution.remove(&workflow_key);
+        }
+        store.execution_index.remove(&(
+            state.namespace_id,
+            state.workflow_id.0.clone(),
+            state.run_id,
+        ));
+        store.runs.remove(&run_key);
+        store.history.remove(&run_key);
+        store.transition_audit.remove(&run_key);
+        store.run_shard_map.remove(&run_key);
+        store.conflict_injections.remove(&run_key);
+        store
+            .request_dedupe
+            .retain(|_, record| record.run_key != run_key);
+        store
+            .activity_state_table
+            .retain(|(candidate, _), _| *candidate != run_key);
+        store
+            .timer_bucket
+            .retain(|(candidate, _), _| *candidate != run_key);
+        store
+            .activity_dispatch
+            .retain(|(candidate, _), _| *candidate != run_key);
+        store
+            .dispatch_backlog
+            .retain(|entry| entry.run_key != run_key);
+
+        Ok(DeleteRunResult::Deleted { tombstone })
     }
 
     async fn materialize_reset_successor(
@@ -793,6 +867,13 @@ impl RunRepository for InMemoryStore {
                 successor_state.namespace_id,
                 successor_state.workflow_id.0.clone(),
                 successor_state.run_id,
+            ),
+            successor_run_key,
+        );
+        store.current_execution.insert(
+            (
+                successor_state.namespace_id,
+                successor_state.workflow_id.0.clone(),
             ),
             successor_run_key,
         );
@@ -1184,11 +1265,6 @@ impl RunRepository for InMemoryStore {
     }
 }
 
-fn projection_execution_duration(state: &WorkflowState) -> Option<i64> {
-    let close_time = state.closed_at?;
-    Some((close_time - state.started_at).whole_nanoseconds() as i64)
-}
-
 #[async_trait]
 impl WorkerDeploymentRepository for InMemoryStore {
     async fn load_deployment(&self, key: &DeploymentKey) -> Result<Option<StoredWorkerDeployment>> {
@@ -1522,8 +1598,8 @@ mod tests {
     };
     use tokeira_types::{
         ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey, RequestId,
-        RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName, TransitionSeq, WorkerIdentity,
-        WorkflowId, WorkflowType,
+        RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName, TransitionSeq,
+        VisibilityLifecycleState, WorkerIdentity, WorkflowId, WorkflowType,
     };
     use tracing::{
         Subscriber,
@@ -3939,21 +4015,407 @@ mod tests {
         }
     }
 
+    async fn commit_closed_lineage_run(
+        store: &InMemoryStore,
+        namespace_id: NamespaceId,
+        workflow_id: &WorkflowId,
+        run_key: RunKey,
+        run_id: RunId,
+    ) {
+        let mut start = start_transition(run_key);
+        start.next_state.namespace_id = namespace_id;
+        start.next_state.workflow_id = workflow_id.clone();
+        start.next_state.run_id = run_id;
+        let mut closed_state = start.next_state.clone();
+        store
+            .commit_transition(run_key, start, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+
+        closed_state.transition_seq = TransitionSeq(2);
+        closed_state.status = ExecutionStatus::Completed;
+        closed_state.pending_workflow_task = None;
+        closed_state.closed_at = Some(fixed_now());
+        let close = Transition {
+            expected_seq: TransitionSeq(1),
+            next_state: closed_state,
+            history_events: Default::default(),
+            request_dedupe_ops: Default::default(),
+            activity_ops: Default::default(),
+            timer_ops: Default::default(),
+            dispatch_ops: Default::default(),
+            projection_ops: Default::default(),
+        };
+        store
+            .commit_transition(run_key, close, ShardEpoch::ZERO)
+            .await
+            .unwrap();
+    }
+
+    // Feature: temporal-ui-support, Property 5: authoritative workflow deletion
+    // A successful purge removes every run-owned authoritative/dispatch row and
+    // leaves exactly the newer Deleted projection high-water record.
+    // **Validates: Requirements 9.1, 9.2, 9.4**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn property_authoritative_workflow_deletion(
+            seed in any::<u128>(),
+            side_row_count in 1usize..6,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let store = InMemoryStore::with_shard_count(1);
+                let run_key = RunKey(uuid::Uuid::from_u128(seed));
+                let namespace_id = NamespaceId(uuid::Uuid::from_u128(seed.wrapping_add(1)));
+                let workflow_id = WorkflowId(format!("delete-{seed}"));
+                let run_id = RunId(uuid::Uuid::from_u128(seed.wrapping_add(2)));
+                let activity_queue = QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName("activity-q".to_string()),
+                    task_kind: TaskKind::Activity,
+                    deployment: None,
+                    build_id: None,
+                };
+
+                let mut transition = start_transition(run_key);
+                transition.next_state.namespace_id = namespace_id;
+                transition.next_state.workflow_id = workflow_id.clone();
+                transition.next_state.run_id = run_id;
+                transition.next_state.status = ExecutionStatus::Terminated;
+                transition.next_state.pending_workflow_task = None;
+                transition.next_state.closed_at = Some(fixed_now());
+                transition.next_state.last_event_id = side_row_count as i64;
+                for index in 0..side_row_count {
+                    let suffix = index.to_string();
+                    transition.history_events.push(history_event(
+                        index as i64 + 1,
+                        fixed_now(),
+                        HistoryEventKind::WorkflowExecutionTerminated {
+                            reason: format!("terminated-{suffix}"),
+                            details: None,
+                            identity: "history-service".to_string(),
+                        },
+                    ));
+                    transition.request_dedupe_ops.push(RequestDedupeOp {
+                        request_id: RequestId(format!("request-{suffix}")),
+                    });
+                    let activity_id = format!("activity-{suffix}");
+                    let mut activity = activity_state(&activity_id);
+                    activity.schedule_event_id = index as i64 + 1;
+                    transition.activity_ops.push(ActivityOp::Upsert(activity));
+                    transition.timer_ops.push(TimerOp::Upsert(timer_state(
+                        &format!("timer-{suffix}"),
+                        fixed_now() + Duration::minutes(1),
+                    )));
+                    transition.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+                        queue: activity_queue.clone(),
+                        activity_id,
+                        input: tokeira_types::Payloads::default(),
+                        schedule_event_id: index as i64 + 1,
+                        attempt: 1,
+                        dispatch_revision: 0,
+                        schedule_to_close_timeout: None,
+                        schedule_to_start_timeout: None,
+                        start_to_close_timeout: None,
+                        heartbeat_timeout: None,
+                    });
+                }
+                let commit = store
+                    .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                    .await
+                    .unwrap();
+                prop_assert!(
+                    matches!(commit, CommitResult::Applied { .. }),
+                    "seed commit should apply",
+                );
+
+                store
+                    .persist_to_backlog(
+                        (0..side_row_count)
+                            .map(|index| BacklogEntry {
+                                run_key,
+                                queue: activity_queue.clone(),
+                                payload: crate::api::BacklogPayload::Activity {
+                                    activity_id: format!("backlog-{index}"),
+                                    input: tokeira_types::Payloads::default(),
+                                    schedule_event_id: index as i64 + 1,
+                                    attempt: 1,
+                                    dispatch_revision: 0,
+                                },
+                                scheduled_at: fixed_now(),
+                                insertion_seq: index as u64,
+                            })
+                            .collect(),
+                    )
+                    .await
+                    .unwrap();
+                store.inject_conflict(run_key, 1).await;
+
+                {
+                    let inner = store.inner.lock().await;
+                    prop_assert_eq!(inner.history[&run_key].len(), side_row_count);
+                    prop_assert_eq!(
+                        inner
+                            .request_dedupe
+                            .values()
+                            .filter(|record| record.run_key == run_key)
+                            .count(),
+                        side_row_count,
+                    );
+                    prop_assert_eq!(
+                        inner
+                            .activity_state_table
+                            .keys()
+                            .filter(|(candidate, _)| *candidate == run_key)
+                            .count(),
+                        side_row_count,
+                    );
+                    prop_assert_eq!(
+                        inner
+                            .timer_bucket
+                            .keys()
+                            .filter(|(candidate, _)| *candidate == run_key)
+                            .count(),
+                        side_row_count,
+                    );
+                    prop_assert_eq!(
+                        inner
+                            .activity_dispatch
+                            .keys()
+                            .filter(|(candidate, _)| *candidate == run_key)
+                            .count(),
+                        side_row_count,
+                    );
+                    prop_assert_eq!(
+                        inner
+                            .dispatch_backlog
+                            .iter()
+                            .filter(|entry| entry.run_key == run_key)
+                            .count(),
+                        side_row_count,
+                    );
+                }
+
+                let result = store
+                    .delete_run_for_bundle(
+                        run_key,
+                        ShardId(0),
+                        DeleteRunRequest {
+                            expected_seq: TransitionSeq(1),
+                            deleted_at: fixed_now() + Duration::seconds(1),
+                        },
+                        ShardEpoch::ZERO,
+                    )
+                    .await
+                    .unwrap();
+                let DeleteRunResult::Deleted { tombstone } = result else {
+                    prop_assert!(false, "closed run should be deleted: {result:?}");
+                    return Ok(());
+                };
+                prop_assert_eq!(tombstone.transition_seq, TransitionSeq(2));
+                prop_assert_eq!(
+                    tombstone.context.lifecycle_state,
+                    VisibilityLifecycleState::Deleted,
+                );
+                prop_assert!(tombstone.context.memo.0.is_empty());
+                prop_assert!(tombstone.context.search_attributes.0.is_empty());
+
+                prop_assert!(matches!(
+                    store.load_run(run_key).await.unwrap(),
+                    LoadedRun::Absent
+                ));
+                prop_assert!(store.read_history(run_key, 0, usize::MAX).await.unwrap().is_empty());
+                prop_assert_eq!(
+                    store
+                        .resolve_execution(&ExecutionRef {
+                            namespace_id,
+                            workflow_id: workflow_id.clone(),
+                            run_id: Some(run_id),
+                        })
+                        .await
+                        .unwrap(),
+                    None,
+                );
+
+                let inner = store.inner.lock().await;
+                prop_assert!(!inner.runs.contains_key(&run_key));
+                prop_assert!(!inner.history.contains_key(&run_key));
+                prop_assert!(!inner.transition_audit.contains_key(&run_key));
+                prop_assert!(!inner.run_shard_map.contains_key(&run_key));
+                prop_assert!(!inner.conflict_injections.contains_key(&run_key));
+                prop_assert!(inner.request_dedupe.values().all(|record| record.run_key != run_key));
+                prop_assert!(inner.activity_state_table.keys().all(|(candidate, _)| *candidate != run_key));
+                prop_assert!(inner.timer_bucket.keys().all(|(candidate, _)| *candidate != run_key));
+                prop_assert!(inner.activity_dispatch.keys().all(|(candidate, _)| *candidate != run_key));
+                prop_assert!(inner.dispatch_backlog.iter().all(|entry| entry.run_key != run_key));
+                prop_assert_eq!(inner.projection_log.last(), Some(&tombstone));
+                Ok(())
+            })?;
+        }
+    }
+
+    // Feature: temporal-ui-support, Property 10: current-execution pointer safety
+    // Deleting the selected run conditionally clears only its pointer and never
+    // exposes an older surviving execution as current.
+    // **Validates: Requirements 9.3**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn property_current_execution_pointer_safety(
+            seed in any::<u128>(),
+            older_count in 0usize..5,
+            install_replacement in any::<bool>(),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let store = InMemoryStore::with_shard_count(1);
+                store
+                    .set_conflict_policy(CurrentExecutionConflictPolicy::AllowAfterClose)
+                    .await;
+                let namespace_id = NamespaceId(uuid::Uuid::from_u128(seed.wrapping_add(1)));
+                let workflow_id = WorkflowId(format!("lineage-{seed}"));
+                let mut older = Vec::new();
+
+                for index in 0..older_count {
+                    let run_key = RunKey(uuid::Uuid::from_u128(
+                        seed.wrapping_add(100 + index as u128),
+                    ));
+                    let run_id = RunId(uuid::Uuid::from_u128(
+                        seed.wrapping_add(200 + index as u128),
+                    ));
+                    commit_closed_lineage_run(
+                        &store,
+                        namespace_id,
+                        &workflow_id,
+                        run_key,
+                        run_id,
+                    )
+                    .await;
+                    older.push((run_key, run_id));
+                }
+
+                let target_key = RunKey(uuid::Uuid::from_u128(seed.wrapping_add(10_000)));
+                let target_id = RunId(uuid::Uuid::from_u128(seed.wrapping_add(20_000)));
+                commit_closed_lineage_run(
+                    &store,
+                    namespace_id,
+                    &workflow_id,
+                    target_key,
+                    target_id,
+                )
+                .await;
+
+                let replacement = if install_replacement {
+                    let run_key = RunKey(uuid::Uuid::from_u128(seed.wrapping_add(30_000)));
+                    let run_id = RunId(uuid::Uuid::from_u128(seed.wrapping_add(40_000)));
+                    let mut start = start_transition(run_key);
+                    start.next_state.namespace_id = namespace_id;
+                    start.next_state.workflow_id = workflow_id.clone();
+                    start.next_state.run_id = run_id;
+                    let result = store
+                        .commit_transition(run_key, start, ShardEpoch::ZERO)
+                        .await
+                        .unwrap();
+                    prop_assert!(
+                        matches!(result, CommitResult::Applied { .. }),
+                        "replacement start should apply",
+                    );
+                    Some((run_key, run_id))
+                } else {
+                    None
+                };
+
+                let result = store
+                    .delete_run_for_bundle(
+                        target_key,
+                        ShardId(0),
+                        DeleteRunRequest {
+                            expected_seq: TransitionSeq(2),
+                            deleted_at: fixed_now(),
+                        },
+                        ShardEpoch::ZERO,
+                    )
+                    .await
+                    .unwrap();
+                prop_assert!(
+                    matches!(result, DeleteRunResult::Deleted { .. }),
+                    "target deletion should apply",
+                );
+
+                prop_assert_eq!(
+                    store.find_latest_run(namespace_id, &workflow_id).await.unwrap(),
+                    replacement.map(|(run_key, _)| run_key),
+                );
+                prop_assert_eq!(
+                    store
+                        .resolve_execution(&ExecutionRef {
+                            namespace_id,
+                            workflow_id: workflow_id.clone(),
+                            run_id: None,
+                        })
+                        .await
+                        .unwrap(),
+                    replacement.map(|(run_key, _)| run_key),
+                );
+                prop_assert_eq!(
+                    store
+                        .resolve_execution(&ExecutionRef {
+                            namespace_id,
+                            workflow_id: workflow_id.clone(),
+                            run_id: Some(target_id),
+                        })
+                        .await
+                        .unwrap(),
+                    None,
+                );
+                for (run_key, run_id) in older {
+                    prop_assert_eq!(
+                        store
+                            .resolve_execution(&ExecutionRef {
+                                namespace_id,
+                                workflow_id: workflow_id.clone(),
+                                run_id: Some(run_id),
+                            })
+                            .await
+                            .unwrap(),
+                        Some(run_key),
+                    );
+                }
+                Ok(())
+            })?;
+        }
+    }
+
     #[test]
     fn load_run_emits_storage_load_run_span() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        // A thread-local tracing dispatch does not follow a future migrated to
+        // another worker thread. Keep this instrumentation assertion on one
+        // thread so parallel test load cannot make the span nondeterministic.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let buffer = SpanNames::default();
         let subscriber = tracing_subscriber::registry().with(buffer.clone());
-        let dispatch = tracing::Dispatch::new(subscriber);
+        // This test is the crate's sole subscriber installer. A global default
+        // avoids the static-callsite interest race that a thread-local dispatch
+        // has with parallel tests invoking `load_run` first.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("storage tests should install one tracing subscriber");
 
-        tracing::dispatcher::with_default(&dispatch, || {
-            rt.block_on(async {
-                let store = InMemoryStore::default();
-                let run_key = RunKey::new();
-                seed_base_run(&store, run_key, sample_state(run_key), Vec::new()).await;
+        rt.block_on(async {
+            let store = InMemoryStore::default();
+            let run_key = RunKey::new();
+            seed_base_run(&store, run_key, sample_state(run_key), Vec::new()).await;
 
-                let _ = store.load_run(run_key).await.unwrap();
-            });
+            let _ = store.load_run(run_key).await.unwrap();
         });
 
         let names = buffer.0.lock().unwrap().clone();

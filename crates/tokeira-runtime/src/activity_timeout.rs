@@ -197,6 +197,14 @@ impl ActivityTrackingState {
             .remove(&(run_key, activity_id.to_string()));
     }
 
+    /// Stop tracking every activity owned by a deleted workflow run.
+    pub fn remove_all_for_run(&self, run_key: RunKey) {
+        self.inner
+            .lock()
+            .unwrap()
+            .retain(|(candidate, _), _| *candidate != run_key);
+    }
+
     /// Drop every entry for a shard on handoff; the new owner rebuilds them from
     /// durable state during its sweep.
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {

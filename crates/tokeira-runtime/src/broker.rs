@@ -59,7 +59,9 @@ use tokio::{
     time::{Duration, Instant},
 };
 
-use crate::{DeliveryMetrics, QueryTask, StartedWorkflowTask, metrics as runtime_metrics};
+use crate::{
+    DeliveryMetrics, QueryResult, QueryTask, StartedWorkflowTask, metrics as runtime_metrics,
+};
 
 /// Lightweight in-memory workflow-task broker.
 ///
@@ -953,6 +955,58 @@ impl InMemoryBroker {
             }
         }
     }
+
+    /// Remove every queued workflow task and direct query for a deleted run.
+    ///
+    /// Broker state is disposable, but retaining stale entries wastes worker
+    /// polls and can strand query callers. Authoritative storage still fences a
+    /// task already handed to a worker; this only cleans work not yet delivered.
+    pub async fn remove_run(&self, run_key: RunKey) {
+        let mut inner = self.inner.lock().await;
+        for ready in inner.sticky_ready.values_mut() {
+            ready.retain(|entry| entry.task.run_key != run_key);
+        }
+        for ready in inner.general_ready.values_mut() {
+            ready.retain(|entry| entry.task.run_key != run_key);
+        }
+        inner
+            .enqueued
+            .retain(|(candidate, _)| *candidate != run_key);
+
+        let mut removed_queries = Vec::new();
+        for ready in inner.query_ready.values_mut() {
+            let mut retained = VecDeque::with_capacity(ready.len());
+            while let Some(query) = ready.pop_front() {
+                if query.run_key == run_key {
+                    removed_queries.push(query);
+                } else {
+                    retained.push_back(query);
+                }
+            }
+            *ready = retained;
+        }
+
+        let workflow_queues = inner
+            .sticky_ready
+            .keys()
+            .chain(inner.general_ready.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        inner.sticky_ready.retain(|_, ready| !ready.is_empty());
+        inner.general_ready.retain(|_, ready| !ready.is_empty());
+        inner.query_ready.retain(|_, ready| !ready.is_empty());
+        for queue in workflow_queues {
+            Self::emit_queue_depths(&inner, &queue);
+        }
+        drop(inner);
+
+        for query in removed_queries {
+            let _ = query.response_tx.send(QueryResult::Failed {
+                message: "workflow execution was deleted".to_owned(),
+                failure: None,
+            });
+        }
+    }
 }
 
 impl InMemoryActivityBroker {
@@ -1159,6 +1213,22 @@ impl InMemoryActivityBroker {
             if *count == 0 {
                 inner.waiter_counts.remove(queue);
             }
+        }
+    }
+
+    /// Remove all not-yet-delivered activity tasks for a deleted run.
+    pub async fn remove_run(&self, run_key: RunKey) {
+        let mut inner = self.inner.lock().await;
+        for ready in inner.ready.values_mut() {
+            ready.retain(|entry| entry.task.run_key != run_key);
+        }
+        inner
+            .enqueued
+            .retain(|(candidate, _, _)| *candidate != run_key);
+        let queues = inner.ready.keys().cloned().collect::<Vec<_>>();
+        inner.ready.retain(|_, ready| !ready.is_empty());
+        for queue in queues {
+            Self::emit_queue_depth(&inner, &queue);
         }
     }
 }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use tokeira_storage::ProjectionRecord;
 use tokeira_types::{ArchetypeId, NamespaceId, ProjectionCursor, RunKey, SearchAttrValue};
 
 use crate::types::{
@@ -23,7 +24,12 @@ pub trait VisibilityStore: Send + Sync {
         Ok(())
     }
     async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()>;
-    async fn delete_execution(&self, run_key: RunKey) -> Result<()>;
+    /// Apply a versioned deletion tombstone while retaining its high-water mark.
+    ///
+    /// A physical delete would allow an older delayed snapshot to recreate the
+    /// visibility row. Implementations therefore remove query indexes and rollup
+    /// membership but preserve the `Deleted` row for version fencing.
+    async fn apply_deletion(&self, tombstone: &ProjectionRecord) -> Result<()>;
     async fn upsert_search_attr_index(
         &self,
         run_key: RunKey,

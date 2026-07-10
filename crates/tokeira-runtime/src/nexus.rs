@@ -933,6 +933,15 @@ impl NexusTaskBroker {
             .get_mut(&(namespace_id, task_queue.clone()))
             .and_then(VecDeque::pop_front)
     }
+
+    /// Remove all not-yet-delivered Nexus tasks owned by a deleted run.
+    pub async fn remove_run(&self, run_key: RunKey) {
+        let mut inner = self.inner.lock().await;
+        for ready in inner.ready.values_mut() {
+            ready.retain(|task| task.token.run_key != run_key);
+        }
+        inner.ready.retain(|_, ready| !ready.is_empty());
+    }
 }
 
 pub struct NoopNexusHttpClient;

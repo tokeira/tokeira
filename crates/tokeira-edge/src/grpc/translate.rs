@@ -3996,17 +3996,26 @@ fn rate_limit_config_to_proto(requests_per_second: f32) -> taskqueue_proto::Rate
 pub fn delete_request_to_edge(
     req: workflowservice::DeleteWorkflowExecutionRequest,
 ) -> Result<EdgeDeleteWorkflowExecutionRequest, ProtoConversionError> {
-    let execution = req
-        .workflow_execution
-        .as_ref()
-        .ok_or(ProtoConversionError::MissingField(
-            "DeleteWorkflowExecutionRequest.workflow_execution",
-        ))?;
+    let execution = req.workflow_execution.as_ref().ok_or_else(|| {
+        ProtoConversionError::InvalidArgument("Execution is not set on request.".to_string())
+    })?;
+    if execution.workflow_id.is_empty() {
+        return Err(ProtoConversionError::InvalidArgument(
+            "WorkflowId is not set on request.".to_string(),
+        ));
+    }
+    let run_id = if execution.run_id.is_empty() {
+        None
+    } else {
+        parse_run_id(&execution.run_id)
+            .map_err(|_| ProtoConversionError::InvalidArgument("Invalid RunId.".to_string()))?;
+        Some(execution.run_id.clone())
+    };
 
     Ok(EdgeDeleteWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
-        run_id: non_empty(execution.run_id.clone()),
+        run_id,
     })
 }
 
@@ -7848,6 +7857,67 @@ mod tests {
             other => {
                 panic!("unexpected error: {other:?}")
             }
+        }
+    }
+
+    #[test]
+    fn delete_request_accepts_omitted_run_id_as_current_execution() {
+        let request = workflowservice::DeleteWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                workflow_id: "workflow".to_string(),
+                run_id: String::new(),
+            }),
+        };
+
+        let translated = delete_request_to_edge(request).unwrap();
+        assert_eq!(translated.workflow_id, "workflow");
+        assert_eq!(translated.run_id, None);
+    }
+
+    // Feature: temporal-ui-support, Property 12: rejected deletion preserves state
+    // Delete admission is a pure wire conversion. Every invalid execution shape
+    // is rejected before the edge can resolve or mutate authoritative/visibility
+    // state; the gRPC integration test separately verifies a seeded run survives.
+    // **Validates: Requirements 9.6, 9.7**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn rejected_delete_admission_is_pure(
+            invalid_kind in 0u8..3,
+            suffix in "[a-z0-9]{1,24}",
+        ) {
+            let execution = match invalid_kind {
+                0 => None,
+                1 => Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id: String::new(),
+                    run_id: String::new(),
+                }),
+                _ => Some(tokeira_proto::common::WorkflowExecution {
+                    workflow_id: format!("workflow-{suffix}"),
+                    run_id: format!("not-a-run-id-{suffix}"),
+                }),
+            };
+            let request = workflowservice::DeleteWorkflowExecutionRequest {
+                namespace: format!("namespace-{suffix}"),
+                workflow_execution: execution,
+            };
+            let before = request.clone();
+
+            let error = delete_request_to_edge(request.clone()).unwrap_err();
+
+            let ProtoConversionError::InvalidArgument(message) = error else {
+                return Err(TestCaseError::fail(format!(
+                    "invalid deletion should be InvalidArgument, got {error:?}"
+                )));
+            };
+            let expected = match invalid_kind {
+                0 => "Execution is not set on request.",
+                1 => "WorkflowId is not set on request.",
+                _ => "Invalid RunId.",
+            };
+            prop_assert_eq!(message, expected);
+            prop_assert_eq!(request, before);
         }
     }
 

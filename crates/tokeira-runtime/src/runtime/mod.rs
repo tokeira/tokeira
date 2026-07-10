@@ -23,8 +23,9 @@ use tokeira_kernel::{
     WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{
-    CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, LeaseOutcome,
-    LeaseRepository, RunRepository, WorkerDeploymentRepository,
+    CommitResult, DeleteRunRequest, DeleteRunResult, DispatchableActivityTask,
+    DispatchableWorkflowTask, LeaseOutcome, LeaseRepository, ProjectionRecord, RunRepository,
+    WorkerDeploymentRepository,
 };
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, Headers,
@@ -45,7 +46,9 @@ use crate::{
     buffered_queries::{BufferedQuery, BufferedQueryRegistry},
     deployment_registry::DeploymentRegistry,
     drain::RuntimeDrain,
-    errors::{ActivityTaskNotFound, ActivityTokenResolutionError, NotShardOwner},
+    errors::{
+        ActivityTaskNotFound, ActivityTokenResolutionError, NotShardOwner, WorkflowDeletionNotFound,
+    },
     fairness::{DeliveryMetrics, FairnessState, run_control_loop},
     heartbeat::{InMemoryHeartbeatStore, spawn_heartbeat_maintenance},
     lane::{LaneConfig, LaneHandle, spawn_lane_with_id},
@@ -203,6 +206,22 @@ pub struct TokeiraRuntime<R> {
 pub struct ResetWorkflowResult {
     pub successor_run_key: RunKey,
     pub successor_run_id: RunId,
+}
+
+/// Runtime inputs for deleting one already-resolved workflow run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeleteWorkflowRequest {
+    /// Request identity persisted if an open target must first terminate.
+    pub request: RequestContext,
+    /// Stable admission time used by both termination and the deletion tombstone.
+    pub now: OffsetDateTime,
+}
+
+/// Result of an authoritative workflow deletion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowDeletion {
+    /// Exact projection-log record persisted atomically with the purge.
+    pub tombstone: ProjectionRecord,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3328,6 +3347,16 @@ mod tests {
             _transition: Transition,
             _epoch: ShardEpoch,
         ) -> Result<CommitResult> {
+            panic!("unused in timer scanner tests")
+        }
+
+        async fn delete_run_for_bundle(
+            &self,
+            _run_key: RunKey,
+            _execution_home_bundle: ShardId,
+            _request: tokeira_storage::DeleteRunRequest,
+            _epoch: ShardEpoch,
+        ) -> Result<tokeira_storage::DeleteRunResult> {
             panic!("unused in timer scanner tests")
         }
 

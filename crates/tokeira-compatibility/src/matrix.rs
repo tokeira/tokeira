@@ -96,6 +96,24 @@ const EAGER_WORKFLOW_START_EVIDENCE: &[CompatibilityEvidence] = &[
         reference: "crates/tokeira-storage/src/dsql/codec.rs::legacy_workflow_started_fixture_decodes_and_v2_round_trips",
     },
 ];
+const WORKFLOW_DELETION_EVIDENCE: &[CompatibilityEvidence] = &[
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "Temporal functional corpus TestWorkflowDeleteExecutionSuite @ v1.31.0: 3 pass / 0 fail (2 consecutive runs)",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-storage/src/memory.rs::authoritative workflow deletion Property 5",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-projection/src/visibility_sink.rs::visibility tombstone monotonicity Property 11",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-runtime/src/runtime/lifecycle.rs::running_workflow_deletion_terminates_then_purges",
+    },
+];
 const EMPTY_RPCS: &[&str] = &[];
 
 const LEGACY_VISIBILITY_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
@@ -597,8 +615,8 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         capability_field: None,
         dynamic_config_key: None,
         rpcs: WORKFLOW_CANCEL_TERMINATE_RPCS,
-        notes: "Cancel, terminate, and delete requests exist but need broader failure-mode conformance evidence.",
-        evidence: &[],
+        notes: "DeleteWorkflowExecution is proven against the v1.31.0 functional corpus with authoritative state/history purge and monotonic visibility tombstones. The group remains Partial until cancel and terminate independently have broader failure-mode conformance evidence.",
+        evidence: WORKFLOW_DELETION_EVIDENCE,
     },
     FeatureEntry {
         id: "workflow-history",

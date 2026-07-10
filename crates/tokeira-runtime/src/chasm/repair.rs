@@ -190,22 +190,30 @@ mod tests {
                 let first = scanner.repair_once().await.unwrap();
                 prop_assert_eq!(first.scanned, statuses.len());
 
-                // Drop an arbitrary subset of projections (loss after commit).
+                // Seed a fresh projection store with an arbitrary retained subset,
+                // modelling projection loss without bypassing the visibility
+                // store's deletion-tombstone contract.
+                let repaired_store = InMemoryVisibilityStore::default();
                 for i in 0..statuses.len() {
-                    if (drop_seed >> (i % 64)) & 1 == 1 {
-                        store
-                            .delete_execution(RunKey(Uuid::from_u128(1000 + i as u128)))
-                            .await
-                            .unwrap();
+                    if (drop_seed >> (i % 64)) & 1 == 0 {
+                        let run_key = RunKey(Uuid::from_u128(1000 + i as u128));
+                        let row = store.get_row(run_key).await.unwrap();
+                        repaired_store.upsert_execution(&row).await.unwrap();
                     }
                 }
+                let repaired_sink: Arc<dyn ProjectionSink> =
+                    Arc::new(VisibilitySink::new(repaired_store.clone()));
+                let repair_scanner =
+                    VisibilityRepairScanner::new(nodes.clone(), repaired_sink, rebuilder(), 1);
 
                 // Repair drives the index back to the fold of the latest snapshots,
                 // regardless of which projections were dropped (idempotent on the rest).
-                scanner.repair_once().await.unwrap();
+                repair_scanner.repair_once().await.unwrap();
 
                 for (i, status) in statuses.iter().enumerate() {
-                    let row = store.get_row(RunKey(Uuid::from_u128(1000 + i as u128))).await;
+                    let row = repaired_store
+                        .get_row(RunKey(Uuid::from_u128(1000 + i as u128)))
+                        .await;
                     prop_assert!(row.is_some(), "execution {} missing after repair", i);
                     prop_assert_eq!(row.unwrap().status_keyword, *status);
                 }

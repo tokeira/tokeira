@@ -5150,6 +5150,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_delete_requests_leave_authoritative_run_unchanged() {
+        let (grpc, repo, run_key, _run_id) = history_test_service().await;
+        let cases = [
+            (
+                workflowservice::DeleteWorkflowExecutionRequest {
+                    namespace: "default".to_string(),
+                    workflow_execution: None,
+                },
+                "Execution is not set on request.",
+            ),
+            (
+                workflowservice::DeleteWorkflowExecutionRequest {
+                    namespace: "default".to_string(),
+                    workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                        workflow_id: String::new(),
+                        run_id: String::new(),
+                    }),
+                },
+                "WorkflowId is not set on request.",
+            ),
+            (
+                workflowservice::DeleteWorkflowExecutionRequest {
+                    namespace: "default".to_string(),
+                    workflow_execution: Some(tokeira_proto::common::WorkflowExecution {
+                        workflow_id: "wf".to_string(),
+                        run_id: "not-a-run-id".to_string(),
+                    }),
+                },
+                "Invalid RunId.",
+            ),
+        ];
+
+        for (request, expected_message) in cases {
+            let error = grpc
+                .delete_workflow_execution(Request::new(request))
+                .await
+                .expect_err("invalid delete request should fail before mutation");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert_eq!(error.message(), expected_message);
+            assert!(matches!(
+                repo.load_run(run_key).await.unwrap(),
+                LoadedRun::Existing(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn reset_workflow_execution_invalid_event_returns_invalid_argument() {
         let (grpc, _repo, _run_key, run_id) = history_test_service().await;
 

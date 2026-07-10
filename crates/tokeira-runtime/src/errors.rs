@@ -42,6 +42,18 @@ impl NotShardOwner {
     }
 }
 
+/// The exact workflow run selected for deletion no longer exists.
+///
+/// This is distinct from a generic storage failure so the edge can preserve
+/// Temporal's typed NOT_FOUND response even when the run disappears between
+/// initial request resolution and runtime admission.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("workflow run not found for deletion: {run_key:?}")]
+pub struct WorkflowDeletionNotFound {
+    /// Stable run key that was selected before the race.
+    pub run_key: RunKey,
+}
+
 /// A worker-presented activity task token failed revalidation against
 /// authoritative state: the run or activity is gone, or the token's identity
 /// (`schedule_event_id`, `attempt`) no longer matches the live activity.

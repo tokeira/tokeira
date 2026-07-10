@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_kernel::{HistoryEvent, LoadedRun, Transition};
 use tokeira_storage::{
-    ActivitySweepEntry, BacklogEntry, BundleLease, CommitResult, DispatchableActivityTask,
-    DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry,
-    RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
+    ActivitySweepEntry, BacklogEntry, BundleLease, CommitResult, DeleteRunRequest, DeleteRunResult,
+    DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository,
+    NexusSweepEntry, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
     WorkflowTimeoutSweepEntry,
 };
 use tokeira_types::{
@@ -153,6 +153,26 @@ where
             && let Some(last_event_id) = last_event_id
         {
             self.waits.notify(run_key, last_event_id).await;
+        }
+        Ok(result)
+    }
+
+    async fn delete_run_for_bundle(
+        &self,
+        run_key: RunKey,
+        execution_home_bundle: ShardId,
+        request: DeleteRunRequest,
+        epoch: ShardEpoch,
+    ) -> Result<DeleteRunResult> {
+        let result = self
+            .inner
+            .delete_run_for_bundle(run_key, execution_home_bundle, request, epoch)
+            .await?;
+        if matches!(result, DeleteRunResult::Deleted { .. }) {
+            // Wake long-polling history readers after the purge. Their next loop
+            // iteration reloads the run and returns NOT_FOUND instead of waiting
+            // for the ordinary 20-second long-poll expiry.
+            self.waits.notify(run_key, i64::MAX).await;
         }
         Ok(result)
     }

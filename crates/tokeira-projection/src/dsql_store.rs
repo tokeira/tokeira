@@ -135,15 +135,81 @@ impl VisibilityStore for DsqlVisibilityStore {
     async fn upsert_execution(&self, row: &ExecutionRow) -> Result<()> {
         let memo = codec::encode(&row.memo)?;
         let mut permit = self.director.acquire(DbClass::Projection).await?;
-        upsert_execution_row(permit.connection()?, row, Some(memo)).await
+        upsert_execution_row(permit.connection()?, row, Some(memo))
+            .await
+            .map(|_| ())
     }
 
-    #[instrument(skip_all, fields(run_key = %run_key.0))]
-    async fn delete_execution(&self, run_key: RunKey) -> Result<()> {
-        let mut permit = self.director.acquire(DbClass::Projection).await?;
-        sqlx::query("DELETE FROM execution_visibility_current WHERE run_key = $1")
-            .bind(run_key.0)
-            .execute(permit.connection()?)
+    #[instrument(skip_all, fields(run_key = %tombstone.run_key.0))]
+    async fn apply_deletion(&self, tombstone: &ProjectionRecord) -> Result<()> {
+        if tombstone.context.lifecycle_state != VisibilityLifecycleState::Deleted {
+            bail!("visibility deletion requires a Deleted projection record");
+        }
+        let previous = self.get_row(tombstone.run_key).await;
+        if !visibility_version_is_newer(
+            previous.as_ref(),
+            tombstone.context.authority_epoch,
+            tombstone.transition_seq,
+        ) {
+            return Ok(());
+        }
+
+        let row = ExecutionRow::from_projection_record(tombstone);
+        let memo = codec::encode(&row.memo)?;
+        let mut attempts = 0u32;
+        let applied = loop {
+            let mut permit = self.director.acquire(DbClass::Projection).await?;
+            let result = async {
+                let mut tx = permit.connection()?.begin().await?;
+                let applied = upsert_execution_row(&mut tx, &row, Some(memo.clone())).await?;
+                // Tombstones retain only their version fence. User-provided search
+                // attributes are deliberately absent from the deleted context, and
+                // clearing the index in the same transaction prevents filtered
+                // queries from observing the deleted execution.
+                if applied {
+                    clear_search_attr_index_rows(
+                        &mut tx,
+                        tombstone.run_key,
+                        tombstone.context.namespace_id,
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+                Ok::<bool, anyhow::Error>(applied)
+            }
+            .await;
+            drop(permit);
+
+            match result {
+                Ok(applied) => break applied,
+                Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
+                    attempts += 1;
+                    storage_metrics::record_dsql_occ_conflict(
+                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                    );
+                    tokio::time::sleep(Self::retry_delay(attempts)).await;
+                }
+                Err(error) if Self::is_occ_conflict(&error) => {
+                    storage_metrics::record_dsql_retry(
+                        tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                        tokeira_observability::RetryOutcomeLabel::Exhausted,
+                    );
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if attempts > 0 {
+            storage_metrics::record_dsql_retry(
+                tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
+                tokeira_observability::RetryOutcomeLabel::Success,
+            );
+        }
+        if !applied {
+            return Ok(());
+        }
+
+        self.accumulate_rollup_striped(&compute_rollup_deltas(previous.as_ref(), &row))
             .await?;
         Ok(())
     }
@@ -220,6 +286,7 @@ impl VisibilityStore for DsqlVisibilityStore {
                 root_run_id
             FROM execution_visibility_current
             WHERE namespace_id = $1
+              AND lifecycle_state <> 2
               {archetype_sql}
               {filter_sql}
               {cursor_sql}
@@ -316,6 +383,7 @@ impl VisibilityStore for DsqlVisibilityStore {
             FROM execution_visibility_rollup
             WHERE namespace_id = $1 AND archetype_id = $2 AND dimension = $3
             GROUP BY value
+            HAVING SUM(counter) <> 0
             "#,
         )
         .bind(namespace_id.0)
@@ -487,6 +555,11 @@ impl ProjectionSink for DsqlVisibilityStore {
     #[instrument(skip_all, fields(run_key = %record.run_key.0, transition_seq = record.transition_seq.0))]
     async fn apply(&self, record: &ProjectionRecord, partition_id: u32) -> Result<()> {
         let sink_started = Instant::now();
+        if record.context.lifecycle_state == VisibilityLifecycleState::Deleted {
+            VisibilityStore::apply_deletion(self, record).await?;
+            projection_metrics::record_sink_write_duration(partition_id, sink_started.elapsed());
+            return Ok(());
+        }
         let previous = self.get_row(record.run_key).await;
         if !visibility_version_is_newer(
             previous.as_ref(),
@@ -503,42 +576,7 @@ impl ProjectionSink for DsqlVisibilityStore {
         // frozen at its prior value across a superseding transition — the omission
         // failure mode Property 12 exercises. `previous` is still used below to
         // retire dropped search-attribute index rows and to compute rollup deltas.
-        let mut row = ExecutionRow {
-            run_key: record.run_key,
-            namespace_id: record.context.namespace_id,
-            archetype_id: record.context.archetype_id,
-            business_id: record.context.business_id.clone(),
-            workflow_id: record.context.workflow_id.clone(),
-            run_id: record.context.run_id,
-            authority_epoch: record.context.authority_epoch,
-            source_transition_seq: record.transition_seq,
-            status_keyword: record.context.status_keyword.clone(),
-            lifecycle_state: record.context.lifecycle_state,
-            workflow_type: record.context.workflow_type.clone(),
-            task_queue: record.context.task_queue.clone(),
-            status: record.context.execution_status,
-            start_time: record.context.start_time,
-            update_time: record.context.update_time,
-            execution_time: record.context.execution_time,
-            close_time: record.context.close_time,
-            history_length: record.context.history_length,
-            execution_duration: record.context.execution_duration,
-            state_transition_count: record.context.state_transition_count,
-            history_size_bytes: record.context.history_size_bytes,
-            parent_workflow_id: record.context.parent_workflow_id.clone(),
-            parent_run_id: record.context.parent_run_id,
-            root_workflow_id: record
-                .context
-                .root_workflow_id
-                .clone()
-                .unwrap_or_else(|| record.context.workflow_id.clone()),
-            root_run_id: record.context.root_run_id.unwrap_or(record.context.run_id),
-            memo: record.context.memo.clone(),
-            search_attributes: record.context.search_attributes.clone(),
-            transition_count: record.context.transition_count,
-            search_attr_generation: record.context.search_attr_generation,
-            search_attr_version: 0,
-        };
+        let mut row = ExecutionRow::from_projection_record(record);
         let search_patch = record.context.search_attributes.clone();
 
         let mut resolved_search_attrs = Vec::new();
@@ -569,47 +607,57 @@ impl ProjectionSink for DsqlVisibilityStore {
 
         let memo = codec::encode(&row.memo)?;
         let mut attempts = 0u32;
-        loop {
+        let applied = loop {
             let mut permit = self.director.acquire(DbClass::Projection).await?;
             let result = async {
                 let mut tx = permit.connection()?.begin().await?;
 
                 let started = Instant::now();
-                upsert_execution_row(&mut tx, &row, Some(memo.clone())).await?;
+                let applied = upsert_execution_row(&mut tx, &row, Some(memo.clone())).await?;
                 storage_metrics::record_dsql_statement_duration(
                     "projection_apply",
                     "upsert_execution",
                     started.elapsed(),
                 );
 
-                clear_search_attr_index_rows(&mut tx, record.run_key, record.context.namespace_id)
-                    .await?;
-                for (attr, value) in &resolved_search_attrs {
-                    let started = Instant::now();
-                    upsert_search_attr_index_row(
+                // The SQL version guard can lose a race after the optimistic
+                // pre-read. Only the transaction that actually advanced the row
+                // may replace its indexes; otherwise a stale record could erase
+                // attributes belonging to a newer visible version.
+                if applied {
+                    clear_search_attr_index_rows(
                         &mut tx,
                         record.run_key,
                         record.context.namespace_id,
-                        attr.attr_id,
-                        attr.attr_type,
-                        value,
                     )
                     .await?;
-                    storage_metrics::record_dsql_statement_duration(
-                        "projection_apply",
-                        "upsert_search_attr",
-                        started.elapsed(),
-                    );
+                    for (attr, value) in &resolved_search_attrs {
+                        let started = Instant::now();
+                        upsert_search_attr_index_row(
+                            &mut tx,
+                            record.run_key,
+                            record.context.namespace_id,
+                            attr.attr_id,
+                            attr.attr_type,
+                            value,
+                        )
+                        .await?;
+                        storage_metrics::record_dsql_statement_duration(
+                            "projection_apply",
+                            "upsert_search_attr",
+                            started.elapsed(),
+                        );
+                    }
                 }
 
                 tx.commit().await?;
-                Ok::<(), anyhow::Error>(())
+                Ok::<bool, anyhow::Error>(applied)
             }
             .await;
             drop(permit);
 
             match result {
-                Ok(()) => break,
+                Ok(applied) => break applied,
                 Err(error) if Self::is_occ_conflict(&error) && attempts < 5 => {
                     attempts += 1;
                     storage_metrics::record_dsql_occ_conflict(
@@ -636,12 +684,16 @@ impl ProjectionSink for DsqlVisibilityStore {
                     return Err(error);
                 }
             }
-        }
+        };
         if attempts > 0 {
             storage_metrics::record_dsql_retry(
                 tokeira_observability::StorageOperationLabel::ProjectionApplyTx,
                 tokeira_observability::RetryOutcomeLabel::Success,
             );
+        }
+        if !applied {
+            projection_metrics::record_sink_write_duration(partition_id, sink_started.elapsed());
+            return Ok(());
         }
 
         let deltas = compute_rollup_deltas(previous.as_ref(), &row);
@@ -661,14 +713,14 @@ async fn upsert_execution_row(
     connection: &mut PgConnection,
     row: &ExecutionRow,
     memo: Option<Vec<u8>>,
-) -> Result<()> {
+) -> Result<bool> {
     // Apply-iff-newer at the SQL level: the `ON CONFLICT ... DO UPDATE ... WHERE`
     // guard makes the upsert a no-op unless the incoming `(authority_epoch,
     // source_transition_seq)` is strictly newer than the stored one, so a retried
     // or out-of-order snapshot can neither regress the row nor double-apply
     // (reference/DECISION-visibility-dsql-schema.md). The row's version columns are
     // also the search-attribute generation pointer.
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         INSERT INTO execution_visibility_current (
             namespace_id,
@@ -751,7 +803,7 @@ async fn upsert_execution_row(
     .bind(row.root_run_id.0)
     .execute(connection)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 async fn clear_search_attr_index_rows(
@@ -1495,6 +1547,7 @@ async fn count_without_group(
         SELECT COUNT(*) AS total_count
         FROM execution_visibility_current
         WHERE namespace_id = $1
+          AND lifecycle_state <> 2
           {archetype_sql}
           {filter_sql}
         "#
@@ -1523,6 +1576,7 @@ async fn count_system_group(
         SELECT {group_column} AS group_value, COUNT(*) AS group_count
         FROM execution_visibility_current
         WHERE namespace_id = $1
+          AND lifecycle_state <> 2
           {archetype_sql}
           {filter_sql}
         GROUP BY {group_column}
@@ -1576,6 +1630,7 @@ async fn count_custom_group(
             SELECT *
             FROM execution_visibility_current
             WHERE namespace_id = $1
+              AND lifecycle_state <> 2
               {archetype_sql}
               {filter_sql}
         ) ve

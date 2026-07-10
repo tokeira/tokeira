@@ -114,6 +114,7 @@ Tokeira is organized into three planes:
 |-------|---------|
 | `platforms/local` | Bare-process local execution — spawns tokeirad directly |
 | `platforms/compose` | Docker Compose stack with observability services (Mimir, Loki, Grafana, Alloy) |
+| `platforms/compose-syn` | The compose stack as an interpreted `definition.tkd` deployment definition — see `docs/deployment-definitions.md` |
 
 ### Applications
 
@@ -121,6 +122,7 @@ Tokeira is organized into three planes:
 |--------|---------|
 | `tokeirad` | Server process — wires kernel, runtime, storage, edge, and projection into one binary |
 | `tkr` | CLI — deployment lifecycle, infrastructure management, and developer workflows |
+| `tkp` | Platform provisioner — one deployment's lifecycle (init/plan/apply/revert/upgrade), gated on engine provenance; see `docs/deployment-definitions.md` |
 
 ## Quick Start
 

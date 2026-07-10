@@ -450,5 +450,6 @@ The six mirror images (Mimir, Loki, Grafana, Alloy, AWS CLI, BusyBox) are declar
 
 - `.kiro/specs/*/` — feature specs (requirements, design, tasks)
 - `docs/architecture/` — architecture design documents
+- `docs/deployment-definitions.md` — authoring + operating `.tkd` deployment definitions (the rust-syn DSL and `tkp` lifecycle)
 - `proto/upstream/` — vendored Temporal protos (API `v1.62.11`); authoritative wire shape
 - Temporal server source for behaviour: [`github.com/temporalio/temporal` at tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0) (the `TEMPORAL_SERVER_COMPAT` target) — see §8

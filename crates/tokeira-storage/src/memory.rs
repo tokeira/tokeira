@@ -772,6 +772,17 @@ impl RunRepository for InMemoryStore {
         successor_state.original_execution_run_id = base_state
             .original_execution_run_id
             .or(Some(base_state.run_id));
+        // The successor's run/execution-timeout windows restart at reset time:
+        // v1.31.0's resetter calls `RefreshExpirationTimeoutTask`, which
+        // re-anchors BOTH expirations at now + timeout
+        // (mutable_state_impl.go:8417 @ v1.31.0) — the replayed prefix's
+        // original timestamps must not leave the successor born expired
+        // (TestResetWorkflowAfterTimeout resets well past the base's 1s
+        // window and still expects a usable successor). Tokeira's sweep
+        // derives both deadlines from these two anchors.
+        let materialized_at = time::OffsetDateTime::now_utc();
+        successor_state.started_at = materialized_at;
+        successor_state.first_run_started_at = Some(materialized_at);
 
         store.history.insert(successor_run_key, copied_history);
         store

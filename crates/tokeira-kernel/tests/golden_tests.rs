@@ -1956,7 +1956,10 @@ fn reset_accepts_closed_run() {
     let req = make_reset_request();
     let new_run_id = req.new_run_id;
     let transition = kernel()
-        .apply(LoadedRun::Existing(make_closed_state()), Command::Reset(req))
+        .apply(
+            LoadedRun::Existing(make_closed_state()),
+            Command::Reset(req),
+        )
         .unwrap();
     assert_eq!(transition.next_state.status, ExecutionStatus::Completed);
     assert_eq!(transition.next_state.reset_run_id, Some(new_run_id));
@@ -2302,6 +2305,7 @@ fn wft_failed_paused_workflow_no_redispatch() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now(),
+                reset_reapply: Vec::new(),
             }),
         )
         .unwrap();
@@ -3454,6 +3458,7 @@ fn wft_failed_with_started_wft() {
                 failure_details: Some(payload("details")),
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now(),
+                reset_reapply: Vec::new(),
             }),
         )
         .unwrap();
@@ -3472,6 +3477,7 @@ fn wft_failed_with_started_wft() {
             new_run_id,
             fork_event_version,
             fork_event_id,
+            ..
         }
         if *logical_seq == LogicalTaskSeq(3)
             && *scheduled_event_id == 8
@@ -3580,6 +3586,7 @@ fn wft_failed_no_sticky() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now(),
+                reset_reapply: Vec::new(),
             }),
         )
         .unwrap();
@@ -4086,6 +4093,7 @@ fn reject_wft_failed_absent_run() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now(),
+                reset_reapply: Vec::new(),
             })
         ),
         Err(Reject::MissingRun)
@@ -4104,6 +4112,7 @@ fn reject_wft_failed_closed_run() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now(),
+                reset_reapply: Vec::new(),
             })
         ),
         Err(Reject::RunClosed(ExecutionStatus::Completed))
@@ -4122,6 +4131,7 @@ fn reject_wft_failed_no_pending() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now(),
+                reset_reapply: Vec::new(),
             })
         ),
         Err(Reject::NoPendingWorkflowTask)
@@ -4140,6 +4150,7 @@ fn reject_wft_failed_not_started() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now(),
+                reset_reapply: Vec::new(),
             })
         ),
         Err(Reject::WorkflowTaskNotStarted { logical_seq: 3 })
@@ -4158,6 +4169,7 @@ fn reject_wft_failed_seq_mismatch() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now(),
+                reset_reapply: Vec::new(),
             })
         ),
         Err(Reject::WorkflowTaskSeqMismatch {
@@ -4179,6 +4191,7 @@ fn reject_wft_failed_started_event_mismatch() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now(),
+                reset_reapply: Vec::new(),
             })
         ),
         Err(Reject::WorkflowTaskTokenMismatch)
@@ -8283,6 +8296,7 @@ fn speculative_explicit_fail_materializes_and_keeps_update_admitted() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now: now() + Duration::seconds(1),
+                reset_reapply: Vec::new(),
             }),
         )
         .unwrap();

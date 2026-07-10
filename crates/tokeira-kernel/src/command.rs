@@ -7,7 +7,7 @@ use tokeira_types::{
 };
 
 use crate::{
-    event::ActivityResolution,
+    event::{ActivityResolution, HistoryEventKind},
     state::{
         CompletionCallback, Link, OnConflictOptions, ParentClosePolicy, Priority, UserMetadata,
         VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef,
@@ -1012,6 +1012,13 @@ pub struct WorkflowTaskFailedRequest {
     pub worker_identity: WorkerIdentity,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
+    /// Reset-only: the post-fork events the resetter reapplies onto the
+    /// successor branch, emitted BETWEEN the authored `WorkflowTaskFailed`
+    /// and the freshly-scheduled workflow task (empty for a normal failure).
+    /// The lane populates this from the base run's post-fork history filtered
+    /// by the request's reapply exclude bits (`collect_reset_reapply`).
+    #[serde(default)]
+    pub reset_reapply: Vec<HistoryEventKind>,
 }
 
 /// Request from the runtime when `RespondWorkflowTaskFailed` arrives with

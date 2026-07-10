@@ -342,6 +342,9 @@ fn event_type_for_kind(kind: &HistoryEventKind) -> i32 {
         HistoryEventKind::WorkflowExecutionUpdateAccepted { .. } => {
             E::WorkflowExecutionUpdateAccepted
         }
+        HistoryEventKind::WorkflowExecutionUpdateAdmitted { .. } => {
+            E::WorkflowExecutionUpdateAdmitted
+        }
         HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
         | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { .. } => {
             E::WorkflowExecutionUpdateCompleted
@@ -1516,6 +1519,28 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                     }),
                 }),
                 ..Default::default()
+            },
+        ),
+        HistoryEventKind::WorkflowExecutionUpdateAdmitted {
+            update_id,
+            update_name,
+            input,
+        } => Attributes::WorkflowExecutionUpdateAdmittedEventAttributes(
+            history::WorkflowExecutionUpdateAdmittedEventAttributes {
+                request: Some(proto_update::Request {
+                    meta: Some(proto_update::Meta {
+                        update_id: update_id.clone(),
+                        identity: String::new(),
+                    }),
+                    input: Some(proto_update::Input {
+                        header: None,
+                        name: update_name.clone(),
+                        args: Some(payloads_from_domain(input)),
+                    }),
+                }),
+                // The only admitted-event author today is the reset reapply
+                // path (UPDATE_ADMITTED_EVENT_ORIGIN_REAPPLY).
+                origin: tokeira_proto::enums::UpdateAdmittedEventOrigin::Reapply as i32,
             },
         ),
         HistoryEventKind::WorkflowExecutionUpdateCompleted {

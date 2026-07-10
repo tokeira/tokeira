@@ -507,9 +507,13 @@ where
         // A cron completion/failure closes with its real outcome carrying this
         // successor id; the runtime starts the cron successor after the close
         // commits (the same derived-effect posture as the retry successor).
-        let cron_successor = cron_continuation
-            .as_ref()
-            .map(|cron| (cron.new_run_id, cron.cron_schedule.clone(), cron.input.clone()));
+        let cron_successor = cron_continuation.as_ref().map(|cron| {
+            (
+                cron.new_run_id,
+                cron.cron_schedule.clone(),
+                cron.input.clone(),
+            )
+        });
         // Anchor the cron backoff on the completion time (`req.now`), captured before
         // `req` moves into the command below.
         let completion_now = req.now;
@@ -570,6 +574,7 @@ where
                             failure_details: Some(server_failure_payload(&wire_message)),
                             worker_identity: completion_identity,
                             now: OffsetDateTime::now_utc(),
+                            reset_reapply: Vec::new(),
                         }),
                     )
                     .await
@@ -649,6 +654,7 @@ where
                             failure_details: Some(server_failure_payload(&persisted_message)),
                             worker_identity: completion_identity,
                             now: OffsetDateTime::now_utc(),
+                            reset_reapply: Vec::new(),
                         }),
                     )
                     .await
@@ -782,6 +788,7 @@ where
                 failure_details,
                 worker_identity,
                 now,
+                reset_reapply: Vec::new(),
             })
         };
         self.submit_for_owned_shard(run_key, command).await
@@ -1462,7 +1469,8 @@ pub(crate) fn build_cron_successor_start(
     // intervals still lands on the schedule's phase rather than `now + interval`
     // (`common/backoff/cron.go` `GetBackoffForNextSchedule`).
     let scheduled_time = state.started_at + state.workflow_start_delay.unwrap_or(Duration::ZERO);
-    let backoff = crate::schedule::cron_backoff_for_next_schedule(&cron_schedule, scheduled_time, now)?;
+    let backoff =
+        crate::schedule::cron_backoff_for_next_schedule(&cron_schedule, scheduled_time, now)?;
     let successor_run_key = RunKey::derive(state.namespace_id, &state.workflow_id, new_run_id);
     let first_execution_run_id = Some(state.first_execution_run_id.unwrap_or(state.run_id));
     let first_run_started_at = Some(state.first_run_started_at.unwrap_or(state.started_at));

@@ -300,9 +300,21 @@ impl DsqlRunRepository {
                     parent_workflow_id: base_state.parent_workflow_id.clone(),
                     first_run_started_at: base_state.first_run_started_at,
                 };
-                let successor_state = BasicKernel
+                let mut successor_state = BasicKernel
                     .replay_history_prefix(replay_ctx, &copied_events)
                     .map_err(anyhow::Error::from)?;
+                // Parity with the memory store's materialization: the reset run
+                // inherits the chain origin, and its run/execution-timeout
+                // windows restart at reset time (v1.31.0
+                // `RefreshExpirationTimeoutTask`, mutable_state_impl.go:8417 —
+                // the replayed prefix's original timestamps must not leave the
+                // successor born expired).
+                successor_state.original_execution_run_id = base_state
+                    .original_execution_run_id
+                    .or(Some(base_state.run_id));
+                let materialized_at = time::OffsetDateTime::now_utc();
+                successor_state.started_at = materialized_at;
+                successor_state.first_run_started_at = Some(materialized_at);
                 let successor_shard = self.shard_for_run_key(successor_run_key);
                 crate::dsql::run_repository::commit::insert_workflow_hot(
                     &mut tx,

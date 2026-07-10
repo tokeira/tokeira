@@ -982,6 +982,7 @@ where
         let reset_reason = request.reason.clone();
         let reset_now = request.now;
         let successor_run_id = request.new_run_id;
+        let fork_event_id = request.fork_event_id;
         match self.submit(run_key, Command::Reset(request)).await? {
             CommitResult::Applied { .. } => {}
             CommitResult::Duplicate => {
@@ -1023,6 +1024,54 @@ where
             self.submit(current_run_key, Command::Terminate(terminate))
                 .await?;
         }
+        // v1.31.0's reset RPC is synchronous: fork, WFTFailed(RESET), reapply,
+        // and the fresh WorkflowTaskScheduled are all durable before it returns,
+        // and callers assert the successor's history immediately. Tokeira's lane
+        // materializes the successor inline with the base commit (done by the
+        // time submit() replies) but authors the fork-point WFT failure via an
+        // off-lane task — wait until the successor's history holds a
+        // `WorkflowTaskFailed(ResetWorkflow)` at or after the fork point. The
+        // copied prefix ends before `fork_event_id` (any earlier reset marker
+        // from a prior reset sits strictly inside the prefix), so this
+        // condition is unique to the boundary; raw event-id growth is NOT
+        // sufficient — when the fork WFT was scheduled-not-started, a
+        // concurrent signal can take `fork_event_id` before the failure lands.
+        // Once present, the marker persists (monotone), which keeps the wait
+        // robust against a fast worker consuming the fresh task concurrently.
+        const RESET_BOUNDARY_WAIT_ATTEMPTS: usize = 250;
+        const RESET_BOUNDARY_WAIT_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(20);
+        const RESET_BOUNDARY_SCAN_PAGE: usize = 64;
+        for _ in 0..RESET_BOUNDARY_WAIT_ATTEMPTS {
+            let boundary_window = self
+                .repo
+                .read_history(
+                    successor_run_key,
+                    fork_event_id - 1,
+                    RESET_BOUNDARY_SCAN_PAGE,
+                )
+                .await?;
+            let boundary_landed = boundary_window.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    tokeira_kernel::HistoryEventKind::WorkflowTaskFailed {
+                        failure_cause: tokeira_kernel::WorkflowTaskFailedCause::ResetWorkflow,
+                        ..
+                    }
+                )
+            });
+            if boundary_landed {
+                return Ok(ResetWorkflowResult {
+                    successor_run_key,
+                    successor_run_id,
+                });
+            }
+            tokio::time::sleep(RESET_BOUNDARY_WAIT_INTERVAL).await;
+        }
+        tracing::warn!(
+            successor_run_key = ?successor_run_key,
+            "reset successor's fork-point workflow task failure did not land before the RPC deadline; returning anyway"
+        );
         Ok(ResetWorkflowResult {
             successor_run_key,
             successor_run_id,

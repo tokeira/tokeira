@@ -253,7 +253,7 @@ pub fn spawn_lane<K, R, P>(
 ) -> LaneHandle
 where
     K: Kernel + Send + Sync + 'static,
-    R: RunRepository + 'static,
+    R: RunRepository + Clone + 'static,
     P: DispatchPublisher + Clone + 'static,
 {
     spawn_lane_with_id(
@@ -286,7 +286,7 @@ pub(crate) fn spawn_lane_with_id<K, R, P>(
 ) -> LaneHandle
 where
     K: Kernel + Send + Sync + 'static,
-    R: RunRepository + 'static,
+    R: RunRepository + Clone + 'static,
     P: DispatchPublisher + Clone + 'static,
 {
     let (tx, mut rx) = mpsc::channel::<LaneMessage>(1024);
@@ -344,7 +344,7 @@ async fn run_activation<K, R, P>(
 ) -> Vec<LaneMessage>
 where
     K: Kernel + Send + Sync + 'static,
-    R: RunRepository + 'static,
+    R: RunRepository + Clone + 'static,
     P: DispatchPublisher + Clone + 'static,
 {
     let mut cache = LaneCache::new(config);
@@ -395,7 +395,7 @@ async fn run_activation_with_cache<K, R, P>(
 ) -> Vec<LaneMessage>
 where
     K: Kernel + Send + Sync + 'static,
-    R: RunRepository + 'static,
+    R: RunRepository + Clone + 'static,
     P: DispatchPublisher + Clone + 'static,
 {
     let active_run_key = first_message.run_key;
@@ -602,6 +602,18 @@ where
                         && let Some((successor_run_id, fork_event_id)) =
                             extract_reset_metadata(&history_events)
                     {
+                        // The reapply exclude bits ride the committed Reset
+                        // command (the marker event's persisted shape is
+                        // frozen). A reset close always originates from
+                        // Command::Reset, so missing bits (defensive arm)
+                        // mean "exclude nothing".
+                        let (exclude_signal, exclude_update) = match &committed_command {
+                            Command::Reset(reset_request) => (
+                                reset_request.reapply_exclude_signal,
+                                reset_request.reapply_exclude_update,
+                            ),
+                            _ => (false, false),
+                        };
                         // A reset closes the predecessor and forks a successor
                         // run at `fork_event_id`. The successor is materialized
                         // here rather than through the normal start path, so
@@ -612,7 +624,63 @@ where
                             &new_state.workflow_id,
                             successor_run_id,
                         );
-                        if let Err(error) = repo
+                        // The resetter reapplies the base run's eligible post-fork
+                        // events onto the successor branch. Read them from the base
+                        // (predecessor) history now — the successor's authored
+                        // WFTFailed command below carries them so the kernel emits
+                        // them between the failure and the fresh scheduled task.
+                        // Paged: the DSQL store clamps an unbounded limit to its
+                        // default page size, which would silently truncate reapply
+                        // on a long post-fork tail. A read error FAILS the reset
+                        // (same posture as a materialization failure below) —
+                        // degrading to an empty reapply would silently drop
+                        // durably-recorded post-fork signals/updates while the
+                        // RPC reports success.
+                        let reset_reapply = {
+                            const REAPPLY_READ_PAGE: usize = 1024;
+                            let mut base_post_fork = Vec::new();
+                            let mut cursor = fork_event_id;
+                            loop {
+                                match repo
+                                    .read_history(message.run_key, cursor, REAPPLY_READ_PAGE)
+                                    .await
+                                {
+                                    Ok(page) => {
+                                        let page_len = page.len();
+                                        if let Some(last) = page.last() {
+                                            cursor = last.event_id;
+                                        }
+                                        base_post_fork.extend(page);
+                                        if page_len < REAPPLY_READ_PAGE {
+                                            break Ok(collect_reset_reapply(
+                                                &base_post_fork,
+                                                fork_event_id,
+                                                exclude_signal,
+                                                exclude_update,
+                                            ));
+                                        }
+                                    }
+                                    Err(error) => break Err(error),
+                                }
+                            }
+                        };
+                        let reset_reapply = match reset_reapply {
+                            Ok(reset_reapply) => Some(reset_reapply),
+                            Err(error) => {
+                                tracing::error!(
+                                    ?error,
+                                    base_run_key = ?message.run_key,
+                                    "failed to read base history for reset reapply"
+                                );
+                                reset_materialization_error = Some(error);
+                                None
+                            }
+                        };
+                        if reset_reapply.is_none() {
+                            // Reapply extraction failed: surface the error to the
+                            // reset RPC and do NOT materialize a successor missing
+                            // its reapplied events.
+                        } else if let Err(error) = repo
                             .materialize_reset_successor(
                                 message.run_key,
                                 fork_event_id,
@@ -708,6 +776,9 @@ where
                                             "reset".into(),
                                         ),
                                         now: time::OffsetDateTime::now_utc(),
+                                        // Guarded above: this branch is reached only
+                                        // when the reapply extraction succeeded.
+                                        reset_reapply: reset_reapply.clone().unwrap_or_default(),
                                     },
                                 );
                                 let publisher = publisher.clone();
@@ -841,6 +912,7 @@ where
                                         },
                                     );
                                     let publisher = publisher.clone();
+                                    let repo = repo.clone();
                                     let child_run_key = message.run_key;
                                     // Deliver to the parent off this lane: the
                                     // parent may hash to the very lane running
@@ -849,21 +921,68 @@ where
                                     // busy with us. The spawned submit routes
                                     // through the parent's own lane.
                                     tokio::spawn(async move {
-                                        if let Err(error) =
-                                            publisher.submit_to_run(parent_run_key, command).await
-                                        {
-                                            let error_message = error.to_string();
-                                            // A parent that already moved on
-                                            // (kernel rejects the resolution) or
-                                            // no longer exists is an expected
-                                            // race, not an operational fault —
-                                            // log it quietly.
-                                            if error_message.contains("kernel rejected")
-                                                || error_message.contains("not found")
-                                            {
-                                                tracing::debug!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                        // A parent terminated/superseded by reset
+                                        // records its successor in `reset_run_id`;
+                                        // the resolution follows that lineage until
+                                        // an open run accepts it — v1.31.0 redirects
+                                        // RecordChildExecutionCompleted the same way
+                                        // (recordchildworkflowcompleted/api.go:47-54
+                                        // @ v1.31.0, maxResetRedirectCount = 100).
+                                        // The successor's replayed prefix still holds
+                                        // the pending child, so the redirected
+                                        // resolution lands as an ordinary child
+                                        // completion there.
+                                        const MAX_RESET_REDIRECTS: usize = 100;
+                                        let mut target = parent_run_key;
+                                        let mut redirects = 0;
+                                        loop {
+                                            let Err(error) = publisher
+                                                .submit_to_run(target, command.clone())
+                                                .await
+                                            else {
+                                                return;
+                                            };
+                                            let redirected = if redirects < MAX_RESET_REDIRECTS {
+                                                match repo.load_run(target).await {
+                                                    Ok(LoadedRun::Existing(parent_state))
+                                                        if !parent_state.is_open() =>
+                                                    {
+                                                        parent_state.reset_run_id.map(
+                                                            |reset_run_id| {
+                                                                RunKey::derive(
+                                                                    parent_state.namespace_id,
+                                                                    &parent_state.workflow_id,
+                                                                    reset_run_id,
+                                                                )
+                                                            },
+                                                        )
+                                                    }
+                                                    _ => None,
+                                                }
                                             } else {
-                                                tracing::warn!(?error, parent_run_key = ?parent_run_key, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                                None
+                                            };
+                                            match redirected {
+                                                Some(next) if next != target => {
+                                                    redirects += 1;
+                                                    target = next;
+                                                }
+                                                _ => {
+                                                    let error_message = error.to_string();
+                                                    // A parent that already moved on
+                                                    // (kernel rejects the resolution) or
+                                                    // no longer exists is an expected
+                                                    // race, not an operational fault —
+                                                    // log it quietly.
+                                                    if error_message.contains("kernel rejected")
+                                                        || error_message.contains("not found")
+                                                    {
+                                                        tracing::debug!(?error, parent_run_key = ?target, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                                    } else {
+                                                        tracing::warn!(?error, parent_run_key = ?target, child_run_key = ?child_run_key, "failed to deliver child resolution to parent");
+                                                    }
+                                                    return;
+                                                }
                                             }
                                         }
                                     });
@@ -1580,6 +1699,9 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         HistoryEventKind::WorkflowExecutionUpdateAccepted { .. } => {
             "WorkflowExecutionUpdateAccepted"
         }
+        HistoryEventKind::WorkflowExecutionUpdateAdmitted { .. } => {
+            "WorkflowExecutionUpdateAdmitted"
+        }
         HistoryEventKind::WorkflowExecutionUpdateCompleted { .. } => {
             "WorkflowExecutionUpdateCompleted"
         }
@@ -1655,7 +1777,9 @@ fn close_authored_by(history_events: &[HistoryEvent]) -> bool {
 /// `ResetWorkflow` cause names the successor run and the fork point. Returns
 /// `(new_run_id, fork_event_id)` so the lane can materialize the forked run.
 /// Distinguishes a reset close from an ordinary close (which delivers a child
-/// resolution to the parent instead).
+/// resolution to the parent instead). The reapply exclude bits are NOT on the
+/// marker — the persisted `WorkflowTaskFailed` shape is postcard-positional and
+/// frozen — they ride the committed `Command::Reset` the lane already holds.
 fn extract_reset_metadata(history_events: &[HistoryEvent]) -> Option<(tokeira_types::RunId, i64)> {
     history_events.iter().find_map(|event| match &event.kind {
         HistoryEventKind::WorkflowTaskFailed {
@@ -1666,6 +1790,71 @@ fn extract_reset_metadata(history_events: &[HistoryEvent]) -> Option<(tokeira_ty
         } => Some((*new_run_id, *fork_event_id)),
         _ => None,
     })
+}
+
+/// Walk the base run's post-fork history `[fork_event_id+1 .. end]` and collect
+/// the events the resetter must reapply onto the successor branch, in original
+/// order. v1.31.0's `reapplyEvents` (workflow_resetter.go): signals are
+/// reapplied as-is (unless excluded), execution-options updates are ALWAYS
+/// reapplied (even under `RESET_REAPPLY_TYPE_NONE`), accepted/admitted updates
+/// are re-authored as `WorkflowExecutionUpdateAdmitted` (unless excluded), and
+/// task/lifecycle/cancel events are skipped. The successor's WFT is never
+/// processed by these leaves — they assert only the post-reset history shape —
+/// so reapply just re-emits the eligible event kinds.
+fn collect_reset_reapply(
+    base_history: &[HistoryEvent],
+    fork_event_id: i64,
+    exclude_signal: bool,
+    exclude_update: bool,
+) -> Vec<HistoryEventKind> {
+    base_history
+        .iter()
+        .filter(|event| event.event_id > fork_event_id)
+        .filter_map(|event| match &event.kind {
+            HistoryEventKind::WorkflowExecutionOptionsUpdated { .. } => Some(event.kind.clone()),
+            HistoryEventKind::WorkflowExecutionSignaled { .. } if !exclude_signal => {
+                Some(event.kind.clone())
+            }
+            HistoryEventKind::WorkflowExecutionUpdateAccepted {
+                update_id,
+                update_name,
+                input,
+                ..
+            } if !exclude_update => Some(HistoryEventKind::WorkflowExecutionUpdateAdmitted {
+                update_id: update_id.clone(),
+                update_name: update_name.clone(),
+                input: input.clone(),
+            }),
+            // A base that is itself a reset successor may carry re-admitted
+            // updates from ITS reset; a further reset reapplies them as-is
+            // (still admitted, still unprocessed).
+            HistoryEventKind::WorkflowExecutionUpdateAdmitted { .. } if !exclude_update => {
+                Some(event.kind.clone())
+            }
+            // Child lifecycle events on the tail re-deliver onto the successor
+            // when it still holds the matching pending child (whose Initiated
+            // event lies inside the copied prefix) — v1.31.0 `reapplyChildEvents`
+            // (workflow_resetter.go:1039 @ v1.31.0). `StartChildWorkflowExecution-
+            // Initiated` is NOT reapplied (no switch case; the phase-2
+            // terminate-and-start producer is commented out upstream). Child
+            // events are not gated by the signal/update exclude bits except the
+            // all-eligible-excluded short-circuit (`shouldExcludeAllReapplyEvents`,
+            // workflow_resetter.go:662-665). The pending-child guard itself
+            // lives in the kernel's reapply loop, which holds successor state.
+            HistoryEventKind::ChildWorkflowExecutionStarted { .. }
+            | HistoryEventKind::StartChildWorkflowExecutionFailed { .. }
+            | HistoryEventKind::ChildWorkflowExecutionCompleted { .. }
+            | HistoryEventKind::ChildWorkflowExecutionFailed { .. }
+            | HistoryEventKind::ChildWorkflowExecutionCanceled { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTerminated { .. }
+            | HistoryEventKind::ChildWorkflowExecutionTimedOut { .. }
+                if !(exclude_signal && exclude_update) =>
+            {
+                Some(event.kind.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -1002,6 +1002,7 @@ fn arb_wft_failed_request(
                 failure_details,
                 worker_identity: WorkerIdentity(worker_identity),
                 now,
+                reset_reapply: Vec::new(),
             }
         })
 }
@@ -2366,7 +2367,7 @@ proptest! {
         let state = with_pending_wft(make_open_state(now), 50, Some(21), 1);
         let transition = kernel().apply(LoadedRun::Existing(state), Command::WorkflowTaskFailed(req.clone())).unwrap();
         match &transition.history_events[0].kind {
-            HistoryEventKind::WorkflowTaskFailed { logical_seq, scheduled_event_id, started_event_id, failure_cause, failure_details, identity, base_run_id, new_run_id, fork_event_version, fork_event_id } => {
+            HistoryEventKind::WorkflowTaskFailed { logical_seq, scheduled_event_id, started_event_id, failure_cause, failure_details, identity, base_run_id, new_run_id, fork_event_version, fork_event_id, .. } => {
                 prop_assert_eq!(*logical_seq, LogicalTaskSeq(50));
                 prop_assert_eq!(*scheduled_event_id, 13);
                 prop_assert_eq!(*started_event_id, 21);
@@ -5636,6 +5637,7 @@ proptest! {
                         failure_details: None,
                         worker_identity: WorkerIdentity("worker".into()),
                         now,
+                        reset_reapply: Vec::new(),
                     }),
                 )
                 .unwrap();
@@ -5880,6 +5882,7 @@ fn wft_failed_with_buffered_events_schedules_fresh_normal_task() {
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
                 now,
+                reset_reapply: Vec::new(),
             }),
         )
         .unwrap();

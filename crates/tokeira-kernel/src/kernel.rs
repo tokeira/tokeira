@@ -1401,6 +1401,13 @@ impl BasicKernel {
             fork_event_version: None,
             fork_event_id: Some(req.fork_event_id),
         });
+        // Events buffered while the base's WFT was started flush onto the BASE
+        // right after its reset marker ("failWorkflowTask fails then flushes",
+        // service/history/workflow/util.go:26 @ v1.31.0). They land post-fork,
+        // which is exactly what makes a buffered signal visible to the reapply
+        // scan (TestBufferedSignalIsReappliedOnReset) — or droppable under the
+        // exclude bits — instead of dying with the terminated base.
+        builder.flush_buffered();
         // A RUNNING base (base == current, running) is terminated by the reset;
         // a base that is already closed keeps its terminal status — only the
         // `ResetRunId` link (set above) is recorded. Child parent-close-policy is
@@ -2748,6 +2755,166 @@ impl BasicKernel {
                 fork_event_id: None,
             });
         }
+        // A reset reapplies the base run's eligible post-fork events onto the
+        // successor branch, authored between the WorkflowTaskFailed above and the
+        // fresh WorkflowTaskScheduled below — mirroring v1.31.0's `reapplyEvents`
+        // (workflow_resetter.go): execution-options updates, signals, and
+        // re-admitted updates, in original order, filtered by the reapply
+        // exclude bits at the lane. Empty for a normal (non-reset) failure.
+        if is_reset {
+            for kind in req.reset_reapply {
+                // A child event reapplies only while the successor still holds
+                // the matching pending child — its Initiated event lies inside
+                // the copied prefix. A missing entry means the child was
+                // initiated on the discarded tail or already resolved in the
+                // prefix; v1.31.0 drops those silently (`reapplyChildEvents`'
+                // GetChildExecutionInfo guard, workflow_resetter.go:1044), and
+                // an already-started child skips a duplicate Started
+                // (workflow_resetter.go:1059).
+                let skip_child_event = match &kind {
+                    HistoryEventKind::ChildWorkflowExecutionStarted {
+                        child_workflow_id, ..
+                    } => builder
+                        .state
+                        .children
+                        .get(child_workflow_id)
+                        .is_none_or(|child| child.started_event_id.is_some()),
+                    HistoryEventKind::StartChildWorkflowExecutionFailed {
+                        child_workflow_id,
+                        ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionCompleted {
+                        child_workflow_id, ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionFailed {
+                        child_workflow_id, ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionCanceled {
+                        child_workflow_id, ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionTerminated {
+                        child_workflow_id,
+                        ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                        child_workflow_id, ..
+                    } => !builder.state.children.contains_key(child_workflow_id),
+                    _ => false,
+                };
+                if skip_child_event {
+                    continue;
+                }
+                // Mirror the cold-replay arms so hot-path state matches what a
+                // recovery replay of these events reconstructs: a reapplied
+                // update re-enters the successor as ADMITTED (awaiting
+                // re-acceptance), a reapplied options-update re-registers
+                // its attached request id and versioning override, and a
+                // reapplied child resolution retires the pending child.
+                match &kind {
+                    HistoryEventKind::StartChildWorkflowExecutionFailed {
+                        child_workflow_id,
+                        ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionCompleted {
+                        child_workflow_id, ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionFailed {
+                        child_workflow_id, ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionCanceled {
+                        child_workflow_id, ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionTerminated {
+                        child_workflow_id,
+                        ..
+                    }
+                    | HistoryEventKind::ChildWorkflowExecutionTimedOut {
+                        child_workflow_id, ..
+                    } => {
+                        builder.state.children.remove(child_workflow_id);
+                    }
+                    HistoryEventKind::WorkflowExecutionUpdateAdmitted { update_id, .. } => {
+                        builder.state.admitted_updates.insert(update_id.clone());
+                    }
+                    HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                        versioning_override,
+                        completion_callbacks,
+                        attached_completion_callbacks,
+                        attached_links,
+                        attached_request_id: _,
+                    } => {
+                        match versioning_override {
+                            FieldChange::Set(value) => {
+                                builder.state.set_versioning_override(Some(value.clone()));
+                            }
+                            FieldChange::Clear => {
+                                builder.state.set_versioning_override(None);
+                            }
+                            FieldChange::Unchanged => {}
+                        }
+                        match completion_callbacks {
+                            FieldChange::Set(value) => {
+                                builder.state.completion_callbacks = value.clone();
+                            }
+                            FieldChange::Clear => {
+                                builder.state.completion_callbacks.clear();
+                            }
+                            FieldChange::Unchanged => {}
+                        }
+                        builder
+                            .state
+                            .completion_callbacks
+                            .extend(attached_completion_callbacks.clone());
+                        builder.state.links.extend(attached_links.clone());
+                    }
+                    _ => {}
+                }
+                let attached_request_id = match &kind {
+                    HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                        attached_request_id,
+                        ..
+                    } => attached_request_id.clone(),
+                    _ => None,
+                };
+                // A reapplied Started stamps the pending child with the child's
+                // run id and the REAPPLIED event's id (the replay arm anchors
+                // started_event_id the same way) — captured before the emit
+                // moves `kind`, applied after it yields the new event id.
+                let started_child = match &kind {
+                    HistoryEventKind::ChildWorkflowExecutionStarted {
+                        child_workflow_id,
+                        child_run_id,
+                        ..
+                    } => Some((child_workflow_id.clone(), *child_run_id)),
+                    _ => None,
+                };
+                let event_id = builder.emit(kind);
+                if let Some((child_workflow_id, child_run_id)) = started_child
+                    && let Some(child) = builder.state.children.get_mut(&child_workflow_id)
+                {
+                    child.child_run_id = Some(child_run_id);
+                    child.started_event_id = Some(event_id);
+                }
+                if let Some(attached_request_id) = attached_request_id {
+                    builder.state.request_id_infos.insert(
+                        attached_request_id.clone(),
+                        RequestIdInfo {
+                            event_id,
+                            event_type: EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED,
+                            buffered: false,
+                        },
+                    );
+                    // Re-point the workflow-scoped dedupe record at the
+                    // successor: request ids attached to mutable state follow
+                    // the reset in v1.31.0, so a retried UseExisting start with
+                    // this request id must dedupe against the successor (no new
+                    // options-updated event) rather than re-attach.
+                    builder.request_dedupe_ops.push(RequestDedupeOp {
+                        request_id: tokeira_types::RequestId(attached_request_id),
+                    });
+                }
+            }
+        }
         // A reset-cause WFT failure re-drives the run from the fork point. The
         // reset successor was replayed from the copied prefix, which reconstructs
         // each pending activity's STATE but not its dispatch; re-enqueue every
@@ -3662,11 +3829,25 @@ impl BasicKernel {
                         name: update_name.clone(),
                     },
                 );
+                // Acceptance moves the update out of ADMITTED (mirrors the hot
+                // path at apply-time); without this a replayed
+                // UpdateAdmitted→UpdateAccepted pair leaves the id in both
+                // registries and the K7 gate schedules spurious speculative
+                // WFTs forever.
+                state.admitted_updates.remove(update_id);
+            }
+            HistoryEventKind::WorkflowExecutionUpdateAdmitted { update_id, .. } => {
+                // A reset-reapplied update re-enters the successor as ADMITTED
+                // (awaiting re-acceptance by the successor's worker), not accepted
+                // — reconstruct that registry entry on cold replay so recovery
+                // re-delivers it (mirrors the accepted arm above for pending).
+                state.admitted_updates.insert(update_id.clone());
             }
             HistoryEventKind::WorkflowExecutionUpdateCompleted { update_id, .. }
             | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { update_id, .. }
             | HistoryEventKind::WorkflowExecutionUpdateRejected { update_id, .. } => {
                 state.pending_updates.remove(update_id);
+                state.admitted_updates.remove(update_id);
             }
             HistoryEventKind::WorkflowExecutionOptionsUpdated {
                 versioning_override,
@@ -4769,18 +4950,20 @@ fn apply_workflow_command(
                             not_found: false,
                         });
                     }
-                    if sequencing_event_id < 0
-                        || sequencing_event_id >= workflow_task_completed_event_id
-                    {
-                        // Owner amendment F5 (spec speculative-wft K6): the
-                        // value is worker-controlled and lands in a persisted
-                        // event, so tokeira additionally refuses negatives
-                        // and forward references beyond the delivering
-                        // task's ids (every legal anchor — the delivering
-                        // WFTScheduled id at most started_event_id — precedes
-                        // this completion's WorkflowTaskCompleted event, which
-                        // was already emitted/materialized). No v1.31.0
-                        // analogue message; invalid-argument flavor.
+                    if sequencing_event_id >= workflow_task_completed_event_id {
+                        // Owner amendment F5 (spec speculative-wft K6), narrowed:
+                        // the value is worker-controlled and lands in a persisted
+                        // event, so tokeira refuses forward references beyond the
+                        // delivering task's ids (every legal anchor — the
+                        // delivering WFTScheduled id at most started_event_id —
+                        // precedes this completion's WorkflowTaskCompleted event,
+                        // which was already emitted/materialized). NEGATIVE values
+                        // pass through recorded verbatim: v1.31.0 does the same
+                        // (event_factory.go:424-440 records it unvalidated) and
+                        // the reset conformance corpus sends -1 as a deliberate
+                        // fake (reset_workflow_test.go:474 @ tokeira/conformance-
+                        // v1.31.0). No v1.31.0 analogue message;
+                        // invalid-argument flavor.
                         return Err(Reject::BadUpdateMessage {
                             message: format!(
                                 "invalid *update.Acceptance: \

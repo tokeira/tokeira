@@ -731,6 +731,19 @@ pub enum HistoryEventKind {
         /// Whether the first WFT was accepted and started inline with run creation.
         eager_execution_accepted: bool,
     },
+    /// An update whose acceptance was reapplied onto a reset successor before it
+    /// has been re-processed. v1.31.0's resetter re-admits a post-fork
+    /// accepted/admitted update onto the successor branch as
+    /// `WorkflowExecutionUpdateAdmitted` (`reapplyEvents` →
+    /// `AddWorkflowExecutionUpdateAdmittedEvent`, workflow_resetter.go @
+    /// v1.31.0) rather than re-accepting it — the update is re-queued for the
+    /// successor's worker to accept afresh. Appended at the enum tail so the
+    /// postcard positional index stays additive.
+    WorkflowExecutionUpdateAdmitted {
+        update_id: String,
+        update_name: String,
+        input: Payloads,
+    },
 }
 
 impl HistoryEventKind {

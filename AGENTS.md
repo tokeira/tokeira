@@ -235,7 +235,7 @@ tokeira/
 │   ├── local/                    # Bare-process local platform
 │   └── compose/                  # Docker Compose platform with observability + DSQL module
 ├── docs/
-│   └── architecture/             # Design documents (000–110)
+│   └── architecture/             # Design documents (000–131)
 └── .kiro/specs/                  # Feature specs (requirements, design, tasks)
 ```
 

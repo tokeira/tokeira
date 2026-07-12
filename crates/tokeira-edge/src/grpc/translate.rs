@@ -57,7 +57,8 @@ use tokeira_proto::{
         compute::v1 as compute_proto, deployment::v1 as deployment_proto,
         errordetails::v1 as errordetails_proto, failure::v1 as failure_proto,
         namespace::v1 as namespace_proto, replication::v1 as replication_proto,
-        taskqueue::v1 as taskqueue_proto, version::v1 as version_proto, workflow::v1 as workflow,
+        sdk::v1 as sdk_proto, taskqueue::v1 as taskqueue_proto, version::v1 as version_proto,
+        workflow::v1 as workflow,
     },
     workflowservice,
 };
@@ -3276,9 +3277,13 @@ fn execution_config_to_proto(
         default_workflow_task_timeout: Some(to_proto_duration(
             config.default_workflow_task_timeout,
         )),
-        // Start user metadata is not retained yet, so the DTO keeps it optional
-        // and describe leaves the proto field default until that start state exists.
-        user_metadata: None,
+        user_metadata: config
+            .user_metadata
+            .as_ref()
+            .map(|metadata| sdk_proto::UserMetadata {
+                summary: metadata.summary.as_ref().map(payload_from_domain),
+                details: metadata.details.as_ref().map(payload_from_domain),
+            }),
     }
 }
 
@@ -6226,6 +6231,39 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_types::RunKey;
+
+    #[test]
+    fn execution_config_preserves_start_user_metadata() {
+        let summary = tokeira_types::Payload {
+            data: b"summary".to_vec(),
+            metadata: [("encoding".to_owned(), "binary/plain".to_owned())]
+                .into_iter()
+                .collect(),
+            external_payloads: Vec::new(),
+        };
+        let details = tokeira_types::Payload {
+            data: b"details".to_vec(),
+            metadata: [("encoding".to_owned(), "binary/plain".to_owned())]
+                .into_iter()
+                .collect(),
+            external_payloads: Vec::new(),
+        };
+        let config = crate::translate::ExecutionConfigDescription {
+            task_queue: "queue".to_owned(),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            default_workflow_task_timeout: time::Duration::seconds(10),
+            user_metadata: Some(crate::translate::UserMetadata {
+                summary: Some(summary.clone()),
+                details: Some(details.clone()),
+            }),
+        };
+
+        let proto = execution_config_to_proto(&config);
+        let metadata = proto.user_metadata.expect("metadata must be present");
+        assert_eq!(metadata.summary, Some(payload_from_domain(&summary)));
+        assert_eq!(metadata.details, Some(payload_from_domain(&details)));
+    }
 
     #[test]
     fn workflow_timeout_zero_maps_to_unlimited() {

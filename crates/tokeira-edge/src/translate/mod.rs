@@ -364,7 +364,11 @@ pub struct ExecutionConfigDescription {
     pub workflow_execution_timeout: Option<time::Duration>,
     pub workflow_run_timeout: Option<time::Duration>,
     pub default_workflow_task_timeout: time::Duration,
-    pub user_metadata: Option<Payload>,
+    /// Start-authored summary/details returned by DescribeWorkflowExecution.
+    ///
+    /// v1.31.0 reads this from the authoritative start event rather than mutable
+    /// execution properties (`service/history/api/describeworkflow/api.go:98-110`).
+    pub user_metadata: Option<UserMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

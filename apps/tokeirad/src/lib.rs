@@ -1749,7 +1749,15 @@ where
                         workflow_execution_timeout: state.workflow_execution_timeout,
                         workflow_run_timeout: state.workflow_run_timeout,
                         default_workflow_task_timeout: state.workflow_task_timeout,
-                        user_metadata: None,
+                        // Describe returns start-event metadata verbatim, even after later
+                        // transitions (`describeworkflow/api.go:98-110 @ v1.31.0`). The kernel
+                        // summary is replayed from that event, so no history scan is needed here.
+                        user_metadata: state.user_metadata.map(|metadata| {
+                            tokeira_edge::translate::UserMetadata {
+                                summary: metadata.summary,
+                                details: metadata.details,
+                            }
+                        }),
                     },
                     history_length: state.last_event_id,
                     history_size_bytes,

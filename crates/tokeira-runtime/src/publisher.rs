@@ -30,8 +30,8 @@ use tokeira_storage::{
     CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, RunRepository,
 };
 use tokeira_types::{
-    BuildId, ExecutionRef, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
-    RequestId, RunId, RunKey, SearchAttributes, ShardId, TaskQueueName, WorkflowId,
+    ExecutionRef, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext, RequestId, RunId,
+    RunKey, SearchAttributes, ShardId, TaskQueueName, WorkflowId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -52,7 +52,6 @@ use crate::{
     },
     scanner::pick_lane_for_run_key,
     shard::{ShardOwner, shard_for},
-    versioning::VersioningRuleStore,
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -101,7 +100,6 @@ pub struct RuntimeDispatchPublisher<R> {
     completion_callback_tracking: CompletionCallbackTrackingState,
     activity_tracking: ActivityTrackingState,
     delivery_metrics: DeliveryMetrics,
-    versioning_rule_store: Option<Arc<VersioningRuleStore>>,
     /// Resolves the originator namespace name for the External-endpoint outbound metric.
     /// `None` outside the full server (unit harnesses), where the metric is then omitted.
     namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
@@ -125,7 +123,6 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             completion_callback_tracking: self.completion_callback_tracking.clone(),
             activity_tracking: self.activity_tracking.clone(),
             delivery_metrics: self.delivery_metrics.clone(),
-            versioning_rule_store: self.versioning_rule_store.clone(),
             namespace_resolver: self.namespace_resolver.clone(),
         }
     }
@@ -152,7 +149,6 @@ where
         completion_callback_tracking: CompletionCallbackTrackingState,
         activity_tracking: ActivityTrackingState,
         delivery_metrics: DeliveryMetrics,
-        versioning_rule_store: Option<Arc<VersioningRuleStore>>,
     ) -> Self {
         Self {
             broker,
@@ -170,7 +166,6 @@ where
             completion_callback_tracking,
             activity_tracking,
             delivery_metrics,
-            versioning_rule_store,
             namespace_resolver: None,
         }
     }
@@ -238,38 +233,6 @@ where
             outcome,
         );
         runtime_metrics::record_nexus_outbound_latency(&namespace, "StartOperation", latency);
-    }
-
-    fn redirected_queue(&self, queue: &QueueKey) -> QueueKey {
-        let Some(store) = &self.versioning_rule_store else {
-            return queue.clone();
-        };
-        // Redirect rules are a build-ID compatibility mechanism. Deployment
-        // pinned queues carry their own series identity and must not be mixed
-        // with redirected build IDs.
-        if queue.deployment.is_some() {
-            return queue.clone();
-        }
-        let Some(build_id) = &queue.build_id else {
-            return queue.clone();
-        };
-        match store.resolve_redirect(queue.namespace_id, &queue.task_queue, build_id) {
-            Ok(resolved) if resolved != *build_id => {
-                let mut redirected = queue.clone();
-                redirected.build_id = Some(BuildId(resolved.0));
-                redirected
-            }
-            Ok(_) => queue.clone(),
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    task_queue = %queue.task_queue.0,
-                    build_id = %build_id.0,
-                    "worker versioning redirect failed; using original queue"
-                );
-                queue.clone()
-            }
-        }
     }
 
     /// Resolve a namespace id to its registered NAME for metric labelling (M.1)
@@ -1664,7 +1627,7 @@ where
                     speculative,
                 } => {
                     let _ = speculative;
-                    let redirected = self.redirected_queue(queue);
+                    let workflow_queue = queue.clone();
                     // R.1: a SPECULATIVE task dispatched sticky-first falls back
                     // to the normal queue immediately when no sticky poller is
                     // waiting, so a lost sticky worker does not strand the update
@@ -1675,16 +1638,16 @@ where
                     // schedule-to-start timer still guards the normal dispatch.
                     let (final_queue, final_sticky) = if *speculative
                         && sticky_preferred.is_some()
-                        && !self.has_workflow_poller(&redirected).await
+                        && !self.has_workflow_poller(&workflow_queue).await
                         && let Some(normal_name) = normal_task_queue
                     {
-                        let normal = self.redirected_queue(&QueueKey {
+                        let normal = QueueKey {
                             task_queue: normal_name.clone(),
                             ..queue.clone()
-                        });
+                        };
                         (normal, None)
                     } else {
-                        (redirected, sticky_preferred.clone())
+                        (workflow_queue, sticky_preferred.clone())
                     };
                     self.broker
                         .publish_workflow_task(
@@ -1742,7 +1705,7 @@ where
                             .publish_activity_task(
                                 DispatchableActivityTask {
                                     run_key,
-                                    queue: self.redirected_queue(queue),
+                                    queue: queue.clone(),
                                     activity_id: activity_id.clone(),
                                     input: input.clone(),
                                     schedule_event_id: *schedule_event_id,

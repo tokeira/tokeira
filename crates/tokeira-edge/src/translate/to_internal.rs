@@ -5,7 +5,6 @@ use tokeira_kernel::{
     WorkflowTaskCompletedRequest,
     state::{VersioningOverride as KernelVersioningOverride, WorkerDeploymentVersionRef},
 };
-use tokeira_runtime::VersioningRuleStore;
 use tokeira_types::{
     BuildId, DeploymentId, NamespaceId, QueueKey, RequestContext, RequestId as CoreRequestId,
     RunId, RunKey, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowTaskToken,
@@ -42,23 +41,13 @@ pub fn namespace_id_for(name: &str) -> NamespaceId {
     NamespaceId(Uuid::from_bytes(bytes))
 }
 
-pub fn start_request(
-    req: StartWorkflowExecutionRequest,
-    request_id: &RequestId,
-    versioning_rules: Option<&VersioningRuleStore>,
-) -> StartRequest {
+pub fn start_request(req: StartWorkflowExecutionRequest, request_id: &RequestId) -> StartRequest {
     let now = req.now.unwrap_or_else(OffsetDateTime::now_utc);
     let run_id = req.run_id.unwrap_or_default();
     let namespace_id = namespace_id_for(&req.namespace);
     let workflow_id = WorkflowId(req.workflow_id);
     let task_queue = TaskQueueName(req.task_queue);
-    let (deployment, build_id) = start_versioning(
-        namespace_id,
-        &workflow_id,
-        &task_queue,
-        req.versioning_override.as_ref(),
-        versioning_rules,
-    );
+    let (deployment, build_id) = start_versioning(req.versioning_override.as_ref());
     // `eager_worker_deployment_options` is an eager-delivery hint, not a
     // general start-routing override. Temporal only applies it when the client
     // actually asks for eager execution (`StartWorkflowExecutionRequest` field
@@ -159,20 +148,13 @@ pub fn start_request(
 pub fn signal_with_start_request(
     req: crate::translate::SignalWithStartWorkflowExecutionRequest,
     request_id: &RequestId,
-    versioning_rules: Option<&VersioningRuleStore>,
 ) -> SignalWithStartRequest {
     let now = OffsetDateTime::now_utc();
     let run_id = RunId::new();
     let namespace_id = namespace_id_for(&req.namespace);
     let workflow_id = WorkflowId(req.workflow_id);
     let task_queue = TaskQueueName(req.task_queue);
-    let (deployment, build_id) = start_versioning(
-        namespace_id,
-        &workflow_id,
-        &task_queue,
-        req.versioning_override.as_ref(),
-        versioning_rules,
-    );
+    let (deployment, build_id) = start_versioning(req.versioning_override.as_ref());
     let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
     SignalWithStartRequest {
         run_key,
@@ -360,11 +342,7 @@ fn on_conflict_options_to_kernel(
 }
 
 fn start_versioning(
-    namespace_id: NamespaceId,
-    workflow_id: &WorkflowId,
-    task_queue: &TaskQueueName,
     override_: Option<&VersioningOverride>,
-    versioning_rules: Option<&VersioningRuleStore>,
 ) -> (Option<DeploymentId>, Option<BuildId>) {
     match override_ {
         Some(VersioningOverride::Pinned {
@@ -374,11 +352,9 @@ fn start_versioning(
             Some(DeploymentId(deployment_series.clone())),
             Some(BuildId(build_id.clone())),
         ),
-        Some(VersioningOverride::AutoUpgrade) | None => {
-            let build_id = versioning_rules
-                .and_then(|rules| rules.evaluate_assignment(namespace_id, task_queue, workflow_id));
-            (None, build_id)
-        }
+        // v0.2 assignment rules are gated off (never populated), so a start
+        // without a pinned override is unversioned.
+        Some(VersioningOverride::AutoUpgrade) | None => (None, None),
     }
 }
 
@@ -570,7 +546,6 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_kernel::{WorkflowIdConflictPolicy, WorkflowIdReusePolicy};
-    use tokeira_runtime::{AssignmentRule, VersioningMutation, VersioningRuleStore};
     use tokeira_types::{
         BuildId, DeploymentId, Headers, LogicalTaskSeq, Memo, Payload, Payloads, RetryPolicy,
         SearchAttrValue, SearchAttributes, ShardEpoch,
@@ -755,30 +730,6 @@ mod tests {
         prop::option::of(0i64..120).prop_map(|seconds| seconds.map(time::Duration::seconds))
     }
 
-    fn store_with_assignment() -> VersioningRuleStore {
-        let store = VersioningRuleStore::default();
-        let namespace_id = namespace_id_for("default");
-        let task_queue = TaskQueueName("queue".to_string());
-        let token = store.get_rules(namespace_id, &task_queue).conflict_token;
-        store
-            .apply_mutation(
-                namespace_id,
-                &task_queue,
-                token,
-                VersioningMutation::InsertAssignmentRule {
-                    rule: AssignmentRule {
-                        target_build_id: "rule-build".to_string(),
-                        percentage_ramp: None,
-                        create_time: OffsetDateTime::UNIX_EPOCH,
-                    },
-                    index: 0,
-                },
-                OffsetDateTime::UNIX_EPOCH,
-            )
-            .unwrap();
-        store
-    }
-
     #[test]
     fn start_field_policy_table_covers_v1_62_11_proto_surface() {
         // Feature: api-conformance-start-fields, task 1.1.
@@ -954,6 +905,7 @@ mod tests {
             shard_epoch: ShardEpoch(42),
         };
         let req = RespondWorkflowTaskCompletedRequest {
+            namespace: "default".to_string(),
             task_token: serde_json::to_vec(&token).unwrap(),
             identity: "worker-a".to_string(),
             sdk_metadata: None,
@@ -981,15 +933,14 @@ mod tests {
     }
 
     #[test]
-    fn start_request_pinned_override_skips_assignment_rules() {
-        let store = store_with_assignment();
+    fn start_request_pinned_override_maps_deployment_and_build() {
         let mut dto = start_dto();
         dto.versioning_override = Some(VersioningOverride::Pinned {
             deployment_series: "series-a".to_string(),
             build_id: "pinned-build".to_string(),
         });
 
-        let internal = start_request(dto, &RequestId::new("req"), Some(&store));
+        let internal = start_request(dto, &RequestId::new("req"));
 
         assert_eq!(
             internal.deployment,
@@ -999,31 +950,28 @@ mod tests {
     }
 
     #[test]
-    fn start_request_evaluates_assignment_rules_without_pinned_override() {
-        let store = store_with_assignment();
-
-        let internal = start_request(start_dto(), &RequestId::new("req"), Some(&store));
+    fn start_request_without_pinned_override_is_unversioned() {
+        let internal = start_request(start_dto(), &RequestId::new("req"));
 
         assert_eq!(internal.deployment, None);
-        assert_eq!(internal.build_id, Some(BuildId("rule-build".to_string())));
+        assert_eq!(internal.build_id, None);
     }
 
     #[test]
     fn start_request_applies_eager_deployment_options_only_for_eager_execution() {
-        let store = store_with_assignment();
         let mut dto = start_dto();
         dto.eager_worker_deployment_options = Some(WorkerDeploymentVersionRef {
             deployment_name: "eager-deployment".to_string(),
             build_id: "eager-build".to_string(),
         });
 
-        let non_eager = start_request(dto.clone(), &RequestId::new("req"), Some(&store));
+        let non_eager = start_request(dto.clone(), &RequestId::new("req"));
         assert_eq!(non_eager.deployment, None);
-        assert_eq!(non_eager.build_id, Some(BuildId("rule-build".to_string())));
+        assert_eq!(non_eager.build_id, None);
         assert!(!non_eager.eager_execution_accepted);
 
         dto.request_eager_execution = true;
-        let eager = start_request(dto, &RequestId::new("req"), Some(&store));
+        let eager = start_request(dto, &RequestId::new("req"));
         assert_eq!(
             eager.deployment,
             Some(DeploymentId("eager-deployment".to_string()))
@@ -1069,7 +1017,7 @@ mod tests {
             fairness_weight: 1.5,
         });
 
-        let internal = start_request(dto, &RequestId::new("req"), None);
+        let internal = start_request(dto, &RequestId::new("req"));
 
         assert_eq!(
             internal.workflow_start_delay,
@@ -1173,7 +1121,7 @@ mod tests {
             dto.workflow_task_timeout = workflow_task_timeout;
             dto.retry_policy = retry_policy.clone();
 
-            let internal = start_request(dto, &RequestId::new("prop-start"), None);
+            let internal = start_request(dto, &RequestId::new("prop-start"));
 
             prop_assert_eq!(internal.input, input);
             prop_assert_eq!(internal.memo, memo);
@@ -1253,8 +1201,8 @@ mod tests {
             signal.workflow_task_timeout = workflow_task_timeout;
             signal.retry_policy = retry_policy;
 
-            let start_internal = start_request(start, &RequestId::new("prop-start"), None);
-            let signal_internal = signal_with_start_request(signal, &RequestId::new("prop-signal"), None);
+            let start_internal = start_request(start, &RequestId::new("prop-start"));
+            let signal_internal = signal_with_start_request(signal, &RequestId::new("prop-signal"));
 
             prop_assert_eq!(start_internal.workflow_type, signal_internal.workflow_type);
             prop_assert_eq!(start_internal.task_queue, signal_internal.task_queue);
@@ -1276,16 +1224,10 @@ mod tests {
     }
 
     #[test]
-    fn signal_with_start_evaluates_assignment_rules() {
-        let store = store_with_assignment();
-
-        let internal = signal_with_start_request(
-            signal_with_start_dto(),
-            &RequestId::new("req"),
-            Some(&store),
-        );
+    fn signal_with_start_without_pinned_override_is_unversioned() {
+        let internal = signal_with_start_request(signal_with_start_dto(), &RequestId::new("req"));
 
         assert_eq!(internal.deployment, None);
-        assert_eq!(internal.build_id, Some(BuildId("rule-build".to_string())));
+        assert_eq!(internal.build_id, None);
     }
 }

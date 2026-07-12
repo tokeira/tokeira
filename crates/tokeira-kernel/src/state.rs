@@ -9,7 +9,7 @@ use tokeira_types::{
     TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
-use crate::command::WorkflowTaskFailedCause;
+use crate::command::{WorkerVersionStamp, WorkflowTaskFailedCause, WorkflowTaskWorkerVersion};
 
 /// Identity of the last non-transient workflow-task problem, the kernel
 /// analog of v1.31.0's `WorkflowExecutionInfo.LastWorkflowTaskFailure` oneof.
@@ -62,6 +62,12 @@ pub struct WorkflowState {
     pub transition_seq: TransitionSeq,
     /// Highest event ID assigned so far in this run.
     pub last_event_id: i64,
+    /// Number of external-payload references across committed history.
+    #[serde(default)]
+    pub external_payload_count: i64,
+    /// Sum of declared external-payload sizes across committed history.
+    #[serde(default)]
+    pub external_payload_size_bytes: i64,
     /// Next logical task sequence to assign when scheduling a
     /// workflow task.
     pub next_workflow_task_seq: LogicalTaskSeq,
@@ -398,6 +404,47 @@ impl WorkflowState {
         // An unversioned worker that reports a deployment name still records it.
         self.worker_deployment_name = worker_deployment_name;
         self.compact_versioning_info();
+    }
+
+    /// Record the legacy worker stamp and its visibility-index values from a
+    /// successful workflow-task completion.
+    ///
+    /// The values are durable derived state reconstructed from the completed
+    /// event. v1.31.0 places the current unversioned sentinel first, preserves
+    /// earlier concrete build IDs, and appends a newly observed stamp
+    /// (`addBuildIdToLoadedSearchAttribute`,
+    /// `service/history/workflow/mutable_state_impl.go @ v1.31.0`).
+    pub fn apply_wft_worker_version(
+        &mut self,
+        worker_version: Option<&WorkflowTaskWorkerVersion>,
+        behavior: VersioningBehavior,
+    ) {
+        let info = self
+            .versioning_info
+            .get_or_insert_with(WorkflowVersioningInfo::default);
+        let stamp = worker_version.and_then(|version| version.stamp.as_ref());
+        info.most_recent_worker_version_stamp = stamp.cloned();
+
+        info.build_id_search_attributes
+            .retain(|value| value != "unversioned");
+        if behavior == VersioningBehavior::Unspecified
+            && !stamp.is_some_and(|stamp| stamp.use_versioning)
+        {
+            info.build_id_search_attributes
+                .insert(0, "unversioned".to_owned());
+        }
+
+        if let Some(stamp) = stamp.filter(|stamp| !stamp.build_id.is_empty()) {
+            let prefix = if stamp.use_versioning {
+                "versioned"
+            } else {
+                "unversioned"
+            };
+            let value = format!("{prefix}:{}", stamp.build_id);
+            if !info.build_id_search_attributes.contains(&value) {
+                info.build_id_search_attributes.push(value);
+            }
+        }
     }
 
     /// Update the execution-scoped versioning override while preserving any
@@ -796,17 +843,35 @@ pub struct WorkflowVersioningInfo {
     pub revision_number: i64,
     /// Continue-as-new behavior for the first task of this run and retries.
     pub continue_as_new_initial_versioning_behavior: ContinueAsNewVersioningBehavior,
+    /// Ordered values projected into the system-managed `BuildIds` search
+    /// attribute. These are per-run and therefore do not leak across
+    /// continue-as-new boundaries.
+    #[serde(default)]
+    pub build_id_search_attributes: Vec<String>,
+    /// Most recent structured worker-version stamp from a completed WFT.
+    #[serde(default)]
+    pub most_recent_worker_version_stamp: Option<WorkerVersionStamp>,
 }
 
 impl WorkflowVersioningInfo {
+    /// Whether this value carries routing-facing execution versioning data.
+    ///
+    /// Legacy BuildIds bookkeeping alone must not manufacture a non-empty
+    /// `WorkflowExecutionInfo.versioning_info` for an unversioned run.
+    pub fn has_execution_versioning_info(&self) -> bool {
+        self.behavior != VersioningBehavior::Unspecified
+            || self.deployment_version.is_some()
+            || self.versioning_override.is_some()
+            || self.version_transition.is_some()
+            || self.revision_number != 0
+            || self.continue_as_new_initial_versioning_behavior
+                != ContinueAsNewVersioningBehavior::Unspecified
+    }
+
     fn is_unversioned_default(&self) -> bool {
-        self.behavior == VersioningBehavior::Unspecified
-            && self.deployment_version.is_none()
-            && self.versioning_override.is_none()
-            && self.version_transition.is_none()
-            && self.revision_number == 0
-            && self.continue_as_new_initial_versioning_behavior
-                == ContinueAsNewVersioningBehavior::Unspecified
+        !self.has_execution_versioning_info()
+            && self.build_id_search_attributes.is_empty()
+            && self.most_recent_worker_version_stamp.is_none()
     }
 }
 
@@ -1036,6 +1101,8 @@ mod tests {
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq(1),
             last_event_id: 1,
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: None,
             previous_started_event_id: 0,
@@ -1102,6 +1169,7 @@ mod tests {
             revision_number: 7,
             continue_as_new_initial_versioning_behavior:
                 ContinueAsNewVersioningBehavior::Unspecified,
+            ..WorkflowVersioningInfo::default()
         });
 
         assert_eq!(state.effective_behavior(), VersioningBehavior::AutoUpgrade);
@@ -1134,6 +1202,7 @@ mod tests {
             revision_number: 3,
             continue_as_new_initial_versioning_behavior:
                 ContinueAsNewVersioningBehavior::Unspecified,
+            ..WorkflowVersioningInfo::default()
         });
 
         assert_eq!(state.effective_behavior(), VersioningBehavior::AutoUpgrade);
@@ -1153,6 +1222,7 @@ mod tests {
             revision_number: 11,
             continue_as_new_initial_versioning_behavior:
                 ContinueAsNewVersioningBehavior::Unspecified,
+            ..WorkflowVersioningInfo::default()
         });
         let before = state.clone();
 
@@ -1243,6 +1313,7 @@ mod tests {
             revision_number: 6,
             continue_as_new_initial_versioning_behavior:
                 ContinueAsNewVersioningBehavior::Unspecified,
+            ..WorkflowVersioningInfo::default()
         });
 
         state.apply_wft_versioning(
@@ -1274,6 +1345,7 @@ mod tests {
             revision_number: 9,
             continue_as_new_initial_versioning_behavior:
                 ContinueAsNewVersioningBehavior::Unspecified,
+            ..WorkflowVersioningInfo::default()
         });
 
         state.apply_wft_versioning(

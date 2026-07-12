@@ -9,7 +9,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_storage::ProjectionRecord;
-use tokeira_types::{ArchetypeId, ExecutionStatus, Memo, NamespaceId, RunId, SearchAttributes};
+use tokeira_types::{
+    ArchetypeId, ExecutionStatus, Memo, NamespaceId, RunId, SearchAttributes, WorkflowId,
+};
 
 /// Summary of a single workflow execution for list/count responses.
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +30,10 @@ pub struct WorkflowExecutionSummary {
     pub close_time: Option<OffsetDateTime>,
     pub history_length: i64,
     pub state_transition_count: i64,
+    pub parent_workflow_id: Option<WorkflowId>,
+    pub parent_run_id: Option<RunId>,
+    pub root_workflow_id: WorkflowId,
+    pub root_run_id: RunId,
     pub memo: Memo,
     pub search_attributes: SearchAttributes,
 }

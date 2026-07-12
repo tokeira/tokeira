@@ -73,6 +73,36 @@ impl TryFrom<i16> for SearchAttrType {
     }
 }
 
+/// Decode an untyped SDK search-attribute value using its registered schema.
+///
+/// Temporal's SDK payloads commonly omit the optional `type` metadata. String
+/// payloads therefore arrive at the compatibility boundary as `Keyword`, while
+/// v1.31.0 resolves `Text` and `Datetime` from the namespace registry before
+/// indexing (`searchattribute.DecodeValue`, `common/searchattribute @
+/// v1.31.0`). Only those ambiguous string forms are coerced; an explicit or
+/// structurally incompatible value remains a type error.
+pub fn normalize_search_attr_value(
+    expected: SearchAttrType,
+    value: &SearchAttrValue,
+) -> Result<SearchAttrValue> {
+    match (expected, value) {
+        (SearchAttrType::Text, SearchAttrValue::Keyword(text)) => {
+            Ok(SearchAttrValue::Text(text.clone()))
+        }
+        (SearchAttrType::Datetime, SearchAttrValue::Keyword(text)) => {
+            OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+                .map(SearchAttrValue::Datetime)
+                .map_err(|_| anyhow!("invalid Datetime search attribute value"))
+        }
+        _ if expected == search_attr_type_of(value) => Ok(value.clone()),
+        _ => Err(anyhow!(
+            "search attribute type mismatch: expected {:?}, got {:?}",
+            expected,
+            search_attr_type_of(value)
+        )),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttrDescriptor {
     pub attr_id: AttrId,
@@ -382,6 +412,10 @@ pub fn workflow_lifecycle_state(status: ExecutionStatus) -> VisibilityLifecycleS
 pub enum FilterExpr {
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
+    Not(Box<FilterExpr>),
+    IsNull {
+        field: FieldRef,
+    },
     Compare {
         field: FieldRef,
         op: CompareOp,
@@ -700,6 +734,40 @@ mod tests {
                 Err(SearchAttrTypeDecodeError { value })
             );
         }
+    }
+
+    #[test]
+    fn registered_schema_resolves_ambiguous_string_search_attributes() {
+        let text = normalize_search_attr_value(
+            SearchAttrType::Text,
+            &SearchAttrValue::Keyword("searchable phrase".into()),
+        )
+        .unwrap();
+        assert_eq!(text, SearchAttrValue::Text("searchable phrase".into()));
+
+        let timestamp = "2026-07-12T13:14:15Z";
+        let datetime = normalize_search_attr_value(
+            SearchAttrType::Datetime,
+            &SearchAttrValue::Keyword(timestamp.into()),
+        )
+        .unwrap();
+        assert_eq!(
+            datetime,
+            SearchAttrValue::Datetime(
+                OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn registered_schema_rejects_structurally_incompatible_search_attributes() {
+        let error = normalize_search_attr_value(
+            SearchAttrType::Int,
+            &SearchAttrValue::Keyword("not-an-integer".into()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("type mismatch"));
     }
 
     #[test]

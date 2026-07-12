@@ -92,9 +92,20 @@ signature and behavior consistency"). The GA set:
 
 The four newer worker-deployment APIs that v1.31.0 labels experimental/pre-release
 (`CreateWorkerDeployment`, `CreateWorkerDeploymentVersion`, `UpdateWorkerDeploymentVersionComputeConfig`,
-`ValidateWorkerDeploymentVersionComputeConfig`) are in [`excluded.md`](./excluded.md). The older
-build-ID / versioning-rules surface that v1.31.0 deprecates is under decision in
-[`decisions.md`](./decisions.md).
+`ValidateWorkerDeploymentVersionComputeConfig`) are in [`excluded.md`](./excluded.md).
+
+The older deprecated **Worker Versioning V1/V2** RPCs (`UpdateWorkerBuildIdCompatibility`,
+`GetWorkerBuildIdCompatibility`, `UpdateWorkerVersioningRules`, `GetWorkerVersioningRules`,
+`GetWorkerTaskReachability`) are in-surface **only as their stock-default rejections**: a
+default-configuration v1.31.0 server refuses all five with fixed `PERMISSION_DENIED` errors
+(the gates `frontend.workerVersioningDataAPIs` / `frontend.workerVersioningRuleAPIs` default to
+`false`), and conformance means reproducing those rejections exactly — message, status detail,
+gate-before-validation ordering, and the reachability-RPC quirk. Their enabled-path semantics
+are in [`excluded.md`](./excluded.md). The shared field machinery that stock serves regardless
+(`WorkerVersionStamp`/`binary_checksum` echo, `worker_version_capabilities` poller validation,
+`GetSystemInfo`'s `BuildIdBasedVersioning: true`, degenerate ENHANCED `DescribeTaskQueue`)
+remains part of the field-fidelity bar of the areas above. Decision record:
+[`worker-versioning.md`](./worker-versioning.md).
 
 ## Standalone Activities
 

@@ -290,7 +290,7 @@ impl VisibilityStore for InMemoryVisibilityStore {
             rows.retain(|row| row_after(row, after));
         }
         let limit = page.limit.min(crate::types::MAX_PAGE_SIZE);
-        let next_page_token = if rows.len() > limit {
+        let next_page_token = if rows.len() >= limit {
             let last = rows[limit - 1].clone();
             Some(PageToken {
                 close_time: last.close_time,
@@ -580,6 +580,8 @@ fn eval_expr(inner: &VisibilityState, row: &ExecutionRow, expr: &FilterExpr) -> 
     match expr {
         FilterExpr::And(lhs, rhs) => Ok(eval_expr(inner, row, lhs)? && eval_expr(inner, row, rhs)?),
         FilterExpr::Or(lhs, rhs) => Ok(eval_expr(inner, row, lhs)? || eval_expr(inner, row, rhs)?),
+        FilterExpr::Not(expr) => Ok(!eval_expr(inner, row, expr)?),
+        FilterExpr::IsNull { field } => Ok(field_value(inner, row, field).is_none()),
         FilterExpr::Compare { field, op, value } => eval_compare(inner, row, field, *op, value),
         FilterExpr::In { field, values } => eval_in(inner, row, field, values),
         FilterExpr::Between { field, low, high } => {
@@ -700,12 +702,12 @@ fn eval_text_compare(text: &str, op: CompareOp, value: &FilterValue) -> Result<b
     let FilterValue::String(candidate) = value else {
         return Ok(false);
     };
-    let Some(candidate) = normalize_text_literal(candidate) else {
-        return Ok(matches!(op, CompareOp::Ne));
-    };
-    let contains = InMemoryVisibilityStore::index_text(text)
-        .iter()
-        .any(|token| token == &candidate);
+    let candidates = text_search_tokens(candidate);
+    let indexed = InMemoryVisibilityStore::index_text(text);
+    let contains = !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| indexed.iter().any(|token| token == candidate));
     match op {
         CompareOp::Eq => Ok(contains),
         CompareOp::Ne => Ok(!contains),
@@ -1331,7 +1333,27 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.rows.is_empty());
+        assert_eq!(result.rows.len(), 1);
+
+        // Temporal Text equality is token-set membership rather than phrase
+        // equality, so changing token order does not change the result.
+        let result = store
+            .list_executions(
+                ns,
+                &CompiledFilter {
+                    archetype: None,
+                    expr: Some(FilterExpr::Compare {
+                        field: field.clone(),
+                        op: CompareOp::Eq,
+                        value: FilterValue::String("world hello".to_owned()),
+                    }),
+                },
+                SortOrder::Default,
+                &page(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
 
         let result = store
             .list_executions(

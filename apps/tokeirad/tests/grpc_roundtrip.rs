@@ -1077,6 +1077,10 @@ where
                 original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
                 versioning_info: state.versioning_info.clone(),
                 worker_deployment_name: state.worker_deployment_name.clone(),
+                most_recent_worker_version_stamp: state
+                    .versioning_info
+                    .as_ref()
+                    .and_then(|info| info.most_recent_worker_version_stamp.clone()),
                 request_id_infos: state.request_id_infos.clone(),
                 external_payload_count: 0,
                 external_payload_size_bytes: 0,

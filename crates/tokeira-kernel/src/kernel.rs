@@ -13,8 +13,9 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, NamespaceId, Payloads, QueueKey, RunId,
-    RunKey, StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId,
+    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey,
+    RunId, RunKey, SearchAttributes, StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity,
+    WorkflowId,
 };
 
 use crate::{
@@ -23,16 +24,17 @@ use crate::{
         ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, Command,
         CompletionCallbackAttemptedRequest, ContinueAsNewInitiator, CronContinuation,
         ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-        ExternalSignalResult, FieldChange, NexusOperationResolvedRequest,
+        ExternalSignalResult, FieldChange, MemoPatch, NexusOperationResolvedRequest,
         NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
         ResetActivityRequest, ResetRequest, ResetStickyRequest, RetryContinuation, RetryState,
-        ScheduleQueryTaskRequest, SignalRequest, SignalWithStartRequest, StartAndUpdateRequest,
-        StartRequest, StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest,
-        TerminateRequest, TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
-        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
-        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-        WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
-        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+        ScheduleQueryTaskRequest, SearchAttributesPatch, SignalRequest, SignalWithStartRequest,
+        StartAndUpdateRequest, StartRequest, StartWorkflowTaskRequest,
+        TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest,
+        UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+        UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, WorkflowCommand,
+        WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest,
+        WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+        WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind, UpdateEventOutcome},
     state::{
@@ -350,6 +352,8 @@ impl BasicKernel {
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq::ZERO,
             last_event_id: first.event_id,
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: None,
             previous_started_event_id: 0,
@@ -422,6 +426,9 @@ impl BasicKernel {
 
         for event in events {
             state.last_event_id = event.event_id;
+            let (count, size) = crate::event::external_payload_stats_for_event(event);
+            state.external_payload_count += count;
+            state.external_payload_size_bytes += size;
             self.apply_replayed_event(&mut state, event);
         }
 
@@ -470,6 +477,8 @@ impl BasicKernel {
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq::ZERO,
             last_event_id: 0,
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: None,
             previous_started_event_id: 0,
@@ -634,6 +643,8 @@ impl BasicKernel {
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq::ZERO,
             last_event_id: 0,
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: None,
             previous_started_event_id: 0,
@@ -1920,6 +1931,7 @@ impl BasicKernel {
                 (pending.scheduled_event_id, started_event_id)
             };
 
+        let worker_version = req.worker_version.clone();
         let wft_completed_event_id = builder.emit(HistoryEventKind::WorkflowTaskCompleted {
             logical_seq: req.token.logical_seq,
             scheduled_event_id,
@@ -1943,6 +1955,9 @@ impl BasicKernel {
         builder.state.workflow_task_attempts_since_last_success = 0;
         builder.state.last_workflow_task_problem = None;
         builder.state.pending_workflow_task = None;
+        builder
+            .state
+            .apply_wft_worker_version(worker_version.as_ref(), req.versioning_behavior);
         builder.state.apply_wft_versioning(
             req.versioning_behavior,
             req.deployment_version,
@@ -3604,6 +3619,7 @@ impl BasicKernel {
             }
             HistoryEventKind::WorkflowTaskCompleted {
                 started_event_id,
+                worker_version,
                 versioning_behavior,
                 deployment_version,
                 worker_deployment_name,
@@ -3618,6 +3634,7 @@ impl BasicKernel {
                 state.workflow_task_attempts_since_last_success = 0;
                 state.last_workflow_task_problem = None;
                 state.pending_workflow_task = None;
+                state.apply_wft_worker_version(worker_version.as_ref(), *versioning_behavior);
                 state.apply_wft_versioning(
                     *versioning_behavior,
                     deployment_version.clone(),
@@ -3991,6 +4008,12 @@ impl BasicKernel {
                 // re-delivers it (mirrors the accepted arm above for pending).
                 state.admitted_updates.insert(update_id.clone());
             }
+            HistoryEventKind::WorkflowPropertiesModified { patch, .. } => {
+                apply_memo_patch(&mut state.memo, patch);
+            }
+            HistoryEventKind::UpsertWorkflowSearchAttributes { patch, .. } => {
+                apply_search_attributes_patch(&mut state.search_attributes, patch);
+            }
             HistoryEventKind::WorkflowExecutionUpdateCompleted { update_id, .. }
             | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { update_id, .. }
             | HistoryEventKind::WorkflowExecutionUpdateRejected { update_id, .. } => {
@@ -4099,6 +4122,42 @@ fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
     }
 
     Ok(state)
+}
+
+/// Merge a memo patch using Temporal's null-means-delete semantics.
+///
+/// This helper is shared by the live transition and history replay so recovery
+/// cannot reconstruct a different authoritative memo from the same event log.
+fn apply_memo_patch(memo: &mut Memo, patch: &MemoPatch) {
+    for (key, change) in &patch.0 {
+        match change {
+            FieldChange::Unchanged => {}
+            FieldChange::Set(value) => {
+                memo.0.insert(key.clone(), value.clone());
+            }
+            FieldChange::Clear => {
+                memo.0.remove(key);
+            }
+        }
+    }
+}
+
+/// Merge a search-attribute patch identically on the hot and replay paths.
+fn apply_search_attributes_patch(
+    search_attributes: &mut SearchAttributes,
+    patch: &SearchAttributesPatch,
+) {
+    for (key, change) in &patch.0 {
+        match change {
+            FieldChange::Unchanged => {}
+            FieldChange::Set(value) => {
+                search_attributes.0.insert(key.clone(), value.clone());
+            }
+            FieldChange::Clear => {
+                search_attributes.0.remove(key);
+            }
+        }
+    }
 }
 
 fn apply_workflow_command(
@@ -4238,6 +4297,38 @@ fn apply_workflow_command(
                 search_attr_patch: search_attributes,
             });
             Ok(false)
+        }
+        WorkflowCommand::UpsertMemoPatch(patch) => {
+            builder.emit(HistoryEventKind::WorkflowPropertiesModified {
+                workflow_task_completed_event_id,
+                patch: patch.clone(),
+            });
+            apply_memo_patch(&mut builder.state.memo, &patch);
+            builder.projection_ops.push(ProjectionOp::UpsertExecution {
+                status: builder.state.status,
+                memo_patch: builder.state.memo.clone(),
+                search_attr_patch: builder.state.search_attributes.clone(),
+            });
+            Ok(false)
+        }
+        WorkflowCommand::UpsertSearchAttributesPatch(patch) => {
+            builder.emit(HistoryEventKind::UpsertWorkflowSearchAttributes {
+                workflow_task_completed_event_id,
+                patch: patch.clone(),
+            });
+            apply_search_attributes_patch(&mut builder.state.search_attributes, &patch);
+            builder.projection_ops.push(ProjectionOp::UpsertExecution {
+                status: builder.state.status,
+                memo_patch: builder.state.memo.clone(),
+                search_attr_patch: builder.state.search_attributes.clone(),
+            });
+            Ok(false)
+        }
+        WorkflowCommand::InvalidSearchAttributes { message } => {
+            Err(Reject::InvalidCommandAttributes {
+                cause: WorkflowTaskFailedCause::BadSearchAttributes,
+                message: Some(message),
+            })
         }
         WorkflowCommand::RecordMarker {
             marker_name,
@@ -5393,11 +5484,15 @@ impl TransitionBuilder {
     fn emit_at(&mut self, happened_at: OffsetDateTime, kind: HistoryEventKind) -> i64 {
         let event_id = self.state.last_event_id + 1;
         self.state.last_event_id = event_id;
-        self.history_events.push(HistoryEvent {
+        let event = HistoryEvent {
             event_id,
             happened_at,
             kind,
-        });
+        };
+        let (count, size) = crate::event::external_payload_stats_for_event(&event);
+        self.state.external_payload_count += count;
+        self.state.external_payload_size_bytes += size;
+        self.history_events.push(event);
         event_id
     }
 

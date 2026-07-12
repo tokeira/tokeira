@@ -310,6 +310,70 @@ fn activity_already_started_status(
     )
 }
 
+/// Build v1.31.0's stock-default rejection for the deprecated Worker
+/// Versioning v0.1 (Version Set-based) data APIs. The gate
+/// (`frontend.workerVersioningDataAPIs`) defaults to **false**
+/// (`common/dynamicconfig/constants.go:1054-1058` @ v1.31.0), so an
+/// out-of-the-box server refuses `UpdateWorkerBuildIdCompatibility` and
+/// `GetWorkerBuildIdCompatibility` with this exact PermissionDenied — checked
+/// first within the handler, before any request-field validation
+/// (`service/frontend/workflow_handler.go:5330-5391`,
+/// `service/frontend/errors.go:131`; upstream's namespace-validator
+/// interceptor still runs ahead of the handler, a layer tokeira does not
+/// model). tokeira has no dynamic config, so the gate is permanently off and
+/// this rejection *is* the conformant behaviour.
+pub(crate) fn worker_versioning_v1_disabled_status() -> Status {
+    worker_versioning_disabled_status(
+        "Worker versioning v0.1 (Version Set-based, deprecated) is disabled on this namespace.",
+    )
+}
+
+/// Build v1.31.0's stock-default rejection for the deprecated Worker
+/// Versioning v0.2 (Rules-based) APIs. The rules gate
+/// (`frontend.workerVersioningRuleAPIs`) defaults to **false**
+/// (`common/dynamicconfig/constants.go:1064-1068` @ v1.31.0), refusing
+/// `UpdateWorkerVersioningRules` / `GetWorkerVersioningRules` with this exact
+/// PermissionDenied before any request-field validation.
+/// `GetWorkerTaskReachability` is gated by the **v0.1 data flag** but returns
+/// this **v0.2 message** — a deliberate upstream cross-wiring
+/// (`service/frontend/workflow_handler.go:5491-5493`); with both gates
+/// permanently off in tokeira the observable result is this same status.
+pub(crate) fn worker_versioning_v2_disabled_status() -> Status {
+    worker_versioning_disabled_status(
+        "Worker versioning v0.2 (Rules-based, deprecated) is disabled on this namespace.",
+    )
+}
+
+/// PERMISSION_DENIED carrying a `PermissionDeniedFailure` detail with an empty
+/// `reason`, matching `serviceerror.NewPermissionDenied(message, "")`
+/// (`go.temporal.io/api serviceerror/permission_denied.go` @ v1.62.8) so SDK
+/// clients reconstruct the typed `serviceerror.PermissionDenied` from the
+/// `grpc-status-details-bin` trailer.
+fn worker_versioning_disabled_status(message: &'static str) -> Status {
+    use prost::Message as _;
+    use tokeira_proto::public::temporal::api::errordetails::v1::PermissionDeniedFailure;
+
+    let detail = ProtoAny {
+        type_url: "type.googleapis.com/temporal.api.errordetails.v1.PermissionDeniedFailure"
+            .to_owned(),
+        value: PermissionDeniedFailure {
+            reason: String::new(),
+        }
+        .encode_to_vec(),
+    };
+    let rpc_status = RpcStatus {
+        code: Code::PermissionDenied as i32,
+        message: message.to_owned(),
+        details: vec![detail],
+    };
+    Status::with_details_and_metadata(
+        Code::PermissionDenied,
+        message.to_owned(),
+        rpc_status.encode_to_vec().into(),
+        MetadataMap::new(),
+    )
+}
+
 /// Minimal `google.rpc.Status` mirror for the `grpc-status-details-bin` trailer.
 /// Not generated (no temporal proto pulls `google/rpc/status.proto` into our
 /// build), so it is hand-defined to the stable field numbers.

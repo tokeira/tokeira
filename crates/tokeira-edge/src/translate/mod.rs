@@ -18,7 +18,7 @@ use std::{
 use time::OffsetDateTime;
 
 use tokeira_kernel::{
-    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowTaskWorkerVersion,
     event::HistoryEvent,
     state::{ParentClosePolicy, WorkflowVersioningInfo},
 };
@@ -281,13 +281,16 @@ pub struct PollWorkflowTaskQueueResponse {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RespondWorkflowTaskCompletedRequest {
+    /// Namespace named by the wire request, needed for namespace-scoped command
+    /// validation before the authoritative completion transition.
+    pub namespace: String,
     pub task_token: Vec<u8>,
     pub identity: String,
     /// Decoded at the edge; downstream behaviour belongs to the `speculative-wft` spec.
     pub client_discards_speculative_with_events: bool,
     pub sdk_metadata: Option<Vec<u8>>,
     pub metering_metadata: Option<Vec<u8>>,
-    pub worker_version: Option<String>,
+    pub worker_version: Option<WorkflowTaskWorkerVersion>,
     pub versioning_behavior: tokeira_kernel::state::VersioningBehavior,
     pub deployment_version: Option<tokeira_kernel::state::WorkerDeploymentVersionRef>,
     pub worker_deployment_name: Option<String>,
@@ -401,6 +404,8 @@ pub struct WorkflowExecutionDescription {
     pub original_start_time: OffsetDateTime,
     pub versioning_info: Option<WorkflowVersioningInfo>,
     pub worker_deployment_name: Option<String>,
+    /// Most recent structured worker-version stamp from a completed WFT.
+    pub most_recent_worker_version_stamp: Option<tokeira_kernel::WorkerVersionStamp>,
     /// Per-request → authoring-event map for `WorkflowExtendedInfo.request_id_infos`
     /// (the start request → STARTED, each UseExisting attach → OPTIONS_UPDATED).
     pub request_id_infos: std::collections::BTreeMap<String, tokeira_kernel::RequestIdInfo>,
@@ -1259,38 +1264,10 @@ pub struct ResetActivityResponse;
 /// details. Search attributes are typed values — never `Payload` — so they
 /// are naturally excluded, matching v1.31.0's `SkipSearchAttributes`.
 pub fn external_payload_stats(events: &[tokeira_kernel::HistoryEvent]) -> (i64, i64) {
-    fn walk(value: &serde_json::Value, count: &mut i64, size: &mut i64) {
-        match value {
-            serde_json::Value::Object(map) => {
-                if let Some(serde_json::Value::Array(details)) = map.get("external_payloads") {
-                    for detail in details {
-                        if let Some(bytes) = detail.get("size_bytes").and_then(|v| v.as_i64()) {
-                            *count += 1;
-                            *size += bytes;
-                        }
-                    }
-                }
-                for entry in map.values() {
-                    walk(entry, count, size);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    walk(item, count, size);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut count = 0;
-    let mut size = 0;
-    for event in events {
-        if let Ok(value) = serde_json::to_value(event) {
-            walk(&value, &mut count, &mut size);
-        }
-    }
-    (count, size)
+    events.iter().fold((0, 0), |(count, size), event| {
+        let (event_count, event_size) = tokeira_kernel::external_payload_stats_for_event(event);
+        (count + event_count, size + event_size)
+    })
 }
 
 #[cfg(test)]

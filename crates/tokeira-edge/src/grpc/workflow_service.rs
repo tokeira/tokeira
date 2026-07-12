@@ -24,21 +24,26 @@ use tokeira_proto::{
     },
 };
 use tokeira_runtime::{
-    BuildIdReachabilityResult, ScheduleError, TaskQueueConfigEntry, TaskQueueReachability,
-    VersioningError, compute_matching_times, compute_next_times, compute_reachability,
+    ScheduleError, TaskQueueConfigEntry, compute_matching_times, compute_next_times,
 };
-use tokeira_types::{BuildId, NamespaceId, TaskQueueName, WorkerIdentity};
+use tokeira_types::{NamespaceId, TaskQueueName, WorkerIdentity};
 
 use tokeira_chasm_activity::ActivityStatus;
 use tokeira_proto::public::temporal::api::activity::v1 as activity_v1;
 
 use crate::{
-    grpc::{errors::proto_conversion_status, metadata::metadata_to_header_map, translate},
+    grpc::{
+        errors::{
+            proto_conversion_status, worker_versioning_v1_disabled_status,
+            worker_versioning_v2_disabled_status,
+        },
+        metadata::metadata_to_header_map,
+        translate,
+    },
     translate::{batch, nexus, schedule, to_internal, worker_heartbeat},
     workflow_service::WorkflowService,
 };
 
-const COMMIT_POLLER_RECENT_WINDOW: time::Duration = time::Duration::minutes(5);
 const DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED: &str =
     "Deployments are deprecated and no longer supported, use Worker Deployments instead";
 
@@ -195,19 +200,6 @@ impl WorkflowServiceGrpc {
             activity_id,
             resolved_run_id,
         ))
-    }
-}
-
-fn versioning_error_status(error: VersioningError) -> Status {
-    match error {
-        VersioningError::StaleConflictToken => Status::aborted(error.to_string()),
-        VersioningError::DuplicateRedirectSource => Status::already_exists(error.to_string()),
-        VersioningError::OutOfBounds
-        | VersioningError::EmptyBuildId
-        | VersioningError::UnknownRedirectSource
-        | VersioningError::LastUnconditionalRule
-        | VersioningError::RedirectCycle
-        | VersioningError::RedirectChainTooDeep => Status::failed_precondition(error.to_string()),
     }
 }
 
@@ -1920,10 +1912,17 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         } else {
             req.maximum_page_size as usize
         };
-        let (mut entries, next_page_token) =
-            self.inner
-                .schedule_store()
-                .list(namespace_id, page_size, &req.next_page_token);
+        let query = req.query.trim();
+        let (mut entries, next_page_token) = self
+            .inner
+            .schedule_store()
+            .list(
+                namespace_id,
+                page_size,
+                &req.next_page_token,
+                (!query.is_empty()).then_some(query),
+            )
+            .map_err(|_| Status::invalid_argument("unsupported schedule query"))?;
         let now = OffsetDateTime::now_utc();
         for entry in &mut entries {
             entry.info.future_action_times =
@@ -1934,126 +1933,43 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             next_page_token,
         )))
     }
+    // Worker Versioning V1 (version sets) and V2 (rules) are deprecated in
+    // v1.31.0 and their frontend gates (`frontend.workerVersioningDataAPIs`,
+    // `frontend.workerVersioningRuleAPIs`) default to off, so a stock server
+    // refuses all five RPCs before any namespace or field validation. tokeira
+    // has no dynamic config: the gates are permanently off and the rejection
+    // is the whole surface (docs/conformance/v1.31.0/worker-versioning.md).
     async fn update_worker_build_id_compatibility(
         &self,
         _request: Request<workflowservice::UpdateWorkerBuildIdCompatibilityRequest>,
     ) -> Result<Response<workflowservice::UpdateWorkerBuildIdCompatibilityResponse>, Status> {
-        Err(Status::unimplemented(
-            "Legacy worker versioning API (v1 version sets) is not supported. Use UpdateWorkerVersioningRules (v2 rule-based API) instead.",
-        ))
+        Err(worker_versioning_v1_disabled_status())
     }
     async fn get_worker_build_id_compatibility(
         &self,
         _request: Request<workflowservice::GetWorkerBuildIdCompatibilityRequest>,
     ) -> Result<Response<workflowservice::GetWorkerBuildIdCompatibilityResponse>, Status> {
-        Err(Status::unimplemented(
-            "Legacy worker versioning API (v1 version sets) is not supported. Use GetWorkerVersioningRules (v2 rule-based API) instead.",
-        ))
+        Err(worker_versioning_v1_disabled_status())
     }
     async fn update_worker_versioning_rules(
         &self,
-        request: Request<workflowservice::UpdateWorkerVersioningRulesRequest>,
+        _request: Request<workflowservice::UpdateWorkerVersioningRulesRequest>,
     ) -> Result<Response<workflowservice::UpdateWorkerVersioningRulesResponse>, Status> {
-        let req = request.into_inner();
-        if req.namespace.is_empty() || req.task_queue.is_empty() {
-            return Err(Status::invalid_argument(
-                "namespace and task_queue are required",
-            ));
-        }
-        let namespace_id = crate::to_internal::namespace_id_for(&req.namespace);
-        let task_queue = TaskQueueName(req.task_queue);
-        let now = OffsetDateTime::now_utc();
-        let parsed = translate::versioning_mutation_from_proto(req.operation, now)
-            .map_err(proto_conversion_status)?;
-        if let Some(build_id) = &parsed.commit_build_id
-            && !parsed.commit_force
-            && !self.inner.worker_registry().has_recent_poller_for_build_id(
-                namespace_id,
-                &task_queue,
-                &BuildId(build_id.clone()),
-                now,
-                COMMIT_POLLER_RECENT_WINDOW,
-            )
-        {
-            return Err(Status::failed_precondition(
-                "no recent poller observed for target build id",
-            ));
-        }
-        let rules = self
-            .inner
-            .versioning_rule_store()
-            .apply_mutation(
-                namespace_id,
-                &task_queue,
-                req.conflict_token,
-                parsed.mutation,
-                now,
-            )
-            .map_err(versioning_error_status)?;
-        Ok(Response::new(translate::versioning_rules_to_update_proto(
-            rules,
-        )))
+        Err(worker_versioning_v2_disabled_status())
     }
     async fn get_worker_versioning_rules(
         &self,
-        request: Request<workflowservice::GetWorkerVersioningRulesRequest>,
+        _request: Request<workflowservice::GetWorkerVersioningRulesRequest>,
     ) -> Result<Response<workflowservice::GetWorkerVersioningRulesResponse>, Status> {
-        let req = request.into_inner();
-        if req.namespace.is_empty() || req.task_queue.is_empty() {
-            return Err(Status::invalid_argument(
-                "namespace and task_queue are required",
-            ));
-        }
-        let rules = self.inner.versioning_rule_store().get_rules(
-            crate::to_internal::namespace_id_for(&req.namespace),
-            &TaskQueueName(req.task_queue),
-        );
-        Ok(Response::new(translate::versioning_rules_to_get_proto(
-            rules,
-        )))
+        Err(worker_versioning_v2_disabled_status())
     }
     async fn get_worker_task_reachability(
         &self,
-        request: Request<workflowservice::GetWorkerTaskReachabilityRequest>,
+        _request: Request<workflowservice::GetWorkerTaskReachabilityRequest>,
     ) -> Result<Response<workflowservice::GetWorkerTaskReachabilityResponse>, Status> {
-        let req = request.into_inner();
-        if req.namespace.is_empty() {
-            return Err(Status::invalid_argument("namespace is required"));
-        }
-        let namespace_id = crate::to_internal::namespace_id_for(&req.namespace);
-        let store = self.inner.versioning_rule_store();
-        let task_queues: Vec<TaskQueueName> = if req.task_queues.is_empty() {
-            store
-                .all_task_queues_with_rules()
-                .into_iter()
-                .filter_map(|(ns, task_queue)| (ns == namespace_id).then_some(task_queue))
-                .collect()
-        } else {
-            req.task_queues.into_iter().map(TaskQueueName).collect()
-        };
-        let results = req
-            .build_ids
-            .into_iter()
-            .map(|build_id| {
-                let task_queue_reachability = task_queues
-                    .iter()
-                    .map(|task_queue| {
-                        let rules = store.get_rules(namespace_id, task_queue);
-                        compute_reachability(
-                            &build_id,
-                            task_queue.clone(),
-                            &rules.assignment_rules,
-                            &rules.redirect_rules,
-                        )
-                    })
-                    .collect::<Vec<TaskQueueReachability>>();
-                BuildIdReachabilityResult {
-                    build_id,
-                    task_queue_reachability,
-                }
-            })
-            .collect();
-        Ok(Response::new(translate::reachability_to_proto(results)))
+        // Gated by the v0.1 data flag upstream but surfaces the v0.2 message
+        // (workflow_handler.go:5491-5493 @ v1.31.0).
+        Err(worker_versioning_v2_disabled_status())
     }
     async fn describe_deployment(
         &self,
@@ -3198,14 +3114,13 @@ mod tests {
         deployment::v1::WorkerDeploymentVersion, nexus::v1 as nexus_v1, worker::v1 as worker_v1,
     };
     use tokeira_runtime::{
-        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken, VersioningRuleStore,
-        WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata,
+        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken, WorkerRegistry,
     };
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
     use tokeira_types::{
-        BuildId, LogicalTaskSeq, Memo, Payloads, QueueKey, RequestContext, RequestId, RunId,
-        RunKey, SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity,
-        WorkerInstanceKey, WorkflowId, WorkflowType,
+        LogicalTaskSeq, Memo, Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey,
+        SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkerInstanceKey,
+        WorkflowId, WorkflowType,
     };
 
     #[test]
@@ -3943,54 +3858,34 @@ mod tests {
         }
     }
 
-    fn versioning_test_service() -> (
-        WorkflowServiceGrpc,
-        Arc<VersioningRuleStore>,
-        WorkerRegistry,
-        tokeira_runtime::InMemoryBroker,
-    ) {
+    fn versioning_test_service() -> (WorkflowServiceGrpc, tokeira_runtime::InMemoryBroker) {
         let cache = Arc::new(InMemoryNamespaceCache::new());
         let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
-        let store = Arc::new(VersioningRuleStore::default());
-        let worker_registry = WorkerRegistry::default();
         let broker = tokeira_runtime::InMemoryBroker::default();
-        let service =
-            WorkflowService::new_with_versioning_and_buffered_queries_and_history_wait_registry(
-                Arc::new(PollNoneRuntime),
-                Arc::new(NoopResolver),
-                Arc::new(EmptyVisibilityApi),
-                Arc::new(tokeira_storage::InMemoryStore::default()),
-                operator_api,
-                cache.clone(),
-                Arc::new(EdgeInterceptors::permissive(cache)),
-                PollerRegistry::default(),
-                crate::PendingQueryStore::default(),
-                tokeira_runtime::BufferedQueryRegistry::default(),
-                broker.clone(),
-                tokeira_runtime::NexusTaskBroker::default(),
-                LongPollGate::new(LongPollConfig::default()),
-                Arc::new(LocalOnlyRouter),
-                HistoryWaitRegistry::default(),
-                store.clone(),
-                worker_registry.clone(),
-                Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
-                Arc::new(tokeira_runtime::ScheduleStore::default()),
-                Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
-                Arc::new(tokeira_runtime::BatchOperationStore::default()),
-            );
-        (
-            WorkflowServiceGrpc::new(service),
-            store,
-            worker_registry,
-            broker,
-        )
+        let service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
+            Arc::new(PollNoneRuntime),
+            Arc::new(NoopResolver),
+            Arc::new(EmptyVisibilityApi),
+            Arc::new(tokeira_storage::InMemoryStore::default()),
+            operator_api,
+            cache.clone(),
+            Arc::new(EdgeInterceptors::permissive(cache)),
+            PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::BufferedQueryRegistry::default(),
+            broker.clone(),
+            LongPollGate::new(LongPollConfig::default()),
+            Arc::new(LocalOnlyRouter),
+            HistoryWaitRegistry::default(),
+        );
+        (WorkflowServiceGrpc::new(service), broker)
     }
 
     fn worker_deployment_test_service() -> WorkflowServiceGrpc {
         let cache: Arc<dyn NamespaceCache> = Arc::new(StaticNamespaceCache);
         let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
         let service =
-            WorkflowService::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+            WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
                 Arc::new(PollNoneRuntime),
                 Arc::new(NoopResolver),
                 Arc::new(EmptyVisibilityApi),
@@ -4006,7 +3901,6 @@ mod tests {
                 LongPollGate::new(LongPollConfig::default()),
                 Arc::new(LocalOnlyRouter),
                 HistoryWaitRegistry::default(),
-                Arc::new(VersioningRuleStore::default()),
                 WorkerRegistry::default(),
                 Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
                 Arc::new(tokeira_runtime::ScheduleStore::default()),
@@ -4135,7 +4029,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_search_attributes_exposes_system_visibility_keys() {
-        let (grpc, _, _, _) = versioning_test_service();
+        let (grpc, _broker) = versioning_test_service();
 
         let response = grpc
             .get_search_attributes(Request::new(workflowservice::GetSearchAttributesRequest {}))
@@ -4192,7 +4086,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_handler_blocks_return_tracked_unimplemented_messages() {
-        let (grpc, _store, _registry, _broker) = versioning_test_service();
+        let (grpc, _broker) = versioning_test_service();
 
         assert_deferred_rpc!(
             grpc,
@@ -4304,7 +4198,7 @@ mod tests {
         let broker = tokeira_runtime::InMemoryBroker::default();
         let nexus_broker = NexusTaskBroker::default();
         let service =
-            WorkflowService::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+            WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
                 runtime,
                 Arc::new(NoopResolver),
                 Arc::new(EmptyVisibilityApi),
@@ -4320,7 +4214,6 @@ mod tests {
                 LongPollGate::new(LongPollConfig::default()),
                 Arc::new(LocalOnlyRouter),
                 HistoryWaitRegistry::default(),
-                Arc::new(VersioningRuleStore::default()),
                 WorkerRegistry::default(),
                 Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
                 Arc::new(tokeira_runtime::ScheduleStore::default()),
@@ -4330,61 +4223,123 @@ mod tests {
         (WorkflowServiceGrpc::new(service), nexus_broker)
     }
 
-    fn commit_build_id_request(
-        conflict_token: Vec<u8>,
-        build_id: &str,
-        force: bool,
-    ) -> workflowservice::UpdateWorkerVersioningRulesRequest {
-        workflowservice::UpdateWorkerVersioningRulesRequest {
-            namespace: "default".to_string(),
-            task_queue: "queue".to_string(),
-            conflict_token,
-            operation: Some(
-                workflowservice::update_worker_versioning_rules_request::Operation::CommitBuildId(
-                    workflowservice::update_worker_versioning_rules_request::CommitBuildId {
-                        target_build_id: build_id.to_string(),
-                        force,
-                    },
-                ),
-            ),
-        }
-    }
-
-    fn versioning_token(store: &VersioningRuleStore, task_queue: &str) -> Vec<u8> {
-        store
-            .get_rules(
-                namespace_id_for("default"),
-                &TaskQueueName(task_queue.to_string()),
-            )
-            .conflict_token
-    }
-
+    /// All five deprecated Worker Versioning RPCs answer exactly like a
+    /// default-config v1.31.0 server: PERMISSION_DENIED with the fixed
+    /// "disabled on this namespace" messages, emitted before any request-field
+    /// validation — the requests below name a registered namespace but omit
+    /// the required task queue on purpose; upstream's gate check precedes
+    /// field validation inside the handler (workflow_handler.go:5330-5524,
+    /// errors.go:131-132 @ v1.31.0). The trailer carries exactly one
+    /// `PermissionDeniedFailure{reason:""}` detail inside a `google.rpc.Status`
+    /// wrapper, matching `serviceerror.NewPermissionDenied(message, "")`, and
+    /// `GetWorkerTaskReachability` surfaces the v0.2 message (the upstream
+    /// v0.1-gate/v0.2-message quirk).
     #[tokio::test]
-    async fn legacy_worker_versioning_handlers_return_unimplemented_messages() {
-        let (grpc, _store, _registry, _broker) = versioning_test_service();
+    async fn worker_versioning_v1_v2_rpcs_are_rejected_like_stock_default_config() {
+        const V1_MESSAGE: &str =
+            "Worker versioning v0.1 (Version Set-based, deprecated) is disabled on this namespace.";
+        const V2_MESSAGE: &str =
+            "Worker versioning v0.2 (Rules-based, deprecated) is disabled on this namespace.";
 
-        let update = grpc
+        // Local mirrors of `google.rpc.Status` / `google.protobuf.Any` to
+        // decode the `grpc-status-details-bin` trailer bytes.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct RpcStatusMirror {
+            #[prost(int32, tag = "1")]
+            code: i32,
+            #[prost(string, tag = "2")]
+            message: String,
+            #[prost(message, repeated, tag = "3")]
+            details: Vec<ProtoAnyMirror>,
+        }
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct ProtoAnyMirror {
+            #[prost(string, tag = "1")]
+            type_url: String,
+            #[prost(bytes = "vec", tag = "2")]
+            value: Vec<u8>,
+        }
+
+        fn assert_versioning_disabled(status: &Status, expected_message: &str) {
+            use prost::Message as _;
+            assert_eq!(status.code(), tonic::Code::PermissionDenied);
+            assert_eq!(status.message(), expected_message);
+            let trailer = RpcStatusMirror::decode(status.details())
+                .expect("grpc-status-details-bin must decode as google.rpc.Status");
+            assert_eq!(trailer.code, tonic::Code::PermissionDenied as i32);
+            assert_eq!(trailer.message, expected_message);
+            assert_eq!(trailer.details.len(), 1, "exactly one status detail");
+            assert_eq!(
+                trailer.details[0].type_url,
+                "type.googleapis.com/temporal.api.errordetails.v1.PermissionDeniedFailure"
+            );
+            assert!(
+                trailer.details[0].value.is_empty(),
+                "PermissionDeniedFailure.reason must be empty, as stock encodes it"
+            );
+        }
+
+        let (grpc, _broker) = versioning_test_service();
+
+        let update_v1 = grpc
             .update_worker_build_id_compatibility(Request::new(
-                workflowservice::UpdateWorkerBuildIdCompatibilityRequest::default(),
+                workflowservice::UpdateWorkerBuildIdCompatibilityRequest {
+                    namespace: "default".to_string(),
+                    ..Default::default()
+                },
             ))
             .await
-            .expect_err("legacy update should be unsupported");
-        assert_eq!(update.code(), tonic::Code::Unimplemented);
-        assert!(update.message().contains("UpdateWorkerVersioningRules"));
+            .expect_err("v1 update is gated off");
+        assert_versioning_disabled(&update_v1, V1_MESSAGE);
 
-        let get = grpc
+        let get_v1 = grpc
             .get_worker_build_id_compatibility(Request::new(
-                workflowservice::GetWorkerBuildIdCompatibilityRequest::default(),
+                workflowservice::GetWorkerBuildIdCompatibilityRequest {
+                    namespace: "default".to_string(),
+                    ..Default::default()
+                },
             ))
             .await
-            .expect_err("legacy get should be unsupported");
-        assert_eq!(get.code(), tonic::Code::Unimplemented);
-        assert!(get.message().contains("GetWorkerVersioningRules"));
+            .expect_err("v1 get is gated off");
+        assert_versioning_disabled(&get_v1, V1_MESSAGE);
+
+        let update_v2 = grpc
+            .update_worker_versioning_rules(Request::new(
+                workflowservice::UpdateWorkerVersioningRulesRequest {
+                    namespace: "default".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("v2 update is gated off");
+        assert_versioning_disabled(&update_v2, V2_MESSAGE);
+
+        let get_v2 = grpc
+            .get_worker_versioning_rules(Request::new(
+                workflowservice::GetWorkerVersioningRulesRequest {
+                    namespace: "default".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("v2 get is gated off");
+        assert_versioning_disabled(&get_v2, V2_MESSAGE);
+
+        let reachability = grpc
+            .get_worker_task_reachability(Request::new(
+                workflowservice::GetWorkerTaskReachabilityRequest {
+                    namespace: "default".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("reachability is gated off");
+        assert_versioning_disabled(&reachability, V2_MESSAGE);
     }
 
     #[tokio::test]
     async fn deployment_handlers_return_unimplemented_messages() {
-        let (grpc, _store, _registry, _broker) = versioning_test_service();
+        let (grpc, _broker) = versioning_test_service();
 
         let describe = grpc
             .describe_deployment(Request::new(
@@ -4662,93 +4617,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_build_id_requires_recent_poller_unless_forced() {
-        let (grpc, store, _registry, _broker) = versioning_test_service();
-
-        let error = grpc
-            .update_worker_versioning_rules(Request::new(commit_build_id_request(
-                versioning_token(store.as_ref(), "queue"),
-                "build-a",
-                false,
-            )))
-            .await
-            .expect_err("commit without poller should fail");
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-
-        let response = grpc
-            .update_worker_versioning_rules(Request::new(commit_build_id_request(
-                versioning_token(store.as_ref(), "queue"),
-                "build-a",
-                true,
-            )))
-            .await
-            .expect("forced commit should succeed")
-            .into_inner();
-        assert_eq!(response.assignment_rules.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn commit_build_id_accepts_recent_build_id_only_poller() {
-        let (grpc, store, registry, _broker) = versioning_test_service();
-        let namespace_id = namespace_id_for("default");
-        registry.register(
-            WorkerRegistrationKey {
-                worker_identity: WorkerIdentity("worker-a".to_string()),
-                namespace_id,
-                task_queue: TaskQueueName("queue".to_string()),
-            },
-            WorkerVersionMetadata {
-                deployment: None,
-                build_id: Some(BuildId("build-a".to_string())),
-                last_seen_at: Some(OffsetDateTime::now_utc()),
-            },
-        );
-
-        let response = grpc
-            .update_worker_versioning_rules(Request::new(commit_build_id_request(
-                versioning_token(store.as_ref(), "queue"),
-                "build-a",
-                false,
-            )))
-            .await
-            .expect("recent poller should allow commit")
-            .into_inner();
-
-        assert_eq!(response.assignment_rules.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn commit_build_id_rejects_stale_poller() {
-        let (grpc, store, registry, _broker) = versioning_test_service();
-        let namespace_id = namespace_id_for("default");
-        registry.register(
-            WorkerRegistrationKey {
-                worker_identity: WorkerIdentity("worker-a".to_string()),
-                namespace_id,
-                task_queue: TaskQueueName("queue".to_string()),
-            },
-            WorkerVersionMetadata {
-                deployment: None,
-                build_id: Some(BuildId("build-a".to_string())),
-                last_seen_at: Some(OffsetDateTime::UNIX_EPOCH),
-            },
-        );
-
-        let error = grpc
-            .update_worker_versioning_rules(Request::new(commit_build_id_request(
-                versioning_token(store.as_ref(), "queue"),
-                "build-a",
-                false,
-            )))
-            .await
-            .expect_err("stale poller should not allow commit");
-
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    }
-
-    #[tokio::test]
     async fn shutdown_worker_is_idempotent_and_blocks_workflow_delivery() {
-        let (grpc, _store, _registry, broker) = versioning_test_service();
+        let (grpc, broker) = versioning_test_service();
         let namespace_id = namespace_id_for("default");
         let queue = QueueKey {
             namespace_id,
@@ -4809,7 +4679,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_worker_heartbeat_stores_compact_heartbeat() {
-        let (grpc, _versioning, _registry, _broker) = versioning_test_service();
+        let (grpc, _broker) = versioning_test_service();
         let store = grpc.inner.heartbeat_store();
 
         grpc.record_worker_heartbeat(Request::new(
@@ -4838,7 +4708,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_worker_records_final_heartbeat_before_denying_worker() {
-        let (grpc, _versioning, _registry, _broker) = versioning_test_service();
+        let (grpc, _broker) = versioning_test_service();
         let store = grpc.inner.heartbeat_store();
 
         grpc.shutdown_worker(Request::new(workflowservice::ShutdownWorkerRequest {

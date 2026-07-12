@@ -38,4 +38,5 @@
 
 ## Conformance 2
 
-- [ ] Resolve the two open scope decisions — auth/authz, worker-versioning V1/V2 ([decisions](../conformance/v1.31.0/decisions.md))
+- [ ] Resolve the remaining open scope decision — auth/authz ([decisions](../conformance/v1.31.0/decisions.md))
+- [x] Worker-versioning V1/V2 scope decision — resolved 2026-07-12: GA Worker Deployments only; the five deprecated RPCs conform as stock-default rejections ([worker-versioning](../conformance/v1.31.0/worker-versioning.md))

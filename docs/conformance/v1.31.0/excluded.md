@@ -6,8 +6,8 @@
 > (not part of the public SDK/operator API), or an RPC **absent from v1.31.0**. It is **definitional, not
 > a status report**.
 >
-> Surfaces that are present in v1.31.0 but still **under decision** (authentication, the deprecated
-> worker-versioning surface) are not here — they are in [`decisions.md`](./decisions.md).
+> Surfaces that are present in v1.31.0 but still **under decision** (authentication) are not here —
+> they are in [`decisions.md`](./decisions.md).
 
 ## 1. Experimental / pre-release features (Temporal-designated)
 
@@ -66,9 +66,13 @@ v1.31.0 ships these but marks them **deprecated**; the GA replacements are in [`
 |---------|------------------------|
 | Deployment v0 — `DescribeDeployment`, `ListDeployments`, `GetDeploymentReachability`, `GetCurrentDeployment`, `SetCurrentDeployment` | GA Worker Deployments |
 | Activity-control aliases — `PauseActivity`, `UnpauseActivity`, `ResetActivity` | the standalone-activity control verbs |
+| Worker Versioning V1/V2 **enabled-path semantics** — version sets, versioning rules, rule-computed reachability behind `UpdateWorkerBuildIdCompatibility`, `GetWorkerBuildIdCompatibility`, `UpdateWorkerVersioningRules`, `GetWorkerVersioningRules`, `GetWorkerTaskReachability` | GA Worker Deployments |
 
-(The deprecated worker-versioning V1/V2 surface is a TBD, not a settled exclusion — it is in
-[`decisions.md`](./decisions.md).)
+The V1/V2 enabled path is reachable only through non-default dynamic config
+(`frontend.workerVersioningDataAPIs` / `frontend.workerVersioningRuleAPIs`, both default `false`);
+the five RPCs themselves stay **in-surface as their stock-default rejections** — the exact
+`PERMISSION_DENIED` errors a default-configuration v1.31.0 server produces. Decision record with the
+full factual case: [`worker-versioning.md`](./worker-versioning.md).
 
 ## Related pages
 

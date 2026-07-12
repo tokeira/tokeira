@@ -116,7 +116,17 @@ impl ScheduleField {
         search_attributes: &SearchAttributes,
     ) -> Option<ScheduleFilterValue> {
         match self {
-            Self::ScheduleId => Some(ScheduleFilterValue::String(schedule_id.to_string())),
+            Self::ScheduleId => {
+                // ScheduleId is a synthetic field until the namespace defines a
+                // custom SA with that name; the custom value then takes normal
+                // SA precedence (`common/searchattribute/sadefs/constants.go`
+                // @ v1.31.0). This is why a per-entry fallback is required.
+                search_attributes
+                    .0
+                    .get("ScheduleId")
+                    .and_then(search_attr_value)
+                    .or_else(|| Some(ScheduleFilterValue::String(schedule_id.to_string())))
+            }
             Self::Namespace => Some(ScheduleFilterValue::String(namespace_id.0.to_string())),
             Self::Paused => Some(ScheduleFilterValue::Bool(paused)),
             Self::Notes => Some(ScheduleFilterValue::String(notes.to_string())),
@@ -211,6 +221,7 @@ async fn compile_expr<S>(input: &str, namespace_id: NamespaceId, store: &S) -> R
 where
     S: VisibilityStore + ?Sized,
 {
+    let input = strip_enclosing_parentheses(input.trim());
     if let Some((lhs, rhs)) = split_top_level(input, " AND ") {
         return Ok(FilterExpr::And(
             Box::new(compile_expr(lhs, namespace_id, store).await?),
@@ -222,6 +233,19 @@ where
             Box::new(compile_expr(lhs, namespace_id, store).await?),
             Box::new(compile_expr(rhs, namespace_id, store).await?),
         ));
+    }
+    if let Some((field, prefix)) = parse_not_starts_with(input) {
+        let field = resolve_field(field, namespace_id, store).await?;
+        ensure_starts_with_field(&field)?;
+        return Ok(FilterExpr::Not(Box::new(FilterExpr::StartsWith {
+            field,
+            prefix,
+        })));
+    }
+    if let Some(field) = parse_is_null(input) {
+        return Ok(FilterExpr::IsNull {
+            field: resolve_field(field, namespace_id, store).await?,
+        });
     }
     if let Some((field, low, high)) = parse_between(input) {
         let field = resolve_field(field, namespace_id, store).await?;
@@ -260,7 +284,7 @@ where
                 let value = FilterValue::Int(archetype_division_to_id(value.trim()));
                 return Ok(FilterExpr::Compare { field, op, value });
             }
-            let value = parse_value(value.trim());
+            let value = normalize_temporal_value(&field, parse_value(value.trim()))?;
             ensure_value_type(&field, &value)?;
             return Ok(FilterExpr::Compare { field, op, value });
         }
@@ -383,27 +407,49 @@ fn parse_value(input: &str) -> FilterValue {
 /// string-literal `AND`s never split.
 fn split_top_level<'a>(input: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
     const BETWEEN_KEYWORD: &str = " BETWEEN ";
-    let mut in_quotes = false;
+    let mut quote = None;
+    let mut depth = 0usize;
     let mut between_pending = false;
     let mut skip_until = 0;
     for (i, ch) in input.char_indices() {
         if i < skip_until {
             continue;
         }
-        if ch == '\'' {
-            in_quotes = !in_quotes;
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
             continue;
         }
-        if in_quotes {
+        if quote.is_some() {
+            continue;
+        }
+        if ch == '(' {
+            depth += 1;
+            continue;
+        }
+        if ch == ')' {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth != 0 {
             continue;
         }
         let rest = &input[i..];
-        if rest.starts_with(BETWEEN_KEYWORD) {
+        if rest
+            .get(..BETWEEN_KEYWORD.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(BETWEEN_KEYWORD))
+        {
             between_pending = true;
             skip_until = i + BETWEEN_KEYWORD.len();
             continue;
         }
-        if rest.starts_with(needle) {
+        if rest
+            .get(..needle.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+        {
             if needle == " AND " && between_pending {
                 between_pending = false;
                 skip_until = i + needle.len();
@@ -413,6 +459,54 @@ fn split_top_level<'a>(input: &'a str, needle: &str) -> Option<(&'a str, &'a str
         }
     }
     None
+}
+
+/// Remove only parentheses that enclose the complete expression.
+///
+/// Visibility queries use SQL-style grouping and boolean keywords are
+/// case-insensitive in v1.31.0. Stripping a complete outer group before the
+/// recursive split keeps parentheses out of field names without erasing a
+/// meaningful boundary such as `(A OR B) AND C`.
+fn strip_enclosing_parentheses(mut input: &str) -> &str {
+    loop {
+        let Some(inner) = input
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+        else {
+            return input;
+        };
+        let mut quote = None;
+        let mut depth = 0usize;
+        let mut encloses_all = true;
+        for (index, ch) in input.char_indices() {
+            if matches!(ch, '\'' | '"') {
+                if quote == Some(ch) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(ch);
+                }
+                continue;
+            }
+            if quote.is_some() {
+                continue;
+            }
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && index + ch.len_utf8() != input.len() {
+                        encloses_all = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !encloses_all {
+            return input;
+        }
+        input = inner.trim();
+    }
 }
 
 fn parse_between(input: &str) -> Option<(&str, String, String)> {
@@ -439,6 +533,42 @@ fn parse_starts_with(input: &str) -> Option<(&str, String)> {
         field.trim(),
         rest.trim().trim_matches('"').trim_matches('\'').to_string(),
     ))
+}
+
+fn parse_not_starts_with(input: &str) -> Option<(&str, String)> {
+    let (field, rest) = split_once_ascii_case(input, " NOT STARTS_WITH ")?;
+    Some((
+        field.trim(),
+        rest.trim().trim_matches('"').trim_matches('\'').to_string(),
+    ))
+}
+
+fn parse_is_null(input: &str) -> Option<&str> {
+    let (field, tail) = split_once_ascii_case(input, " IS NULL")?;
+    tail.trim().is_empty().then_some(field.trim())
+}
+
+fn split_once_ascii_case<'a>(input: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    input
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+        .map(|index| (&input[..index], &input[index + needle.len()..]))
+}
+
+fn normalize_temporal_value(field: &FieldRef, value: FilterValue) -> Result<FilterValue> {
+    if matches!(
+        field,
+        FieldRef::System(
+            SystemField::StartTime | SystemField::ExecutionTime | SystemField::CloseTime
+        )
+    ) && let FilterValue::Int(nanos) = value
+    {
+        return OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos))
+            .map(FilterValue::Datetime)
+            .map_err(|error| anyhow!("invalid nanosecond visibility timestamp: {error}"));
+    }
+    Ok(value)
 }
 
 pub fn expected_type_for_field(field: &FieldRef) -> Option<SearchAttrType> {
@@ -551,6 +681,19 @@ mod tests {
     #[test]
     fn split_top_level_lone_between_does_not_split() {
         assert_eq!(split_top_level("StartTime BETWEEN 1 AND 2", " AND "), None);
+    }
+
+    #[test]
+    fn grouped_boolean_queries_are_case_insensitive_and_preserve_precedence() {
+        let input = "(WorkflowId = \"one\" or WorkflowId = \"two\") AND ExecutionTime < 3";
+        let (lhs, rhs) = split_top_level(input, " AND ").expect("outer conjunction");
+        assert_eq!(lhs, "(WorkflowId = \"one\" or WorkflowId = \"two\")");
+        assert_eq!(rhs, "ExecutionTime < 3");
+
+        let grouped = strip_enclosing_parentheses(lhs);
+        let (first, second) = split_top_level(grouped, " OR ").expect("inner disjunction");
+        assert_eq!(first, "WorkflowId = \"one\"");
+        assert_eq!(second, "WorkflowId = \"two\"");
     }
 
     fn arb_system_string_field() -> impl Strategy<Value = &'static str> {

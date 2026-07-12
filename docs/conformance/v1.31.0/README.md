@@ -43,8 +43,8 @@ The surface is defined across three companion pages, partitioned by Temporal's o
   Temporal labels **experimental / pre-release**, **internal** (non-public) surfaces, and RPCs **absent
   from v1.31.0** (the `v1.62.11`-only Nexus operation-execution RPCs).
 - **[`decisions.md`](./decisions.md)** — surfaces present in v1.31.0 but **still under decision**:
-  authentication/authorization (to be resolved before first release) and the deprecated worker-versioning
-  V1/V2 surface.
+  authentication/authorization (to be resolved before first release). The deprecated worker-versioning
+  V1/V2 surface is resolved — see [`worker-versioning.md`](./worker-versioning.md).
 
 ## How the contract is established (ground truth)
 
@@ -66,6 +66,8 @@ v1.31.0 would return for the same execution lineage?"
 - [`excluded.md`](./excluded.md) — what is outside the surface (experimental/pre-release, internal,
   absent from v1.31.0), with reasons.
 - [`decisions.md`](./decisions.md) — surfaces present in v1.31.0 that are still under decision.
+- [`worker-versioning.md`](./worker-versioning.md) — the resolved Worker Versioning V1/V2 decision:
+  GA Worker Deployments only; the five deprecated RPCs conform as stock-default rejections.
 - [`configuration.md`](./configuration.md) — the complete v1.31.0 configuration surface (564 dynamic-config
   keys + the static YAML sections), captured as the denominator for triaging what tokeira must support.
 

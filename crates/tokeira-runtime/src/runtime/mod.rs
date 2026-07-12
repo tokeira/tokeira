@@ -76,7 +76,6 @@ use crate::{
         PendingUpdateTransport, UpdateLifecycleSnapshot, UpdateLifecycleStage, UpdateOutcome,
         UpdateRegistry, UpdateResolution, UpdateTransportResolution, UpdateWaitPolicy,
     },
-    versioning::VersioningRuleStore,
     wft_timeout::{
         WftTimeoutEntry, WftTimeoutKind, WftTimeoutScannerConfig, WftTimeoutTrackingState,
         run_wft_timeout_scanner,
@@ -232,8 +231,6 @@ pub struct TokeiraRuntime<R> {
     delivery_metrics: DeliveryMetrics,
     /// Runtime-local backlog fairness state.
     fairness_state: FairnessState,
-    /// Shared worker-versioning rules used by edge handlers and dispatch.
-    versioning_rule_store: Arc<VersioningRuleStore>,
     /// Optional durable Worker Deployment registry used for v2 routing decisions.
     worker_deployment_repository: Option<Arc<dyn WorkerDeploymentRepository>>,
     /// Background Nexus-timeout scanner task.
@@ -493,8 +490,8 @@ where
     /// lane executors backed by `repo`.
     ///
     /// This is the entry point of a constructor ladder: each `new_with_*`
-    /// overload fills in one more optional dependency (versioning, Nexus,
-    /// shard ownership, node endpoint) and delegates inward, so all paths
+    /// overload fills in one more optional dependency (Nexus, shard
+    /// ownership, node endpoint) and delegates inward, so all paths
     /// converge on `new_with_nexus_and_shards_and_endpoint`, the single place
     /// that actually wires brokers, lanes, and scanners.
     pub fn new(
@@ -505,39 +502,7 @@ where
         workflow_timeout_config: WorkflowTimeoutScannerConfig,
         backlog_config: BacklogConfig,
     ) -> Self {
-        let versioning_rule_store = Arc::new(VersioningRuleStore::default());
-        Self::new_with_versioning(
-            repo,
-            lane_count,
-            config,
-            timer_config,
-            workflow_timeout_config,
-            backlog_config,
-            versioning_rule_store,
-        )
-    }
-
-    pub fn new_with_config(repo: Arc<R>, runtime_config: RuntimeConfig) -> Self {
-        Self::new(
-            repo,
-            runtime_config.lane_count,
-            runtime_config.lane,
-            runtime_config.timer_scanner,
-            runtime_config.workflow_timeout_scanner,
-            runtime_config.backlog,
-        )
-    }
-
-    pub fn new_with_versioning(
-        repo: Arc<R>,
-        lane_count: usize,
-        config: LaneConfig,
-        timer_config: TimerScannerConfig,
-        workflow_timeout_config: WorkflowTimeoutScannerConfig,
-        backlog_config: BacklogConfig,
-        versioning_rule_store: Arc<VersioningRuleStore>,
-    ) -> Self {
-        Self::new_with_nexus_and_versioning(
+        Self::new_with_nexus(
             repo,
             lane_count,
             config,
@@ -549,7 +514,17 @@ where
             NexusEndpointRegistry::default(),
             Arc::new(NoopNexusHttpClient),
             NexusCompletionDeps::default(),
-            versioning_rule_store,
+        )
+    }
+
+    pub fn new_with_config(repo: Arc<R>, runtime_config: RuntimeConfig) -> Self {
+        Self::new(
+            repo,
+            runtime_config.lane_count,
+            runtime_config.lane,
+            runtime_config.timer_scanner,
+            runtime_config.workflow_timeout_scanner,
+            runtime_config.backlog,
         )
     }
 
@@ -566,36 +541,6 @@ where
         nexus_client: Arc<dyn NexusHttpClient>,
         nexus_completion: NexusCompletionDeps,
     ) -> Self {
-        Self::new_with_nexus_and_versioning(
-            repo,
-            lane_count,
-            config,
-            timer_config,
-            workflow_timeout_config,
-            backlog_config,
-            activity_timeout_config,
-            nexus_timeout_config,
-            nexus_registry,
-            nexus_client,
-            nexus_completion,
-            Arc::new(VersioningRuleStore::default()),
-        )
-    }
-
-    pub fn new_with_nexus_and_versioning(
-        repo: Arc<R>,
-        lane_count: usize,
-        config: LaneConfig,
-        timer_config: TimerScannerConfig,
-        workflow_timeout_config: WorkflowTimeoutScannerConfig,
-        backlog_config: BacklogConfig,
-        activity_timeout_config: ActivityTimeoutScannerConfig,
-        nexus_timeout_config: NexusTimeoutScannerConfig,
-        nexus_registry: NexusEndpointRegistry,
-        nexus_client: Arc<dyn NexusHttpClient>,
-        nexus_completion: NexusCompletionDeps,
-        versioning_rule_store: Arc<VersioningRuleStore>,
-    ) -> Self {
         Self::new_with_nexus_and_shards(
             repo,
             lane_count,
@@ -611,19 +556,17 @@ where
             1,
             IncarnationId::new().to_string(),
             true,
-            versioning_rule_store,
         )
     }
 
-    pub fn new_with_nexus_and_versioning_config(
+    pub fn new_with_nexus_config(
         repo: Arc<R>,
         runtime_config: RuntimeConfig,
         nexus_registry: NexusEndpointRegistry,
         nexus_client: Arc<dyn NexusHttpClient>,
         nexus_completion: NexusCompletionDeps,
-        versioning_rule_store: Arc<VersioningRuleStore>,
     ) -> Self {
-        Self::new_with_nexus_and_versioning(
+        Self::new_with_nexus(
             repo,
             runtime_config.lane_count,
             runtime_config.lane,
@@ -635,7 +578,6 @@ where
             nexus_registry,
             nexus_client,
             nexus_completion,
-            versioning_rule_store,
         )
     }
 
@@ -654,7 +596,6 @@ where
         shard_count: u32,
         owner_identity: String,
         seed_default_shard: bool,
-        versioning_rule_store: Arc<VersioningRuleStore>,
     ) -> Self {
         Self::new_with_nexus_and_shards_and_endpoint(
             repo,
@@ -672,7 +613,6 @@ where
             owner_identity,
             "127.0.0.1:0".to_owned(),
             seed_default_shard,
-            versioning_rule_store,
             None,
         )
     }
@@ -693,7 +633,6 @@ where
         owner_identity: String,
         node_endpoint: String,
         seed_default_shard: bool,
-        versioning_rule_store: Arc<VersioningRuleStore>,
         // Resolves originator namespace names for the External-endpoint outbound metric;
         // wired by the server bootstrap, `None` for the simpler constructors and tests.
         namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
@@ -753,7 +692,6 @@ where
                     completion_callback_tracking.clone(),
                     activity_tracking.clone(),
                     delivery_metrics.clone(),
-                    Some(versioning_rule_store.clone()),
                 )
                 .with_namespace_resolver(namespace_resolver.clone());
                 spawn_lane_with_id(
@@ -884,7 +822,6 @@ where
             completion_callback_tracking.clone(),
             activity_tracking.clone(),
             delivery_metrics.clone(),
-            Some(versioning_rule_store.clone()),
         )
         .with_namespace_resolver(namespace_resolver.clone());
         let completion_callback_scanner_cancel = CancellationToken::new();
@@ -942,14 +879,13 @@ where
             runtime_drain,
             owner_identity,
             node_endpoint,
-            versioning_rule_store,
             worker_deployment_repository: None,
         }
     }
 
     /// Attach a durable Worker Deployment registry, enabling version-aware
-    /// (v2) task routing. Without it the runtime falls back to the legacy
-    /// versioning-rule path; routing must not depend on this being present.
+    /// (v2) task routing. Without it traffic is dispatched unversioned;
+    /// routing must not depend on this being present.
     pub fn with_worker_deployment_repository(
         mut self,
         repository: Arc<dyn WorkerDeploymentRepository>,
@@ -1057,10 +993,6 @@ where
 
     pub fn heartbeat_store(&self) -> Arc<dyn HeartbeatStore> {
         self.heartbeat_store.clone()
-    }
-
-    pub fn versioning_rule_store(&self) -> Arc<VersioningRuleStore> {
-        self.versioning_rule_store.clone()
     }
 
     pub fn update_registry(&self) -> UpdateRegistry {
@@ -1489,7 +1421,6 @@ mod tests {
             WorkflowTimeoutViolation, evaluate_workflow_timeout, scan_workflow_timeouts_once,
             workflow_timeout_retry_state,
         },
-        versioning::{RedirectRule, VersioningMutation},
     };
     use tokeira_kernel::{
         CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback, Link, OnConflictOptions,
@@ -2008,7 +1939,6 @@ mod tests {
                 8,
                 "test-owner".to_string(),
                 true,
-                Arc::new(VersioningRuleStore::default()),
             );
             let run_key = RunKey(Uuid::from_u128(7));
             let lane_index = lane_index_for_run_key(run_key, runtime.lanes.len());
@@ -2040,7 +1970,6 @@ mod tests {
                 shard_count,
                 "test-owner".to_string(),
                 true,
-                Arc::new(VersioningRuleStore::default()),
             );
             let first = RunKey(Uuid::from_u128(3));
             let first_shard = shard_for(first, shard_count);
@@ -2080,7 +2009,6 @@ mod tests {
                 node_id.to_string(),
                 "127.0.0.1:7233".to_owned(),
                 true,
-                Arc::new(VersioningRuleStore::default()),
                 None,
             );
 
@@ -2257,7 +2185,6 @@ mod tests {
             CompletionCallbackTrackingState::default(),
             ActivityTrackingState::default(),
             DeliveryMetrics::new(),
-            None,
         );
         let queue = QueueKey {
             namespace_id: NamespaceId::new(),
@@ -2295,260 +2222,6 @@ mod tests {
         assert_eq!(task.0.run_key, run_key);
         assert_eq!(task.0.activity_id, "activity-1");
         assert_eq!(task.0.attempt, 2);
-    }
-
-    #[tokio::test]
-    async fn runtime_dispatch_publisher_applies_build_id_redirects() {
-        let workflow_broker = InMemoryBroker::default();
-        let activity_broker = InMemoryActivityBroker::default();
-        let repo = Arc::new(MockTimerRepo::from_responses(Vec::new()));
-        let versioning = Arc::new(VersioningRuleStore::default());
-        let namespace_id = NamespaceId::new();
-        let task_queue = TaskQueueName("workflow-q".to_string());
-        let token = versioning
-            .get_rules(namespace_id, &task_queue)
-            .conflict_token;
-        versioning
-            .apply_mutation(
-                namespace_id,
-                &task_queue,
-                token,
-                VersioningMutation::AddRedirectRule {
-                    rule: RedirectRule {
-                        source_build_id: "old".to_string(),
-                        target_build_id: "new".to_string(),
-                        create_time: OffsetDateTime::UNIX_EPOCH,
-                    },
-                },
-                OffsetDateTime::UNIX_EPOCH,
-            )
-            .unwrap();
-        let publisher = RuntimeDispatchPublisher::new(
-            workflow_broker.clone(),
-            activity_broker,
-            repo,
-            Arc::new(Mutex::new(Vec::new())),
-            1,
-            1,
-            Arc::new(NoopNexusHttpClient),
-            Arc::new(NoopNexusCompletionClient),
-            NexusCompletionRuntimeConfig::default(),
-            NexusEndpointRegistry::default(),
-            NexusTaskBroker::default(),
-            NexusTimeoutTrackingState::default(),
-            CompletionCallbackTrackingState::default(),
-            ActivityTrackingState::default(),
-            DeliveryMetrics::new(),
-            Some(versioning),
-        );
-        let original_queue = QueueKey {
-            namespace_id,
-            task_queue: task_queue.clone(),
-            task_kind: TaskKind::Workflow,
-            deployment: None,
-            build_id: Some(BuildId("old".to_string())),
-        };
-        let redirected_queue = QueueKey {
-            build_id: Some(BuildId("new".to_string())),
-            ..original_queue.clone()
-        };
-        let run_key = RunKey::new();
-
-        publisher
-            .publish(
-                run_key,
-                &[DispatchOp::EnqueueWorkflowTask {
-                    speculative: false,
-                    normal_task_queue: None,
-                    queue: original_queue,
-                    logical_seq: LogicalTaskSeq(1),
-                    sticky_preferred: None,
-                }],
-            )
-            .await
-            .unwrap();
-
-        let task = workflow_broker
-            .poll_workflow_task(
-                &redirected_queue,
-                &WorkerIdentity("worker-a".to_string()),
-                std::time::Duration::from_millis(5),
-            )
-            .await
-            .unwrap()
-            .expect("redirected workflow task should deliver");
-        let (task, _) = task.into_queued().expect("queued workflow task");
-        assert_eq!(task.run_key, run_key);
-        assert_eq!(task.queue.build_id, Some(BuildId("new".to_string())));
-    }
-
-    #[tokio::test]
-    async fn runtime_dispatch_publisher_skips_redirect_for_deployment_pinned_queue() {
-        let workflow_broker = InMemoryBroker::default();
-        let activity_broker = InMemoryActivityBroker::default();
-        let repo = Arc::new(MockTimerRepo::from_responses(Vec::new()));
-        let versioning = Arc::new(VersioningRuleStore::default());
-        let namespace_id = NamespaceId::new();
-        let task_queue = TaskQueueName("workflow-q".to_string());
-        let token = versioning
-            .get_rules(namespace_id, &task_queue)
-            .conflict_token;
-        versioning
-            .apply_mutation(
-                namespace_id,
-                &task_queue,
-                token,
-                VersioningMutation::AddRedirectRule {
-                    rule: RedirectRule {
-                        source_build_id: "old".to_string(),
-                        target_build_id: "new".to_string(),
-                        create_time: OffsetDateTime::UNIX_EPOCH,
-                    },
-                },
-                OffsetDateTime::UNIX_EPOCH,
-            )
-            .unwrap();
-        let publisher = RuntimeDispatchPublisher::new(
-            workflow_broker.clone(),
-            activity_broker,
-            repo,
-            Arc::new(Mutex::new(Vec::new())),
-            1,
-            1,
-            Arc::new(NoopNexusHttpClient),
-            Arc::new(NoopNexusCompletionClient),
-            NexusCompletionRuntimeConfig::default(),
-            NexusEndpointRegistry::default(),
-            NexusTaskBroker::default(),
-            NexusTimeoutTrackingState::default(),
-            CompletionCallbackTrackingState::default(),
-            ActivityTrackingState::default(),
-            DeliveryMetrics::new(),
-            Some(versioning),
-        );
-        let pinned_queue = QueueKey {
-            namespace_id,
-            task_queue,
-            task_kind: TaskKind::Workflow,
-            deployment: Some(DeploymentId("series-a".to_string())),
-            build_id: Some(BuildId("old".to_string())),
-        };
-        let redirected_queue = QueueKey {
-            build_id: Some(BuildId("new".to_string())),
-            ..pinned_queue.clone()
-        };
-
-        publisher
-            .publish(
-                RunKey::new(),
-                &[DispatchOp::EnqueueWorkflowTask {
-                    speculative: false,
-                    normal_task_queue: None,
-                    queue: pinned_queue.clone(),
-                    logical_seq: LogicalTaskSeq(1),
-                    sticky_preferred: None,
-                }],
-            )
-            .await
-            .unwrap();
-
-        let wrong = workflow_broker
-            .poll_workflow_task(
-                &redirected_queue,
-                &WorkerIdentity("worker-a".to_string()),
-                std::time::Duration::from_millis(5),
-            )
-            .await
-            .unwrap();
-        let right = workflow_broker
-            .poll_workflow_task(
-                &pinned_queue,
-                &WorkerIdentity("worker-a".to_string()),
-                std::time::Duration::from_millis(5),
-            )
-            .await
-            .unwrap();
-
-        assert!(wrong.is_none());
-        assert!(right.is_some());
-    }
-
-    #[tokio::test]
-    async fn runtime_dispatch_publisher_skips_redirect_for_unassigned_queue() {
-        let workflow_broker = InMemoryBroker::default();
-        let activity_broker = InMemoryActivityBroker::default();
-        let repo = Arc::new(MockTimerRepo::from_responses(Vec::new()));
-        let versioning = Arc::new(VersioningRuleStore::default());
-        let namespace_id = NamespaceId::new();
-        let task_queue = TaskQueueName("workflow-q".to_string());
-        let token = versioning
-            .get_rules(namespace_id, &task_queue)
-            .conflict_token;
-        versioning
-            .apply_mutation(
-                namespace_id,
-                &task_queue,
-                token,
-                VersioningMutation::AddRedirectRule {
-                    rule: RedirectRule {
-                        source_build_id: "old".to_string(),
-                        target_build_id: "new".to_string(),
-                        create_time: OffsetDateTime::UNIX_EPOCH,
-                    },
-                },
-                OffsetDateTime::UNIX_EPOCH,
-            )
-            .unwrap();
-        let publisher = RuntimeDispatchPublisher::new(
-            workflow_broker.clone(),
-            activity_broker,
-            repo,
-            Arc::new(Mutex::new(Vec::new())),
-            1,
-            1,
-            Arc::new(NoopNexusHttpClient),
-            Arc::new(NoopNexusCompletionClient),
-            NexusCompletionRuntimeConfig::default(),
-            NexusEndpointRegistry::default(),
-            NexusTaskBroker::default(),
-            NexusTimeoutTrackingState::default(),
-            CompletionCallbackTrackingState::default(),
-            ActivityTrackingState::default(),
-            DeliveryMetrics::new(),
-            Some(versioning),
-        );
-        let queue = QueueKey {
-            namespace_id,
-            task_queue,
-            task_kind: TaskKind::Workflow,
-            deployment: None,
-            build_id: None,
-        };
-
-        publisher
-            .publish(
-                RunKey::new(),
-                &[DispatchOp::EnqueueWorkflowTask {
-                    speculative: false,
-                    normal_task_queue: None,
-                    queue: queue.clone(),
-                    logical_seq: LogicalTaskSeq(1),
-                    sticky_preferred: None,
-                }],
-            )
-            .await
-            .unwrap();
-
-        let delivered = workflow_broker
-            .poll_workflow_task(
-                &queue,
-                &WorkerIdentity("worker-a".to_string()),
-                std::time::Duration::from_millis(5),
-            )
-            .await
-            .unwrap();
-
-        assert!(delivered.is_some());
     }
 
     #[test]

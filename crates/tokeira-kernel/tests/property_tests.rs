@@ -135,6 +135,8 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         status: ExecutionStatus::Running,
         transition_seq: TransitionSeq(7),
         last_event_id: 14,
+        external_payload_count: 0,
+        external_payload_size_bytes: 0,
         next_workflow_task_seq: LogicalTaskSeq(4),
         pending_workflow_task: None,
         previous_started_event_id: 0,
@@ -888,6 +890,7 @@ fn arb_workflow_versioning_info() -> impl Strategy<Value = WorkflowVersioningInf
                 version_transition,
                 revision_number,
                 continue_as_new_initial_versioning_behavior,
+                ..WorkflowVersioningInfo::default()
             },
         )
 }

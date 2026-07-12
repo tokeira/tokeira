@@ -81,8 +81,7 @@ use tokeira_runtime::{
     NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusEndpointSpec,
     NexusEndpointSpecTarget, NexusEndpointStore, NexusNamespaceResolver, RuntimeConfig,
     ScheduleEngineConfig, ScheduleStore, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime,
-    VersioningRuleStore, WorkflowTaskReportedProblem, reported_problem_from_state,
-    run_schedule_engine,
+    WorkflowTaskReportedProblem, reported_problem_from_state, run_schedule_engine,
 };
 use tokeira_storage::{
     InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
@@ -768,7 +767,6 @@ where
 
     // The runtime owns execution orchestration, scanners, brokers, and all
     // run-local in-memory coordination such as buffered consistent queries.
-    let versioning_rule_store = Arc::new(VersioningRuleStore::default());
     let schedule_store = Arc::new(ScheduleStore::default());
     let task_queue_config_store = Arc::new(InMemoryTaskQueueConfigStore::default());
     let mut runtime_config = RuntimeConfig::default();
@@ -846,7 +844,6 @@ where
         node_id.to_string(),
         node_endpoint.as_authority(),
         seed_default_shard,
-        versioning_rule_store.clone(),
         // Tag the External-endpoint outbound Nexus metric with the originator's
         // namespace name, resolved through the shared edge namespace cache.
         Some(Arc::new(CacheNexusNamespaceResolver {
@@ -898,7 +895,6 @@ where
     let _schedule_engine = run_schedule_engine(
         schedule_store.clone(),
         runtime.clone(),
-        versioning_rule_store.clone(),
         ScheduleEngineConfig::default(),
         background_cancel.clone(),
     );
@@ -982,7 +978,7 @@ where
     }
 
     let workflow_service =
-        WorkflowService::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+        WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
             runtime_adapter.clone(),
             resolver,
             visibility,
@@ -998,7 +994,6 @@ where
             long_polls,
             router,
             history_waits,
-            versioning_rule_store,
             worker_registry,
             runtime.heartbeat_store(),
             schedule_store,
@@ -1717,11 +1712,22 @@ where
                 // and problem identity live on the run, the threshold is read
                 // live at derive time (Tier 3.22 `DynamicConfigChanges`).
                 let reported_problem = reported_problem_from_state(&state);
+                let versioning_info = state.versioning_info.clone();
+                let most_recent_worker_version_stamp = versioning_info
+                    .as_ref()
+                    .and_then(|info| info.most_recent_worker_version_stamp.clone());
                 let mut search_attributes = state.search_attributes;
-                apply_reported_problem_search_attribute(
-                    &mut search_attributes,
-                    reported_problem,
-                );
+                apply_reported_problem_search_attribute(&mut search_attributes, reported_problem);
+                if let Some(build_ids) = versioning_info
+                    .as_ref()
+                    .map(|info| &info.build_id_search_attributes)
+                    .filter(|build_ids| !build_ids.is_empty())
+                {
+                    search_attributes.0.insert(
+                        "BuildIds".to_string(),
+                        tokeira_types::SearchAttrValue::KeywordList(build_ids.clone()),
+                    );
+                }
                 Ok(Some(WorkflowExecutionDescription {
                     namespace: namespace.to_string(),
                     workflow_id: state.workflow_id.0,
@@ -1868,8 +1874,10 @@ where
                         .map(|timeout| state.started_at + timeout),
                     cancel_requested: state.cancel_requested,
                     original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
-                    versioning_info: state.versioning_info.clone(),
+                    versioning_info: versioning_info
+                        .filter(|info| info.has_execution_versioning_info()),
                     worker_deployment_name: state.worker_deployment_name.clone(),
+                    most_recent_worker_version_stamp,
                     request_id_infos: state.request_id_infos.clone(),
                     external_payload_count,
                     external_payload_size_bytes,

@@ -33,7 +33,8 @@ use tokeira_edge::{
     },
 };
 use tokeira_kernel::{
-    WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, state::ParentClosePolicy,
+    FieldChange, MemoPatch, SearchAttributesPatch, WorkflowCommand, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy, state::ParentClosePolicy,
 };
 use tokeira_proto::{
     conversions::common::{
@@ -291,9 +292,36 @@ proptest! {
                 }
                 prop_assert_eq!(roundtrip, expected);
             }
+            WorkflowCommand::UpsertMemo(memo) => {
+                let proto = workflow_command_to_proto(&cmd).unwrap();
+                let roundtrip = proto_command_to_workflow_command(proto, "").unwrap();
+                let expected = WorkflowCommand::UpsertMemoPatch(MemoPatch(
+                    memo.0
+                        .iter()
+                        .map(|(key, value)| (key.clone(), FieldChange::Set(value.clone())))
+                        .collect(),
+                ));
+                prop_assert_eq!(roundtrip, expected);
+            }
+            WorkflowCommand::UpsertSearchAttributes(search_attributes) => {
+                let proto = workflow_command_to_proto(&cmd).unwrap();
+                let roundtrip = proto_command_to_workflow_command(proto, "").unwrap();
+                let expected = WorkflowCommand::UpsertSearchAttributesPatch(
+                    SearchAttributesPatch(
+                        search_attributes
+                            .0
+                            .iter()
+                            .map(|(key, value)| {
+                                (key.clone(), FieldChange::Set(value.clone()))
+                            })
+                            .collect(),
+                    ),
+                );
+                prop_assert_eq!(roundtrip, expected);
+            }
             WorkflowCommand::StartTimer { .. }
-            | WorkflowCommand::UpsertMemo(_)
-            | WorkflowCommand::UpsertSearchAttributes(_)
+            | WorkflowCommand::UpsertMemoPatch(_)
+            | WorkflowCommand::UpsertSearchAttributesPatch(_)
             | WorkflowCommand::CompleteWorkflow { .. }
             | WorkflowCommand::FailWorkflow { .. }
             | WorkflowCommand::CancelWorkflow { .. }
@@ -332,7 +360,8 @@ proptest! {
             }
             WorkflowCommand::UpdateCompleted { .. }
             | WorkflowCommand::UpdateRejected { .. }
-            | WorkflowCommand::RequestNewWorkflowTask => {
+            | WorkflowCommand::RequestNewWorkflowTask
+            | WorkflowCommand::InvalidSearchAttributes { .. } => {
                 prop_assert!(workflow_command_to_proto(&cmd).is_err());
             }
         }
@@ -350,7 +379,8 @@ proptest! {
             }
             WorkflowCommand::UpdateCompleted { .. }
             | WorkflowCommand::UpdateRejected { .. }
-            | WorkflowCommand::RequestNewWorkflowTask => {
+            | WorkflowCommand::RequestNewWorkflowTask
+            | WorkflowCommand::InvalidSearchAttributes { .. } => {
                 prop_assert!(workflow_command_to_proto(&cmd).is_err());
             }
             _ => {}
@@ -975,6 +1005,7 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                     .unwrap_or(OffsetDateTime::UNIX_EPOCH),
                 versioning_info: None,
                 worker_deployment_name: None,
+                most_recent_worker_version_stamp: None,
                 request_id_infos: std::collections::BTreeMap::new(),
                 external_payload_count: 0,
                 external_payload_size_bytes: 0,
@@ -1098,7 +1129,7 @@ fn arb_summary() -> impl Strategy<Value = WorkflowExecutionSummary> {
                 close_time,
             )| WorkflowExecutionSummary {
                 namespace,
-                workflow_id,
+                workflow_id: workflow_id.clone(),
                 run_id: RunId(Uuid::from_u128(run_id)),
                 workflow_type,
                 task_queue,
@@ -1110,6 +1141,10 @@ fn arb_summary() -> impl Strategy<Value = WorkflowExecutionSummary> {
                     .map(|secs| OffsetDateTime::from_unix_timestamp(secs).unwrap()),
                 history_length: 0,
                 state_transition_count: 0,
+                parent_workflow_id: None,
+                parent_run_id: None,
+                root_workflow_id: tokeira_types::WorkflowId(workflow_id),
+                root_run_id: RunId(Uuid::from_u128(run_id)),
                 memo: Default::default(),
                 search_attributes: Default::default(),
             },

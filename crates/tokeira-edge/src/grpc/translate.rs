@@ -28,7 +28,8 @@ use std::{collections::BTreeMap, time::Duration};
 use prost::Message as _;
 use time::OffsetDateTime;
 use tokeira_kernel::{
-    WorkflowCommand,
+    FieldChange, MemoPatch, SearchAttributesPatch, WorkerVersionStamp, WorkflowCommand,
+    WorkflowTaskWorkerVersion,
     state::{
         CallbackSpec as KernelCallbackSpec, CallbackState as KernelCallbackState,
         CallbackTrigger as KernelCallbackTrigger, CompletionCallback as KernelCompletionCallback,
@@ -41,11 +42,13 @@ use tokeira_proto::{
     conversions::{
         ProtoConversionError,
         common::{
-            failure_to_payload, headers_from_domain, headers_to_domain, memo_from_domain,
-            memo_to_domain, payload_from_domain, payload_to_domain, payload_to_failure,
-            payloads_from_domain, payloads_to_domain, search_attributes_from_domain,
-            search_attributes_to_domain, task_queue_from_domain, task_queue_to_domain,
-            to_proto_duration, to_proto_timestamp, workflow_execution_from_ids,
+            failure_to_payload, headers_from_domain, headers_to_domain, is_temporal_nil_payload,
+            memo_from_domain, memo_to_domain, payload_from_domain, payload_to_domain,
+            payload_to_failure, payloads_from_domain, payloads_to_domain,
+            search_attr_payload_to_domain, search_attr_value_to_payload,
+            search_attributes_from_domain, search_attributes_to_domain, task_queue_from_domain,
+            task_queue_to_domain, to_proto_duration, to_proto_timestamp,
+            workflow_execution_from_ids,
         },
     },
     enums,
@@ -59,12 +62,11 @@ use tokeira_proto::{
     workflowservice,
 };
 use tokeira_runtime::{
-    AssignmentRule, ComputeConfigScalingGroupUpdate, CreateDeployment, CreateVersion,
-    DeleteDeployment, DeleteVersion, DeploymentPage, DeploymentView, DescribeVersion,
-    ListDeployments, NewManagerIdentity, RedirectRule, ScheduleError, SetCurrent,
-    SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome,
-    TaskReachabilityType, UpdateComputeConfig, UpdateMetadata, ValidateComputeConfig,
-    VersionMetadataView, VersionView, VersioningMutation, VersioningRules, cron_initial_backoff,
+    ComputeConfigScalingGroupUpdate, CreateDeployment, CreateVersion, DeleteDeployment,
+    DeleteVersion, DeploymentPage, DeploymentView, DescribeVersion, ListDeployments,
+    NewManagerIdentity, ScheduleError, SetCurrent, SetCurrentOutcome, SetManager,
+    SetManagerOutcome, SetRamping, SetRampingOutcome, UpdateComputeConfig, UpdateMetadata,
+    ValidateComputeConfig, VersionMetadataView, VersionView, cron_initial_backoff,
 };
 use tokeira_storage::{
     BuildId as DeploymentBuildId, ComputeConfig, ComputeConfigScalingGroup, ComputeProvider,
@@ -548,12 +550,6 @@ fn activity_retry_classification(failure: &failure_proto::Failure) -> (Option<St
         cursor = current.cause.as_deref();
     }
     (None, false)
-}
-
-pub struct ParsedVersioningMutation {
-    pub mutation: VersioningMutation,
-    pub commit_build_id: Option<String>,
-    pub commit_force: bool,
 }
 
 fn retry_policy_to_domain(value: &tokeira_proto::common::RetryPolicy) -> RetryPolicy {
@@ -2322,13 +2318,27 @@ pub fn respond_completed_request_to_edge(
     let sticky = sticky_spec_from_attributes(req.sticky_attributes.as_ref())?;
 
     Ok(RespondWorkflowTaskCompletedRequest {
+        namespace: request_namespace,
         task_token: req.task_token,
         identity: req.identity,
         sdk_metadata: req.sdk_metadata.map(|metadata| metadata.encode_to_vec()),
         metering_metadata: req
             .metering_metadata
             .map(|metadata| metadata.encode_to_vec()),
-        worker_version: req.worker_version_stamp.map(|stamp| stamp.build_id),
+        worker_version: {
+            let stamp = req.worker_version_stamp.map(|stamp| WorkerVersionStamp {
+                build_id: stamp.build_id,
+                use_versioning: stamp.use_versioning,
+            });
+            if stamp.is_some() || !req.binary_checksum.is_empty() {
+                Some(WorkflowTaskWorkerVersion {
+                    binary_checksum: req.binary_checksum,
+                    stamp,
+                })
+            } else {
+                None
+            }
+        },
         versioning_behavior: versioning_behavior_from_proto(req.versioning_behavior)?,
         deployment_version,
         worker_deployment_name,
@@ -2736,11 +2746,44 @@ fn quote_visibility_value(value: &str) -> String {
 pub fn count_request_to_edge(
     req: workflowservice::CountWorkflowExecutionsRequest,
 ) -> Result<CountWorkflowExecutionsRequest, ProtoConversionError> {
+    let (query, group_by) = split_count_group_by(&req.query)?;
     Ok(CountWorkflowExecutionsRequest {
         namespace: req.namespace,
-        query: non_empty(req.query),
-        group_by: None,
+        query,
+        group_by,
     })
+}
+
+fn split_count_group_by(
+    query: &str,
+) -> Result<(Option<String>, Option<String>), ProtoConversionError> {
+    let upper = query.to_ascii_uppercase();
+    let group_start = upper
+        .find(" GROUP BY ")
+        .map(|index| (index, " GROUP BY ".len()))
+        .or_else(|| {
+            upper
+                .starts_with("GROUP BY ")
+                .then_some((0, "GROUP BY ".len()))
+        });
+    let Some((index, keyword_len)) = group_start else {
+        return Ok((non_empty(query.to_string()), None));
+    };
+    let field = query[index + keyword_len..].trim();
+    if field.contains(',') {
+        return Err(ProtoConversionError::InvalidArgument(
+            "'GROUP BY' clause supports only a single field".to_string(),
+        ));
+    }
+    if field != "ExecutionStatus" {
+        return Err(ProtoConversionError::InvalidArgument(
+            "'GROUP BY' clause is only supported for ExecutionStatus".to_string(),
+        ));
+    }
+    Ok((
+        non_empty(query[..index].trim().to_string()),
+        Some(field.to_string()),
+    ))
 }
 
 pub fn list_activity_request_to_edge(
@@ -3401,10 +3444,9 @@ pub fn count_response_to_proto(
             .groups
             .into_iter()
             .map(|group| AggregationGroup {
-                group_values: vec![tokeira_proto::common::Payload {
-                    data: group.value.into_bytes(),
-                    ..Default::default()
-                }],
+                group_values: vec![search_attr_value_to_payload(
+                    &tokeira_types::SearchAttrValue::Keyword(group.value),
+                )],
                 count: group.count,
             })
             .collect(),
@@ -4178,200 +4220,6 @@ pub fn signal_with_start_response_to_proto(
     }
 }
 
-pub fn versioning_mutation_from_proto(
-    operation: Option<workflowservice::update_worker_versioning_rules_request::Operation>,
-    now: OffsetDateTime,
-) -> Result<ParsedVersioningMutation, ProtoConversionError> {
-    use workflowservice::update_worker_versioning_rules_request::Operation;
-
-    let operation = operation.ok_or(ProtoConversionError::MissingField(
-        "UpdateWorkerVersioningRulesRequest.operation",
-    ))?;
-    let parsed = match operation {
-        Operation::InsertAssignmentRule(op) => ParsedVersioningMutation {
-            mutation: VersioningMutation::InsertAssignmentRule {
-                rule: assignment_rule_from_proto(op.rule, now)?,
-                index: op.rule_index.max(0) as usize,
-            },
-            commit_build_id: None,
-            commit_force: false,
-        },
-        Operation::ReplaceAssignmentRule(op) => ParsedVersioningMutation {
-            mutation: VersioningMutation::ReplaceAssignmentRule {
-                rule: assignment_rule_from_proto(op.rule, now)?,
-                index: op.rule_index.max(0) as usize,
-                force: op.force,
-            },
-            commit_build_id: None,
-            commit_force: false,
-        },
-        Operation::DeleteAssignmentRule(op) => ParsedVersioningMutation {
-            mutation: VersioningMutation::DeleteAssignmentRule {
-                index: op.rule_index.max(0) as usize,
-                force: op.force,
-            },
-            commit_build_id: None,
-            commit_force: false,
-        },
-        Operation::AddCompatibleRedirectRule(op) => ParsedVersioningMutation {
-            mutation: VersioningMutation::AddRedirectRule {
-                rule: redirect_rule_from_proto(op.rule, now)?,
-            },
-            commit_build_id: None,
-            commit_force: false,
-        },
-        Operation::ReplaceCompatibleRedirectRule(op) => {
-            let rule = redirect_rule_from_proto(op.rule, now)?;
-            ParsedVersioningMutation {
-                mutation: VersioningMutation::ReplaceRedirectRule {
-                    source_build_id: rule.source_build_id.clone(),
-                    rule,
-                },
-                commit_build_id: None,
-                commit_force: false,
-            }
-        }
-        Operation::DeleteCompatibleRedirectRule(op) => ParsedVersioningMutation {
-            mutation: VersioningMutation::DeleteRedirectRule {
-                source_build_id: op.source_build_id,
-            },
-            commit_build_id: None,
-            commit_force: false,
-        },
-        Operation::CommitBuildId(op) => ParsedVersioningMutation {
-            mutation: VersioningMutation::CommitBuildId {
-                build_id: op.target_build_id.clone(),
-            },
-            commit_build_id: Some(op.target_build_id),
-            commit_force: op.force,
-        },
-    };
-    Ok(parsed)
-}
-
-fn assignment_rule_from_proto(
-    rule: Option<taskqueue_proto::BuildIdAssignmentRule>,
-    now: OffsetDateTime,
-) -> Result<AssignmentRule, ProtoConversionError> {
-    let rule = rule.ok_or(ProtoConversionError::MissingField(
-        "BuildIdAssignmentRule.rule",
-    ))?;
-    let percentage_ramp = rule.ramp.map(|ramp| match ramp {
-        taskqueue_proto::build_id_assignment_rule::Ramp::PercentageRamp(ramp) => {
-            ramp.ramp_percentage
-        }
-    });
-    Ok(AssignmentRule {
-        target_build_id: rule.target_build_id,
-        percentage_ramp,
-        create_time: now,
-    })
-}
-
-fn redirect_rule_from_proto(
-    rule: Option<taskqueue_proto::CompatibleBuildIdRedirectRule>,
-    now: OffsetDateTime,
-) -> Result<RedirectRule, ProtoConversionError> {
-    let rule = rule.ok_or(ProtoConversionError::MissingField(
-        "CompatibleBuildIdRedirectRule.rule",
-    ))?;
-    Ok(RedirectRule {
-        source_build_id: rule.source_build_id,
-        target_build_id: rule.target_build_id,
-        create_time: now,
-    })
-}
-
-pub fn versioning_rules_to_update_proto(
-    rules: VersioningRules,
-) -> workflowservice::UpdateWorkerVersioningRulesResponse {
-    workflowservice::UpdateWorkerVersioningRulesResponse {
-        assignment_rules: assignment_rules_to_proto(&rules.assignment_rules),
-        compatible_redirect_rules: redirect_rules_to_proto(&rules.redirect_rules),
-        conflict_token: rules.conflict_token,
-    }
-}
-
-pub fn versioning_rules_to_get_proto(
-    rules: VersioningRules,
-) -> workflowservice::GetWorkerVersioningRulesResponse {
-    workflowservice::GetWorkerVersioningRulesResponse {
-        assignment_rules: assignment_rules_to_proto(&rules.assignment_rules),
-        compatible_redirect_rules: redirect_rules_to_proto(&rules.redirect_rules),
-        conflict_token: rules.conflict_token,
-    }
-}
-
-fn assignment_rules_to_proto(
-    rules: &[AssignmentRule],
-) -> Vec<taskqueue_proto::TimestampedBuildIdAssignmentRule> {
-    rules
-        .iter()
-        .map(|rule| taskqueue_proto::TimestampedBuildIdAssignmentRule {
-            rule: Some(taskqueue_proto::BuildIdAssignmentRule {
-                target_build_id: rule.target_build_id.clone(),
-                ramp: rule.percentage_ramp.map(|percentage| {
-                    taskqueue_proto::build_id_assignment_rule::Ramp::PercentageRamp(
-                        taskqueue_proto::RampByPercentage {
-                            ramp_percentage: percentage,
-                        },
-                    )
-                }),
-            }),
-            create_time: Some(to_proto_timestamp(rule.create_time)),
-        })
-        .collect()
-}
-
-fn redirect_rules_to_proto(
-    rules: &[RedirectRule],
-) -> Vec<taskqueue_proto::TimestampedCompatibleBuildIdRedirectRule> {
-    rules
-        .iter()
-        .map(
-            |rule| taskqueue_proto::TimestampedCompatibleBuildIdRedirectRule {
-                rule: Some(taskqueue_proto::CompatibleBuildIdRedirectRule {
-                    source_build_id: rule.source_build_id.clone(),
-                    target_build_id: rule.target_build_id.clone(),
-                }),
-                create_time: Some(to_proto_timestamp(rule.create_time)),
-            },
-        )
-        .collect()
-}
-
-pub fn reachability_to_proto(
-    results: Vec<tokeira_runtime::BuildIdReachabilityResult>,
-) -> workflowservice::GetWorkerTaskReachabilityResponse {
-    workflowservice::GetWorkerTaskReachabilityResponse {
-        build_id_reachability: results
-            .into_iter()
-            .map(|result| taskqueue_proto::BuildIdReachability {
-                build_id: result.build_id,
-                task_queue_reachability: result
-                    .task_queue_reachability
-                    .into_iter()
-                    .map(|queue| taskqueue_proto::TaskQueueReachability {
-                        task_queue: queue.task_queue.0,
-                        reachability: queue
-                            .reachability
-                            .into_iter()
-                            .map(|reachability| match reachability {
-                                TaskReachabilityType::NewWorkflows => {
-                                    enums::TaskReachability::NewWorkflows as i32
-                                }
-                                TaskReachabilityType::ExistingWorkflows => {
-                                    enums::TaskReachability::ExistingWorkflows as i32
-                                }
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-    }
-}
-
 fn is_close_event(event_type: i32) -> bool {
     use tokeira_proto::enums::EventType;
     matches!(
@@ -4392,6 +4240,44 @@ fn is_close_event(event_type: i32) -> bool {
 // with `namespace_id` (equivalent semantics) and moves `control` to a separate
 // `input_payload` shape; edge preserves both reads so v0.4-era SDK completions
 // that still send the old shape continue to dispatch correctly.
+#[allow(deprecated)]
+fn memo_patch_to_domain(value: &proto_common::Memo) -> MemoPatch {
+    MemoPatch(
+        value
+            .fields
+            .iter()
+            .map(|(key, payload)| {
+                let change = if is_temporal_nil_payload(payload) {
+                    FieldChange::Clear
+                } else {
+                    FieldChange::Set(payload_to_domain(payload))
+                };
+                (key.clone(), change)
+            })
+            .collect(),
+    )
+}
+
+fn search_attributes_patch_to_domain(
+    value: &proto_common::SearchAttributes,
+) -> Result<SearchAttributesPatch, ProtoConversionError> {
+    let mut patch = BTreeMap::new();
+    for (key, payload) in &value.indexed_fields {
+        if tokeira_types::is_banned_predefined_search_attribute(key) {
+            return Err(ProtoConversionError::InvalidArgument(format!(
+                "{key} attribute can't be set in SearchAttributes"
+            )));
+        }
+        let change = if is_temporal_nil_payload(payload) {
+            FieldChange::Clear
+        } else {
+            FieldChange::Set(search_attr_payload_to_domain(payload)?)
+        };
+        patch.insert(key.clone(), change);
+    }
+    Ok(SearchAttributesPatch(patch))
+}
+
 #[allow(deprecated)]
 pub fn proto_command_to_workflow_command(
     cmd: command::Command,
@@ -4452,21 +4338,21 @@ pub fn proto_command_to_workflow_command(
             })
         }
         Some(Attributes::UpsertWorkflowSearchAttributesCommandAttributes(attrs)) => {
-            Ok(WorkflowCommand::UpsertSearchAttributes(
+            Ok(WorkflowCommand::UpsertSearchAttributesPatch(
                 attrs
                     .search_attributes
                     .as_ref()
-                    .map(search_attributes_to_domain)
+                    .map(search_attributes_patch_to_domain)
                     .transpose()?
                     .unwrap_or_default(),
             ))
         }
         Some(Attributes::ModifyWorkflowPropertiesCommandAttributes(attrs)) => {
-            Ok(WorkflowCommand::UpsertMemo(
+            Ok(WorkflowCommand::UpsertMemoPatch(
                 attrs
                     .upserted_memo
                     .as_ref()
-                    .map(memo_to_domain)
+                    .map(memo_patch_to_domain)
                     .unwrap_or_default(),
             ))
         }
@@ -4703,6 +4589,46 @@ pub fn proto_command_to_workflow_command(
     }
 }
 
+fn deletion_payload() -> proto_common::Payload {
+    proto_common::Payload {
+        metadata: BTreeMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
+        data: b"null".to_vec(),
+        external_payloads: Vec::new(),
+    }
+}
+
+fn memo_patch_from_domain(value: &MemoPatch) -> proto_common::Memo {
+    proto_common::Memo {
+        fields: value
+            .0
+            .iter()
+            .filter_map(|(key, change)| match change {
+                FieldChange::Unchanged => None,
+                FieldChange::Set(payload) => Some((key.clone(), payload_from_domain(payload))),
+                FieldChange::Clear => Some((key.clone(), deletion_payload())),
+            })
+            .collect(),
+    }
+}
+
+fn search_attributes_patch_from_domain(
+    value: &SearchAttributesPatch,
+) -> proto_common::SearchAttributes {
+    proto_common::SearchAttributes {
+        indexed_fields: value
+            .0
+            .iter()
+            .filter_map(|(key, change)| match change {
+                FieldChange::Unchanged => None,
+                FieldChange::Set(attribute) => {
+                    Some((key.clone(), search_attr_value_to_payload(attribute)))
+                }
+                FieldChange::Clear => Some((key.clone(), deletion_payload())),
+            })
+            .collect(),
+    }
+}
+
 // v1.62-sync: writes deprecated `namespace` and `control` fields on outbound
 // `StartChildWorkflowExecutionCommandAttributes`,
 // `SignalExternalWorkflowExecutionCommandAttributes`, and
@@ -4777,6 +4703,20 @@ pub fn workflow_command_to_proto(
             Some(Attributes::ModifyWorkflowPropertiesCommandAttributes(
                 command::ModifyWorkflowPropertiesCommandAttributes {
                     upserted_memo: Some(memo_from_domain(memo)),
+                },
+            ))
+        }
+        WorkflowCommand::UpsertSearchAttributesPatch(patch) => {
+            Some(Attributes::UpsertWorkflowSearchAttributesCommandAttributes(
+                command::UpsertWorkflowSearchAttributesCommandAttributes {
+                    search_attributes: Some(search_attributes_patch_from_domain(patch)),
+                },
+            ))
+        }
+        WorkflowCommand::UpsertMemoPatch(patch) => {
+            Some(Attributes::ModifyWorkflowPropertiesCommandAttributes(
+                command::ModifyWorkflowPropertiesCommandAttributes {
+                    upserted_memo: Some(memo_patch_from_domain(patch)),
                 },
             ))
         }
@@ -4986,7 +4926,8 @@ pub fn workflow_command_to_proto(
         )),
         WorkflowCommand::UpdateCompleted { .. }
         | WorkflowCommand::UpdateRejected { .. }
-        | WorkflowCommand::RequestNewWorkflowTask => {
+        | WorkflowCommand::RequestNewWorkflowTask
+        | WorkflowCommand::InvalidSearchAttributes { .. } => {
             return Err(ProtoConversionError::MissingField(
                 "WorkflowCommand has no proto Command equivalent",
             ));
@@ -5043,6 +4984,12 @@ fn workflow_execution_info_from_description(
             .unwrap_or_default(),
         memo: Some(memo_from_domain(&value.memo)),
         search_attributes: Some(search_attributes_from_domain(&value.search_attributes)),
+        most_recent_worker_version_stamp: value.most_recent_worker_version_stamp.as_ref().map(
+            |stamp| proto_common::WorkerVersionStamp {
+                build_id: stamp.build_id.clone(),
+                use_versioning: stamp.use_versioning,
+            },
+        ),
         versioning_info: value
             .versioning_info
             .as_ref()
@@ -5098,6 +5045,11 @@ fn workflow_extended_info_to_proto(
 fn workflow_execution_info_from_summary(
     value: WorkflowExecutionSummary,
 ) -> workflow::WorkflowExecutionInfo {
+    let parent_execution = value
+        .parent_workflow_id
+        .as_ref()
+        .zip(value.parent_run_id)
+        .map(|(workflow_id, run_id)| workflow_execution_from_ids(workflow_id, run_id));
     workflow::WorkflowExecutionInfo {
         execution: Some(workflow_execution_from_ids(
             &WorkflowId(value.workflow_id),
@@ -5115,6 +5067,11 @@ fn workflow_execution_info_from_summary(
         state_transition_count: value.state_transition_count,
         memo: Some(memo_from_domain(&value.memo)),
         search_attributes: Some(search_attributes_from_domain(&value.search_attributes)),
+        parent_execution,
+        root_execution: Some(workflow_execution_from_ids(
+            &value.root_workflow_id,
+            value.root_run_id,
+        )),
         ..Default::default()
     }
 }
@@ -6235,7 +6192,6 @@ mod tests {
     use proptest::prelude::*;
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
-    use tokeira_runtime::{RedirectRule, VersioningRules};
     use tokeira_types::RunKey;
 
     #[test]
@@ -7209,6 +7165,53 @@ mod tests {
     }
 
     #[test]
+    fn workflow_task_upserts_preserve_null_as_per_key_clear() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("encoding".to_string(), b"json/plain".to_vec());
+        let command = command::Command {
+            attributes: Some(
+                command::command::Attributes::UpsertWorkflowSearchAttributesCommandAttributes(
+                    command::UpsertWorkflowSearchAttributesCommandAttributes {
+                        search_attributes: Some(proto_common::SearchAttributes {
+                            indexed_fields: BTreeMap::from([
+                                (
+                                    "remove".to_string(),
+                                    proto_common::Payload {
+                                        metadata: metadata.clone(),
+                                        data: b"null".to_vec(),
+                                        external_payloads: Vec::new(),
+                                    },
+                                ),
+                                (
+                                    "keep".to_string(),
+                                    proto_common::Payload {
+                                        metadata,
+                                        data: br#""value""#.to_vec(),
+                                        external_payloads: Vec::new(),
+                                    },
+                                ),
+                            ]),
+                        }),
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+
+        let converted = proto_command_to_workflow_command(command, "default").unwrap();
+        let WorkflowCommand::UpsertSearchAttributesPatch(patch) = converted else {
+            panic!("expected search-attribute patch");
+        };
+        assert_eq!(patch.0.get("remove"), Some(&FieldChange::Clear));
+        assert_eq!(
+            patch.0.get("keep"),
+            Some(&FieldChange::Set(tokeira_types::SearchAttrValue::Keyword(
+                "value".into()
+            )))
+        );
+    }
+
+    #[test]
     fn respond_completed_request_preserves_metering_sticky_and_worker_envelope() {
         let metering = proto_common::MeteringMetadata {
             nonfirst_local_activity_execution_attempts: 3,
@@ -7330,7 +7333,13 @@ mod tests {
         )
         .expect("deprecated fields should convert for back-compat");
 
-        assert_eq!(edge.worker_version.as_deref(), Some("legacy-build"));
+        assert_eq!(
+            edge.worker_version
+                .as_ref()
+                .and_then(|version| version.stamp.as_ref())
+                .map(|stamp| (stamp.build_id.as_str(), stamp.use_versioning)),
+            Some(("legacy-build", false))
+        );
         assert_eq!(
             edge.deployment_version
                 .as_ref()
@@ -7340,26 +7349,6 @@ mod tests {
         assert_eq!(
             edge.worker_deployment_name.as_deref(),
             Some("legacy-deployment")
-        );
-    }
-
-    #[test]
-    fn versioning_rules_proto_emits_redirect_create_time() {
-        let create_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(42);
-        let proto = versioning_rules_to_get_proto(VersioningRules {
-            assignment_rules: Vec::new(),
-            redirect_rules: vec![RedirectRule {
-                source_build_id: "old".to_string(),
-                target_build_id: "new".to_string(),
-                create_time,
-            }],
-            conflict_token: 7_u64.to_be_bytes().to_vec(),
-        });
-
-        assert_eq!(proto.compatible_redirect_rules.len(), 1);
-        assert_eq!(
-            proto.compatible_redirect_rules[0].create_time,
-            Some(to_proto_timestamp(create_time))
         );
     }
 
@@ -7662,6 +7651,7 @@ mod tests {
                         version_transition,
                         revision_number,
                         continue_as_new_initial_versioning_behavior,
+                        ..WorkflowVersioningInfo::default()
                     }
                 },
             )
@@ -7746,6 +7736,7 @@ mod tests {
             original_start_time: OffsetDateTime::UNIX_EPOCH,
             versioning_info: case.versioning_info.clone(),
             worker_deployment_name: case.worker_deployment_name.clone(),
+            most_recent_worker_version_stamp: None,
             request_id_infos: std::collections::BTreeMap::new(),
             external_payload_count: 0,
             external_payload_size_bytes: 0,

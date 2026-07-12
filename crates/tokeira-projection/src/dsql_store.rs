@@ -32,8 +32,9 @@ use crate::{
     types::{
         AttrDescriptor, AttrId, CompareOp, CompiledFilter, CountResult, ExecutionRow, FieldRef,
         FilterExpr, FilterValue, GroupByField, ListResult, PageBounds, PageToken, RollupCounter,
-        RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField, search_attr_type_of,
-        text_search_tokens, visibility_version_is_newer, workflow_status_from_keyword,
+        RollupDelta, RollupDimension, SearchAttrType, SortOrder, SystemField,
+        normalize_search_attr_value, search_attr_type_of, text_search_tokens,
+        visibility_version_is_newer, workflow_status_from_keyword,
     },
 };
 
@@ -588,20 +589,18 @@ impl ProjectionSink for DsqlVisibilityStore {
                 );
                 bail!("unknown search attribute: {name}");
             };
-            let actual = search_attr_type_of(value);
-            if attr.attr_type != actual {
-                projection_metrics::record_sink_error_with_kind(
-                    partition_id,
-                    tokeira_observability::ProjectionErrorKindLabel::Serialization,
-                );
-                bail!(
-                    "search attribute type mismatch for {name}: expected {:?}, got {:?}",
-                    attr.attr_type,
-                    actual
-                );
-            }
-            resolved_search_attrs.push((attr, value));
-            row.search_attributes.0.insert(name.clone(), value.clone());
+            let normalized = match normalize_search_attr_value(attr.attr_type, value) {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    projection_metrics::record_sink_error_with_kind(
+                        partition_id,
+                        tokeira_observability::ProjectionErrorKindLabel::Serialization,
+                    );
+                    bail!("search attribute {name}: {error}");
+                }
+            };
+            resolved_search_attrs.push((attr, normalized.clone()));
+            row.search_attributes.0.insert(name.clone(), normalized);
             row.search_attr_version += 1;
         }
 
@@ -1019,6 +1018,12 @@ fn collect_referenced_tables(expr: &FilterExpr, tables: &mut BTreeSet<&'static s
             collect_referenced_tables(lhs, tables)?;
             collect_referenced_tables(rhs, tables)?;
         }
+        FilterExpr::Not(expr) => collect_referenced_tables(expr, tables)?,
+        FilterExpr::IsNull { field } => {
+            if let FieldRef::Custom { attr_type, .. } = field {
+                tables.insert(index_table(*attr_type)?);
+            }
+        }
         FilterExpr::Compare { field, .. }
         | FilterExpr::In { field, .. }
         | FilterExpr::Between { field, .. }
@@ -1043,10 +1048,27 @@ fn compile_expr(expr: &FilterExpr, compiler: &mut SqlCompiler) -> Result<String>
             compile_expr(lhs, compiler)?,
             compile_expr(rhs, compiler)?
         )),
+        FilterExpr::Not(expr) => Ok(format!("NOT ({})", compile_expr(expr, compiler)?)),
+        FilterExpr::IsNull { field } => compile_is_null(field, compiler),
         FilterExpr::Compare { field, op, value } => compile_compare(field, *op, value, compiler),
         FilterExpr::In { field, values } => compile_in(field, values, compiler),
         FilterExpr::Between { field, low, high } => compile_between(field, low, high, compiler),
         FilterExpr::StartsWith { field, prefix } => compile_starts_with(field, prefix, compiler),
+    }
+}
+
+fn compile_is_null(field: &FieldRef, compiler: &mut SqlCompiler) -> Result<String> {
+    match field {
+        FieldRef::System(field) => Ok(format!("{} IS NULL", system_column(*field))),
+        FieldRef::Custom { attr_id, .. } => {
+            let attr = compiler.push(SqlValue::Int(i64_from_u64(
+                attr_id.0,
+                "search attribute id",
+            )?));
+            Ok(format!(
+                "NOT EXISTS (SELECT 1 FROM {ATTR_INDEX_TABLE} idx WHERE idx.namespace_id = execution_visibility_current.namespace_id AND idx.run_key = execution_visibility_current.run_key AND idx.attr_id = {attr})"
+            ))
+        }
     }
 }
 

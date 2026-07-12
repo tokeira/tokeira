@@ -29,7 +29,7 @@ does not support or cannot yet populate, along with rationale.
 | Original `ScheduleSpec.calendar` / `cron_string` | Not round-tripped | Inputs are compiled to `structured_calendar` before storage |
 | `NewWorkflowExecutionInfo.header` | Not supported | Schedule action headers are not modeled internally |
 | `NewWorkflowExecutionInfo.user_metadata` | Not supported | SDK user metadata is not threaded to scheduled starts |
-| `NewWorkflowExecutionInfo.versioning_override` | Not supported | Scheduled starts use assignment rule evaluation; pinned overrides are rejected |
+| `NewWorkflowExecutionInfo.versioning_override` | Not supported | Scheduled starts are unversioned (deprecated v0.2 assignment rules are gated off per docs/conformance/v1.31.0/worker-versioning.md); pinned overrides are rejected |
 
 ## RespondWorkflowTaskCompletedRequest
 

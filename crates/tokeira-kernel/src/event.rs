@@ -7,8 +7,9 @@ use tokeira_types::{
 
 use crate::{
     command::{
-        ContinueAsNewInitiator, ExternalWorkflowExecution, FieldChange, NexusTimeoutType,
-        RetryState, WorkflowTaskFailedCause, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+        ContinueAsNewInitiator, ExternalWorkflowExecution, FieldChange, MemoPatch,
+        NexusTimeoutType, RetryState, SearchAttributesPatch, WorkflowTaskFailedCause,
+        WorkflowTaskTimeoutType, WorkflowTaskWorkerVersion, WorkflowTimeoutType,
     },
     state::{
         CompletionCallback, Link, ParentClosePolicy, Priority, UserMetadata, VersioningBehavior,
@@ -29,6 +30,49 @@ pub struct HistoryEvent {
     pub happened_at: OffsetDateTime,
     /// Semantic content of the event.
     pub kind: HistoryEventKind,
+}
+
+/// Count external-payload references and declared bytes in one history event.
+///
+/// v1.31.0 visits every payload in an event while explicitly skipping search
+/// attributes (`CalculateExternalPayloadSize`,
+/// `service/history/workflow/external_payload_size.go @ v1.31.0`). Walking the
+/// serde tree keeps this fold complete as payload-bearing event variants grow:
+/// domain [`tokeira_types::Payload`] is the only type that emits an
+/// `external_payloads` array, while typed search attributes never do.
+pub fn external_payload_stats_for_event(event: &HistoryEvent) -> (i64, i64) {
+    fn walk(value: &serde_json::Value, count: &mut i64, size: &mut i64) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Array(details)) = map.get("external_payloads") {
+                    for detail in details {
+                        if let Some(bytes) =
+                            detail.get("size_bytes").and_then(|value| value.as_i64())
+                        {
+                            *count += 1;
+                            *size += bytes;
+                        }
+                    }
+                }
+                for entry in map.values() {
+                    walk(entry, count, size);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, count, size);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut count = 0;
+    let mut size = 0;
+    if let Ok(value) = serde_json::to_value(event) {
+        walk(&value, &mut count, &mut size);
+    }
+    (count, size)
 }
 
 /// Discriminant for the semantic content of a history event.
@@ -173,7 +217,7 @@ pub enum HistoryEventKind {
         sdk_metadata: Option<Vec<u8>>,
         #[serde(default)]
         metering_metadata: Option<Vec<u8>>,
-        worker_version: Option<String>,
+        worker_version: Option<WorkflowTaskWorkerVersion>,
         #[serde(default)]
         versioning_behavior: VersioningBehavior,
         #[serde(default)]
@@ -743,6 +787,25 @@ pub enum HistoryEventKind {
         update_id: String,
         update_name: String,
         input: Payloads,
+    },
+    /// A completed workflow task merged a per-key memo patch.
+    ///
+    /// Appended because history kinds use positional postcard discriminants.
+    /// This maps to Temporal's `WorkflowPropertiesModified` event
+    /// (`CreateWorkflowPropertiesModifiedEvent`, event_factory.go @ v1.31.0).
+    WorkflowPropertiesModified {
+        workflow_task_completed_event_id: i64,
+        patch: MemoPatch,
+    },
+    /// A completed workflow task merged a per-key search-attribute patch.
+    ///
+    /// Appended for postcard compatibility and mapped to Temporal's
+    /// `UpsertWorkflowSearchAttributes` event
+    /// (`CreateUpsertWorkflowSearchAttributesEvent`, event_factory.go @
+    /// v1.31.0).
+    UpsertWorkflowSearchAttributes {
+        workflow_task_completed_event_id: i64,
+        patch: SearchAttributesPatch,
     },
 }
 

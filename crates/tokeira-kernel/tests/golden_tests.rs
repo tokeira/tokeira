@@ -8,20 +8,21 @@ use tokeira_kernel::{
     ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
     CompletionCallbackAttemptedRequest, DispatchOp, ExternalCancelResolvedRequest,
     ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, FieldChange, LoadedRun, NexusOperationResolvedRequest,
+    ExternalWorkflowExecution, FieldChange, LoadedRun, MemoPatch, NexusOperationResolvedRequest,
     NexusOperationRetryRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
     PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
     PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp,
-    Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState, SignalRequest,
-    SignalWithStartRequest, StartDeploymentTransitionRequest, StartRequest,
+    Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState, SearchAttributesPatch,
+    SignalRequest, SignalWithStartRequest, StartDeploymentTransitionRequest, StartRequest,
     StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest, TerminateRequest,
     TimerDueRequest, TimerState, Transition, UnpauseActivityRequest, UnpauseWorkflowRequest,
     UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
     VersioningBehavior, VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID,
-    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-    WorkflowStartDelayElapsedRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    WorkerDeploymentVersionRef, WorkerVersionStamp, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTaskWorkerVersion,
+    WorkflowTimeoutType,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -234,6 +235,8 @@ fn make_open_state() -> WorkflowState {
         status: ExecutionStatus::Running,
         transition_seq: TransitionSeq(5),
         last_event_id: 9,
+        external_payload_count: 0,
+        external_payload_size_bytes: 0,
         next_workflow_task_seq: LogicalTaskSeq(4),
         pending_workflow_task: None,
         previous_started_event_id: 0,
@@ -367,7 +370,13 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 identity: worker,
                 sdk_metadata: None,
                 metering_metadata: None,
-                worker_version: None,
+                worker_version: Some(WorkflowTaskWorkerVersion {
+                    binary_checksum: "legacy-checksum".into(),
+                    stamp: Some(WorkerVersionStamp {
+                        build_id: "1.0".into(),
+                        use_versioning: false,
+                    }),
+                }),
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
@@ -385,6 +394,20 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
     assert_eq!(state.transition_seq, TransitionSeq::ZERO);
     assert_eq!(state.last_event_id, 4);
     assert_eq!(state.started_at, started_at);
+    let versioning = state
+        .versioning_info
+        .expect("legacy worker version summary");
+    assert_eq!(
+        versioning.build_id_search_attributes,
+        vec!["unversioned", "unversioned:1.0"]
+    );
+    assert_eq!(
+        versioning.most_recent_worker_version_stamp,
+        Some(WorkerVersionStamp {
+            build_id: "1.0".into(),
+            use_versioning: false,
+        })
+    );
 }
 
 #[test]
@@ -2761,6 +2784,7 @@ fn start_deployment_transition_rejects_pinned_workflow() {
         revision_number: 7,
         continue_as_new_initial_versioning_behavior:
             tokeira_kernel::ContinueAsNewVersioningBehavior::Unspecified,
+        ..tokeira_kernel::WorkflowVersioningInfo::default()
     });
     let before = state.clone();
 
@@ -4804,6 +4828,167 @@ fn record_marker_missing_name_fails_wft() {
         Err(Reject::InvalidCommandAttributes {
             cause: tokeira_kernel::WorkflowTaskFailedCause::BadRecordMarkerAttributes,
             message: Some("MarkerName is not set on RecordMarkerCommand.".to_string()),
+        })
+    );
+}
+
+#[test]
+fn workflow_property_and_search_attribute_patches_record_merge_and_replay() {
+    let start = make_start_request();
+    let replay_context = replay_context_from_start(&start);
+    let started = kernel()
+        .apply(LoadedRun::Absent, Command::Start(start))
+        .unwrap();
+    let mut history = started.history_events.clone();
+    let pending = started.next_state.pending_workflow_task.clone().unwrap();
+    let task_started = kernel()
+        .apply(
+            LoadedRun::Existing(started.next_state),
+            Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                logical_seq: pending.logical_seq,
+                worker_identity: WorkerIdentity("worker".into()),
+                request_id: "start-patches".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
+                deployment_transition: None,
+                deployment_transition_revision_number: None,
+                sticky_ttl: None,
+                now: now(),
+            }),
+        )
+        .unwrap();
+    history.extend(task_started.history_events.clone());
+    let pending = task_started
+        .next_state
+        .pending_workflow_task
+        .clone()
+        .unwrap();
+    let memo_patch = MemoPatch(BTreeMap::from([
+        ("memo".into(), FieldChange::Clear),
+        ("new-memo".into(), FieldChange::Set(payload("new-value"))),
+    ]));
+    let search_patch = SearchAttributesPatch(BTreeMap::from([
+        ("keyword".into(), FieldChange::Clear),
+        (
+            "text".into(),
+            FieldChange::Set(SearchAttrValue::Text("searchable".into())),
+        ),
+    ]));
+    let completed = kernel()
+        .apply(
+            LoadedRun::Existing(task_started.next_state.clone()),
+            Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                client_discards_speculative_with_events: false,
+                token: WorkflowTaskToken {
+                    run_key: task_started.next_state.run_key,
+                    logical_seq: pending.logical_seq,
+                    started_event_id: pending.started_event_id.unwrap(),
+                    attempt: pending.attempt,
+                    shard_epoch: ShardEpoch::ZERO,
+                },
+                identity: WorkerIdentity("worker".into()),
+                sdk_metadata: None,
+                metering_metadata: None,
+                worker_version: None,
+                versioning_behavior: VersioningBehavior::Unspecified,
+                deployment_version: None,
+                worker_deployment_name: None,
+                sticky: None,
+                commands: vec![
+                    WorkflowCommand::UpsertMemoPatch(memo_patch.clone()),
+                    WorkflowCommand::UpsertSearchAttributesPatch(search_patch.clone()),
+                ],
+                force_new_workflow_task: false,
+                delivered_update_ids: Vec::new(),
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        completed.history_events.as_slice(),
+        [
+            HistoryEvent {
+                kind: HistoryEventKind::WorkflowTaskCompleted { .. },
+                ..
+            },
+            HistoryEvent {
+                kind: HistoryEventKind::WorkflowPropertiesModified { .. },
+                ..
+            },
+            HistoryEvent {
+                kind: HistoryEventKind::UpsertWorkflowSearchAttributes { .. },
+                ..
+            }
+        ]
+    ));
+    assert!(!completed.next_state.memo.0.contains_key("memo"));
+    assert_eq!(
+        completed.next_state.memo.0.get("new-memo"),
+        Some(&payload("new-value"))
+    );
+    assert!(
+        !completed
+            .next_state
+            .search_attributes
+            .0
+            .contains_key("keyword")
+    );
+    assert_eq!(
+        completed.next_state.search_attributes.0.get("text"),
+        Some(&SearchAttrValue::Text("searchable".into()))
+    );
+
+    history.extend(completed.history_events);
+    let replayed = kernel()
+        .replay_history_prefix(replay_context, &history)
+        .unwrap();
+    assert_eq!(replayed.memo, completed.next_state.memo);
+    assert_eq!(
+        replayed.search_attributes,
+        completed.next_state.search_attributes
+    );
+}
+
+#[test]
+fn invalid_search_attribute_uses_bad_search_attributes_failure_cause() {
+    let state = make_open_state_with_started_wft();
+    let result = kernel().apply(
+        LoadedRun::Existing(state.clone()),
+        Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
+            token: WorkflowTaskToken {
+                run_key: state.run_key,
+                logical_seq: LogicalTaskSeq(3),
+                started_event_id: 9,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            identity: WorkerIdentity("worker".into()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![WorkflowCommand::InvalidSearchAttributes {
+                message: "Namespace default has no mapping defined for search attribute INVALIDKEY"
+                    .into(),
+            }],
+            force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
+            now: now(),
+        }),
+    );
+
+    assert_eq!(
+        result,
+        Err(Reject::InvalidCommandAttributes {
+            cause: WorkflowTaskFailedCause::BadSearchAttributes,
+            message: Some(
+                "Namespace default has no mapping defined for search attribute INVALIDKEY".into()
+            ),
         })
     );
 }

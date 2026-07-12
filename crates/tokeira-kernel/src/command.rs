@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
     BuildId, DeploymentId, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads,
-    RequestContext, RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName, WorkerIdentity,
-    WorkflowId, WorkflowTaskToken, WorkflowType,
+    RequestContext, RetryPolicy, RunId, RunKey, SearchAttrValue, SearchAttributes, TaskQueueName,
+    WorkerIdentity, WorkflowId, WorkflowTaskToken, WorkflowType,
 };
 
 use crate::{
@@ -164,6 +166,23 @@ pub enum FieldChange<T> {
     Clear,
 }
 
+/// Per-key patch applied to a workflow memo by a completed workflow task.
+///
+/// Temporal treats a JSON-null payload as deletion and otherwise merges each
+/// supplied key into the existing memo (`payload.MergeMapOfPayload`,
+/// `common/payload/payload.go @ v1.31.0`). Keeping the three-way change in the
+/// authoritative command preserves that distinction through history and replay.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemoPatch(pub BTreeMap<String, FieldChange<Payload>>);
+
+/// Per-key patch applied to workflow search attributes by a completed task.
+///
+/// The patch is persisted on `UpsertWorkflowSearchAttributes`; replay applies
+/// the same set/delete operations rather than treating an upsert as replacement
+/// (`updateSearchAttributes`, `mutable_state_impl.go @ v1.31.0`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SearchAttributesPatch(pub BTreeMap<String, FieldChange<SearchAttrValue>>);
+
 /// Reason a workflow task was rejected by the server.
 ///
 /// The kernel records this in the `WorkflowTaskFailed` history
@@ -255,6 +274,9 @@ pub enum WorkflowTaskFailedCause {
     /// TestContinueAsNewWithInternalTaskQueue_Blocked). Appended LAST per the
     /// postcard positional discipline above.
     BadContinueAsNewAttributes,
+    /// `RespondWorkflowTaskCompleted` carried an unknown or otherwise invalid
+    /// search attribute. Appended to preserve postcard discriminants.
+    BadSearchAttributes,
 }
 
 impl WorkflowTaskFailedCause {
@@ -287,6 +309,7 @@ impl WorkflowTaskFailedCause {
             Self::BadUpdateWorkflowExecutionMessage => "BadUpdateWorkflowExecutionMessage",
             Self::BadStartChildExecutionAttributes => "BadStartChildExecutionAttributes",
             Self::BadContinueAsNewAttributes => "BadContinueAsNewAttributes",
+            Self::BadSearchAttributes => "BadSearchAttributes",
         }
     }
 }
@@ -933,6 +956,29 @@ pub enum RetryContinuation {
     },
 }
 
+/// Deprecated structured worker-version stamp reported by an SDK.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerVersionStamp {
+    /// SDK build identifier.
+    pub build_id: String,
+    /// Whether the worker opted into deprecated build-ID routing.
+    pub use_versioning: bool,
+}
+
+/// Legacy worker-build metadata retained on a workflow-task completion.
+///
+/// v1.31.0 persists both fields on the completed event. Keeping the stamp
+/// separate from `binary_checksum` preserves the distinction when an older SDK
+/// supplies only the checksum (`history/v1/message.proto`,
+/// `WorkflowTaskCompletedEventAttributes` fields 4-5).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTaskWorkerVersion {
+    /// Deprecated binary checksum supplied by older SDKs.
+    pub binary_checksum: String,
+    /// Deprecated structured worker-version stamp, when supplied.
+    pub stamp: Option<WorkerVersionStamp>,
+}
+
 /// Request from a worker that has finished processing a
 /// workflow task and is returning a batch of commands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -954,9 +1000,9 @@ pub struct WorkflowTaskCompletedRequest {
     /// Raw encoded Temporal metering metadata from the completion request.
     #[serde(default)]
     pub metering_metadata: Option<Vec<u8>>,
-    /// Build ID from the worker version stamp, when reported by the SDK.
+    /// Deprecated worker build metadata reported by the SDK.
     #[serde(default)]
-    pub worker_version: Option<String>,
+    pub worker_version: Option<WorkflowTaskWorkerVersion>,
     /// Versioning behavior reported by the worker that completed this task.
     #[serde(default)]
     pub versioning_behavior: VersioningBehavior,
@@ -1512,4 +1558,23 @@ pub enum WorkflowCommand {
     /// Explicitly request a new workflow task even when no
     /// other command requires one.
     RequestNewWorkflowTask,
+    /// Merge a per-key memo patch and record `WorkflowPropertiesModified`.
+    ///
+    /// Appended instead of changing [`Self::UpsertMemo`] because workflow
+    /// commands are postcard-persisted; the legacy replacement variant remains
+    /// decode-compatible for previously written transitions.
+    UpsertMemoPatch(MemoPatch),
+    /// Merge a per-key search-attribute patch and record
+    /// `UpsertWorkflowSearchAttributes`.
+    ///
+    /// Appended for the same positional-encoding reason as
+    /// [`Self::UpsertMemoPatch`].
+    UpsertSearchAttributesPatch(SearchAttributesPatch),
+    /// Fail the workflow task through the normal invalid-command seam after
+    /// edge validation finds an invalid search attribute.
+    ///
+    /// Validation depends on the namespace registry and therefore remains at
+    /// the compatibility edge; this sentinel lets the pure kernel author the
+    /// durable v1.31.0 failure event atomically with WFT rescheduling.
+    InvalidSearchAttributes { message: String },
 }

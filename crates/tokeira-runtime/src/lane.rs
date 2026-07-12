@@ -1702,6 +1702,8 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         HistoryEventKind::WorkflowExecutionUpdateAdmitted { .. } => {
             "WorkflowExecutionUpdateAdmitted"
         }
+        HistoryEventKind::WorkflowPropertiesModified { .. } => "WorkflowPropertiesModified",
+        HistoryEventKind::UpsertWorkflowSearchAttributes { .. } => "UpsertWorkflowSearchAttributes",
         HistoryEventKind::WorkflowExecutionUpdateCompleted { .. } => {
             "WorkflowExecutionUpdateCompleted"
         }
@@ -2586,6 +2588,8 @@ mod tests {
             status: ExecutionStatus::Running,
             transition_seq: DurableTransitionSeq::ZERO,
             last_event_id: 0,
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq::ONE,
             pending_workflow_task: Some(PendingWorkflowTask {
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,

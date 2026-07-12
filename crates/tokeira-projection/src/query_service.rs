@@ -293,8 +293,17 @@ fn map_summary(row: crate::types::ExecutionRow) -> WorkflowExecutionSummary {
         close_time: row.close_time,
         history_length: row.history_length,
         state_transition_count: row.state_transition_count,
+        parent_workflow_id: row.parent_workflow_id,
+        parent_run_id: row.parent_run_id,
+        root_workflow_id: row.root_workflow_id,
+        root_run_id: row.root_run_id,
         memo: row.memo,
-        search_attributes: SearchAttributes::default(),
+        // The projection row carries the complete post-transition image. List
+        // APIs return it just as Describe does; dropping it here made indexed
+        // filtering succeed while the matching execution's public payload was
+        // empty (`ListWorkflowExecutions` response construction,
+        // visibility_manager_impl.go @ v1.31.0).
+        search_attributes: row.search_attributes,
     }
 }
 

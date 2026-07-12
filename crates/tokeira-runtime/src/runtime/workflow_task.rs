@@ -26,7 +26,7 @@ use tokeira_storage::{
 };
 use tokeira_types::WorkflowId;
 
-use crate::{timeout::WorkflowTimeoutEntry, versioning::deterministic_bucket};
+use crate::timeout::WorkflowTimeoutEntry;
 
 /// Workflow-task routing target computed from durable run state plus registry config.
 ///
@@ -132,6 +132,17 @@ fn routing_config_target(
         return Some(version_key_to_ref(ramping));
     }
     Some(version_key_to_ref(current))
+}
+
+/// Stable per-workflow-id bucket in `[0, 9999]` for ramp splits.
+fn deterministic_bucket(value: &str) -> u64 {
+    // FNV-1a is stable across processes, unlike DefaultHasher's seeded state.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash % 10_000
 }
 
 fn version_key_to_ref(version: &WorkerDeploymentVersionKey) -> WorkerDeploymentVersionRef {
@@ -1783,6 +1794,8 @@ pub(crate) mod tests {
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq(1),
             last_event_id: 1,
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: None,
             previous_started_event_id: 0,
@@ -1850,6 +1863,7 @@ pub(crate) mod tests {
                 revision_number: 7,
                 continue_as_new_initial_versioning_behavior:
                     ContinueAsNewVersioningBehavior::Unspecified,
+                ..WorkflowVersioningInfo::default()
             }),
             VersioningCase::OverridePinned => Some(WorkflowVersioningInfo {
                 behavior: VersioningBehavior::AutoUpgrade,
@@ -1861,6 +1875,7 @@ pub(crate) mod tests {
                 revision_number: 8,
                 continue_as_new_initial_versioning_behavior:
                     ContinueAsNewVersioningBehavior::Unspecified,
+                ..WorkflowVersioningInfo::default()
             }),
             VersioningCase::OverrideAutoUpgrade => Some(WorkflowVersioningInfo {
                 behavior: VersioningBehavior::Pinned,
@@ -1870,6 +1885,7 @@ pub(crate) mod tests {
                 revision_number: 9,
                 continue_as_new_initial_versioning_behavior:
                     ContinueAsNewVersioningBehavior::Unspecified,
+                ..WorkflowVersioningInfo::default()
             }),
             VersioningCase::BehaviorPinned => Some(WorkflowVersioningInfo {
                 behavior: VersioningBehavior::Pinned,
@@ -1879,6 +1895,7 @@ pub(crate) mod tests {
                 revision_number: 10,
                 continue_as_new_initial_versioning_behavior:
                     ContinueAsNewVersioningBehavior::Unspecified,
+                ..WorkflowVersioningInfo::default()
             }),
             VersioningCase::BehaviorAutoUpgrade => Some(WorkflowVersioningInfo {
                 behavior: VersioningBehavior::AutoUpgrade,
@@ -1888,6 +1905,7 @@ pub(crate) mod tests {
                 revision_number: 11,
                 continue_as_new_initial_versioning_behavior:
                     ContinueAsNewVersioningBehavior::Unspecified,
+                ..WorkflowVersioningInfo::default()
             }),
             VersioningCase::Unversioned => None,
         }
@@ -1995,6 +2013,7 @@ pub(crate) mod tests {
                 revision_number: 100,
                 continue_as_new_initial_versioning_behavior:
                     ContinueAsNewVersioningBehavior::Unspecified,
+                ..WorkflowVersioningInfo::default()
             }),
         );
         let target = resolve_workflow_task_target_version(&routing, &already_effective);
@@ -2018,6 +2037,7 @@ pub(crate) mod tests {
                 revision_number: 100,
                 continue_as_new_initial_versioning_behavior:
                     ContinueAsNewVersioningBehavior::Unspecified,
+                ..WorkflowVersioningInfo::default()
             }),
         );
         let target = resolve_workflow_task_target_version(&routing, &pinned);

@@ -15,17 +15,19 @@
 // them is required for v1.31.0 history compatibility.
 #![allow(deprecated)]
 
+use std::collections::BTreeMap;
+
 use prost::Message;
 use tokeira_kernel::{
-    command::FieldChange,
+    command::{FieldChange, MemoPatch, SearchAttributesPatch},
     event::{HistoryEvent, HistoryEventKind},
     state::{VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef},
 };
 use tokeira_proto::{
     conversions::common::{
         headers_from_domain, memo_from_domain, payload_from_domain, payload_to_failure,
-        payloads_from_domain, search_attributes_from_domain, task_queue_from_domain,
-        to_opt_proto_duration, to_proto_duration, to_proto_timestamp,
+        payloads_from_domain, search_attr_value_to_payload, search_attributes_from_domain,
+        task_queue_from_domain, to_opt_proto_duration, to_proto_duration, to_proto_timestamp,
     },
     enums, history,
     public::temporal::api::{
@@ -51,6 +53,44 @@ pub fn serialize_history(events: &[HistoryEvent]) -> Vec<u8> {
 /// meaningful to clients rather than tied to an internal storage codec.
 pub fn serialized_history_size_bytes(events: &[HistoryEvent]) -> i64 {
     i64::try_from(history_to_proto(events).encoded_len()).unwrap_or(i64::MAX)
+}
+
+fn deletion_payload() -> proto_common::Payload {
+    proto_common::Payload {
+        metadata: BTreeMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
+        data: b"null".to_vec(),
+        external_payloads: Vec::new(),
+    }
+}
+
+fn memo_patch_to_proto(patch: &MemoPatch) -> proto_common::Memo {
+    proto_common::Memo {
+        fields: patch
+            .0
+            .iter()
+            .filter_map(|(key, change)| match change {
+                FieldChange::Unchanged => None,
+                FieldChange::Set(payload) => Some((key.clone(), payload_from_domain(payload))),
+                FieldChange::Clear => Some((key.clone(), deletion_payload())),
+            })
+            .collect(),
+    }
+}
+
+fn search_attributes_patch_to_proto(
+    patch: &SearchAttributesPatch,
+) -> proto_common::SearchAttributes {
+    proto_common::SearchAttributes {
+        indexed_fields: patch
+            .0
+            .iter()
+            .filter_map(|(key, change)| match change {
+                FieldChange::Unchanged => None,
+                FieldChange::Set(value) => Some((key.clone(), search_attr_value_to_payload(value))),
+                FieldChange::Clear => Some((key.clone(), deletion_payload())),
+            })
+            .collect(),
+    }
 }
 
 fn history_to_proto(events: &[HistoryEvent]) -> history::History {
@@ -359,6 +399,10 @@ fn event_type_for_kind(kind: &HistoryEventKind) -> i32 {
         }
         HistoryEventKind::WorkflowExecutionUpdateAdmitted { .. } => {
             E::WorkflowExecutionUpdateAdmitted
+        }
+        HistoryEventKind::WorkflowPropertiesModified { .. } => E::WorkflowPropertiesModified,
+        HistoryEventKind::UpsertWorkflowSearchAttributes { .. } => {
+            E::UpsertWorkflowSearchAttributes
         }
         HistoryEventKind::WorkflowExecutionUpdateCompleted { .. }
         | HistoryEventKind::WorkflowExecutionUpdateCompletedV2 { .. } => {
@@ -746,11 +790,18 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 metering_metadata: metering_metadata
                     .as_ref()
                     .and_then(|bytes| proto_common::MeteringMetadata::decode(bytes.as_slice()).ok()),
-                worker_version: worker_version.as_ref().map(|build_id| {
-                    proto_common::WorkerVersionStamp {
-                        build_id: build_id.clone(),
-                        ..Default::default()
-                    }
+                binary_checksum: worker_version
+                    .as_ref()
+                    .map(|version| version.binary_checksum.clone())
+                    .unwrap_or_default(),
+                worker_version: worker_version.as_ref().and_then(|version| {
+                    version
+                        .stamp
+                        .as_ref()
+                        .map(|stamp| proto_common::WorkerVersionStamp {
+                            build_id: stamp.build_id.clone(),
+                            use_versioning: stamp.use_versioning,
+                        })
                 }),
                 versioning_behavior: versioning_behavior_to_proto(*versioning_behavior),
                 deployment_version: deployment_version.as_ref().map(deployment_version_to_proto),
@@ -1558,6 +1609,24 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 origin: tokeira_proto::enums::UpdateAdmittedEventOrigin::Reapply as i32,
             },
         ),
+        HistoryEventKind::WorkflowPropertiesModified {
+            workflow_task_completed_event_id,
+            patch,
+        } => Attributes::WorkflowPropertiesModifiedEventAttributes(
+            history::WorkflowPropertiesModifiedEventAttributes {
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
+                upserted_memo: Some(memo_patch_to_proto(patch)),
+            },
+        ),
+        HistoryEventKind::UpsertWorkflowSearchAttributes {
+            workflow_task_completed_event_id,
+            patch,
+        } => Attributes::UpsertWorkflowSearchAttributesEventAttributes(
+            history::UpsertWorkflowSearchAttributesEventAttributes {
+                workflow_task_completed_event_id: *workflow_task_completed_event_id,
+                search_attributes: Some(search_attributes_patch_to_proto(patch)),
+            },
+        ),
         HistoryEventKind::WorkflowExecutionUpdateCompleted {
             update_id,
             result,
@@ -1779,6 +1848,7 @@ fn wft_failed_cause_i32(c: &WorkflowTaskFailedCause) -> i32 {
         WorkflowTaskFailedCause::BadStartChildExecutionAttributes => {
             C::BadStartChildExecutionAttributes
         }
+        WorkflowTaskFailedCause::BadSearchAttributes => C::BadSearchAttributes,
     }) as i32
 }
 

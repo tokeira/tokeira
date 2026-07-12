@@ -13,7 +13,7 @@ use tokeira_kernel::{
 use tokeira_runtime::{
     ActivityTimeoutScannerConfig, BacklogConfig, LaneConfig, NexusCompletionDeps,
     NexusEndpointRegistry, NexusTimeoutScannerConfig, NoopNexusHttpClient, TimerScannerConfig,
-    TokeiraRuntime, VersioningRuleStore, WorkflowTimeoutScannerConfig,
+    TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -1040,7 +1040,6 @@ fn recovering_runtime_with_store(store: Arc<InMemoryStore>) -> TokeiraRuntime<In
         1,
         "restart-test-owner".to_string(),
         false,
-        Arc::new(VersioningRuleStore::default()),
     )
 }
 

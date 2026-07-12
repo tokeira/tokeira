@@ -28,8 +28,8 @@ use tokeira_runtime::{
     BufferedQueryRegistry, DeleteWorkflowRequest, InMemoryBroker, JobId, LaneConfig,
     PendingUpdateTransport, QueryResult, ResetWorkflowResult, ScheduleStore, SignalWithStartResult,
     StartWorkflowResult, TimerScannerConfig, TokeiraRuntime, UpdateLifecycleSnapshot,
-    UpdateTransportResolution, UpdateWaitPolicy, VersioningRuleStore, WorkerRegistry,
-    WorkflowDeletion, WorkflowExecutionRef, WorkflowTimeoutScannerConfig,
+    UpdateTransportResolution, UpdateWaitPolicy, WorkerRegistry, WorkflowDeletion,
+    WorkflowExecutionRef, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{InMemoryStore, ProjectionContext, ProjectionRecord};
 use tokeira_types::{
@@ -441,7 +441,7 @@ async fn build_service(
         .insert(ResolvedNamespace::active("default"))
         .await
         .expect("namespace insert");
-    WorkflowService::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+    WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
         runtime,
         Arc::new(InMemoryExecutionResolver::new()),
         visibility,
@@ -457,7 +457,6 @@ async fn build_service(
         LongPollGate::new(LongPollConfig::default()),
         Arc::new(LocalOnlyRouter),
         tokeira_edge::HistoryWaitRegistry::default(),
-        Arc::new(VersioningRuleStore::default()),
         WorkerRegistry::default(),
         Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
         Arc::new(ScheduleStore::default()),
@@ -935,6 +934,10 @@ async fn run_batch_operation_uses_visibility_pagination() {
                 close_time: None,
                 history_length: 0,
                 state_transition_count: 0,
+                parent_workflow_id: None,
+                parent_run_id: None,
+                root_workflow_id: tokeira_types::WorkflowId(wf1.workflow_id.clone()),
+                root_run_id: RunId(uuid::Uuid::parse_str(wf1.run_id.as_deref().unwrap()).unwrap()),
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
             }],
@@ -953,6 +956,10 @@ async fn run_batch_operation_uses_visibility_pagination() {
                 close_time: None,
                 history_length: 0,
                 state_transition_count: 0,
+                parent_workflow_id: None,
+                parent_run_id: None,
+                root_workflow_id: tokeira_types::WorkflowId(wf2.workflow_id.clone()),
+                root_run_id: RunId(uuid::Uuid::parse_str(wf2.run_id.as_deref().unwrap()).unwrap()),
                 memo: Memo::default(),
                 search_attributes: SearchAttributes::default(),
             }],

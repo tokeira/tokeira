@@ -15,9 +15,7 @@ use tokeira_kernel::{
     BasicKernel, Command, DispatchOp, LoadedRun, PendingWorkflowTask, StartWorkflowTaskRequest,
     VersioningBehavior, WorkflowState, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
     WorkflowTaskFailedRequest, WorkflowTaskProblem, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType,
-    event::HistoryEventKind,
-    kernel::Kernel,
+    WorkflowTaskTimeoutType, event::HistoryEventKind, kernel::Kernel,
 };
 use tokeira_types::{
     ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, RunId, RunKey, SearchAttributes,
@@ -48,6 +46,8 @@ fn open_state() -> WorkflowState {
         status: ExecutionStatus::Running,
         transition_seq: TransitionSeq(5),
         last_event_id: 9,
+        external_payload_count: 0,
+        external_payload_size_bytes: 0,
         next_workflow_task_seq: LogicalTaskSeq(4),
         pending_workflow_task: None,
         previous_started_event_id: 0,
@@ -163,7 +163,9 @@ fn non_sticky_attempt1_failure_counts_and_records_cause() {
         .unwrap();
 
     assert_eq!(
-        transition.next_state.workflow_task_attempts_since_last_success,
+        transition
+            .next_state
+            .workflow_task_attempts_since_last_success,
         1
     );
     assert_eq!(
@@ -202,7 +204,9 @@ fn transient_failure_counts_without_touching_recorded_cause() {
     // v1.31.0 only rewrites `LastWorkflowTaskFailure` when the event is
     // emitted (workflow_task_state_machine.go:907-911 @ v1.31.0).
     assert_eq!(
-        transition.next_state.workflow_task_attempts_since_last_success,
+        transition
+            .next_state
+            .workflow_task_attempts_since_last_success,
         2
     );
     assert_eq!(
@@ -230,7 +234,9 @@ fn sticky_failure_counts_nothing_and_retries_fresh_attempt1() {
     // sticky rule suppresses only the increments
     // (workflow_task_state_machine.go:1010-1027 @ v1.31.0).
     assert_eq!(
-        transition.next_state.workflow_task_attempts_since_last_success,
+        transition
+            .next_state
+            .workflow_task_attempts_since_last_success,
         0
     );
     assert_eq!(
@@ -279,7 +285,9 @@ fn start_to_close_timeout_counts_like_a_failure() {
         .unwrap();
 
     assert_eq!(
-        transition.next_state.workflow_task_attempts_since_last_success,
+        transition
+            .next_state
+            .workflow_task_attempts_since_last_success,
         1
     );
     assert_eq!(
@@ -316,7 +324,9 @@ fn transient_timeout_counts_but_preserves_attempt1_failure_cause() {
         .unwrap();
 
     assert_eq!(
-        transition.next_state.workflow_task_attempts_since_last_success,
+        transition
+            .next_state
+            .workflow_task_attempts_since_last_success,
         2
     );
     assert_eq!(
@@ -345,7 +355,9 @@ fn sticky_start_to_close_timeout_counts_nothing_and_resets_attempt() {
         .unwrap();
 
     assert_eq!(
-        transition.next_state.workflow_task_attempts_since_last_success,
+        transition
+            .next_state
+            .workflow_task_attempts_since_last_success,
         0
     );
     assert!(transition.next_state.sticky.is_none());
@@ -382,7 +394,9 @@ fn schedule_to_start_timeout_never_counts() {
     // (`ApplyWorkflowTaskTimedOutEvent`,
     // workflow_task_state_machine.go:263-268 @ v1.31.0).
     assert_eq!(
-        transition.next_state.workflow_task_attempts_since_last_success,
+        transition
+            .next_state
+            .workflow_task_attempts_since_last_success,
         0
     );
     assert_eq!(transition.next_state.last_workflow_task_problem, None);
@@ -425,7 +439,9 @@ fn completion_clears_count_and_recorded_problem() {
     // cause on success (workflow_task_state_machine.go:838-846,
     // mutable_state_impl.go:6530-6541 @ v1.31.0).
     assert_eq!(
-        transition.next_state.workflow_task_attempts_since_last_success,
+        transition
+            .next_state
+            .workflow_task_attempts_since_last_success,
         0
     );
     assert_eq!(transition.next_state.last_workflow_task_problem, None);

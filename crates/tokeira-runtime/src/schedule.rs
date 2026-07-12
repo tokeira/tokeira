@@ -23,13 +23,13 @@ use tokeira_kernel::{
 use tokeira_projection::filter::compile_schedule_filter;
 use tokeira_storage::RunRepository;
 use tokeira_types::{
-    BuildId, ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payloads, RequestContext, RequestId,
-    RunId, RunKey, SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
+    ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payloads, RequestContext, RequestId, RunId,
+    RunKey, SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{StartWorkflowResult, TokeiraRuntime, VersioningRuleStore};
+use crate::{StartWorkflowResult, TokeiraRuntime};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ScheduleId(pub String);
@@ -333,19 +333,37 @@ impl ScheduleStore {
         namespace_id: NamespaceId,
         page_size: usize,
         page_token: &[u8],
-    ) -> (Vec<ScheduleEntry>, Option<Vec<u8>>) {
+        query: Option<&str>,
+    ) -> Result<(Vec<ScheduleEntry>, Option<Vec<u8>>), ScheduleCountError> {
+        let filter = query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(compile_schedule_filter)
+            .transpose()
+            .map_err(|_| ScheduleCountError::UnsupportedQuery)?;
         let mut entries: Vec<_> = self
             .schedules
             .iter()
             .filter(|entry| entry.key().0 == namespace_id)
             .map(|entry| entry.value().clone())
+            .filter(|schedule| {
+                filter.as_ref().is_none_or(|filter| {
+                    filter.matches(
+                        &schedule.schedule_id.0,
+                        schedule.namespace_id,
+                        schedule.state.paused,
+                        &schedule.state.notes,
+                        &schedule.search_attributes,
+                    )
+                })
+            })
             .collect();
         entries.sort_by(|a, b| a.schedule_id.cmp(&b.schedule_id));
         let start = (decode_page_token(page_token).unwrap_or(0) as usize).min(entries.len());
         let limit = page_size.max(1);
         let end = (start + limit).min(entries.len());
         let next = (end < entries.len()).then(|| encode_token(end as u64));
-        (entries[start..end].to_vec(), next)
+        Ok((entries[start..end].to_vec(), next))
     }
 
     pub fn count(&self, namespace_id: NamespaceId) -> usize {
@@ -917,7 +935,6 @@ fn div_floor(lhs: i128, rhs: i128) -> i128 {
 pub fn run_schedule_engine<R>(
     store: Arc<ScheduleStore>,
     runtime: Arc<TokeiraRuntime<R>>,
-    versioning_rules: Arc<VersioningRuleStore>,
     config: ScheduleEngineConfig,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()>
@@ -932,7 +949,7 @@ where
                 _ = cancel.cancelled() => break,
                 _ = ticker.tick() => {
                     let now = OffsetDateTime::now_utc();
-                    evaluate_all_schedules(&store, runtime.as_ref(), versioning_rules.as_ref(), last_tick, now).await;
+                    evaluate_all_schedules(&store, runtime.as_ref(), last_tick, now).await;
                     last_tick = now;
                 }
             }
@@ -961,7 +978,6 @@ impl Default for ScheduleEngineConfig {
 pub async fn evaluate_all_schedules<R>(
     store: &ScheduleStore,
     runtime: &TokeiraRuntime<R>,
-    versioning_rules: &VersioningRuleStore,
     last_tick: OffsetDateTime,
     now: OffsetDateTime,
 ) where
@@ -975,7 +991,6 @@ pub async fn evaluate_all_schedules<R>(
             handle_due_action(
                 store,
                 runtime,
-                versioning_rules,
                 entry.namespace_id,
                 &schedule_id,
                 nominal_time,
@@ -996,7 +1011,6 @@ pub async fn evaluate_all_schedules<R>(
 pub async fn handle_due_action<R>(
     store: &ScheduleStore,
     runtime: &TokeiraRuntime<R>,
-    versioning_rules: &VersioningRuleStore,
     namespace_id: NamespaceId,
     schedule_id: &ScheduleId,
     nominal_time: OffsetDateTime,
@@ -1027,7 +1041,6 @@ pub async fn handle_due_action<R>(
             let _ = trigger_schedule_action(
                 store,
                 runtime,
-                versioning_rules,
                 namespace_id,
                 schedule_id,
                 nominal_time,
@@ -1072,7 +1085,6 @@ pub async fn handle_due_action<R>(
             let _ = trigger_schedule_action(
                 store,
                 runtime,
-                versioning_rules,
                 namespace_id,
                 schedule_id,
                 nominal_time,
@@ -1132,7 +1144,6 @@ where
             handle_due_action(
                 store,
                 runtime,
-                &runtime.versioning_rule_store(),
                 entry.namespace_id,
                 &entry.schedule_id,
                 buffered.nominal_time,
@@ -1154,7 +1165,6 @@ where
 pub async fn trigger_schedule_action<R>(
     store: &ScheduleStore,
     runtime: &TokeiraRuntime<R>,
-    versioning_rules: &VersioningRuleStore,
     namespace_id: NamespaceId,
     schedule_id: &ScheduleId,
     nominal_time: OffsetDateTime,
@@ -1171,11 +1181,6 @@ where
     );
     let run_id = RunId::new();
     let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
-    let build_id: Option<BuildId> = versioning_rules.evaluate_assignment(
-        namespace_id,
-        &entry.action.start_workflow.task_queue,
-        &workflow_id,
-    );
     let request = StartRequest {
         run_key,
         namespace_id,
@@ -1200,7 +1205,7 @@ where
         // A Schedule action starts a fresh execution (Initiator UNSPECIFIED).
         initiator: None,
         deployment: None,
-        build_id,
+        build_id: None,
         versioning_override: None,
         workflow_start_delay: None,
         completion_callbacks: Vec::new(),
@@ -1393,6 +1398,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use tokeira_storage::{InMemoryStore, RunRepository};
+    use tokeira_types::SearchAttrValue;
 
     fn make_runtime(store: Arc<InMemoryStore>) -> TokeiraRuntime<InMemoryStore> {
         TokeiraRuntime::new(
@@ -1470,6 +1476,38 @@ mod tests {
         assert_eq!(stored.info.buffer_size, 0);
         assert!(stored.info.running_workflows.is_empty());
         assert!(stored.info.recent_actions.is_empty());
+    }
+
+    #[test]
+    fn list_filters_before_pagination_and_prefers_custom_schedule_id() {
+        let store = ScheduleStore::new();
+        let system = sample_entry("system-id");
+        let namespace_id = system.namespace_id;
+        store.create(system).expect("create system schedule");
+
+        let mut custom = sample_entry("different-system-id");
+        custom.namespace_id = namespace_id;
+        custom.search_attributes.0.insert(
+            "ScheduleId".to_owned(),
+            SearchAttrValue::Keyword("custom-value".to_owned()),
+        );
+        store.create(custom).expect("create custom schedule");
+
+        let (system_matches, _) = store
+            .list(namespace_id, 1, &[], Some("ScheduleId = 'system-id'"))
+            .expect("system query");
+        assert_eq!(system_matches[0].schedule_id.0, "system-id");
+
+        let (custom_matches, next_page_token) = store
+            .list(
+                namespace_id,
+                1,
+                &[],
+                Some("ScheduleId IN ('custom-value', 'other')"),
+            )
+            .expect("custom query");
+        assert_eq!(custom_matches[0].schedule_id.0, "different-system-id");
+        assert!(next_page_token.is_none());
     }
 
     #[test]
@@ -1760,7 +1798,6 @@ mod tests {
         handle_due_action(
             &store,
             &runtime,
-            &VersioningRuleStore::default(),
             namespace_id,
             &schedule_id,
             OffsetDateTime::UNIX_EPOCH,
@@ -1790,7 +1827,6 @@ mod tests {
         handle_due_action(
             &store,
             &runtime,
-            &VersioningRuleStore::default(),
             namespace_id,
             &schedule_id,
             OffsetDateTime::UNIX_EPOCH,
@@ -1821,7 +1857,6 @@ mod tests {
         handle_due_action(
             &store,
             &runtime,
-            &VersioningRuleStore::default(),
             namespace_id,
             &schedule_id,
             OffsetDateTime::UNIX_EPOCH,
@@ -1877,7 +1912,6 @@ mod tests {
         trigger_schedule_action(
             &store,
             &runtime,
-            &VersioningRuleStore::default(),
             namespace_id,
             &schedule_id,
             OffsetDateTime::UNIX_EPOCH,
@@ -1913,7 +1947,6 @@ mod tests {
         evaluate_all_schedules(
             &store,
             &runtime,
-            &VersioningRuleStore::default(),
             OffsetDateTime::UNIX_EPOCH,
             OffsetDateTime::UNIX_EPOCH + Duration::seconds(60),
         )

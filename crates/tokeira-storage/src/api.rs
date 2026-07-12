@@ -21,9 +21,9 @@ use tokeira_kernel::{
 };
 use tokeira_types::{
     ArchetypeId, ExecutionRef, ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload,
-    Payloads, ProjectionCursor, QueueKey, RequestId, RunId, RunKey, SearchAttributes, ShardEpoch,
-    ShardId, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkerIdentity, WorkflowId,
-    WorkflowType,
+    Payloads, ProjectionCursor, QueueKey, RequestId, RunId, RunKey, SearchAttrValue,
+    SearchAttributes, ShardEpoch, ShardId, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
+    WorkerIdentity, WorkflowId, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -1094,6 +1094,37 @@ fn projection_context(
     let execution_duration = state
         .closed_at
         .map(|closed_at| (closed_at - state.started_at).whole_nanoseconds() as i64);
+    let search_attributes = if redact_user_data {
+        SearchAttributes::default()
+    } else {
+        let mut search_attributes = state.search_attributes.clone();
+        if let Some(build_ids) = state
+            .versioning_info
+            .as_ref()
+            .map(|info| &info.build_id_search_attributes)
+            .filter(|build_ids| !build_ids.is_empty())
+        {
+            // BuildIds is server-managed visibility state, not a user SA and
+            // not part of continue-as-new inheritance. Project it from the
+            // history-derived per-run summary (`updateBuildIdsAndDeploymentSearchAttributes`,
+            // mutable_state_impl.go @ v1.31.0).
+            search_attributes.0.insert(
+                "BuildIds".to_owned(),
+                SearchAttrValue::KeywordList(build_ids.clone()),
+            );
+        }
+        if state.external_payload_count > 0 {
+            search_attributes.0.insert(
+                "TemporalExternalPayloadCount".to_owned(),
+                SearchAttrValue::Int(state.external_payload_count),
+            );
+            search_attributes.0.insert(
+                "TemporalExternalPayloadSizeBytes".to_owned(),
+                SearchAttrValue::Int(state.external_payload_size_bytes),
+            );
+        }
+        search_attributes
+    };
 
     Ok(ProjectionContext {
         archetype_id: ArchetypeId::WORKFLOW,
@@ -1133,11 +1164,7 @@ fn projection_context(
         } else {
             state.memo.clone()
         },
-        search_attributes: if redact_user_data {
-            SearchAttributes::default()
-        } else {
-            state.search_attributes.clone()
-        },
+        search_attributes,
     })
 }
 

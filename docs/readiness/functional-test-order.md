@@ -56,7 +56,7 @@ dependency then cost.
 
 | # | Suite | Exercises |
 |---|-------|-----------|
-| 23 | `TestVisibilityTestSuite`, `TestWorkflowVisibilityTestSuite` | List/Count, basic query surface. |
+| 23 | `TestWorkflowVisibilityTestSuite` | List/Count, basic query surface. |
 | 24 | `TestAdvancedVisibilitySuite` | ORDER BY / BETWEEN / STARTS_WITH / keyword IN / null close-time. |
 | 25 | `TestWorkflowMemoTestSuite` | Memo round-trip. |
 | 26 | `TestWorkflowAliasSearchAttributeTestSuite` | Search-attribute aliasing. |
@@ -119,8 +119,14 @@ Do not run as conformance gates until the owning decision lands.
 
 | Suite | Blocked on |
 |-------|-----------|
-| `TestVersioningFunctionalSuite` | Worker-versioning V1/V2 — TBD (`decisions.md`). |
 | `TestPrioritySuite`, `TestFairnessSuite`, `TestFairnessAutoEnableSuite` | Task Queue Priority & Fairness — architecture research (`delivery.md`). |
+
+`TestVersioningFunctionalSuite` (406 tests) is no longer deferred — it is **out of surface** by the
+resolved V1/V2 decision (`docs/conformance/v1.31.0/worker-versioning.md`): the suite only passes
+against stock after flipping non-default dynamic config
+(`frontend.workerVersioningDataAPIs`/`frontend.workerVersioningRuleAPIs`), a surface a
+default-configuration v1.31.0 server refuses and tokeira, by design, does not expose. The five V1/V2
+RPCs conform as stock-default `PERMISSION_DENIED` rejections instead.
 
 ## Out of public scope — do not run
 
@@ -133,7 +139,7 @@ Reason in parentheses; see [`excluded.md`](../conformance/v1.31.0/excluded.md).
   `TestNexusRequestForwardingTestSuite`, `TestNexusStateReplicationTestSuite`,
   `TestFuncClustersTestSuite`, `TestFuncClustersWithRedirectionTestSuite`,
   `TestScheduleMigrationTestSuite`, `TestCallbacksMigrationSuite`,
-  `TestWorkflowTaskReportedProblemsReplicationSuite` (all `tests/xdc/`, `tests/ndc/`).
+  `TestWorkflowTaskReportedProblemsReplicationSuite`, `TestVisibilityTestSuite` (all `tests/xdc/`, `tests/ndc/`).
 - **Admin / DLQ / internal task** (internal): `TestAddTasksSuite`,
   `TestAdminBatchRefreshWorkflowTasksTestSuite`, `TestDLQSuite`, `TestPurgeDLQTasksSuite`,
   `TestRelayTaskTestSuite`.

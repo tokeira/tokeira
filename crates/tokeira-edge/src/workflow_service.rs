@@ -43,9 +43,9 @@ use tokeira_runtime::{
     StartedActivityTask, StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore,
     TaskQueueVersioningView, UpdateComputeConfig, UpdateLifecycleError, UpdateLifecycleSnapshot,
     UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig,
-    VersionMetadataView, VersionView, VersioningRuleStore, WorkerRegistry, WorkflowActivation,
-    WorkflowDeletion, WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus,
-    compute_matching_times, decide_overlap, schedule_workflow_id,
+    VersionMetadataView, VersionView, WorkerRegistry, WorkflowActivation, WorkflowDeletion,
+    WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus, compute_matching_times,
+    decide_overlap, schedule_workflow_id,
 };
 use tokeira_storage::{
     ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
@@ -789,7 +789,6 @@ pub struct WorkflowService {
     long_polls: LongPollGate,
     router: Arc<dyn EdgeRouter>,
     history_waiters: HistoryWaitRegistry,
-    versioning_rule_store: Arc<VersioningRuleStore>,
     worker_registry: WorkerRegistry,
     heartbeat_store: Arc<dyn HeartbeatStore>,
     schedule_store: Arc<ScheduleStore>,
@@ -909,7 +908,7 @@ impl WorkflowService {
         long_polls: LongPollGate,
         router: Arc<dyn EdgeRouter>,
     ) -> Self {
-        Self::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+        Self::new_with_stores_and_buffered_queries_and_history_wait_registry(
             runtime,
             resolver,
             visibility,
@@ -925,7 +924,6 @@ impl WorkflowService {
             long_polls,
             router,
             HistoryWaitRegistry::default(),
-            Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
             Arc::new(ScheduleStore::default()),
@@ -949,7 +947,7 @@ impl WorkflowService {
         long_polls: LongPollGate,
         router: Arc<dyn EdgeRouter>,
     ) -> Self {
-        Self::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+        Self::new_with_stores_and_buffered_queries_and_history_wait_registry(
             runtime,
             resolver,
             visibility,
@@ -965,7 +963,6 @@ impl WorkflowService {
             long_polls,
             router,
             HistoryWaitRegistry::default(),
-            Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
             Arc::new(ScheduleStore::default()),
@@ -989,7 +986,7 @@ impl WorkflowService {
         router: Arc<dyn EdgeRouter>,
         history_waiters: HistoryWaitRegistry,
     ) -> Self {
-        Self::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+        Self::new_with_stores_and_buffered_queries_and_history_wait_registry(
             runtime,
             resolver,
             visibility,
@@ -1005,7 +1002,6 @@ impl WorkflowService {
             long_polls,
             router,
             history_waiters,
-            Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
             Arc::new(ScheduleStore::default()),
@@ -1014,7 +1010,7 @@ impl WorkflowService {
         )
     }
 
-    pub fn new_with_versioning_and_buffered_queries_and_history_wait_registry(
+    pub fn new_with_stores_and_buffered_queries_and_history_wait_registry(
         runtime: Arc<dyn WorkflowRuntimeApi>,
         resolver: Arc<dyn ExecutionResolver>,
         visibility: Arc<dyn VisibilityApi>,
@@ -1030,7 +1026,6 @@ impl WorkflowService {
         long_polls: LongPollGate,
         router: Arc<dyn EdgeRouter>,
         history_waiters: HistoryWaitRegistry,
-        versioning_rule_store: Arc<VersioningRuleStore>,
         worker_registry: WorkerRegistry,
         heartbeat_store: Arc<dyn HeartbeatStore>,
         schedule_store: Arc<ScheduleStore>,
@@ -1054,7 +1049,6 @@ impl WorkflowService {
             long_polls,
             router,
             history_waiters,
-            versioning_rule_store,
             worker_registry,
             heartbeat_store,
             schedule_store,
@@ -1091,10 +1085,6 @@ impl WorkflowService {
                 "worker deployment registry is not configured for this service".to_string(),
             )
         })
-    }
-
-    pub fn versioning_rule_store(&self) -> Arc<VersioningRuleStore> {
-        self.versioning_rule_store.clone()
     }
 
     pub fn worker_registry(&self) -> WorkerRegistry {
@@ -2042,11 +2032,6 @@ impl WorkflowService {
         );
         let run_id = RunId::new();
         let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
-        let build_id = self.versioning_rule_store.evaluate_assignment(
-            namespace_id,
-            &entry.action.start_workflow.task_queue,
-            &workflow_id,
-        );
         let request = StartRequest {
             run_key,
             namespace_id,
@@ -2071,7 +2056,7 @@ impl WorkflowService {
             // A Schedule action starts a fresh execution (Initiator UNSPECIFIED).
             initiator: None,
             deployment: None,
-            build_id,
+            build_id: None,
             versioning_override: None,
             workflow_start_delay: None,
             completion_callbacks: Vec::new(),
@@ -2186,7 +2171,7 @@ impl WorkflowService {
         router: Arc<dyn EdgeRouter>,
         history_waiters: HistoryWaitRegistry,
     ) -> Self {
-        Self::new_with_versioning_and_buffered_queries_and_history_wait_registry(
+        Self::new_with_stores_and_buffered_queries_and_history_wait_registry(
             runtime,
             resolver,
             visibility,
@@ -2202,7 +2187,6 @@ impl WorkflowService {
             long_polls,
             router,
             history_waiters,
-            Arc::new(VersioningRuleStore::default()),
             WorkerRegistry::default(),
             Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
             Arc::new(ScheduleStore::default()),
@@ -2401,11 +2385,7 @@ impl WorkflowService {
 
                 ensure_local(self.router.route_workflow(&namespace, &workflow_id).await?)?;
 
-                let internal = to_internal::start_request(
-                    req,
-                    &ctx.request_id,
-                    Some(self.versioning_rule_store.as_ref()),
-                );
+                let internal = to_internal::start_request(req, &ctx.request_id);
                 let outcome = self
                     .runtime
                     .start_workflow_with_policy(internal.clone())
@@ -2867,6 +2847,38 @@ impl WorkflowService {
 
                 let task_token: tokeira_types::WorkflowTaskToken =
                     serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
+
+                // Search-attribute registration is namespace-scoped edge state,
+                // so validate here and turn only the offending command into a
+                // kernel sentinel. The completion must still enter the
+                // authoritative transition: v1.31.0 records WorkflowTaskFailed
+                // with BAD_SEARCH_ATTRIBUTES and schedules the replacement WFT
+                // before returning InvalidArgument
+                // (`workflow_task_completed_handler.go @ v1.31.0`).
+                let namespace_id = to_internal::namespace_id_for(&req.namespace);
+                for command_index in 0..req.commands.len() {
+                    let keys = match &req.commands[command_index] {
+                        tokeira_kernel::WorkflowCommand::UpsertSearchAttributesPatch(patch) => {
+                            patch.0.keys().cloned().collect::<Vec<_>>()
+                        }
+                        _ => continue,
+                    };
+                    if let Some(unknown) = self
+                        .visibility
+                        .unknown_search_attribute(namespace_id, &keys)
+                        .await
+                        .map_err(EdgeError::from)?
+                    {
+                        req.commands[command_index] =
+                            tokeira_kernel::WorkflowCommand::InvalidSearchAttributes {
+                                message: format!(
+                                    "Namespace {} has no mapping defined for search attribute {unknown}",
+                                    req.namespace
+                                ),
+                            };
+                        break;
+                    }
+                }
 
                 // Hydrate an Acceptance message's command body with the update's
                 // name/input from the registry (the worker echoes only the message
@@ -3906,11 +3918,7 @@ impl WorkflowService {
                         .route_workflow(&req.namespace, &req.workflow_id)
                         .await?,
                 )?;
-                let internal = to_internal::signal_with_start_request(
-                    req.clone(),
-                    &ctx.request_id,
-                    Some(self.versioning_rule_store.as_ref()),
-                );
+                let internal = to_internal::signal_with_start_request(req.clone(), &ctx.request_id);
                 match self
                     .runtime
                     .signal_with_start_workflow(internal)
@@ -3989,11 +3997,7 @@ impl WorkflowService {
                 )?;
 
                 let workflow_id = req.start.workflow_id.clone();
-                let internal = to_internal::start_request(
-                    req.start,
-                    &ctx.request_id,
-                    Some(self.versioning_rule_store.as_ref()),
-                );
+                let internal = to_internal::start_request(req.start, &ctx.request_id);
 
                 // Wait-policy defaulting mirrors standalone update
                 // (`update_workflow_execution` above): Unspecified waits for

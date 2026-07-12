@@ -161,19 +161,26 @@ pub fn search_attributes_to_domain(
     ))
 }
 
-fn is_temporal_nil_payload(value: &common::Payload) -> bool {
+/// Return whether a payload carries Temporal's memo/search-attribute deletion
+/// sentinel (`json/plain` null or empty-list).
+///
+/// Starts filter these values; workflow-task upserts retain the distinction as
+/// a per-key clear operation (`common/payload/payload.go @ v1.31.0`).
+pub fn is_temporal_nil_payload(value: &common::Payload) -> bool {
     let encoding = value.metadata.get("encoding").map(Vec::as_slice);
     // Temporal filters JSON null and empty-list payloads from memo/search
     // attributes before writing start history, so client-side nil values do not
     // become validation errors (`common/payload/payload.go:94 @ v1.31.0`).
-    matches!(encoding, Some(b"json/plain")) && matches!(value.data.as_slice(), b"null" | b"[]")
+    matches!(encoding, Some(b"binary/null"))
+        || (matches!(encoding, Some(b"json/plain"))
+            && matches!(value.data.as_slice(), b"null" | b"[]"))
 }
 
 /// Encode a search-attribute value in the standard Temporal wire format: the
 /// bare JSON value with `encoding=json/plain` plus a `type` metadata key naming
 /// the `IndexedValueType` (`searchattribute/encode_value.go:14-22` +
 /// `sadefs/util.go:22-33 @ v1.31.0`). Datetimes are RFC 3339 strings.
-fn search_attr_value_to_payload(value: &SearchAttrValue) -> common::Payload {
+pub fn search_attr_value_to_payload(value: &SearchAttrValue) -> common::Payload {
     let (type_name, json) = match value {
         SearchAttrValue::Keyword(v) => ("Keyword", serde_json::json!(v)),
         SearchAttrValue::KeywordList(v) => ("KeywordList", serde_json::json!(v)),
@@ -207,7 +214,7 @@ fn search_attr_value_to_payload(value: &SearchAttrValue) -> common::Payload {
 /// key the variant is inferred from the JSON shape — strings map to `Keyword`
 /// (Temporal's default for unregistered string attributes; `Text`/`Datetime`
 /// require an explicit type).
-fn search_attr_payload_to_domain(
+pub fn search_attr_payload_to_domain(
     value: &common::Payload,
 ) -> Result<SearchAttrValue, ProtoConversionError> {
     let invalid = |_| ProtoConversionError::MissingField("SearchAttributes: invalid payload data");

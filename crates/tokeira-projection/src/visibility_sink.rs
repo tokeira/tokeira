@@ -21,7 +21,8 @@ use crate::{
     types::{
         AttrDescriptor, AttrId, CompiledFilter, CountResult, ExecutionRow, GroupByField,
         ListResult, PageBounds, RollupDelta, RollupDimension, SearchAttrType, SortOrder,
-        VisibilitySnapshot, search_attr_type_of, visibility_version_is_newer,
+        VisibilitySnapshot, normalize_search_attr_value, search_attr_type_of,
+        visibility_version_is_newer,
     },
 };
 
@@ -167,7 +168,34 @@ where
         // consulted below to retire search-attribute index entries this snapshot
         // dropped and to compute rollup deltas.
         let mut row = ExecutionRow::from_projection_record(record);
-        let search_patch = record.context.search_attributes.clone();
+        let mut resolved_search_attrs = Vec::new();
+        for (name, value) in &record.context.search_attributes.0 {
+            let Some(attr) = self
+                .store
+                .resolve_attr(record.context.namespace_id, name)
+                .await?
+            else {
+                projection_metrics::record_sink_error_with_kind(
+                    record.partition_id,
+                    tokeira_observability::ProjectionErrorKindLabel::Sink,
+                );
+                return Err(anyhow!("unknown search attribute: {name}"));
+            };
+            let normalized =
+                normalize_search_attr_value(attr.attr_type, value).map_err(|error| {
+                    projection_metrics::record_sink_error_with_kind(
+                        record.partition_id,
+                        tokeira_observability::ProjectionErrorKindLabel::Serialization,
+                    );
+                    anyhow!("search attribute {name}: {error}")
+                })?;
+            resolved_search_attrs.push((name.clone(), attr, normalized));
+        }
+        row.search_attributes.0 = resolved_search_attrs
+            .iter()
+            .map(|(name, _, value)| (name.clone(), value.clone()))
+            .collect();
+        let search_patch = row.search_attributes.clone();
 
         self.store.upsert_execution(&row).await?;
         if let Some(previous) = previous.as_ref() {
@@ -192,31 +220,7 @@ where
                     .await?;
             }
         }
-        for (name, value) in &search_patch.0 {
-            let Some(attr) = self
-                .store
-                .resolve_attr(record.context.namespace_id, name)
-                .await?
-            else {
-                projection_metrics::record_sink_error_with_kind(
-                    record.partition_id,
-                    tokeira_observability::ProjectionErrorKindLabel::Sink,
-                );
-                return Err(anyhow!("unknown search attribute: {name}"));
-            };
-            let expected = attr.attr_type;
-            let actual = search_attr_type_of(value);
-            if expected != actual {
-                projection_metrics::record_sink_error_with_kind(
-                    record.partition_id,
-                    tokeira_observability::ProjectionErrorKindLabel::Serialization,
-                );
-                return Err(anyhow!(
-                    "search attribute type mismatch for {name}: expected {:?}, got {:?}",
-                    expected,
-                    actual
-                ));
-            }
+        for (_name, attr, value) in &resolved_search_attrs {
             self.store
                 .remove_search_attr_index(
                     record.run_key,
@@ -234,7 +238,6 @@ where
                     value,
                 )
                 .await?;
-            row.search_attributes.0.insert(name.clone(), value.clone());
             row.search_attr_version += 1;
         }
         self.store.upsert_execution(&row).await?;

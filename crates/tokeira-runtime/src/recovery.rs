@@ -363,6 +363,8 @@ mod tests {
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq(1),
             last_event_id: 0,
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,

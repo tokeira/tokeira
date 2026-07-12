@@ -1335,6 +1335,8 @@ mod tests {
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq(1),
             last_event_id: 1,
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: None,
             previous_started_event_id: 0,
@@ -1396,6 +1398,7 @@ mod tests {
             revision_number: 10,
             continue_as_new_initial_versioning_behavior:
                 ContinueAsNewVersioningBehavior::Unspecified,
+            ..WorkflowVersioningInfo::default()
         }))
     }
 
@@ -1408,6 +1411,7 @@ mod tests {
             revision_number: 10,
             continue_as_new_initial_versioning_behavior:
                 ContinueAsNewVersioningBehavior::Unspecified,
+            ..WorkflowVersioningInfo::default()
         }))
     }
 
@@ -1420,6 +1424,7 @@ mod tests {
             revision_number: 10,
             continue_as_new_initial_versioning_behavior:
                 ContinueAsNewVersioningBehavior::Unspecified,
+            ..WorkflowVersioningInfo::default()
         }))
     }
 

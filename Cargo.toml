@@ -6,6 +6,9 @@ members = [
     "crates/tokeira-compatibility",
     "crates/tokeira-compatibility-proto",
     "crates/tokeira-compatibility-service",
+    "crates/tokeira-conformance",
+    "crates/tokeira-conformance-proto",
+    "crates/tokeira-conformance-control",
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
@@ -117,6 +120,9 @@ tokeira-build-info = { path = "crates/tokeira-build-info" }
 tokeira-compatibility = { path = "crates/tokeira-compatibility" }
 tokeira-compatibility-proto = { path = "crates/tokeira-compatibility-proto" }
 tokeira-compatibility-service = { path = "crates/tokeira-compatibility-service" }
+tokeira-conformance = { path = "crates/tokeira-conformance" }
+tokeira-conformance-proto = { path = "crates/tokeira-conformance-proto" }
+tokeira-conformance-control = { path = "crates/tokeira-conformance-control" }
 dagger-client = { path = "crates/dagger-client" }
 tokeira-build = { path = "crates/tokeira-build" }
 

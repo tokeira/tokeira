@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package tokeira.conformance.v1;
+
+// Conformance-only control surface for delivering Temporal
+// `OverrideDynamicConfig(setting, value)` values to an out-of-process `tokeirad`
+// (spec `.kiro/specs/conformance-config-override/`). It is NEVER mounted in a
+// production server. Only wired, non-kernel keys whose declared value type
+// matches are honoured; every other override is rejected (unimplemented /
+// invalid_argument), and the fork harness falls back to the skip registry.
+service ConformanceControlService {
+  // Set an override for a dynamic-config key. Honoured only for a wired,
+  // non-kernel key whose declared value type matches the supplied value.
+  rpc SetDynamicConfigOverride(SetDynamicConfigOverrideRequest) returns (SetDynamicConfigOverrideResponse);
+  // Clear the override for one key, reverting consults to the pinned default.
+  rpc ClearDynamicConfigOverride(ClearDynamicConfigOverrideRequest) returns (ClearDynamicConfigOverrideResponse);
+  // Drop all overrides — per-test isolation on teardown.
+  rpc ResetDynamicConfigOverrides(ResetDynamicConfigOverridesRequest) returns (ResetDynamicConfigOverridesResponse);
+}
+
+// A typed dynamic-config value, covering the Temporal value kinds the corpus
+// sets. `duration_nanos` carries a duration as integer nanoseconds so this
+// conformance-only proto needs no google.protobuf well-known-type import.
+message DynamicConfigValue {
+  oneof kind {
+    int64 int_value = 1;
+    double double_value = 2;
+    bool bool_value = 3;
+    string string_value = 4;
+    int64 duration_nanos = 5;
+  }
+}
+
+message SetDynamicConfigOverrideRequest {
+  // The Temporal setting key, matched verbatim against the corpus's `setting.Key()`.
+  string key = 1;
+  DynamicConfigValue value = 2;
+}
+
+message SetDynamicConfigOverrideResponse {}
+
+message ClearDynamicConfigOverrideRequest {
+  string key = 1;
+}
+
+message ClearDynamicConfigOverrideResponse {}
+
+message ResetDynamicConfigOverridesRequest {}
+
+message ResetDynamicConfigOverridesResponse {}

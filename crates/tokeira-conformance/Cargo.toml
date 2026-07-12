@@ -1,0 +1,17 @@
+[package]
+name = "tokeira-conformance"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Conformance-only dynamic-config override registry (feature-gated; never linked into a production tokeirad)"
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

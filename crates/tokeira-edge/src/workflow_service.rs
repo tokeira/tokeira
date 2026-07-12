@@ -5923,7 +5923,10 @@ fn namespace_to_description(namespace: ResolvedNamespace) -> NamespaceDescriptio
         custom_search_attribute_aliases: std::collections::BTreeMap::new(),
         capabilities: NamespaceCapabilities {
             worker_heartbeats: true,
-            reported_problems_search_attribute: false,
+            // v1.31.0 advertises this whenever the consecutive-problem
+            // threshold is non-zero (`namespace_handler.go:851-862`). Tokeira
+            // pins the enabled release default of five.
+            reported_problems_search_attribute: true,
         },
         retention: namespace.retention,
     }

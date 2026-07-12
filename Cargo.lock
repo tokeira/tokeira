@@ -1375,13 +1375,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffa"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f29a40702df4b86ccd84211bfde8cee0bce6d0811450ade4a86a7d0958a23a"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
+ "once_cell",
+ "rustversion",
+ "serde",
+ "serde_json",
+ "smoothutf8",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "buffa-codegen"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "693ea91be01336fb0084b2e7bb071be7393224c72f737c846471e4013e58c327"
 dependencies = [
- "buffa",
- "buffa-descriptor",
+ "buffa 0.6.0",
+ "buffa-descriptor 0.6.0",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "buffa-codegen"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6681b562b18ea719622d0d12684e88ecbdca600d517557dc7bcef7704631e28"
+dependencies = [
+ "buffa 0.8.1",
+ "buffa-descriptor 0.8.1",
  "prettyplease",
  "proc-macro2",
  "quote",
@@ -1395,7 +1428,19 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad8df83adfcb525621f5a96c88e610f90aff1112ec57522d9b48a943df327394"
 dependencies = [
- "buffa",
+ "buffa 0.6.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "buffa-descriptor"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57ed423c4ecec86d1500879ce42e7e5f6def01bc632985ac756c1fd723fa21fc"
+dependencies = [
+ "buffa 0.8.1",
+ "rustversion",
  "serde",
  "serde_json",
 ]
@@ -1406,7 +1451,20 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc84fac1e7efc335e74934a4ebe0534a30411ec2ea6a5a17ed294201c6b3b23c"
 dependencies = [
- "buffa",
+ "buffa 0.6.0",
+ "bytes",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "buffa-types"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cb54bcbf6946c58e550eeaf6209047146363dbc7cbdc87e49e67089ed2ff5f"
+dependencies = [
+ "buffa 0.8.1",
  "bytes",
  "serde",
  "serde_json",
@@ -1611,7 +1669,40 @@ dependencies = [
  "async-trait",
  "axum 0.8.9",
  "base64 0.22.1",
- "buffa",
+ "buffa 0.6.0",
+ "bytes",
+ "flate2",
+ "futures",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.10.1",
+ "hyper-util",
+ "libc",
+ "percent-encoding",
+ "pin-project",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower 0.5.3",
+ "tower-http 0.6.8",
+ "tracing",
+ "wasm-bindgen-futures",
+ "zstd",
+]
+
+[[package]]
+name = "connectrpc"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4d1bbfc95ed1f4f31a027f5b97ff981be2617bc8a5c800fd6fcc701867bb97f"
+dependencies = [
+ "async-compression",
+ "async-trait",
+ "base64 0.22.1",
+ "buffa 0.8.1",
  "bytes",
  "flate2",
  "futures",
@@ -1642,9 +1733,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e83c1366d73975a36aa5788beaef5e39747841d07ce9aa69237047aaf76c4fea"
 dependencies = [
  "anyhow",
- "buffa",
- "buffa-codegen",
- "connectrpc-codegen",
+ "buffa 0.6.0",
+ "buffa-codegen 0.6.0",
+ "connectrpc-codegen 0.6.0",
+ "tempfile",
+]
+
+[[package]]
+name = "connectrpc-build"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8cdec2dacacd00437898dad38f98105c82d51086a78baa62cee6dc66c031070"
+dependencies = [
+ "anyhow",
+ "buffa 0.8.1",
+ "buffa-codegen 0.8.1",
+ "connectrpc-codegen 0.8.0",
  "tempfile",
 ]
 
@@ -1655,8 +1759,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4185bd4287223a2f5a2aef54c4d668e8e148cdd244ebf73db62a4e61e6c2f350"
 dependencies = [
  "anyhow",
- "buffa",
- "buffa-codegen",
+ "buffa 0.6.0",
+ "buffa-codegen 0.6.0",
+ "heck",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "connectrpc-codegen"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36c6e3bb62a4a77f41d5cd3d290a488bf529dc7e26b444cda67a3e5544c97542"
+dependencies = [
+ "anyhow",
+ "buffa 0.8.1",
+ "buffa-codegen 0.8.1",
  "heck",
  "prettyplease",
  "proc-macro2",
@@ -5529,6 +5649,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
 name = "siphasher"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5562,6 +5688,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "smoothutf8"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36358427d32ecdb1624616deed99eccfef0a167fe5bf40ddb51efe6980bc1ec8"
+dependencies = [
+ "simdutf8",
 ]
 
 [[package]]
@@ -6274,8 +6409,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "buffa",
- "connectrpc",
+ "buffa 0.6.0",
+ "connectrpc 0.6.0",
  "metrics",
  "metrics-util",
  "proptest",
@@ -6457,10 +6592,10 @@ dependencies = [
 name = "tokeira-compatibility-proto"
 version = "0.1.0"
 dependencies = [
- "buffa",
- "buffa-types",
- "connectrpc",
- "connectrpc-build",
+ "buffa 0.6.0",
+ "buffa-types 0.6.0",
+ "connectrpc 0.6.0",
+ "connectrpc-build 0.6.0",
  "http-body 1.0.1",
  "serde",
  "serde_json",
@@ -6472,8 +6607,8 @@ dependencies = [
 name = "tokeira-compatibility-service"
 version = "0.1.0"
 dependencies = [
- "buffa",
- "connectrpc",
+ "buffa 0.6.0",
+ "connectrpc 0.6.0",
  "tokeira-build-info",
  "tokeira-compatibility",
  "tokeira-compatibility-proto",
@@ -6567,13 +6702,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-conformance"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "tokeira-conformance-control"
+version = "0.1.0"
+dependencies = [
+ "connectrpc 0.8.1",
+ "tokeira-conformance",
+ "tokeira-conformance-proto",
+]
+
+[[package]]
+name = "tokeira-conformance-proto"
+version = "0.1.0"
+dependencies = [
+ "buffa 0.8.1",
+ "buffa-types 0.8.1",
+ "connectrpc 0.8.1",
+ "connectrpc-build 0.8.0",
+ "http-body 1.0.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "walkdir",
+]
+
+[[package]]
 name = "tokeira-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "buffa",
- "connectrpc",
+ "buffa 0.6.0",
+ "connectrpc 0.6.0",
  "futures",
  "metrics",
  "metrics-util",
@@ -6602,7 +6769,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "axum 0.8.9",
  "clap",
- "connectrpc",
+ "connectrpc 0.6.0",
  "metrics",
  "metrics-exporter-prometheus",
  "serde",
@@ -6672,8 +6839,8 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
- "buffa",
- "connectrpc",
+ "buffa 0.6.0",
+ "connectrpc 0.6.0",
  "http 1.4.0",
  "metrics",
  "metrics-util",
@@ -6877,10 +7044,10 @@ dependencies = [
 name = "tokeira-proto"
 version = "0.1.0"
 dependencies = [
- "buffa",
- "buffa-types",
- "connectrpc",
- "connectrpc-build",
+ "buffa 0.6.0",
+ "buffa-types 0.6.0",
+ "connectrpc 0.6.0",
+ "connectrpc-build 0.6.0",
  "http-body 1.0.1",
  "prost 0.12.6",
  "prost-types 0.12.6",
@@ -6949,11 +7116,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "buffa",
- "buffa-types",
+ "buffa 0.6.0",
+ "buffa-types 0.6.0",
  "chrono",
  "chrono-tz",
- "connectrpc",
+ "connectrpc 0.6.0",
  "dashmap",
  "metrics",
  "metrics-util",
@@ -6970,6 +7137,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokeira-chasm",
+ "tokeira-conformance",
  "tokeira-kernel",
  "tokeira-observability",
  "tokeira-projection",
@@ -7069,6 +7237,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
  "clap",
+ "connectrpc 0.8.1",
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",
@@ -7090,6 +7259,7 @@ dependencies = [
  "tokeira-chasm",
  "tokeira-chasm-activity",
  "tokeira-config",
+ "tokeira-conformance-control",
  "tokeira-edge",
  "tokeira-kernel",
  "tokeira-observability",

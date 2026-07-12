@@ -41,7 +41,13 @@ tokeira-proto = { path = "../tokeira-proto" }
 tokeira-storage = { path = "../tokeira-storage" }
 tokeira-types = { path = "../tokeira-types" }
 tokeira-chasm = { path = "../tokeira-chasm" }
+tokeira-conformance = { workspace = true, optional = true }
 prost = "0.12"
+
+[features]
+# Conformance-only: pulls in the override registry so the reported-problems
+# threshold (and future wired keys) is read live. Absent from production builds.
+conformance = ["dep:tokeira-conformance"]
 
 [dev-dependencies]
 metrics-util.workspace = true

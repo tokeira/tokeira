@@ -1,0 +1,16 @@
+[package]
+name = "tokeira-conformance-control"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Conformance-only Connect-RPC control service delivering dynamic-config overrides to the registry"
+
+[dependencies]
+connectrpc = { version = "0.8.1", features = ["server"] }
+tokeira-conformance.workspace = true
+tokeira-conformance-proto.workspace = true
+
+[lints]
+workspace = true

@@ -200,6 +200,27 @@ const REMOTE_CLUSTER_RPCS: &[&str] = &[
     "OperatorService.RemoveRemoteCluster",
 ];
 
+const REPORTED_PROBLEMS_SURFACES: &[CompatibilitySurface] = &[
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::CapabilityFlag,
+        identifier: "NamespaceInfo.capabilities.reported_problems_search_attribute",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::ResponseField,
+        identifier: "WorkflowExecutionInfo.search_attributes.TemporalReportedProblems",
+    },
+];
+const REPORTED_PROBLEMS_EVIDENCE: &[CompatibilityEvidence] = &[
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-runtime/src/runtime/mod.rs::reported_problem_appears_at_default_threshold_and_carries_latest_cause",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "apps/tokeirad/src/lib.rs::reported_problem_search_attribute_has_exact_v131_keyword_list",
+    },
+];
+
 const SCHEDULE_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
     kind: CompatibilitySurfaceKind::Rpc,
     identifier: "WorkflowService.Schedules",
@@ -518,6 +539,17 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         rpcs: REMOTE_CLUSTER_RPCS,
         notes: "Multi-cluster administration is outside the current deployment model.",
         evidence: &[],
+    },
+    FeatureEntry {
+        id: "reported-problems-search-attribute",
+        name: "Workflow task reported problems",
+        state: FeatureState::Partial,
+        surfaces: REPORTED_PROBLEMS_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: EMPTY_RPCS,
+        notes: "Describe derives the v1.31.0 TemporalReportedProblems KeywordList from kernel-state consecutive-problem accounting (failures and start-to-close timeouts, sticky-suppressed and cleared on WFT success, per failWorkflowTask @ v1.31.0) at the pinned default threshold of five; the last non-transient problem supplies the Failed or TimedOut category pair. The accumulator is durable with the run's hot state. Visibility-index projection of the attribute (v1.31.0 upserts it for ListWorkflowExecutions) remains open — the attribute currently surfaces on Describe only.",
+        evidence: REPORTED_PROBLEMS_EVIDENCE,
     },
     FeatureEntry {
         id: "schedules",

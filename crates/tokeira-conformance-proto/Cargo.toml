@@ -1,0 +1,26 @@
+[package]
+name = "tokeira-conformance-proto"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Buffa/connect-rust bindings for the Tokeira conformance control API (conformance-only)"
+
+[dependencies]
+buffa = { version = "0.8.1", features = ["json"] }
+buffa-types = { version = "0.8.1", features = ["json"] }
+connectrpc = { version = "0.8.1", features = ["client"] }
+http-body = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+# connectrpc-build tops out at 0.8.0 on crates.io; additive-patch semver keeps it
+# compatible with the connectrpc 0.8.1 runtime crate (same 0.8 minor line).
+connectrpc-build = "0.8"
+walkdir = "2"
+
+[lints]
+workspace = true

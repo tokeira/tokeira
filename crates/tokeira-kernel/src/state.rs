@@ -9,6 +9,21 @@ use tokeira_types::{
     TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
+use crate::command::WorkflowTaskFailedCause;
+
+/// Identity of the last non-transient workflow-task problem, the kernel
+/// analog of v1.31.0's `WorkflowExecutionInfo.LastWorkflowTaskFailure` oneof.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum WorkflowTaskProblem {
+    /// A `WorkflowTaskFailed` event was persisted with this cause.
+    Failed(WorkflowTaskFailedCause),
+    /// A `WorkflowTaskTimedOut(StartToClose)` event was persisted. v1.31.0
+    /// only ever stores the start-to-close type — schedule-to-start timeouts
+    /// never set the oneof (`workflow_task_state_machine.go:968, 270-305 @
+    /// v1.31.0`).
+    TimedOutStartToClose,
+}
+
 /// Durable state for an open or closed workflow run.
 ///
 /// This state is intentionally *summary shaped*. The authoritative event stream
@@ -59,6 +74,25 @@ pub struct WorkflowState {
     /// Attempt number to assign to the next scheduled
     /// workflow task.
     pub workflow_task_attempt: u32,
+    /// Consecutive workflow-task problems (failures and start-to-close
+    /// timeouts) since the last successful WFT completion. Advances under
+    /// exactly the same guard as the attempt counter in v1.31.0's
+    /// `failWorkflowTask` (`workflow_task_state_machine.go:1010-1027 @
+    /// v1.31.0`): non-sticky failures and non-sticky start-to-close
+    /// timeouts, transient or not; never for schedule-to-start timeouts or
+    /// while the run's real sticky queue is set. Reset to zero on WFT
+    /// completion. Drives the `TemporalReportedProblems` derive on Describe.
+    #[serde(default)]
+    pub workflow_task_attempts_since_last_success: u32,
+    /// Identity of the last NON-TRANSIENT workflow-task problem, mirroring
+    /// v1.31.0's persisted `LastWorkflowTaskFailure` oneof — written only
+    /// when the corresponding failed/timed-out event is actually emitted
+    /// (`workflow_task_state_machine.go:907-911, 975-977 @ v1.31.0`).
+    /// Transient problems advance the counter without touching this, so a
+    /// threshold crossed by a transient retry's timeout still reports the
+    /// attempt-1 cause. Cleared on WFT completion.
+    #[serde(default)]
+    pub last_workflow_task_problem: Option<WorkflowTaskProblem>,
     /// Sticky execution affinity recorded when a worker
     /// provides a `sticky_ttl`.
     pub sticky: Option<StickyAffinity>,
@@ -1006,6 +1040,8 @@ mod tests {
             pending_workflow_task: None,
             previous_started_event_id: 0,
             workflow_task_attempt: 1,
+            workflow_task_attempts_since_last_success: 0,
+            last_workflow_task_problem: None,
             sticky: None,
             pause_info: None,
             cancel_requested: false,

@@ -680,6 +680,9 @@ where
                     .lock()
                     .expect("close-attempt tracking lock")
                     .remove(&run_key);
+                // The consecutive-problem count and its derived search
+                // attribute clear inside the kernel's completion transition
+                // (`workflow_task_state_machine.go:838-846 @ v1.31.0`).
                 // Publish rejection outcomes now that the completion is durable:
                 // the rejected update left the kernel's admitted set with no
                 // event, and its waiters were pre-claimed above so the close
@@ -791,6 +794,12 @@ where
                 reset_reapply: Vec::new(),
             })
         };
+        // The consecutive-problem accumulator advances inside the kernel's
+        // failed/timed-out transitions themselves — RPC-level failures,
+        // transient retries, and timeout-driven retries all count at the
+        // transition that records them, mirroring v1.31.0's single
+        // `failWorkflowTask` funnel
+        // (`workflow_task_state_machine.go:1010-1027 @ v1.31.0`).
         self.submit_for_owned_shard(run_key, command).await
     }
 
@@ -1542,7 +1551,7 @@ pub(crate) fn build_cron_successor_start(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use proptest::prelude::*;
@@ -1756,7 +1765,10 @@ mod tests {
         }
     }
 
-    fn open_state(workflow_id: String, info: Option<WorkflowVersioningInfo>) -> WorkflowState {
+    pub(crate) fn open_state(
+        workflow_id: String,
+        info: Option<WorkflowVersioningInfo>,
+    ) -> WorkflowState {
         WorkflowState {
             run_key: RunKey::new(),
             namespace_id: NamespaceId::new(),
@@ -1775,6 +1787,8 @@ mod tests {
             pending_workflow_task: None,
             previous_started_event_id: 0,
             workflow_task_attempt: 1,
+            workflow_task_attempts_since_last_success: 0,
+            last_workflow_task_problem: None,
             sticky: None,
             pause_info: None,
             cancel_requested: false,

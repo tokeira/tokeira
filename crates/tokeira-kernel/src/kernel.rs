@@ -40,7 +40,8 @@ use crate::{
         EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
         LoadedRun, ParentClosePolicy, PauseInfo, PendingExternalCancel, PendingExternalSignal,
         PendingNexusOperation, PendingUpdate, PendingWorkflowTask, RequestIdInfo, TimerState,
-        VersioningOverride, WorkflowState, WorkflowTaskType, WorkflowVersioningInfo,
+        VersioningOverride, WorkflowState, WorkflowTaskProblem, WorkflowTaskType,
+        WorkflowVersioningInfo,
     },
     transition::{
         ActivityOp, CallbackCompletionOutcome, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp,
@@ -353,6 +354,8 @@ impl BasicKernel {
             pending_workflow_task: None,
             previous_started_event_id: 0,
             workflow_task_attempt: 1,
+            workflow_task_attempts_since_last_success: 0,
+            last_workflow_task_problem: None,
             sticky: None,
             pause_info: None,
             cancel_requested: false,
@@ -471,6 +474,8 @@ impl BasicKernel {
             pending_workflow_task: None,
             previous_started_event_id: 0,
             workflow_task_attempt: 1,
+            workflow_task_attempts_since_last_success: 0,
+            last_workflow_task_problem: None,
             sticky: None,
             pause_info: None,
             cancel_requested: false,
@@ -633,6 +638,8 @@ impl BasicKernel {
             pending_workflow_task: None,
             previous_started_event_id: 0,
             workflow_task_attempt: 1,
+            workflow_task_attempts_since_last_success: 0,
+            last_workflow_task_problem: None,
             sticky: None,
             pause_info: None,
             cancel_requested: false,
@@ -1642,13 +1649,31 @@ impl BasicKernel {
             // Poll-side affinity is a sync-match HINT only: no sticky queue
             // and no S2S deadline (empty queue name disables sticky
             // dispatch). Real sticky attributes arrive on the completion
-            // (sticky raise S1).
-            builder.state.sticky = Some(StickyAffinity {
-                worker_identity: req.worker_identity,
-                expires_at: req.now + ttl,
-                sticky_queue: TaskQueueName(String::new()),
-                schedule_to_start_timeout: Duration::ZERO,
-            });
+            // (sticky raise S1). The hint must never CLOBBER a real (S1)
+            // affinity — the failure path's sticky rule (raise S4) reads it
+            // at fail time. v1.31.0's RecordWorkflowTaskStarted keeps the
+            // sticky queue on a sticky-queue start and clears it ONLY when
+            // the poller's queue differs from it (the StickyWorkerUnavailable
+            // normal-queue fallback, recordworkflowtaskstarted/api.go:113-135
+            // @ v1.31.0). Tokeira's live dispatch cannot produce that
+            // mismatch (a sticky task is enqueued under the sticky QueueKey;
+            // only the S2S timeout — which clears sticky — moves it), so no
+            // clear is modeled here; the recovery-sweep republish path that
+            // CAN start a sticky-scheduled task from the normal queue without
+            // clearing is a recorded residual (sticky raise series).
+            let has_real_sticky = builder
+                .state
+                .sticky
+                .as_ref()
+                .is_some_and(|sticky| !sticky.sticky_queue.0.is_empty());
+            if !has_real_sticky {
+                builder.state.sticky = Some(StickyAffinity {
+                    worker_identity: req.worker_identity,
+                    expires_at: req.now + ttl,
+                    sticky_queue: TaskQueueName(String::new()),
+                    schedule_to_start_timeout: Duration::ZERO,
+                });
+            }
         }
 
         if let Some(target) = req.deployment_transition {
@@ -1909,6 +1934,14 @@ impl BasicKernel {
         });
         builder.state.previous_started_event_id = started_event_id;
         builder.state.workflow_task_attempt = 1;
+        // A successful completion clears the consecutive-problem accumulator
+        // and the recorded problem identity — v1.31.0's
+        // `afterAddWorkflowTaskCompletedEvent` zeroes
+        // `AttemptsSinceLastSuccess` and removes the reported-problems SA
+        // plus its stored cause (`workflow_task_state_machine.go:838-846`,
+        // `mutable_state_impl.go:6530-6541 @ v1.31.0`).
+        builder.state.workflow_task_attempts_since_last_success = 0;
+        builder.state.last_workflow_task_problem = None;
         builder.state.pending_workflow_task = None;
         builder.state.apply_wft_versioning(
             req.versioning_behavior,
@@ -2670,7 +2703,22 @@ impl BasicKernel {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
+        let reported_cause = req.failure_cause.clone();
         let mut builder = TransitionBuilder::new(state, req.now);
+        // v1.31.0's sticky rule in `failWorkflowTask`: a failure while the
+        // run's REAL sticky queue is set (raise S1 — the poll-side hint's
+        // empty queue name does not qualify) clears the affinity and retries
+        // a fresh attempt-1 task on the normal queue WITHOUT counting:
+        // neither the attempt nor the attempts-since-last-success accumulator
+        // advances ("clear sticky task queue first and try again before
+        // creating transient workflow task",
+        // workflow_task_state_machine.go:1010-1027 @ v1.31.0; sticky raise
+        // S4). Captured before any mutation below.
+        let sticky_was_set = builder
+            .state
+            .sticky
+            .as_ref()
+            .is_some_and(|sticky| !sticky.sticky_queue.0.is_empty());
         // A started SPECULATIVE task persists Scheduled + Started late,
         // immediately before the failed event — v1.31.0's
         // `AddWorkflowTaskFailedEvent` creates "the corresponding
@@ -2754,6 +2802,27 @@ impl BasicKernel {
                 fork_event_version: None,
                 fork_event_id: None,
             });
+            // The persisted (non-transient) failure records the problem
+            // identity — v1.31.0 sets `LastWorkflowTaskFailure` only when the
+            // event is actually emitted (`workflow_task_state_machine.go:
+            // 907-911 @ v1.31.0`), so transient retries keep reporting this
+            // cause while only the counter below advances.
+            builder.state.last_workflow_task_problem =
+                Some(WorkflowTaskProblem::Failed(reported_cause));
+        }
+        // The consecutive-problem accumulator advances under the same guard
+        // as v1.31.0's attempt counter: every non-sticky failure counts,
+        // transient or not, independent of event emission; a sticky-dispatched
+        // failure counts nothing and drops the affinity instead
+        // (`failWorkflowTask`, workflow_task_state_machine.go:1010-1027
+        // @ v1.31.0).
+        if sticky_was_set {
+            builder.state.sticky = None;
+        } else {
+            builder.state.workflow_task_attempts_since_last_success = builder
+                .state
+                .workflow_task_attempts_since_last_success
+                .saturating_add(1);
         }
         // A reset reapplies the base run's eligible post-fork events onto the
         // successor branch, authored between the WorkflowTaskFailed above and the
@@ -2970,8 +3039,12 @@ impl BasicKernel {
         // A reset re-drives from the fork point on a FRESH normal attempt-1 task
         // with a real `WorkflowTaskScheduled` (v1.31.0 `ScheduleWorkflowTask` after
         // the reset failure, workflow_resetter.go:243) — never the transient
-        // attempt-2 retry the ordinary WFT-failure path takes.
-        if (flushed > 0 || is_reset) && !paused {
+        // attempt-2 retry the ordinary WFT-failure path takes. A
+        // sticky-dispatched failure takes the same fresh-task path: v1.31.0
+        // resets the attempt to 1 and, with the affinity cleared above, the
+        // retry lands on the NORMAL queue as a real scheduled task
+        // (workflow_task_state_machine.go:1011-1018 @ v1.31.0; raise S4).
+        if (flushed > 0 || is_reset || sticky_was_set) && !paused {
             // Events buffered during the WFT invalidate any continuously-failing
             // (transient) suffix: v1.31.0 resets the next task to a NORMAL,
             // attempt-1 task with a REAL WorkflowTaskScheduled — the flushed events
@@ -3000,6 +3073,14 @@ impl BasicKernel {
                 .expect("validated pending workflow task must still exist");
             current.started_event_id = None;
             current.started_at = None;
+            // Paused-with-sticky corner (the only way sticky_was_set reaches
+            // this branch): keep the retained task in the TRANSIENT
+            // (attempt>1, virtual-id) shape the resume/start path expects —
+            // an attempt-1 task with a virtual scheduled id would emit a
+            // Started event referencing a never-persisted Scheduled event.
+            // The v1.31.0 attempt-1 reset only accompanies the fresh
+            // reschedule above; the sticky clear and the skipped count
+            // already happened either way.
             builder.state.workflow_task_attempt += 1;
             current.attempt = builder.state.workflow_task_attempt;
             // The retry is transient: its Scheduled event is never persisted, so
@@ -3155,6 +3236,17 @@ impl BasicKernel {
         }
 
         let mut builder = TransitionBuilder::new(state, req.now);
+        // Same sticky rule as the failure path (raise S4): a start-to-close
+        // timeout while the run's REAL sticky queue is set clears the
+        // affinity and retries fresh at attempt 1 without counting —
+        // v1.31.0's `failWorkflowTask` applies its sticky override to
+        // timeout-driven calls identically
+        // (workflow_task_state_machine.go:1010-1027 @ v1.31.0).
+        let sticky_was_set = builder
+            .state
+            .sticky
+            .as_ref()
+            .is_some_and(|sticky| !sticky.sticky_queue.0.is_empty());
         // A started SPECULATIVE task persists Scheduled + Started LATE, at
         // its real schedule/start times, immediately before the timed-out
         // event — v1.31.0's `AddWorkflowTaskTimedOutEvent` creates "the
@@ -3211,21 +3303,46 @@ impl BasicKernel {
                 started_event_id,
                 timeout_type: req.timeout_type,
             });
+            // The persisted (non-transient) timeout records the problem
+            // identity; v1.31.0 stores only the start-to-close type and only
+            // when the event is emitted (`workflow_task_state_machine.go:
+            // 966-979 @ v1.31.0`), so a transient retry's timeout keeps
+            // reporting the earlier attempt-1 cause.
+            builder.state.last_workflow_task_problem =
+                Some(WorkflowTaskProblem::TimedOutStartToClose);
+        }
+        // A non-sticky start-to-close timeout advances the
+        // consecutive-problem accumulator exactly like a non-sticky explicit
+        // failure — both funnel into v1.31.0's `failWorkflowTask(true)`
+        // (`ApplyWorkflowTaskTimedOutEvent`,
+        // workflow_task_state_machine.go:263-268, 1017-1027 @ v1.31.0). The
+        // sticky case counts nothing (the affinity is dropped below either
+        // way).
+        if !sticky_was_set {
+            builder.state.workflow_task_attempts_since_last_success = builder
+                .state
+                .workflow_task_attempts_since_last_success
+                .saturating_add(1);
         }
         // WFT timeout is a close: buffered events flush after the timed-out
         // event and before the retry's fresh WorkflowTaskScheduled
         // (`AddWorkflowTaskScheduledEventAsHeartbeat` flushes first,
         // workflow_task_state_machine.go @ v1.31.0). As at WFT-failed close, a
         // non-empty flush converts the retry back to a NORMAL attempt-1 task
-        // (rule (i), workflow_task_state_machine.go:329-338; Req B.4).
+        // (rule (i), workflow_task_state_machine.go:329-338; Req B.4). A
+        // sticky-dispatched timeout also resets to attempt 1 — v1.31.0's
+        // sticky override forces `incrementAttempt = false` for timeouts too —
+        // but only when the fresh reschedule actually runs: a PAUSED retention
+        // must keep the transient shape (see the WFT-failed paused corner).
         let flushed = builder.flush_buffered();
-        if flushed > 0 {
+        let paused = builder.state.status == ExecutionStatus::Paused;
+        if flushed > 0 || (sticky_was_set && !paused) {
             builder.state.workflow_task_attempt = 1;
         } else {
             builder.state.workflow_task_attempt += 1;
         }
         builder.state.sticky = None;
-        if builder.state.status == ExecutionStatus::Paused {
+        if paused {
             // Paused workflows retain the pending task (cleared of started
             // state) so it can be re-dispatched when the workflow resumes.
             let current = builder
@@ -3494,6 +3611,12 @@ impl BasicKernel {
             } => {
                 state.previous_started_event_id = *started_event_id;
                 state.workflow_task_attempt = 1;
+                // Mirror the hot-path completion reset: success zeroes the
+                // consecutive-problem accumulator and the recorded problem
+                // (v1.31.0's rebuilder funnels the same
+                // `afterAddWorkflowTaskCompletedEvent` bookkeeping).
+                state.workflow_task_attempts_since_last_success = 0;
+                state.last_workflow_task_problem = None;
                 state.pending_workflow_task = None;
                 state.apply_wft_versioning(
                     *versioning_behavior,
@@ -3510,6 +3633,18 @@ impl BasicKernel {
                 if *failure_cause == WorkflowTaskFailedCause::ResetWorkflow {
                     close_replayed_run(state, ExecutionStatus::Terminated, event.happened_at);
                 } else {
+                    // A persisted failure is non-transient by construction:
+                    // count it and record its cause, as v1.31.0's rebuilder
+                    // does via `ApplyWorkflowTaskFailedEvent` →
+                    // `failWorkflowTask(true)` (mutable_state_rebuilder.go:284
+                    // @ v1.31.0). Transient problems left no event, so a
+                    // replay-reconstructed count undercounts them exactly as
+                    // v1.31.0's rebuild does.
+                    state.workflow_task_attempts_since_last_success = state
+                        .workflow_task_attempts_since_last_success
+                        .saturating_add(1);
+                    state.last_workflow_task_problem =
+                        Some(WorkflowTaskProblem::Failed(failure_cause.clone()));
                     let attempt = state
                         .pending_workflow_task
                         .as_ref()
@@ -3538,8 +3673,21 @@ impl BasicKernel {
             HistoryEventKind::WorkflowTaskTimedOut {
                 logical_seq,
                 scheduled_event_id,
+                timeout_type,
                 ..
             } => {
+                // Only a start-to-close timeout counts as a problem; a
+                // schedule-to-start timeout maps to v1.31.0's
+                // `failWorkflowTask(false)` and never sets the stored cause
+                // (`ApplyWorkflowTaskTimedOutEvent`,
+                // workflow_task_state_machine.go:263-268 @ v1.31.0).
+                if *timeout_type == WorkflowTaskTimeoutType::StartToClose {
+                    state.workflow_task_attempts_since_last_success = state
+                        .workflow_task_attempts_since_last_success
+                        .saturating_add(1);
+                    state.last_workflow_task_problem =
+                        Some(WorkflowTaskProblem::TimedOutStartToClose);
+                }
                 let attempt = state
                     .pending_workflow_task
                     .as_ref()
@@ -5416,6 +5564,27 @@ impl TransitionBuilder {
                 fork_event_version: None,
                 fork_event_id: None,
             });
+            self.state.last_workflow_task_problem = Some(WorkflowTaskProblem::Failed(
+                WorkflowTaskFailedCause::ForceCloseCommand,
+            ));
+        }
+        // This force-fail funnels through the same `failWorkflowTask(true)`
+        // bookkeeping as an explicit failure in v1.31.0
+        // (mutable_state_impl.go:8220 @ v1.31.0): a non-sticky occurrence
+        // advances the consecutive-problem accumulator; a sticky one drops
+        // the affinity instead.
+        let sticky_was_set = self
+            .state
+            .sticky
+            .as_ref()
+            .is_some_and(|sticky| !sticky.sticky_queue.0.is_empty());
+        if sticky_was_set {
+            self.state.sticky = None;
+        } else {
+            self.state.workflow_task_attempts_since_last_success = self
+                .state
+                .workflow_task_attempts_since_last_success
+                .saturating_add(1);
         }
         // Flush after the WFT-failed event, then schedule a fresh normal
         // attempt-1 task to redeliver the buffered batch (failWorkflowTask then
@@ -5492,6 +5661,24 @@ impl TransitionBuilder {
         let Some(started_event_id) = pending.started_event_id else {
             return;
         };
+        // v1.31.0's terminate tail still runs `failWorkflowTask(true)`
+        // bookkeeping for the force-closed task (event or not), so the
+        // consecutive-problem accumulator advances under the usual
+        // non-sticky rule even though the run closes right after
+        // (workflow/util.go:115-130 @ v1.31.0).
+        let sticky_was_set = self
+            .state
+            .sticky
+            .as_ref()
+            .is_some_and(|sticky| !sticky.sticky_queue.0.is_empty());
+        if sticky_was_set {
+            self.state.sticky = None;
+        } else {
+            self.state.workflow_task_attempts_since_last_success = self
+                .state
+                .workflow_task_attempts_since_last_success
+                .saturating_add(1);
+        }
         // Force-closing a TRANSIENT (attempt>1) task writes nothing — its
         // Scheduled/Started were never persisted, so there is no event to fail
         // ("Failing transient WT doesn't create any events at all and
@@ -5548,6 +5735,9 @@ impl TransitionBuilder {
             fork_event_version: None,
             fork_event_id: None,
         });
+        self.state.last_workflow_task_problem = Some(WorkflowTaskProblem::Failed(
+            WorkflowTaskFailedCause::ForceCloseCommand,
+        ));
         // The force-failed task is not retried — the run is about to close.
         self.state.pending_workflow_task = None;
     }
@@ -5618,8 +5808,9 @@ impl TransitionBuilder {
         // schedule-to-start deadline (the scheduled event records the sticky
         // queue, mirroring `CurrentTaskQueue()` @ v1.31.0). Guarded to
         // attempt-1: v1.31.0 clears sticky on any WFT failure before a
-        // transient retry could exist (S4, deferred), and pre-S1 encodings
-        // (empty queue name) degrade to a normal-queue sync-match hint.
+        // transient retry could exist — implemented by the failed/timed-out
+        // transitions (raise S4) — and pre-S1 encodings (empty queue name)
+        // degrade to a normal-queue sync-match hint.
         let sticky_dispatch = self
             .state
             .sticky

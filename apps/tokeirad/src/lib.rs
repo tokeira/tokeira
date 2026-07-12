@@ -81,7 +81,8 @@ use tokeira_runtime::{
     NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusEndpointSpec,
     NexusEndpointSpecTarget, NexusEndpointStore, NexusNamespaceResolver, RuntimeConfig,
     ScheduleEngineConfig, ScheduleStore, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime,
-    VersioningRuleStore, run_schedule_engine,
+    VersioningRuleStore, WorkflowTaskReportedProblem, reported_problem_from_state,
+    run_schedule_engine,
 };
 use tokeira_storage::{
     InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
@@ -90,7 +91,7 @@ use tokeira_storage::{
 };
 use tokeira_types::{
     ExecutionRef, IncarnationId, NamespaceId, NodeEndpoint, PlacementConfig, ProjectionCursor,
-    ShardId, WorkflowId,
+    SearchAttrValue, ShardId, WorkflowId,
 };
 
 /// Nexus-endpoint bootstrap target used by the dev startup path. Kept in the
@@ -826,38 +827,37 @@ where
         scanner: CompletionCallbackScannerConfig::default(),
     };
 
-    let runtime = Arc::new(
-        TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
-            repo.clone(),
-            runtime_config.lane_count,
-            runtime_config.lane,
-            runtime_config.timer_scanner,
-            runtime_config.workflow_timeout_scanner,
-            runtime_config.backlog,
-            runtime_config.activity_timeout_scanner,
-            runtime_config.nexus_timeout_scanner,
-            nexus_registry,
-            Arc::new(HttpNexusClient::new()),
-            // Wave 5: the real `HttpNexusCompletionClient` POSTs completions to the
-            // inbound `/nexus/callback` listener bound above; `system_callback_url` was
-            // resolved to that listener's actual address so the loopback closes.
-            nexus_completion_deps,
-            effective_config.infrastructure.placement.shard_count,
-            node_id.to_string(),
-            node_endpoint.as_authority(),
-            seed_default_shard,
-            versioning_rule_store.clone(),
-            // Tag the External-endpoint outbound Nexus metric with the originator's
-            // namespace name, resolved through the shared edge namespace cache.
-            Some(Arc::new(CacheNexusNamespaceResolver {
-                namespaces: namespaces.clone(),
-            }) as Arc<dyn NexusNamespaceResolver>),
-        )
-        // The edge always exposes Worker Deployment v2 RPCs. Wiring the
-        // repository here keeps their registry durable for both in-memory and
-        // DSQL backends instead of falling back to a detached test registry.
-        .with_worker_deployment_repository(worker_deployment_repository),
-    );
+    let runtime = TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
+        repo.clone(),
+        runtime_config.lane_count,
+        runtime_config.lane,
+        runtime_config.timer_scanner,
+        runtime_config.workflow_timeout_scanner,
+        runtime_config.backlog,
+        runtime_config.activity_timeout_scanner,
+        runtime_config.nexus_timeout_scanner,
+        nexus_registry,
+        Arc::new(HttpNexusClient::new()),
+        // Wave 5: the real `HttpNexusCompletionClient` POSTs completions to the
+        // inbound `/nexus/callback` listener bound above; `system_callback_url` was
+        // resolved to that listener's actual address so the loopback closes.
+        nexus_completion_deps,
+        effective_config.infrastructure.placement.shard_count,
+        node_id.to_string(),
+        node_endpoint.as_authority(),
+        seed_default_shard,
+        versioning_rule_store.clone(),
+        // Tag the External-endpoint outbound Nexus metric with the originator's
+        // namespace name, resolved through the shared edge namespace cache.
+        Some(Arc::new(CacheNexusNamespaceResolver {
+            namespaces: namespaces.clone(),
+        }) as Arc<dyn NexusNamespaceResolver>),
+    )
+    // The edge always exposes Worker Deployment v2 RPCs. Wiring the
+    // repository here keeps their registry durable for both in-memory and
+    // DSQL backends instead of falling back to a detached test registry.
+    .with_worker_deployment_repository(worker_deployment_repository);
+    let runtime = Arc::new(runtime);
 
     if dsql_endpoint.is_some()
         && effective_config
@@ -1190,6 +1190,39 @@ where
         Ok::<(), anyhow::Error>(())
     });
 
+    // Conformance-only dynamic-config control listener (spec
+    // `.kiro/specs/conformance-config-override/`). Mounted on a SEPARATE
+    // loopback listener — never the public gRPC router — and only when the fork
+    // harness set `TOKEIRA_CONFORMANCE_CONTROL_ADDR`. The whole block is behind
+    // the `conformance` feature, so a production build never contains it.
+    #[cfg(feature = "conformance")]
+    {
+        if let Some(control_addr) = conformance_control_addr() {
+            let control_cancel = background_cancel.clone();
+            tokio::spawn(async move {
+                let router = connectrpc::Router::new().add_service(std::sync::Arc::new(
+                    tokeira_conformance_control::ConformanceControlHandler,
+                ));
+                match connectrpc::Server::bind(control_addr).await {
+                    Ok(bound) => {
+                        if let Err(error) = bound
+                            .serve_with_graceful_shutdown(router, control_cancel.cancelled_owned())
+                            .await
+                        {
+                            tracing::error!(%error, "conformance control service exited with error");
+                        }
+                    }
+                    Err(error) => tracing::error!(
+                        %error,
+                        %control_addr,
+                        "failed to bind conformance control listener"
+                    ),
+                }
+            });
+            tracing::warn!(%control_addr, "conformance control service mounted (conformance build)");
+        }
+    }
+
     Ok((
         server_task,
         bound_addr,
@@ -1386,6 +1419,23 @@ fn wire_coverage_out_path() -> PathBuf {
     }
 }
 
+/// The loopback address the conformance dynamic-config control service binds to,
+/// if the fork harness enabled it.
+///
+/// Conformance-only (spec `.kiro/specs/conformance-config-override/`): the
+/// harness sets `TOKEIRA_CONFORMANCE_CONTROL_ADDR` to a concrete loopback
+/// address when booting `tokeirad` for the corpus; its presence enables the
+/// control listener and its value is the bind address. Read only in a
+/// `conformance` build — production never references it. Like the wire-coverage
+/// enable seam this is a test-harness switch, not a production configuration
+/// surface: it carries no dynamic-config value, only where to listen.
+#[cfg(feature = "conformance")]
+fn conformance_control_addr() -> Option<std::net::SocketAddr> {
+    std::env::var("TOKEIRA_CONFORMANCE_CONTROL_ADDR")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+}
+
 /// Build the shared Nexus endpoint store, seeding any bootstrap-configured
 /// endpoints. The same store backs both runtime dispatch resolution (via
 /// [`NexusEndpointRegistry`]) and the OperatorService endpoint-admin CRUD, so a
@@ -1563,6 +1613,36 @@ impl<R> StoreExecutionResolver<R> {
     }
 }
 
+fn apply_reported_problem_search_attribute(
+    search_attributes: &mut tokeira_types::SearchAttributes,
+    problem: Option<WorkflowTaskReportedProblem>,
+) {
+    let Some(problem) = problem else {
+        return;
+    };
+    // v1.31.0 exposes exactly these two KeywordList elements, derived from the
+    // last NON-TRANSIENT WFT problem once AttemptsSinceLastSuccess reaches the
+    // configured threshold — a `Failed`-flavored pair or a `TimedOut` pair,
+    // per the persisted `LastWorkflowTaskFailure` oneof
+    // (`mutable_state_impl.go:6478-6491 @ v1.31.0`; the timed-out cause
+    // renders `TimeoutType.String()`, which is "StartToClose" for the only
+    // type v1.31.0 ever stores).
+    let entries = match &problem.problem {
+        tokeira_kernel::WorkflowTaskProblem::Failed(cause) => vec![
+            "category=WorkflowTaskFailed".to_string(),
+            format!("cause=WorkflowTaskFailedCause{}", cause.as_str()),
+        ],
+        tokeira_kernel::WorkflowTaskProblem::TimedOutStartToClose => vec![
+            "category=WorkflowTaskTimedOut".to_string(),
+            "cause=WorkflowTaskTimedOutCauseStartToClose".to_string(),
+        ],
+    };
+    search_attributes.0.insert(
+        "TemporalReportedProblems".to_string(),
+        SearchAttrValue::KeywordList(entries),
+    );
+}
+
 #[async_trait]
 impl<R> ExecutionResolver for StoreExecutionResolver<R>
 where
@@ -1633,6 +1713,15 @@ where
                     );
                 let (external_payload_count, external_payload_size_bytes) =
                     tokeira_edge::translate::external_payload_stats(&history);
+                // Derived straight from committed kernel state: the counter
+                // and problem identity live on the run, the threshold is read
+                // live at derive time (Tier 3.22 `DynamicConfigChanges`).
+                let reported_problem = reported_problem_from_state(&state);
+                let mut search_attributes = state.search_attributes;
+                apply_reported_problem_search_attribute(
+                    &mut search_attributes,
+                    reported_problem,
+                );
                 Ok(Some(WorkflowExecutionDescription {
                     namespace: namespace.to_string(),
                     workflow_id: state.workflow_id.0,
@@ -1668,7 +1757,7 @@ where
                     root_run_id: state.root_run_id,
                     first_run_id: state.first_execution_run_id,
                     memo: state.memo,
-                    search_attributes: state.search_attributes,
+                    search_attributes,
                     pending_activities: state
                         .activities
                         .values()
@@ -1833,6 +1922,51 @@ mod tests {
         assert_eq!(verbose, render_build_info(true, false));
         assert_eq!(json, render_build_info(false, true));
         assert!(json.contains("temporal_proto_version"));
+    }
+
+    #[test]
+    fn reported_problem_search_attribute_has_exact_v131_keyword_list() {
+        let mut search_attributes = tokeira_types::SearchAttributes::default();
+        apply_reported_problem_search_attribute(
+            &mut search_attributes,
+            Some(WorkflowTaskReportedProblem {
+                attempts_since_last_success: 5,
+                problem: tokeira_kernel::WorkflowTaskProblem::Failed(
+                    tokeira_kernel::WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                ),
+            }),
+        );
+
+        assert_eq!(
+            search_attributes.0.get("TemporalReportedProblems"),
+            Some(&SearchAttrValue::KeywordList(vec![
+                "category=WorkflowTaskFailed".to_string(),
+                "cause=WorkflowTaskFailedCauseWorkflowWorkerUnhandledFailure".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn reported_problem_search_attribute_renders_timeout_category() {
+        // A timeout-first sequence reports the TimedOut pair — v1.31.0 renders
+        // `TimeoutType.String()` for the only stored type
+        // (`mutable_state_impl.go:6486-6491 @ v1.31.0`).
+        let mut search_attributes = tokeira_types::SearchAttributes::default();
+        apply_reported_problem_search_attribute(
+            &mut search_attributes,
+            Some(WorkflowTaskReportedProblem {
+                attempts_since_last_success: 5,
+                problem: tokeira_kernel::WorkflowTaskProblem::TimedOutStartToClose,
+            }),
+        );
+
+        assert_eq!(
+            search_attributes.0.get("TemporalReportedProblems"),
+            Some(&SearchAttrValue::KeywordList(vec![
+                "category=WorkflowTaskTimedOut".to_string(),
+                "cause=WorkflowTaskTimedOutCauseStartToClose".to_string(),
+            ]))
+        );
     }
 
     #[tokio::test]

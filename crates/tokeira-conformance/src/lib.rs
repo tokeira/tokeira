@@ -1,0 +1,593 @@
+//! Conformance-only dynamic-config override registry.
+//!
+//! This crate lets the Temporal functional test corpus deliver its
+//! `OverrideDynamicConfig(setting, value)` calls to an out-of-process `tokeirad`
+//! (spec `.kiro/specs/conformance-config-override/`). It holds a process-global
+//! store of `setting-key -> typed value` overrides that consult sites in the
+//! runtime / edge / projection planes read **live** at request time.
+//!
+//! # Where it sits
+//!
+//! Runtime/edge/projection plane, never the kernel. A pure deterministic engine
+//! must not read a runtime-mutable global — that would make history replay
+//! non-deterministic — so the kernel's tunables stay compile-time `const`s and
+//! this registry is off-limits to it (enforced by a dependency-graph test:
+//! `tokeira-kernel` must never depend on this crate). The overridable set is
+//! therefore exactly the values consulted live at request time.
+//!
+//! # Production isolation
+//!
+//! Consumer crates depend on this crate **only** under their own `conformance`
+//! Cargo feature (an optional dependency). A production `tokeirad` — built
+//! without that feature — never links this crate, so the process-global registry
+//! does not exist in production. The mutable global is a sanctioned,
+//! feature-gated exception to the engine's config-as-constant posture, confined
+//! to conformance builds.
+//!
+//! # Honesty boundary
+//!
+//! [`KEY_CLASSIFICATION`] is the single source of truth for what is honourable.
+//! An override takes effect only when its key's [`Disposition`] is
+//! [`Disposition::Wired`], which is set only in the same change that adds a real
+//! consult-site accessor for that key. Unknown keys, kernel-excluded keys, and
+//! keys tokeira does not enforce are rejected — never silently honoured, never
+//! fabricated — so a test can never turn green on an override tokeira does not
+//! actually apply.
+
+use std::{
+    collections::HashMap,
+    sync::{LazyLock, RwLock},
+    time::Duration,
+};
+
+use thiserror::Error;
+
+/// A typed override value, covering the Temporal dynamic-config value kinds the
+/// corpus sets. Its kind must match the target key's declared [`ValueType`]
+/// (enforced by [`ConformanceOverrides::set`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum OverrideValue {
+    /// An integer setting (e.g. a count or threshold).
+    Int(i64),
+    /// A floating-point setting (e.g. a rate).
+    Double(f64),
+    /// A boolean feature toggle.
+    Bool(bool),
+    /// A string setting.
+    Text(String),
+    /// A duration setting (e.g. a timeout or interval).
+    Duration(Duration),
+}
+
+impl OverrideValue {
+    /// The value's kind, used to type-check a `set` against the key's declared type.
+    pub fn value_type(&self) -> ValueType {
+        match self {
+            Self::Int(_) => ValueType::Int,
+            Self::Double(_) => ValueType::Double,
+            Self::Bool(_) => ValueType::Bool,
+            Self::Text(_) => ValueType::Text,
+            Self::Duration(_) => ValueType::Duration,
+        }
+    }
+}
+
+/// The declared kind of a dynamic-config key's value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueType {
+    /// Integer-valued setting.
+    Int,
+    /// Floating-point-valued setting.
+    Double,
+    /// Boolean-valued setting.
+    Bool,
+    /// String-valued setting.
+    Text,
+    /// Duration-valued setting.
+    Duration,
+}
+
+/// Whether — and why — a key may be overridden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// A real consult-site accessor reads this key live; overrides are honoured.
+    Wired,
+    /// Consulted inside the pure kernel as a compile-time constant; never
+    /// overridable, because overriding it would break replay determinism.
+    KernelExcluded,
+    /// tokeira has no consult site for this key (e.g. a size limit it does not
+    /// enforce); an override cannot bite, so it is rejected rather than faked.
+    NotEnforced,
+}
+
+/// Classification of one known dynamic-config key: its declared value type and
+/// its override disposition.
+///
+/// `key` is the Temporal setting key (e.g.
+/// `"history.MaxBufferedQueryCount"`), matched verbatim against the corpus's
+/// `setting.Key()`.
+#[derive(Clone, Copy, Debug)]
+pub struct KeySpec {
+    /// The Temporal setting key string.
+    pub key: &'static str,
+    /// The value kind this key carries.
+    pub value_type: ValueType,
+    /// Whether this key may be overridden (and if not, why).
+    pub disposition: Disposition,
+}
+
+/// The single source of truth for what is honourable.
+///
+/// Only [`Disposition::Wired`] keys are honoured; a key becomes `Wired` in the
+/// same change that adds its consult-site accessor. Wirable-but-not-yet-wired
+/// keys are deliberately absent (an unknown key is rejected), so this table's
+/// `Wired` set always equals the set of keys a real accessor reads — which is
+/// exactly the honesty boundary the spec requires.
+pub static KEY_CLASSIFICATION: &[KeySpec] = &[
+    // Proving consumer (Tier 3.22): the reported-problems threshold, consulted
+    // live where `TemporalReportedProblems` is derived on Describe / at the
+    // WFT-failure check. Wired here because this change adds that accessor.
+    KeySpec {
+        key: "system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    // Kernel-consulted constants — never overridable. A runtime-mutable read
+    // inside the pure kernel would make the same history replay differently
+    // (`CONTINUE_AS_NEW_MIN_INTERVAL`, `MAX_BUFFERED_EVENTS` @ tokeira-kernel).
+    KeySpec {
+        key: "history.workflowIdReuseMinimalInterval",
+        value_type: ValueType::Duration,
+        disposition: Disposition::KernelExcluded,
+    },
+    KeySpec {
+        key: "history.maximumBufferedEventsBatch",
+        value_type: ValueType::Int,
+        disposition: Disposition::KernelExcluded,
+    },
+    // Size limits tokeira does not enforce — there is no consult site to
+    // override, so an override is rejected rather than fabricating a limit.
+    KeySpec {
+        key: "limit.mutableStateSize.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::NotEnforced,
+    },
+    KeySpec {
+        key: "limit.blobSize.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::NotEnforced,
+    },
+    KeySpec {
+        key: "limit.historySize.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::NotEnforced,
+    },
+    KeySpec {
+        key: "limit.historyCount.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::NotEnforced,
+    },
+    KeySpec {
+        key: "limit.historySize.suggestContinueAsNew",
+        value_type: ValueType::Int,
+        disposition: Disposition::NotEnforced,
+    },
+];
+
+/// Look up a key's classification, if the key is known.
+///
+/// Matching is ASCII-case-insensitive. Temporal dynamic-config keys are
+/// case-insensitive and the fork delivers `setting.Key()` lowercased
+/// (`common/dynamicconfig/key.go` `Key.String()` @ v1.31.0), while this table
+/// spells the keys in the canonical mixed case of `constants.go`. Both spellings
+/// therefore resolve to the same [`KeySpec`], whose `key` is the canonical
+/// storage identity every consult site reads back under.
+pub fn classification(key: &str) -> Option<&'static KeySpec> {
+    KEY_CLASSIFICATION
+        .iter()
+        .find(|spec| spec.key.eq_ignore_ascii_case(key))
+}
+
+/// Why a `set` was rejected. The `Display` text is surfaced verbatim by the
+/// conformance control service as the Connect error message, and the fork bridge
+/// treats any rejection as a signal to fall back to the skip registry.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum OverrideError {
+    /// The key is absent from [`KEY_CLASSIFICATION`].
+    #[error("unsupported override key: {0}")]
+    UnknownKey(String),
+    /// The key is consulted in the pure kernel and is not overridable.
+    #[error("kernel-consulted constant is not overridable: {0}")]
+    KernelExcluded(String),
+    /// tokeira has no consult site for the key, so an override cannot take effect.
+    #[error("tokeira does not enforce {0}")]
+    NotEnforced(String),
+    /// The value's kind does not match the key's declared [`ValueType`].
+    #[error("value type mismatch for {key}: expected {expected:?}, got {got:?}")]
+    TypeMismatch {
+        /// The key whose declared type was violated.
+        key: String,
+        /// The type the key declares.
+        expected: ValueType,
+        /// The type the caller supplied.
+        got: ValueType,
+    },
+    /// The key was empty.
+    #[error("override key must not be empty")]
+    MissingKey,
+}
+
+/// Process-global store of active overrides.
+///
+/// Reads happen on the request path (via the typed getters); writes happen only
+/// from the conformance control service. Reads observe the current state with no
+/// caching, so a mid-run override change — as Tier 3.22's `DynamicConfigChanges`
+/// leaf requires — takes effect on the next consult.
+#[derive(Debug, Default)]
+pub struct ConformanceOverrides {
+    inner: RwLock<HashMap<&'static str, OverrideValue>>,
+}
+
+impl ConformanceOverrides {
+    /// Honour an override, or reject it.
+    ///
+    /// This is the honesty gate: an override is stored only for a
+    /// [`Disposition::Wired`] key whose declared [`ValueType`] matches the
+    /// value's kind. An unknown key, a kernel-excluded or not-enforced key, an
+    /// empty key, or a type mismatch is rejected and **records nothing**.
+    pub fn set(&self, key: &str, value: OverrideValue) -> Result<(), OverrideError> {
+        if key.is_empty() {
+            return Err(OverrideError::MissingKey);
+        }
+        let spec = classification(key).ok_or_else(|| OverrideError::UnknownKey(key.to_string()))?;
+        match spec.disposition {
+            Disposition::KernelExcluded => {
+                return Err(OverrideError::KernelExcluded(key.to_string()));
+            }
+            Disposition::NotEnforced => {
+                return Err(OverrideError::NotEnforced(key.to_string()));
+            }
+            Disposition::Wired => {}
+        }
+        let got = value.value_type();
+        if got != spec.value_type {
+            return Err(OverrideError::TypeMismatch {
+                key: key.to_string(),
+                expected: spec.value_type,
+                got,
+            });
+        }
+        // Key by the interned `&'static str` from the classification so getters
+        // (which take `&str`) resolve against a stable key identity.
+        self.inner
+            .write()
+            .expect("conformance overrides poisoned")
+            .insert(spec.key, value);
+        Ok(())
+    }
+
+    /// Drop the override for `key`, if any; subsequent consults observe the default.
+    pub fn clear(&self, key: &str) {
+        if let Some(spec) = classification(key) {
+            self.inner
+                .write()
+                .expect("conformance overrides poisoned")
+                .remove(spec.key);
+        }
+    }
+
+    /// Drop every override — used for per-test isolation on teardown.
+    pub fn reset(&self) {
+        self.inner
+            .write()
+            .expect("conformance overrides poisoned")
+            .clear();
+    }
+
+    fn get(&self, key: &str) -> Option<OverrideValue> {
+        // Resolve through the (case-insensitive) classification so a consult
+        // site's key spelling matches the canonical `spec.key` the override was
+        // stored under, regardless of case.
+        let spec = classification(key)?;
+        self.inner
+            .read()
+            .expect("conformance overrides poisoned")
+            .get(spec.key)
+            .cloned()
+    }
+
+    /// Live integer override for `key`, if one is set to an integer.
+    pub fn get_i64(&self, key: &str) -> Option<i64> {
+        match self.get(key)? {
+            OverrideValue::Int(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Live floating-point override for `key`, if one is set to a double.
+    pub fn get_f64(&self, key: &str) -> Option<f64> {
+        match self.get(key)? {
+            OverrideValue::Double(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Live boolean override for `key`, if one is set to a bool.
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        match self.get(key)? {
+            OverrideValue::Bool(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Live string override for `key`, if one is set to a string.
+    pub fn get_str(&self, key: &str) -> Option<String> {
+        match self.get(key)? {
+            OverrideValue::Text(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Live duration override for `key`, if one is set to a duration.
+    pub fn get_duration(&self, key: &str) -> Option<Duration> {
+        match self.get(key)? {
+            OverrideValue::Duration(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// The process-global override registry.
+///
+/// Present only in a `conformance`-feature build (consumer crates gate their
+/// dependency on this crate behind that feature), so a production `tokeirad`
+/// never instantiates it.
+pub fn overrides() -> &'static ConformanceOverrides {
+    static OVERRIDES: LazyLock<ConformanceOverrides> = LazyLock::new(ConformanceOverrides::default);
+    &OVERRIDES
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    const REPORTED_PROBLEMS_KEY: &str =
+        "system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute";
+
+    /// The classification table is internally consistent: keys are unique, and
+    /// the reported-problems threshold — the proving wired consumer — is present
+    /// as a `Wired` `Int`.
+    #[test]
+    fn classification_table_is_consistent() {
+        let mut seen = std::collections::HashSet::new();
+        for spec in KEY_CLASSIFICATION {
+            assert!(
+                seen.insert(spec.key),
+                "duplicate key in classification: {}",
+                spec.key
+            );
+        }
+        let reported = classification(REPORTED_PROBLEMS_KEY).expect("reported-problems classified");
+        assert_eq!(reported.disposition, Disposition::Wired);
+        assert_eq!(reported.value_type, ValueType::Int);
+    }
+
+    /// A fresh registry: set on a wired key is observed live; clear reverts to
+    /// the default (None); reset drops everything.
+    #[test]
+    fn lifecycle_set_clear_reset() {
+        let overrides = ConformanceOverrides::default();
+        assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+
+        overrides
+            .set(REPORTED_PROBLEMS_KEY, OverrideValue::Int(2))
+            .expect("wired set");
+        assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), Some(2));
+
+        overrides
+            .set(REPORTED_PROBLEMS_KEY, OverrideValue::Int(0))
+            .expect("re-set");
+        assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), Some(0));
+
+        overrides.clear(REPORTED_PROBLEMS_KEY);
+        assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+
+        overrides
+            .set(REPORTED_PROBLEMS_KEY, OverrideValue::Int(2))
+            .expect("wired set");
+        overrides.reset();
+        assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+    }
+
+    /// Keys are matched case-insensitively. The fork bridge delivers
+    /// `setting.Key()` lowercased (Temporal keys are case-insensitive), so a
+    /// lowercase set must be honoured and observed by the canonical-case consult
+    /// site — the exact end-to-end path Tier 3.22 exercises. Regression guard for
+    /// the lowercased-key mismatch that made the reported-problems override land
+    /// as `UnknownKey`.
+    #[test]
+    fn key_matching_is_case_insensitive() {
+        let overrides = ConformanceOverrides::default();
+        let lowercased = REPORTED_PROBLEMS_KEY.to_ascii_lowercase();
+        assert_ne!(
+            lowercased, REPORTED_PROBLEMS_KEY,
+            "sanity: the canonical key has uppercase"
+        );
+
+        overrides
+            .set(&lowercased, OverrideValue::Int(2))
+            .expect("lowercase set is honoured");
+        // The runtime consult site reads back under the canonical mixed-case key.
+        assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), Some(2));
+
+        // A lowercase clear drops the canonically-stored override.
+        overrides.clear(&lowercased);
+        assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+    }
+
+    /// The honesty gate rejects (recording nothing) unknown, kernel-excluded,
+    /// not-enforced, empty, and type-mismatched sets.
+    #[test]
+    fn set_rejects_unhonourable_keys_and_type_mismatches() {
+        let overrides = ConformanceOverrides::default();
+
+        assert!(matches!(
+            overrides.set("nope.not.a.key", OverrideValue::Int(1)),
+            Err(OverrideError::UnknownKey(_))
+        ));
+        assert!(matches!(
+            overrides.set(
+                "history.workflowIdReuseMinimalInterval",
+                OverrideValue::Duration(Duration::ZERO)
+            ),
+            Err(OverrideError::KernelExcluded(_))
+        ));
+        assert!(matches!(
+            overrides.set("limit.mutableStateSize.error", OverrideValue::Int(410_000)),
+            Err(OverrideError::NotEnforced(_))
+        ));
+        assert!(matches!(
+            overrides.set("", OverrideValue::Int(1)),
+            Err(OverrideError::MissingKey)
+        ));
+        assert!(matches!(
+            overrides.set(REPORTED_PROBLEMS_KEY, OverrideValue::Bool(true)),
+            Err(OverrideError::TypeMismatch { .. })
+        ));
+
+        // None of the rejected sets recorded anything.
+        assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+    }
+
+    fn any_override_value() -> impl Strategy<Value = OverrideValue> {
+        prop_oneof![
+            any::<i64>().prop_map(OverrideValue::Int),
+            any::<f64>().prop_map(OverrideValue::Double),
+            any::<bool>().prop_map(OverrideValue::Bool),
+            any::<String>().prop_map(OverrideValue::Text),
+            (0u64..1_000_000u64).prop_map(|n| OverrideValue::Duration(Duration::from_millis(n))),
+        ]
+    }
+
+    fn any_key() -> impl Strategy<Value = String> {
+        let known: Vec<String> = KEY_CLASSIFICATION
+            .iter()
+            .map(|spec| spec.key.to_string())
+            .collect();
+        // The random arm is `[a-z.]`-only. Matching is now case-insensitive, so a
+        // random lowercase string could in principle equal a known key's lowercased
+        // form; the honesty property below derives its expectation from
+        // `classification()` itself (which `set` also uses), so the two always agree
+        // whether or not such a collision occurs.
+        prop_oneof![
+            proptest::sample::select(known),
+            proptest::string::string_regex("[a-z][a-z.]{0,24}").expect("valid key regex"),
+        ]
+    }
+
+    fn any_key_stored(overrides: &ConformanceOverrides) -> bool {
+        KEY_CLASSIFICATION.iter().any(|spec| match spec.value_type {
+            ValueType::Int => overrides.get_i64(spec.key).is_some(),
+            ValueType::Double => overrides.get_f64(spec.key).is_some(),
+            ValueType::Bool => overrides.get_bool(spec.key).is_some(),
+            ValueType::Text => overrides.get_str(spec.key).is_some(),
+            ValueType::Duration => overrides.get_duration(spec.key).is_some(),
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: conformance-config-override, Property 2: override lifecycle and liveness.
+        // A wired override is observed live; re-set replaces it; clear reverts to the
+        // default; reset drops all.
+        #[test]
+        fn prop_lifecycle_and_liveness(first in any::<i64>(), second in any::<i64>()) {
+            let overrides = ConformanceOverrides::default();
+            prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+            overrides.set(REPORTED_PROBLEMS_KEY, OverrideValue::Int(first)).unwrap();
+            prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), Some(first));
+            overrides.set(REPORTED_PROBLEMS_KEY, OverrideValue::Int(second)).unwrap();
+            prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), Some(second));
+            overrides.clear(REPORTED_PROBLEMS_KEY);
+            prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+            overrides.set(REPORTED_PROBLEMS_KEY, OverrideValue::Int(first)).unwrap();
+            overrides.reset();
+            prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+        }
+
+        // Feature: conformance-config-override, Property 3: value-type fidelity.
+        // On a wired key, a matching-kind value round-trips; a mismatched kind is
+        // rejected and records nothing.
+        #[test]
+        fn prop_value_type_fidelity(value in any_override_value()) {
+            let overrides = ConformanceOverrides::default();
+            let result = overrides.set(REPORTED_PROBLEMS_KEY, value.clone());
+            match value {
+                OverrideValue::Int(expected) => {
+                    prop_assert!(result.is_ok());
+                    prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), Some(expected));
+                }
+                _ => {
+                    prop_assert!(
+                        matches!(result, Err(OverrideError::TypeMismatch { .. })),
+                        "expected type mismatch",
+                    );
+                    prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+                }
+            }
+        }
+
+        // Feature: conformance-config-override, Property 4: honesty boundary.
+        // set() honours iff the key is Wired and the value kind matches its declared
+        // type; every other case returns the mapped error and records nothing.
+        #[test]
+        fn prop_honesty_boundary(key in any_key(), value in any_override_value()) {
+            let overrides = ConformanceOverrides::default();
+            let result = overrides.set(&key, value.clone());
+            match classification(&key) {
+                None => prop_assert!(matches!(result, Err(OverrideError::UnknownKey(_)))),
+                Some(spec) => match spec.disposition {
+                    Disposition::KernelExcluded => {
+                        prop_assert!(matches!(result, Err(OverrideError::KernelExcluded(_))));
+                    }
+                    Disposition::NotEnforced => {
+                        prop_assert!(matches!(result, Err(OverrideError::NotEnforced(_))));
+                    }
+                    Disposition::Wired => {
+                        if value.value_type() == spec.value_type {
+                            prop_assert!(result.is_ok());
+                        } else {
+                            prop_assert!(
+                                matches!(result, Err(OverrideError::TypeMismatch { .. })),
+                                "expected type mismatch",
+                            );
+                        }
+                    }
+                },
+            }
+            // Nothing is stored unless the set was honoured.
+            prop_assert_eq!(result.is_ok(), any_key_stored(&overrides));
+        }
+
+        // Feature: conformance-config-override, Property 7: between-test isolation.
+        // Whatever a "test" sets or clears, reset() at teardown clears all state so the
+        // next test starts from defaults.
+        #[test]
+        fn prop_between_test_isolation(ops in prop::collection::vec(any::<Option<i64>>(), 0..24)) {
+            let overrides = ConformanceOverrides::default();
+            for op in ops {
+                match op {
+                    Some(value) => {
+                        let _ = overrides.set(REPORTED_PROBLEMS_KEY, OverrideValue::Int(value));
+                    }
+                    None => overrides.clear(REPORTED_PROBLEMS_KEY),
+                }
+            }
+            overrides.reset();
+            prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+        }
+    }
+}

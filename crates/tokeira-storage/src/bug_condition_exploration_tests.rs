@@ -57,6 +57,8 @@ mod tests {
             }),
             previous_started_event_id: 0,
             workflow_task_attempt: 1,
+            workflow_task_attempts_since_last_success: 0,
+            last_workflow_task_problem: None,
             sticky: None,
             pause_info: None,
             cancel_requested: false,

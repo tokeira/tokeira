@@ -55,6 +55,18 @@ tokeira-runtime = { path = "../../crates/tokeira-runtime" }
 tokeira-config.workspace = true
 tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }
 tokeira-types = { path = "../../crates/tokeira-types" }
+tokeira-conformance-control = { workspace = true, optional = true }
+connectrpc = { version = "0.8.1", features = ["server"], optional = true }
+
+[features]
+# Conformance-only: mounts the dynamic-config control service on a separate
+# loopback listener and enables the runtime's live override reads. Absent from
+# a production build.
+conformance = [
+    "dep:tokeira-conformance-control",
+    "dep:connectrpc",
+    "tokeira-runtime/conformance",
+]
 
 [dev-dependencies]
 metrics-util.workspace = true

@@ -95,6 +95,78 @@ pub(crate) use activity::{
     ActivityRetryDeps, ActivityRetryTarget, commit_activity_retry, exhausted_reason_to_retry_state,
 };
 
+/// v1.31.0 default number of consecutive workflow-task problems required
+/// before `TemporalReportedProblems` is surfaced.
+///
+/// This remains a release-pinned constant rather than a deployment knob
+/// (`common/dynamicconfig/constants.go:307-312 @ v1.31.0`).
+pub const REPORTED_PROBLEMS_THRESHOLD: u32 = 5;
+
+/// The live reported-problems threshold consulted when deriving
+/// `TemporalReportedProblems`. In a production build this is exactly the pinned
+/// [`REPORTED_PROBLEMS_THRESHOLD`].
+#[cfg(not(feature = "conformance"))]
+#[inline]
+fn reported_problems_threshold() -> u32 {
+    REPORTED_PROBLEMS_THRESHOLD
+}
+
+/// Conformance builds read the threshold *live* from the override registry at
+/// the consult site — never cached on any state — so a mid-run change (Tier
+/// 3.22 `DynamicConfigChanges` sets it 0 then 2) takes effect on the next
+/// Describe. The key is honoured only when the control service set an override;
+/// otherwise the pinned default stands
+/// (spec `.kiro/specs/conformance-config-override/`).
+#[cfg(feature = "conformance")]
+#[inline]
+fn reported_problems_threshold() -> u32 {
+    let raw = tokeira_conformance::overrides()
+        .get_i64("system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute");
+    raw.and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(REPORTED_PROBLEMS_THRESHOLD)
+}
+
+/// Reported-problem observation used to derive `TemporalReportedProblems` on
+/// Describe, materialized from committed kernel state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowTaskReportedProblem {
+    /// Consecutive problems observed since the last successful WFT completion.
+    pub attempts_since_last_success: u32,
+    /// Identity of the last non-transient WFT problem (v1.31.0's
+    /// `LastWorkflowTaskFailure` oneof).
+    pub problem: tokeira_kernel::WorkflowTaskProblem,
+}
+
+/// Derive the reported problem for a run from its committed state.
+///
+/// The kernel advances `workflow_task_attempts_since_last_success` and
+/// `last_workflow_task_problem` under exactly v1.31.0's `failWorkflowTask`
+/// rules (non-sticky failures and non-sticky start-to-close timeouts count;
+/// success clears), so this is a pure read: publish once the count meets the
+/// threshold and a non-transient problem identity exists
+/// (`workflow_task_state_machine.go:1050-1054`,
+/// `mutable_state_impl.go:6478-6491 @ v1.31.0`).
+///
+/// The threshold is read *live* via [`reported_problems_threshold`], so a
+/// mid-run override takes effect on the next call (Tier 3.22
+/// `DynamicConfigChanges`). A zero threshold disables publication, matching
+/// v1.31.0's dynamic-config semantics.
+pub fn reported_problem_from_state(
+    state: &tokeira_kernel::WorkflowState,
+) -> Option<WorkflowTaskReportedProblem> {
+    let threshold = reported_problems_threshold();
+    if threshold == 0 || state.workflow_task_attempts_since_last_success < threshold {
+        return None;
+    }
+    state
+        .last_workflow_task_problem
+        .clone()
+        .map(|problem| WorkflowTaskReportedProblem {
+            attempts_since_last_success: state.workflow_task_attempts_since_last_success,
+            problem,
+        })
+}
+
 /// Public runtime facade.
 ///
 /// This is intentionally small. The point is to expose the
@@ -1421,7 +1493,7 @@ mod tests {
     };
     use tokeira_kernel::{
         CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback, Link, OnConflictOptions,
-        RetryState,
+        RetryState, WorkflowTaskFailedCause,
     };
     use tokeira_storage::{
         BacklogEntry, CommitResult, DispatchableWorkflowTask, InMemoryStore, RequestRecord,
@@ -1431,6 +1503,99 @@ mod tests {
         ExecutionRef, LogicalTaskSeq, Memo, NamespaceId, Payloads, RequestContext, RequestId,
         SearchAttributes, TaskKind, WorkflowId,
     };
+
+    /// Minimal open-run state for exercising the reported-problems derive.
+    fn reported_problem_state(
+        attempts_since_last_success: u32,
+        problem: Option<tokeira_kernel::WorkflowTaskProblem>,
+    ) -> tokeira_kernel::WorkflowState {
+        let mut state = crate::runtime::workflow_task::tests::open_state(
+            "reported-problems-workflow".to_string(),
+            None,
+        );
+        state.workflow_task_attempts_since_last_success = attempts_since_last_success;
+        state.last_workflow_task_problem = problem;
+        state
+    }
+
+    #[test]
+    fn reported_problem_appears_at_default_threshold_and_carries_latest_cause() {
+        for below in 0..REPORTED_PROBLEMS_THRESHOLD {
+            let state = reported_problem_state(
+                below,
+                Some(tokeira_kernel::WorkflowTaskProblem::Failed(
+                    WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                )),
+            );
+            assert!(reported_problem_from_state(&state).is_none());
+        }
+
+        let state = reported_problem_state(
+            REPORTED_PROBLEMS_THRESHOLD,
+            Some(tokeira_kernel::WorkflowTaskProblem::Failed(
+                WorkflowTaskFailedCause::NonDeterminismError,
+            )),
+        );
+        assert_eq!(
+            reported_problem_from_state(&state),
+            Some(WorkflowTaskReportedProblem {
+                attempts_since_last_success: REPORTED_PROBLEMS_THRESHOLD,
+                problem: tokeira_kernel::WorkflowTaskProblem::Failed(
+                    WorkflowTaskFailedCause::NonDeterminismError
+                ),
+            })
+        );
+    }
+
+    #[test]
+    fn reported_problem_counter_survives_rescheduling_and_clears_on_success() {
+        // The kernel carries the accumulator across task rescheduling and
+        // zeroes it (plus the problem identity) on completion; the derive
+        // publishes only while BOTH survive. A count with no recorded
+        // non-transient problem publishes nothing — v1.31.0's SA composer
+        // renders nothing when `LastWorkflowTaskFailure` is nil
+        // (`mutable_state_impl.go:6478-6491 @ v1.31.0`).
+        let above_threshold = REPORTED_PROBLEMS_THRESHOLD + 2;
+        let state = reported_problem_state(
+            above_threshold,
+            Some(tokeira_kernel::WorkflowTaskProblem::TimedOutStartToClose),
+        );
+        assert_eq!(
+            reported_problem_from_state(&state)
+                .expect("problem observation")
+                .attempts_since_last_success,
+            above_threshold
+        );
+
+        let cleared = reported_problem_state(0, None);
+        assert!(reported_problem_from_state(&cleared).is_none());
+
+        let count_without_identity = reported_problem_state(above_threshold, None);
+        assert!(reported_problem_from_state(&count_without_identity).is_none());
+    }
+
+    // Feature: conformance-config-override, Property 1: off-feature equivalence.
+    // A production (non-`conformance`) build resolves the reported-problems threshold
+    // to the pinned constant with no registry read — the accessor is the constant by
+    // construction, so a production binary cannot be influenced by any override.
+    #[cfg(not(feature = "conformance"))]
+    #[test]
+    fn reported_problems_threshold_is_pinned_constant_off_feature() {
+        assert_eq!(reported_problems_threshold(), REPORTED_PROBLEMS_THRESHOLD);
+    }
+
+    // Feature: conformance-config-override, Property 1: off-feature equivalence
+    // (feature-on, no override). Building the `conformance` feature alone changes
+    // nothing: with no override set, the live-read accessor still yields the pinned
+    // default. Only an actual override moves it (covered by the registry's lifecycle
+    // property test).
+    #[cfg(feature = "conformance")]
+    #[test]
+    fn reported_problems_threshold_defaults_to_constant_without_override() {
+        tokeira_conformance::overrides()
+            .clear("system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute");
+        assert_eq!(reported_problems_threshold(), REPORTED_PROBLEMS_THRESHOLD);
+    }
 
     proptest! {
         #[test]

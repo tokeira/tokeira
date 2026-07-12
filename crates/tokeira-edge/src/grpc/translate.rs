@@ -754,10 +754,10 @@ fn migrate_reuse_policy(
     }
 }
 
-// v1.62-sync: reads deprecated `VersioningOverride.behavior` and `.deployment`
-// fields for wire-compat with v0.4-era SDK clients. v1.62 replaces the flat
-// shape with a `override` oneof; migration to the new shape is tracked under
-// `runtime-worker-versioning`.
+// Read the modern oneof first, then the deprecated v0.30/v0.31 fields. Temporal
+// v1.31.0 accepts both shapes and validates the modern pinned version before
+// consulting the deprecated behavior (`ValidateVersioningOverride`,
+// `common/worker_versioning/worker_versioning.go:672-718 @ v1.31.0`).
 #[allow(deprecated)]
 fn versioning_override_to_edge(
     override_: Option<workflow::VersioningOverride>,
@@ -765,6 +765,39 @@ fn versioning_override_to_edge(
     let Some(override_) = override_ else {
         return Ok(None);
     };
+    if let Some(modern) = override_.r#override {
+        return match modern {
+            workflow::versioning_override::Override::Pinned(pinned) => {
+                if pinned.behavior
+                    != workflow::versioning_override::PinnedOverrideBehavior::Pinned as i32
+                {
+                    return Err(ProtoConversionError::InvalidArgument(
+                        "must specify pinned override behavior if override is pinned.".to_string(),
+                    ));
+                }
+                let version = pinned.version.ok_or_else(|| {
+                    ProtoConversionError::InvalidArgument(
+                        "must provide version if override is pinned.".to_string(),
+                    )
+                })?;
+                if version.deployment_name.is_empty() || version.build_id.is_empty() {
+                    return Err(ProtoConversionError::MissingField(
+                        "VersioningOverride.pinned.version.deployment_name/build_id",
+                    ));
+                }
+                Ok(Some(VersioningOverride::Pinned {
+                    deployment_series: version.deployment_name,
+                    build_id: version.build_id,
+                }))
+            }
+            workflow::versioning_override::Override::AutoUpgrade(enabled) if enabled => {
+                Ok(Some(VersioningOverride::AutoUpgrade))
+            }
+            workflow::versioning_override::Override::AutoUpgrade(_) => Err(
+                ProtoConversionError::InvalidArgument("override behavior is required".to_string()),
+            ),
+        };
+    }
     match enums::VersioningBehavior::try_from(override_.behavior).ok() {
         Some(enums::VersioningBehavior::Pinned) => {
             let deployment = override_
@@ -7349,6 +7382,31 @@ mod tests {
         assert_eq!(
             edge.worker_deployment_name.as_deref(),
             Some("legacy-deployment")
+        );
+    }
+
+    #[test]
+    fn modern_pinned_versioning_override_is_preserved() {
+        let converted = versioning_override_to_edge(Some(workflow::VersioningOverride {
+            r#override: Some(workflow::versioning_override::Override::Pinned(
+                workflow::versioning_override::PinnedOverride {
+                    behavior: workflow::versioning_override::PinnedOverrideBehavior::Pinned as i32,
+                    version: Some(deployment_proto::WorkerDeploymentVersion {
+                        deployment_name: "deployment".to_owned(),
+                        build_id: "build-id".to_owned(),
+                    }),
+                },
+            )),
+            ..Default::default()
+        }))
+        .expect("modern pinned override should convert");
+
+        assert_eq!(
+            converted,
+            Some(VersioningOverride::Pinned {
+                deployment_series: "deployment".to_owned(),
+                build_id: "build-id".to_owned(),
+            })
         );
     }
 

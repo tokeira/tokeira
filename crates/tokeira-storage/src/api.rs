@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokeira_kernel::{
     ActivityOp, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, RequestIdInfo, TimerOp,
-    Transition, WorkflowState, state::VersioningBehavior,
+    Transition, WorkflowState,
+    state::{VersioningBehavior, VersioningOverride},
 };
 use tokeira_types::{
     ArchetypeId, ExecutionRef, ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload,
@@ -1112,6 +1113,63 @@ fn projection_context(
                 "BuildIds".to_owned(),
                 SearchAttrValue::KeywordList(build_ids.clone()),
             );
+        }
+        if let Some(info) = state.versioning_info.as_ref() {
+            // These are mutable-state-derived visibility attributes, not client-authored
+            // WorkflowExecutionStarted attributes. Deriving them in the complete projection
+            // image mirrors `addBuildIDAndDeploymentInfoToSearchAttributesWithNoVisibilityTask`
+            // without leaking server-managed values into history
+            // (`service/history/workflow/mutable_state_impl.go:2870-2990,3767-3835 @ v1.31.0`).
+            let (deployment, version, behavior) = match info.versioning_override.as_ref() {
+                Some(VersioningOverride::Pinned { version }) => (
+                    Some(version.deployment_name.as_str()),
+                    Some(version),
+                    Some("Pinned"),
+                ),
+                Some(VersioningOverride::AutoUpgrade) => (
+                    info.deployment_version
+                        .as_ref()
+                        .map(|version| version.deployment_name.as_str())
+                        .or(state.worker_deployment_name.as_deref()),
+                    info.deployment_version.as_ref(),
+                    Some("AutoUpgrade"),
+                ),
+                None => (
+                    info.deployment_version
+                        .as_ref()
+                        .map(|version| version.deployment_name.as_str())
+                        .or(state.worker_deployment_name.as_deref()),
+                    info.deployment_version.as_ref(),
+                    match info.behavior {
+                        VersioningBehavior::Pinned => Some("Pinned"),
+                        VersioningBehavior::AutoUpgrade => Some("AutoUpgrade"),
+                        VersioningBehavior::Unspecified => None,
+                    },
+                ),
+            };
+            if let Some(deployment) = deployment.filter(|value| !value.is_empty()) {
+                search_attributes.0.insert(
+                    "TemporalWorkerDeployment".to_owned(),
+                    SearchAttrValue::Keyword(deployment.to_owned()),
+                );
+            }
+            if let Some(version) = version.filter(|version| {
+                !version.deployment_name.is_empty() && !version.build_id.is_empty()
+            }) {
+                search_attributes.0.insert(
+                    "TemporalWorkerDeploymentVersion".to_owned(),
+                    SearchAttrValue::Keyword(format!(
+                        "{}:{}",
+                        version.deployment_name, version.build_id
+                    )),
+                );
+            }
+            if let Some(behavior) = behavior {
+                search_attributes.0.insert(
+                    "TemporalWorkflowVersioningBehavior".to_owned(),
+                    SearchAttrValue::Keyword(behavior.to_owned()),
+                );
+            }
         }
         if state.external_payload_count > 0 {
             search_attributes.0.insert(

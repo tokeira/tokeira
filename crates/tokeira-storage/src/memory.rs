@@ -1595,10 +1595,11 @@ mod tests {
     use tokeira_kernel::{
         ActivityPauseInfo, PauseInfo, PendingWorkflowTask, RequestDedupeOp,
         event::{HistoryEvent, HistoryEventKind},
+        state::{VersioningOverride, WorkerDeploymentVersionRef, WorkflowVersioningInfo},
     };
     use tokeira_types::{
         ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey, RequestId,
-        RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName, TransitionSeq,
+        RunId, RunKey, SearchAttrValue, SearchAttributes, TaskKind, TaskQueueName, TransitionSeq,
         VisibilityLifecycleState, WorkerIdentity, WorkflowId, WorkflowType,
     };
     use tracing::{
@@ -2129,6 +2130,52 @@ mod tests {
             dispatch_ops: Default::default(),
             projection_ops: Default::default(),
         }
+    }
+
+    #[test]
+    fn projection_derives_pinned_worker_deployment_search_attributes() {
+        let run_key = RunKey::new();
+        let mut state = sample_state(run_key);
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            versioning_override: Some(VersioningOverride::Pinned {
+                version: WorkerDeploymentVersionRef {
+                    deployment_name: "deployment".to_owned(),
+                    build_id: "build-id".to_owned(),
+                },
+            }),
+            ..WorkflowVersioningInfo::default()
+        });
+
+        let projection = workflow_projection_context(&state).unwrap();
+        assert_eq!(
+            projection
+                .search_attributes
+                .0
+                .get("TemporalWorkflowVersioningBehavior"),
+            Some(&SearchAttrValue::Keyword("Pinned".to_owned()))
+        );
+        assert_eq!(
+            projection
+                .search_attributes
+                .0
+                .get("TemporalWorkerDeployment"),
+            Some(&SearchAttrValue::Keyword("deployment".to_owned()))
+        );
+        assert_eq!(
+            projection
+                .search_attributes
+                .0
+                .get("TemporalWorkerDeploymentVersion"),
+            Some(&SearchAttrValue::Keyword("deployment:build-id".to_owned()))
+        );
+        assert!(
+            state
+                .search_attributes
+                .0
+                .get("TemporalWorkflowVersioningBehavior")
+                .is_none(),
+            "server-managed visibility attributes must not mutate authoritative history state"
+        );
     }
 
     // The completion-callback sweep query must surface BOTH `Scheduled` (first delivery

@@ -362,14 +362,33 @@ async fn resolve_field<S: VisibilityStore + ?Sized>(
     if let Some(system) = system {
         return Ok(FieldRef::System(system));
     }
-    let Some(attr) = store.resolve_attr(namespace_id, trimmed).await? else {
-        return Err(anyhow!("unknown search attribute: {trimmed}"));
-    };
-    Ok(FieldRef::Custom {
-        name: trimmed.to_string(),
-        attr_id: attr.attr_id,
-        attr_type: attr.attr_type,
-    })
+    if let Some(attr) = store.resolve_attr(namespace_id, trimmed).await? {
+        return Ok(FieldRef::Custom {
+            name: trimmed.to_string(),
+            attr_id: attr.attr_id,
+            attr_type: attr.attr_type,
+        });
+    }
+
+    // v1.31.0 resolves a registered custom alias before trying the reserved-prefix
+    // fallback. Thus a user-defined `WorkflowVersioningBehavior` remains distinct from
+    // `TemporalWorkflowVersioningBehavior`, while the unregistered short name aliases the
+    // system attribute (`common/persistence/visibility/store/query/resolve.go @ v1.31.0`).
+    let prefixed_or_stripped = trimmed
+        .strip_prefix("Temporal")
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Temporal{trimmed}"));
+    if let Some(attr) = store
+        .resolve_attr(namespace_id, &prefixed_or_stripped)
+        .await?
+    {
+        return Ok(FieldRef::Custom {
+            name: prefixed_or_stripped,
+            attr_id: attr.attr_id,
+            attr_type: attr.attr_type,
+        });
+    }
+    Err(anyhow!("unknown search attribute: {trimmed}"))
 }
 
 fn parse_value(input: &str) -> FilterValue {
@@ -815,6 +834,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("type mismatch"));
+    }
+
+    #[tokio::test]
+    async fn temporal_prefix_fallback_preserves_custom_attribute_precedence() {
+        let store = InMemoryVisibilityStore::default();
+        let namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+        let system = store
+            .register_attr(
+                namespace_id,
+                "TemporalWorkflowVersioningBehavior".to_string(),
+                SearchAttrType::Keyword,
+            )
+            .await
+            .unwrap();
+
+        let fallback = compile_filter(
+            Some("WorkflowVersioningBehavior = 'Pinned'"),
+            namespace_id,
+            &store,
+        )
+        .await
+        .unwrap();
+        let Some(FilterExpr::Compare {
+            field: FieldRef::Custom { name, attr_id, .. },
+            ..
+        }) = fallback.expr
+        else {
+            panic!("expected custom-attribute comparison")
+        };
+        assert_eq!(name, "TemporalWorkflowVersioningBehavior");
+        assert_eq!(attr_id, system);
+
+        let custom = store
+            .register_attr(
+                namespace_id,
+                "WorkflowVersioningBehavior".to_string(),
+                SearchAttrType::Keyword,
+            )
+            .await
+            .unwrap();
+        let exact = compile_filter(
+            Some("WorkflowVersioningBehavior = 'user-defined'"),
+            namespace_id,
+            &store,
+        )
+        .await
+        .unwrap();
+        let Some(FilterExpr::Compare {
+            field: FieldRef::Custom { name, attr_id, .. },
+            ..
+        }) = exact.expr
+        else {
+            panic!("expected custom-attribute comparison")
+        };
+        assert_eq!(name, "WorkflowVersioningBehavior");
+        assert_eq!(attr_id, custom);
     }
 
     #[tokio::test]

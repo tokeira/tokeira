@@ -30,12 +30,15 @@ forked onebox's service boot is short-circuited; `FrontendClient()` is pointed a
 confined to the onebox seam and a per-test ledger — never a test body — so the corpus stays
 byte-for-byte upstream and rebases cleanly on each compat bump.
 
-Two tools live in the fork:
+Three tools live in the fork:
 
 - **run-all executor** — enumerates every top-level entrypoint and runs each in its **own** `go test`
   process. Per-entrypoint isolation means a panicking test cannot abort the rest of the corpus (full
   execution is guaranteed; a single crash truncates only its own siblings). Emits a combined
   `go test -json` stream.
+- **single-suite runner** — the iteration counterpart: runs one suite (or an arbitrary `-run` regexp)
+  against a booted-or-reused `tokeirad` on the same shared lifecycle and skip registry, and prints a
+  per-leaf PASS/FAIL/SKIP tally. Replaces the former `run_suite.sh` bash harness.
 - **outcome distiller** — reduces the `-json` stream to one outcome per test, at per-test granularity
   including `t.Run` sub-tests (`pass` / `fail` / `skip` / `unfinished`).
 
@@ -83,9 +86,25 @@ go run -tags test_dep ./tests/tokeira_conformance_ledger/ \
   tokeira-conformance-results.json outcomes.json
 ```
 
-Run a single entrypoint in isolation (fast iteration while fixing one cluster), against an
-already-running `tokeirad`. Pin the toolchain, and apply the registry's skips for that entrypoint so a
-manual run matches the run-all runner (omit `-skip` to see the out-of-scope tests fail):
+Run a single suite in isolation (fast iteration while fixing one cluster) with the **single-suite
+runner** — the iteration counterpart to the run-all executor. It boots-or-reuses `tokeirad` on the same
+shared lifecycle, applies the same skip registry, and prints a per-leaf PASS/FAIL/SKIP tally:
+
+```bash
+# Boot tokeirad from the binary (use the `--features conformance` build for override-driven suites):
+TOKEIRA_BIN=<tokeira-workspace>/target/debug/tokeirad \
+  go run -tags test_dep ./tests/tokeira_conformance_runsuite/ '^TestCronTestSuite$'
+
+# …or reuse an already-running frontend:
+TOKEIRA_CONFORMANCE_FRONTEND_ADDR=127.0.0.1:7233 \
+  go run -tags test_dep ./tests/tokeira_conformance_runsuite/ '^TestCronTestSuite$'
+```
+
+The runner takes an arbitrary `-run` regexp (a single leaf works too, e.g.
+`'^TestNexusWorkflowTestSuite/TestNexusOperationSyncNexusFailure$'`) and an optional `-timeout`
+(default 8m). To drive `go test` directly against an already-running frontend instead, apply the
+registry's skips yourself so the manual run matches the runner (omit `-skip` to see the out-of-scope
+tests fail):
 
 ```bash
 TOKEIRA_CONFORMANCE_FRONTEND_ADDR=127.0.0.1:7233 \

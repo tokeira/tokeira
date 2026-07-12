@@ -304,13 +304,33 @@ what it proves, how it works, and the conventions binding any fix derived from a
 run (v1.31.0 ground truth, no kernel additions, config-as-constant, feature modes
 as independent runs, raise ambiguity).
 
-Runs pin the corpus's `go.mod` toolchain (`go1.26.2`) via `GOTOOLCHAIN`, set by the
-run-all runner. Tests that cannot run against an out-of-process `tokeirad` (e.g.
-those depending on `OverrideDynamicConfig`) are skipped by name through the fork's
-conformance skip registry (`tests/testcore/tokeira_conformance_skip.go`) — never by
-editing a corpus test body — applied via the `SetupTest`/`SetupSubTest` hooks and a
-runner-derived `go test -skip` regexp for raw `t.Run` sub-tests. Each skip carries a
-cited reason and still emits a classified `skip` outcome.
+Three Go runners live in the fork (`../temporal`, branch `tokeira/conformance-v1.31.0`); each
+boots-or-reuses `tokeirad` on a shared lifecycle and pins the corpus toolchain
+(`GOTOOLCHAIN=go1.26.2`). Build `tokeirad` first (`cargo build -p tokeirad`, or with
+`--features conformance` for the dynamic-config control listener), then invoke from the fork:
+
+```bash
+# Full corpus baseline — every entrypoint, each isolated — emitting a combined -json stream:
+TOKEIRA_BIN=<workspace>/target/debug/tokeirad \
+  go run -tags test_dep ./tests/tokeira_conformance_runall/
+
+# Single suite (or any -run regexp) for iteration, with a per-leaf PASS/FAIL/SKIP tally:
+TOKEIRA_BIN=<workspace>/target/debug/tokeirad \
+  go run -tags test_dep ./tests/tokeira_conformance_runsuite/ '^TestSuiteName$'
+
+# Distil the run-all -json stream into per-test outcomes:
+go run -tags test_dep ./tests/tokeira_conformance_ledger/ \
+  tokeira-conformance-results.json outcomes.json
+```
+
+A run never excludes a test; out-of-scope cases are skipped **by name** through the fork's
+conformance skip registry (`tests/testcore/tokeira_conformance_skip.go`) — never by editing a corpus
+test body — applied via the `SetupTest`/`SetupSubTest` hooks and a runner-derived `go test -skip`
+regexp for raw `t.Run` sub-tests. Each skip carries a cited reason and still emits a classified `skip`
+outcome. A test needing a non-default dynamic-config value is **no longer** a blanket skip: the
+conformance-only dynamic-config override bridge delivers `OverrideDynamicConfig` to a
+`--features conformance` `tokeirad` for **wired** keys (`.kiro/specs/conformance-config-override/`);
+only unwired, kernel-excluded, or not-enforced keys fall back to the skip registry.
 
 ## Enforced Commands
 

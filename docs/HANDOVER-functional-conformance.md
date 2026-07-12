@@ -45,10 +45,10 @@ this bar.
 
 ## 4. The drive-to-green loop (per suite, in tier order)
 
-1. **Run** the suite — single-suite for iteration, run-all + ledger for the baseline:
+1. **Run** the suite — single-suite runner for iteration, run-all + ledger for the baseline:
    ```bash
-   TOKEIRA_CONFORMANCE_FRONTEND_ADDR=127.0.0.1:7233 GOTOOLCHAIN=go1.26.2 \
-     go test -tags test_dep -count=1 -run '^TestSuiteName$' ./tests/ -v
+   TOKEIRA_BIN=<tokeira-workspace>/target/debug/tokeirad \
+     go run -tags test_dep ./tests/tokeira_conformance_runsuite/ '^TestSuiteName$'
    ```
 2. **Classify** every non-pass: `pass` / `real-gap` / `deliberate-deviation` / `out-of-public-scope`.
 3. **Act:**

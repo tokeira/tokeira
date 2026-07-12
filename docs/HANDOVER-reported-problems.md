@@ -73,9 +73,10 @@ out-of-process `tokeirad` built `--features conformance`. Latest run:
 | `_DynamicConfigChanges` (4) | ❌ FAIL (15s) | threshold 0→2 mid-run; transient retries |
 
 Repro (reference only — the task is code reading, not running this):
-`bash run_suite.sh '^TestWFTFailureReportedProblemsTestSuite$' 8m` from `../temporal`
-(`TOKEIRA_BIN` defaults to `../tokeira/target/debug/tokeirad`; the harness exports
-`TOKEIRA_CONFORMANCE_CONTROL_ADDR` so a feature build binds the control listener).
+`TOKEIRA_BIN=<tokeira-workspace>/target/debug/tokeirad go run -tags test_dep
+./tests/tokeira_conformance_runsuite/ '^TestWFTFailureReportedProblemsTestSuite$'` from `../temporal`
+(use the `--features conformance` tokeirad so the control listener binds; the single-suite runner
+allocates and exports `TOKEIRA_CONFORMANCE_CONTROL_ADDR`).
 
 ---
 

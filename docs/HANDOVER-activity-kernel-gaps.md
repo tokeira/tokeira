@@ -135,7 +135,7 @@ tests, ledger row, land engine + fork skips.
 
 ## 6. Verification bar
 
-`run_suite.sh '^TestActivityTestSuite$'` and `'^TestActivityClientTestSuite$'` clean (every leaf green
+`tokeira_conformance_runsuite '^TestActivityTestSuite$'` and `'^TestActivityClientTestSuite$'` clean (every leaf green
 or classified-skip with cited reason), 3× stress each; Tier 1.1 (32/0/2) and Tier 1.2 (9/0/1)
 unregressed; `cargo fmt` + scoped `clippy -D warnings` + full test suites for kernel/runtime/edge/tokeirad.
 

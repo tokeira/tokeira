@@ -108,7 +108,7 @@ Tier 1.1–1.3 regression (the WFT schedule path is shared machinery), fmt/clipp
 
 ## 6. Verification bar
 
-`run_suite.sh '^TestStickyTqTestSuite$'` clean (2/0/0), 3× stress; Tiers 1.1 (32/0/2),
+`tokeira_conformance_runsuite '^TestStickyTqTestSuite$'` clean (2/0/0), 3× stress; Tiers 1.1 (32/0/2),
 1.2 (9/0/1), 1.3 (10/0/0 + 6/0/0) unregressed; full kernel/runtime/edge/tokeirad suites; ledger
 row in `docs/readiness/conformance.md`.
 

@@ -1552,13 +1552,14 @@ proptest! {
         prop_assert_eq!(proto.activity_tasks.len(), edge.activity_tasks.len());
     }
 
-    // Property 5c: Terminate request round-trip
+    // Feature: grpc-edge-transport, Property 7: Lifecycle link preservation
     #[test]
     fn property_terminate_request_roundtrip(
         namespace in arb_small_string(),
         workflow_id in arb_small_string(),
         reason in arb_small_string(),
         identity in arb_small_string(),
+        links in arb_signal_links(),
     ) {
         let edge = TerminateWorkflowExecutionRequest {
             namespace: namespace.clone(),
@@ -1567,6 +1568,7 @@ proptest! {
             reason: reason.clone(),
             details: None,
             identity: identity.clone(),
+            links: links.clone(),
         };
         let proto =
             workflowservice::TerminateWorkflowExecutionRequest {
@@ -1579,6 +1581,7 @@ proptest! {
                 reason,
                 details: None,
                 identity,
+                links: links.iter().map(edge_link_to_proto).collect(),
                 ..Default::default()
             };
         let roundtrip =
@@ -1586,13 +1589,14 @@ proptest! {
         prop_assert_eq!(roundtrip, edge);
     }
 
-    // Property 5d: Cancel request round-trip
+    // Feature: grpc-edge-transport, Property 7: Lifecycle link preservation
     #[test]
     fn property_cancel_request_roundtrip(
         namespace in arb_small_string(),
         workflow_id in arb_small_string(),
         reason in arb_small_string(),
         identity in arb_small_string(),
+        links in arb_signal_links(),
     ) {
         let edge = RequestCancelWorkflowExecutionRequest {
             namespace: namespace.clone(),
@@ -1600,6 +1604,7 @@ proptest! {
             run_id: None,
             reason: reason.clone(),
             identity: identity.clone(),
+            links: links.clone(),
         };
         let proto =
             workflowservice::RequestCancelWorkflowExecutionRequest {
@@ -1611,6 +1616,7 @@ proptest! {
                 }),
                 reason,
                 identity,
+                links: links.iter().map(edge_link_to_proto).collect(),
                 ..Default::default()
             };
         let roundtrip =

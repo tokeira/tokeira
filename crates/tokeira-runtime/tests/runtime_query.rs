@@ -116,6 +116,7 @@ async fn closed_run_query_with_explicit_run_id_still_dispatches() -> Result<()> 
                 reason: "done".into(),
                 details: None,
                 identity: "tester".into(),
+                links: Vec::new(),
                 request: RequestContext {
                     request_id: RequestId("term-1".into()),
                     caller_identity: Some("tester".into()),

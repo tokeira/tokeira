@@ -34,6 +34,7 @@ fn workflow_deletion_termination(request: &DeleteWorkflowRequest) -> TerminateRe
         reason: "Delete workflow execution".to_owned(),
         details: None,
         identity: "history-service".to_owned(),
+        links: Vec::new(),
         request: terminate_context,
         now: request.now,
     }
@@ -1149,6 +1150,7 @@ where
                 reason: reset_reason,
                 details: None,
                 identity: "reset".to_string(),
+                links: Vec::new(),
                 request: RequestContext {
                     request_id: tokeira_types::RequestId(format!(
                         "reset-terminate:{}",
@@ -1394,6 +1396,7 @@ where
                         .caller_identity
                         .clone()
                         .unwrap_or_else(|| "workflow-id-conflict-policy".to_string()),
+                    links: Vec::new(),
                     request: RequestContext {
                         // v1.31.0's internal conflict-terminate (workflow_id_dedup.go:202
                         // terminateWorkflowAction) runs under IdentityHistoryService and does NOT
@@ -1644,6 +1647,7 @@ mod tests {
                     reason: "operator termination".to_string(),
                     details: None,
                     identity: "operator".to_string(),
+                    links: Vec::new(),
                     request: RequestContext {
                         request_id: RequestId("terminate-before-delete".to_string()),
                         caller_identity: Some("operator".to_string()),

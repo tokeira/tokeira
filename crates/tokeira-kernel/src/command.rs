@@ -675,6 +675,10 @@ pub struct CancelRequest {
     /// direct RPC cancels.
     #[serde(default)]
     pub external_initiated_event_id: i64,
+    /// Client-authored correlations recorded on the outer
+    /// `WorkflowExecutionCancelRequested` history event.
+    #[serde(default)]
+    pub links: Vec<Link>,
     /// Caller-supplied request context for dedupe and tracing.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
@@ -691,6 +695,10 @@ pub struct TerminateRequest {
     pub details: Option<Payloads>,
     /// Identity of the caller who issued the termination.
     pub identity: String,
+    /// Client-authored correlations recorded on the outer
+    /// `WorkflowExecutionTerminated` history event.
+    #[serde(default)]
+    pub links: Vec<Link>,
     /// Caller-supplied request context for dedupe and tracing.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.

@@ -1038,12 +1038,14 @@ fn arb_cancel_request(now: OffsetDateTime) -> impl Strategy<Value = CancelReques
         arb_small_string(),
         prop::option::of(arb_external_workflow_execution()),
         arb_small_string(),
+        arb_links(),
     )
         .prop_map(
-            move |(reason, external_initiator, request_id)| CancelRequest {
+            move |(reason, external_initiator, request_id, links)| CancelRequest {
                 reason,
                 external_initiator,
                 external_initiated_event_id: 0,
+                links,
                 request: request_context(&request_id, now),
                 now,
             },
@@ -1056,12 +1058,14 @@ fn arb_terminate_request(now: OffsetDateTime) -> impl Strategy<Value = Terminate
         prop::option::of(arb_payloads()),
         arb_small_string(),
         arb_small_string(),
+        arb_links(),
     )
         .prop_map(
-            move |(reason, details, identity, request_id)| TerminateRequest {
+            move |(reason, details, identity, request_id, links)| TerminateRequest {
                 reason,
                 details,
                 identity,
+                links,
                 request: request_context(&request_id, now),
                 now,
             },
@@ -2538,6 +2542,7 @@ proptest! {
         prop_assert_eq!(timed_out_transition.next_state.status, ExecutionStatus::Running);
     }
 
+    // Feature: grpc-edge-transport, Property 7: Lifecycle link preservation
     #[test]
     fn property_17_cancel_event_field_pass_through(req in arb_cancel_request(fixed_now())) {
         let now = fixed_now();
@@ -2550,11 +2555,13 @@ proptest! {
                 reason,
                 external_workflow_execution,
                 request_id,
+                links,
                 ..
             } => {
                 prop_assert_eq!(reason, &req.reason);
                 prop_assert_eq!(external_workflow_execution, &req.external_initiator);
                 prop_assert_eq!(request_id, &req.request.request_id.0);
+                prop_assert_eq!(links, &req.links);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -2841,6 +2848,7 @@ proptest! {
         }
     }
 
+    // Feature: grpc-edge-transport, Property 7: Lifecycle link preservation
     #[test]
     fn property_20_terminate_event_field_pass_through(req in arb_terminate_request(fixed_now())) {
         let now = fixed_now();
@@ -2849,10 +2857,11 @@ proptest! {
             Command::Terminate(req.clone()),
         ).unwrap();
         match &transition.history_events[0].kind {
-            HistoryEventKind::WorkflowExecutionTerminated { reason, details, identity } => {
+            HistoryEventKind::WorkflowExecutionTerminated { reason, details, identity, links } => {
                 prop_assert_eq!(reason, &req.reason);
                 prop_assert_eq!(details, &req.details);
                 prop_assert_eq!(identity, &req.identity);
+                prop_assert_eq!(links, &req.links);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -3348,6 +3357,7 @@ proptest! {
                 reason: "cancel".into(),
                 external_initiator: None,
                 external_initiated_event_id: 0,
+                links: Vec::new(),
                 request: request_context("cancel-req", now),
                 now,
             }),
@@ -4021,6 +4031,7 @@ fn property_42_parent_close_policy_all_paths() {
                 reason: "reason".into(),
                 details: None,
                 identity: "tester".into(),
+                links: Vec::new(),
                 request: request_context("term", now),
                 now,
             })),
@@ -4357,6 +4368,7 @@ fn property_57_close_clears_pending_updates() {
             reason: "reason".into(),
             details: None,
             identity: "tester".into(),
+            links: Vec::new(),
             request: request_context("term", now),
             now,
         })),
@@ -4647,6 +4659,7 @@ fn property_63_close_preserves_execution_options() {
             reason: "reason".into(),
             details: None,
             identity: "tester".into(),
+            links: Vec::new(),
             request: request_context("term-options", now),
             now,
         })),
@@ -4785,6 +4798,7 @@ fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
             reason: "terminated".into(),
             details: None,
             identity: "operator".into(),
+            links: Vec::new(),
             request: request_context("terminate-req", now),
             now,
         }),
@@ -5304,6 +5318,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
             reason: "reason".into(),
             details: None,
             identity: "tester".into(),
+            links: Vec::new(),
             request: request_context("term-nexus", now),
             now,
         })),
@@ -5585,6 +5600,7 @@ proptest! {
                         reason: "p5".into(),
                         details: None,
                         identity: "tester".into(),
+                        links: Vec::new(),
                         request: request_context("p5-terminate", now),
                         now,
                     }),
@@ -5654,6 +5670,7 @@ proptest! {
                         reason: "p5-after-fail".into(),
                         details: None,
                         identity: "tester".into(),
+                        links: Vec::new(),
                         request: request_context("p5-terminate-2", now),
                         now,
                     }),

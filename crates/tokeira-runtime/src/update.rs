@@ -895,6 +895,7 @@ mod tests {
                             reason: "test".into(),
                             details: None,
                             identity: "test".into(),
+                            links: Vec::new(),
                             request: req_ctx("term"),
                             now: OffsetDateTime::now_utc(),
                         },

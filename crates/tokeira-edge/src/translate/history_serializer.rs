@@ -179,6 +179,13 @@ fn event_links(event: &HistoryEvent) -> Vec<proto_common::Link> {
             // (`service/history/historybuilder/event_factory.go @ v1.31.0`).
             links.iter().map(link_to_proto).collect()
         }
+        HistoryEventKind::WorkflowExecutionCancelRequested { links, .. }
+        | HistoryEventKind::WorkflowExecutionTerminated { links, .. } => {
+            // Lifecycle-request links are outer-event metadata in v1.31.0
+            // (`service/history/historybuilder/event_factory.go:578-590` and
+            // `service/history/workflow/util.go:105-145 @ v1.31.0`).
+            links.iter().map(link_to_proto).collect()
+        }
         // Nexus start/completion links are handler-returned and recorded on the
         // event, not the attributes (`saveResult` sets `e.Links = links` @ v1.31.0).
         HistoryEventKind::NexusOperationStarted { links, .. }
@@ -623,6 +630,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             external_initiated_event_id,
             identity,
             request_id: _,
+            links: _,
         } => {
             let ext_exec =
                 external_workflow_execution
@@ -656,6 +664,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             reason,
             details,
             identity,
+            links: _,
         } => Attributes::WorkflowExecutionTerminatedEventAttributes(
             history::WorkflowExecutionTerminatedEventAttributes {
                 reason: reason.clone(),
@@ -2012,6 +2021,13 @@ mod tests {
         proptest::option::of(Just(tokeira_types::Headers(Default::default())))
     }
 
+    fn arb_lifecycle_links() -> impl Strategy<Value = Vec<Link>> {
+        prop::collection::vec(
+            "[a-z]{1,12}".prop_map(|job_id| Link::BatchJob { job_id }),
+            0..4,
+        )
+    }
+
     fn arb_history_event_kind() -> impl Strategy<Value = HistoryEventKind> {
         prop_oneof![
             (
@@ -2092,6 +2108,7 @@ mod tests {
                     reason: r,
                     details: None,
                     identity: "test".to_string(),
+                    links: Vec::new(),
                 }
             }),
             ("[a-z]{1,6}", arb_payloads(), "[a-z]{1,8}").prop_map(|(sn, input, rid)| {
@@ -2374,6 +2391,42 @@ mod tests {
                 i64::try_from(history_bytes.len()).expect("test history length fits in i64")
             );
             prop_assert!(serialized_history_size_bytes(events) > 0);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: grpc-edge-transport, Property 7: Lifecycle link preservation
+        #[test]
+        fn lifecycle_links_project_on_outer_events(links in arb_lifecycle_links()) {
+            let timestamp = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+            let cancel = HistoryEvent {
+                event_id: 2,
+                happened_at: timestamp,
+                kind: HistoryEventKind::WorkflowExecutionCancelRequested {
+                    reason: "cancel".to_string(),
+                    external_workflow_execution: None,
+                    external_initiated_event_id: 0,
+                    identity: "client".to_string(),
+                    request_id: "cancel-request".to_string(),
+                    links: links.clone(),
+                },
+            };
+            let terminate = HistoryEvent {
+                event_id: 3,
+                happened_at: timestamp,
+                kind: HistoryEventKind::WorkflowExecutionTerminated {
+                    reason: "terminate".to_string(),
+                    details: None,
+                    identity: "client".to_string(),
+                    links: links.clone(),
+                },
+            };
+            let expected: Vec<_> = links.iter().map(link_to_proto).collect();
+
+            prop_assert_eq!(history_event_to_proto(&cancel).links, expected.clone());
+            prop_assert_eq!(history_event_to_proto(&terminate).links, expected);
         }
     }
 

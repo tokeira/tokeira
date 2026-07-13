@@ -162,6 +162,10 @@ pub enum HistoryEventKind {
         external_initiated_event_id: i64,
         identity: String,
         request_id: String,
+        /// Correlations supplied by the cancel requester. Temporal stores
+        /// these on the outer history event rather than its attributes.
+        #[serde(default)]
+        links: Vec<Link>,
     },
     /// The workflow was paused by an operator or API call.
     WorkflowExecutionPaused {
@@ -181,6 +185,10 @@ pub enum HistoryEventKind {
         reason: String,
         details: Option<Payloads>,
         identity: String,
+        /// Correlations supplied by the terminating client. Temporal stores
+        /// these on the outer history event rather than its attributes.
+        #[serde(default)]
+        links: Vec<Link>,
     },
     /// The workflow exceeded its execution or run timeout.
     WorkflowExecutionTimedOut {

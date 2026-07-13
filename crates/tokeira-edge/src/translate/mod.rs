@@ -750,6 +750,8 @@ pub struct TerminateWorkflowExecutionRequest {
     pub reason: String,
     pub details: Option<Payloads>,
     pub identity: String,
+    /// Validated client correlations preserved on the terminated history event.
+    pub links: Vec<Link>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -788,6 +790,8 @@ pub struct RequestCancelWorkflowExecutionRequest {
     pub run_id: Option<String>,
     pub reason: String,
     pub identity: String,
+    /// Validated client correlations preserved on the cancel-requested history event.
+    pub links: Vec<Link>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

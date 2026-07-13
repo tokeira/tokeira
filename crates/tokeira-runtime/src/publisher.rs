@@ -494,6 +494,7 @@ where
             reason: "TerminateIfRunning WorkflowIdReusePolicy".to_string(),
             details: None,
             identity: "history-service".to_string(),
+            links: Vec::new(),
             request: RequestContext {
                 request_id: RequestId(format!("conflict-terminate:{run_key:?}:{new_run_id:?}")),
                 caller_identity: Some("history-service".to_string()),
@@ -535,6 +536,7 @@ where
                     reason,
                     details: None,
                     identity: "parent-close-policy".to_string(),
+                    links: Vec::new(),
                     request: RequestContext {
                         request_id: RequestId(format!("terminate-child-{child_run_id:?}")),
                         caller_identity: Some("runtime-child-orchestrator".to_string()),
@@ -599,6 +601,7 @@ where
                     reason,
                     external_initiator: None,
                     external_initiated_event_id: 0,
+                    links: Vec::new(),
                     request: RequestContext {
                         request_id: RequestId(format!("cancel-child-{child_run_id:?}")),
                         caller_identity: Some("runtime-child-orchestrator".to_string()),
@@ -836,6 +839,7 @@ where
                         run_id: originator_run_id,
                     }),
                     external_initiated_event_id: initiated_event_id,
+                    links: Vec::new(),
                     request: RequestContext {
                         request_id: RequestId(format!(
                             "ext-cancel-{originator_run_key:?}-{initiated_event_id}"

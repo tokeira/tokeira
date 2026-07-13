@@ -763,6 +763,7 @@ fn make_cancel_request() -> CancelRequest {
         reason: "cancel requested".into(),
         external_initiator: None,
         external_initiated_event_id: 0,
+        links: Vec::new(),
         request: request_context("cancel-req"),
         now: now(),
     }
@@ -773,6 +774,7 @@ fn make_terminate_request() -> TerminateRequest {
         reason: "terminated".into(),
         details: Some(payloads("term-details")),
         identity: "operator".into(),
+        links: Vec::new(),
         request: request_context("terminate-req"),
         now: now(),
     }
@@ -1625,7 +1627,7 @@ fn terminate_no_open_entities() {
     assert_eq!(transition.history_events.len(), 1);
     assert!(matches!(
         &transition.history_events[0].kind,
-        HistoryEventKind::WorkflowExecutionTerminated { reason, details, identity }
+        HistoryEventKind::WorkflowExecutionTerminated { reason, details, identity, .. }
         if reason == &req.reason && details == &req.details && identity == &req.identity
     ));
     assert_eq!(transition.next_state.status, ExecutionStatus::Terminated);

@@ -578,6 +578,7 @@ mod tests {
                     reason: "done".into(),
                     details: None,
                     identity: "test".into(),
+                    links: Vec::new(),
                     request: RequestContext {
                         request_id: RequestId("term".into()),
                         caller_identity: None,

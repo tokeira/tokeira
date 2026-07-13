@@ -39,7 +39,7 @@ use crate::{
     event::{ActivityResolution, HistoryEvent, HistoryEventKind, UpdateEventOutcome},
     state::{
         ActivityPauseInfo, ActivityState, ChildWorkflowState,
-        EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+        EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, Link,
         LoadedRun, ParentClosePolicy, PauseInfo, PendingExternalCancel, PendingExternalSignal,
         PendingNexusOperation, PendingUpdate, PendingWorkflowTask, RequestIdInfo, TimerState,
         VersioningOverride, WorkflowState, WorkflowTaskProblem, WorkflowTaskType,
@@ -928,6 +928,7 @@ impl BasicKernel {
             external_initiated_event_id: req.external_initiated_event_id,
             identity: req.request.caller_identity.clone().unwrap_or_default(),
             request_id: req.request.request_id.0,
+            links: req.links,
         };
         // `cancel_requested` flips at admission even when the event buffers:
         // v1.31.0 mutates the execution info immediately while the event sits
@@ -969,7 +970,7 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        builder.terminate_run(req.reason, req.details, req.identity);
+        builder.terminate_run(req.reason, req.details, req.identity, req.links);
         Ok(builder.finish())
     }
 
@@ -1009,7 +1010,7 @@ impl BasicKernel {
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        builder.terminate_run(req.reason, None, req.identity);
+        builder.terminate_run(req.reason, None, req.identity, Vec::new());
         Ok(builder.finish())
     }
 
@@ -5842,13 +5843,20 @@ impl TransitionBuilder {
     /// clean up activities/timers/children. Ordering per `TerminateWorkflow`
     /// (util.go:115 @ v1.31.0): WorkflowTaskFailed(ForceCloseCommand) →
     /// flushed buffered events → WorkflowExecutionTerminated.
-    fn terminate_run(&mut self, reason: String, details: Option<Payloads>, identity: String) {
+    fn terminate_run(
+        &mut self,
+        reason: String,
+        details: Option<Payloads>,
+        identity: String,
+        links: Vec<Link>,
+    ) {
         self.force_close_started_workflow_task();
         self.flush_buffered();
         self.emit(HistoryEventKind::WorkflowExecutionTerminated {
             reason,
             details,
             identity,
+            links,
         });
         self.close(ExecutionStatus::Terminated);
 

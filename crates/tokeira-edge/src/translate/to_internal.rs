@@ -448,6 +448,7 @@ pub fn terminate_request(
         reason: req.reason,
         details: req.details,
         identity: req.identity,
+        links: req.links.into_iter().map(link_to_kernel).collect(),
         request: RequestContext {
             request_id: CoreRequestId(request_id.as_str().to_string()),
             caller_identity: None,
@@ -511,6 +512,7 @@ pub fn cancel_request(
         reason: req.reason,
         external_initiator: None,
         external_initiated_event_id: 0,
+        links: req.links.into_iter().map(link_to_kernel).collect(),
         request: RequestContext {
             request_id: CoreRequestId(request_id.as_str().to_string()),
             // The request identity lands on the WorkflowExecutionCancelRequested

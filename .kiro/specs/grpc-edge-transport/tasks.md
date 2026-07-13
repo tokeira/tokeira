@@ -310,6 +310,27 @@ Wire the existing `tokeira-edge` service layer and `tokeira-proto` generated bin
 - [x] 25. Final checkpoint — Ensure all new endpoint tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
+- [x] 26. Preserve lifecycle request links (Tier 5.31 correction)
+  - [x] 26.1 Extend terminate and request-cancel edge DTOs and translators
+    - Preserve every validated request link in order and map it to the existing kernel `Link` model.
+    - Keep the shared v1.31.0 count, size, variant, and identity-field validation ahead of runtime invocation.
+    - _Requirements: 10.5, 10.6, 10.7, 12.7, 12.8, 12.16_
+  - [x] 26.2 Extend the pure kernel request and history variants
+    - Carry lifecycle links as deterministic data on `CancelRequest`, `TerminateRequest`, `WorkflowExecutionCancelRequested`, and `WorkflowExecutionTerminated`.
+    - Preserve empty-link behavior for internal cancellation and termination call sites.
+    - _Requirements: 10.5, 10.6_
+  - [x] 26.3 Project lifecycle links on outer history events
+    - Extend the history serializer's common event-link projection for cancel-requested and terminated events.
+    - _Requirements: 10.5, 10.6_
+  - [x] 26.4 Required property test: lifecycle link preservation
+    - **Property 7: Lifecycle link preservation**
+    - Generate at least 100 valid ordered link lists and prove edge-to-kernel-to-history-to-proto equality for both operations, plus preservation for empty lists.
+    - Tag the property `// Feature: grpc-edge-transport, Property 7`.
+    - _Requirements: 10.1, 10.2, 10.5, 10.6, 12.7, 12.8, 12.15_
+  - [x] 26.5 Functional conformance checkpoint
+    - Run focused kernel and edge tests, then two clean consecutive `TestLinksTestSuite` runs against the final binary.
+    - _Requirements: 10.5, 10.6, 10.7_
+
 ## Notes
 
 - Tasks marked with `*` are optional and can be skipped for faster MVP

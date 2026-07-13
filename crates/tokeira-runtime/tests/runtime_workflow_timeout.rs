@@ -166,6 +166,7 @@ async fn manually_terminated_workflow_does_not_timeout() -> Result<()> {
                 reason: "manual".to_string(),
                 details: None,
                 identity: "tester".to_string(),
+                links: Vec::new(),
                 request: RequestContext {
                     request_id: RequestId("req-term".to_string()),
                     caller_identity: None,

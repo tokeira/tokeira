@@ -143,6 +143,16 @@ Requirements 1–8 cover the initial gRPC transport milestone: workflow task pol
 2. WHEN a `RequestCancelWorkflowExecution` gRPC request is received, THE WorkflowService_Adapter SHALL extract gRPC metadata, translate the proto request into an edge `RequestCancelWorkflowExecutionRequest`, invoke `WorkflowService::request_cancel_workflow_execution`, and return a proto `RequestCancelWorkflowExecutionResponse`.
 3. WHEN a `QueryWorkflow` gRPC request is received, THE WorkflowService_Adapter SHALL extract gRPC metadata, translate the proto request into an edge `QueryWorkflowRequest`, invoke `WorkflowService::query_workflow`, and return a proto `QueryWorkflowResponse`.
 4. WHEN an `UpdateWorkflowExecution` gRPC request is received, THE WorkflowService_Adapter SHALL extract gRPC metadata, translate the proto request into an edge `UpdateWorkflowExecutionRequest`, invoke `WorkflowService::update_workflow_execution`, and return a proto `UpdateWorkflowExecutionResponse`.
+5. WHEN a valid `TerminateWorkflowExecutionRequest.links` list is supplied, THE system SHALL preserve the list on the outer `WorkflowExecutionTerminated` history event in request order.
+6. WHEN a valid `RequestCancelWorkflowExecutionRequest.links` list is supplied and the cancellation request authors an event, THE system SHALL preserve the list on the outer `WorkflowExecutionCancelRequested` history event in request order.
+7. IF either lifecycle request contains a link rejected by the v1.31.0 link validator, THE WorkflowService_Adapter SHALL return `INVALID_ARGUMENT` without authoring a lifecycle history event.
+
+Ground truth: both request fields are defined in
+`proto/upstream/temporal/api/workflowservice/v1/request_response.proto`.
+`service/history/api/terminateworkflow/api.go` passes termination links to
+`workflow.TerminateWorkflow`, and
+`service/history/historybuilder/event_factory.go` assigns cancellation links to
+the outer event (`event.Links`), all at v1.31.0.
 
 ### Requirement 11: Extended WorkflowRuntimeApi Trait and Runtime Adapter
 
@@ -172,8 +182,8 @@ Requirements 1–8 cover the initial gRPC transport milestone: workflow task pol
 4. THE Proto_Translator SHALL convert `workflowservice::RespondActivityTaskFailedRequest` into an edge `RespondActivityTaskFailedRequest` by deserializing the task token bytes into an `ActivityTaskToken` and extracting the failure message and optional error type.
 5. THE Proto_Translator SHALL convert `workflowservice::RecordActivityTaskHeartbeatRequest` into an edge `RecordActivityTaskHeartbeatRequest` by deserializing the task token bytes into an `ActivityTaskToken`.
 6. THE Proto_Translator SHALL convert an edge `RecordActivityTaskHeartbeatResponse` into `workflowservice::RecordActivityTaskHeartbeatResponse`, including the cancellation-requested boolean.
-7. THE Proto_Translator SHALL convert `workflowservice::TerminateWorkflowExecutionRequest` into an edge `TerminateWorkflowExecutionRequest` with namespace, workflow ID, reason, details, and identity.
-8. THE Proto_Translator SHALL convert `workflowservice::RequestCancelWorkflowExecutionRequest` into an edge `RequestCancelWorkflowExecutionRequest` with namespace, workflow ID, and reason.
+7. THE Proto_Translator SHALL convert `workflowservice::TerminateWorkflowExecutionRequest` into an edge `TerminateWorkflowExecutionRequest` with namespace, workflow ID, reason, details, identity, and links.
+8. THE Proto_Translator SHALL convert `workflowservice::RequestCancelWorkflowExecutionRequest` into an edge `RequestCancelWorkflowExecutionRequest` with namespace, workflow ID, reason, identity, and links.
 9. THE Proto_Translator SHALL convert `workflowservice::QueryWorkflowRequest` into an edge `QueryWorkflowRequest` with namespace, workflow ID, query type, and query args.
 10. THE Proto_Translator SHALL convert an edge `QueryWorkflowResponse` into `workflowservice::QueryWorkflowResponse`, including the query result payloads.
 11. THE Proto_Translator SHALL convert `workflowservice::UpdateWorkflowExecutionRequest` into an edge `UpdateWorkflowExecutionRequest` with namespace, workflow ID, update ID, update name, input payloads, and wait policy.
@@ -181,3 +191,4 @@ Requirements 1–8 cover the initial gRPC transport milestone: workflow task pol
 13. IF a task token deserialization fails in any activity completion, failure, or heartbeat translation, THEN THE Proto_Translator SHALL return a conversion error.
 14. THE proto `service.proto` file SHALL be extended with RPC definitions for `PollActivityTaskQueue`, `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RecordActivityTaskHeartbeat`, `TerminateWorkflowExecution`, `RequestCancelWorkflowExecution`, `QueryWorkflow`, and `UpdateWorkflowExecution`, along with the corresponding request and response message types.
 15. FOR ALL valid edge DTOs for the new endpoints, converting to proto and back to edge DTO SHALL produce an equivalent value, excluding fields explicitly deferred (such as activity heartbeat details payloads).
+16. IF a terminate or request-cancel link fails the v1.31.0 count, size, variant, or required-identity-field rules, THEN THE Proto_Translator SHALL return a conversion error before invoking the runtime.

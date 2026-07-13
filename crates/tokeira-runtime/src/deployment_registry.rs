@@ -2679,6 +2679,7 @@ mod tests {
             reason: "drainage-test".to_string(),
             details: None,
             identity: "operator-a".to_string(),
+            links: Vec::new(),
             request: RequestContext {
                 request_id: RequestId(request_id.to_string()),
                 caller_identity: None,

@@ -1494,6 +1494,7 @@ pub struct TerminateWorkflowExecutionRequest {
     pub reason: String,
     pub details: Option<Payloads>,
     pub identity: Option<String>,
+    pub links: Vec<Link>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1507,6 +1508,7 @@ pub struct RequestCancelWorkflowExecutionRequest {
     pub workflow_id: String,
     pub reason: String,
     pub identity: Option<String>,
+    pub links: Vec<Link>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1567,9 +1569,9 @@ pub struct UpdateWorkflowExecutionResponse {
 | `RespondActivityTaskFailedResponse` | `RespondActivityTaskFailedResponse` | Empty response |
 | `RecordActivityTaskHeartbeatRequest` | `RecordActivityTaskHeartbeatRequest` | `task_token` bytes → `ActivityTaskToken` |
 | `RecordActivityTaskHeartbeatResponse` | `RecordActivityTaskHeartbeatResponse` | `cancel_requested` boolean |
-| `TerminateWorkflowExecutionRequest` | `TerminateWorkflowExecutionRequest` | `namespace`, `workflow_id`, `reason`, `details` via `payloads_to_domain`, `identity` |
+| `TerminateWorkflowExecutionRequest` | `TerminateWorkflowExecutionRequest` | `namespace`, `workflow_id`, `reason`, `details` via `payloads_to_domain`, `identity`, validated `links` |
 | `TerminateWorkflowExecutionResponse` | `TerminateWorkflowExecutionResponse` | Empty response |
-| `RequestCancelWorkflowExecutionRequest` | `RequestCancelWorkflowExecutionRequest` | `namespace`, `workflow_id`, `reason` |
+| `RequestCancelWorkflowExecutionRequest` | `RequestCancelWorkflowExecutionRequest` | `namespace`, `workflow_id`, `reason`, `identity`, validated `links` |
 | `RequestCancelWorkflowExecutionResponse` | `RequestCancelWorkflowExecutionResponse` | Empty response |
 | `QueryWorkflowRequest` | `QueryWorkflowRequest` | `namespace`, `workflow_id`, `query_type`, `query_args` via `payloads_to_domain`, default timeout 10s |
 | `QueryWorkflowResponse` | `QueryWorkflowResponse` | `query_result` via `payloads_from_domain`, `query_rejected.message` |
@@ -1731,6 +1733,24 @@ The existing design defines Properties 1–4. The new endpoints add two addition
 
 **Validates: Requirements 12.3, 12.4, 12.5, 12.13**
 
+### Property 7: Lifecycle link preservation
+
+*For any* valid ordered link list, translating and applying a terminate or
+request-cancel operation SHALL preserve an equal ordered list on the matching
+outer history event, and serializing that event SHALL reproduce the same proto
+links. Applying the same inputs with an empty link list SHALL preserve the
+pre-existing lifecycle attributes and state transitions.
+
+**Validates: Requirements 10.1, 10.2, 10.5, 10.6, 12.7, 12.8, 12.15**
+
+The link list is authoritative history metadata, not an edge-side response
+decoration. The pure kernel request and matching history variants therefore
+carry `links: Vec<Link>`, while the history serializer projects those values to
+top-level `HistoryEvent.links`. This mirrors
+`service/history/api/terminateworkflow/api.go` and
+`service/history/historybuilder/event_factory.go @ v1.31.0` without importing
+Temporal's workflow-backed implementation.
+
 ## Error Handling (Extended)
 
 ### Activity Token Errors
@@ -1738,6 +1758,11 @@ The existing design defines Properties 1–4. The new endpoints add two addition
 When a `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, or `RecordActivityTaskHeartbeat` request contains invalid task token bytes (not valid JSON, wrong structure, missing fields), the translation layer returns `ProtoConversionError::InvalidTaskToken(message)`. The gRPC adapter maps this to `Status::invalid_argument("invalid task token: {message}")`.
 
 This is the same error path as `ProtoConversionError::MissingField` — both are proto conversion errors that indicate a malformed client request.
+
+Terminate and request-cancel links use the shared v1.31.0 link validator before
+runtime invocation. Invalid count, encoded size, variant, or required identity
+fields map to `ProtoConversionError::InvalidArgument` and gRPC
+`INVALID_ARGUMENT`; no transition is submitted.
 
 ### Query and Update Timeout Errors
 

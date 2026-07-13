@@ -5700,6 +5700,7 @@ pub fn terminate_request_to_edge(
         reason: req.reason,
         details: req.details.as_ref().map(payloads_to_domain),
         identity: req.identity,
+        links: links_to_edge(&req.links)?,
     })
 }
 
@@ -5767,6 +5768,7 @@ pub fn cancel_request_to_edge(
         run_id: non_empty(execution.run_id.clone()),
         reason: req.reason,
         identity: req.identity,
+        links: links_to_edge(&req.links)?,
     })
 }
 

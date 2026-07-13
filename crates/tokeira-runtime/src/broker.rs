@@ -85,6 +85,15 @@ pub struct InMemoryActivityBroker {
     inner: Arc<Mutex<ActivityBrokerState>>,
 }
 
+/// Live backlog shape used by matching diagnostics and poller scaling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrokerBacklogStats {
+    /// Number of runnable tasks currently held by the disposable broker.
+    pub count: usize,
+    /// Age of the oldest runnable task, or zero for an empty queue.
+    pub oldest_age: Duration,
+}
+
 #[derive(Default)]
 struct ActivityBrokerState {
     ready: HashMap<QueueKey, VecDeque<TimestampedActivityTask>>,
@@ -92,6 +101,7 @@ struct ActivityBrokerState {
     waiter_counts: HashMap<QueueKey, usize>,
     /// Per-queue wake handles (see the module's "Per-queue wake pattern").
     wakes: HashMap<QueueKey, Arc<Notify>>,
+    denied_workers: HashSet<(NamespaceId, TaskQueueName, WorkerIdentity)>,
 }
 
 #[derive(Default)]
@@ -223,6 +233,78 @@ impl InMemoryBroker {
             .unwrap_or(0);
         runtime_metrics::set_queue_depth(queue, "sticky", sticky);
         runtime_metrics::set_queue_depth(queue, "general", general);
+    }
+
+    /// Whether a workflow poll that just claimed one task left runnable work
+    /// behind on the same physical queue.
+    ///
+    /// v1.31.0 recommends one additional poll when either aged backlog or the
+    /// root queue's add/dispatch-rate pressure is positive
+    /// (`physical_task_queue_manager.go:840-889 @ v1.31.0`). Tokeira's
+    /// disposable broker has no sampled rate window, so remaining runnable
+    /// work is the live pressure signal used for that same `+1` recommendation.
+    pub async fn has_runnable_backlog(&self, queue: &QueueKey) -> bool {
+        let inner = self.inner.lock().await;
+        inner
+            .sticky_ready
+            .get(queue)
+            .is_some_and(|ready| !ready.is_empty())
+            || inner
+                .general_ready
+                .get(queue)
+                .is_some_and(|ready| !ready.is_empty())
+    }
+
+    /// Snapshot non-sticky workflow backlog for `DescribeTaskQueue`.
+    /// Sticky work is intentionally excluded by the public field contract
+    /// (`proto/upstream/temporal/api/taskqueue/v1/message.proto:101-115`).
+    pub async fn backlog_stats(&self, queue: &QueueKey) -> BrokerBacklogStats {
+        let inner = self.inner.lock().await;
+        let Some(ready) = inner.general_ready.get(queue) else {
+            return BrokerBacklogStats::default();
+        };
+        BrokerBacklogStats {
+            count: ready.len(),
+            oldest_age: ready
+                .front()
+                .map(|task| task.entered_at.elapsed())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Move already-ready unversioned work onto a newly promoted deployment
+    /// queue and wake pollers parked there.
+    ///
+    /// Temporal matching lets a Current (or 100% Ramping) version consume the
+    /// unversioned backlog that existed before promotion. Rekeying disposable
+    /// broker entries preserves that observable routing without changing the
+    /// authoritative pending workflow task.
+    pub async fn promote_unversioned_backlog(&self, target: &QueueKey) {
+        let source = QueueKey {
+            namespace_id: target.namespace_id,
+            task_queue: target.task_queue.clone(),
+            task_kind: target.task_kind,
+            deployment: None,
+            build_id: None,
+        };
+        let mut inner = self.inner.lock().await;
+        let mut moved = inner.general_ready.remove(&source).unwrap_or_default();
+        if moved.is_empty() {
+            return;
+        }
+        for entry in &mut moved {
+            entry.task.queue = target.clone();
+        }
+        inner
+            .general_ready
+            .entry(target.clone())
+            .or_default()
+            .append(&mut moved);
+        Self::emit_queue_depths(&inner, &source);
+        Self::emit_queue_depths(&inner, target);
+        let wake = inner.wakes.entry(target.clone()).or_default().clone();
+        drop(inner);
+        wake.notify_waiters();
     }
 
     /// Take a specific run's task out of the general tier by run key, if present.
@@ -856,6 +938,11 @@ impl InMemoryBroker {
         ))
     }
 
+    /// Whether worker shutdown currently fences this identity from the queue.
+    pub async fn is_worker_denied(&self, queue: &QueueKey, worker: &WorkerIdentity) -> bool {
+        self.is_denied(queue, worker).await
+    }
+
     /// Per-queue wake handle, created on first use (see the module's "Per-queue
     /// wake pattern"). Wakeups are scoped to the queue so a publish elsewhere
     /// never disturbs — or empties — a poll on this one.
@@ -1019,6 +1106,62 @@ impl InMemoryActivityBroker {
         runtime_metrics::set_queue_depth(queue, "general", depth);
     }
 
+    /// Whether an activity poll that just claimed one task left runnable work
+    /// behind on the same physical queue.
+    pub async fn has_runnable_backlog(&self, queue: &QueueKey) -> bool {
+        self.inner
+            .lock()
+            .await
+            .ready
+            .get(queue)
+            .is_some_and(|ready| !ready.is_empty())
+    }
+
+    /// Snapshot activity backlog for `DescribeTaskQueue`.
+    pub async fn backlog_stats(&self, queue: &QueueKey) -> BrokerBacklogStats {
+        let inner = self.inner.lock().await;
+        let Some(ready) = inner.ready.get(queue) else {
+            return BrokerBacklogStats::default();
+        };
+        BrokerBacklogStats {
+            count: ready.len(),
+            oldest_age: ready
+                .front()
+                .map(|task| task.entered_at.elapsed())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Move already-ready unversioned activities onto a newly promoted
+    /// deployment queue and wake its pollers.
+    pub async fn promote_unversioned_backlog(&self, target: &QueueKey) {
+        let source = QueueKey {
+            namespace_id: target.namespace_id,
+            task_queue: target.task_queue.clone(),
+            task_kind: target.task_kind,
+            deployment: None,
+            build_id: None,
+        };
+        let mut inner = self.inner.lock().await;
+        let mut moved = inner.ready.remove(&source).unwrap_or_default();
+        if moved.is_empty() {
+            return;
+        }
+        for entry in &mut moved {
+            entry.task.queue = target.clone();
+        }
+        inner
+            .ready
+            .entry(target.clone())
+            .or_default()
+            .append(&mut moved);
+        Self::emit_queue_depth(&inner, &source);
+        Self::emit_queue_depth(&inner, target);
+        let wake = inner.wakes.entry(target.clone()).or_default().clone();
+        drop(inner);
+        wake.notify_waiters();
+    }
+
     /// Take a specific activity out of the ready queue by run key and activity
     /// id, if present.
     ///
@@ -1098,6 +1241,20 @@ impl InMemoryActivityBroker {
         queue: &QueueKey,
         wait_for: Duration,
     ) -> Result<Option<(DispatchableActivityTask, Instant)>> {
+        self.poll_activity_task_for_worker(queue, &WorkerIdentity(String::new()), wait_for)
+            .await
+    }
+
+    /// Long-poll with worker-shutdown fencing.
+    pub async fn poll_activity_task_for_worker(
+        &self,
+        queue: &QueueKey,
+        worker: &WorkerIdentity,
+        wait_for: Duration,
+    ) -> Result<Option<(DispatchableActivityTask, Instant)>> {
+        if self.is_denied(queue, worker).await {
+            return Ok(None);
+        }
         if let Some(task) = self.try_take(queue).await? {
             return Ok(Some(task));
         }
@@ -1112,6 +1269,9 @@ impl InMemoryActivityBroker {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
+            if self.is_denied(queue, worker).await {
+                break Ok(None);
+            }
             if let Some(task) = self.try_take(queue).await? {
                 break Ok(Some(task));
             }
@@ -1127,6 +1287,34 @@ impl InMemoryActivityBroker {
 
         self.decrement_waiter(queue).await;
         result
+    }
+
+    /// Cancel current and reject future activity polls for a shutting-down
+    /// worker identity on a task-queue family.
+    pub async fn deny_worker(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: TaskQueueName,
+        worker: WorkerIdentity,
+    ) {
+        let mut inner = self.inner.lock().await;
+        inner
+            .denied_workers
+            .insert((namespace_id, task_queue, worker));
+        let wakes = inner.wakes.values().cloned().collect::<Vec<_>>();
+        drop(inner);
+        for wake in wakes {
+            wake.notify_waiters();
+        }
+    }
+
+    async fn is_denied(&self, queue: &QueueKey, worker: &WorkerIdentity) -> bool {
+        !worker.0.is_empty()
+            && self.inner.lock().await.denied_workers.contains(&(
+                queue.namespace_id,
+                queue.task_queue.clone(),
+                worker.clone(),
+            ))
     }
 
     /// Per-queue wake handle, created on first use.
@@ -1573,6 +1761,138 @@ mod tests {
             .unwrap();
 
         assert_eq!(delivered.map(|entry| entry.0), Some(activity));
+    }
+
+    // Tier 4.29 invariant: scaling pressure and Describe depth are two views of
+    // the same live workflow backlog, and consuming the last task clears both.
+    #[tokio::test]
+    async fn workflow_backlog_drives_stats_and_scaling_pressure() {
+        let broker = InMemoryBroker::default();
+        let queue = workflow_queue("queue-a", None, None);
+        let task = workflow_task(queue.clone());
+        broker.publish_workflow_task(task.clone(), None).await;
+
+        assert!(broker.has_runnable_backlog(&queue).await);
+        assert_eq!(broker.backlog_stats(&queue).await.count, 1);
+
+        assert!(
+            broker
+                .try_claim_workflow_task(&queue, task.run_key)
+                .await
+                .is_some()
+        );
+        assert!(!broker.has_runnable_backlog(&queue).await);
+        assert_eq!(
+            broker.backlog_stats(&queue).await,
+            BrokerBacklogStats::default()
+        );
+    }
+
+    // Tier 4.29 invariant: promotion rekeys disposable backlog without losing
+    // or duplicating authoritative work.
+    #[tokio::test]
+    async fn promotion_moves_workflow_and_activity_backlog_to_versioned_queues() {
+        let workflow_broker = InMemoryBroker::default();
+        let unversioned_workflow = workflow_queue("queue-a", None, None);
+        let versioned_workflow = QueueKey {
+            deployment: Some(DeploymentId("deployment-a".to_string())),
+            build_id: Some(BuildId("build-a".to_string())),
+            ..unversioned_workflow.clone()
+        };
+        workflow_broker
+            .publish_workflow_task(workflow_task(unversioned_workflow.clone()), None)
+            .await;
+        workflow_broker
+            .promote_unversioned_backlog(&versioned_workflow)
+            .await;
+
+        assert_eq!(
+            workflow_broker
+                .backlog_stats(&unversioned_workflow)
+                .await
+                .count,
+            0
+        );
+        assert_eq!(
+            workflow_broker
+                .backlog_stats(&versioned_workflow)
+                .await
+                .count,
+            1
+        );
+
+        let activity_broker = InMemoryActivityBroker::default();
+        let unversioned_activity = QueueKey {
+            task_kind: TaskKind::Activity,
+            ..unversioned_workflow
+        };
+        let versioned_activity = QueueKey {
+            deployment: versioned_workflow.deployment.clone(),
+            build_id: versioned_workflow.build_id.clone(),
+            ..unversioned_activity.clone()
+        };
+        activity_broker
+            .publish_activity_task(activity_task(unversioned_activity.clone()), None)
+            .await
+            .unwrap();
+        activity_broker
+            .promote_unversioned_backlog(&versioned_activity)
+            .await;
+
+        assert_eq!(
+            activity_broker
+                .backlog_stats(&unversioned_activity)
+                .await
+                .count,
+            0
+        );
+        assert_eq!(
+            activity_broker
+                .backlog_stats(&versioned_activity)
+                .await
+                .count,
+            1
+        );
+    }
+
+    // Tier 4.29 invariant: the shutdown fence applies to activity polls as well
+    // as workflow polls while leaving other worker identities eligible.
+    #[tokio::test]
+    async fn denied_activity_worker_cannot_receive_activity_tasks() {
+        let broker = InMemoryActivityBroker::default();
+        let queue = activity_queue("queue-a");
+        let denied_worker = WorkerIdentity("worker-a".to_string());
+        broker
+            .deny_worker(
+                queue.namespace_id,
+                queue.task_queue.clone(),
+                denied_worker.clone(),
+            )
+            .await;
+        broker
+            .publish_activity_task(activity_task(queue.clone()), None)
+            .await
+            .unwrap();
+
+        let denied = broker
+            .poll_activity_task_for_worker(
+                &queue,
+                &denied_worker,
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+        let allowed = broker
+            .poll_activity_task_for_worker(
+                &queue,
+                &WorkerIdentity("worker-b".to_string()),
+                std::time::Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+
+        assert!(denied.is_none());
+        assert!(allowed.is_some());
     }
 
     #[tokio::test]

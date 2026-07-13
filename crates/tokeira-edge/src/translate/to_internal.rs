@@ -27,6 +27,8 @@ use crate::{
 pub struct PollInternalRequest {
     pub queue: QueueKey,
     pub worker_identity: WorkerIdentity,
+    /// Worker-advertised matching ceiling, superseded by API queue config.
+    pub worker_rate_limit: Option<f64>,
     pub timeout: std::time::Duration,
 }
 
@@ -390,6 +392,7 @@ pub fn poll_request(req: PollWorkflowTaskQueueRequest) -> PollInternalRequest {
             build_id: req.build_id,
         },
         worker_identity: WorkerIdentity(req.worker_identity),
+        worker_rate_limit: None,
         timeout: req.timeout,
     }
 }
@@ -427,10 +430,11 @@ pub fn poll_activity_request(
             namespace_id: namespace_id_for(&req.namespace),
             task_queue: TaskQueueName(req.task_queue),
             task_kind: TaskKind::Activity,
-            deployment: None,
-            build_id: None,
+            deployment: req.deployment,
+            build_id: req.build_id,
         },
         worker_identity: WorkerIdentity(req.worker_identity),
+        worker_rate_limit: req.worker_rate_limit,
         timeout: req.timeout,
     }
 }

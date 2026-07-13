@@ -132,6 +132,18 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
+    // Shutdown poll cancellation is a matching/runtime liveness policy. The
+    // v1.31.0 default is false; the task-queue corpus enables it per test.
+    KeySpec {
+        key: "frontend.enableCancelWorkerPollsOnShutdown",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "matching.maxFairnessKeyWeightOverrides",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
     // Kernel-consulted constants — never overridable. A runtime-mutable read
     // inside the pure kernel would make the same history replay differently
     // (`CONTINUE_AS_NEW_MIN_INTERVAL`, `MAX_BUFFERED_EVENTS` @ tokeira-kernel).

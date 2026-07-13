@@ -243,6 +243,8 @@ pub struct PollWorkflowTaskQueueRequest {
     pub namespace: String,
     pub task_queue: String,
     pub worker_identity: String,
+    /// Stable SDK worker-process key used by matching shutdown cancellation.
+    pub worker_instance_key: String,
     pub deployment: Option<DeploymentId>,
     pub build_id: Option<BuildId>,
     pub sticky_run: Option<RunKey>,
@@ -277,6 +279,9 @@ pub struct PollWorkflowTaskQueueResponse {
     pub query: Option<WorkflowQueryDto>,
     pub queries: HashMap<String, WorkflowQueryDto>,
     pub messages: Vec<ProtocolMessageDto>,
+    /// SDK poller-count hint derived from matching pressure. `None` means the
+    /// server has no recommendation for this response.
+    pub poller_scaling_decision: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -598,6 +603,14 @@ pub struct PollActivityTaskQueueRequest {
     pub namespace: String,
     pub task_queue: String,
     pub worker_identity: String,
+    /// Stable SDK worker-process key used by matching shutdown cancellation.
+    pub worker_instance_key: String,
+    /// Worker Deployment selected by the poller's versioning options.
+    pub deployment: Option<DeploymentId>,
+    /// Build within `deployment` selected by the poller's versioning options.
+    pub build_id: Option<BuildId>,
+    /// Worker-advertised dispatch ceiling in tasks per second.
+    pub worker_rate_limit: Option<f64>,
     pub timeout: Duration,
 }
 
@@ -623,6 +636,8 @@ pub struct PollActivityTaskQueueResponse {
     pub schedule_to_close_timeout: Option<Duration>,
     pub start_to_close_timeout: Option<Duration>,
     pub heartbeat_timeout: Option<Duration>,
+    /// SDK poller-count hint derived from matching pressure.
+    pub poller_scaling_decision: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1024,6 +1039,19 @@ pub struct DescribeTaskQueueRequest {
     pub task_queue: String,
     pub task_kind: TaskKind,
     pub include_status: bool,
+    /// Whether live matching backlog statistics were requested.
+    pub report_stats: bool,
+    /// Whether enhanced mode should include statistics for both task kinds.
+    pub enhanced: bool,
+}
+
+/// Live matching backlog values projected by `DescribeTaskQueue`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskQueueStatsDto {
+    /// Current runnable broker depth; approximate because the broker is live.
+    pub approximate_backlog_count: i64,
+    /// Age of the oldest runnable task, or zero when the queue is empty.
+    pub approximate_backlog_age: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1065,6 +1093,12 @@ pub struct DescribeTaskQueueResponse {
     /// version has polled it. `None` renders no `versioning_info` on the wire,
     /// matching a task queue with no deployment association.
     pub versioning_info: Option<TaskQueueVersioningInfo>,
+    /// Statistics for the task kind requested through the basic response shape.
+    pub stats: Option<TaskQueueStatsDto>,
+    /// Workflow statistics included by enhanced mode.
+    pub workflow_stats: Option<TaskQueueStatsDto>,
+    /// Activity statistics included by enhanced mode.
+    pub activity_stats: Option<TaskQueueStatsDto>,
 }
 
 /// A `(deployment_name, build_id)` reference to one Worker Deployment Version,
@@ -1105,9 +1139,27 @@ pub struct CountSchedulesResponse {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TaskQueueConfig {
+    /// Queue-wide dispatch ceiling in tasks per second.
     pub queue_rate_limit: Option<f32>,
+    /// Audit metadata for the latest queue-wide limit update, including unset.
+    pub queue_rate_limit_metadata: Option<TaskQueueConfigMetadata>,
+    /// Default dispatch ceiling for each fairness key.
     pub fairness_key_rate_limit_default: Option<f32>,
+    /// Audit metadata for the latest per-key default update, including unset.
+    pub fairness_key_rate_limit_metadata: Option<TaskQueueConfigMetadata>,
+    /// Relative dispatch weights keyed by fairness key.
     pub fairness_weight_overrides: BTreeMap<String, f32>,
+}
+
+/// Audit metadata for one task-queue rate-limit update.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskQueueConfigMetadata {
+    /// Caller-supplied audit reason.
+    pub reason: String,
+    /// Identity that issued the update.
+    pub update_identity: String,
+    /// Time the edge accepted the update.
+    pub update_time: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -778,6 +778,7 @@ fn arb_poll_request() -> impl Strategy<Value = PollWorkflowTaskQueueRequest> {
             namespace,
             task_queue,
             worker_identity,
+            worker_instance_key: String::new(),
             deployment: None,
             build_id: None,
             sticky_run: None,
@@ -915,6 +916,7 @@ fn arb_poll_response() -> impl Strategy<Value = PollWorkflowTaskQueueResponse> {
                 query: None,
                 queries: Default::default(),
                 messages: Vec::new(),
+                poller_scaling_decision: None,
             },
         )
 }
@@ -1456,6 +1458,10 @@ fn arb_poll_activity_request() -> impl Strategy<Value = PollActivityTaskQueueReq
             namespace,
             task_queue,
             worker_identity,
+            worker_instance_key: String::new(),
+            deployment: None,
+            build_id: None,
+            worker_rate_limit: None,
             timeout: Duration::from_secs(60),
         },
     )
@@ -1493,6 +1499,7 @@ fn arb_poll_activity_response() -> impl Strategy<Value = PollActivityTaskQueueRe
                     schedule_to_close_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
+                    poller_scaling_decision: None,
                 }
             },
         )

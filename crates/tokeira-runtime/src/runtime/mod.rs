@@ -101,6 +101,24 @@ pub(crate) use activity::{
 /// (`common/dynamicconfig/constants.go:307-312 @ v1.31.0`).
 pub const REPORTED_PROBLEMS_THRESHOLD: u32 = 5;
 
+/// v1.31.0 defaults worker-shutdown poll cancellation off
+/// (`common/dynamicconfig/constants.go:3207-3212 @ v1.31.0`).
+const CANCEL_WORKER_POLLS_ON_SHUTDOWN: bool = false;
+
+#[cfg(not(feature = "conformance"))]
+#[inline]
+fn cancel_worker_polls_on_shutdown() -> bool {
+    CANCEL_WORKER_POLLS_ON_SHUTDOWN
+}
+
+#[cfg(feature = "conformance")]
+#[inline]
+fn cancel_worker_polls_on_shutdown() -> bool {
+    tokeira_conformance::overrides()
+        .get_bool("frontend.enableCancelWorkerPollsOnShutdown")
+        .unwrap_or(CANCEL_WORKER_POLLS_ON_SHUTDOWN)
+}
+
 /// The live reported-problems threshold consulted when deriving
 /// `TemporalReportedProblems`. In a production build this is exactly the pinned
 /// [`REPORTED_PROBLEMS_THRESHOLD`].
@@ -902,6 +920,30 @@ where
     /// Return a clone of the activity-task broker.
     pub fn activity_broker(&self) -> InMemoryActivityBroker {
         self.activity_broker.clone()
+    }
+
+    /// Cancel outstanding workflow polls and reject subsequent polls for a
+    /// shutting-down worker when the v1.31.0 feature flag is enabled.
+    ///
+    /// The broker wake makes parked long polls return normally with an empty
+    /// response; correctness state is untouched because polls are disposable
+    /// matching state (`workflow_handler.go:3050-3118 @ v1.31.0`).
+    pub async fn cancel_outstanding_worker_polls(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: TaskQueueName,
+        worker: WorkerIdentity,
+    ) -> bool {
+        if !cancel_worker_polls_on_shutdown() {
+            return false;
+        }
+        self.broker
+            .deny_worker(namespace_id, task_queue.clone(), worker.clone())
+            .await;
+        self.activity_broker
+            .deny_worker(namespace_id, task_queue, worker)
+            .await;
+        true
     }
 
     pub fn buffered_queries(&self) -> BufferedQueryRegistry {

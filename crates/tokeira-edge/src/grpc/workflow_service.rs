@@ -41,7 +41,9 @@ use crate::{
         translate,
     },
     translate::{batch, nexus, schedule, to_internal, worker_heartbeat},
-    workflow_service::WorkflowService,
+    workflow_service::{
+        WorkflowService, task_queue_config_metadata_to_edge, task_queue_config_metadata_to_runtime,
+    },
 };
 
 const DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED: &str =
@@ -1746,6 +1748,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .deny_worker(
                     namespace_id,
                     TaskQueueName(req.sticky_task_queue),
+                    WorkerIdentity(req.identity.clone()),
+                )
+                .await;
+        }
+        if !req.task_queue.is_empty() {
+            self.inner
+                .cancel_outstanding_worker_polls(
+                    namespace_id,
+                    TaskQueueName(req.task_queue),
                     WorkerIdentity(req.identity),
                 )
                 .await;
@@ -2539,14 +2550,52 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .await
             .map_err(namespace_resolution_status)?;
         let task_queue = TaskQueueName(req.task_queue.clone());
-        let config = translate::task_queue_config_from_update_request(&req);
+        let existing = self
+            .inner
+            .task_queue_config_store()
+            .get(&namespace_id, &task_queue);
+        let mut config = translate::task_queue_config_from_update_request(&req);
+        if let Some(existing) = existing {
+            if req.update_queue_rate_limit.is_none() {
+                config.queue_rate_limit = existing.queue_rate_limit;
+                config.queue_rate_limit_metadata = existing
+                    .queue_rate_limit_metadata
+                    .map(task_queue_config_metadata_to_edge);
+            }
+            if req.update_fairness_key_rate_limit_default.is_none() {
+                config.fairness_key_rate_limit_default = existing.fairness_key_rate_limit_default;
+                config.fairness_key_rate_limit_metadata = existing
+                    .fairness_key_rate_limit_metadata
+                    .map(task_queue_config_metadata_to_edge);
+            }
+            let mut merged = existing.fairness_weight_overrides;
+            for key in &req.unset_fairness_weight_overrides {
+                merged.remove(key);
+            }
+            merged.extend(req.set_fairness_weight_overrides.clone());
+            config.fairness_weight_overrides = merged;
+        }
+        if config.fairness_weight_overrides.len() > tokeira_runtime::max_fairness_weight_overrides()
+        {
+            return Err(Status::invalid_argument(
+                "fairness weight overrides update rejected: maximum number of overrides exceeded",
+            ));
+        }
         self.inner
             .task_queue_config_store()
             .set(TaskQueueConfigEntry {
                 namespace_id,
                 task_queue,
                 queue_rate_limit: config.queue_rate_limit,
+                queue_rate_limit_metadata: config
+                    .queue_rate_limit_metadata
+                    .clone()
+                    .map(task_queue_config_metadata_to_runtime),
                 fairness_key_rate_limit_default: config.fairness_key_rate_limit_default,
+                fairness_key_rate_limit_metadata: config
+                    .fairness_key_rate_limit_metadata
+                    .clone()
+                    .map(task_queue_config_metadata_to_runtime),
                 fairness_weight_overrides: config.fairness_weight_overrides.clone(),
             });
         Ok(Response::new(
@@ -4880,6 +4929,10 @@ mod tests {
             namespace: "default".to_string(),
             task_queue: "queue".to_string(),
             worker_identity: "w2".to_string(),
+            worker_instance_key: String::new(),
+            deployment: None,
+            build_id: None,
+            worker_rate_limit: None,
             timeout: std::time::Duration::from_millis(50),
         };
         let result = service.poll_activity_task_queue(&headers, req).await;

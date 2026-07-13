@@ -14,6 +14,7 @@
 //! surfaced to workers as `ProtocolMessage` entries on the poll response.
 
 use std::{
+    collections::HashMap,
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -51,9 +52,9 @@ use tokeira_storage::{
     ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
 };
 use tokeira_types::{
-    ActivityTaskToken, ArchetypeId, ExecutionRef, ExecutionStatus, HeartbeatStore, Payload,
-    Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey, TaskKind, TaskQueueName,
-    WorkerIdentity, WorkflowId,
+    ActivityTaskToken, ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus,
+    HeartbeatStore, Payload, Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey,
+    TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
 };
 use uuid::Uuid;
 
@@ -302,6 +303,25 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
             .map(|task| task.map(WorkflowActivation::WorkflowTask))
     }
 
+    /// Return a poller-count delta after a successful workflow poll, if the
+    /// matching plane currently observes pressure on that physical queue.
+    async fn workflow_poller_scaling_decision(
+        &self,
+        _queue: &tokeira_types::QueueKey,
+    ) -> Option<i32> {
+        None
+    }
+
+    /// Whether a workflow poll returned empty because worker shutdown cancelled
+    /// it, rather than because its long-poll deadline elapsed.
+    async fn workflow_poll_cancelled(
+        &self,
+        _queue: &tokeira_types::QueueKey,
+        _worker: &tokeira_types::WorkerIdentity,
+    ) -> bool {
+        false
+    }
+
     async fn try_claim_workflow_task(
         &self,
         queue: tokeira_types::QueueKey,
@@ -349,6 +369,37 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         worker_identity: tokeira_types::WorkerIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<StartedActivityTask>>;
+
+    /// Return a poller-count delta after a successful activity poll, if the
+    /// matching plane currently observes pressure on that physical queue.
+    async fn activity_poller_scaling_decision(
+        &self,
+        _queue: &tokeira_types::QueueKey,
+    ) -> Option<i32> {
+        None
+    }
+
+    /// Snapshot one physical queue's live matching backlog.
+    async fn task_queue_backlog_stats(
+        &self,
+        _queue: &tokeira_types::QueueKey,
+    ) -> tokeira_runtime::BrokerBacklogStats {
+        tokeira_runtime::BrokerBacklogStats::default()
+    }
+
+    /// Absorb already-unversioned ready work into a promoted deployment queue.
+    async fn absorb_unversioned_backlog(&self, _queue: &tokeira_types::QueueKey) {}
+
+    /// Apply the v1.31.0 worker-shutdown cancellation policy to outstanding
+    /// matching polls. Returns whether the policy was enabled and applied.
+    async fn cancel_outstanding_worker_polls(
+        &self,
+        _namespace_id: tokeira_types::NamespaceId,
+        _task_queue: tokeira_types::TaskQueueName,
+        _worker: tokeira_types::WorkerIdentity,
+    ) -> bool {
+        false
+    }
 
     async fn try_claim_activity_task(
         &self,
@@ -795,6 +846,7 @@ pub struct WorkflowService {
     task_queue_config_store: Arc<dyn TaskQueueConfigStore>,
     batch_store: Arc<BatchOperationStore>,
     eager_dispatch_config: EagerDispatchConfig,
+    task_queue_rate_limiter: TaskQueueRateLimiter,
 }
 
 impl std::fmt::Debug for WorkflowService {
@@ -813,6 +865,52 @@ impl Default for EagerDispatchConfig {
         Self {
             max_eager_activity_tasks_per_response: 3,
         }
+    }
+}
+
+/// Process-local dispatch pacing for matching task queues.
+///
+/// Temporal matching applies the API queue rate limit ahead of a worker's
+/// advertised rate (`task_queue_partition_manager.go @ v1.31.0`). The limiter
+/// is deliberately ephemeral: it affects delivery timing only and never owns
+/// task correctness.
+#[derive(Clone, Debug, Default)]
+struct TaskQueueRateLimiter {
+    next_dispatch:
+        Arc<tokio::sync::Mutex<HashMap<(tokeira_types::NamespaceId, TaskQueueName), Instant>>>,
+}
+
+impl TaskQueueRateLimiter {
+    async fn acquire(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        task_queue: TaskQueueName,
+        requests_per_second: f64,
+        max_wait: Duration,
+    ) -> bool {
+        if requests_per_second <= 0.0 {
+            tokio::time::sleep(max_wait).await;
+            return false;
+        }
+        let interval = Duration::from_secs_f64(1.0 / requests_per_second);
+        let now = Instant::now();
+        let wait = {
+            let mut next_dispatch = self.next_dispatch.lock().await;
+            let next = next_dispatch
+                .entry((namespace_id, task_queue))
+                .or_insert(now);
+            let dispatch_at = (*next).max(now);
+            *next = dispatch_at + interval;
+            dispatch_at.saturating_duration_since(now)
+        };
+        if wait >= max_wait {
+            tokio::time::sleep(max_wait).await;
+            return false;
+        }
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        true
     }
 }
 
@@ -1055,6 +1153,7 @@ impl WorkflowService {
             task_queue_config_store,
             batch_store,
             eager_dispatch_config: EagerDispatchConfig::default(),
+            task_queue_rate_limiter: TaskQueueRateLimiter::default(),
         }
     }
 
@@ -1191,7 +1290,11 @@ impl WorkflowService {
                     crate::translate::nexus::broker_queue(&req.namespace, &req.task_queue);
                 let task = self
                     .nexus_broker
-                    .poll(namespace_id, task_queue, std::time::Duration::from_secs(60))
+                    .poll(
+                        namespace_id,
+                        task_queue.clone(),
+                        std::time::Duration::from_secs(60),
+                    )
                     .await;
 
                 match task {
@@ -1202,6 +1305,11 @@ impl WorkflowService {
                         Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
                             task_token: task.token.encode().map_err(EdgeError::from)?,
                             request: task.request,
+                            poller_scaling_decision: self
+                                .nexus_broker
+                                .has_runnable_backlog(namespace_id, &task_queue)
+                                .await
+                                .then_some(1),
                         }))
                     }
                     None => {
@@ -2155,6 +2263,25 @@ impl WorkflowService {
         self.broker.clone()
     }
 
+    /// Cancel and suppress a worker's task-queue polls when the release-pinned
+    /// shutdown policy is enabled, and eagerly remove its Describe poller row.
+    pub async fn cancel_outstanding_worker_polls(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        task_queue: tokeira_types::TaskQueueName,
+        worker: tokeira_types::WorkerIdentity,
+    ) -> bool {
+        let applied = self
+            .runtime
+            .cancel_outstanding_worker_polls(namespace_id, task_queue.clone(), worker.clone())
+            .await;
+        if applied {
+            self.poller_registry
+                .remove_worker(namespace_id, &task_queue, &worker);
+        }
+        applied
+    }
+
     pub fn new_with_buffered_queries_and_history_wait_registry(
         runtime: Arc<dyn WorkflowRuntimeApi>,
         resolver: Arc<dyn ExecutionResolver>,
@@ -2356,6 +2483,7 @@ impl WorkflowService {
             }),
             queries: std::collections::HashMap::new(),
             messages: Vec::new(),
+            poller_scaling_decision: None,
         })
     }
 
@@ -2685,6 +2813,7 @@ impl WorkflowService {
                     );
                 }
                 let internal = to_internal::poll_request(req);
+                let scaling_queue = internal.queue.clone();
                 let activation = self
                     .runtime
                     .poll_workflow_activation(
@@ -2697,8 +2826,24 @@ impl WorkflowService {
                 // timeout, or runtime error from tonic cancellation, which
                 // drops the handler future before this finalizer can run
                 // (`task_queue_partition_manager.go:617-621 @ v1.31.0`).
-                poller.completed();
                 let activation = activation.map_err(EdgeError::from)?;
+                if activation.is_none()
+                    && self
+                        .runtime
+                        .workflow_poll_cancelled(&scaling_queue, &internal.worker_identity)
+                        .await
+                {
+                    poller.cancelled();
+                } else {
+                    poller.completed();
+                }
+                let scaling_decision = if activation.is_some() {
+                    self.runtime
+                        .workflow_poller_scaling_decision(&scaling_queue)
+                        .await
+                } else {
+                    None
+                };
 
                 match activation {
                     Some(WorkflowActivation::WorkflowTask(started)) => {
@@ -2708,13 +2853,17 @@ impl WorkflowService {
                                 .map_err(EdgeError::from)?;
                         self.decorate_workflow_task_response(&started, &mut response)
                             .await?;
+                        response.poller_scaling_decision = scaling_decision;
 
                         Ok(Some(response))
                     }
-                    Some(WorkflowActivation::QueryTask(query)) => Ok(Some(
-                        self.build_direct_query_poll_response(query, &internal.worker_identity)
-                            .await?,
-                    )),
+                    Some(WorkflowActivation::QueryTask(query)) => {
+                        let mut response = self
+                            .build_direct_query_poll_response(query, &internal.worker_identity)
+                            .await?;
+                        response.poller_scaling_decision = scaling_decision;
+                        Ok(Some(response))
+                    }
                     None => Ok(None),
                 }
             },
@@ -3622,18 +3771,99 @@ impl WorkflowService {
                     .map(task_queue_config_to_edge)
                     .unwrap_or_default();
 
+                let versioning_view = match self.worker_deployments.as_ref() {
+                    Some(worker_deployments) => {
+                        worker_deployments
+                            .task_queue_versioning(namespace_id, req.task_queue.clone())
+                            .await?
+                    }
+                    None => None,
+                };
+                let stats_version = versioning_view.as_ref().and_then(|view| {
+                    if view.ramping_percentage >= 100.0 {
+                        view.ramping_version.as_ref()
+                    } else {
+                        view.current_version.as_ref()
+                    }
+                });
+                let stats_deployment =
+                    stats_version.map(|version| DeploymentId(version.deployment_name.0.clone()));
+                let stats_build_id =
+                    stats_version.map(|version| BuildId(version.build_id.0.clone()));
+                let workflow_queue = queue_key_for_poll(
+                    &req.namespace,
+                    &req.task_queue,
+                    TaskKind::Workflow,
+                    stats_deployment.clone(),
+                    stats_build_id.clone(),
+                );
+                let activity_queue = queue_key_for_poll(
+                    &req.namespace,
+                    &req.task_queue,
+                    TaskKind::Activity,
+                    stats_deployment,
+                    stats_build_id,
+                );
+                let (workflow_stats, activity_stats) = if req.report_stats {
+                    let mut workflow = self.runtime.task_queue_backlog_stats(&workflow_queue).await;
+                    let mut activity = self.runtime.task_queue_backlog_stats(&activity_queue).await;
+                    // Current and 100%-ramping versions absorb work that was
+                    // queued while the family was still unversioned. Matching's
+                    // adjusted stats include both physical queues
+                    // (`GetPhysicalQueueAdjustedStats`,
+                    // `physical_task_queue_manager.go @ v1.31.0`).
+                    if stats_version.is_some() {
+                        let unversioned_workflow = self
+                            .runtime
+                            .task_queue_backlog_stats(&queue_key_for_poll(
+                                &req.namespace,
+                                &req.task_queue,
+                                TaskKind::Workflow,
+                                None,
+                                None,
+                            ))
+                            .await;
+                        workflow.count += unversioned_workflow.count;
+                        workflow.oldest_age =
+                            workflow.oldest_age.max(unversioned_workflow.oldest_age);
+                        let unversioned_activity = self
+                            .runtime
+                            .task_queue_backlog_stats(&queue_key_for_poll(
+                                &req.namespace,
+                                &req.task_queue,
+                                TaskKind::Activity,
+                                None,
+                                None,
+                            ))
+                            .await;
+                        activity.count += unversioned_activity.count;
+                        activity.oldest_age =
+                            activity.oldest_age.max(unversioned_activity.oldest_age);
+                    }
+                    (
+                        Some(crate::translate::TaskQueueStatsDto {
+                            approximate_backlog_count: workflow.count as i64,
+                            approximate_backlog_age: workflow.oldest_age,
+                        }),
+                        Some(crate::translate::TaskQueueStatsDto {
+                            approximate_backlog_count: activity.count as i64,
+                            approximate_backlog_age: activity.oldest_age,
+                        }),
+                    )
+                } else {
+                    (None, None)
+                };
+                let stats = match req.task_kind {
+                    TaskKind::Activity => activity_stats,
+                    _ => workflow_stats,
+                };
+
                 // Surface Worker Deployment versioning for this task queue (current /
                 // ramping version) the way Temporal's matching layer does from synced
                 // task-queue user data (`task_queue_partition_manager.go:976 @ v1.31.0`).
                 // Derived from the registry; absent when no deployment version has
                 // polled the queue or when the registry is not configured.
-                let versioning_info = match self.worker_deployments.as_ref() {
-                    Some(worker_deployments) => worker_deployments
-                        .task_queue_versioning(namespace_id, req.task_queue.clone())
-                        .await?
-                        .map(task_queue_versioning_view_to_edge),
-                    None => None,
-                };
+                let versioning_info = versioning_view.map(task_queue_versioning_view_to_edge);
 
                 Ok(DescribeTaskQueueResponse {
                     pollers: self
@@ -3642,9 +3872,14 @@ impl WorkflowService {
                         .into_iter()
                         .map(active_poller_to_edge)
                         .collect(),
-                    backlog_count_hint: req.include_status.then_some(0),
+                    backlog_count_hint: req
+                        .include_status
+                        .then_some(stats.map_or(0, |value| value.approximate_backlog_count)),
                     config,
                     versioning_info,
+                    stats,
+                    workflow_stats: if req.enhanced { workflow_stats } else { None },
+                    activity_stats: if req.enhanced { activity_stats } else { None },
                 })
             },
         )
@@ -4163,12 +4398,64 @@ impl WorkflowService {
                         &req.namespace,
                         &req.task_queue,
                         TaskKind::Activity,
-                        None,
-                        None,
+                        req.deployment.clone(),
+                        req.build_id.clone(),
                     ),
                     WorkerIdentity(req.worker_identity.clone()),
                 );
+                // Activity polls participate in the same matching-driven Worker
+                // Deployment auto-registration as workflow polls. v1.31.0 reports
+                // both queue types in DescribeWorkerDeploymentVersion once each has
+                // polled (`service/worker/workerdeployment/client.go:1230 @ v1.31.0`).
+                if let (Some(worker_deployments), Some(deployment), Some(build_id)) = (
+                    self.worker_deployments.as_ref(),
+                    req.deployment.as_ref(),
+                    req.build_id.as_ref(),
+                ) && let Err(error) = worker_deployments
+                    .register_polled_deployment(RegisterPolledDeployment {
+                        namespace_id: to_internal::namespace_id_for(&req.namespace),
+                        deployment_name: DeploymentName(deployment.0.clone()),
+                        build_id: tokeira_storage::BuildId(build_id.0.clone()),
+                        task_queue: req.task_queue.clone(),
+                        task_queue_type: DeploymentTaskQueueType::Activity,
+                        identity: req.worker_identity.clone(),
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        deployment = %deployment.0,
+                        build_id = %build_id.0,
+                        "failed to auto-register activity worker deployment"
+                    );
+                }
                 let internal = to_internal::poll_activity_request(req);
+                let scaling_queue = internal.queue.clone();
+                if internal.queue.deployment.is_some() {
+                    self.runtime
+                        .absorb_unversioned_backlog(&internal.queue)
+                        .await;
+                }
+                let configured_rate = self
+                    .task_queue_config_store
+                    .get(&internal.queue.namespace_id, &internal.queue.task_queue)
+                    .and_then(|config| config.queue_rate_limit)
+                    .map(f64::from);
+                let effective_rate = configured_rate.or(internal.worker_rate_limit);
+                if let Some(rate) = effective_rate
+                    && !self
+                        .task_queue_rate_limiter
+                        .acquire(
+                            internal.queue.namespace_id,
+                            internal.queue.task_queue.clone(),
+                            rate,
+                            internal.timeout,
+                        )
+                        .await
+                {
+                    poller.completed();
+                    return Ok(None);
+                }
                 let started = self
                     .runtime
                     .poll_activity_task(internal.queue, internal.worker_identity, internal.timeout)
@@ -4179,11 +4466,21 @@ impl WorkflowService {
                 // 617-621 @ v1.31.0`).
                 poller.completed();
                 let started = started.map_err(EdgeError::from)?;
+                let scaling_decision = if started.is_some() {
+                    self.runtime
+                        .activity_poller_scaling_decision(&scaling_queue)
+                        .await
+                } else {
+                    None
+                };
 
                 match started {
-                    Some(started) => Ok(Some(
-                        from_internal::poll_activity_response(started).map_err(EdgeError::from)?,
-                    )),
+                    Some(started) => {
+                        let mut response = from_internal::poll_activity_response(started)
+                            .map_err(EdgeError::from)?;
+                        response.poller_scaling_decision = scaling_decision;
+                        Ok(Some(response))
+                    }
                     None => Ok(None),
                 }
             },
@@ -6091,8 +6388,34 @@ fn active_poller_to_edge(poller: ActivePoller) -> crate::translate::PollerInfo {
 fn task_queue_config_to_edge(entry: TaskQueueConfigEntry) -> TaskQueueConfig {
     TaskQueueConfig {
         queue_rate_limit: entry.queue_rate_limit,
+        queue_rate_limit_metadata: entry
+            .queue_rate_limit_metadata
+            .map(task_queue_config_metadata_to_edge),
         fairness_key_rate_limit_default: entry.fairness_key_rate_limit_default,
+        fairness_key_rate_limit_metadata: entry
+            .fairness_key_rate_limit_metadata
+            .map(task_queue_config_metadata_to_edge),
         fairness_weight_overrides: entry.fairness_weight_overrides,
+    }
+}
+
+pub(crate) fn task_queue_config_metadata_to_edge(
+    metadata: tokeira_runtime::TaskQueueConfigMetadata,
+) -> crate::translate::TaskQueueConfigMetadata {
+    crate::translate::TaskQueueConfigMetadata {
+        reason: metadata.reason,
+        update_identity: metadata.update_identity,
+        update_time: metadata.update_time,
+    }
+}
+
+pub(crate) fn task_queue_config_metadata_to_runtime(
+    metadata: crate::translate::TaskQueueConfigMetadata,
+) -> tokeira_runtime::TaskQueueConfigMetadata {
+    tokeira_runtime::TaskQueueConfigMetadata {
+        reason: metadata.reason,
+        update_identity: metadata.update_identity,
+        update_time: metadata.update_time,
     }
 }
 

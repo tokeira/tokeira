@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use dashmap::DashMap;
+use time::OffsetDateTime;
 use tokeira_types::{NamespaceId, TaskQueueName};
 
 /// Operator-set dispatch tuning for a single task queue.
@@ -26,12 +27,46 @@ pub struct TaskQueueConfigEntry {
     /// Optional ceiling on total dispatch rate for the queue (tasks/sec). `None`
     /// leaves the queue at the built-in default.
     pub queue_rate_limit: Option<f32>,
+    /// Metadata is retained even when the update explicitly unsets the limit.
+    pub queue_rate_limit_metadata: Option<TaskQueueConfigMetadata>,
     /// Optional default per-fairness-key rate limit applied when a key has no
     /// explicit override.
     pub fairness_key_rate_limit_default: Option<f32>,
+    /// Metadata for the default fairness-key limit update/unset.
+    pub fairness_key_rate_limit_metadata: Option<TaskQueueConfigMetadata>,
     /// Per-fairness-key weight overrides, keyed by fairness key. Weights bias the
     /// share of dispatch a key receives relative to others.
     pub fairness_weight_overrides: BTreeMap<String, f32>,
+}
+
+/// Audit metadata attached to a task-queue configuration update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskQueueConfigMetadata {
+    /// Caller-supplied reason.
+    pub reason: String,
+    /// Identity that issued the update.
+    pub update_identity: String,
+    /// Time the update was accepted.
+    pub update_time: OffsetDateTime,
+}
+
+/// v1.31.0's maximum fairness-weight override count (default 1000).
+const MAX_FAIRNESS_WEIGHT_OVERRIDES: usize = 1000;
+
+/// Live limit used by the UpdateTaskQueueConfig admission path.
+#[cfg(not(feature = "conformance"))]
+pub fn max_fairness_weight_overrides() -> usize {
+    MAX_FAIRNESS_WEIGHT_OVERRIDES
+}
+
+/// Conformance builds honour the corpus's per-test override at the live edge
+/// admission site; production remains pinned to the release default.
+#[cfg(feature = "conformance")]
+pub fn max_fairness_weight_overrides() -> usize {
+    tokeira_conformance::overrides()
+        .get_i64("matching.maxFairnessKeyWeightOverrides")
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(MAX_FAIRNESS_WEIGHT_OVERRIDES)
 }
 
 /// Storage for per-task-queue configuration entries.
@@ -110,7 +145,9 @@ mod tests {
             namespace_id: namespace_a,
             task_queue: queue.clone(),
             queue_rate_limit: Some(10.0),
+            queue_rate_limit_metadata: None,
             fairness_key_rate_limit_default: Some(5.0),
+            fairness_key_rate_limit_metadata: None,
             fairness_weight_overrides: BTreeMap::from([("tenant-a".to_string(), 2.0)]),
         };
 

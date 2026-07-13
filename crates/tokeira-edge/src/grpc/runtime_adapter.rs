@@ -17,8 +17,14 @@ use tokeira_runtime::{
     UpdateComputeConfig, UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution,
     UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView, VersionView, WorkflowDeletion,
 };
-use tokeira_storage::{CommitResult, ConflictToken, DeploymentKey, RunRepository};
-use tokeira_types::{ActivityTaskToken, ExecutionRef, Payload, Payloads, RequestContext, RunKey};
+use tokeira_storage::{
+    CommitResult, ConflictToken, DeploymentKey, DeploymentTaskQueueType, RunRepository,
+    WorkerDeploymentVersionStatus,
+};
+use tokeira_types::{
+    ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, NamespaceId, Payload, Payloads,
+    QueueKey, RequestContext, RunKey, TaskKind, TaskQueueName, WorkerIdentity,
+};
 
 use crate::{
     errors::{EdgeError, EdgeResult},
@@ -47,6 +53,50 @@ impl<R> RuntimeAdapter<R> {
                 "worker deployment registry is not configured for this runtime".to_string(),
             )
         })
+    }
+
+    async fn promote_unversioned_backlog(
+        &self,
+        deployment: &DeploymentView,
+        build_id: &tokeira_storage::BuildId,
+    ) where
+        R: RunRepository + 'static,
+    {
+        let Some(version) = deployment
+            .versions
+            .iter()
+            .find(|version| &version.build_id == build_id)
+        else {
+            return;
+        };
+        for membership in &version.task_queues {
+            let task_kind = match membership.task_queue.task_queue_type {
+                DeploymentTaskQueueType::Workflow => TaskKind::Workflow,
+                DeploymentTaskQueueType::Activity => TaskKind::Activity,
+                DeploymentTaskQueueType::Nexus | DeploymentTaskQueueType::Unspecified => continue,
+            };
+            let target = QueueKey {
+                namespace_id: deployment.namespace_id,
+                task_queue: TaskQueueName(membership.task_queue.name.clone()),
+                task_kind,
+                deployment: Some(DeploymentId(deployment.name.0.clone())),
+                build_id: Some(BuildId(build_id.0.clone())),
+            };
+            match task_kind {
+                TaskKind::Workflow => {
+                    self.runtime
+                        .broker()
+                        .promote_unversioned_backlog(&target)
+                        .await;
+                }
+                TaskKind::Activity => {
+                    self.runtime
+                        .activity_broker()
+                        .promote_unversioned_backlog(&target)
+                        .await;
+                }
+            }
+        }
     }
 }
 
@@ -131,6 +181,25 @@ where
             .await
     }
 
+    async fn workflow_poller_scaling_decision(
+        &self,
+        queue: &tokeira_types::QueueKey,
+    ) -> Option<i32> {
+        self.runtime
+            .broker()
+            .has_runnable_backlog(queue)
+            .await
+            .then_some(1)
+    }
+
+    async fn workflow_poll_cancelled(
+        &self,
+        queue: &tokeira_types::QueueKey,
+        worker: &WorkerIdentity,
+    ) -> bool {
+        self.runtime.broker().is_worker_denied(queue, worker).await
+    }
+
     async fn try_claim_workflow_task(
         &self,
         queue: tokeira_types::QueueKey,
@@ -158,6 +227,79 @@ where
     ) -> Result<Option<StartedActivityTask>> {
         self.runtime
             .poll_activity_task(queue, worker_identity, timeout)
+            .await
+    }
+
+    async fn activity_poller_scaling_decision(
+        &self,
+        queue: &tokeira_types::QueueKey,
+    ) -> Option<i32> {
+        self.runtime
+            .activity_broker()
+            .has_runnable_backlog(queue)
+            .await
+            .then_some(1)
+    }
+
+    async fn task_queue_backlog_stats(
+        &self,
+        queue: &tokeira_types::QueueKey,
+    ) -> tokeira_runtime::BrokerBacklogStats {
+        match queue.task_kind {
+            tokeira_types::TaskKind::Activity => {
+                self.runtime.activity_broker().backlog_stats(queue).await
+            }
+            tokeira_types::TaskKind::Workflow => self.runtime.broker().backlog_stats(queue).await,
+        }
+    }
+
+    async fn absorb_unversioned_backlog(&self, queue: &tokeira_types::QueueKey) {
+        let (Some(deployment), Some(build_id), Some(registry)) = (
+            queue.deployment.as_ref(),
+            queue.build_id.as_ref(),
+            self.runtime.deployment_registry(),
+        ) else {
+            return;
+        };
+        let Ok(Some(versioning)) = registry
+            .task_queue_versioning(queue.namespace_id, &queue.task_queue.0)
+            .await
+        else {
+            return;
+        };
+        let is_target = |version: &tokeira_storage::WorkerDeploymentVersionKey| {
+            version.deployment_name.0 == deployment.0 && version.build_id.0 == build_id.0
+        };
+        let routes_to_worker = versioning.current_version.as_ref().is_some_and(is_target)
+            || (versioning.ramping_percentage > 0.0
+                && versioning.ramping_version.as_ref().is_some_and(is_target));
+        if !routes_to_worker {
+            return;
+        }
+        match queue.task_kind {
+            TaskKind::Workflow => {
+                self.runtime
+                    .broker()
+                    .promote_unversioned_backlog(queue)
+                    .await;
+            }
+            TaskKind::Activity => {
+                self.runtime
+                    .activity_broker()
+                    .promote_unversioned_backlog(queue)
+                    .await;
+            }
+        }
+    }
+
+    async fn cancel_outstanding_worker_polls(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: TaskQueueName,
+        worker: WorkerIdentity,
+    ) -> bool {
+        self.runtime
+            .cancel_outstanding_worker_polls(namespace_id, task_queue, worker)
             .await
     }
 
@@ -514,10 +656,62 @@ where
         &self,
         req: DescribeVersion,
     ) -> EdgeResult<VersionView> {
-        self.worker_deployment_registry()?
+        let report_stats = req.report_task_queue_stats;
+        let namespace_id = req.namespace_id;
+        let mut view = self
+            .worker_deployment_registry()?
             .describe_version(req)
             .await
-            .map_err(registry_error_to_edge)
+            .map_err(registry_error_to_edge)?;
+        if report_stats {
+            for membership in &mut view.task_queues {
+                let task_kind = match membership.task_queue.task_queue_type {
+                    DeploymentTaskQueueType::Workflow => TaskKind::Workflow,
+                    DeploymentTaskQueueType::Activity => TaskKind::Activity,
+                    DeploymentTaskQueueType::Nexus | DeploymentTaskQueueType::Unspecified => {
+                        continue;
+                    }
+                };
+                let queue = QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName(membership.task_queue.name.clone()),
+                    task_kind,
+                    deployment: Some(DeploymentId(view.deployment_name.0.clone())),
+                    build_id: Some(BuildId(view.build_id.0.clone())),
+                };
+                let mut stats = match task_kind {
+                    TaskKind::Workflow => self.runtime.broker().backlog_stats(&queue).await,
+                    TaskKind::Activity => {
+                        self.runtime.activity_broker().backlog_stats(&queue).await
+                    }
+                };
+                if matches!(
+                    view.record.status,
+                    WorkerDeploymentVersionStatus::Current | WorkerDeploymentVersionStatus::Ramping
+                ) {
+                    let unversioned = QueueKey {
+                        deployment: None,
+                        build_id: None,
+                        ..queue.clone()
+                    };
+                    let absorbed = match task_kind {
+                        TaskKind::Workflow => {
+                            self.runtime.broker().backlog_stats(&unversioned).await
+                        }
+                        TaskKind::Activity => {
+                            self.runtime
+                                .activity_broker()
+                                .backlog_stats(&unversioned)
+                                .await
+                        }
+                    };
+                    stats.count += absorbed.count;
+                    stats.oldest_age = stats.oldest_age.max(absorbed.oldest_age);
+                }
+                membership.stats = Some(stats);
+            }
+        }
+        Ok(view)
     }
 
     async fn delete_worker_deployment_version(&self, req: DeleteVersion) -> EdgeResult<()> {
@@ -531,11 +725,16 @@ where
         &self,
         req: SetCurrent,
     ) -> EdgeResult<DeploymentMutationOutcome<SetCurrentOutcome>> {
+        let target_build_id = req.build_id.clone();
         let view = self
             .worker_deployment_registry()?
             .set_current_version(req)
             .await
             .map_err(registry_error_to_edge)?;
+        if let Some(build_id) = target_build_id.as_ref() {
+            self.promote_unversioned_backlog(&view.deployment, build_id)
+                .await;
+        }
         Ok(deployment_mutation_outcome(view.conflict_token, view))
     }
 
@@ -543,11 +742,17 @@ where
         &self,
         req: SetRamping,
     ) -> EdgeResult<DeploymentMutationOutcome<SetRampingOutcome>> {
+        let promote_all = (req.ramping_percentage - 100.0).abs() < f32::EPSILON;
+        let target_build_id = req.build_id.clone();
         let view = self
             .worker_deployment_registry()?
             .set_ramping_version(req)
             .await
             .map_err(registry_error_to_edge)?;
+        if promote_all && let Some(build_id) = target_build_id.as_ref() {
+            self.promote_unversioned_backlog(&view.deployment, build_id)
+                .await;
+        }
         Ok(deployment_mutation_outcome(view.conflict_token, view))
     }
 

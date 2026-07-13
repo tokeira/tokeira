@@ -88,7 +88,7 @@ where
     ) -> Result<Option<StartedActivityTask>> {
         let offered = match self
             .activity_broker
-            .poll_activity_task(&queue, timeout_after)
+            .poll_activity_task_for_worker(&queue, &worker_identity, timeout_after)
             .await?
         {
             Some(offered) => {

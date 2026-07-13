@@ -1130,6 +1130,7 @@ pub fn poll_request_to_edge(
         namespace: req.namespace,
         task_queue: task_queue.name.clone(),
         worker_identity: req.identity,
+        worker_instance_key: req.worker_instance_key,
         deployment,
         build_id,
         sticky_run: None,
@@ -2123,7 +2124,14 @@ fn version_task_queue_from_edge(
     workflowservice::describe_worker_deployment_version_response::VersionTaskQueue {
         name: view.task_queue.name.clone(),
         r#type: deployment_task_queue_type_to_proto(view.task_queue.task_queue_type),
-        stats: None,
+        stats: view.stats.map(|stats| taskqueue_proto::TaskQueueStats {
+            approximate_backlog_count: stats.count as i64,
+            approximate_backlog_age: time::Duration::try_from(stats.oldest_age)
+                .ok()
+                .map(to_proto_duration),
+            tasks_add_rate: 0.0,
+            tasks_dispatch_rate: 0.0,
+        }),
         stats_by_priority_key: BTreeMap::new(),
     }
 }
@@ -3065,6 +3073,11 @@ pub fn poll_response_to_proto(
             })
             .collect::<Result<Vec<_>, ProtoConversionError>>()
             .unwrap_or_default(),
+        poller_scaling_decision: resp.poller_scaling_decision.map(|delta| {
+            taskqueue_proto::PollerScalingDecision {
+                poll_request_delta_suggestion: delta,
+            }
+        }),
         ..Default::default()
     }
 }
@@ -3881,6 +3894,8 @@ pub fn describe_task_queue_request_to_edge(
         task_queue: task_queue.name.clone(),
         task_kind,
         include_status: req.include_task_queue_status,
+        report_stats: req.report_stats,
+        enhanced: req.api_mode == enums::DescribeTaskQueueMode::Enhanced as i32,
     })
 }
 
@@ -3959,6 +3974,36 @@ pub fn describe_task_queue_response_to_proto(
     let versioning_info = resp
         .versioning_info
         .map(task_queue_versioning_info_to_proto);
+    let stats = resp.stats.map(task_queue_stats_to_proto);
+    let mut versions_info = std::collections::BTreeMap::new();
+    if resp.workflow_stats.is_some() || resp.activity_stats.is_some() {
+        let mut types_info = std::collections::BTreeMap::new();
+        if let Some(workflow_stats) = resp.workflow_stats {
+            types_info.insert(
+                enums::TaskQueueType::Workflow as i32,
+                taskqueue_proto::TaskQueueTypeInfo {
+                    pollers: Vec::new(),
+                    stats: Some(task_queue_stats_to_proto(workflow_stats)),
+                },
+            );
+        }
+        if let Some(activity_stats) = resp.activity_stats {
+            types_info.insert(
+                enums::TaskQueueType::Activity as i32,
+                taskqueue_proto::TaskQueueTypeInfo {
+                    pollers: Vec::new(),
+                    stats: Some(task_queue_stats_to_proto(activity_stats)),
+                },
+            );
+        }
+        versions_info.insert(
+            String::new(),
+            taskqueue_proto::TaskQueueVersionInfo {
+                types_info,
+                task_reachability: enums::BuildIdTaskReachability::Unspecified as i32,
+            },
+        );
+    }
     workflowservice::DescribeTaskQueueResponse {
         pollers: resp
             .pollers
@@ -3973,7 +4018,7 @@ pub fn describe_task_queue_response_to_proto(
                 },
             )
             .collect(),
-        stats: None,
+        stats,
         stats_by_priority_key: Default::default(),
         versioning_info,
         config: Some(task_queue_config_to_proto(resp.config)),
@@ -3984,7 +4029,20 @@ pub fn describe_task_queue_response_to_proto(
                 ..Default::default()
             }
         }),
-        versions_info: Default::default(),
+        versions_info,
+    }
+}
+
+fn task_queue_stats_to_proto(
+    stats: crate::translate::TaskQueueStatsDto,
+) -> taskqueue_proto::TaskQueueStats {
+    taskqueue_proto::TaskQueueStats {
+        approximate_backlog_count: stats.approximate_backlog_count,
+        approximate_backlog_age: time::Duration::try_from(stats.approximate_backlog_age)
+            .ok()
+            .map(to_proto_duration),
+        tasks_add_rate: 0.0,
+        tasks_dispatch_rate: 0.0,
     }
 }
 
@@ -4039,37 +4097,67 @@ fn task_queue_versioning_info_to_proto(
 pub fn task_queue_config_from_update_request(
     req: &workflowservice::UpdateTaskQueueConfigRequest,
 ) -> TaskQueueConfig {
+    let now = OffsetDateTime::now_utc();
+    let metadata = |reason: String| crate::translate::TaskQueueConfigMetadata {
+        reason,
+        update_identity: req.identity.clone(),
+        update_time: now,
+    };
     TaskQueueConfig {
         queue_rate_limit: req
             .update_queue_rate_limit
             .as_ref()
             .and_then(|update| update.rate_limit.as_ref())
             .map(|rate_limit| rate_limit.requests_per_second),
+        queue_rate_limit_metadata: req
+            .update_queue_rate_limit
+            .as_ref()
+            .map(|update| metadata(update.reason.clone())),
         fairness_key_rate_limit_default: req
             .update_fairness_key_rate_limit_default
             .as_ref()
             .and_then(|update| update.rate_limit.as_ref())
             .map(|rate_limit| rate_limit.requests_per_second),
+        fairness_key_rate_limit_metadata: req
+            .update_fairness_key_rate_limit_default
+            .as_ref()
+            .map(|update| metadata(update.reason.clone())),
         fairness_weight_overrides: req.set_fairness_weight_overrides.clone(),
     }
 }
 
 pub fn task_queue_config_to_proto(config: TaskQueueConfig) -> taskqueue_proto::TaskQueueConfig {
     taskqueue_proto::TaskQueueConfig {
-        queue_rate_limit: config.queue_rate_limit.map(rate_limit_config_to_proto),
-        fairness_keys_rate_limit_default: config
-            .fairness_key_rate_limit_default
-            .map(rate_limit_config_to_proto),
+        queue_rate_limit: (config.queue_rate_limit.is_some()
+            || config.queue_rate_limit_metadata.is_some())
+        .then(|| {
+            rate_limit_config_to_proto(config.queue_rate_limit, config.queue_rate_limit_metadata)
+        }),
+        fairness_keys_rate_limit_default: (config.fairness_key_rate_limit_default.is_some()
+            || config.fairness_key_rate_limit_metadata.is_some())
+        .then(|| {
+            rate_limit_config_to_proto(
+                config.fairness_key_rate_limit_default,
+                config.fairness_key_rate_limit_metadata,
+            )
+        }),
         fairness_weight_overrides: config.fairness_weight_overrides,
     }
 }
 
-fn rate_limit_config_to_proto(requests_per_second: f32) -> taskqueue_proto::RateLimitConfig {
+fn rate_limit_config_to_proto(
+    requests_per_second: Option<f32>,
+    metadata: Option<crate::translate::TaskQueueConfigMetadata>,
+) -> taskqueue_proto::RateLimitConfig {
     taskqueue_proto::RateLimitConfig {
-        rate_limit: Some(taskqueue_proto::RateLimit {
+        rate_limit: requests_per_second.map(|requests_per_second| taskqueue_proto::RateLimit {
             requests_per_second,
         }),
-        metadata: None,
+        metadata: metadata.map(|metadata| taskqueue_proto::ConfigMetadata {
+            reason: metadata.reason,
+            update_identity: metadata.update_identity,
+            update_time: Some(to_proto_timestamp(metadata.update_time)),
+        }),
     }
 }
 
@@ -5238,6 +5326,9 @@ pub fn deserialize_activity_token(bytes: &[u8]) -> Result<ActivityTaskToken, Pro
     serde_json::from_slice(bytes).map_err(|e| ProtoConversionError::InvalidTaskToken(e.to_string()))
 }
 
+// v1.62-sync: reads deprecated worker capabilities for SDKs predating
+// `deployment_options`, matching the workflow-poll compatibility path above.
+#[allow(deprecated)]
 pub fn poll_activity_request_to_edge(
     req: workflowservice::PollActivityTaskQueueRequest,
 ) -> Result<crate::translate::PollActivityTaskQueueRequest, ProtoConversionError> {
@@ -5248,10 +5339,43 @@ pub fn poll_activity_request_to_edge(
             "PollActivityTaskQueueRequest.task_queue",
         ))?;
 
+    let (deployment, build_id) = req
+        .deployment_options
+        .as_ref()
+        .and_then(|options| {
+            let mode =
+                enums::WorkerVersioningMode::try_from(options.worker_versioning_mode).ok()?;
+            if mode != enums::WorkerVersioningMode::Versioned {
+                return None;
+            }
+            Some((
+                non_empty(options.deployment_name.clone()).map(DeploymentId),
+                non_empty(options.build_id.clone()).map(BuildId),
+            ))
+        })
+        .or_else(|| {
+            req.worker_version_capabilities
+                .as_ref()
+                .filter(|caps| caps.use_versioning)
+                .map(|caps| {
+                    (
+                        non_empty(caps.deployment_series_name.clone()).map(DeploymentId),
+                        non_empty(caps.build_id.clone()).map(BuildId),
+                    )
+                })
+        })
+        .unwrap_or((None, None));
+
     Ok(crate::translate::PollActivityTaskQueueRequest {
         namespace: req.namespace,
         task_queue: task_queue.name.clone(),
         worker_identity: req.identity,
+        worker_instance_key: req.worker_instance_key,
+        deployment,
+        build_id,
+        worker_rate_limit: req
+            .task_queue_metadata
+            .and_then(|metadata| metadata.max_tasks_per_second),
         timeout: DEFAULT_POLL_TIMEOUT,
     })
 }
@@ -5296,6 +5420,11 @@ pub fn poll_activity_response_to_proto(
             .heartbeat_timeout
             .and_then(|d| time::Duration::try_from(d).ok())
             .map(to_proto_duration),
+        poller_scaling_decision: resp.poller_scaling_decision.map(|delta| {
+            taskqueue_proto::PollerScalingDecision {
+                poll_request_delta_suggestion: delta,
+            }
+        }),
         ..Default::default()
     }
 }
@@ -8113,6 +8242,7 @@ mod tests {
                 schedule_to_close_timeout: None,
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
+                poller_scaling_decision: Some(1),
             });
 
         assert_eq!(
@@ -8125,6 +8255,38 @@ mod tests {
             Some(to_proto_timestamp(current_attempt))
         );
         assert_eq!(proto.started_time, Some(to_proto_timestamp(started)));
+        assert_eq!(
+            proto
+                .poller_scaling_decision
+                .expect("scaling decision should be projected")
+                .poll_request_delta_suggestion,
+            1
+        );
+    }
+
+    #[test]
+    fn task_queue_config_projects_metadata_for_an_explicit_unset() {
+        let updated_at = OffsetDateTime::from_unix_timestamp(123).unwrap();
+        let proto = task_queue_config_to_proto(crate::translate::TaskQueueConfig {
+            queue_rate_limit: None,
+            queue_rate_limit_metadata: Some(crate::translate::TaskQueueConfigMetadata {
+                reason: "remove queue ceiling".to_string(),
+                update_identity: "operator".to_string(),
+                update_time: updated_at,
+            }),
+            fairness_key_rate_limit_default: None,
+            fairness_key_rate_limit_metadata: None,
+            fairness_weight_overrides: Default::default(),
+        });
+
+        let rate = proto
+            .queue_rate_limit
+            .expect("an explicit unset retains its audit envelope");
+        assert!(rate.rate_limit.is_none());
+        let metadata = rate.metadata.expect("unset metadata should project");
+        assert_eq!(metadata.reason, "remove queue ceiling");
+        assert_eq!(metadata.update_identity, "operator");
+        assert_eq!(metadata.update_time, Some(to_proto_timestamp(updated_at)));
     }
 
     #[test]
@@ -8154,6 +8316,7 @@ mod tests {
             }),
             queries: Default::default(),
             messages: Vec::new(),
+            poller_scaling_decision: None,
         });
 
         let query = proto.query.expect("legacy query field should be set");

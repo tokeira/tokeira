@@ -908,6 +908,24 @@ impl NexusTaskBroker {
         }
     }
 
+    /// Whether a Nexus poll that just claimed one task left runnable work on
+    /// the same queue. Nexus tasks have no durable matching backlog in
+    /// v1.31.0, so its poller scaler uses add/dispatch pressure instead
+    /// (`physical_task_queue_manager.go:878-883 @ v1.31.0`); remaining ready
+    /// tasks are Tokeira's direct equivalent signal.
+    pub async fn has_runnable_backlog(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &TaskQueueName,
+    ) -> bool {
+        self.inner
+            .lock()
+            .await
+            .ready
+            .get(&(namespace_id, task_queue.clone()))
+            .is_some_and(|ready| !ready.is_empty())
+    }
+
     async fn queue_wake(
         &self,
         namespace_id: NamespaceId,

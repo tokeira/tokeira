@@ -36,6 +36,8 @@ pub struct PollNexusTaskQueueRequest {
 pub struct PollNexusTaskQueueResponse {
     pub task_token: Vec<u8>,
     pub request: NexusTaskRequest,
+    /// SDK poller-count hint derived from remaining Nexus queue pressure.
+    pub poller_scaling_decision: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,7 +100,11 @@ pub fn poll_response_to_proto(
         request: Some(nexus_task_to_proto_request(&resp.request)?),
         poller_group_id: String::new(),
         poller_group_infos: Vec::new(),
-        poller_scaling_decision: None,
+        poller_scaling_decision: resp.poller_scaling_decision.map(|delta| {
+            tokeira_proto::public::temporal::api::taskqueue::v1::PollerScalingDecision {
+                poll_request_delta_suggestion: delta,
+            }
+        }),
     })
 }
 

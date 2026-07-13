@@ -102,6 +102,7 @@ pub async fn poll_response(
         query: None,
         queries: HashMap::new(),
         messages: Vec::new(),
+        poller_scaling_decision: None,
     })
 }
 
@@ -155,6 +156,7 @@ pub fn poll_activity_response(
             .start_to_close_timeout
             .and_then(|d| d.try_into().ok()),
         heartbeat_timeout: started.heartbeat_timeout.and_then(|d| d.try_into().ok()),
+        poller_scaling_decision: None,
     })
 }
 

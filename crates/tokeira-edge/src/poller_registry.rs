@@ -11,8 +11,9 @@
 //!
 //! Temporal eagerly removes a worker when `CancelOutstandingWorkerPolls`
 //! reports shutdown (`service/matching/matching_engine.go:1194-1206 @
-//! v1.31.0`). Tokeira has no equivalent matching-internal shutdown signal yet,
-//! so a stopped worker may remain visible until the bounded TTL expires.
+//! v1.31.0`). Tokeira applies the same removal when its conformance-wired
+//! shutdown-cancellation policy is enabled; with the stock-disabled default,
+//! entries retain the ordinary bounded TTL.
 //! A cancelled poll deliberately does not refresh its completion timestamp, so
 //! cancellation cannot extend that stale window or re-add a future eager
 //! removal (`service/matching/task_queue_partition_manager.go:617-621 @
@@ -84,6 +85,32 @@ impl PollerRegistryState {
         recent.sort_by(|left, right| left.identity.0.cmp(&right.identity.0));
         recent
     }
+
+    fn remove_worker(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        task_queue: &tokeira_types::TaskQueueName,
+        identity: &WorkerIdentity,
+    ) {
+        let mut pollers = self.pollers.write().expect("poller registry poisoned");
+        pollers.retain(|queue, entries| {
+            if queue.namespace_id == namespace_id && &queue.task_queue == task_queue {
+                entries.remove(identity);
+            }
+            !entries.is_empty()
+        });
+    }
+
+    fn remove(&self, queue: &QueueKey, identity: &WorkerIdentity) {
+        let mut pollers = self.pollers.write().expect("poller registry poisoned");
+        let remove_queue = pollers.get_mut(queue).is_some_and(|entries| {
+            entries.remove(identity);
+            entries.is_empty()
+        });
+        if remove_queue {
+            pollers.remove(queue);
+        }
+    }
 }
 
 /// Ephemeral recent-poller history shared by poll and Describe handlers.
@@ -124,6 +151,17 @@ impl PollerRegistry {
         self.state.pollers_at(queue, OffsetDateTime::now_utc())
     }
 
+    /// Eagerly remove one worker identity from every physical version and task
+    /// kind in a task-queue family after worker shutdown.
+    pub fn remove_worker(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        task_queue: &tokeira_types::TaskQueueName,
+        identity: &WorkerIdentity,
+    ) {
+        self.state.remove_worker(namespace_id, task_queue, identity);
+    }
+
     #[cfg(test)]
     fn record_at(&self, queue: QueueKey, identity: WorkerIdentity, observed_at: OffsetDateTime) {
         self.state.record(queue, identity, observed_at);
@@ -153,6 +191,16 @@ impl PollerGuard {
     /// deadline/long-poll timeout that returns no task.
     pub fn completed(self) {
         self.completed_at(OffsetDateTime::now_utc());
+    }
+
+    /// Consume a poll finalizer without refreshing history because matching
+    /// ended the poll as part of worker shutdown.
+    pub fn cancelled(self) {
+        // Shutdown cancellation differs from an arbitrary client disconnect:
+        // matching has explicitly removed this worker from poller history, so
+        // an admission racing that removal must be deleted as the poll unwinds
+        // (`matching_engine.go:1194-1206 @ v1.31.0`).
+        self.state.remove(&self.queue, &self.identity);
     }
 
     fn completed_at(self, observed_at: OffsetDateTime) {
@@ -202,6 +250,27 @@ mod tests {
         assert_eq!(pollers.len(), 1);
         assert_eq!(pollers[0].identity.0, "worker");
         assert_eq!(pollers[0].last_accessed_at, admission);
+    }
+
+    #[test]
+    fn shutdown_cancelled_poll_removes_admission_observation() {
+        let registry = PollerRegistry::default();
+        let queue = queue();
+        let admission = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
+
+        registry
+            .register_at(
+                queue.clone(),
+                WorkerIdentity("worker".to_string()),
+                admission,
+            )
+            .cancelled();
+
+        assert!(
+            registry
+                .pollers_at(&queue, admission + Duration::seconds(1))
+                .is_empty()
+        );
     }
 
     #[test]

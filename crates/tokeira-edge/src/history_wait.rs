@@ -89,6 +89,10 @@ where
         self.inner.find_latest_run(namespace_id, workflow_id).await
     }
 
+    async fn list_runs_for_namespace(&self, namespace_id: NamespaceId) -> Result<Vec<RunKey>> {
+        self.inner.list_runs_for_namespace(namespace_id).await
+    }
+
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         self.inner.load_run(run_key).await
     }

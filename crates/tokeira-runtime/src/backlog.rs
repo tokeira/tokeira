@@ -380,6 +380,9 @@ mod tests {
         ) -> Result<Option<RunKey>> {
             Ok(None)
         }
+        async fn list_runs_for_namespace(&self, _namespace_id: NamespaceId) -> Result<Vec<RunKey>> {
+            Ok(Vec::new())
+        }
         async fn load_run(&self, _run_key: RunKey) -> Result<LoadedRun> {
             Ok(LoadedRun::Absent)
         }

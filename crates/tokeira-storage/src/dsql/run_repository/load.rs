@@ -58,6 +58,30 @@ impl DsqlRunRepository {
         })
     }
 
+    #[instrument(name = "dsql.list_runs_for_namespace", skip(self), fields(namespace_id = %namespace_id.0))]
+    pub(super) async fn do_list_runs_for_namespace(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<RunKey>> {
+        record_dsql_operation!(self, "list_runs_for_namespace", None, {
+            let mut permit = self.director.acquire(DbClass::Read).await?;
+            // Namespace reclaim reads the authoritative hot table rather than
+            // visibility: deletion must also find runs whose projection row is
+            // delayed or missing (`deleteWorkflowExecutions`,
+            // `service/worker/deletenamespace/reclaimresources/workflow.go @ v1.31.0`).
+            let rows = sqlx::query_as::<_, (Uuid,)>(
+                "SELECT run_key FROM workflow_hot
+                 WHERE namespace_id = $1
+                 ORDER BY run_key ASC",
+            )
+            .bind(namespace_id.0)
+            .fetch_all(permit.connection()?)
+            .await?;
+            metrics::record_dsql_rows_read("list_runs_for_namespace", rows.len());
+            Ok(rows.into_iter().map(|(run_key,)| RunKey(run_key)).collect())
+        })
+    }
+
     #[instrument(name = "dsql.load_run", skip(self), fields(run_key = %run_key.0))]
     pub(super) async fn do_load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         record_dsql_operation!(self, "load_run", Some(self.shard_for_run_key(run_key)), {

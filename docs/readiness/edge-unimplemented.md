@@ -21,7 +21,6 @@ only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
 | RPC | Service | How it stubs | Owning spec | Spec implemented |
 |-----|---------|--------------|-------------|------------------|
 | `DeprecateNamespace` | Workflow | `unimplemented` | `api-conformance-namespace-full` | No (0/15) |
-| `DeleteNamespace` | Operator | `unimplemented` | `api-conformance-namespace-full` | No (0/15) |
 | `RemoveSearchAttributes` | Operator | `unimplemented` | — (no spec) | No spec |
 | `AddOrUpdateRemoteCluster` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) | No (0/14) |
 | `RemoveRemoteCluster` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) | No (0/14) |
@@ -61,7 +60,7 @@ This list is **minimal and complete** when:
 
 | Entry | supported.md feature area |
 |-------|---------------------------|
-| `DeprecateNamespace`, `DeleteNamespace` | Namespaces |
+| `DeprecateNamespace` | Namespaces |
 | `RemoveSearchAttributes` | Search attributes (operator) |
 | `AddOrUpdateRemoteCluster`, `RemoveRemoteCluster`, `ListClusters` | Remote-cluster registry |
 | `DescribeWorker`, `ListWorkers`, `FetchWorkerConfig`, `UpdateWorkerConfig` | Worker inventory |

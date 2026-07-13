@@ -224,6 +224,17 @@ impl RunRepository for InMemoryStore {
             .copied())
     }
 
+    async fn list_runs_for_namespace(&self, namespace_id: NamespaceId) -> Result<Vec<RunKey>> {
+        let store = self.inner.lock().await;
+        let mut run_keys = store
+            .runs
+            .iter()
+            .filter_map(|(run_key, state)| (state.namespace_id == namespace_id).then_some(*run_key))
+            .collect::<Vec<_>>();
+        run_keys.sort_by_key(|run_key| run_key.0);
+        Ok(run_keys)
+    }
+
     #[tracing::instrument(name = "storage.load_run", skip(self), fields(run_key = %run_key.0))]
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         let started = Instant::now();
@@ -2169,11 +2180,10 @@ mod tests {
             Some(&SearchAttrValue::Keyword("deployment:build-id".to_owned()))
         );
         assert!(
-            state
+            !state
                 .search_attributes
                 .0
-                .get("TemporalWorkflowVersioningBehavior")
-                .is_none(),
+                .contains_key("TemporalWorkflowVersioningBehavior"),
             "server-managed visibility attributes must not mutate authoritative history state"
         );
     }
@@ -2843,6 +2853,52 @@ mod tests {
                 }
                 let result = store.commit_transition(run_key, start_transition(run_key), ShardEpoch::ZERO).await.unwrap();
                 assert!(matches!(result, CommitResult::Applied { .. }));
+            });
+        }
+
+        /// Authoritative namespace enumeration is complete, isolated, and sorted.
+        // Feature: api-conformance-namespace-full, Property 3: namespace reclaim is complete and isolated
+        #[test]
+        fn property_list_runs_for_namespace_is_complete_and_isolated(
+            target_count in 0_usize..12,
+            other_count in 0_usize..12,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store = InMemoryStore::default();
+                let target_namespace = NamespaceId::new();
+                let other_namespace = NamespaceId::new();
+                let mut expected = Vec::new();
+
+                for (namespace_id, count, prefix) in [
+                    (target_namespace, target_count, "target"),
+                    (other_namespace, other_count, "other"),
+                ] {
+                    for index in 0..count {
+                        let run_key = RunKey::new();
+                        let mut transition = start_transition(run_key);
+                        transition.next_state.namespace_id = namespace_id;
+                        transition.next_state.workflow_id =
+                            WorkflowId(format!("{prefix}-{index}"));
+                        let result = store
+                            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                            .await
+                            .unwrap();
+                        assert!(matches!(result, CommitResult::Applied { .. }));
+                        if namespace_id == target_namespace {
+                            expected.push(run_key);
+                        }
+                    }
+                }
+
+                expected.sort_by_key(|run_key| run_key.0);
+                assert_eq!(
+                    store
+                        .list_runs_for_namespace(target_namespace)
+                        .await
+                        .unwrap(),
+                    expected
+                );
             });
         }
 

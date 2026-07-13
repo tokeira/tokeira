@@ -14,7 +14,7 @@ use tonic::codec::CompressionEncoding;
 
 use crate::{
     grpc::metadata::metadata_to_header_map,
-    operator_service::{OperatorService, SearchAttributeDefinition},
+    operator_service::{DeleteNamespaceRequest, OperatorService, SearchAttributeDefinition},
 };
 
 #[derive(Clone)]
@@ -109,9 +109,38 @@ impl OperatorServiceGrpcApi for OperatorServiceGrpc {
 
     async fn delete_namespace(
         &self,
-        _request: Request<operatorservice::DeleteNamespaceRequest>,
+        request: Request<operatorservice::DeleteNamespaceRequest>,
     ) -> Result<Response<operatorservice::DeleteNamespaceResponse>, Status> {
-        Err(Status::unimplemented("delete_namespace"))
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+        let namespace_delete_delay = req
+            .namespace_delete_delay
+            .map(|duration| {
+                if duration.seconds < 0 || !(0..1_000_000_000).contains(&duration.nanos) {
+                    return Err(Status::invalid_argument(
+                        "namespace_delete_delay must be a non-negative protobuf duration",
+                    ));
+                }
+                Ok(std::time::Duration::new(
+                    duration.seconds as u64,
+                    duration.nanos as u32,
+                ))
+            })
+            .transpose()?;
+        let response = self
+            .inner
+            .delete_namespace(
+                &headers,
+                DeleteNamespaceRequest {
+                    namespace: (!req.namespace.is_empty()).then_some(req.namespace),
+                    namespace_id: (!req.namespace_id.is_empty()).then_some(req.namespace_id),
+                    namespace_delete_delay,
+                },
+            )
+            .await?;
+        Ok(Response::new(operatorservice::DeleteNamespaceResponse {
+            deleted_namespace: response.deleted_namespace,
+        }))
     }
 
     async fn add_or_update_remote_cluster(
@@ -247,12 +276,32 @@ fn indexed_value_type_from_edge(value: &str) -> Result<IndexedValueType, Status>
 mod tests {
     use std::sync::Arc;
 
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use tokio::sync::Notify;
+
     use super::*;
     use crate::{
         interceptors::EdgeInterceptors,
-        namespace_cache::{InMemoryNamespaceCache, NamespaceCache},
-        operator_service::{InMemoryOperatorApi, OperatorApi},
+        namespace_cache::{InMemoryNamespaceCache, NamespaceCache, ResolvedNamespace},
+        operator_service::{InMemoryOperatorApi, NamespaceDeletionApi, OperatorApi},
     };
+
+    #[derive(Debug, Default)]
+    struct RecordingNamespaceDeletion {
+        called: Notify,
+    }
+
+    #[async_trait]
+    impl NamespaceDeletionApi for RecordingNamespaceDeletion {
+        async fn reclaim_namespace_runs(
+            &self,
+            _namespace_id: tokeira_types::NamespaceId,
+        ) -> Result<()> {
+            self.called.notify_one();
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn add_search_attributes_upserts_multiple_attributes() {
@@ -329,5 +378,86 @@ mod tests {
             Some(IndexedValueType::KeywordList as i32)
         );
         assert!(response.custom_attributes.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_namespace_marks_renames_then_removes_after_reclaim() {
+        let namespaces = Arc::new(InMemoryNamespaceCache::new());
+        let namespace_id = uuid::Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        namespaces
+            .insert(ResolvedNamespace {
+                namespace_id: Some(namespace_id.to_string()),
+                ..ResolvedNamespace::active("delete-me")
+            })
+            .await
+            .unwrap();
+        let deletion = Arc::new(RecordingNamespaceDeletion::default());
+        let api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let service = OperatorService::new(
+            api,
+            Arc::new(EdgeInterceptors::permissive(namespaces.clone())),
+        )
+        .with_namespace_deletion(namespaces.clone(), deletion.clone());
+        let grpc = OperatorServiceGrpc::new(service);
+
+        let response = grpc
+            .delete_namespace(Request::new(operatorservice::DeleteNamespaceRequest {
+                namespace: "delete-me".to_owned(),
+                ..Default::default()
+            }))
+            .await
+            .expect("delete namespace")
+            .into_inner();
+        assert_eq!(response.deleted_namespace, "delete-me-deleted-12345");
+        let tombstone = namespaces
+            .get_by_id(&namespace_id.to_string())
+            .await
+            .unwrap()
+            .expect("deleted tombstone remains immediately observable");
+        assert!(tombstone.deleted);
+        assert_eq!(tombstone.name, response.deleted_namespace);
+        assert!(namespaces.get("delete-me").await.unwrap().is_none());
+
+        deletion.called.notified().await;
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            namespaces
+                .get_by_id(&namespace_id.to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_namespace_rejects_both_selectors_without_mutation() {
+        let namespaces = Arc::new(InMemoryNamespaceCache::new());
+        namespaces
+            .insert(ResolvedNamespace::active("keep-me"))
+            .await
+            .unwrap();
+        let deletion = Arc::new(RecordingNamespaceDeletion::default());
+        let service = OperatorService::new(
+            Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+            Arc::new(EdgeInterceptors::permissive(namespaces.clone())),
+        )
+        .with_namespace_deletion(namespaces.clone(), deletion);
+        let grpc = OperatorServiceGrpc::new(service);
+
+        let error = grpc
+            .delete_namespace(Request::new(operatorservice::DeleteNamespaceRequest {
+                namespace: "keep-me".to_owned(),
+                namespace_id: "12345678-1234-1234-1234-123456789abc".to_owned(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("two selectors are invalid");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "Only one of namespace name or Id should be set on request."
+        );
+        assert!(namespaces.get("keep-me").await.unwrap().is_some());
     }
 }

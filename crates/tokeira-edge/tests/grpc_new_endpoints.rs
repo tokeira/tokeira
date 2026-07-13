@@ -352,6 +352,69 @@ async fn respond_workflow_task_completed_returns_new_started_wft_after_durable_s
 }
 
 #[tokio::test]
+async fn workflow_task_token_rejects_a_different_request_namespace() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store).await;
+
+    grpc.start_workflow_execution(Request::new(
+        workflowservice::StartWorkflowExecutionRequest {
+            namespace: "default".to_string(),
+            workflow_id: "namespace-token-fence".to_string(),
+            workflow_type: Some(tokeira_proto::common::WorkflowType {
+                name: "example".to_string(),
+            }),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: "namespace-token-queue".to_string(),
+                ..Default::default()
+            }),
+            request_id: "namespace-token-start".to_string(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("start workflow");
+
+    let task_token = grpc
+        .poll_workflow_task_queue(Request::new(PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: "namespace-token-queue".to_string(),
+                ..Default::default()
+            }),
+            identity: "worker-a".to_string(),
+            ..Default::default()
+        }))
+        .await
+        .expect("poll workflow task")
+        .into_inner()
+        .task_token;
+
+    let mismatch = grpc
+        .respond_workflow_task_completed(Request::new(RespondWorkflowTaskCompletedRequest {
+            namespace: "another-namespace".to_string(),
+            task_token: task_token.clone(),
+            identity: "worker-a".to_string(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("a token cannot be applied through another namespace");
+    assert_eq!(mismatch.code(), Code::InvalidArgument);
+    assert_eq!(
+        mismatch.message(),
+        "Operation requested with a token from a different namespace."
+    );
+
+    grpc.respond_workflow_task_completed(Request::new(RespondWorkflowTaskCompletedRequest {
+        namespace: "default".to_string(),
+        task_token,
+        identity: "worker-a".to_string(),
+        ..Default::default()
+    }))
+    .await
+    .expect("the correctly namespaced retry remains valid");
+}
+
+#[tokio::test]
 async fn worker_deployment_registry_roundtrip_via_grpc() {
     let store = Arc::new(InMemoryStore::default());
     let grpc = build_grpc(store).await;

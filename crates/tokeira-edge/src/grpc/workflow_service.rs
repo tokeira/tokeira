@@ -232,7 +232,7 @@ fn namespace_resolution_status(error: crate::errors::EdgeError) -> Status {
         // found." carrying the requested name (`go.temporal.io/api/serviceerror/
         // namespace_not_found.go @ v1.31.0`; `standalone_activity_test.go:3882`).
         crate::errors::EdgeError::NamespaceNotFound(name) => {
-            Status::not_found(format!("Namespace {name} is not found."))
+            crate::grpc::errors::namespace_not_found_status(name)
         }
         crate::errors::EdgeError::NamespaceDeleted(_) => {
             Status::failed_precondition("namespace is deleted")
@@ -1175,14 +1175,17 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::DescribeNamespaceResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
-        let namespace = if !req.namespace.is_empty() {
-            req.namespace
+        let edge_resp = if !req.namespace.is_empty() {
+            self.inner
+                .describe_namespace(&headers, &req.namespace)
+                .await?
         } else if !req.id.is_empty() {
-            req.id
+            self.inner
+                .describe_namespace_by_id(&headers, &req.id)
+                .await?
         } else {
             return Err(Status::invalid_argument("namespace or id is required"));
         };
-        let edge_resp = self.inner.describe_namespace(&headers, &namespace).await?;
         Ok(Response::new(translate::namespace_to_proto(
             edge_resp,
             self.standalone_activities_enabled(),

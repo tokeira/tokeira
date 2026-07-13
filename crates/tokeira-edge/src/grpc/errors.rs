@@ -35,7 +35,7 @@ impl From<EdgeError> for Status {
                 };
                 Status::permission_denied(message)
             }
-            EdgeError::NamespaceNotFound(namespace) => Status::not_found(namespace),
+            EdgeError::NamespaceNotFound(namespace) => namespace_not_found_status(namespace),
             EdgeError::NamespaceDeleted(namespace) => Status::failed_precondition(namespace),
             EdgeError::NamespaceAlreadyExists(namespace) => Status::already_exists(namespace),
             EdgeError::WorkflowNotFound {
@@ -123,6 +123,36 @@ impl From<EdgeError> for Status {
             EdgeError::Internal(message) => Status::internal(message),
         }
     }
+}
+
+/// Build the typed `serviceerror.NamespaceNotFound` status expected by Temporal
+/// clients. A bare gRPC `NOT_FOUND` is reconstructed as a generic service error;
+/// the `NamespaceNotFoundFailure` detail is what makes `errors.As` succeed
+/// (`serviceerror/namespace_not_found.go @ go.temporal.io/api v1.62`).
+pub(crate) fn namespace_not_found_status(namespace: String) -> Status {
+    use prost::Message as _;
+    use tokeira_proto::public::temporal::api::errordetails::v1::NamespaceNotFoundFailure;
+
+    let message = format!("Namespace {namespace} is not found.");
+    let detail = ProtoAny {
+        type_url: "type.googleapis.com/temporal.api.errordetails.v1.NamespaceNotFoundFailure"
+            .to_owned(),
+        value: NamespaceNotFoundFailure {
+            namespace: namespace.clone(),
+        }
+        .encode_to_vec(),
+    };
+    let rpc_status = RpcStatus {
+        code: Code::NotFound as i32,
+        message: message.clone(),
+        details: vec![detail],
+    };
+    Status::with_details_and_metadata(
+        Code::NotFound,
+        message,
+        rpc_status.encode_to_vec().into(),
+        MetadataMap::new(),
+    )
 }
 
 /// Build the typed `WorkflowExecutionAlreadyStarted` gRPC status.
@@ -565,6 +595,25 @@ mod tests {
             .expect("decode failure detail");
         assert_eq!(failure.run_id, "run-123");
         assert_eq!(failure.start_request_id, "req-abc");
+    }
+
+    #[test]
+    fn namespace_not_found_status_carries_typed_detail() {
+        use prost::Message as _;
+        use tokeira_proto::public::temporal::api::errordetails::v1::NamespaceNotFoundFailure;
+
+        let status: Status = EdgeError::NamespaceNotFound("namespace-id".to_owned()).into();
+        assert_eq!(status.code(), Code::NotFound);
+
+        let rpc_status = RpcStatus::decode(status.details()).expect("decode google.rpc.Status");
+        let detail = &rpc_status.details[0];
+        assert_eq!(
+            detail.type_url,
+            "type.googleapis.com/temporal.api.errordetails.v1.NamespaceNotFoundFailure"
+        );
+        let failure = NamespaceNotFoundFailure::decode(detail.value.as_slice())
+            .expect("decode namespace-not-found detail");
+        assert_eq!(failure.namespace, "namespace-id");
     }
 
     #[test]

@@ -428,6 +428,10 @@ impl RunRepository for DsqlRunRepository {
         self.do_find_latest_run(namespace_id, workflow_id).await
     }
 
+    async fn list_runs_for_namespace(&self, namespace_id: NamespaceId) -> Result<Vec<RunKey>> {
+        self.do_list_runs_for_namespace(namespace_id).await
+    }
+
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         self.do_load_run(run_key).await
     }
@@ -1589,6 +1593,8 @@ mod tests {
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq(1),
             last_event_id: 0,
+            external_payload_count: 0,
+            external_payload_size_bytes: 0,
             next_workflow_task_seq: LogicalTaskSeq(1),
             pending_workflow_task: Some(PendingWorkflowTask {
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,

@@ -2821,11 +2821,19 @@ impl WorkflowService {
                     .begin(headers, None, Action::RespondWorkflowTaskCompleted, false)
                     .await?;
 
-                let query_only = {
-                    let token: tokeira_types::WorkflowTaskToken =
-                        serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
-                    token.logical_seq.0 == 0
-                };
+                let task_token: tokeira_types::WorkflowTaskToken =
+                    serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
+                let namespace_id = to_internal::namespace_id_for(&req.namespace);
+                if !req.namespace.is_empty()
+                    && let tokeira_kernel::LoadedRun::Existing(state) = self
+                    .repo
+                    .load_run(task_token.run_key)
+                    .await
+                    .map_err(EdgeError::from)?
+                {
+                    validate_task_token_namespace(&req.namespace, state.namespace_id)?;
+                }
+                let query_only = task_token.logical_seq.0 == 0;
 
                 for (query_id, result) in &req.query_results {
                     if let Some(sender) = self.pending_queries.take(&req.task_token, query_id).await
@@ -2845,9 +2853,6 @@ impl WorkflowService {
                     }
                 }
 
-                let task_token: tokeira_types::WorkflowTaskToken =
-                    serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
-
                 // Search-attribute registration is namespace-scoped edge state,
                 // so validate here and turn only the offending command into a
                 // kernel sentinel. The completion must still enter the
@@ -2855,7 +2860,6 @@ impl WorkflowService {
                 // with BAD_SEARCH_ATTRIBUTES and schedules the replacement WFT
                 // before returning InvalidArgument
                 // (`workflow_task_completed_handler.go @ v1.31.0`).
-                let namespace_id = to_internal::namespace_id_for(&req.namespace);
                 for command_index in 0..req.commands.len() {
                     let keys = match &req.commands[command_index] {
                         tokeira_kernel::WorkflowCommand::UpsertSearchAttributesPatch(patch) => {
@@ -3389,6 +3393,7 @@ impl WorkflowService {
             Ok(EdgeListNamespacesResponse {
                 namespaces: namespaces
                     .into_iter()
+                    .filter(|namespace| !namespace.deleted)
                     .map(namespace_to_description)
                     .collect(),
                 next_page_token: None,
@@ -3432,6 +3437,33 @@ impl WorkflowService {
         .await
     }
 
+    /// Describe a namespace by stable ID, including its deletion tombstone.
+    ///
+    /// `DescribeNamespace` is a metadata read that bypasses ordinary active-state
+    /// admission in v1.31.0. That exception is required so callers can observe
+    /// `NAMESPACE_STATE_DELETED` between mark-and-rename and final namespace removal
+    /// (`tests/namespace_delete_test.go @ v1.31.0`).
+    pub async fn describe_namespace_by_id(
+        &self,
+        headers: &HeaderMap,
+        namespace_id: &str,
+    ) -> EdgeResult<NamespaceDescription> {
+        self.observe_edge_call(headers, "describe_namespace", None, None, async move {
+            let _ctx = self
+                .interceptors
+                .begin(headers, None, Action::DescribeNamespace, false)
+                .await?;
+            let namespace = self
+                .namespaces
+                .get_by_id(namespace_id)
+                .await
+                .map_err(EdgeError::from)?
+                .ok_or_else(|| EdgeError::NamespaceNotFound(namespace_id.to_owned()))?;
+            Ok(namespace_to_description(namespace))
+        })
+        .await
+    }
+
     pub async fn register_namespace(
         &self,
         headers: &HeaderMap,
@@ -3468,6 +3500,9 @@ impl WorkflowService {
 
                 self.namespaces
                     .insert(ResolvedNamespace {
+                        namespace_id: Some(
+                            to_internal::namespace_id_for(&req.namespace).0.to_string(),
+                        ),
                         retention: req.retention,
                         ..ResolvedNamespace::active(req.namespace.clone())
                     })
@@ -5578,6 +5613,68 @@ impl WorkflowService {
     }
 }
 
+#[async_trait]
+impl crate::operator_service::NamespaceDeletionApi for WorkflowService {
+    async fn reclaim_namespace_runs(&self, namespace_id: tokeira_types::NamespaceId) -> Result<()> {
+        loop {
+            let run_keys = self.repo.list_runs_for_namespace(namespace_id).await?;
+            if run_keys.is_empty() {
+                return Ok(());
+            }
+
+            for run_key in run_keys {
+                let deletion = match self
+                    .runtime
+                    .delete_workflow(
+                        run_key,
+                        DeleteWorkflowRequest {
+                            request: RequestContext {
+                                request_id: RequestId(format!(
+                                    "namespace-delete-{}-{}",
+                                    namespace_id.0, run_key.0
+                                )),
+                                caller_identity: Some("tokeira-namespace-reclaimer".to_owned()),
+                                received_at: OffsetDateTime::now_utc(),
+                            },
+                            now: OffsetDateTime::now_utc(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(deletion) => deletion,
+                    Err(error) if error.downcast_ref::<WorkflowDeletionNotFound>().is_some() => {
+                        // A concurrent/retried namespace reclaimer may have removed a
+                        // key from the enumeration snapshot. Re-listing below proves the
+                        // namespace is empty before final removal.
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.visibility.apply_deletion(deletion.tombstone).await?;
+            }
+        }
+    }
+}
+
+fn validate_task_token_namespace(
+    request_namespace: &str,
+    token_namespace_id: tokeira_types::NamespaceId,
+) -> EdgeResult<()> {
+    // Task-token namespace takes precedence, but v1.31.0 still rejects a request
+    // that names a different namespace instead of silently applying the token there
+    // (`checkNamespaceMatch`, `common/rpc/interceptor/namespace_validator.go @
+    // v1.31.0`). Calling this before consuming query results keeps rejection free of
+    // edge effects. An omitted namespace deliberately defers to the token.
+    if !request_namespace.is_empty()
+        && to_internal::namespace_id_for(request_namespace) != token_namespace_id
+    {
+        return Err(EdgeError::BadRequest(
+            "Operation requested with a token from a different namespace.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Render v1.31.0's `WorkflowExecutionAlreadyStarted` message for a start
 /// rejected by the workflow-id conflict/reuse policy — the corpus asserts the
 /// policy suffixes verbatim (`workflow_id_dedup.go:95-129 @ v1.31.0`).
@@ -6121,6 +6218,27 @@ mod tests {
             validate_namespace_state_update(true, NamespaceStateUpdate::Deprecated),
             Err(EdgeError::BadRequest(_))
         ));
+    }
+
+    proptest! {
+        /// A non-empty request namespace is accepted exactly when its identity equals
+        /// the task token's; rejection is a pure admission decision.
+        // Feature: api-conformance-namespace-full, Property 5: task-token namespace mismatch is side-effect free
+        #[test]
+        fn task_token_namespace_guard_matches_identity(
+            request_namespace in "[a-z][a-z0-9-]{0,20}",
+            token_namespace in "[a-z][a-z0-9-]{0,20}",
+        ) {
+            let token_namespace_id = namespace_id_for(&token_namespace);
+            let result = super::validate_task_token_namespace(
+                &request_namespace,
+                token_namespace_id,
+            );
+            prop_assert_eq!(
+                result.is_ok(),
+                namespace_id_for(&request_namespace) == token_namespace_id
+            );
+        }
     }
 
     fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {

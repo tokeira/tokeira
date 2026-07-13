@@ -2110,6 +2110,13 @@ mod tests {
             Ok(None)
         }
 
+        async fn list_runs_for_namespace(
+            &self,
+            _namespace_id: tokeira_types::NamespaceId,
+        ) -> Result<Vec<RunKey>> {
+            Ok(Vec::new())
+        }
+
         async fn load_run(&self, _run_key: RunKey) -> Result<LoadedRun> {
             let mut state = self.state.lock().await;
             state.load_calls += 1;

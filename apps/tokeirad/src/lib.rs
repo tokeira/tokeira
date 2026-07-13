@@ -1023,8 +1023,9 @@ where
         )),
         nexus_endpoint_limits,
     ));
-    let operator_service =
-        OperatorService::new(operator_api, interceptors).with_nexus_endpoints(nexus_endpoint_admin);
+    let operator_service = OperatorService::new(operator_api, interceptors)
+        .with_nexus_endpoints(nexus_endpoint_admin)
+        .with_namespace_deletion(namespaces.clone(), Arc::new(workflow_service.clone()));
 
     // Wire the standalone-activity (CHASM) bridge onto the gRPC adapter: a CHASM
     // engine over the backend's node repository, an activity-library registry, and

@@ -495,6 +495,14 @@ pub trait RunRepository: Send + Sync {
         workflow_id: &WorkflowId,
     ) -> Result<Option<RunKey>>;
 
+    /// List every authoritative run owned by `namespace_id`.
+    ///
+    /// Namespace reclaim must not trust visibility because projection lag or a
+    /// missing visibility row could otherwise strand mutable state. Implementations
+    /// therefore enumerate their authoritative hot-state records and return keys in
+    /// deterministic UUID order.
+    async fn list_runs_for_namespace(&self, namespace_id: NamespaceId) -> Result<Vec<RunKey>>;
+
     /// Load the full durable state for a run, or
     /// [`LoadedRun::Absent`] if the key is unknown.
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun>;
@@ -1424,6 +1432,10 @@ where
         workflow_id: &WorkflowId,
     ) -> Result<Option<RunKey>> {
         (**self).find_latest_run(namespace_id, workflow_id).await
+    }
+
+    async fn list_runs_for_namespace(&self, namespace_id: NamespaceId) -> Result<Vec<RunKey>> {
+        (**self).list_runs_for_namespace(namespace_id).await
     }
 
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {

@@ -3138,6 +3138,13 @@ mod tests {
             panic!("unused in timer scanner tests")
         }
 
+        async fn list_runs_for_namespace(
+            &self,
+            _namespace_id: tokeira_types::NamespaceId,
+        ) -> Result<Vec<RunKey>> {
+            panic!("unused in timer scanner tests")
+        }
+
         async fn load_run(&self, _run_key: RunKey) -> Result<LoadedRun> {
             panic!("unused in timer scanner tests")
         }

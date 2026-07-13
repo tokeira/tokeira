@@ -65,6 +65,7 @@ connectrpc = { version = "0.8.1", features = ["server"], optional = true }
 conformance = [
     "dep:tokeira-conformance-control",
     "dep:connectrpc",
+    "tokeira-edge/conformance",
     "tokeira-runtime/conformance",
 ]
 

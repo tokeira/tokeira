@@ -34,11 +34,12 @@ callback.
 This feature implements the complete, v1.31.0-conformant async completion path:
 
 1. **Outbound attachment** — when invoking a handler's `StartOperation`, tokeira sends a callback URL
-   and a signed completion token so the handler side attaches a completion callback to the backing
-   workflow.
+   and a versioned, opaque completion token so the handler side attaches a completion callback to the
+   backing workflow.
 2. **Handler-close dispatch** — when a tokeira workflow that carries a Nexus completion callback
-   reaches a terminal state, tokeira fires the callback, delivering the workflow's result or failure
-   over the Nexus completion HTTP protocol, with retry/backoff.
+   reaches a chain-terminal state, tokeira fires the callback, delivering the workflow's result or
+   failure over the Nexus completion HTTP protocol, with retry/backoff. A continue-as-new or a
+   retry-in-progress failure/timeout carries the callback to the successor instead of firing it.
 3. **Inbound completion endpoint** — tokeira hosts the Nexus completion callback HTTP route, decodes
    the token, and routes the completion to the caller's pending operation.
 4. **Originator resolution** — the completion is applied to the caller run, recording the terminal
@@ -66,9 +67,13 @@ completion token shape `tokenspb.NexusOperationCompletion`
   `NexusOperationStarted`), opaque to the caller.
 - **Completion callback** — a callback (`CallbackSpec::Nexus { url, header }`) registered on the
   handler workflow at start, fired when that workflow closes, that delivers the outcome to the caller.
-- **Completion token** — a tokeira-issued, signed token carried in the `Temporal-Callback-Token`
-  header of a completion request, encoding the originator reference needed to locate the pending
-  operation. Mirrors `tokenspb.NexusOperationCompletion`.
+- **Completion token** — a tokeira-issued, versioned and opaque token carried in the
+  `Temporal-Callback-Token` header of a completion request, encoding the originator reference needed
+  to locate the pending operation. Mirrors `tokenspb.NexusOperationCompletion`; v1.31.0 checks the
+  envelope version but does not sign the token (`common/nexus/callback_token.go @ v1.31.0`).
+- **Chain-terminal close** — a close that ends the execution chain. Completion, cancellation,
+  termination, and non-retrying failure/timeout are chain-terminal; continue-as-new and a
+  failure/timeout whose retry state is `InProgress` are continuation closes.
 - **System callback URL** — the sentinel `temporal://system` used for Worker-target endpoints,
   meaning "deliver to this cluster's own Nexus completion endpoint" rather than an external HTTP host.
 - **Completion HTTP protocol** — the Nexus wire format for delivering an operation outcome: a POST to
@@ -88,9 +93,10 @@ In scope (becomes `Implemented`):
   `Temporal-Callback-Token` encoding the originator's `(namespace, workflow_id, run_id,
   scheduled_event_id, request_id)`.
 - A tokeira workflow that closes with one or more registered Nexus completion callbacks fires each
-  callback once it reaches a terminal state, delivering the terminal outcome (success result, or
-  failure for failed/terminated/timed-out/canceled handler workflows) via the completion HTTP
-  protocol, with bounded retry/backoff and durable callback lifecycle state.
+  callback once it reaches a chain-terminal state, delivering the terminal outcome (success result,
+  or failure for failed/terminated/timed-out/canceled handler workflows) via the completion HTTP
+  protocol, with bounded retry/backoff and durable callback lifecycle state. Continue-as-new and
+  retry-in-progress failure/timeout preserve `Standby` callbacks for the successor run.
 - tokeira hosts the Nexus completion callback HTTP route (`POST /nexus/callback`), decoding the token
   and the operation state, and routes a `temporal://system` callback to that same endpoint in-process
   (no real network hop) while remaining a real, externally reachable HTTP endpoint.
@@ -120,9 +126,10 @@ Out of scope (and why):
   completion endpoint are deferred; `StartOperation` is built without a callback.
 - `crates/tokeira-runtime/src/publisher.rs` — `DispatchOp::DispatchCompletionCallback { callback_index,
   callback }` arm only logs `"completion callback scheduled for dispatch"`; no delivery.
-- `crates/tokeira-kernel/src/kernel.rs` — `schedule_completion_callbacks` already advances
-  `WorkflowClosed`-triggered callbacks `Standby → Scheduled` and emits `DispatchCompletionCallback` on
-  close; `crates/tokeira-kernel/src/state.rs` defines `CompletionCallback` / `CallbackSpec::Nexus` /
+- `crates/tokeira-kernel/src/kernel.rs` — `schedule_completion_callbacks` advances
+  `WorkflowClosed`-triggered callbacks `Standby → Scheduled` and emits `DispatchCompletionCallback`;
+  before the Tier 5.32 correction it did so for every close, including continuation closes.
+  `crates/tokeira-kernel/src/state.rs` defines `CompletionCallback` / `CallbackSpec::Nexus` /
   `CallbackState`.
 - `crates/tokeira-runtime/src/publisher.rs` — `handle_schedule_nexus_operation` already submits a
   `NexusResolution` (`Started`/`Completed`/`Failed`) to the originator via the lane; the originator
@@ -150,8 +157,9 @@ to deliver the eventual outcome, so that my operation can complete.
 4. THE completion token SHALL encode the originator's `namespace_id`, `workflow_id`, `run_id`,
    `scheduled_event_id`, and the operation's `request_id`, sufficient to locate the pending operation
    on completion.
-5. THE completion token SHALL be tamper-evident (signed/verifiable by tokeira) and SHALL be rejected
-   on the inbound path if it fails verification.
+5. THE completion token SHALL use the versioned opaque envelope defined by v1.31.0, and WHEN its
+   envelope version is unsupported or its payload cannot be decoded THEN the inbound path SHALL reject
+   it without resolving an operation.
 
 ### Requirement 2: A closed workflow fires its registered completion callbacks
 
@@ -161,8 +169,8 @@ when it closes, so that I do not have to poll.
 #### Acceptance Criteria
 
 1. WHEN a workflow with one or more `WorkflowClosed`-triggered Nexus completion callbacks reaches a
-   terminal state THEN the system SHALL attempt to deliver each callback exactly once per attempt,
-   advancing its lifecycle state from `Scheduled`.
+   chain-terminal state THEN the system SHALL schedule each `Standby` callback exactly once and SHALL
+   attempt delivery from the `Scheduled` state.
 2. WHEN the workflow completed successfully THEN the delivered outcome SHALL be `succeeded` carrying
    the workflow's result payload.
 3. WHEN the workflow failed, timed out, was terminated, or was canceled THEN the delivered outcome
@@ -172,6 +180,16 @@ when it closes, so that I do not have to poll.
    error THEN it SHALL transition to `Failed`.
 5. WHEN a delivery attempt succeeds THEN the callback SHALL transition to `Succeeded` and SHALL NOT be
    re-delivered.
+6. WHEN a workflow continues as new with a `Standby` completion callback THEN the closing run SHALL
+   NOT schedule or dispatch that callback AND the successor run SHALL inherit it in `Standby`.
+7. WHEN a workflow fails or times out with retry state `InProgress` and carries a `Standby` completion
+   callback THEN the closing run SHALL NOT schedule or dispatch that callback AND the retry successor
+   SHALL inherit it in `Standby`.
+8. WHEN a callback delivery returns a Nexus `HandlerError` THEN the recorded
+   `last_attempt_failure.message` SHALL be the decoded handler-error text produced by the v1.31.0
+   Nexus client, rather than the raw HTTP status and response body.
+9. WHEN multiple callbacks become eligible for retry in the same scan THEN the runtime SHALL dispatch
+   them independently so one handler response cannot prevent the other due callbacks from starting.
 
 ### Requirement 3: tokeira hosts the inbound Nexus completion endpoint
 
@@ -233,8 +251,9 @@ caller's history.
 #### Acceptance Criteria
 
 1. WHEN `DescribeWorkflowExecution` is called on a workflow carrying completion callbacks THEN the
-   response SHALL report each callback with its current lifecycle state and attempt/last-failure
-   metadata, consistent with v1.31.0's `callbacks` field.
+   response SHALL report each callback with its current lifecycle state, attempt count,
+   `last_attempt_complete_time`, and last-failure metadata, consistent with v1.31.0's `callbacks`
+   field.
 2. THE SYSTEM SHALL emit structured logs/metrics for completion delivery attempts (outcome, attempt,
    retryability) without inlining payload bodies.
 

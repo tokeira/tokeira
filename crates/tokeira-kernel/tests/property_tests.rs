@@ -90,6 +90,7 @@ fn completion_callback() -> CompletionCallback {
         state: CallbackState::Standby,
         attempt: 0,
         last_attempt_failure: None,
+        last_attempt_complete_time: None,
         next_attempt_at: None,
     }
 }
@@ -4724,9 +4725,24 @@ enum CloseKind {
     Completed(Vec<u8>),
     Failed(Vec<u8>),
     Canceled,
-    ContinuedAsNew,
     Terminated,
     TimedOut,
+}
+
+/// A close that ends only the current run while the workflow chain continues.
+#[derive(Clone, Debug)]
+enum ContinuationCloseKind {
+    ContinuedAsNew,
+    RetryFailure,
+    RetryTimeout,
+}
+
+fn arb_continuation_close_kind() -> impl Strategy<Value = ContinuationCloseKind> {
+    prop_oneof![
+        Just(ContinuationCloseKind::ContinuedAsNew),
+        Just(ContinuationCloseKind::RetryFailure),
+        Just(ContinuationCloseKind::RetryTimeout),
+    ]
 }
 
 fn arb_close_kind() -> impl Strategy<Value = CloseKind> {
@@ -4734,7 +4750,6 @@ fn arb_close_kind() -> impl Strategy<Value = CloseKind> {
         prop::collection::vec(any::<u8>(), 0..16).prop_map(CloseKind::Completed),
         prop::collection::vec(any::<u8>(), 0..16).prop_map(CloseKind::Failed),
         Just(CloseKind::Canceled),
-        Just(CloseKind::ContinuedAsNew),
         Just(CloseKind::Terminated),
         Just(CloseKind::TimedOut),
     ]
@@ -4744,6 +4759,11 @@ fn arb_close_kind() -> impl Strategy<Value = CloseKind> {
 /// to the terminal state described by `kind`, returning the resulting transition.
 fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
     let mut state = with_pending_wft(make_open_state(now), 90, Some(40), 1);
+    if matches!(kind, CloseKind::Failed(_)) {
+        // The terminal-failure property must not exercise the retry-in-progress
+        // branch; continuation failure is covered separately by Property 10.
+        state.retry_policy = None;
+    }
     let mut callback = completion_callback();
     callback.registration_time = Some(now);
     state.completion_callbacks = vec![callback];
@@ -4781,19 +4801,6 @@ fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
             failure: Payload::new(bytes.clone()),
         }]),
         CloseKind::Canceled => wft(vec![WorkflowCommand::CancelWorkflow { details: None }]),
-        CloseKind::ContinuedAsNew => wft(vec![WorkflowCommand::ContinueAsNew {
-            header: None,
-            new_run_id: RunId::new(),
-            workflow_type: WorkflowType("wf".into()),
-            task_queue: TaskQueueName("queue".into()),
-            input: payloads("can-input"),
-            memo: memo_with("memo"),
-            search_attributes: search_attrs_with("search"),
-            workflow_execution_timeout: None,
-            workflow_run_timeout: None,
-            workflow_task_timeout: default_workflow_task_timeout(),
-            retry_policy: None,
-        }]),
         CloseKind::Terminated => Command::Terminate(TerminateRequest {
             reason: "terminated".into(),
             details: None,
@@ -4862,6 +4869,91 @@ fn arb_attempt_outcome() -> impl Strategy<Value = CallbackAttemptOutcome> {
 }
 
 proptest! {
+    /// Feature: nexus-async-completion, Property 10 (exploration).
+    /// A continuation close preserves every Standby callback for the successor
+    /// and emits no completion dispatch. **Validates: Requirements 2.6, 2.7**
+    #[test]
+    fn property_p10_continuation_close_preserves_standby_callbacks(
+        kind in arb_continuation_close_kind(),
+        callback_count in 1usize..5,
+    ) {
+        let now = fixed_now();
+        let mut state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+        state.completion_callbacks = (0..callback_count)
+            .map(|_| {
+                let mut callback = completion_callback();
+                callback.registration_time = Some(now);
+                callback
+            })
+            .collect();
+
+        let transition = match kind {
+            ContinuationCloseKind::ContinuedAsNew => kernel().apply(
+                LoadedRun::Existing(state.clone()),
+                Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
+                    client_discards_speculative_with_events: false,
+                    token: WorkflowTaskToken {
+                        run_key: state.run_key,
+                        logical_seq: LogicalTaskSeq(30),
+                        started_event_id: 13,
+                        attempt: 1,
+                        shard_epoch: ShardEpoch::ZERO,
+                    },
+                    identity: WorkerIdentity("worker".into()),
+                    sdk_metadata: None,
+                    metering_metadata: None,
+                    worker_version: None,
+                    versioning_behavior: VersioningBehavior::Unspecified,
+                    deployment_version: None,
+                    worker_deployment_name: None,
+                    sticky: None,
+                    commands: vec![WorkflowCommand::ContinueAsNew {
+                        header: None,
+                        new_run_id: RunId::new(),
+                        workflow_type: WorkflowType("wf".into()),
+                        task_queue: TaskQueueName("queue".into()),
+                        input: payloads("can-input"),
+                        memo: memo_with("memo"),
+                        search_attributes: search_attrs_with("search"),
+                        workflow_execution_timeout: None,
+                        workflow_run_timeout: None,
+                        workflow_task_timeout: default_workflow_task_timeout(),
+                        retry_policy: None,
+                    }],
+                    force_new_workflow_task: false,
+                    delivered_update_ids: Vec::new(),
+                    now,
+                }),
+            ),
+            ContinuationCloseKind::RetryFailure => kernel().apply(
+                LoadedRun::Existing(state.clone()),
+                Command::WorkflowTaskCompletedWithRetry {
+                    request: fail_workflow_completion_request(&state),
+                    retry_continuation: RetryContinuation::Retry {
+                        new_run_id: RunId::new(),
+                    },
+                },
+            ),
+            ContinuationCloseKind::RetryTimeout => kernel().apply(
+                LoadedRun::Existing(state),
+                Command::WorkflowExecutionTimedOut(WorkflowExecutionTimedOutRequest {
+                    timeout_type: WorkflowTimeoutType::RunTimeout,
+                    retry_state: RetryState::InProgress,
+                    new_execution_run_id: Some(RunId::new()),
+                    now,
+                }),
+            ),
+        }.unwrap();
+
+        prop_assert!(dispatched_outcomes(&transition).is_empty());
+        prop_assert_eq!(transition.next_state.completion_callbacks.len(), callback_count);
+        prop_assert!(transition
+            .next_state
+            .completion_callbacks
+            .iter()
+            .all(|callback| callback.state == CallbackState::Standby));
+    }
+
     #[test]
     fn property_completion_callbacks_schedule_once_on_terminal_close(
         standby_flags in prop::collection::vec(any::<bool>(), 0..5)
@@ -4943,7 +5035,7 @@ proptest! {
 
     /// Feature: nexus-async-completion, Property 2 (kernel half).
     /// A closing workflow carrying a Standby completion callback dispatches exactly
-    /// one callback whose `outcome` matches the close kind — the variant the runtime
+    /// one callback whose `outcome` matches the chain-terminal close kind — the variant the runtime
     /// maps to a `NexusResolution`. **Validates: Requirements 2.2, 2.3, 4.1, 4.2, 4.3**
     #[test]
     fn property_p2_close_kind_yields_matching_outcome(kind in arb_close_kind()) {
@@ -4959,7 +5051,6 @@ proptest! {
                 failure: Payload::new(bytes.clone()),
             },
             CloseKind::Canceled => CallbackCompletionOutcome::Canceled { details: None },
-            CloseKind::ContinuedAsNew => CallbackCompletionOutcome::ContinuedAsNew,
             CloseKind::Terminated => CallbackCompletionOutcome::Terminated,
             CloseKind::TimedOut => CallbackCompletionOutcome::TimedOut,
         };
@@ -4968,10 +5059,11 @@ proptest! {
 
     /// Feature: nexus-async-completion, Property 4.
     /// A delivery attempt against a non-terminal callback advances its lifecycle to
-    /// exactly one well-formed state: `Succeeded`/`Failed` are terminal with no
-    /// `next_attempt_at`; `RetryableFailure` backs off with `attempt` incremented and
-    /// a future `next_attempt_at`. No history event or dispatch op is emitted, and the
-    /// state-only commit still bumps `transition_seq`. **Validates: Requirements 2.1, 2.4, 2.5**
+    /// exactly one well-formed state: every outcome increments `attempt` and records
+    /// its completion time; `Succeeded`/`Failed` are terminal with no
+    /// `next_attempt_at`; `RetryableFailure` backs off with a future retry time. No
+    /// history event or dispatch op is emitted, and the state-only commit still bumps
+    /// `transition_seq`. **Validates: Requirements 2.1, 2.4, 2.5, 6.1**
     #[test]
     fn property_p4_attempt_advances_lifecycle_well_formed(
         backing_off in any::<bool>(),
@@ -5004,15 +5096,16 @@ proptest! {
         prop_assert_eq!(transition.next_state.transition_seq, expected_seq.next());
 
         let callback = &transition.next_state.completion_callbacks[0];
+        prop_assert_eq!(callback.attempt, start_attempt + 1);
+        prop_assert_eq!(callback.last_attempt_complete_time, Some(now));
         match outcome {
             CallbackAttemptOutcome::Succeeded => {
                 prop_assert_eq!(&callback.state, &CallbackState::Succeeded);
-                prop_assert_eq!(callback.attempt, start_attempt);
                 prop_assert_eq!(callback.next_attempt_at, None);
+                prop_assert_eq!(&callback.last_attempt_failure, &None);
             }
             CallbackAttemptOutcome::RetryableFailure { failure, next_attempt_at } => {
                 prop_assert_eq!(&callback.state, &CallbackState::BackingOff);
-                prop_assert_eq!(callback.attempt, start_attempt + 1);
                 prop_assert_eq!(callback.next_attempt_at, Some(next_attempt_at));
                 prop_assert!(next_attempt_at > now);
                 prop_assert_eq!(callback.last_attempt_failure.as_ref(), Some(&failure));

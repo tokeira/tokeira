@@ -995,6 +995,15 @@ pub struct CompletionCallback {
     /// callback only once `now >= next_attempt_at`.
     #[serde(default)]
     pub next_attempt_at: Option<OffsetDateTime>,
+    /// Wall-clock completion time of the latest delivery attempt.
+    ///
+    /// Every success or failure records this timestamp so
+    /// `DescribeWorkflowExecution.CallbackInfo.last_attempt_complete_time`
+    /// reflects the callback executor's latest observation
+    /// (`components/callbacks/statemachine.go @ v1.31.0`). This trailing field
+    /// preserves the prefix layout of callback state serialized before Tier 5.32.
+    #[serde(default)]
+    pub last_attempt_complete_time: Option<OffsetDateTime>,
 }
 
 /// Public callback target.

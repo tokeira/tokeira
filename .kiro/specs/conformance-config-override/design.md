@@ -66,7 +66,7 @@ flowchart LR
             PJ["projection consult sites"]
         end
         RT -->|"max_buffered_queries()"| Reg
-        ED -->|"page size / long-poll / timeouts"| Reg
+        ED -->|"page size / long-poll / timeouts / callback policy"| Reg
         PJ -->|"page size"| Reg
 
         Kernel["tokeira-kernel (PURE)"]
@@ -96,12 +96,13 @@ pub enum OverrideValue {
     Bool(bool),
     Text(String),
     Duration(std::time::Duration),
+    Json(String),
 }
 
 /// Expected value type + which plane consults the key. `Disposition` is the honesty gate.
 pub struct KeySpec {
     pub key: &'static str,           // Temporal setting key, e.g. "history.MaxBufferedQueryCount"
-    pub value_type: ValueType,       // Int | Double | Bool | Text | Duration
+    pub value_type: ValueType,       // Int | Double | Bool | Text | Duration | Json
     pub disposition: Disposition,    // Wired | KernelExcluded | NotEnforced
 }
 
@@ -125,6 +126,7 @@ impl ConformanceOverrides {
     pub fn get_bool(&self, key: &str) -> Option<bool>;
     pub fn get_str(&self, key: &str) -> Option<String>;
     pub fn get_duration(&self, key: &str) -> Option<std::time::Duration>;
+    pub fn get_json(&self, key: &str) -> Option<String>;
 }
 
 pub enum OverrideError { UnknownKey, KernelExcluded, NotEnforced, TypeMismatch, MissingKey }
@@ -173,6 +175,12 @@ impl proto::ConformanceControlService for ConformanceControlHandler {
 }
 ```
 
+Structured dynamic-config values cross the control boundary as canonical JSON text. The registry is
+schema-agnostic and preserves the text losslessly; the wired consumer owns deserialization and schema
+validation. For Tier 5.32 the fork marshals Temporal's callback `AddressMatchRule` slice and the edge
+deserializes `{Pattern, AllowInsecure}` records before callback admission. This avoids making the
+generic control proto depend on each Temporal setting's Go type.
+
 ### `tokeirad` mount (feature-gated + runtime-flagged, separate listener)
 
 Follows the `wire_coverage_enabled()` precedent exactly: a runtime flag decides whether to mount, and
@@ -219,6 +227,7 @@ message DynamicConfigValue {
     bool bool_value = 3;
     string string_value = 4;
     google.protobuf.Duration duration_value = 5;   // Temporal duration settings
+    string json_value = 6;                         // structured settings; consumer validates schema
   }
 }
 message SetDynamicConfigOverrideRequest { string key = 1; DynamicConfigValue value = 2; }
@@ -262,7 +271,8 @@ their defaults. Consults read the current registry state at call time (no cachin
 **Validates: Requirements 1.2, 2.3, 2.5, 2.6, 8.2**
 
 ### Property 3: Value-type fidelity
-*For any* supported value kind and value, a `Set` whose `DynamicConfigValue.kind` matches the key's
+*For any* supported value kind and value, including arbitrary valid JSON text, a `Set` whose
+`DynamicConfigValue.kind` matches the key's
 declared `value_type` round-trips losslessly (the stored value equals the sent value); a `Set` whose
 kind does not match is rejected `InvalidArgument` and records nothing.
 
@@ -321,7 +331,7 @@ registry (Requirement 5.2). `ok` lets the test proceed.
     set) consult equals the constant.
 - **Unit tests (example-based):** `KEY_CLASSIFICATION` invariants (every entry's `value_type` is
   self-consistent; no `Wired` entry names a kernel plane); value coercion edge cases (duration nanos,
-  negative ints, `usize` conversion bounds).
+  structured JSON, negative ints, `usize` conversion bounds).
 - **Structural test (Property 5):** a manifest/dependency assertion that `tokeira-kernel`'s
   dependencies do not include `tokeira-conformance` (a small test or a CI `cargo metadata` check), plus
   the documented invariant that `apply` is unchanged.

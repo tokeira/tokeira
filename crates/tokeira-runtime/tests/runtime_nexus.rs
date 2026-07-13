@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
@@ -26,7 +29,7 @@ use tokeira_types::{
     ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext, RequestId, RunId, RunKey,
     SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
 };
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::Barrier};
 use uuid::Uuid;
 
 /// Build a store-backed [`NexusEndpointRegistry`] seeded with `(name, target)` pairs.
@@ -1604,12 +1607,55 @@ impl NexusCompletionClient for RecordingCompletionClient {
     }
 }
 
+/// Completion client that makes the first two calls retryable, then holds both retry
+/// calls at a barrier. Reaching the barrier proves the scanner dispatched the retries
+/// concurrently; a serial scanner deadlocks on the first held request.
+#[derive(Clone)]
+struct ConcurrentRetryCompletionClient {
+    calls: Arc<AtomicUsize>,
+    retries_observed: Arc<Barrier>,
+    release_retries: Arc<Barrier>,
+}
+
+impl ConcurrentRetryCompletionClient {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            // Two delivery tasks plus the test observer.
+            retries_observed: Arc::new(Barrier::new(3)),
+            release_retries: Arc::new(Barrier::new(3)),
+        }
+    }
+}
+
+#[async_trait]
+impl NexusCompletionClient for ConcurrentRetryCompletionClient {
+    async fn complete_operation(
+        &self,
+        _url: &str,
+        _token: &str,
+        _completion: NexusCompletion,
+        _links: &[tokeira_kernel::Link],
+    ) -> Result<CompletionDeliveryOutcome> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call <= 2 {
+            return Ok(CompletionDeliveryOutcome::RetryableError {
+                detail: "retry together".to_string(),
+            });
+        }
+
+        self.retries_observed.wait().await;
+        self.release_retries.wait().await;
+        Ok(CompletionDeliveryOutcome::Delivered)
+    }
+}
+
 /// Build a runtime whose completion client is the recording mock and whose scanner ticks
 /// fast (so a re-fire is observable without a long wait).
 fn runtime_with_completion_client(
     store: Arc<InMemoryStore>,
     registry: NexusEndpointRegistry,
-    completion_client: Arc<RecordingCompletionClient>,
+    completion_client: Arc<dyn NexusCompletionClient>,
 ) -> TokeiraRuntime<InMemoryStore> {
     TokeiraRuntime::new_with_nexus(
         store,
@@ -1656,6 +1702,7 @@ fn system_completion_callback(token: &str) -> CompletionCallback {
         state: CallbackState::Standby,
         attempt: 0,
         last_attempt_failure: None,
+        last_attempt_complete_time: None,
         next_attempt_at: None,
     }
 }
@@ -1683,16 +1730,16 @@ where
     }
 }
 
-/// Start a workflow carrying `callback`, run one WFT, and close it with `close`.
-async fn close_workflow_with_callback(
+/// Start a workflow carrying `callbacks`, run one WFT, and close it with `close`.
+async fn close_workflow_with_callbacks(
     runtime: &TokeiraRuntime<InMemoryStore>,
     namespace_id: NamespaceId,
     workflow_id: WorkflowId,
-    callback: CompletionCallback,
+    callbacks: Vec<CompletionCallback>,
     close: WorkflowCommand,
 ) -> Result<RunKey> {
     let mut start = start_request(namespace_id, workflow_id, "req-start");
-    start.completion_callbacks = vec![callback];
+    start.completion_callbacks = callbacks;
     let run_key = applied_state(&runtime.start_workflow(start).await?).run_key;
     let task = poll_wft(runtime, namespace_id, "workflow-q").await?;
     runtime
@@ -1714,6 +1761,17 @@ async fn close_workflow_with_callback(
         })
         .await?;
     Ok(run_key)
+}
+
+/// Start a workflow carrying one callback and close it with `close`.
+async fn close_workflow_with_callback(
+    runtime: &TokeiraRuntime<InMemoryStore>,
+    namespace_id: NamespaceId,
+    workflow_id: WorkflowId,
+    callback: CompletionCallback,
+    close: WorkflowCommand,
+) -> Result<RunKey> {
+    close_workflow_with_callbacks(runtime, namespace_id, workflow_id, vec![callback], close).await
 }
 
 #[tokio::test]
@@ -1823,6 +1881,7 @@ async fn completion_callback_fires_with_lowercased_token_header() -> Result<()> 
         state: CallbackState::Standby,
         attempt: 0,
         last_attempt_failure: None,
+        last_attempt_complete_time: None,
         next_attempt_at: None,
     };
 
@@ -1967,10 +2026,79 @@ async fn completion_callback_retryable_backs_off_then_scanner_refires() -> Resul
             == Some(CallbackState::Succeeded)
     })
     .await?;
-    assert_eq!(resolved.completion_callbacks[0].attempt, 1);
+    assert_eq!(resolved.completion_callbacks[0].attempt, 2);
     assert!(
         client.calls().len() >= 2,
         "the scanner re-fired the backing-off callback"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_callback_scanner_dispatches_due_retries_concurrently() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let namespace_id = NamespaceId::new();
+    let client = Arc::new(ConcurrentRetryCompletionClient::new());
+    let runtime =
+        runtime_with_completion_client(store.clone(), seed_registry(vec![]), client.clone());
+
+    let callbacks = [45u128, 46]
+        .into_iter()
+        .map(|id| {
+            NexusCompletionToken {
+                originator_run_key: RunKey(uuid::Uuid::from_u128(id)),
+                operation_id: format!("op-concurrent-{id}"),
+                scheduled_event_id: 5,
+                request_id: format!("op-concurrent-{id}"),
+                endpoint: String::new(),
+                service: String::new(),
+                operation: String::new(),
+            }
+            .encode()
+            .map(|token| system_completion_callback(&token))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let run_key = close_workflow_with_callbacks(
+        &runtime,
+        namespace_id,
+        WorkflowId("handler-wf-concurrent-retry".to_string()),
+        callbacks,
+        WorkflowCommand::CompleteWorkflow {
+            result: payloads("ok"),
+        },
+    )
+    .await?;
+
+    wait_for_run(&store, run_key, |state| {
+        state.completion_callbacks.len() == 2
+            && state
+                .completion_callbacks
+                .iter()
+                .all(|callback| callback.state == CallbackState::BackingOff)
+    })
+    .await?;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.retries_observed.wait(),
+    )
+    .await
+    .map_err(|_| anyhow!("scanner did not dispatch both due callbacks concurrently"))?;
+    client.release_retries.wait().await;
+
+    let state = wait_for_run(&store, run_key, |state| {
+        state
+            .completion_callbacks
+            .iter()
+            .all(|callback| callback.state == CallbackState::Succeeded)
+    })
+    .await?;
+    assert!(
+        state
+            .completion_callbacks
+            .iter()
+            .all(|callback| callback.attempt == 2)
     );
     Ok(())
 }

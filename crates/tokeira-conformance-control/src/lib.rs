@@ -52,6 +52,7 @@ impl proto::ConformanceControlService for ConformanceControlHandler {
             Some(Kind::DurationNanos(v)) => {
                 OverrideValue::Duration(Duration::from_nanos((*v).max(0) as u64))
             }
+            Some(Kind::JsonValue(v)) => OverrideValue::Json((*v).to_string()),
             None => {
                 return Err(ConnectError::invalid_argument(
                     "SetDynamicConfigOverride value has no kind set",

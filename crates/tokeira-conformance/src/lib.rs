@@ -57,6 +57,8 @@ pub enum OverrideValue {
     Text(String),
     /// A duration setting (e.g. a timeout or interval).
     Duration(Duration),
+    /// A structured setting serialized as JSON; the wired consumer owns its schema.
+    Json(String),
 }
 
 impl OverrideValue {
@@ -68,6 +70,7 @@ impl OverrideValue {
             Self::Bool(_) => ValueType::Bool,
             Self::Text(_) => ValueType::Text,
             Self::Duration(_) => ValueType::Duration,
+            Self::Json(_) => ValueType::Json,
         }
     }
 }
@@ -85,6 +88,8 @@ pub enum ValueType {
     Text,
     /// Duration-valued setting.
     Duration,
+    /// Structured setting transported as JSON text.
+    Json,
 }
 
 /// Whether — and why — a key may be overridden.
@@ -150,6 +155,32 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
     KeySpec {
         key: "matching.maxFairnessKeyWeightOverrides",
         value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    // Callback limits are frontend admission policy, read live before a start is
+    // translated into runtime state (`validateWorkflowCompletionCallbacks`,
+    // service/frontend/workflow_handler.go:6300-6350 @ v1.31.0).
+    KeySpec {
+        key: "frontend.callbackURLMaxLength",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "frontend.callbackHeaderMaxLength",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "system.maxCallbacksPerWorkflow",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    // Temporal models callback address policy as a namespace-scoped typed
+    // setting. The conformance bridge transports the Go rule slice as JSON;
+    // tokeira-edge owns its schema and wildcard semantics.
+    KeySpec {
+        key: "component.callbacks.allowedAddresses",
+        value_type: ValueType::Json,
         disposition: Disposition::Wired,
     },
     // Kernel-consulted constants — never overridable. A runtime-mutable read
@@ -355,6 +386,14 @@ impl ConformanceOverrides {
             _ => None,
         }
     }
+
+    /// Live structured JSON override for `key`, if one is set to JSON text.
+    pub fn get_json(&self, key: &str) -> Option<String> {
+        match self.get(key)? {
+            OverrideValue::Json(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// The process-global override registry.
@@ -375,6 +414,7 @@ mod tests {
 
     const REPORTED_PROBLEMS_KEY: &str =
         "system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute";
+    const CALLBACK_ALLOWED_ADDRESSES_KEY: &str = "component.callbacks.allowedAddresses";
 
     /// The classification table is internally consistent: keys are unique, and
     /// the reported-problems threshold — the proving wired consumer — is present
@@ -488,6 +528,7 @@ mod tests {
             any::<bool>().prop_map(OverrideValue::Bool),
             any::<String>().prop_map(OverrideValue::Text),
             (0u64..1_000_000u64).prop_map(|n| OverrideValue::Duration(Duration::from_millis(n))),
+            any::<String>().prop_map(OverrideValue::Json),
         ]
     }
 
@@ -514,6 +555,7 @@ mod tests {
             ValueType::Bool => overrides.get_bool(spec.key).is_some(),
             ValueType::Text => overrides.get_str(spec.key).is_some(),
             ValueType::Duration => overrides.get_duration(spec.key).is_some(),
+            ValueType::Json => overrides.get_json(spec.key).is_some(),
         })
     }
 
@@ -558,6 +600,30 @@ mod tests {
                     prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
                 }
             }
+        }
+
+        // Feature: conformance-config-override, Property 3: structured JSON fidelity.
+        // Structured values round-trip without registry interpretation, participate in
+        // lifecycle operations, and remain type-separated from scalar keys.
+        #[test]
+        fn prop_structured_json_fidelity(json in any::<String>()) {
+            let overrides = ConformanceOverrides::default();
+            overrides
+                .set(CALLBACK_ALLOWED_ADDRESSES_KEY, OverrideValue::Json(json.clone()))
+                .unwrap();
+            prop_assert_eq!(
+                overrides.get_json(CALLBACK_ALLOWED_ADDRESSES_KEY),
+                Some(json.clone())
+            );
+            overrides.clear(CALLBACK_ALLOWED_ADDRESSES_KEY);
+            prop_assert_eq!(overrides.get_json(CALLBACK_ALLOWED_ADDRESSES_KEY), None);
+
+            let mismatch = overrides.set(REPORTED_PROBLEMS_KEY, OverrideValue::Json(json));
+            prop_assert!(
+                matches!(mismatch, Err(OverrideError::TypeMismatch { .. })),
+                "JSON value must not be accepted by an integer key",
+            );
+            prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
         }
 
         // Feature: conformance-config-override, Property 4: honesty boundary.

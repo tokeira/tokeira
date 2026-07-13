@@ -10,10 +10,10 @@ against tokeira instead of being skipped.
 tokeira's production posture is deliberately **config-as-constant**: each Temporal dynamic-config
 default is pinned as a hardcoded Rust constant, `RuntimeConfig` is built from `Default` (never from
 TOML), and `tokeirad` takes no env vars on invocation (`AGENTS.md` §Configuration). The functional
-harness enshrines the consequence: "`OverrideDynamicConfig` … the harness cannot deliver to an
-out-of-process `tokeirad`" (`docs/testing/functional-conformance-harness.md`), so such leaves are
-either run as an independent tagged process ("feature modes are independent runs") or registered as
-skips (`tests/testcore/tokeira_conformance_skip.go`).
+harness originally recorded the consequence: `OverrideDynamicConfig` could not reach an
+out-of-process `tokeirad`, so such leaves were either independent tagged runs or classified skips.
+The conformance control service and fork bridge implemented by this spec now deliver supported
+overrides to the external process; kernel-excluded and unwired settings retain those fallback paths.
 
 This spec **does not change that production posture**. It introduces a surface that exists **only in a
 `conformance`-feature build** and is **inert unless explicitly mounted**, through which the harness can
@@ -104,11 +104,14 @@ observable effect is inside a conformance build.
 - A `conformance` Cargo feature that compiles in (a) a process-global override registry, (b) a
   Connect-RPC control service, and (c) consult-site accessors at the wired sites.
 - The control service, when explicitly mounted on its own loopback listener, honours
-  set/clear/reset of overrides for **wired, non-kernel** setting keys.
+  set/clear/reset of scalar and structured-JSON overrides for **wired, non-kernel** setting keys.
 - The pinned Temporal fork's out-of-process `OverrideDynamicConfig` delivers to the control service and
   cleans up per test.
 - An initial wired key (`MaxBufferedQueryCount`) proving the loop, then incremental wiring of
   page-size, long-poll interval, and the reported-problems threshold (unblocking Tier 3.22 leaf 4).
+- Callback admission limits and the structured `component.callbacks.allowedAddresses` rule list are
+  wired at the edge for Tier 5.32. The structured form is conformance-only transport; it does not add
+  a production config field.
 
 **Stays out of scope / unchanged:**
 - Production `tokeirad`: no registry, no service, no indirection, no new listener, no env var, no TOML
@@ -159,6 +162,10 @@ so an override is Unsupported until enforcement lands under another spec.
 | `history.longPollExpirationInterval` (20s) | edge inline | **Overridable** | live-read at poll admission |
 | default WFT / query / update timeouts | edge inline | **Overridable** | live-read at translate |
 | `system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute` (5) | reported-problems (runtime, `reported_problems_threshold()` live-read) | **Overridable — wired (Tier 3.22 proving consumer)** | leaf 4 un-skipped; threshold read live at the derive-on-read consult site (0→2 mid-run). Accessor landed; live two-run verification tracked separately |
+| `frontend.callbackURLMaxLength` (1000) | callback admission (edge) | **Overridable — Tier 5.32** | live-read before validating each Nexus callback URL |
+| `frontend.callbackHeaderMaxLength` (8192) | callback admission (edge) | **Overridable — Tier 5.32** | live-read before validating aggregate callback header size |
+| `system.maxCallbacksPerWorkflow` (32) | callback admission (edge) | **Overridable — Tier 5.32** | live-read before per-callback validation |
+| `component.callbacks.allowedAddresses` | callback admission (edge) | **Overridable — Tier 5.32, structured JSON** | fork serializes the v1.31.0 address-rule list as JSON; production policy remains a separate decision |
 | `history.workflowIdReuseMinimalInterval` (1s) | `CONTINUE_AS_NEW_MIN_INTERVAL` (kernel) | **Kernel-excluded** | separate decision (independent-run build or kernel→runtime move) |
 | `history.maximumBufferedEventsBatch` (100) | `MAX_BUFFERED_EVENTS` (kernel) | **Kernel-excluded** | no corpus leaf overrides it today |
 | `limit.mutableStateSize.error`, `limit.blobSize.error`, `limit.historySize.error`, `limit.historyCount.error`, `limit.historySize.suggestContinueAsNew` | none | **Not-enforced** | Unsupported until enforcement exists |
@@ -252,7 +259,8 @@ out-of-process `tokeirad` can receive the values the corpus would set in-process
 1. THE control service SHALL expose `SetDynamicConfigOverride(key, value)`,
    `ClearDynamicConfigOverride(key)`, and `ResetDynamicConfigOverrides()`.
 2. THE override value SHALL be a typed union covering the Temporal dynamic-config value kinds used by
-   the corpus: `int64`, `double`, `bool`, `string`, and `Duration`.
+   the corpus: `int64`, `double`, `bool`, `string`, `Duration`, and a JSON string for structured Go
+   values whose schema is validated by the wired consumer.
 3. WHEN `SetDynamicConfigOverride(key, value)` names a wired, non-kernel key AND the value's type
    matches that key's expected type THE registry SHALL record the value AND every subsequent consult of
    that key SHALL observe it (read live at request time).
@@ -352,6 +360,9 @@ so that the loop is validated before breadth is added.
    observed live), once the reported-problems feature itself exists.
 4. Each newly wired key SHALL be reflected in the override-target policy table (this document) so the
    supported set is auditable.
+5. THE callback URL/header/count limits and `component.callbacks.allowedAddresses` SHALL be read live
+   by callback admission in the edge; WHEN no conformance override exists THE three limits SHALL use
+   the v1.31.0 defaults and the production allowed-address posture SHALL remain unchanged.
 
 ## Requirement 8 — Non-regression and testing
 
@@ -365,7 +376,8 @@ correct, so that this test infrastructure is safe to carry.
 2. A property SHALL assert override lifecycle: after `Set(k, v)` a consult of `k` observes `v`; after
    `Clear(k)` it observes the default; after `Reset()` all keys observe defaults.
 3. A property SHALL assert value-type round-trips for each supported value kind (`int64`, `double`,
-   `bool`, `string`, `Duration`), and that a type-mismatched `Set` is rejected without recording.
+   `bool`, `string`, `Duration`, structured JSON), and that a type-mismatched `Set` is rejected without
+   recording.
 4. A property SHALL assert the honesty boundary: a `Set` for an unwired key, a kernel-excluded key, or
    a not-enforced key is `Unsupported` and records nothing.
 5. THE public Temporal gRPC surface SHALL be unchanged whether or not an override is active at an

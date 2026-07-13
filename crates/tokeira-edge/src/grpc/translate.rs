@@ -26,6 +26,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use prost::Message as _;
+use serde::Deserialize;
 use time::OffsetDateTime;
 use tokeira_kernel::{
     FieldChange, MemoPatch, SearchAttributesPatch, WorkerVersionStamp, WorkflowCommand,
@@ -124,6 +125,16 @@ const NON_RETRYABLE_ACTIVITY_SENTINEL: &str = "__tokeira_non_retryable__";
 const CALLBACK_URL_MAX_LENGTH: usize = 1000;
 const CALLBACK_HEADER_MAX_SIZE: usize = 8 * 1024;
 const MAX_CALLBACKS_PER_WORKFLOW: usize = 32;
+#[cfg(feature = "conformance")]
+const CALLBACK_URL_MAX_LENGTH_KEY: &str = "frontend.callbackURLMaxLength";
+#[cfg(feature = "conformance")]
+const CALLBACK_HEADER_MAX_SIZE_KEY: &str = "frontend.callbackHeaderMaxLength";
+#[cfg(feature = "conformance")]
+const MAX_CALLBACKS_PER_WORKFLOW_KEY: &str = "system.maxCallbacksPerWorkflow";
+#[cfg(feature = "conformance")]
+const CALLBACK_ALLOWED_ADDRESSES_KEY: &str = "component.callbacks.allowedAddresses";
+const SYSTEM_CALLBACK_URL: &str = "temporal://system";
+const CHASM_INTERNAL_CALLBACK_URL: &str = "temporal://internal";
 // `frontend.maxlinksPerRequest` / `frontend.linkMaxSize` defaults
 // (`common/dynamicconfig/constants.go:1010,1015 @ v1.31.0`). Behavioural limits,
 // so source-cited constants per the callback-validation decision note.
@@ -348,22 +359,26 @@ fn validate_completion_callbacks(
     // written (`service/frontend/workflow_handler.go:6299 @ v1.31.0`). Keeping
     // this in the edge preserves that validation order without making callback
     // policy part of workflow semantics.
-    if callbacks.len() > MAX_CALLBACKS_PER_WORKFLOW {
+    let max_callbacks = max_callbacks_per_workflow();
+    let url_max_length = callback_url_max_length();
+    let header_max_size = callback_header_max_size();
+    let address_rules = callback_address_rules();
+    if callbacks.len() > max_callbacks {
         return Err(ProtoConversionError::InvalidArgument(format!(
-            "cannot attach more than {MAX_CALLBACKS_PER_WORKFLOW} callbacks to a workflow"
+            "cannot attach more than {max_callbacks} callbacks to a workflow"
         )));
     }
     for callback in callbacks {
         if let Some(proto_common::callback::Variant::Nexus(nexus)) = callback.variant.as_ref() {
-            validate_callback_url(&nexus.url)?;
+            validate_callback_url(&nexus.url, url_max_length, address_rules.as_deref())?;
             let header_size: usize = nexus
                 .header
                 .iter()
                 .map(|(key, value)| key.len() + value.len())
                 .sum();
-            if header_size > CALLBACK_HEADER_MAX_SIZE {
+            if header_size > header_max_size {
                 return Err(ProtoConversionError::InvalidArgument(format!(
-                    "invalid header: header size longer than max allowed size of {CALLBACK_HEADER_MAX_SIZE}"
+                    "invalid header: header size longer than max allowed size of {header_max_size}"
                 )));
             }
         }
@@ -469,16 +484,120 @@ fn validate_links(links: &[proto_common::Link]) -> Result<(), ProtoConversionErr
     Ok(())
 }
 
-fn validate_callback_url(raw_url: &str) -> Result<(), ProtoConversionError> {
-    if raw_url.len() > CALLBACK_URL_MAX_LENGTH {
+#[cfg(not(feature = "conformance"))]
+fn callback_url_max_length() -> usize {
+    CALLBACK_URL_MAX_LENGTH
+}
+
+#[cfg(feature = "conformance")]
+fn callback_url_max_length() -> usize {
+    tokeira_conformance::overrides()
+        .get_i64(CALLBACK_URL_MAX_LENGTH_KEY)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(CALLBACK_URL_MAX_LENGTH)
+}
+
+#[cfg(not(feature = "conformance"))]
+fn callback_header_max_size() -> usize {
+    CALLBACK_HEADER_MAX_SIZE
+}
+
+#[cfg(feature = "conformance")]
+fn callback_header_max_size() -> usize {
+    tokeira_conformance::overrides()
+        .get_i64(CALLBACK_HEADER_MAX_SIZE_KEY)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(CALLBACK_HEADER_MAX_SIZE)
+}
+
+#[cfg(not(feature = "conformance"))]
+fn max_callbacks_per_workflow() -> usize {
+    MAX_CALLBACKS_PER_WORKFLOW
+}
+
+#[cfg(feature = "conformance")]
+fn max_callbacks_per_workflow() -> usize {
+    tokeira_conformance::overrides()
+        .get_i64(MAX_CALLBACKS_PER_WORKFLOW_KEY)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(MAX_CALLBACKS_PER_WORKFLOW)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+struct CallbackAddressRule {
+    #[serde(default)]
+    pattern: String,
+    #[serde(default)]
+    allow_insecure: bool,
+}
+
+#[cfg(not(feature = "conformance"))]
+fn callback_address_rules() -> Option<Vec<CallbackAddressRule>> {
+    None
+}
+
+#[cfg(feature = "conformance")]
+fn callback_address_rules() -> Option<Vec<CallbackAddressRule>> {
+    let json = tokeira_conformance::overrides().get_json(CALLBACK_ALLOWED_ADDRESSES_KEY)?;
+    Some(serde_json::from_str(&json).unwrap_or_else(|error| {
+        // Temporal's typed-setting converter falls back when the configured
+        // structure cannot be converted. Treating malformed conformance JSON as
+        // an empty rule set is the same fail-closed posture and avoids admitting
+        // an address under an uninterpretable policy.
+        tracing::warn!(%error, "invalid conformance callback-address override; using no rules");
+        Vec::new()
+    }))
+}
+
+fn wildcard_host_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let host = host.as_bytes();
+    let mut pattern_index = 0;
+    let mut host_index = 0;
+    let mut last_star = None;
+    let mut star_host_index = 0;
+
+    while host_index < host.len() {
+        if pattern_index < pattern.len() && pattern[pattern_index] == host[host_index] {
+            pattern_index += 1;
+            host_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            last_star = Some(pattern_index);
+            pattern_index += 1;
+            star_host_index = host_index;
+        } else if let Some(star_index) = last_star {
+            pattern_index = star_index + 1;
+            star_host_index += 1;
+            host_index = star_host_index;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+fn validate_callback_url(
+    raw_url: &str,
+    max_length: usize,
+    address_rules: Option<&[CallbackAddressRule]>,
+) -> Result<(), ProtoConversionError> {
+    if raw_url.len() > max_length {
         return Err(ProtoConversionError::InvalidArgument(format!(
-            "invalid url: url length longer than max length allowed of {CALLBACK_URL_MAX_LENGTH}"
+            "invalid url: url length longer than max length allowed of {max_length}"
         )));
     }
-    let Some(rest) = raw_url
-        .strip_prefix("http://")
-        .or_else(|| raw_url.strip_prefix("https://"))
-    else {
+    if matches!(raw_url, SYSTEM_CALLBACK_URL | CHASM_INTERNAL_CALLBACK_URL) {
+        return Ok(());
+    }
+    let (rest, insecure) = if let Some(rest) = raw_url.strip_prefix("http://") {
+        (rest, true)
+    } else if let Some(rest) = raw_url.strip_prefix("https://") {
+        (rest, false)
+    } else {
         return Err(ProtoConversionError::InvalidArgument(format!(
             "invalid url: unknown scheme: {raw_url}"
         )));
@@ -499,10 +618,28 @@ fn validate_callback_url(raw_url: &str) -> Result<(), ProtoConversionError> {
             "invalid url: missing host".to_string(),
         ));
     }
-    // Temporal also evaluates dynamic address allow-list policy after URL
-    // shape validation. Tokeira has no callback address-policy config surface
-    // yet, so hard-coding that deployment policy here would make admission
-    // stricter than the configured server rather than more compatible.
+    if let Some(rules) = address_rules {
+        let host = uri
+            .authority()
+            .map(http::uri::Authority::as_str)
+            .unwrap_or_default();
+        for rule in rules.iter().filter(|rule| !rule.pattern.is_empty()) {
+            if wildcard_host_matches(&rule.pattern, host) {
+                if insecure && !rule.allow_insecure {
+                    return Err(ProtoConversionError::InvalidArgument(format!(
+                        "invalid url: callback address does not allow insecure connections: {raw_url}"
+                    )));
+                }
+                return Ok(());
+            }
+        }
+        return Err(ProtoConversionError::InvalidArgument(format!(
+            "invalid url: url does not match any configured callback address: {raw_url}"
+        )));
+    }
+    // Production address policy remains an explicit open decision. Feature-off
+    // builds preserve Tokeira's existing accept-after-shape-validation posture;
+    // conformance builds apply the corpus's supplied v1.31.0 rules above.
     Ok(())
 }
 
@@ -3156,7 +3293,7 @@ fn workflow_callback_info_to_proto(callback: &KernelCompletionCallback) -> workf
         registration_time: callback.registration_time.map(to_proto_timestamp),
         state: kernel_callback_state_to_proto(&callback.state) as i32,
         attempt: callback.attempt as i32,
-        last_attempt_complete_time: None,
+        last_attempt_complete_time: callback.last_attempt_complete_time.map(to_proto_timestamp),
         last_attempt_failure: callback
             .last_attempt_failure
             .as_ref()
@@ -6443,6 +6580,7 @@ mod tests {
                 metadata: std::collections::BTreeMap::new(),
                 external_payloads: Vec::new(),
             }),
+            last_attempt_complete_time: Some(time::OffsetDateTime::UNIX_EPOCH),
             next_attempt_at: Some(next_attempt),
         };
 
@@ -6450,6 +6588,10 @@ mod tests {
 
         assert_eq!(info.state, enums::CallbackState::BackingOff as i32);
         assert_eq!(info.attempt, 2);
+        assert!(
+            info.last_attempt_complete_time.is_some(),
+            "a completed delivery attempt surfaces its completion time"
+        );
         assert!(
             info.last_attempt_failure.is_some(),
             "a recorded delivery failure is surfaced"
@@ -6475,6 +6617,7 @@ mod tests {
             state: KernelCallbackState::Succeeded,
             attempt: 1,
             last_attempt_failure: None,
+            last_attempt_complete_time: Some(time::OffsetDateTime::UNIX_EPOCH),
             next_attempt_at: None,
         };
 
@@ -6482,6 +6625,7 @@ mod tests {
 
         assert_eq!(info.state, enums::CallbackState::Succeeded as i32);
         assert_eq!(info.attempt, 1);
+        assert!(info.last_attempt_complete_time.is_some());
         assert!(info.last_attempt_failure.is_none());
         assert!(info.next_attempt_schedule_time.is_none());
     }
@@ -7139,6 +7283,86 @@ mod tests {
             status.message(),
             "cannot attach more than 32 callbacks to a workflow"
         );
+    }
+
+    #[test]
+    fn callback_address_rules_match_v1_31_policy_and_messages() {
+        let rules = vec![
+            CallbackAddressRule {
+                pattern: "some-ignored-*".to_string(),
+                allow_insecure: true,
+            },
+            CallbackAddressRule {
+                pattern: "some-secure-address".to_string(),
+                allow_insecure: false,
+            },
+        ];
+
+        validate_callback_url("http://some-ignored-address", 1000, Some(&rules))
+            .expect("matching insecure-enabled rule");
+        validate_callback_url("https://some-secure-address", 1000, Some(&rules))
+            .expect("secure URL matching secure-only rule");
+        validate_callback_url(SYSTEM_CALLBACK_URL, 1000, Some(&[]))
+            .expect("system callback bypasses external address rules");
+
+        let status = proto_conversion_status(
+            validate_callback_url("http://some-secure-address", 1000, Some(&rules))
+                .expect_err("insecure URL must be rejected"),
+        );
+        assert_eq!(
+            status.message(),
+            "invalid url: callback address does not allow insecure connections: http://some-secure-address"
+        );
+
+        let status = proto_conversion_status(
+            validate_callback_url("http://some-unconfigured-address", 1000, Some(&rules))
+                .expect_err("unconfigured host must be rejected"),
+        );
+        assert_eq!(
+            status.message(),
+            "invalid url: url does not match any configured callback address: http://some-unconfigured-address"
+        );
+    }
+
+    fn wildcard_host_matches_reference(pattern: &str, host: &str) -> bool {
+        let pattern = pattern.as_bytes();
+        let host = host.as_bytes();
+        let mut previous = vec![false; host.len() + 1];
+        previous[0] = true;
+        for pattern_byte in pattern {
+            let mut current = vec![false; host.len() + 1];
+            if *pattern_byte == b'*' {
+                current[0] = previous[0];
+                for host_index in 1..=host.len() {
+                    current[host_index] = previous[host_index] || current[host_index - 1];
+                }
+            } else {
+                for host_index in 1..=host.len() {
+                    current[host_index] =
+                        previous[host_index - 1] && *pattern_byte == host[host_index - 1];
+                }
+            }
+            previous = current;
+        }
+        previous[host.len()]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        // Feature: callback-validation, Property: address wildcards are full-host matches.
+        // The linear matcher agrees with an independent dynamic-programming model for
+        // arbitrary literal/star patterns and hosts.
+        #[test]
+        fn callback_address_wildcard_matches_reference_model(
+            pattern in "[a-c*]{0,12}",
+            host in "[a-c]{0,12}",
+        ) {
+            prop_assert_eq!(
+                wildcard_host_matches(&pattern, &host),
+                wildcard_host_matches_reference(&pattern, &host),
+            );
+        }
     }
 
     #[test]

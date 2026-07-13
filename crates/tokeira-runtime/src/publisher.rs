@@ -2112,10 +2112,23 @@ pub(crate) async fn scan_completion_callbacks_once<R>(
             "completion_callback",
             shard_id.map(|s| s.0).unwrap_or(0),
         );
+        // Retry deliveries must have the same concurrency shape as first-attempt
+        // dispatch. A callback handler may wait until it has received every callback in
+        // a batch before replying to any of them (the v1.31.0 callbacks corpus does
+        // exactly this). Awaiting one HTTP exchange here would therefore prevent the
+        // scanner from issuing the remaining callbacks and deadlock the batch. Temporal
+        // executes each invocation task independently; spawn the derived delivery effect
+        // just as `DispatchCompletionCallback` does above
+        // (`components/callbacks/executors.go @ v1.31.0`).
         let callback = callback.clone();
-        publisher
-            .deliver_completion_callback(entry.run_key, entry.callback_index, &callback, &outcome)
-            .await;
+        let publisher = RuntimeDispatchPublisher::clone(publisher);
+        let run_key = entry.run_key;
+        let callback_index = entry.callback_index;
+        tokio::spawn(async move {
+            publisher
+                .deliver_completion_callback(run_key, callback_index, &callback, &outcome)
+                .await;
+        });
         fired += 1;
     }
 }

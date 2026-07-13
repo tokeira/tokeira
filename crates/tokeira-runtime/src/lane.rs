@@ -1872,8 +1872,9 @@ mod tests {
     use smallvec::smallvec;
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{
-        ActivityState, HistoryEvent, LoadedRun, PendingWorkflowTask, ProjectionOp, Reject,
-        RequestDedupeOp, TimerOp, Transition, WorkflowState,
+        ActivityState, CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback,
+        HistoryEvent, LoadedRun, PendingWorkflowTask, ProjectionOp, Reject, RequestDedupeOp,
+        TimerOp, Transition, WorkflowState,
     };
     use tokeira_storage::{
         BacklogEntry, CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
@@ -3498,6 +3499,21 @@ mod tests {
             maximum_attempts: 3,
             non_retryable_error_types: vec![],
         });
+        let callback = CompletionCallback {
+            spec: CallbackSpec::Nexus {
+                url: "https://callback.example/run".to_string(),
+                header: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            trigger: CallbackTrigger::WorkflowClosed,
+            registration_time: Some(OffsetDateTime::now_utc()),
+            state: CallbackState::Standby,
+            attempt: 0,
+            last_attempt_failure: None,
+            last_attempt_complete_time: None,
+            next_attempt_at: None,
+        };
+        state.completion_callbacks = vec![callback.clone()];
         let successor_retry_policy = Some(tokeira_types::RetryPolicy {
             initial_interval: Duration::seconds(5),
             backoff_coefficient: 1.5,
@@ -3574,6 +3590,13 @@ mod tests {
                     Some(Duration::minutes(30))
                 );
                 assert_eq!(request.workflow_run_timeout, Some(Duration::minutes(5)));
+                assert_eq!(request.completion_callbacks, vec![callback]);
+                assert!(
+                    request
+                        .completion_callbacks
+                        .iter()
+                        .all(|callback| callback.state == CallbackState::Standby)
+                );
             }
             other => panic!("expected successor Start request, got {other:?}"),
         }

@@ -224,6 +224,27 @@ helper scripts (`run_suite.sh`, `run_nexus_outbound_conformance.sh`, and four `d
     runs. Record the enabling capability in `docs/readiness/conformance.md`.
   - _Requirements: 8.1, 8.6_
 
+- [x] 15. Tier 5.32 — callback-policy overrides
+  - [x] 15.1 Extend the generic override transport with structured JSON
+    - Add `OverrideValue::Json`, `ValueType::Json`, `get_json`, and `json_value = 6` in the control
+      proto. The fork bridge marshals composite Go values with `json.Marshal`; scalar coercion remains
+      unchanged.
+    - _Requirements: 2.2, 2.3, 8.3_
+  - [x] 15.2 Property test: Property 3 — structured value fidelity
+    - Generate JSON strings and assert matching-kind Set/Get round-trips losslessly, lifecycle
+      operations clear/reset them, and a JSON value sent to a scalar key is rejected without storage.
+    - Tag: `// Feature: conformance-config-override, Property 3: structured JSON fidelity`
+    - _Requirements: 2.2, 2.4, 8.2, 8.3_
+  - [x] 15.3 Wire callback admission consult sites in `tokeira-edge`
+    - Add live accessors for URL/header/count limits and parse the structured allowed-address rule
+      override. Match v1.31.0 wildcard host and `AllowInsecure` behavior; preserve pinned defaults and
+      the current production address-policy posture when no override exists.
+    - _Requirements: 7.4, 7.5_
+  - [x] 15.4 Bridge and corpus verification
+    - Add Go coercion tests, run `TestCallbacksSuiteHSM` twice clean, and retain CHASM as an exact
+      top-level classified skip under the campaign's framework-internals exclusion.
+    - _Requirements: 6.1, 6.3, 8.6_
+
 ## Task Dependency Graph
 
 ```
@@ -241,6 +262,7 @@ helper scripts (`run_suite.sh`, `run_nexus_outbound_conformance.sh`, and four `d
 12 (checkpoint)             depends on 11
 13 (incremental wiring)     depends on 7,11     # 13.3 also depends on the reported-problems feature (external)
 14 (final checkpoint)       depends on 13
+15 (callback overrides)     depends on 4,5,11
 ```
 
 Critical path: 1 → 4 → 5 → 10 → 11 → 13 → 14. Tasks 2, 7, 8 parallelize off 1/5.

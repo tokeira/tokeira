@@ -1566,7 +1566,10 @@ pub(crate) mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use proptest::prelude::*;
-    use tokeira_kernel::{ContinueAsNewVersioningBehavior, WorkflowVersioningInfo};
+    use tokeira_kernel::{
+        CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback,
+        ContinueAsNewVersioningBehavior, WorkflowVersioningInfo,
+    };
     use tokeira_storage::{BuildId as StorageBuildId, DeploymentName};
     use tokeira_types::{
         BuildId as RuntimeBuildId, DeploymentId, LogicalTaskSeq, Memo, SearchAttributes, TaskKind,
@@ -1718,6 +1721,52 @@ pub(crate) mod tests {
         };
         assert_eq!(retry_backoff(&flat, 1), Duration::seconds(1));
         assert_eq!(retry_backoff(&flat, 3), Duration::seconds(1));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: nexus-async-completion, Property 10: retry successors inherit
+        // every completion callback without changing Standby lifecycle state.
+        #[test]
+        fn retry_successor_preserves_standby_completion_callbacks(callback_count in 0usize..6) {
+            let mut state = open_state("retry-callbacks".to_string(), None);
+            state.completion_callbacks = (0..callback_count)
+                .map(|index| CompletionCallback {
+                    spec: CallbackSpec::Nexus {
+                        url: format!("https://callback.example/{index}"),
+                        header: BTreeMap::new(),
+                    },
+                    links: Vec::new(),
+                    trigger: CallbackTrigger::WorkflowClosed,
+                    registration_time: Some(now()),
+                    state: CallbackState::Standby,
+                    attempt: 0,
+                    last_attempt_failure: None,
+                    last_attempt_complete_time: None,
+                    next_attempt_at: None,
+                })
+                .collect();
+            let policy = RetryPolicy {
+                initial_interval: Duration::seconds(1),
+                backoff_coefficient: 2.0,
+                maximum_interval: Some(Duration::seconds(10)),
+                maximum_attempts: 5,
+                non_retryable_error_types: Vec::new(),
+            };
+
+            let successor = build_retry_successor_start(
+                &state,
+                &policy,
+                Payloads::default(),
+                RunId::new(),
+            );
+            prop_assert_eq!(&successor.completion_callbacks, &state.completion_callbacks);
+            prop_assert!(successor
+                .completion_callbacks
+                .iter()
+                .all(|callback| callback.state == CallbackState::Standby));
+        }
     }
 
     #[derive(Clone, Debug)]

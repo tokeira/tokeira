@@ -21,6 +21,8 @@ service ConformanceControlService {
 // A typed dynamic-config value, covering the Temporal value kinds the corpus
 // sets. `duration_nanos` carries a duration as integer nanoseconds so this
 // conformance-only proto needs no google.protobuf well-known-type import.
+// `json_value` carries structured settings whose schema is owned by the wired
+// consumer, keeping this generic control surface independent of setting types.
 message DynamicConfigValue {
   oneof kind {
     int64 int_value = 1;
@@ -28,6 +30,7 @@ message DynamicConfigValue {
     bool bool_value = 3;
     string string_value = 4;
     int64 duration_nanos = 5;
+    string json_value = 6;
   }
 }
 

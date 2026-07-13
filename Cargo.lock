@@ -6857,6 +6857,7 @@ dependencies = [
  "tokeira-chasm",
  "tokeira-chasm-activity",
  "tokeira-compatibility",
+ "tokeira-conformance",
  "tokeira-kernel",
  "tokeira-projection",
  "tokeira-proto",

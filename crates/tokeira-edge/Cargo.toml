@@ -57,6 +57,13 @@ path = "../tokeira-types"
 [dependencies.tokeira-projection]
 path = "../tokeira-projection"
 
+[dependencies.tokeira-conformance]
+workspace = true
+optional = true
+
+[features]
+conformance = ["dep:tokeira-conformance"]
+
 [dev-dependencies]
 metrics-util.workspace = true
 proptest = "1"

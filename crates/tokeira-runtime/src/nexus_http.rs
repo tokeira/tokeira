@@ -354,9 +354,9 @@ impl HttpNexusCompletionClient {
 /// `408`/`429` are the retryable 4xx (`retryable4xxErrorTypes`, `nexus_invocation.go:22 @
 /// v1.31.0`); `500`/`503`/`520` are retryable 5xx; `400`/`401`/`403`/`404`/`409`/`501`
 /// are terminal handler errors. NOTE: the per-type `HandlerError.Retryable()` default
-/// lives in the external `github.com/nexus-rpc/sdk-go v0.6.0` (not in the v1.31.0
-/// checkout); the `409`/`501` terminal classification follows the SDK's conventional
-/// permanent-error set and is flagged for reconfirmation in the Wave 8 conformance pass.
+/// lives in the external `github.com/nexus-rpc/sdk-go v0.6.0` pinned by v1.31.0; the
+/// status-to-type mapping below is the exact table in
+/// `common/nexus/nexusrpc/client.go:425-451 @ v1.31.0`.
 /// Render an error plus its full `source` chain, so a transport failure surfaces its root
 /// cause (e.g. `... -> tcp connect error -> Connection refused (os error 61)` on a specific
 /// address) rather than reqwest's opaque "error sending request for url (...)".
@@ -372,25 +372,70 @@ fn error_chain(err: &dyn std::error::Error) -> String {
 }
 
 /// Map an HTTP status code to the Nexus `HandlerErrorType` string the SDK uses, mirroring
-/// `httpStatusCodeToHandlerErrorType` (`common/nexus/nexusrpc/client.go @ v1.31.0`; the
-/// per-status table itself lives in the external `github.com/nexus-rpc/sdk-go`, like the
-/// retry-default note on [`mapped_handler_error_retryable`]). An unmapped status reports
-/// `INTERNAL`, matching the SDK surfacing an `UnexpectedResponseError` as an internal
-/// handler error. The non-`400` rows follow the SDK's conventional status↔type set and are
-/// flagged for reconfirmation alongside the Wave 8 conformance pass.
+/// `httpStatusCodeToHandlerErrorType` (`common/nexus/nexusrpc/client.go:425-451 @
+/// v1.31.0`). An unmapped status reports `INTERNAL` only as a defensive diagnostic
+/// fallback; the completion path classifies it as `UnexpectedResponseError`, not as a
+/// typed handler error.
 fn handler_error_type_for_status(status: u16) -> &'static str {
     match status {
         400 => "BAD_REQUEST",
         401 => "UNAUTHENTICATED",
         403 => "UNAUTHORIZED",
         404 => "NOT_FOUND",
+        408 => "REQUEST_TIMEOUT",
+        409 => "CONFLICT",
         429 => "RESOURCE_EXHAUSTED",
         500 => "INTERNAL",
         501 => "NOT_IMPLEMENTED",
         503 => "UNAVAILABLE",
-        504 => "UPSTREAM_TIMEOUT",
+        520 => "UPSTREAM_TIMEOUT",
         _ => "INTERNAL",
     }
+}
+
+/// Render a completion-handler HTTP failure as the error text Temporal records in
+/// callback mutable state.
+///
+/// v1.31.0's completion client converts a JSON `nexus.Failure` back into an error before
+/// the callback state machine stores `err.Error()`. A typed `nexus.HandlerError` therefore
+/// becomes `handler error (<TYPE>): <message>`; persisting the raw status/body would leak a
+/// transport representation through `DescribeWorkflowExecution` instead
+/// (`common/nexus/nexusrpc/client.go:86-118` and
+/// `components/callbacks/statemachine.go:216-230 @ v1.31.0`).
+fn completion_error_detail(status: u16, content_type: Option<&str>, body: &str) -> String {
+    let mapped_type = handler_error_type_for_status(status);
+    let is_json = content_type
+        .map(parse_media_type)
+        .is_some_and(|(media_type, _)| media_type == CONTENT_TYPE_JSON);
+
+    if mapped_handler_error_retryable(status).is_some() {
+        if is_json
+            && let Ok(failure) = serde_json::from_str::<NexusHttpFailureBody>(body)
+            && failure.metadata.get("type").map(String::as_str) == Some("nexus.HandlerError")
+        {
+            let error_type = failure
+                .details
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(mapped_type);
+            let mut detail = format!("handler error ({error_type})");
+            if !failure.message.is_empty() {
+                detail.push_str(": ");
+                detail.push_str(&failure.message);
+            }
+            return detail;
+        }
+
+        // The Nexus client still returns a typed HandlerError when the response body
+        // is absent, malformed, or not itself a serialized HandlerError. Its public
+        // error text is status-derived and intentionally excludes the raw body.
+        return format!("handler error ({mapped_type})");
+    }
+
+    // An unmapped status is an UnexpectedResponseError rather than a HandlerError.
+    // Preserve the diagnostic body for that compatibility class.
+    format!("nexus completion status {status}: {body}")
 }
 
 fn mapped_handler_error_retryable(status: u16) -> Option<bool> {
@@ -465,8 +510,13 @@ impl NexusCompletionClient for HttpNexusCompletionClient {
             return Ok(CompletionDeliveryOutcome::Delivered);
         }
 
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let detail_body = response.text().await.unwrap_or_default();
-        let detail = format!("nexus completion status {code}: {detail_body}");
+        let detail = completion_error_detail(code, content_type.as_deref(), &detail_body);
         let retryable = match mapped_handler_error_retryable(code) {
             // Mapped handler error: the header overrides the per-type default.
             Some(default) => retry_override.unwrap_or(default),
@@ -1235,6 +1285,25 @@ mod tests {
         assert!(
             matches!(outcome, CompletionDeliveryOutcome::RetryableError { .. }),
             "got {outcome:?}"
+        );
+    }
+
+    /// A Nexus `HandlerError` response is recorded using the error text produced by
+    /// the v1.31.0 Nexus failure converter, not as an opaque HTTP status/body dump.
+    /// This is the value `DescribeWorkflowExecution.CallbackInfo` exposes after a
+    /// retryable callback attempt (`components/callbacks/statemachine.go @ v1.31.0`).
+    #[tokio::test]
+    async fn completion_handler_error_body_surfaces_converted_error_text() {
+        let outcome = deliver_against(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"message\":\"intentional error\",\"metadata\":{\"type\":\"nexus.HandlerError\"},\"details\":{\"type\":\"INTERNAL\"}}",
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            CompletionDeliveryOutcome::RetryableError {
+                detail: "handler error (INTERNAL): intentional error".to_string(),
+            }
         );
     }
 

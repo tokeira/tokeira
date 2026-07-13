@@ -65,10 +65,13 @@ const SPECULATIVE_WFT_SCHEDULE_TO_START_TIMEOUT: Duration = Duration::seconds(5)
 /// (`service/history/workflow/mutable_state_impl.go @ v1.31.0`): completed → the
 /// first result payload; failed → the failure; canceled → cancellation details;
 /// terminated/timed-out → a synthesized failure (synthesis happens in the runtime,
-/// so the kernel only marks the variant); continued-as-new has no upstream mapping
-/// (v1.31.0 returns an internal error) and is forwarded as its own variant so the
-/// runtime can fail the operation rather than hang the caller. A non-terminal event
-/// yields `None` (the callback is not dispatched).
+/// so the kernel only marks the variant). A continuation close yields `None`:
+/// continue-as-new and retry-in-progress failure/timeout carry callbacks into the
+/// successor instead of completing them. This is the split enforced by
+/// `ApplyWorkflowExecutionContinuedAsNewEvent`, `ApplyWorkflowExecutionFailedEvent`,
+/// and `ApplyWorkflowExecutionTimedoutEvent`
+/// (`service/history/workflow/mutable_state_impl.go @ v1.31.0`). Any other
+/// non-terminal event also yields `None`.
 ///
 /// Public so the runtime's completion-callback retry scanner re-derives a re-fired
 /// callback's outcome from the *same* terminal event (read back from history) and the
@@ -81,6 +84,10 @@ pub fn callback_completion_outcome(kind: &HistoryEventKind) -> Option<CallbackCo
                 result: result.0.first().cloned(),
             })
         }
+        HistoryEventKind::WorkflowExecutionFailed {
+            retry_state: RetryState::InProgress,
+            ..
+        } => None,
         HistoryEventKind::WorkflowExecutionFailed { failure, .. } => {
             Some(CallbackCompletionOutcome::Failed {
                 failure: failure.clone(),
@@ -94,12 +101,14 @@ pub fn callback_completion_outcome(kind: &HistoryEventKind) -> Option<CallbackCo
         HistoryEventKind::WorkflowExecutionTerminated { .. } => {
             Some(CallbackCompletionOutcome::Terminated)
         }
+        HistoryEventKind::WorkflowExecutionTimedOut {
+            retry_state: RetryState::InProgress,
+            ..
+        } => None,
         HistoryEventKind::WorkflowExecutionTimedOut { .. } => {
             Some(CallbackCompletionOutcome::TimedOut)
         }
-        HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => {
-            Some(CallbackCompletionOutcome::ContinuedAsNew)
-        }
+        HistoryEventKind::WorkflowExecutionContinuedAsNew { .. } => None,
         _ => None,
     }
 }
@@ -3519,9 +3528,16 @@ impl BasicKernel {
 
         let mut builder = TransitionBuilder::new(state, req.now);
         let callback = &mut builder.state.completion_callbacks[req.callback_index];
+        // Attempt counts and completion time advance for every executor result,
+        // including success. Temporal's callback state machine increments the
+        // attempt before recording the result, and Describe exposes both values
+        // (`components/callbacks/statemachine.go @ v1.31.0`).
+        callback.attempt += 1;
+        callback.last_attempt_complete_time = Some(req.now);
         match req.outcome {
             CallbackAttemptOutcome::Succeeded => {
                 callback.state = crate::state::CallbackState::Succeeded;
+                callback.last_attempt_failure = None;
                 callback.next_attempt_at = None;
             }
             CallbackAttemptOutcome::RetryableFailure {
@@ -3529,7 +3545,6 @@ impl BasicKernel {
                 next_attempt_at,
             } => {
                 callback.state = crate::state::CallbackState::BackingOff;
-                callback.attempt += 1;
                 callback.last_attempt_failure = Some(failure);
                 callback.next_attempt_at = Some(next_attempt_at);
             }

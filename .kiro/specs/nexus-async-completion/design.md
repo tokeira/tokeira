@@ -26,10 +26,11 @@ gRPC-broker Nexus transport:
    resolves the address up front from `NexusCompletionConfig.system_callback_url`. The
    `temporal://system` sentinel remains the *stored* callback URL for an in-cluster handler **workflow**
    (resolved to the same listener at fire time, item 2).
-2. **Handler-close firing** — when a tokeira workflow that carries a Nexus completion callback closes,
-   the runtime fires the callback: it builds the outcome from the workflow's terminal event and, for an
-   in-cluster (`temporal://system`) callback, delivers it **in-process** to the originator's pending
-   operation; delivery advances a durable callback lifecycle with bounded retry/backoff.
+2. **Handler-close firing** — when a tokeira workflow that carries a Nexus completion callback reaches
+   a chain-terminal close, the runtime fires the callback: it builds the outcome from the workflow's
+   terminal event and, for an in-cluster (`temporal://system`) callback, delivers it **in-process** to
+   the originator's pending operation; delivery advances a durable callback lifecycle with bounded
+   retry/backoff. Continuation closes preserve the callback in `Standby` for the successor.
 3. **Originator resolution** — delivery submits the existing `Command::NexusOperationResolved`
    (`Completed`/`Failed`/`Canceled`) to the originator run, which records the terminal
    `NexusOperation*` event and schedules a workflow task. This reuses the resolution machinery already
@@ -174,6 +175,12 @@ round-trip (the *poll/respond* token) is unchanged.
   - `WorkflowExecutionFailed` / `TimedOut` / `Terminated` → `Failure { failure }` (the terminal
     failure; terminated/timed-out synthesize the v1.31.0 failure shape).
   - `WorkflowExecutionCanceled` → `Canceled { failure }` ("operation canceled").
+  - `WorkflowExecutionContinuedAsNew`, plus `WorkflowExecutionFailed` or
+    `WorkflowExecutionTimedOut` with retry state `InProgress`, produce no callback outcome and no
+    dispatch. Temporal carries the callback into the successor on these paths
+    (`ApplyWorkflowExecutionContinuedAsNewEvent`, `ApplyWorkflowExecutionFailedEvent`,
+    `ApplyWorkflowExecutionTimedoutEvent`, and `retry.go @ v1.31.0`). The kernel may clamp eligibility
+    to false here because the closing event contains the authoritative retry/continuation decision.
   This is derived data available at close; including it keeps the kernel free of result-lookup I/O
   and the runtime free of terminal-event interpretation.
 - **Runtime** (`DispatchCompletionCallback` handler, replacing the no-op stub): for each callback whose
@@ -328,11 +335,12 @@ a wrong version is rejected on decode.
 
 **Validates: Requirements 1.1, 1.2, 1.4, 1.5**
 
-### Property 2: A closed workflow delivers exactly the matching terminal resolution
+### Property 2: A chain-terminal workflow delivers exactly the matching terminal resolution
 
-For a workflow that closes carrying a `temporal://system` Nexus completion callback, the runtime
-submits exactly one `NexusOperationResolved` to the originator whose variant matches the close:
-completed→`Completed{result}`, failed/timed-out/terminated→`Failed{failure}`, canceled→`Canceled`.
+For a workflow that reaches a chain-terminal close carrying a `temporal://system` Nexus completion
+callback, the runtime submits exactly one `NexusOperationResolved` to the originator whose variant
+matches the close: completed→`Completed{result}`, non-retrying failed/timed-out/terminated→
+`Failed{failure}`, canceled→`Canceled`.
 
 **Validates: Requirements 2.1, 2.2, 2.3, 4.1, 4.2, 4.3**
 
@@ -346,12 +354,15 @@ single delivery.
 
 ### Property 4: Callback lifecycle is well-formed and bounded
 
-A callback advances `Standby→Scheduled` on close; a delivery attempt moves it to `Succeeded` (terminal),
-`BackingOff` (with `attempt` incremented and `next_attempt_at` in the future), or `Failed` (terminal);
-`BackingOff` is re-fired only after `next_attempt_at` and only up to the configured max attempts; a
-`Succeeded`/`Failed` callback is never re-fired.
+A callback advances `Standby→Scheduled` only on a chain-terminal close; a delivery attempt moves it to
+`Succeeded` (terminal), `BackingOff` (with `attempt` incremented and `next_attempt_at` in the future),
+or `Failed` (terminal). Every outcome increments `attempt` and records
+`last_attempt_complete_time`; success clears the prior failure. A Nexus handler failure is decoded to
+the v1.31.0 handler-error text before being persisted. `BackingOff` is re-fired only after
+`next_attempt_at` and only up to the configured max attempts; a `Succeeded`/`Failed` callback is never
+re-fired.
 
-**Validates: Requirements 2.1, 2.4, 2.5**
+**Validates: Requirements 2.1, 2.4, 2.5, 2.8, 6.1**
 
 ### Property 5: Completion token round-trip
 
@@ -370,7 +381,8 @@ namespace).
 ### Property 7: Describe reflects callback state
 
 After a delivery attempt, `DescribeWorkflowExecution.callbacks` reports the callback's current
-`state`, `attempt`, and `last_attempt_failure`.
+`state`, one-based `attempt`, `last_attempt_complete_time`, and `last_attempt_failure`; a successful
+attempt clears the prior failure.
 
 **Validates: Requirements 6.1**
 
@@ -390,6 +402,23 @@ token addressing an absent/already-resolved op returns a not-found handler resul
 second event.
 
 **Validates: Requirements 3.1, 3.3, 3.4, 3.5, 5.2**
+
+### Property 10: Continuation closes preserve callbacks for the successor
+
+For any `Standby` completion callback, closing by continue-as-new or by a failure/timeout whose retry
+state is `InProgress` emits no `DispatchCompletionCallback`, leaves the predecessor's callback
+unscheduled, and gives the successor the same callback in `Standby`. A corresponding chain-terminal
+close emits exactly one dispatch per `Standby` callback.
+
+**Validates: Requirements 2.1, 2.6, 2.7**
+
+### Property 11: Due callback retries do not head-of-line block
+
+For any two `BackingOff` callbacks whose retry deadlines have passed, the scanner starts both
+delivery effects without waiting for either handler response. Holding both responses until both
+requests have arrived therefore makes progress rather than deadlocking the scan.
+
+**Validates: Requirement 2.9**
 
 ## Error Handling
 

@@ -78,6 +78,7 @@ fn completion_callback() -> CompletionCallback {
         state: CallbackState::Standby,
         attempt: 0,
         last_attempt_failure: None,
+        last_attempt_complete_time: None,
         next_attempt_at: None,
     }
 }
@@ -6655,7 +6656,7 @@ fn dispatch_completion_callback_outcome_canceled() {
 }
 
 #[test]
-fn dispatch_completion_callback_outcome_continued_as_new() {
+fn continued_as_new_preserves_completion_callback_in_standby() {
     let WorkflowCommand::ContinueAsNew { .. } = make_continue_as_new_command() else {
         unreachable!("make_continue_as_new_command builds a ContinueAsNew command");
     };
@@ -6663,9 +6664,15 @@ fn dispatch_completion_callback_outcome_continued_as_new() {
         make_started_wft_with_standby_callback(),
         vec![make_continue_as_new_command()],
     );
+    assert!(
+        !transition
+            .dispatch_ops
+            .iter()
+            .any(|op| matches!(op, DispatchOp::DispatchCompletionCallback { .. }))
+    );
     assert_eq!(
-        single_dispatched_outcome(&transition),
-        CallbackCompletionOutcome::ContinuedAsNew
+        transition.next_state.completion_callbacks[0].state,
+        CallbackState::Standby
     );
 }
 
@@ -6739,7 +6746,8 @@ fn completion_callback_attempted_succeeded_is_terminal() {
 
     let callback = &transition.next_state.completion_callbacks[0];
     assert_eq!(callback.state, CallbackState::Succeeded);
-    assert_eq!(callback.attempt, 0);
+    assert_eq!(callback.attempt, 1);
+    assert_eq!(callback.last_attempt_complete_time, Some(now()));
     assert_eq!(callback.next_attempt_at, None);
     assert_eq!(callback.last_attempt_failure, None);
     // No history event and no dispatch op: callback lifecycle is mutable state only.
@@ -6770,6 +6778,7 @@ fn completion_callback_attempted_retryable_backs_off() {
     let callback = &transition.next_state.completion_callbacks[0];
     assert_eq!(callback.state, CallbackState::BackingOff);
     assert_eq!(callback.attempt, 1);
+    assert_eq!(callback.last_attempt_complete_time, Some(now()));
     assert_eq!(callback.next_attempt_at, Some(retry_at));
     assert_eq!(callback.last_attempt_failure, Some(payload("503")));
     assert!(transition.history_events.is_empty());
@@ -6790,6 +6799,8 @@ fn completion_callback_attempted_non_retryable_is_terminal() {
 
     let callback = &transition.next_state.completion_callbacks[0];
     assert_eq!(callback.state, CallbackState::Failed);
+    assert_eq!(callback.attempt, 1);
+    assert_eq!(callback.last_attempt_complete_time, Some(now()));
     assert_eq!(callback.next_attempt_at, None);
     assert_eq!(callback.last_attempt_failure, Some(payload("400")));
     assert!(transition.history_events.is_empty());

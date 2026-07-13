@@ -307,6 +307,38 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
   - Operator re-run of `^TestNexusWorkflowTestSuite` async-completion cases; revisit the deferred-skip
     async-completion-callback tests.
 
+- [x] 9. Tier 5.32 correction — continuation closes carry callbacks forward
+  - [x] 9.1 Exploration property: continuation closes do not dispatch callbacks
+    - Before changing the implementation, generate `Standby` completion callbacks and close by
+      continue-as-new or retry-in-progress failure/timeout; assert zero
+      `DispatchCompletionCallback` operations and callback state remains `Standby`. Run against the
+      unfixed kernel and record the failing counterexample.
+    - _Feature: nexus-async-completion, Property 10_
+    - _Requirements: 2.6, 2.7_
+  - [x] 9.2 Correct callback eligibility in `tokeira-kernel`
+    - Make `callback_completion_outcome` return no eligible outcome for continue-as-new and
+      retry-in-progress failure/timeout. Keep terminal completion/cancellation/termination and
+      non-retrying failure/timeout behavior unchanged. Cite
+      `mutable_state_impl.go` and `retry.go @ v1.31.0` at the decision.
+    - _Requirements: 2.1, 2.2, 2.3, 2.6, 2.7_
+  - [x] 9.3 Preservation and successor-carryover property tests
+    - Generate callback sets and assert chain-terminal closes dispatch exactly once per `Standby`
+      callback while continuation successors inherit the same callbacks in `Standby`.
+    - _Feature: nexus-async-completion, Properties 2, 4, 10_
+    - _Requirements: 2.1, 2.2, 2.3, 2.6, 2.7_
+  - [x] 9.4 Complete callback attempt metadata
+    - Persist `last_attempt_complete_time`, increment `attempt` for every success/failure result,
+      clear a prior failure on success, and surface the timestamp through
+      `DescribeWorkflowExecution.CallbackInfo`.
+    - _Feature: nexus-async-completion, Properties 4, 7_
+    - _Requirements: 2.4, 2.5, 6.1_
+  - [x] 9.5 Preserve Nexus handler failures and concurrent retry progress
+    - Decode typed Nexus handler-error responses into the v1.31.0 `err.Error()` text before recording
+      `last_attempt_failure`. Dispatch due retries as independent runtime effects so one callback
+      cannot head-of-line block the scanner. Pin both behaviors with focused regressions.
+    - _Feature: nexus-async-completion, Properties 4, 11_
+    - _Requirements: 2.8, 2.9_
+
 ## Task Dependency Graph
 
 ```json
@@ -320,7 +352,8 @@ is hand-rolled on `hyper` (no new dependency); the lockfile is bumped to `hyper 
     { "wave": 5, "tasks": ["5.1", "5.2", "5.3", "5.4", "5.5"] },
     { "wave": 6, "tasks": ["6"] },
     { "wave": 7, "tasks": ["7.1"] },
-    { "wave": 8, "tasks": ["8"] }
+    { "wave": 8, "tasks": ["8"] },
+    { "wave": 9, "tasks": ["9.1", "9.2", "9.3", "9.4", "9.5"] }
   ]
 }
 ```
@@ -332,8 +365,9 @@ and the final gate (W8). Config (W0) is a prerequisite of W4/W5.
 
 ## Notes
 
-- Every correctness property P1–P9 maps to a required test task: P1→4.4, P2→1.7, P3→4.5, P4→1.6,
-  P5→3.2, P6→4.5, P7→5.5, P8→7.1, P9→5.4.
+- Every correctness property P1–P11 maps to a required test task: P1→4.4, P2→1.7/9.3, P3→4.5,
+  P4→1.6/9.3/9.5, P5→3.2, P6→4.5, P7→5.5/9.4, P8→7.1, P9→5.4,
+  P10→9.1/9.3, P11→9.5.
 - Reuses (no new work): `Command::NexusOperationResolved` → `NexusOperation*` terminal events
   (`kernel-nexus-operations`), the `CompletionCallback`/`CallbackState` model, and the
   `RespondNexusTaskFailed` failure conversion (`translate/nexus.rs`).

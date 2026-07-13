@@ -46,7 +46,7 @@ use tokeira_runtime::{
     UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig,
     VersionMetadataView, VersionView, WorkerRegistry, WorkflowActivation, WorkflowDeletion,
     WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus, compute_matching_times,
-    decide_overlap, schedule_workflow_id,
+    decide_overlap, schedule_workflow_id, scheduled_workflow_search_attributes,
 };
 use tokeira_storage::{
     ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
@@ -2148,9 +2148,13 @@ impl WorkflowService {
             workflow_type: entry.action.start_workflow.workflow_type.clone(),
             task_queue: entry.action.start_workflow.task_queue.clone(),
             input: entry.action.start_workflow.input.clone(),
-            header: None,
+            header: entry.action.start_workflow.header.clone(),
             memo: entry.action.start_workflow.memo.clone(),
-            search_attributes: entry.action.start_workflow.search_attributes.clone(),
+            search_attributes: scheduled_workflow_search_attributes(
+                &entry.action.start_workflow.search_attributes,
+                schedule_id,
+                nominal_time,
+            ),
             workflow_execution_timeout: entry.action.start_workflow.workflow_execution_timeout,
             workflow_run_timeout: entry.action.start_workflow.workflow_run_timeout,
             workflow_task_timeout: entry
@@ -2168,7 +2172,7 @@ impl WorkflowService {
             versioning_override: None,
             workflow_start_delay: None,
             completion_callbacks: Vec::new(),
-            user_metadata: None,
+            user_metadata: entry.action.start_workflow.user_metadata.clone(),
             links: Vec::new(),
             on_conflict_options: None,
             priority: None,
@@ -2184,16 +2188,19 @@ impl WorkflowService {
             root_workflow_id: None,
             root_run_id: None,
             original_execution_run_id: Some(run_id),
-            continued_failure: None,
-            last_completion_result: None,
+            continued_failure: entry.continued_failure.clone(),
+            last_completion_result: entry.last_completion_result.clone(),
             first_run_started_at: None,
             request: schedule_request_context(actual_time),
             now: actual_time,
             client_cron_schedule: None,
-            cron_schedule: Some(schedule_id.0.clone()),
+            // Schedule actions are ordinary starts, not Workflow Cron starts
+            // (`service/worker/scheduler/workflow.go @ v1.31.0`).
+            cron_schedule: None,
             reserved_poller_identity: None,
             eager_execution_accepted: false,
         };
+        self.schedule_store.acquire_start_permit(namespace_id).await;
         let outcome = self
             .runtime
             .start_workflow_with_policy(request)

@@ -271,7 +271,7 @@ fn busy_workflow_resource_exhausted_status(message: String) -> Status {
     )
 }
 
-fn workflow_already_started_status(message: String, run_id: String) -> Status {
+pub(crate) fn workflow_already_started_status(message: String, run_id: String) -> Status {
     use prost::Message as _;
     use tokeira_proto::public::temporal::api::errordetails::v1::WorkflowExecutionAlreadyStartedFailure;
 

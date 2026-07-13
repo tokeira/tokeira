@@ -57,6 +57,8 @@ impl ScheduleFilter {
 
 #[derive(Clone, Debug, PartialEq)]
 enum ScheduleFilterExpr {
+    And(Box<ScheduleFilterExpr>, Box<ScheduleFilterExpr>),
+    Or(Box<ScheduleFilterExpr>, Box<ScheduleFilterExpr>),
     Eq {
         field: ScheduleField,
         value: ScheduleFilterValue,
@@ -77,6 +79,14 @@ impl ScheduleFilterExpr {
         search_attributes: &SearchAttributes,
     ) -> bool {
         match self {
+            Self::And(left, right) => {
+                left.matches(schedule_id, namespace_id, paused, notes, search_attributes)
+                    && right.matches(schedule_id, namespace_id, paused, notes, search_attributes)
+            }
+            Self::Or(left, right) => {
+                left.matches(schedule_id, namespace_id, paused, notes, search_attributes)
+                    || right.matches(schedule_id, namespace_id, paused, notes, search_attributes)
+            }
             Self::Eq { field, value } => field
                 .value(schedule_id, namespace_id, paused, notes, search_attributes)
                 .is_some_and(|actual| actual == *value),
@@ -101,7 +111,7 @@ impl ScheduleField {
         match input.trim() {
             "schedule_id" | "ScheduleId" => Self::ScheduleId,
             "namespace" | "Namespace" => Self::Namespace,
-            "paused" | "Paused" => Self::Paused,
+            "paused" | "Paused" | "TemporalSchedulePaused" | "SchedulePaused" => Self::Paused,
             "notes" | "Notes" => Self::Notes,
             other => Self::SearchAttribute(other.to_string()),
         }
@@ -163,26 +173,41 @@ pub fn compile_schedule_filter(query: &str) -> Result<ScheduleFilter> {
     if input.is_empty() {
         return Err(anyhow!("unsupported schedule query"));
     }
+    Ok(ScheduleFilter {
+        expr: compile_schedule_expr(input)?,
+    })
+}
+
+fn compile_schedule_expr(input: &str) -> Result<ScheduleFilterExpr> {
+    let input = strip_enclosing_parentheses(input.trim());
+    if let Some((left, right)) = split_top_level(input, " AND ") {
+        return Ok(ScheduleFilterExpr::And(
+            Box::new(compile_schedule_expr(left)?),
+            Box::new(compile_schedule_expr(right)?),
+        ));
+    }
+    if let Some((left, right)) = split_top_level(input, " OR ") {
+        return Ok(ScheduleFilterExpr::Or(
+            Box::new(compile_schedule_expr(left)?),
+            Box::new(compile_schedule_expr(right)?),
+        ));
+    }
     if let Some((field, values)) = parse_schedule_in(input) {
-        return Ok(ScheduleFilter {
-            expr: ScheduleFilterExpr::In {
-                field: ScheduleField::parse(field),
-                values: values
-                    .into_iter()
-                    .map(|value| parse_schedule_value(&value))
-                    .collect(),
-            },
+        return Ok(ScheduleFilterExpr::In {
+            field: ScheduleField::parse(field),
+            values: values
+                .into_iter()
+                .map(|value| parse_schedule_value(&value))
+                .collect(),
         });
     }
     if let Some((field, value)) = input.split_once('=') {
         if field.contains('!') || value.contains('=') {
             return Err(anyhow!("unsupported schedule query"));
         }
-        return Ok(ScheduleFilter {
-            expr: ScheduleFilterExpr::Eq {
-                field: ScheduleField::parse(field),
-                value: parse_schedule_value(value),
-            },
+        return Ok(ScheduleFilterExpr::Eq {
+            field: ScheduleField::parse(field),
+            value: parse_schedule_value(value),
         });
     }
     Err(anyhow!("unsupported schedule query"))
@@ -665,6 +690,23 @@ mod tests {
     use super::*;
     use crate::memory::InMemoryVisibilityStore;
     use proptest::prelude::*;
+
+    #[test]
+    fn schedule_filter_conjoins_custom_and_paused_attributes() {
+        let namespace_id = NamespaceId(uuid::Uuid::from_u128(1));
+        let mut attributes = SearchAttributes::default();
+        attributes.0.insert(
+            "CustomKeywordField".to_string(),
+            SearchAttrValue::Keyword("schedule sa value".to_string()),
+        );
+        let filter = compile_schedule_filter(
+            "CustomKeywordField = 'schedule sa value' AND TemporalSchedulePaused = false",
+        )
+        .expect("supported schedule conjunction");
+
+        assert!(filter.matches("schedule", namespace_id, false, "", &attributes));
+        assert!(!filter.matches("schedule", namespace_id, true, "", &attributes));
+    }
 
     // The legacy list-closed conversion emits
     // `CloseTime BETWEEN 'a' AND 'b' AND WorkflowId = 'x'` — the conjunction

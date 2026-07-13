@@ -7,9 +7,10 @@
 //! translate protobufs without owning schedule behavior.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
     sync::Arc,
+    time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{DateTime, Offset as _, Utc};
@@ -23,8 +24,9 @@ use tokeira_kernel::{
 use tokeira_projection::filter::compile_schedule_filter;
 use tokeira_storage::RunRepository;
 use tokeira_types::{
-    ExecutionRef, ExecutionStatus, Memo, NamespaceId, Payloads, RequestContext, RequestId, RunId,
-    RunKey, SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
+    ExecutionRef, ExecutionStatus, Headers, Memo, NamespaceId, Payload, Payloads, RequestContext,
+    RequestId, RunId, RunKey, SearchAttrValue, SearchAttributes, TaskQueueName, WorkflowId,
+    WorkflowType,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -45,6 +47,12 @@ pub struct ScheduleEntry {
     pub info: ScheduleInfo,
     pub memo: Memo,
     pub search_attributes: SearchAttributes,
+    /// Result from the most recent successful scheduled run, carried into the
+    /// next start as Temporal's `LastCompletionResult`.
+    pub last_completion_result: Option<Payloads>,
+    /// Failure from the most recent unsuccessful scheduled run, carried into
+    /// the next start as Temporal's `ContinuedFailure`.
+    pub continued_failure: Option<Payload>,
     pub conflict_token: Vec<u8>,
 }
 
@@ -95,12 +103,16 @@ pub struct StartWorkflowAction {
     pub workflow_type: WorkflowType,
     pub task_queue: TaskQueueName,
     pub input: Payloads,
+    /// Headers authored onto each workflow start fired by this schedule.
+    pub header: Option<Headers>,
     pub workflow_execution_timeout: Option<Duration>,
     pub workflow_run_timeout: Option<Duration>,
     pub workflow_task_timeout: Option<Duration>,
     pub retry_policy: Option<tokeira_types::RetryPolicy>,
     pub memo: Memo,
     pub search_attributes: SearchAttributes,
+    /// UI-facing metadata authored onto each scheduled workflow start.
+    pub user_metadata: Option<tokeira_kernel::UserMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,6 +263,7 @@ pub enum ScheduleError {
 #[derive(Default)]
 pub struct ScheduleStore {
     schedules: DashMap<(NamespaceId, ScheduleId), ScheduleEntry>,
+    next_start: tokio::sync::Mutex<HashMap<NamespaceId, Instant>>,
 }
 
 #[derive(Debug, Error)]
@@ -413,6 +426,47 @@ impl ScheduleStore {
             .map(|entry| entry.value().clone())
             .collect()
     }
+
+    /// Wait until this process may start another scheduled workflow in the
+    /// namespace.
+    ///
+    /// Temporal applies `worker.schedulerNamespaceStartWorkflowRPS` to the
+    /// scheduler's start activity (`service/worker/scheduler/activities.go:68-99`
+    /// and `fx.go:116-133 @ v1.31.0`). This limiter is intentionally volatile:
+    /// it controls liveness and load only, never whether an action is correct or
+    /// durable.
+    pub async fn acquire_start_permit(&self, namespace_id: NamespaceId) {
+        let requests_per_second = schedule_namespace_start_workflow_rps();
+        let interval = StdDuration::from_secs_f64(1.0 / requests_per_second);
+        let now = Instant::now();
+        let wait = {
+            let mut next_start = self.next_start.lock().await;
+            let next = next_start.entry(namespace_id).or_insert(now);
+            let start_at = (*next).max(now);
+            *next = start_at + interval;
+            start_at.saturating_duration_since(now)
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+/// v1.31.0's per-namespace schedule-start default
+/// (`common/dynamicconfig/constants.go:3136-3140 @ v1.31.0`).
+const SCHEDULE_NAMESPACE_START_WORKFLOW_RPS: f64 = 30.0;
+
+#[cfg(not(feature = "conformance"))]
+fn schedule_namespace_start_workflow_rps() -> f64 {
+    SCHEDULE_NAMESPACE_START_WORKFLOW_RPS
+}
+
+#[cfg(feature = "conformance")]
+fn schedule_namespace_start_workflow_rps() -> f64 {
+    tokeira_conformance::overrides()
+        .get_f64("worker.schedulerNamespaceStartWorkflowRPS")
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or(SCHEDULE_NAMESPACE_START_WORKFLOW_RPS)
 }
 
 /// Decision the engine acts on for a single due action, after evaluating the
@@ -472,6 +526,29 @@ pub fn schedule_workflow_id(
         base_workflow_id.0,
         nominal_time.unix_timestamp()
     ))
+}
+
+/// Add the two predefined attributes that link a scheduled workflow back to
+/// its schedule and nominal firing time.
+///
+/// v1.31.0 overlays these server-owned values on every schedule action start,
+/// replacing any same-named authored values
+/// (`service/worker/scheduler/workflow.go:1526-1540 @ v1.31.0`).
+pub fn scheduled_workflow_search_attributes(
+    authored: &SearchAttributes,
+    schedule_id: &ScheduleId,
+    nominal_time: OffsetDateTime,
+) -> SearchAttributes {
+    let mut attributes = authored.clone();
+    attributes.0.insert(
+        "TemporalScheduledStartTime".to_string(),
+        SearchAttrValue::Datetime(nominal_time),
+    );
+    attributes.0.insert(
+        "TemporalScheduledById".to_string(),
+        SearchAttrValue::Keyword(schedule_id.0.clone()),
+    );
+    attributes
 }
 
 /// Compute the next `count` firing times at or after `now`.
@@ -986,7 +1063,12 @@ pub async fn evaluate_all_schedules<R>(
     reconcile_running_workflows(store, runtime).await;
     for entry in store.all_active_schedules() {
         let schedule_id = entry.schedule_id.clone();
-        let times = compute_matching_times(&entry.spec, last_tick, now, &schedule_id);
+        // A newly-created schedule must not catch a matching boundary that
+        // occurred earlier in the engine's global tick window. Temporal's
+        // scheduler begins action evaluation from the schedule's own creation
+        // state, so the first recorded nominal time is never pre-creation.
+        let window_start = last_tick.max(entry.info.create_time);
+        let times = compute_matching_times(&entry.spec, window_start, now, &schedule_id);
         for nominal_time in times {
             handle_due_action(
                 store,
@@ -1095,6 +1177,40 @@ pub async fn handle_due_action<R>(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletedWorkflowObservation {
+    run_id: RunId,
+    status: ExecutionStatus,
+    result: Option<Payloads>,
+    failure: Option<Payload>,
+}
+
+fn apply_completed_workflows(
+    entry: &mut ScheduleEntry,
+    completed: &[CompletedWorkflowObservation],
+) {
+    for observation in completed {
+        if let Some(action) = entry.info.recent_actions.iter_mut().find(|action| {
+            action
+                .start_workflow_result
+                .as_ref()
+                .is_some_and(|workflow| workflow.run_id == observation.run_id)
+        }) {
+            action.start_workflow_status = workflow_execution_status(observation.status);
+        }
+
+        // Temporal retains the last successful result across a later failure,
+        // while a success clears the carried failure
+        // (`service/worker/scheduler/workflow.go:897-914 @ v1.31.0`).
+        if let Some(result) = &observation.result {
+            entry.last_completion_result = Some(result.clone());
+            entry.continued_failure = None;
+        } else if let Some(failure) = &observation.failure {
+            entry.continued_failure = Some(failure.clone());
+        }
+    }
+}
+
 /// Refresh each schedule's running-workflow set against durable run state, then
 /// react to completions.
 ///
@@ -1111,28 +1227,35 @@ where
         if entry.info.running_workflows.is_empty() {
             continue;
         }
-        let mut completed = false;
+        let mut completed_without_state = false;
+        let mut completed = Vec::new();
         let mut still_running = Vec::new();
         for workflow in &entry.info.running_workflows {
-            let keep = match runtime.repo().load_run(workflow.run_key).await {
-                Ok(LoadedRun::Existing(state)) => state.status == ExecutionStatus::Running,
-                _ => false,
-            };
-            completed |= !keep;
-            if keep {
-                still_running.push(workflow.clone());
+            match runtime.repo().load_run(workflow.run_key).await {
+                Ok(LoadedRun::Existing(state)) if state.status.is_open() => {
+                    still_running.push(workflow.clone());
+                }
+                Ok(LoadedRun::Existing(state)) => completed.push(CompletedWorkflowObservation {
+                    run_id: workflow.run_id,
+                    status: state.status,
+                    result: state.close_result,
+                    failure: state.close_failure,
+                }),
+                _ => completed_without_state = true,
             }
         }
+        let any_completed = completed_without_state || !completed.is_empty();
         let mut buffered_to_run = Vec::new();
         let _ = store.update(entry.namespace_id, &entry.schedule_id, &[], |current| {
             current.info.running_workflows = still_running;
-            if completed && current.policies.pause_on_failure {
+            apply_completed_workflows(current, &completed);
+            if any_completed && current.policies.pause_on_failure {
                 current.state.paused = true;
                 current.state.notes = "paused after scheduled workflow completed".to_string();
             }
             // Only release a buffered action once the schedule is fully idle and
             // not paused, so buffering never lets two runs overlap.
-            if completed
+            if any_completed
                 && current.info.running_workflows.is_empty()
                 && !current.state.paused
                 && let Some(buffered) = current.info.buffered_actions.pop_front()
@@ -1152,6 +1275,18 @@ where
             )
             .await;
         }
+    }
+}
+
+fn workflow_execution_status(status: ExecutionStatus) -> WorkflowExecutionStatus {
+    match status {
+        ExecutionStatus::Running | ExecutionStatus::Paused => WorkflowExecutionStatus::Running,
+        ExecutionStatus::Completed => WorkflowExecutionStatus::Completed,
+        ExecutionStatus::Failed => WorkflowExecutionStatus::Failed,
+        ExecutionStatus::Cancelled => WorkflowExecutionStatus::Cancelled,
+        ExecutionStatus::Terminated => WorkflowExecutionStatus::Terminated,
+        ExecutionStatus::ContinuedAsNew => WorkflowExecutionStatus::ContinuedAsNew,
+        ExecutionStatus::TimedOut => WorkflowExecutionStatus::TimedOut,
     }
 }
 
@@ -1189,9 +1324,13 @@ where
         workflow_type: entry.action.start_workflow.workflow_type.clone(),
         task_queue: entry.action.start_workflow.task_queue.clone(),
         input: entry.action.start_workflow.input.clone(),
-        header: None,
+        header: entry.action.start_workflow.header.clone(),
         memo: entry.action.start_workflow.memo.clone(),
-        search_attributes: entry.action.start_workflow.search_attributes.clone(),
+        search_attributes: scheduled_workflow_search_attributes(
+            &entry.action.start_workflow.search_attributes,
+            schedule_id,
+            nominal_time,
+        ),
         workflow_execution_timeout: entry.action.start_workflow.workflow_execution_timeout,
         workflow_run_timeout: entry.action.start_workflow.workflow_run_timeout,
         workflow_task_timeout: entry
@@ -1209,7 +1348,7 @@ where
         versioning_override: None,
         workflow_start_delay: None,
         completion_callbacks: Vec::new(),
-        user_metadata: None,
+        user_metadata: entry.action.start_workflow.user_metadata.clone(),
         links: Vec::new(),
         on_conflict_options: None,
         priority: None,
@@ -1225,8 +1364,8 @@ where
         root_workflow_id: None,
         root_run_id: None,
         original_execution_run_id: Some(run_id),
-        continued_failure: None,
-        last_completion_result: None,
+        continued_failure: entry.continued_failure.clone(),
+        last_completion_result: entry.last_completion_result.clone(),
         first_run_started_at: None,
         request: RequestContext {
             request_id: RequestId(Uuid::new_v4().to_string()),
@@ -1235,11 +1374,16 @@ where
         },
         now: actual_time,
         client_cron_schedule: None,
-        cron_schedule: Some(schedule_id.0.clone()),
+        // A Schedule firing is not a Workflow Cron execution. v1.31.0's
+        // scheduler starts an ordinary workflow and records schedule linkage in
+        // search attributes/action bookkeeping, never in `cron_schedule`
+        // (`service/worker/scheduler/workflow.go @ v1.31.0`).
+        cron_schedule: None,
         eager_execution_accepted: false,
         reserved_poller_identity: None,
     };
 
+    store.acquire_start_permit(namespace_id).await;
     let outcome = runtime.start_workflow_with_policy(request).await;
     let result = match outcome {
         Ok(StartWorkflowResult::Started {
@@ -1440,12 +1584,14 @@ mod tests {
                     workflow_type: WorkflowType("type".to_string()),
                     task_queue: TaskQueueName("q".to_string()),
                     input: Payloads::default(),
+                    header: None,
                     workflow_execution_timeout: None,
                     workflow_run_timeout: None,
                     workflow_task_timeout: None,
                     retry_policy: None,
                     memo: Memo::default(),
                     search_attributes: SearchAttributes::default(),
+                    user_metadata: None,
                 },
             },
             policies: SchedulePolicies::default(),
@@ -1453,6 +1599,8 @@ mod tests {
             info: ScheduleInfo::new(now),
             memo: Memo::default(),
             search_attributes: SearchAttributes::default(),
+            last_completion_result: None,
+            continued_failure: None,
             conflict_token: Vec::new(),
         }
     }
@@ -1476,6 +1624,83 @@ mod tests {
         assert_eq!(stored.info.buffer_size, 0);
         assert!(stored.info.running_workflows.is_empty());
         assert!(stored.info.recent_actions.is_empty());
+    }
+
+    #[test]
+    fn completed_runs_update_status_and_carry_inputs() {
+        let mut entry = sample_entry("completed-carry");
+        let first_run = RunId::new();
+        let second_run = RunId::new();
+        for run_id in [first_run, second_run] {
+            entry.info.recent_actions.push(ScheduleActionResult {
+                schedule_time: OffsetDateTime::UNIX_EPOCH,
+                actual_time: OffsetDateTime::UNIX_EPOCH,
+                start_workflow_result: Some(WorkflowExecution {
+                    namespace_id: entry.namespace_id,
+                    workflow_id: WorkflowId(format!("wf-{}", run_id.0)),
+                    run_id,
+                    run_key: RunKey::new(),
+                }),
+                start_workflow_status: WorkflowExecutionStatus::Running,
+            });
+        }
+
+        let successful_result = Payloads(vec![Payload::new("success")]);
+        apply_completed_workflows(
+            &mut entry,
+            &[CompletedWorkflowObservation {
+                run_id: first_run,
+                status: ExecutionStatus::Completed,
+                result: Some(successful_result.clone()),
+                failure: None,
+            }],
+        );
+        let failure = Payload::new("failure");
+        apply_completed_workflows(
+            &mut entry,
+            &[CompletedWorkflowObservation {
+                run_id: second_run,
+                status: ExecutionStatus::Failed,
+                result: None,
+                failure: Some(failure.clone()),
+            }],
+        );
+
+        assert_eq!(
+            entry.info.recent_actions[0].start_workflow_status,
+            WorkflowExecutionStatus::Completed
+        );
+        assert_eq!(
+            entry.info.recent_actions[1].start_workflow_status,
+            WorkflowExecutionStatus::Failed
+        );
+        assert_eq!(entry.last_completion_result, Some(successful_result));
+        assert_eq!(entry.continued_failure, Some(failure));
+    }
+
+    #[test]
+    fn scheduled_workflow_attributes_override_authored_linkage() {
+        let nominal_time = OffsetDateTime::UNIX_EPOCH + Duration::seconds(5);
+        let mut authored = SearchAttributes::default();
+        authored.0.insert(
+            "TemporalScheduledById".to_string(),
+            SearchAttrValue::Keyword("forged".to_string()),
+        );
+
+        let result = scheduled_workflow_search_attributes(
+            &authored,
+            &ScheduleId("real-schedule".to_string()),
+            nominal_time,
+        );
+
+        assert_eq!(
+            result.0.get("TemporalScheduledById"),
+            Some(&SearchAttrValue::Keyword("real-schedule".to_string()))
+        );
+        assert_eq!(
+            result.0.get("TemporalScheduledStartTime"),
+            Some(&SearchAttrValue::Datetime(nominal_time))
+        );
     }
 
     #[test]
@@ -1953,6 +2178,33 @@ mod tests {
         .await;
 
         assert!(store.describe(namespace_id, &schedule_id).is_err());
+        shutdown(&mut runtime).await;
+    }
+
+    #[tokio::test]
+    async fn engine_never_fires_a_pre_creation_boundary() {
+        let store = ScheduleStore::new();
+        let mut entry = sample_entry("created-between-ticks");
+        entry.spec.intervals[0].interval = Duration::seconds(5);
+        entry.info.create_time = OffsetDateTime::UNIX_EPOCH + Duration::seconds(3);
+        entry.info.update_time = entry.info.create_time;
+        let namespace_id = entry.namespace_id;
+        let schedule_id = entry.schedule_id.clone();
+        store.create(entry).expect("create");
+        let mut runtime = make_runtime(Arc::new(InMemoryStore::default()));
+
+        evaluate_all_schedules(
+            &store,
+            &runtime,
+            OffsetDateTime::UNIX_EPOCH - Duration::seconds(1),
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(4),
+        )
+        .await;
+
+        let stored = store
+            .describe(namespace_id, &schedule_id)
+            .expect("describe");
+        assert_eq!(stored.info.action_count, 0);
         shutdown(&mut runtime).await;
     }
 

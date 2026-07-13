@@ -35,7 +35,7 @@ use crate::{
     grpc::{
         errors::{
             proto_conversion_status, worker_versioning_v1_disabled_status,
-            worker_versioning_v2_disabled_status,
+            worker_versioning_v2_disabled_status, workflow_already_started_status,
         },
         metadata::metadata_to_header_map,
         translate,
@@ -1813,7 +1813,21 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let store = self.inner.schedule_store();
         let (namespace_id, schedule_id, entry, initial_patch) =
             schedule::create_schedule_request_to_edge(request.into_inner())?;
-        let conflict_token = store.create(entry).map_err(schedule_error_status)?;
+        let conflict_token = match store.create(entry) {
+            Ok(token) => token,
+            Err(ScheduleError::AlreadyExists) => {
+                // V1 schedules are backed by a scheduler workflow in Temporal,
+                // so duplicate creation deliberately preserves the typed
+                // WorkflowExecutionAlreadyStarted detail that SDKs translate to
+                // ErrScheduleAlreadyRunning (`workflow_handler.go:3625-3631 @
+                // v1.31.0`).
+                return Err(workflow_already_started_status(
+                    format!("schedule {:?} is already registered", schedule_id.0),
+                    String::new(),
+                ));
+            }
+            Err(error) => return Err(schedule_error_status(error)),
+        };
         if let Some(patch) = initial_patch {
             self.inner
                 .apply_schedule_patch(namespace_id, &schedule_id, patch)
@@ -1846,8 +1860,18 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::UpdateScheduleRequest>,
     ) -> Result<Response<workflowservice::UpdateScheduleResponse>, Status> {
+        let request = request.into_inner();
+        // Workflow-backed schedules reject every memo update, including an
+        // explicitly empty memo (`service/frontend/workflow_handler.go:4559-4563
+        // @ v1.31.0`). CHASM schedule memo replacement is a different surface.
+        if request.memo.is_some() {
+            return Err(Status::failed_precondition(
+                "memo updates are not supported on workflow-backed schedules",
+            ));
+        }
+        let replace_search_attributes = request.search_attributes.is_some();
         let (namespace_id, schedule_id, token, replacement) =
-            schedule::update_schedule_request_to_edge(request.into_inner())?;
+            schedule::update_schedule_request_to_edge(request)?;
         let store = self.inner.schedule_store();
         store
             .update(namespace_id, &schedule_id, &token, |entry| {
@@ -1855,7 +1879,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 entry.action = replacement.action;
                 entry.policies = replacement.policies;
                 entry.state = replacement.state;
-                entry.search_attributes = replacement.search_attributes;
+                // UpdateSchedule treats absent search attributes as no change;
+                // a present empty map explicitly clears them
+                // (`service/frontend/workflow_handler.go @ v1.31.0`).
+                if replace_search_attributes {
+                    entry.search_attributes = replacement.search_attributes;
+                }
                 entry.info.update_time = OffsetDateTime::now_utc();
             })
             .map_err(schedule_error_status)?;
@@ -1895,7 +1924,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .as_ref()
             .and_then(proto_timestamp_to_time)
             .unwrap_or(start);
-        let times = compute_matching_times(&entry.spec, start, end, &schedule_id);
+        // v1.31.0 repeatedly asks for the next time strictly after StartTime,
+        // while accepting a match equal to EndTime
+        // (`service/worker/scheduler/workflow.go:1119-1137 @ v1.31.0`).
+        let times = compute_matching_times(
+            &entry.spec,
+            start + time::Duration::nanoseconds(1),
+            end,
+            &schedule_id,
+        );
         Ok(Response::new(schedule::matching_times_response_to_proto(
             times,
         )))

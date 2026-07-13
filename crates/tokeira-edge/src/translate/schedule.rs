@@ -10,7 +10,8 @@ use prost_types::{Duration as ProtoDuration, Timestamp};
 use time::{Duration, OffsetDateTime};
 use tokeira_proto::{
     conversions::common::{
-        memo_from_domain, memo_to_domain, payloads_from_domain, payloads_to_domain,
+        headers_from_domain, headers_to_domain, memo_from_domain, memo_to_domain,
+        payload_from_domain, payload_to_domain, payloads_from_domain, payloads_to_domain,
         search_attributes_from_domain, search_attributes_to_domain, task_queue_from_domain,
         to_proto_duration, to_proto_timestamp,
     },
@@ -18,6 +19,7 @@ use tokeira_proto::{
     public::temporal::api::{
         common::v1 as common,
         schedule::{v1 as proto_schedule, v1::schedule_action},
+        sdk::v1 as sdk,
         workflow::v1 as workflow,
     },
     workflowservice,
@@ -29,6 +31,15 @@ use tokeira_types::{
 use tonic::Status;
 
 use crate::translate::to_internal::namespace_id_for;
+
+/// v1.31.0 limits each repeated spec field in the ListSchedules memo view to
+/// ten entries (`service/worker/scheduler/workflow.go:1151-1161 @ v1.31.0`).
+const SCHEDULE_LIST_SPEC_FIELD_LIMIT: usize = 10;
+
+/// Temporal reserves this queue for its per-namespace system worker and
+/// rejects a user Schedule action targeting it
+/// (`common/primitives/task_queues.go:24-44 @ v1.31.0`).
+const PER_NS_WORKER_TASK_QUEUE: &str = "temporal-sys-per-ns-tq";
 
 pub fn create_schedule_request_to_edge(
     request: workflowservice::CreateScheduleRequest,
@@ -69,6 +80,8 @@ pub fn create_schedule_request_to_edge(
                 .map_err(|err| Status::invalid_argument(err.to_string()))?,
             None => SearchAttributes::default(),
         },
+        last_completion_result: None,
+        continued_failure: None,
         conflict_token: Vec::new(),
     };
     Ok((
@@ -117,6 +130,8 @@ pub fn update_schedule_request_to_edge(
                 .map_err(|err| Status::invalid_argument(err.to_string()))?,
             None => SearchAttributes::default(),
         },
+        last_completion_result: None,
+        continued_failure: None,
         conflict_token: request.conflict_token.clone(),
     };
     Ok((namespace_id, schedule_id, request.conflict_token, entry))
@@ -304,7 +319,15 @@ pub fn schedule_spec_to_proto(spec: &domain::ScheduleSpec) -> proto_schedule::Sc
 fn schedule_spec_to_proto_without_timezone_data(
     spec: &domain::ScheduleSpec,
 ) -> proto_schedule::ScheduleSpec {
-    schedule_spec_to_proto_inner(spec, Vec::new())
+    let mut proto = schedule_spec_to_proto_inner(spec, Vec::new());
+    proto
+        .structured_calendar
+        .truncate(SCHEDULE_LIST_SPEC_FIELD_LIMIT);
+    proto.interval.truncate(SCHEDULE_LIST_SPEC_FIELD_LIMIT);
+    proto
+        .exclude_structured_calendar
+        .truncate(SCHEDULE_LIST_SPEC_FIELD_LIMIT);
+    proto
 }
 
 fn schedule_spec_to_proto_inner(
@@ -344,11 +367,6 @@ pub fn schedule_action_to_domain(
             "schedule action must start workflow",
         ));
     };
-    if start.header.is_some() || start.user_metadata.is_some() {
-        return Err(Status::invalid_argument(
-            "schedule action header and user_metadata are not supported",
-        ));
-    }
     if start.versioning_override.is_some() {
         return Err(Status::invalid_argument(
             "schedule action versioning_override is not supported",
@@ -360,6 +378,12 @@ pub fn schedule_action_to_domain(
     let task_queue = start
         .task_queue
         .ok_or_else(|| Status::invalid_argument("task_queue is required"))?;
+    if task_queue.name == PER_NS_WORKER_TASK_QUEUE {
+        return Err(Status::invalid_argument(format!(
+            "cannot use internal per-namespace task queue:{}",
+            task_queue.name
+        )));
+    }
     Ok(domain::ScheduleAction {
         start_workflow: domain::StartWorkflowAction {
             workflow_id: WorkflowId(start.workflow_id),
@@ -370,6 +394,7 @@ pub fn schedule_action_to_domain(
                 .as_ref()
                 .map(payloads_to_domain)
                 .unwrap_or_default(),
+            header: start.header.as_ref().map(headers_to_domain),
             workflow_execution_timeout: proto_duration_to_time(
                 start.workflow_execution_timeout.as_ref(),
             ),
@@ -382,6 +407,12 @@ pub fn schedule_action_to_domain(
                     .map_err(|err| Status::invalid_argument(err.to_string()))?,
                 None => SearchAttributes::default(),
             },
+            user_metadata: start.user_metadata.as_ref().map(|metadata| {
+                tokeira_kernel::UserMetadata {
+                    summary: metadata.summary.as_ref().map(payload_to_domain),
+                    details: metadata.details.as_ref().map(payload_to_domain),
+                }
+            }),
         },
     })
 }
@@ -397,6 +428,7 @@ pub fn schedule_action_to_proto(action: &domain::ScheduleAction) -> proto_schedu
                 }),
                 task_queue: Some(task_queue_from_domain(&start.task_queue)),
                 input: Some(payloads_from_domain(&start.input)),
+                header: start.header.as_ref().map(headers_from_domain),
                 workflow_execution_timeout: start.workflow_execution_timeout.map(to_proto_duration),
                 workflow_run_timeout: start.workflow_run_timeout.map(to_proto_duration),
                 workflow_task_timeout: start.workflow_task_timeout.map(to_proto_duration),
@@ -405,8 +437,13 @@ pub fn schedule_action_to_proto(action: &domain::ScheduleAction) -> proto_schedu
                 cron_schedule: String::new(),
                 memo: Some(memo_from_domain(&start.memo)),
                 search_attributes: Some(search_attributes_from_domain(&start.search_attributes)),
-                header: None,
-                user_metadata: None,
+                user_metadata: start
+                    .user_metadata
+                    .as_ref()
+                    .map(|metadata| sdk::UserMetadata {
+                        summary: metadata.summary.as_ref().map(payload_from_domain),
+                        details: metadata.details.as_ref().map(payload_from_domain),
+                    }),
                 versioning_override: None,
                 priority: None,
             },
@@ -630,7 +667,9 @@ fn interval_to_domain(
 fn interval_to_proto(interval: &domain::IntervalSpec) -> proto_schedule::IntervalSpec {
     proto_schedule::IntervalSpec {
         interval: Some(to_proto_duration(interval.interval)),
-        phase: Some(to_proto_duration(interval.phase)),
+        // v1.31.0's normalized V1 schedule preserves an omitted zero phase;
+        // projecting an explicit `0s` breaks exact proto equality for clients.
+        phase: (interval.phase != Duration::ZERO).then(|| to_proto_duration(interval.phase)),
     }
 }
 
@@ -650,12 +689,8 @@ pub fn compile_calendar_spec(
 }
 
 fn compile_cron_string(cron: &str) -> Result<domain::StructuredCalendarSpec, Status> {
-    let fields: Vec<_> = cron
-        .split('#')
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect();
+    let (expression, comment) = cron.split_once('#').unwrap_or((cron, ""));
+    let fields: Vec<_> = expression.split_whitespace().collect();
     let fields = match fields.as_slice() {
         ["@hourly"] => vec!["0", "0", "*", "*", "*", "*", "*"],
         ["@daily"] => vec!["0", "0", "0", "*", "*", "*", "*"],
@@ -681,7 +716,9 @@ fn compile_cron_string(cron: &str) -> Result<domain::StructuredCalendarSpec, Sta
         month: parse_calendar_field(fields[4], 1, 12, false)?,
         day_of_week: parse_calendar_field(fields[5], 0, 6, false)?,
         year: parse_calendar_field(fields[6], 1970, 9999, false)?,
-        comment: cron.to_string(),
+        // Cron text is normalized away. Only a trailing `#` comment survives
+        // into StructuredCalendarSpec (`calendar.go:241-302 @ v1.31.0`).
+        comment: comment.trim().to_string(),
     })
 }
 
@@ -716,15 +753,22 @@ fn parse_calendar_field(
     value
         .split(',')
         .map(|part| {
-            let (base, step) = match part.split_once('/') {
-                Some((base, step)) => (base, step.parse::<i32>().unwrap_or(1).max(1)),
-                None => (part, 1),
+            let (base, step, has_step) = match part.split_once('/') {
+                Some((base, step)) => (base, step.parse::<i32>().unwrap_or(1).max(1), true),
+                None => (part, 1, false),
             };
-            let (start, end) = match base.split_once('-') {
-                Some((start, end)) => (parse_named_int(start)?, parse_named_int(end)?),
-                None => {
-                    let value = parse_named_int(base)?;
-                    (value, value)
+            let (start, end) = if base == "*" {
+                (default_start, default_end)
+            } else {
+                match base.split_once('-') {
+                    Some((start, end)) => (parse_named_int(start)?, parse_named_int(end)?),
+                    None => {
+                        let value = parse_named_int(base)?;
+                        // `11/11` means 11 through the field maximum in steps
+                        // of 11, not the singleton 11. This is the cron range
+                        // expansion used by v1.31.0's calendar parser.
+                        (value, if has_step { default_end } else { value })
+                    }
                 }
             };
             Ok(domain::Range { start, end, step })
@@ -917,5 +961,38 @@ mod tests {
 
         assert!(list_spec.timezone_data.is_empty());
         assert_eq!(list_spec.timezone_name, "UTC");
+    }
+
+    #[test]
+    fn normalized_zero_interval_phase_stays_omitted() {
+        let domain = schedule_spec_to_domain(proto_schedule::ScheduleSpec {
+            interval: vec![proto_schedule::IntervalSpec {
+                interval: Some(ProtoDuration {
+                    seconds: 60,
+                    nanos: 0,
+                }),
+                phase: None,
+            }],
+            ..Default::default()
+        })
+        .expect("valid interval");
+
+        let projected = schedule_spec_to_proto(&domain);
+        assert!(projected.interval[0].phase.is_none());
+    }
+
+    #[test]
+    fn cron_step_extends_to_field_max_and_text_is_not_a_comment() {
+        let calendar = compile_cron_string("11 11/11 11 11 1 2011").expect("valid cron calendar");
+
+        assert_eq!(
+            calendar.hour,
+            vec![domain::Range {
+                start: 11,
+                end: 23,
+                step: 11,
+            }]
+        );
+        assert!(calendar.comment.is_empty());
     }
 }

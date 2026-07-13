@@ -132,6 +132,14 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
+    // Schedule starts are paced at a live runtime consult site. v1.31.0 owns
+    // this as a namespace-scoped scheduler-worker rate
+    // (`service/worker/scheduler/fx.go:116-133 @ v1.31.0`).
+    KeySpec {
+        key: "worker.schedulerNamespaceStartWorkflowRPS",
+        value_type: ValueType::Double,
+        disposition: Disposition::Wired,
+    },
     // Shutdown poll cancellation is a matching/runtime liveness policy. The
     // v1.31.0 default is false; the task-queue corpus enables it per test.
     KeySpec {

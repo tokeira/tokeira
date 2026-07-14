@@ -19,7 +19,6 @@ use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
 use crate::{
-    apply::deployment_identity,
     envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform,
@@ -93,8 +92,7 @@ pub async fn rollback(deployment_dir: &Path) -> Result<()> {
     );
 
     // ── A forward-reconciles toward its retained prior configuration revision ──
-    let project_name = deployment_identity(&envelope.deployment_id);
-    let change_count = platform::infra_apply(deployment_dir, &project_name).await?;
+    let change_count = platform::infra_apply(deployment_dir).await?;
     println!("A reconcile (re-apply retained revision): {change_count} change(s)");
 
     // ── Complete: clear the marker and consume the checkpoint ──

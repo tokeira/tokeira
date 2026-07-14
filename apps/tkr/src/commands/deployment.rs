@@ -15,7 +15,7 @@ use anyhow::Result;
 
 use crate::{
     cli::DeploymentAction,
-    deployment_dir::{DeploymentResolver, load_context, normalize_name},
+    deployment_dir::{DeploymentResolver, normalize_name},
     deployment_lock, launcher,
     metadata::DeploymentMetadata,
     output::OutputFormatter,
@@ -37,6 +37,12 @@ pub async fn run(
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let metadata =
                 deployments.create(&resolved_name, platform.into(), storage.into(), region)?;
+            // Forwarded (`.tkd`) platforms carry their own bound provisioner —
+            // introduce `tkp` into the deployment at create.
+            if deployments.is_forwarded(Some(&metadata.name))? {
+                deployments.place_provisioner(&metadata.name)?;
+                println!("provisioner: placed `tkp` in the deployment");
+            }
             print_metadata(&metadata, json)?;
         }
         DeploymentAction::List => {
@@ -97,25 +103,25 @@ pub async fn run(
             }
         }
         DeploymentAction::Describe => {
-            let ctx = load_context(deployments, selected)?;
+            let dir = deployments.resolve_dir(selected)?;
             let extra = if json {
                 vec!["--json".to_string()]
             } else {
                 Vec::new()
             };
-            launcher::launch(&ctx, "describe", &extra).await?;
+            launcher::launch(&dir,"describe", &extra).await?;
         }
         DeploymentAction::Apply => {
-            let ctx = load_context(deployments, selected)?;
-            launcher::launch_apply(&ctx).await?;
+            let dir = deployments.resolve_dir(selected)?;
+            launcher::launch_apply(&dir).await?;
         }
         DeploymentAction::Upgrade => {
-            let ctx = load_context(deployments, selected)?;
-            launcher::launch(&ctx, "upgrade", &[]).await?;
+            let dir = deployments.resolve_dir(selected)?;
+            launcher::launch(&dir,"upgrade", &[]).await?;
         }
         DeploymentAction::Rollback => {
-            let ctx = load_context(deployments, selected)?;
-            launcher::launch(&ctx, "rollback", &[]).await?;
+            let dir = deployments.resolve_dir(selected)?;
+            launcher::launch(&dir,"rollback", &[]).await?;
         }
     }
     Ok(())

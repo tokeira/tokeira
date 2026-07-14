@@ -103,17 +103,31 @@ async fn main() -> Result<()> {
             commands::image::run(args.command, deployment, format).await
         }
         Command::Infra { action } => {
-            let ctx = load_context(&deployments, selected)?;
-            let format = if cli.json {
-                tui::OutputFormat::Json
+            // A `.tkd` deployment is forwarded to its bound `tkp`; only the legacy
+            // in-process platforms run through `commands::infra`.
+            if deployments.is_forwarded(selected)? {
+                let dir = deployments.resolve_dir(selected)?;
+                let (verb, extra) = forwarded_infra_verb(&action);
+                launcher::launch(&dir, verb, &extra).await
             } else {
-                tui::OutputFormat::Human
-            };
-            commands::infra::run(action, &deployments, ctx, format).await
+                let ctx = load_context(&deployments, selected)?;
+                let format = if cli.json {
+                    tui::OutputFormat::Json
+                } else {
+                    tui::OutputFormat::Human
+                };
+                commands::infra::run(action, &deployments, ctx, format).await
+            }
         }
         Command::Deploy { action } => {
-            let ctx = load_context(&deployments, selected)?;
-            commands::deploy::run(action, &deployments, ctx).await
+            if deployments.is_forwarded(selected)? {
+                let dir = deployments.resolve_dir(selected)?;
+                let (verb, extra) = forwarded_deploy_verb(&action);
+                launcher::launch(&dir, verb, &extra).await
+            } else {
+                let ctx = load_context(&deployments, selected)?;
+                commands::deploy::run(action, &deployments, ctx).await
+            }
         }
         Command::Schema { action } => {
             let ctx = load_context(&deployments, selected)?;
@@ -212,6 +226,31 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Map a `tkr infra` action to the `tkp` verb (+ args) the launcher forwards for a
+/// `.tkd`/forwarded deployment. `tkp`'s surface is currently flat (`tkp plan`);
+/// once it is namespaced (`tkp infra plan`) this maps to the namespaced form.
+fn forwarded_infra_verb(action: &InfraAction) -> (&'static str, Vec<String>) {
+    match action {
+        InfraAction::Plan { .. } => ("plan", Vec::new()),
+        InfraAction::Apply { .. } => ("apply", Vec::new()),
+        InfraAction::Destroy { yes, .. } => (
+            "destroy",
+            if *yes { vec!["--yes".to_string()] } else { Vec::new() },
+        ),
+        InfraAction::Status => ("describe", Vec::new()),
+    }
+}
+
+/// Map a `tkr deploy` action to the forwarded `tkp` verb. compose-syn models its
+/// containers as infra resources, so `deploy` maps to the same lifecycle verbs.
+fn forwarded_deploy_verb(action: &DeployAction) -> (&'static str, Vec<String>) {
+    match action {
+        DeployAction::Plan => ("plan", Vec::new()),
+        DeployAction::Apply { .. } => ("apply", Vec::new()),
+        DeployAction::Status => ("describe", Vec::new()),
     }
 }
 
@@ -800,7 +839,9 @@ mod tests {
     }
 
     #[test]
-    fn compose_deployment_config_has_compose_fields() {
+    fn compose_deployment_seeds_the_tkd_definition() {
+        // Compose is now `.tkd`-defined + tkp-provisioned (forwarded): `create`
+        // seeds `definition.tkd`, not a legacy in-process `deployment.toml`.
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
@@ -811,12 +852,16 @@ mod tests {
                 None,
             )
             .unwrap();
-        let toml_content =
-            fs::read_to_string(deployments.path("test-compose").join(DEPLOYMENT_TOML)).unwrap();
-        // compose_file removed — derived from deployment directory
-        assert!(!toml_content.contains("compose_file"));
-        assert!(toml_content.contains("observability"));
-        assert!(toml_content.contains("mimir"));
-        assert!(toml_content.contains("grafana"));
+        let dir = deployments.path("test-compose");
+
+        let tkd = fs::read_to_string(dir.join("definition.tkd")).unwrap();
+        assert!(tkd.contains("fn deployment"), "seeds the compose `.tkd` structure");
+        assert!(tkd.contains("Storage::InMemory"), "in-memory keeps the shipped config()");
+        assert!(tkd.contains("Observability"), "and the platform's kinds");
+        // Server config is seeded (prototypical, editable pre-apply); no legacy
+        // in-process `deployment.toml`.
+        assert!(dir.join(TOKEIRAD_TOML).exists(), "seeds a prototypical tokeirad.toml");
+        assert!(!dir.join(DEPLOYMENT_TOML).exists(), "no legacy deployment.toml");
+        assert!(dir.join("state").exists(), "state dir created");
     }
 }

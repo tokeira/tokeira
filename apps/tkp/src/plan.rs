@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::{ProvenanceStamp, check_binding};
 
-use crate::{apply::deployment_identity, envelope_store, platform};
+use crate::{envelope_store, platform};
 
 pub async fn plan(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -28,8 +28,7 @@ pub async fn plan(deployment_dir: &Path) -> Result<()> {
         }
     );
 
-    let project_name = deployment_identity(&envelope.deployment_id);
-    let changes = platform::infra_plan(deployment_dir, &project_name).await?;
+    let changes = platform::infra_plan(deployment_dir).await?;
     println!("infra plan: {} change(s)", changes.len());
     for change in &changes {
         println!(

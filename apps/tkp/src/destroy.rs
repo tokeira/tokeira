@@ -18,7 +18,6 @@ use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
 use crate::{
-    apply::deployment_identity,
     envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform,
@@ -61,8 +60,7 @@ pub async fn destroy(deployment_dir: &Path, yes: bool) -> Result<()> {
 
     // ── Engine destroy (dispatched by platform: local | compose-syn) ──
     let resolved = platform::detect(deployment_dir);
-    let project_name = deployment_identity(&envelope.deployment_id);
-    let removed = platform::infra_destroy(deployment_dir, &project_name).await?;
+    let removed = platform::infra_destroy(deployment_dir).await?;
     println!(
         "[{}] infra destroy: {removed} resource(s) removed",
         resolved.label()

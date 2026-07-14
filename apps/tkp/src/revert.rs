@@ -19,7 +19,7 @@ use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
 use crate::{
-    apply::{config_ref, deployment_identity},
+    apply::config_ref,
     config_history, envelope_store,
     gate::{GateOutcome, evaluate_gate},
     platform,
@@ -76,8 +76,7 @@ pub async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()> {
         config_history::config_file(deployment_dir).display()
     );
 
-    let project_name = deployment_identity(&envelope.deployment_id);
-    let change_count = platform::infra_apply(deployment_dir, &project_name).await?;
+    let change_count = platform::infra_apply(deployment_dir).await?;
     println!(
         "[{}] revert reconcile: {change_count} change(s)",
         resolved.label()

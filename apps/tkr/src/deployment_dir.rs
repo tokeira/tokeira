@@ -46,8 +46,12 @@ use crate::metadata::{self, DeploymentMetadata, DeploymentStatus};
 
 pub(crate) const DEPLOYMENT_TOML: &str = "deployment.toml";
 pub(crate) const TOKEIRAD_TOML: &str = "tokeirad.toml";
+pub(crate) const DEFINITION_TKD: &str = "definition.tkd";
 pub(crate) const METADATA_JSON: &str = "metadata.json";
 pub(crate) const LATEST_FILE: &str = ".latest";
+/// The deployment-local provisioner binary — the `tkp` married to this
+/// deployment, placed at create and preferred by the launcher over any on `PATH`.
+pub(crate) const PROVISIONER_BIN: &str = "tkp";
 
 /// Resolves deployment names to on-disk paths and mediates the `.latest`
 /// selection sentinel.
@@ -115,6 +119,58 @@ impl DeploymentResolver {
         Ok(normalize_name(latest.trim()))
     }
 
+    /// Resolve a deployment to its on-disk directory, verifying it exists.
+    ///
+    /// Unlike [`load_context`], this parses **no** in-process platform config —
+    /// it is the entry point for **forwarded** (`.tkd`) deployments, which the
+    /// bound `tkp` drives from the directory alone (the launcher needs only the
+    /// path).
+    pub fn resolve_dir(&self, requested: Option<&str>) -> Result<PathBuf> {
+        let name = self.resolve_name(requested)?;
+        let path = self.path(&name);
+        if !path.join(METADATA_JSON).exists() {
+            bail!("{}", self.not_found_message(&name)?);
+        }
+        Ok(path)
+    }
+
+    /// Whether the resolved deployment is a **`.tkd`/forwarded** deployment —
+    /// provisioned by the bound `tkp`, not the legacy in-process engine. Detected
+    /// by the presence of `definition.tkd`, mirroring `tkp`'s own `platform::detect`.
+    pub fn is_forwarded(&self, requested: Option<&str>) -> Result<bool> {
+        Ok(self.resolve_dir(requested)?.join(DEFINITION_TKD).exists())
+    }
+
+    /// Introduce the deployment's bound provisioner — copy `tkp` into `<name>/` so
+    /// the deployment carries its own binary (the deployment-married provisioner,
+    /// Proposal 005). The launcher prefers this deployment-local copy over any
+    /// `tkp` on `PATH`, so the binary that mutates the deployment is exactly the
+    /// one married to it at create.
+    ///
+    /// Transitional: resolves the installed `tkp` and copies its bytes; the
+    /// per-platform build/obtain + integrity stamping is the provisioner-binary
+    /// work (Proposal 005). Errors clearly when no `tkp` is installed — a forwarded
+    /// (`.tkd`) deployment cannot be driven without its provisioner.
+    pub fn place_provisioner(&self, name: &str) -> Result<()> {
+        let source = which::which(PROVISIONER_BIN).map_err(|_| {
+            anyhow!(
+                "cannot introduce the compose provisioner: no `{PROVISIONER_BIN}` found on PATH. \
+                 Install it (e.g. `cargo install --path apps/tkp`) and re-run `tkr deployment create`."
+            )
+        })?;
+        let dest = self.path(name).join(PROVISIONER_BIN);
+        fs::copy(&source, &dest)
+            .with_context(|| format!("failed to copy {} -> {}", source.display(), dest.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&dest)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&dest, perms)?;
+        }
+        Ok(())
+    }
+
     /// Create a fresh deployment: writes the two TOML files, the metadata
     /// JSON, an empty `state/` subdir, and flips `.latest` to the new name.
     ///
@@ -133,14 +189,34 @@ impl DeploymentResolver {
             bail!("deployment '{name}' already exists at {}", path.display());
         }
         fs::create_dir_all(path.join("state"))?;
-        fs::write(
-            path.join(DEPLOYMENT_TOML),
-            crate::prototypical::deployment_config(platform, storage, region.as_deref())?,
-        )?;
-        fs::write(
-            path.join(TOKEIRAD_TOML),
-            crate::prototypical::server_config(platform, storage, region.as_deref())?,
-        )?;
+        match platform {
+            // The compose platform is `.tkd`-defined and provisioned by a
+            // forwarded compose `tkp`: seed its definition (storage/region baked
+            // into `config()`) plus a prototypical `tokeirad.toml` the operator can
+            // edit before the first apply (writeback-updated at apply). No legacy
+            // in-process `deployment.toml`.
+            PlatformKind::Compose => {
+                fs::write(
+                    path.join(DEFINITION_TKD),
+                    crate::prototypical::compose_definition(storage, region.as_deref())?,
+                )?;
+                fs::write(
+                    path.join(TOKEIRAD_TOML),
+                    crate::prototypical::server_config(platform, storage, region.as_deref())?,
+                )?;
+            }
+            // Legacy in-process platforms (`local`; `ecs` still in-process for now).
+            PlatformKind::Local | PlatformKind::Ecs => {
+                fs::write(
+                    path.join(DEPLOYMENT_TOML),
+                    crate::prototypical::deployment_config(platform, storage, region.as_deref())?,
+                )?;
+                fs::write(
+                    path.join(TOKEIRAD_TOML),
+                    crate::prototypical::server_config(platform, storage, region.as_deref())?,
+                )?;
+            }
+        }
         let now = timestamp();
         let metadata = DeploymentMetadata {
             name: name.clone(),

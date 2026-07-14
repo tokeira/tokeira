@@ -8,12 +8,45 @@
 //! create` will fail here with a clear error rather than minutes later
 //! when `tokeirad` tries to start.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tokeira_compose_deployment::ComposeDeployment;
 use tokeira_ecs_deployment::EcsDeployment;
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::{PlatformConfig, PlatformKind, StorageKind};
 use toml_edit::{DocumentMut, value};
+
+/// The compose platform definition seeded at `tkr deployment create --platform
+/// compose`, with the operator's `--storage`/`--region` **baked into `config()`**.
+///
+/// The compose platform is `.tkd`-defined and provisioned by a forwarded compose
+/// `tkp` — the operator edits the `config()` values in this file; the structure
+/// (`deployment(cfg, cx)`) is the platform's. In-memory keeps the shipped default;
+/// DSQL rewrites `storage: Storage::InMemory` to `Storage::Dsql { .. }` so the
+/// seeded `.tkd` (the interpreter's source of truth), `metadata.json.storage`, and
+/// the prototypical `tokeirad.toml` all agree. (Transitional: embedded from the
+/// compose-syn platform crate; once the per-platform compose `tkp` exists it
+/// should own and provide its own default definition — Proposal 005.)
+pub fn compose_definition(storage: StorageKind, region: Option<&str>) -> Result<String> {
+    const DEFAULT_TKD: &str = include_str!("../../../platforms/compose-syn/definition.tkd");
+    match storage {
+        StorageKind::InMemory => Ok(DEFAULT_TKD.to_string()),
+        StorageKind::Dsql => {
+            const MARKER: &str = "storage: Storage::InMemory,";
+            if !DEFAULT_TKD.contains(MARKER) {
+                bail!(
+                    "compose definition.tkd no longer contains `{MARKER}`; the `--storage dsql` \
+                     bake-in in prototypical.rs needs updating"
+                );
+            }
+            let region = region.unwrap_or("us-east-1");
+            let dsql = format!(
+                "storage: Storage::Dsql {{ region: \"{region}\".into(), mode: DsqlMode::Managed, \
+                 endpoint: None, arn: None }},"
+            );
+            Ok(DEFAULT_TKD.replacen(MARKER, &dsql, 1))
+        }
+    }
+}
 
 pub fn deployment_config(
     platform: PlatformKind,
@@ -84,6 +117,31 @@ mod tests {
     use super::*;
     use tokeira_compose_deployment::ComposeConfig;
     use tokeira_ecs_deployment::EcsConfig;
+
+    #[test]
+    fn compose_definition_in_memory_keeps_the_shipped_default() {
+        let tkd = compose_definition(StorageKind::InMemory, None).unwrap();
+        assert!(
+            tkd.contains("storage: Storage::InMemory,"),
+            "config() default is in-memory"
+        );
+    }
+
+    #[test]
+    fn compose_definition_dsql_bakes_storage_and_region_into_config() {
+        let tkd = compose_definition(StorageKind::Dsql, Some("eu-west-1")).unwrap();
+        // config()'s storage line is rewritten to Dsql with the requested region;
+        // the deployment() destructure (`Storage::Dsql { .. }`) is untouched.
+        assert!(
+            !tkd.contains("storage: Storage::InMemory,"),
+            "the in-memory default was replaced"
+        );
+        assert!(
+            tkd.contains("storage: Storage::Dsql { region: \"eu-west-1\".into()"),
+            "region baked into config()"
+        );
+        assert!(tkd.contains("mode: DsqlMode::Managed"));
+    }
 
     #[test]
     fn compose_prototypical_config_contains_image_defaults_and_comments() {

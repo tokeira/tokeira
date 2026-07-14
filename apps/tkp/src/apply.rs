@@ -54,7 +54,7 @@ pub async fn apply(deployment_dir: &Path) -> Result<()> {
     let resolved = platform::detect(deployment_dir);
     // The deployment identity seeds the compose-syn `Cx`; it was set at `init`.
     let project_name = deployment_identity(&envelope.deployment_id);
-    let change_count = platform::infra_apply(deployment_dir, &project_name).await?;
+    let change_count = platform::infra_apply(deployment_dir).await?;
     println!(
         "[{}] infra apply: {change_count} change(s)",
         resolved.label()

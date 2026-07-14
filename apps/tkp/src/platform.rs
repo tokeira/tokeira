@@ -46,14 +46,26 @@ pub fn detect(deployment_dir: &Path) -> Platform {
     }
 }
 
-/// Load + validate the compose-syn `.tkd` config revision. `project_name` seeds
-/// the engine-injected [`Cx`] (the deployment identity, from the envelope).
-pub(crate) fn load_tkd_config(deployment_dir: &Path, project_name: &str) -> Result<TkdConfig> {
+/// Load + validate the compose-syn `.tkd` config revision, seeding the
+/// engine-injected [`Cx`].
+///
+/// `Cx.project_name` is the **deployment name** — the deployment dir's basename
+/// (`{registry}/{name}/`). It is the compose project / container-name prefix, so
+/// it must be the operator's chosen name, not a default. `Cx.region` is `None`:
+/// region lives in the `.tkd`'s own `config()` (`Storage::Dsql { region }`), which
+/// the definition reads directly, so `cx.region` is unused by compose.
+pub(crate) fn load_tkd_config(deployment_dir: &Path) -> Result<TkdConfig> {
     let path = deployment_dir.join(TKD_FILE);
     let source = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
+    let project_name = deployment_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tokeira")
+        .to_string();
     let cx = Cx {
-        project_name: project_name.to_string(),
+        project_name,
         region: None,
         deployment_dir: deployment_dir.to_path_buf(),
     };
@@ -64,7 +76,7 @@ pub(crate) fn load_tkd_config(deployment_dir: &Path, project_name: &str) -> Resu
 }
 
 /// Plan the infrastructure for the resolved platform (read-only, no mutation).
-pub async fn infra_plan(deployment_dir: &Path, project_name: &str) -> Result<Vec<Change>> {
+pub async fn infra_plan(deployment_dir: &Path) -> Result<Vec<Change>> {
     match detect(deployment_dir) {
         Platform::Local => {
             plan_infra(
@@ -75,7 +87,7 @@ pub async fn infra_plan(deployment_dir: &Path, project_name: &str) -> Result<Vec
             .await
         }
         Platform::ComposeSyn => {
-            let config = load_tkd_config(deployment_dir, project_name)?;
+            let config = load_tkd_config(deployment_dir)?;
             let mut engine = open_compose_syn_engine(config, deployment_dir, false).await?;
             let composition = engine.compose(ModuleSelection::All)?;
             engine
@@ -87,7 +99,7 @@ pub async fn infra_plan(deployment_dir: &Path, project_name: &str) -> Result<Vec
 }
 
 /// Apply the infrastructure for the resolved platform. Returns the change count.
-pub async fn infra_apply(deployment_dir: &Path, project_name: &str) -> Result<usize> {
+pub async fn infra_apply(deployment_dir: &Path) -> Result<usize> {
     match detect(deployment_dir) {
         Platform::Local => {
             apply_infra(
@@ -98,7 +110,7 @@ pub async fn infra_apply(deployment_dir: &Path, project_name: &str) -> Result<us
             .await
         }
         Platform::ComposeSyn => {
-            let config = load_tkd_config(deployment_dir, project_name)?;
+            let config = load_tkd_config(deployment_dir)?;
             let mut engine = open_compose_syn_engine(config, deployment_dir, true).await?;
             let composition = engine.compose(ModuleSelection::All)?;
             let changes = engine
@@ -111,7 +123,7 @@ pub async fn infra_apply(deployment_dir: &Path, project_name: &str) -> Result<us
 }
 
 /// Destroy the infrastructure for the resolved platform. Returns the change count.
-pub async fn infra_destroy(deployment_dir: &Path, project_name: &str) -> Result<usize> {
+pub async fn infra_destroy(deployment_dir: &Path) -> Result<usize> {
     match detect(deployment_dir) {
         Platform::Local => {
             destroy_infra(
@@ -122,7 +134,7 @@ pub async fn infra_destroy(deployment_dir: &Path, project_name: &str) -> Result<
             .await
         }
         Platform::ComposeSyn => {
-            let config = load_tkd_config(deployment_dir, project_name)?;
+            let config = load_tkd_config(deployment_dir)?;
             let mut engine = open_compose_syn_engine(config, deployment_dir, true).await?;
             let composition = engine.compose(ModuleSelection::All)?;
             let removed = engine
@@ -259,7 +271,7 @@ mod tests {
         // fresh deployment still plans (all Creates).
         let tmp = reference_tkd_dir();
         assert_eq!(detect(tmp.path()), Platform::ComposeSyn);
-        let changes = infra_plan(tmp.path(), "tokeira").await.expect("plan");
+        let changes = infra_plan(tmp.path()).await.expect("plan");
         assert!(
             changes.len() >= 6,
             "compose-syn plan produced only {} changes",
@@ -275,6 +287,6 @@ mod tests {
     async fn invalid_tkd_is_rejected_at_load() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(TKD_FILE), "not valid rust-via-syn {{{").unwrap();
-        assert!(load_tkd_config(tmp.path(), "tokeira").is_err());
+        assert!(load_tkd_config(tmp.path()).is_err());
     }
 }

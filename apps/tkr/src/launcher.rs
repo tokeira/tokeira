@@ -29,7 +29,6 @@ use anyhow::{Context, Result, bail};
 use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, Target};
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
-use crate::deployment_dir::DeploymentContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchClass {
@@ -85,7 +84,15 @@ enum TkpBinary {
 }
 
 impl TkpBinary {
-    fn resolve() -> Self {
+    /// Resolve the `tkp` to run, **preferring the deployment's own bound binary**
+    /// (`<dir>/tkp`, placed at `tkr deployment create`) over any `tkp` on `PATH`.
+    /// A never-inceptioned deployment falls back to an installed `tkp`, then a
+    /// `cargo run` dev build.
+    fn resolve(deployment_dir: &Path) -> Self {
+        let bound = deployment_dir.join("tkp");
+        if bound.is_file() {
+            return TkpBinary::Installed(bound);
+        }
         match which::which("tkp") {
             Ok(path) => TkpBinary::Installed(path),
             Err(_) => TkpBinary::Cargo,
@@ -174,11 +181,10 @@ fn verify_against_manifest(path: &Path, envelope: &DeploymentStateEnvelope) -> R
 /// Forward a lifecycle `verb` to the deployment's bound `tkp`: resolve the launch
 /// class, checksum-verify (bound), then exec `tkp <verb> --deployment-dir <dir>
 /// [extra_args]`, inheriting stdio and propagating the exit status.
-pub async fn launch(ctx: &DeploymentContext, verb: &str, extra_args: &[String]) -> Result<()> {
-    let deployment_dir = &ctx.path;
+pub async fn launch(deployment_dir: &Path, verb: &str, extra_args: &[String]) -> Result<()> {
     let envelope = load_envelope(deployment_dir).await?;
     let class = resolve_class(verb, &envelope);
-    let binary = TkpBinary::resolve();
+    let binary = TkpBinary::resolve(deployment_dir);
 
     if requires_manifest_verification(class, &envelope) {
         match &binary {
@@ -220,11 +226,11 @@ pub async fn launch(ctx: &DeploymentContext, verb: &str, extra_args: &[String]) 
 
 /// Forward `apply`, first forwarding `init` when the deployment has never been
 /// stamped — so `tkr deployment apply` is a coherent one-command flow.
-pub async fn launch_apply(ctx: &DeploymentContext) -> Result<()> {
-    if load_envelope(&ctx.path).await?.binding.is_none() {
-        launch(ctx, "init", &[]).await?;
+pub async fn launch_apply(deployment_dir: &Path) -> Result<()> {
+    if load_envelope(deployment_dir).await?.binding.is_none() {
+        launch(deployment_dir, "init", &[]).await?;
     }
-    launch(ctx, "apply", &[]).await
+    launch(deployment_dir, "apply", &[]).await
 }
 
 #[cfg(test)]

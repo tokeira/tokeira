@@ -78,7 +78,13 @@ pub async fn run(
                 )
                 .await;
             }
-            run_build(arch.into(), tag, format)
+            // `DefaultDaggerClient` holds a `reqwest::blocking::Client`, whose
+            // internal runtime panics if constructed or dropped inside this
+            // async context ("Cannot drop a runtime where blocking is not
+            // allowed") — run the whole sync build on a blocking thread.
+            tokio::task::spawn_blocking(move || run_build(arch.into(), tag, format))
+                .await
+                .context("the image build thread panicked")?
         }
         ImageCommand::List { source_type } => {
             let ctx = deployment.ok_or_else(|| deployment_required("image list"))?;

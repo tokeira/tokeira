@@ -20,9 +20,7 @@ use tokeira_provisioner::{
     UpgradeDecision, evaluate_upgrade,
 };
 
-use crate::{
-    apply::deployment_identity, envelope_store, init::running_integrity_manifest, platform,
-};
+use crate::{envelope_store, init::running_integrity_manifest, platform};
 
 pub async fn upgrade(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now()); // B
@@ -77,8 +75,7 @@ pub async fn upgrade(deployment_dir: &Path) -> Result<()> {
     println!("ownership transferred — [A final] checkpoint captured, operation marker open");
 
     // ── Apply B's plan (dispatched by platform). Migrations would run here on a schema change. ──
-    let project_name = deployment_identity(&envelope.deployment_id);
-    let change_count = platform::infra_apply(deployment_dir, &project_name).await?;
+    let change_count = platform::infra_apply(deployment_dir).await?;
     println!("infra apply under the new engine: {change_count} change(s)");
 
     // ── Close the operation marker ──

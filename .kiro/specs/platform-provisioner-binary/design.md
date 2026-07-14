@@ -38,6 +38,60 @@ Scope is the minimal foundational set: provenance, binding, integrity, the upgra
 rollback, and binary retention for S3 state. Out of scope (follow-on): automated binary self-update,
 release-signing infrastructure, and the single-shared-binary-vs-SDK multi-consumer decision.
 
+## `tkp` command structure
+
+`tkp` is married to one deployment and exposes a **lifecycle-only** surface. The operator/global surface —
+`deployment create|list|use|lock|unlock|destroy`, `dev`, `ci`, `compat`, `workstation`, `version`,
+`config`, and `image build` — lives only on `tkr`. `tkp`'s verbs are **namespaced to mirror `tkr`**, so an
+operator only ever types `tkr` and forwarding is a transparent pass-through (`tkr infra plan` →
+`tkp infra plan`; Req 7.3):
+
+```
+tkp --deployment-dir <dir> <command>
+
+  # Substrate — the infrastructure the deployment stands on
+  infra plan             preview the infrastructure Delta; read-only, never mutates
+  infra apply            reconcile infrastructure to desired; gated + locked
+  infra destroy --yes    tear down all provisioned resources; gated + locked; irreversible
+
+  # Workload — the services (tokeirad) that run on the substrate
+  deploy plan            preview the workload Delta; read-only
+  deploy apply           reconcile the workload to desired; gated + locked
+  scale <dim>=<n> …      change workload capacity; a config-revision + workload apply; gated + locked
+  schema apply           apply the storage schema (DSQL); gated + locked; NotApplicable on in-memory
+
+  # Registry — the deployment's own image supply
+  image push             push the workspace image to the deployment's registry; writes back the ref
+  image mirror           mirror external base/dependency images into that registry
+
+  # Revisions & ownership — advance, restore, recover
+  describe [--json]      identity + provenance + binding + state; two views; never gates
+  revert --to <rev>      restore a prior config revision; same-engine re-apply; gated + locked
+  upgrade                advance to a new engine identity (candidate B); gated + locked (Req 9)
+  rollback               forward-reconcile to the retained prior revision (Proposal 002)
+  resume                 resume an interrupted operation from the operation marker
+```
+
+Full behaviour, outputs, gating, and locking for each verb are specified in
+**§Command behaviour and outputs**. Three structural rules the shape encodes:
+
+- **No operator `init`.** The Day-0 provenance stamp + integrity manifest are written as an *internal* step
+  of `tkr deployment create` inception (Req 6.5), not a verb an operator types.
+- **`describe` never gates.** It is the deployment-scoped counterpart to `tkr version` and must report
+  precisely when the applying verbs would refuse — so diagnosis works on a drifted or mismatched deployment.
+- **Verbs are complete but conditionally realized.** The surface is the same for every platform; where a
+  platform or storage cannot honor a verb (e.g. `schema` on in-memory storage), the verb returns a
+  first-class **`NotApplicable`** result — never a missing subcommand and never a crash.
+
+Every command takes `--deployment-dir` (the deployment it operates on); because `tkr` places `tkp` *inside*
+that dir, the same bytes always operate the same deployment. Which binary actually runs for a given verb —
+bound, candidate-upgrade, dev-candidate, or rollback — is decided by **launch class**
+(§Command surfaces and launch classes).
+
+> The current `apps/tkp` surface is transitional: a **flat** verb list (`tkp plan`, `tkp apply`,
+> `tkp destroy`, …) that still carries an `init` verb. Task 15.2 reshapes it into the namespaced tree above
+> and folds `init` into inception, as part of extracting `tokeira-provisioner-cli`.
+
 ## Architecture
 
 `tkp` is a new binary crate (`apps/tkp`) spanning the engine-decoupled crates: `tokeira-iac` (engine),
@@ -214,8 +268,8 @@ lifecycle verbs to the bound `tkp`:
 - **Forwarded to `tkp`:** `infra plan|apply|destroy`, `deploy plan|apply`, `scale`, `schema`,
   `image push|mirror`, and `deployment describe | upgrade | rollback`.
 
-`tkp` carries a specialized lifecycle surface only (`describe`, `plan`, `apply`, `destroy`, `scale`,
-`schema`, `status`, `image push|mirror`, `upgrade`, `rollback`) — never the operator/global surface.
+`tkp` carries the lifecycle-only surface enumerated in [§`tkp` command structure](#tkp-command-structure)
+(namespaced to mirror `tkr`) — never the operator/global surface.
 `describe` is the deployment-scoped counterpart to `tkr version`: it reports identity, recorded
 provenance, the binding verdict, the integrity manifest, and state facts, honors `--json`, and never
 gates (it must work precisely when the applying verbs would refuse). `image push`/`mirror` are
@@ -234,6 +288,65 @@ workspace concern and stays on `tkr`.
 The split is load-bearing: `upgrade` cannot run the recorded binary (A cannot know how to advance to B),
 and dev iteration cannot re-run the recorded dev binary. For **bound** mutations the mutating binary is
 exactly the one the manifest records — that is the structural binding guarantee.
+
+## Command behaviour and outputs
+
+Every verb runs inside one of two shell envelopes; the `ProvisionerPlatform` seam supplies only the
+resource realization, so the guarantees below hold uniformly across platforms.
+
+**Mutating-verb contract — identical for every mutating verb.** The shell wraps each in one sequence:
+
+1. **Resolve** the recorded provenance + integrity manifest from the state envelope.
+2. **Gate** — run the binding gate (§The binding gate); a non-`Match` verdict refuses *before any mutation*,
+   except the classes that explicitly permit a candidate (`DevIterate`, `upgrade`, `rollback`).
+3. **Lock** — acquire the deployment operation lock (§Operation safety): one writer, mutually exclusive.
+4. **Plan** — compute the Delta for the verb's `(desired, state, universe)` triple.
+5. **Confirm** — print the Delta; require confirmation unless `--auto-approve` (or `--yes` for irreversible
+   verbs).
+6. **Apply** — enact the Delta in dependency order; **fail-closed** on delete (§Property 10).
+7. **Record** — advance `config_revision`, snapshot the revision's config source, record
+   `effective_config_ref`, write the new envelope revision atomically; release the lock.
+8. **Report** — emit a `describe`-style summary of the resulting state (operator view; `--json` for machine).
+
+**Read-only verbs** (`describe`, `infra plan`, `deploy plan`) run steps 1, 2, 4 only — resolve, evaluate the
+gate *for report* (never to block), compute the Delta, print. No lock, no mutation, and they **must succeed
+even on a gate mismatch**, so an operator can diagnose a refusal.
+
+| Verb | Class | Gate | Lock | Behaviour & primary output |
+|------|-------|------|------|----------------------------|
+| `describe` | read-only | report | no | Two views (below). Never blocks. |
+| `infra plan` | read-only | report | no | Compute + print the infrastructure Delta and the binding verdict; `--json` emits both as data. |
+| `infra apply` | mutating | block | yes | Reconcile infrastructure to desired via the contract. Output: applied Delta, new `config_revision`, post-state summary. |
+| `infra destroy` | mutating | block | yes | Reverse Delta over the full known universe; requires `--yes`. Fail-closed: an unknown/unremovable resource aborts rather than orphaning. Envelope status → `Destroyed`. |
+| `deploy plan` | read-only | report | no | As `infra plan`, over the workload (tokeirad services) universe. |
+| `deploy apply` | mutating | block | yes | Reconcile the workload to desired. Output as `infra apply`. |
+| `scale` | mutating | block | yes | Fold `<dim>=<n>` into a config revision, then a workload apply. Output: capacity Delta + new revision. `NotApplicable` if the platform has no scale dimension. |
+| `schema apply` | mutating | block | yes | Apply the storage schema/migrations to the managed store (DSQL). `NotApplicable` when storage is in-memory. Output: migrations applied + resulting schema version. |
+| `image push` | mutating | block | yes | Push the workspace image to the deployment's own registry; write the resolved digest ref back into config (a config revision). Output: pushed ref. |
+| `image mirror` | mutating | block | yes | Mirror external base/dependency images into that registry. Output: mirrored refs. |
+| `revert --to <rev>` | mutating | block | yes | Restore revision `<rev>`'s retained config source and re-apply with the **same** engine; produces a *new* forward revision equal to `<rev>` (Req 13.3). Refuses a non-prior or unretained target. |
+| `upgrade` | mutating | permit `Candidate` | yes | Runs candidate **B** (launch class Candidate-upgrade); migrates A→B, re-records the manifest for B, stamps the transition. Sequence in §Upgrade and rollback. |
+| `rollback` | mutating | permit `Rollback` | yes (continuous) | B undoes what it created; the binding re-pins to A; A forward-reconciles its retained prior revision. One lock across the whole sequence (12.2). |
+| `resume` | recovery | per marker | yes | Read the operation marker; resume or safely unwind an interrupted upgrade/rollback. Output: what was resumed and the resulting binding. |
+
+**`describe` — two views.** `describe` answers "what is this deployment, and can it be operated?" in two
+registers over the *same* envelope, and never gates in either:
+
+- **Operator view (default).** A tight human summary for day-to-day work: deployment name + id, platform,
+  storage, **short** engine identity, binding status (`Bound·Match` / `Mismatch` / `Unbound` / `DevIterate`),
+  current `config_revision`, service/health status, and the last operation + its outcome. It answers "is
+  this healthy and safe to act on" at a glance — no checksums, no digests.
+- **Verification / debug view (`--json`; `--verbose` for the human-readable equivalent).** The full
+  auditable record: the complete `EngineIdentity` (source-closure digest, `Cargo.lock`-closure digest,
+  toolchain, build-container digest, features, profile), the **entire integrity manifest** (per-artifact
+  SHA-256), `effective_config_ref`, the source-snapshot ref, the operation marker + lock holder, the
+  retained-revision list, and the envelope revision. This is what verifies a binding by hand and debugs a
+  refusal. `--json` always emits this view (stable, machine-parseable); the operator view is human-only.
+
+**Output conventions.** Every verb honors `--json`; a refusal/failure exits non-zero with a typed reason
+(`GateMismatch`, `LockHeld`, `NotApplicable`, `Interrupted`, …). Read-only verbs never lock or mutate;
+`--yes` is required only by irreversible verbs (`infra destroy`), and `--auto-approve` skips the plan
+confirmation on the others.
 
 ## Upgrade and rollback
 
@@ -442,6 +555,113 @@ manifest — the trust anchor regardless of where the blob lives. For S3 state t
 co-located (keyed by version + target), making the deployment self-contained. Trust never flows from the
 stored blob: a retrieved binary is verified against the manifest `sha256` before execution. The manifest
 records checksums for all built targets even when only one blob is co-located.
+
+## Per-platform provisioner and three-part provenance (Req 14)
+
+`tkp` is **not one universal binary** — it is composed, per deployment platform, from three ingredients:
+
+```
+tkp(compose)  =  IaC engine (tokeira-iac forward reconciler)
+              +  resource providers (tokeira-compose/Bollard, tokeira-aws/DSQL, …)
+              +  ONE deployment platform (compose-syn: kind library + builder vocabulary + .tkd interpreter)
+```
+
+The **platform is compiled in**, so it *is* engine identity; the `.tkd` a deployment carries is **data**.
+That gives the clean three-part provenance:
+
+| Part | What | Where it lives | Changes are |
+|------|------|----------------|-------------|
+| **engine** | IaC engine + resource providers | compiled → `EngineIdentity` | an upgrade (Req 4/9) |
+| **platform** | kind library + vocabulary + interpreter | compiled → `EngineIdentity` | an upgrade (Req 4/9) |
+| **definition** | the `.tkd` | data → `config_revision` | an ordinary apply/revert (Req 13) |
+
+`engine + platform` → the binding's `source_tree_hash`/`EngineIdentity`; `definition` → the digested
+`config_revision`. Two deployments on the same engine+platform can therefore share **the same `tkp` bytes**
+and differ only by their `.tkd` — which is exactly what the interpreted-definition work (platform-config-dsl
+Proposal 004) bought.
+
+**The clean split.** The code is already partitioned at one seam — today every lifecycle verb calls
+`platform::infra_plan|apply|destroy(dir)`, and the target widens that same boundary to the full
+platform-realized surface. So:
+
+- **`tokeira-provisioner-cli`** (new lib) — the platform-*agnostic* shell: the mutating-verb contract and
+  read-only verbs (§Command behaviour and outputs), the binding-gate orchestration, the operation-lock
+  wrapper, the state envelope, `describe` (two views), the internal Day-0 stamp, `config_history`, and the
+  clap dispatch, generic over a `ProvisionerPlatform` seam whose methods are the platform-realized verbs —
+  `infra_plan|apply|destroy`, `deploy_plan|apply`, `scale`, `schema_apply`, `image_push|mirror` (each able to
+  return `NotApplicable`) — plus `label`. It depends on `tokeira-provisioner` (the domain library: stamps,
+  binding, integrity, migration) — the shell is a distinct layer, not folded in.
+- **`apps/tkp-compose`** (bin, `tkp-compose`) = `tokeira-provisioner-cli` + a `ComposePlatform` impl of the
+  seam + `tokeira-compose-syn`/`-compose`/`-iac`/`-orchestrator`. **No `local`.** `apps/tkp-local` mirrors
+  it for the `local` exception. The current bundled `apps/tkp` retires.
+
+**Naming and placement.** The source binaries are per-platform (`tkp-compose`, `tkp-local`).
+`tkr deployment create --platform compose` resolves `tkp-compose`, copies it to `<deployment>/tkp`, and the
+launcher runs `<deployment>/tkp` (Req 6.5; the deployment-married provisioner).
+
+## Reproducible build: Dagger, source snapshot, and bundles (Req 15, 16)
+
+Producing a `tkp` is a single **Dagger** function that runs identically locally and on a Buildkite agent —
+Tokeira already builds its runtime image through Dagger (`tokeira-build`/`dagger-client`), so this extends
+an existing boundary. The full rationale, caching model (four layers + the trust guardrails), and artifact
+topology are in [Proposal 005](./proposals/005-provisioner-bundles-and-binding.md); the load-bearing points:
+
+- **`build_provisioner(source_snapshot, request) -> ProvisionerBundle`** — validate the closure, compute
+  `EngineIdentity`, build `tkp` for the requested targets, run tests, checksum + measure artifacts, package
+  the bundle. `create` **requests a bundle**; Dagger decides *reuse | download | build*, and Tokeira decides
+  *admission* (identity interchangeable, authority sufficient, not revoked, checksum re-verified). Caching
+  accelerates production; it never grants admission.
+- **`EngineIdentity` is closure-scoped** — the digest is over the provisioner's *dependency closure* + its
+  own source subtree, **not** the whole workspace. If it hashed the shared `Cargo.lock` or whole tree, a
+  `tkr`-only dep bump would re-key every `tkp` identity and force a rebuild+rebind (an upgrade) across all
+  deployments. This is the make-or-break scoping (also Req 13.1's `source_tree_hash` narrowing).
+- **Build authority is orthogonal to build mode.** `LocalDeveloper` (native `cargo` for the dev loop —
+  fast, `kache`-accelerated per-worktree) vs `TrustedCi` (hermetic Dagger, cache-by-identity). The trusted,
+  cache-by-identity bundle is a **cold hermetic** build (pure w.r.t. its declared inputs); the two build
+  worlds do not share a compile cache and don't need to.
+
+**Source snapshotting** is the fidelity anchor (Req 16), and it matters concretely because the dev
+environment runs several AI agents mutating source concurrently, each in its own worktree. A build must not
+derive identity from a live tree:
+
+```
+snapshot (immutable, content-addressed)  ->  EngineIdentity (over the snapshot)  ->  build (consumes the snapshot)
+```
+
+atomic w.r.t. source. A Rust git SDK (`gix` pure-Rust, or `git2`/libgit2 — a **new** workspace dependency;
+today `tokeira-build-info` only shells out for the SHA) provides the snapshot. For a dirty `LocalDeveloper`
+tree the primitive is a **temporary-index `write-tree`**: seed a throwaway index from the current one, stage
+the provisioner closure into it (tracked staged + unstaged changes) and write a content-addressed `tree` —
+leaving the working tree, the real index, and every ref untouched. (`gix` does this in-process; the
+porcelain **`git stash` is not usable** — it reverts the tree and writes `refs/stash` — and even
+`git stash create` omits untracked files, so it is only the nearest intuition, not the mechanism.)
+**Untracked `.rs` within the closure are refused by default**: `create` fails and lists them, so nothing
+that determines identity is silently omitted; they are swept in only under an explicit `--include-untracked`
+(Proposal 005 decision 9). For `TrustedCi`, no dirty snapshot exists — the request pins an immutable,
+reachable, protected commit. The snapshot ref + digest are recorded in the request and the bound deployment's
+provenance — so the exact source is auditable, and per-worktree isolation plus the create-time snapshot
+together give per-agent fidelity.
+
+**Identity keys on the tree; the commit is only an audit wrapper.** `write-tree` yields a **`tree`** oid —
+pure content, the thing `EngineIdentity`'s source digest keys on. Wrapping it with `commit-tree` (parent =
+`HEAD`) gives a *reachable, auditable* handle, and is the right move — but a commit embeds author/committer
+timestamps, so committing the same tree twice yields **different commit oids**. Identity must therefore key
+on the tree, never the commit. Four consequences settle the design:
+
+- **Deterministic wrapper.** The snapshot commit uses a fixed synthetic identity (`tkp-snapshot
+  <noreply@tokeira.io>`) and fixed timestamps (the parent's commit time, or epoch 0), so identical
+  `(tree, parent)` → identical commit. Committer identity is *supplied*, not read from git config (which is
+  routinely unset in CI).
+- **Unborn / detached `HEAD`.** `HEAD` may not resolve (fresh repo, mid-rebase, detached). The parent is
+  provenance-only and never semantically load-bearing, so a missing `HEAD` falls back cleanly to a
+  **parentless** snapshot commit.
+- **GC vs retention.** A dangling commit is prunable by `git gc`. Because the built bytes are captured into
+  the ProvisionerBundle and identity keys on the tree, the default is to **record the oid only** (a
+  best-effort audit handle); a lightweight ref (`refs/tokeira/snapshots/<engine-identity>`) pins it **only
+  under `TrustedCi`**, where durable audit matters (Proposal 005 decision 10).
+- **Not stash, not submodule content.** This is why `git stash` is rejected above; likewise `write-tree`
+  captures submodule/LFS entries as gitlinks/pointers, not content — irrelevant to `tkp`'s pure-Rust
+  closure, noted for completeness.
 
 ## Correctness Properties
 

@@ -2,530 +2,384 @@
 
 ## Introduction
 
-A tokeira deployment's infrastructure and services are defined today in **compiled Rust**: a
-fixed-arity config struct per platform (`EcsConfig`, `ComposeConfig`, `LocalConfig`), the
-`modules.rs`/`services.rs` that turn that struct into resources, and the validation that guards it.
-The operator-facing `deployment.toml` supplies only *values within that compiled shape*. Consequently
-any **structural** change to a deployment — a new service, a re-wiring, a changed validation rule —
-requires editing platform code and rebuilding the provisioner binary (`tkp`). That coupling is the
-problem the `platform-provisioner-binary` spec was forced to work around (retained buildable source,
-reproducible builds, an operator toolchain).
+A tokeira deployment's platform — its modules, resources, services, their typed parameters, and their
+wiring — is authored as a **deployment definition** written in a small, fixed subset of Rust and stored
+as a **`.tkd`** file. The bound provisioner (`tkp`) **interprets** the `.tkd` at plan/apply time into the
+in-memory deployment the IaC and runtime engines already consume; it is never compiled into the binary.
+Because the definition is *interpreted data*, both value changes and structural changes are an ordinary
+`apply` — no rebuild, no per-deployment source snapshot.
 
-This spec removes the coupling at its root by introducing a **platform configuration DSL**: a
-strongly-typed, total (terminating, side-effect-free) language in which a deployment's platform —
-its modules, resources, services, their typed parameters, and their dependency wiring — is expressed
-as a **program**. A **compiler embedded in `tkp`** type-checks that program and **lowers** it, at
-plan/apply time, into the exact in-memory composition the IaC and runtime engines already consume
-(`InfraComposition` and the runtime service set). The compiled binary carries a **fixed library of
-typed resource kinds** (the executable `create`/`update`/`delete`/`describe` logic stays Rust); the
-DSL describes only their **composition**, never their behaviour.
+A definition has two halves, both ordinary Rust: `config()` returns the operator surface (a value of the
+config `struct`/`enum` types the definition declares), and `deployment(cfg, cx)` returns the structure
+(it reads the config and injected context and calls a fixed builder vocabulary). The interpreter is the
+platform-agnostic **`tokeira-tkd`** crate; each platform binds it by implementing one **`HostBridge`**.
+`platforms/compose-syn` (`ComposeBridge`) and `platforms/eks` (`EksBridge`) already share it.
 
-The effect on the provisioner is decisive: because both *structural* and *value* changes are now
-edits to a **data artifact** (the DSL program) interpreted by a generic binary, they are an ordinary
-`apply` — no rebuild, no per-deployment source snapshot, no reproducible-build binding problem. The
-engine identity that the provisioner binds against collapses to **the resource-kind library + the
-language/compiler version** compiled into `tkp`; the DSL program is the deployment-married
-configuration the provisioner records and retains.
+The engine identity the provisioner binds against is the compiled Rust — the `tokeira-tkd` interpreter,
+each platform's builder vocabulary, kinds, and bridge; the `.tkd` is the deployment-married configuration
+revision it records and retains. The interpreted subset (reject-by-default) is what guarantees a `.tkd`
+edit can only *name* the versioned vocabulary and can never silently become an engine-identity change.
 
-### Authoring and ownership model
-
-The `.platform` definition is a **platform-author artifact**, checked into each platform crate
-(`platforms/{local,compose,ecs,…}`) and built on the reusable `tokeira-platform-dsl`. It is authored
-**once, when a platform is created** (for example, future `eks` support) — the DSL analog of today's
-`config.rs`/`modules.rs`/`services.rs` — not hand-written per deployment. The everyday **operator**
-**selects a platform and supplies input values**; they do not author the structural definition (though,
-because it is now data and not compiled Rust, an operator *may* evolve a deployment's persisted
-definition — structurally or by value — as an ordinary `apply`, which is the coupling this spec
-removes). `tkr deployment create` **persists the authored definition** (the file set) into the
-deployment alongside its other state; every subsequent `plan`/`apply` compiles that **persisted copy**,
-never the live repo file. There is therefore **no "starter generator."** This spec owns the language,
-the compiler, a platform's use of the DSL, and the authored definition itself; the **persistence and
-retention contract** (storage, versioning against the compiling `tkp`, re-materialization, rollback) is
-owned by the `platform-provisioner-binary` (`tkp`) spec, which consumes this one.
-
-### Scope boundary
-
-- **In scope:** the DSL's surface and semantics; the typed resource-kind library contract; static
-  type checking; totality/determinism; validation parity with today's platform definitions;
-  operator-grade diagnostics; the lowering contract to `InfraComposition` and the runtime service
-  set; in-program parametrisation; language/library versioning; ECS + Compose + Local parity; and the
-  artifact the provisioner records/retains.
-- **Out of scope (deferred / owned elsewhere):** the choice of language *substrate* (a bespoke
-  lexer/parser stack vs. embedding an existing typed-config language) — a design decision, not a
-  requirement; the provisioner's binding/upgrade/rollback machinery (owned by
-  `platform-provisioner-binary`, which *consumes* this spec); the running server's runtime config
-  (`tokeirad.toml` / `TokeiraConfig`), which is the deployed server's own configuration, not the
-  platform's infra+services definition; adding genuinely new resource *kinds* (a code change to the
-  kind library, hence an engine-identity change).
+> **History.** An earlier design specified a bespoke `logos`/`chumsky`/`ariadne` compiler, a `Composition`
+> IR, a `KindLibrary`/`Realizer`/`DslPlatform` framework, multi-file `.platform` files, and an
+> `inputs.toml`. None shipped in that form; see [`proposals/HISTORY.md`](./proposals/HISTORY.md). Two of
+> its ideas — multi-file composition and declared context providers — are retained as **Roadmap** items
+> at the end of this document.
 
 ### Authority for "correct"
 
-This DSL matches no external system. Its ground-truth authority is **the current platform definitions
-in code** — the set of resources/services, their parameters, their wiring, and their validations as
-implemented today — which the DSL must be able to express at parity, and **the engine's consumption
-contract** (`InfraComposition`, the `Resource` trait, the runtime service set) into which it must
-lower without loss.
+This DSL matches no external system. Its ground-truth authority is **the current implementation** —
+`crates/tokeira-tkd` (the interpreter + `HostBridge` seam) and `platforms/compose-syn` (the reference
+bridge, kinds, builder vocabulary, and `definition.tkd`), with `platforms/eks` as the second bridge — and
+**the engine's consumption contract** (`tokeira_orchestrator::Deployment`/`Ops`, `tokeira_iac::Resource`,
+the deploy-engine service set) into which a definition realizes without loss.
 
 ## Glossary
 
-- **Platform DSL (the DSL)** — the strongly-typed, total language in which a deployment's platform
-  (modules, resources, services, wiring) is written.
-- **Program** — the compilation unit: the composed source of one **deployment definition** (one or
-  more `.platform` files) that the compiler processes.
-- **Deployment definition** — the rooted set of `.platform` files describing one deployment; a
-  **platform-author artifact** authored in the owning platform crate and, at `tkr deployment create`,
-  persisted into the deployment as the deployment-married configuration the provisioner retains and
-  digests.
-- **Platform author** — the engineer who authors a platform's `.platform` definition (checked into the
-  platform crate, e.g. `platforms/compose`) on the reusable `tokeira-platform-dsl`, analogous to writing
-  today's `config.rs`/`modules.rs`/`services.rs`. Distinct from the operator.
-- **Operator** — the user who instantiates a deployment by **selecting a platform and supplying input
-  values**; they do not author the structural definition (but may evolve a deployment's persisted
-  definition as an ordinary `apply`, since it is data rather than compiled Rust).
-- **Deployment root** — the boundary directory containing a deployment definition; imports never
-  resolve outside it.
-- **Import (`use`)** — a relative, downward-only include of another `.platform` file within the
-  deployment root.
-- **RuntimeContext** — the closed, typed record `tkp` injects at execution: an **implicit** part
-  (kind-library-delivered, e.g. `deployment_dir`, `home`) plus an operator-**declared** part bound to
-  canonical providers and resolved by `tkp`. Secret-bearing fields are typed `Secret<…>`. The
-  composition reads only typed `ctx.<field>` values and never names a provider; there is no OS-env,
-  network, clock, or arbitrary-filesystem access from the language.
-- **Implicit context** — the `RuntimeContext` fields the `tkp` kind library always delivers for a
-  platform (derived from the platforms: `deployment_dir`, and `home` where needed).
-- **Context declaration** — the operator `context { }` block in the deployment definition binding named
-  context fields to providers; the only place a provider is named.
-- **Provider** — a `tkp`-resolved source of a declared context value, from a catalog **fixed by the
-  `(language, kind-library)` version**. The canonical catalog derived from the current platforms is
-  `{ env }`; new providers arrive only by engine upgrade.
-- **Secret taint** — the typing rule that a `Secret<…>` value never appears in a diagnostic and flows
-  only into resource parameters typed to accept secrets.
-- **Recorded (identity-bearing) context** — a `RuntimeContext` value persisted with the deployment at
-  creation (e.g. `region`, later `account`); authoritative, and a differing ambient source is a
-  *retarget* requiring confirmation.
-- **Ambient (machine-local) context** — a `RuntimeContext` value supplied by the host per invocation
-  (e.g. `deployment_dir`, `home`); not persisted, re-derived per host, no confirmation needed.
-- **Resource kind** — a compiled Rust `Resource` implementation (executable provider lifecycle:
-  `create`/`update`/`delete`/`describe`/`diff`). The DSL references kinds; it does not define them.
-- **Kind library** — the fixed set of resource kinds (and service kinds) compiled into a given `tkp`,
-  spanning the supported platforms (ECS, Compose, Local).
-- **Compiler** — the embedded pipeline (lex → parse → resolve → type-check → validate → lower) that
-  runs in-process inside `tkp` at plan/apply time.
-- **Lowering** — the deterministic transformation of a type-checked program into the engine's
-  in-memory composition: an `InfraComposition` (desired/known/active modules → `Resource` objects)
-  plus the runtime service set.
-- **Composition** — the engine input produced by lowering; the `InfraComposition` plus runtime
-  services.
-- **Diagnostic** — a compiler-emitted error or warning carrying a source span, a message, and where
-  possible a remediation hint.
-- **Totality** — the property that evaluation always terminates and performs no I/O or other side
-  effects; a program is a pure function from inputs to a composition.
-- **Determinism** — the property that the same program (with the same inputs) always lowers to the
-  same composition, byte-for-byte in the resource set, ids, and ordering inputs.
-- **Inputs** — operator-tunable *configuration values* a program reads (scaling, image refs, storage
-  choice) so that *value* refinement need not edit structural code; distinct from the `RuntimeContext`
-  (operator-authored config vs. host-injected execution context).
-- **Language/library version** — the version pair `(language, kind-library)` a `tkp` provides; it is
-  **derived from the compiling `tkp`**, never declared in a program; the provisioner's engine identity
-  is derived from it.
-- **Engine identity** — (from `platform-provisioner-binary`) the binding key over the
-  engine/resource-implementation surface; under this spec it is the kind library + compiler/language
-  compiled into `tkp`, never the DSL program.
+- **Deployment definition (`.tkd`)** — the single-file, interpreted Rust-subset artifact describing one
+  deployment: `config()` (the operator surface) + `deployment(cfg, cx)` (the structure). The
+  deployment-married configuration the provisioner records, digests, and retains.
+- **`config()`** — the function returning the platform's config value; the operator's editable surface.
+  Overriding a default is editing this literal. Must be host-free (data only).
+- **`deployment(cfg, cx)`** — the function returning the structure; reads the config and context and calls
+  the builder vocabulary.
+- **Builder vocabulary** — the fixed verbs a definition may call: `Deployment::new`, `d.module`,
+  `d.resource`, `d.service`, `d.writeback`, `r.output`, and the `cx.*` accessors. Author-owned Rust.
+- **Kind** — a typed struct the operator names (`DsqlCluster`, `DynamoDbTable`, `ObservabilityConfigFiles`,
+  `LocalStateDir`, `Service`, …) that realizes directly to a concrete engine resource. The DSL references
+  kinds; it does not define their behaviour.
+- **`tokeira-tkd`** — the platform-agnostic `syn` interpreter crate: parse → subset check → eval → admit,
+  generic over a `HostBridge`.
+- **`HostBridge`** — the platform-supplied seam the interpreter dispatches through (construct kinds, call
+  builder verbs, read context). The only place platform types are named.
+- **Interpreted subset** — the reject-by-default allow-list of Rust constructs the interpreter evaluates;
+  everything else is a spanned diagnostic and is never run.
+- **`#[create]`** — a config-field attribute marking a create-time-immutable value; changing it after
+  create is a *retarget* the provisioner refuses.
+- **`#[require(expr)]`** — a constraint on a config type, evaluated against the resolved config before
+  `deployment()` runs.
+- **Cx (runtime context)** — the closed record `tkp` injects at interpretation: `project_name` and
+  `region` are readable by the definition; `deployment_dir` is host-supplied, used author-side, and never
+  surfaced to the `.tkd` or persisted.
+- **Output reference** — `r.output(name)`: a deferred handle to a resource's provisioned output, resolved
+  from `InfraState` after apply.
+- **Writeback** — the definition's declaration of which `TokeiraConfig` keys `tkp` writes from post-apply
+  infra outputs (the DSQL endpoint/region and coordination-table names).
+- **Configuration revision** — the deployment's desired state as data (the `.tkd`); editing it is a plan,
+  recorded as a monotonic `config_revision`. Distinct from **engine identity** (the compiled
+  interpreter + vocabulary + kinds + bridge, keyed by the provisioner's `source_tree_hash`).
+- **Platform author** — the engineer who writes a platform's engine identity (bridge, kinds, builder
+  realizers) and ships its default `definition.tkd`.
+- **Operator** — the user who instantiates a deployment by selecting a platform and editing its `.tkd`
+  `config()` (and optionally structure); never rebuilds a binary.
 
 ## Target State
 
-- A deployment's platform is authored as a **DSL program** by the platform author in the platform
-  crate (not a compiled Rust struct + TOML values); the operator selects that platform and supplies
-  input values, and `tkr deployment create` persists the authored definition into the deployment.
-- `tkp` is **generic**: engine + fixed kind library + embedded compiler. It is no longer
-  deployment-specific by source.
-- The compiler **type-checks and validates** a program fully before any lowering, and **lowers**
-  a valid program to the engine composition with no loss of resource ids, dependencies, or module
-  ownership.
-- Every validation enforced today in `EcsConfig::validate` (and the compose conditionals) is enforced
-  by the compiler as a typed/contract check, surfaced as a diagnostic, not deferred to post-lowering
-  Rust.
-- **Structural and value changes are both program edits** → ordinary `apply` on the same `tkp`.
-- ECS and Compose platforms are expressible **at parity** with their current definitions; Local is
-  expressible.
-- The DSL **stays a configuration language**: total, side-effect-free, not Turing-complete in the
-  sense of unbounded computation, and incapable of defining resource behaviour.
-
-## Evidence From Current Code
-
-- **Compiled platform shape + validation (the thing the DSL replaces):**
-  `platforms/ecs/src/config.rs` — fixed-arity `EcsConfig`/`ServiceConfigs`/`CapacityProviderConfigs`;
-  `EcsConfig::validate` with canonical-port checks (`expect_port`, `expect_metrics`), cpu/memory
-  pairing (`validate_cpu_memory`), capacity-range checks (`validate_capacity`,
-  `validate_runtime_capacity`), task-resource sufficiency (`validate_resource_sufficiency`), and
-  conditional-required DSQL fields (`require_preexisting`). `#[serde(deny_unknown_fields)]` throughout.
-- **Compiled service composition + conditionals:** `platforms/compose/src/compose.rs` —
-  `compose_services()` builds a fixed service list and conditionally injects AWS env/volumes when
-  `storage == Dsql`; `module_for_service()` assigns module ownership.
-- **The engine consumption contract (the lowering target):**
-  `crates/tokeira-iac/src/types.rs` — `InfraComposition { desired_modules, known_modules,
-  active_modules }`, `Change`, `ChangeKind`; `crates/tokeira-iac/src/lib.rs` — the `Resource` trait,
-  `ResourceId`, `ResourceType`, `Module`; `crates/tokeira-iac/src/engine.rs` — plan/apply over a
-  composition, topological ordering, and the composition-validation invariants
-  (unique ids, `desired ⊆ known`, deps present, DAG).
-- **Current authoring/loading path (replaced):** `apps/tkr/src/prototypical.rs` (TOML template
-  generation) and `apps/tkr/src/deployment_dir.rs` (`deployment.toml` parsed via
-  `tokeira_config::load_config`).
-- **Consumer of this spec:** `.kiro/specs/platform-provisioner-binary/` — engine identity, binding,
-  retention, and rollback, which bind against the kind-library/language version and record/retain the
-  DSL program.
-
-## Validation Parity Policy
-
-Every validation the compiled platform performs today MUST be enforced by the compiler before
-lowering. Each is accounted for below with the target enforcement mechanism and the diagnostic class.
-
-| Current check (source) | DSL enforcement | On violation |
-|------------------------|-----------------|--------------|
-| Unknown config field (`deny_unknown_fields`) | Static typing: unknown field/parameter is not in the kind's schema | Type-error diagnostic at the field span |
-| Canonical service ports (`expect_port`/`expect_metrics`) | Typed constraint on the service kind's port parameters | Validation diagnostic naming service, field, expected/actual |
-| CPU/memory pairing (`validate_cpu_memory`) | Constraint on the kind's `(cpu, memory)` parameters | Validation diagnostic with the allowed pairing hint |
-| Capacity range `min ≤ desired ≤ max` (`validate_capacity`) | Constraint on capacity-provider parameters | Validation diagnostic naming the provider |
-| Task-resource sufficiency (`validate_resource_sufficiency`) | Cross-field constraint over service + observability overhead | Validation diagnostic with computed overhead |
-| Conditional-required DSQL fields (`require_preexisting`) | Typed sum: `preexisting` variant requires its fields, `managed` forbids them | Type/validation diagnostic at the variant |
-| Non-empty VPC CIDR / AZs (`EmptyVpcCidr`/`EmptySubnets`) | Non-empty typed constraint | Validation diagnostic at the field |
-| Compose DSQL conditional env/volumes (`compose_services`) | Conditional expression on a typed `storage` enum | Lowered deterministically; mis-typed condition is a type error |
-| Module ownership (`module_for_service`) | Each resource/service declares its module; uniqueness enforced | Validation diagnostic on duplicate/missing module |
+- A deployment's platform is a **`.tkd`** deployment definition (`config()` + `deployment(cfg, cx)`),
+  authored by the platform author and shipped with the crate; the operator selects the platform and edits
+  the persisted `.tkd`.
+- `tkp` is **generic**: the `tokeira-tkd` interpreter + a fixed per-platform bridge/kinds/vocabulary. It is
+  not deployment-specific by source.
+- The interpreter **enforces the subset before evaluation**, evaluates `config()` (host-free), runs
+  admission (`#[require]` + the `#[create]` retarget check), then evaluates `deployment()` into the
+  platform's deployment with no partial output on error.
+- **Structural and value changes are both `.tkd` edits** → an ordinary `apply` on the same `tkp`.
+- The DSL powers `compose-syn` and `eks` on the shared interpreter; the compiled platforms
+  (`compose`, `ecs`, `local`) are migration targets.
+- The DSL **stays a configuration language**: total, side-effect-free, deterministic, and incapable of
+  defining resource behaviour.
 
 ## Requirements
 
-### Requirement 1: Platform composition defined by a DSL program
+### Requirement 1: Platform composition defined by a `.tkd` deployment definition
 
-**User Story:** As an operator, I want my deployment's platform (modules, resources, services, wiring)
-expressed as a DSL program rather than compiled Rust, so that I can evolve its structure without
-rebuilding a binary.
-
-#### Acceptance Criteria
-
-1. THE platform DSL SHALL be sufficient to express a deployment's full infra+services definition —
-   modules, resources, services, their typed parameters, and their inter-resource dependencies — such
-   that no part of a supported platform's structure requires compiled Rust beyond the resource-kind
-   library.
-2. WHEN a deployment is created, THEN its platform SHALL be represented by exactly one DSL program —
-   the definition authored in the selected platform crate, persisted into the deployment at create —
-   as the authoritative source of its infra+services definition, AND every subsequent `plan`/`apply`
-   SHALL compile that persisted copy rather than the live platform-crate file.
-3. THE DSL program SHALL be the artifact the provisioner records and retains for the deployment
-   (`platform-provisioner-binary`), not a compiled per-deployment struct.
-4. THE DSL SHALL NOT carry the running server's runtime configuration (`TokeiraConfig`); that remains
-   a separate concern outside this spec.
-
-### Requirement 2: Resource kinds are a fixed, typed, compiled library
-
-**User Story:** As a platform engineer, I want the DSL to instantiate a fixed library of compiled,
-typed resource kinds rather than describe resource behaviour, so that provider correctness stays in
-reviewed Rust while composition stays editable.
+**User Story:** As an operator, I want my deployment's platform expressed as an interpreted `.tkd` rather
+than compiled Rust, so that I can evolve its values and structure without rebuilding a binary.
 
 #### Acceptance Criteria
 
-1. THE DSL SHALL reference resource and service **kinds** by name from a fixed library compiled into
-   `tkp`; it SHALL NOT define or alter a kind's provider lifecycle behaviour.
-2. WHEN a program references a kind not present in the running `tkp`'s kind library, THEN the compiler
-   SHALL emit a diagnostic and SHALL NOT lower the program.
-3. WHEN a program supplies a parameter to a kind that is not in that kind's declared schema, or omits
-   a required one, THEN the compiler SHALL emit a type diagnostic and SHALL NOT lower the program.
-4. THE kind library SHALL declare, for each kind, a typed parameter schema and the kind's
-   `ResourceType`/`ResourceId` derivation, so that the compiler can type-check references and the
-   lowering can construct the engine's `Resource` objects.
+1. THE deployment definition SHALL express a deployment's full infra+services — modules, resources,
+   services, their typed parameters, and their wiring — such that no part of a supported platform's
+   structure requires compiled Rust beyond the author's kinds and builder vocabulary.
+2. THE definition SHALL consist of two functions: `config()` returning the platform's config value, and
+   `deployment(cfg, cx)` returning the structure via the builder vocabulary.
+3. WHEN a deployment is created, THEN its platform SHALL be represented by exactly one persisted
+   `definition.tkd`, AND every subsequent `plan`/`apply` SHALL interpret that persisted copy, never the
+   live platform-crate file.
+4. THE `.tkd` SHALL NOT carry the running server's runtime configuration (`TokeiraConfig`); that remains
+   `tokeirad.toml`, a separate concern.
 
-### Requirement 3: Static type checking precedes lowering
+### Requirement 2: Kinds are a fixed, typed, compiled vocabulary
 
-**User Story:** As an operator, I want a program fully type-checked before anything is provisioned, so
-that a malformed platform definition is caught as a diagnostic rather than mis-provisioned.
-
-#### Acceptance Criteria
-
-1. WHEN the compiler processes a program, THEN it SHALL complete name resolution and static type
-   checking before producing any composition, and a type error SHALL prevent lowering entirely.
-2. THE type system SHALL recover the guarantees the current `#[serde(deny_unknown_fields)]` typed
-   structs provide: unknown fields, wrong-typed values, and missing required values are static errors.
-3. IF a program fails type checking, THEN no partial composition SHALL be passed to the engine.
-
-### Requirement 4: Totality and deterministic evaluation
-
-**User Story:** As an operator, I want compilation to be a pure, terminating, deterministic step, so
-that the plan derived from a program is reproducible and safe to run inside the provisioner.
+**User Story:** As a platform author, I want the `.tkd` to instantiate a fixed set of typed kinds rather
+than describe resource behaviour, so that provider correctness stays in reviewed Rust while composition
+stays editable.
 
 #### Acceptance Criteria
 
-1. THE DSL SHALL be total: evaluation SHALL always terminate and SHALL perform no I/O, network, clock,
-   filesystem, or environment access during compilation.
-2. WHEN the same program is compiled with the same inputs and the same `RuntimeContext`, THEN it SHALL
-   lower to the same composition — the same resource set, the same ids, dependencies, and module
-   ownership — every time.
-3. THE compiler SHALL run in-process within `tkp` at plan/apply time and SHALL NOT require a separate
-   external build step or toolchain.
+1. THE `.tkd` SHALL reference kinds and builder verbs **by name** from the platform's bridge/vocabulary
+   compiled into `tkp`; it SHALL NOT define or alter a kind's realization.
+2. WHEN a `.tkd` names a kind, method, or associated function the platform's `HostBridge` does not expose,
+   THEN the subset check SHALL emit a spanned diagnostic and the definition SHALL NOT be evaluated.
+3. WHEN a `.tkd` supplies a field a kind does not declare, or omits a required one, THEN construction
+   SHALL fail with a located error (the kind constructor consumes the field map and rejects leftovers).
+4. A `d.service(...)` SHALL realize to **both** a `tokeira_iac::Resource` and a
+   `tokeira_deploy_engine::Service`; no engine object SHALL be produced except by a kind's `realize`.
 
-### Requirement 5: Validation parity with the current platform definitions
+### Requirement 3: Total, deterministic, hermetic interpretation
 
-**User Story:** As a platform engineer, I want every validation the compiled platforms enforce today
-to be enforced by the compiler, so that moving to the DSL loses no safety.
-
-#### Acceptance Criteria
-
-1. THE compiler SHALL enforce each check in the Validation Parity Policy table before lowering, and a
-   violation SHALL be a diagnostic that prevents lowering.
-2. WHERE a current validation is conditional (e.g. DSQL `preexisting` requires endpoint/role fields),
-   THE DSL SHALL express the condition through the type system (typed sums/optionals) so the
-   requirement is checked statically rather than after lowering.
-3. THE engine SHALL NOT be relied upon to re-perform a platform validation that the compiler can
-   perform; validations move forward to compile time, not backward to runtime.
-
-### Requirement 6: Operator-grade diagnostics
-
-**User Story:** As an operator, I want compiler errors that point at the exact place in my program and
-explain the problem, so that I can fix a platform definition without reading source.
+**User Story:** As an operator, I want interpretation to be a pure, terminating, deterministic step, so
+that the plan derived from a `.tkd` is reproducible and safe to run inside the provisioner.
 
 #### Acceptance Criteria
 
-1. WHEN the compiler rejects a program at any phase (lex, parse, resolve, type, validation, or
-   pre-lowering composition check), THEN each diagnostic SHALL carry a source span, a human-readable
-   message, and where applicable a remediation hint.
-2. WHERE multiple independent errors exist in a program, THE compiler SHALL report as many as it can
-   in one pass (error recovery) rather than failing on the first.
-3. THE diagnostics SHALL be emitted both human-readably and, under a machine-readable mode, as
-   structured data for `--json` consumers.
+1. THE interpreter SHALL enforce the interpreted subset (a reject-by-default allow-list) **before** any
+   evaluation; a construct outside the subset (loops, arbitrary calls, closures, `std::env`/`std::fs`,
+   non-whitelisted macros) SHALL be a spanned diagnostic and SHALL NOT be evaluated.
+2. Interpretation SHALL perform no I/O into the language — no OS environment, network, clock, or arbitrary
+   filesystem read — during subset check or evaluation.
+3. WHEN the same `.tkd` is interpreted with the same `Cx`, THEN it SHALL yield the same deployment — the
+   same resources, services, ids, dependency edges, module ownership, and writeback entries — every time.
+4. IF interpretation fails at any stage, THEN no partial deployment SHALL be passed to the engine.
 
-### Requirement 7: Lowering contract to the engine composition
+### Requirement 4: Static admission precedes realization
 
-**User Story:** As the IaC engine, I want a type-checked program lowered to exactly the composition I
-consume, with the composition invariants already guaranteed, so that I never receive a malformed graph.
-
-#### Acceptance Criteria
-
-1. WHEN a type-checked, validated program is lowered, THEN the compiler SHALL produce an
-   `InfraComposition` (desired/known/active modules resolving to `Resource` objects) and the runtime
-   service set, preserving every declared `ResourceId`, dependency edge, and module ownership.
-2. BEFORE returning a composition, THE compiler SHALL guarantee the engine's composition invariants —
-   unique module names, unique resource ids, `desired ⊆ known`, every dependency present unless
-   declared external, and no dependency cycles — and SHALL emit a diagnostic (not a composition) if
-   any would be violated.
-3. THE lowering SHALL be the only path from a program to engine input; a program SHALL NOT be able to
-   inject a `Resource` object the kind library did not construct.
-
-### Requirement 8: In-program parametrisation and value refinement
-
-**User Story:** As an operator, I want to vary values (scaling, image refs, region, AZs) through
-program inputs or bindings without editing structural definitions, so that everyday refinement stays
-low-friction and both value and structural edits are the same kind of operation.
+**User Story:** As an operator, I want the config validated before anything is realized, so that a
+malformed or illegal config is caught as an error rather than mis-provisioned.
 
 #### Acceptance Criteria
 
-1. THE DSL SHALL support bindings/inputs and typed expressions (including typed enums, optionals, and
-   conditionals) so that values can be parameterised and reused without duplicating structure.
-2. WHEN an operator changes only input values, THEN recompilation SHALL re-lower to a composition that
-   differs only in those values, and the change SHALL be an ordinary `apply` on the same `tkp` (no new
-   language/kind-library version).
-3. WHERE an input is required and unbound, or bound to a value of the wrong type, THE compiler SHALL
-   emit a diagnostic and SHALL NOT lower.
+1. THE `config()` value SHALL be **host-free** (data only — structs/enums/scalars); IF it contains an
+   author kind or builder handle, THEN `interpret` SHALL reject it before admission.
+2. WHERE a config type carries a `#[require(expr)]` constraint, THE interpreter SHALL evaluate it against
+   the resolved config before `deployment()` runs, AND a false result SHALL abort with the constraint's
+   span.
+3. WHERE a `#[create]` field's value differs from the recorded baseline on a re-apply, THE provisioner
+   SHALL treat it as a **retarget** and refuse it, not reconcile it; a non-`#[create]` field change SHALL
+   reconcile.
 
-### Requirement 9: Language and kind-library versioning
+### Requirement 5: Resource output references
 
-**User Story:** As an operator, I want the language and kind-library version to be derived from the
-`tkp` that compiles a program — never declared in the program — so that version stamping for the
-provisioner is reliable and a program is never silently mis-compiled by a different binary.
-
-#### Acceptance Criteria
-
-1. THE running `tkp` SHALL expose the `(language, kind-library)` version it provides, and the
-   provisioner's engine identity SHALL be derived from it (per `platform-provisioner-binary`), never
-   from a deployment's DSL program.
-2. THE program SHALL NOT declare or pin a language or kind-library version; the
-   `(language, kind-library)` version SHALL be derived solely from the compiling `tkp`. A reference to
-   a kind, field, or construct the running library does not provide SHALL be rejected per Requirement 2
-   (not via a program-declared version).
-3. WHEN the kind library or language changes (a new/changed kind, a changed schema, a language
-   change), THEN it SHALL constitute an engine-identity change handled by the provisioner's
-   `upgrade` path, distinct from an ordinary program edit.
-
-### Requirement 10: Multi-platform parity
-
-**User Story:** As a platform engineer, I want the DSL to express the existing ECS, Compose, and Local
-platforms, so that the DSL can replace the compiled platform structs without regression.
+**User Story:** As a platform author, I want a definition to reference a resource's provisioned output (a
+DSQL endpoint, a table name) so that dependent wiring resolves after provisioning, not at author time.
 
 #### Acceptance Criteria
 
-1. THE kind library SHALL provide the resource and service kinds required to express the ECS and
-   Compose platforms at parity with their current definitions (`platforms/ecs`, `platforms/compose`),
-   and to express the Local platform.
-2. WHEN an ECS or Compose deployment's current compiled definition is re-expressed as a DSL program,
-   THEN lowering SHALL produce a composition equivalent to today's — the same resources, services,
-   dependencies, and module ownership — for the same inputs.
-3. WHERE a platform applies a conditional today (e.g. compose DSQL env/volumes, ECS optional
-   endpoints), THE DSL SHALL express it as a typed conditional that lowers to the same result.
+1. THE builder vocabulary SHALL provide `r.output(name)` returning a deferred `Output` handle bound to the
+   resource's id.
+2. WHEN a definition uses an `Output`, THEN interpretation SHALL record the deferred handle and SHALL NOT
+   require its value; the value SHALL be resolved by the adapter during apply from the referenced
+   resource's provisioned `InfraState`.
+3. WHERE an `Output` names a resource absent from the deployment, THE adapter SHALL emit no value for that
+   entry (it cannot resolve). Determinism (Req 3.3) applies to the deployment structure and the set of
+   references, not to provider-assigned output values.
 
-### Requirement 11: The program is the retained, deployment-married artifact
+### Requirement 6: Server-config writeback
 
-**User Story:** As an operator, I want the deployment to carry its DSL program (and a content digest)
-so that the provisioner records, retains, and can roll back to it, making the deployment
-self-contained without a buildable source tree.
+**User Story:** As an operator, I want the DSQL cluster identity discovered at apply to reach the server
+config, so that `tokeirad` connects to the right cluster and coordination tables.
 
 #### Acceptance Criteria
 
-1. WHEN the provisioner records or retains deployment configuration, THEN it SHALL record/retain the
-   **deployment definition** (the set of `.platform` files) and a content digest computed over the
-   sorted `(relative_path, sha256)` set, sufficient to recompile and re-lower deterministically.
-2. WHEN the provisioner captures a rollback checkpoint (per `platform-provisioner-binary`), THEN the
-   prior **deployment definition** (the file set) SHALL be part of that checkpoint, so a prior
-   configuration is restorable.
-3. THE retained deployment definition SHALL be compilable by the `tkp` whose `(language,
-   kind-library)` version is recorded alongside it; a checkpoint definition SHALL be paired with the
-   version that can compile it.
+1. THE definition SHALL declare writeback entries via `d.writeback(key, value)`, where `value` is a
+   literal or a resource `Output`.
+2. WHEN infra apply completes, THEN `tkp` SHALL resolve each writeback entry (literals directly, `Output`s
+   from `InfraState`) and write exactly those keys into `tokeirad.toml`; it SHALL NOT write any other
+   `TokeiraConfig` key.
+3. THE writeback SHALL be a mechanic specialized for `TokeiraConfig` (the DSQL endpoint/region and the two
+   coordination-table names), not a general-purpose config-editing facility.
+
+### Requirement 7: The definition is the retained, digested configuration revision
+
+**User Story:** As an operator, I want the deployment to carry its `.tkd` (and a content digest) so that
+the provisioner records, retains, and can roll back to it, making the deployment self-contained without a
+buildable source tree.
+
+#### Acceptance Criteria
+
+1. WHEN the provisioner records or retains deployment configuration, THEN it SHALL record/retain
+   `definition.tkd` and a content digest over it, sufficient to re-interpret deterministically.
+2. WHEN the provisioner captures a rollback checkpoint (per `platform-provisioner-binary`), THEN the prior
+   `definition.tkd` SHALL be part of that checkpoint, so a prior configuration is restorable.
+3. THE retained `definition.tkd` SHALL be interpretable by the `tkp` whose engine identity is recorded
+   alongside it; a checkpoint definition SHALL be paired with the engine identity that can interpret it.
+
+### Requirement 8: Create → edit → apply lifecycle and persisted representation
+
+**User Story:** As an operator, I want a clear, minimal on-disk representation of my deployment's config,
+so that I can read, diff, and reason about what defines it.
+
+#### Acceptance Criteria
+
+1. WHEN `tkr deployment create` runs for a `.tkd` platform (compose), THEN it SHALL write the platform's
+   shipped `definition.tkd`, write `metadata.json` (the CLI registry: `name`, `id`, `platform`, `storage`,
+   `status`, `created_at`, `updated_at`), seed a **prototypical `tokeirad.toml`** (from
+   `prototypical_server_config(storage, region)`) so the operator can edit server-config defaults **before**
+   the first apply, and create an empty `state/` — and produce no `docker-compose.yml` or other engine
+   artifacts yet. *(Current gap: the compose branch of `create` does not yet seed `tokeirad.toml` — only
+   `local`/`ecs` do — and does not bake `--storage`/`--region` into the seeded `.tkd`; both are tracked in
+   Roadmap R5 / tasks.md task 4. `deployment.toml` is a legacy-platform artifact the `.tkd` model does not
+   use.)*
+2. THE deployment definition — the configuration revision the interpreter reads — SHALL be exactly the
+   `definition.tkd` (digested), interpreted against the injected `Cx` under the engine identity compiled
+   into `tkp`. `metadata.json` SHALL be a CLI registry, not an input to interpretation (the interpreter
+   never reads it). THERE SHALL be no separate `inputs.toml`; operator value choices live in the `.tkd`'s
+   `config()`.
+3. WHEN a mutating `apply` runs, THEN `tkp` SHALL interpret `definition.tkd` against the injected `Cx`,
+   realize it, generate the derived artifacts (`docker-compose.yml`, `config/`, engine `state/`), perform
+   the writeback into `tokeirad.toml`, and record a monotonically increasing `config_revision`.
+4. THE generated artifacts (`docker-compose.yml`, `config/`, realized engine resources) SHALL be derived
+   and reproducible — regenerated each apply — and SHALL NOT be retained as configuration source.
+5. THE persistence, versioning, retention, state envelope, and `config_revision` mechanics SHALL be owned
+   by the `platform-provisioner-binary` (`tkp`) spec; this spec owns the artifact shape, the interpreter,
+   and the create-time hand-off.
+6. THE `.tkd`'s `config()` SHALL be the source of truth for the `storage` (and `region`) choice, since it
+   is the interpreter's only input. *(Current gap: `create` records `--storage` in `metadata.json` but
+   seeds the `.tkd` verbatim, so the two can diverge, and `--region` is dropped for compose. Reconciling
+   this — patching the seeded `.tkd`, or deriving `metadata.json.storage` from the `.tkd` — is Roadmap
+   R5.)*
+
+### Requirement 9: Multi-platform via the shared interpreter
+
+**User Story:** As a platform author, I want to add a platform by implementing one bridge over the shared
+interpreter, so that platforms share the language and the interpreter is written once.
+
+#### Acceptance Criteria
+
+1. THE interpreter (`tokeira-tkd`) SHALL be platform-agnostic and generic over a `HostBridge`; a platform
+   SHALL be expressible as a `HostBridge` impl plus its kinds, builder realizers, and a `definition.tkd`,
+   with no change to the interpreter.
+2. THE interpreter SHALL support at least two live platforms — `platforms/compose-syn` (`ComposeBridge`)
+   and `platforms/eks` (`EksBridge`) — sharing the one crate.
+3. WHEN the compose `definition.tkd` is interpreted, THEN the realized deployment SHALL match the compiled
+   reference (`definition.rs` → the engine `ComposeDeployment`) for both storage modes: the same workload
+   shape, namespaces, per-module resource identity (id/type/module/deps), and writeback keys/values.
+
+### Requirement 10: Accessible to platform author and operator
+
+**User Story:** As either a platform author or an operator, I want the definition to be legible and
+role-appropriate, so that authors reason about the engine surface and operators about their config.
+
+#### Acceptance Criteria
+
+1. THE `.tkd` SHALL be written in a subset of Rust syntax (parsed by `syn`), so authors and operators read
+   familiar constructs (`struct`/`enum`, `if let`/`match`, struct literals) with editor highlighting and
+   `rustfmt`, without a bespoke grammar to learn.
+2. THE operator-editable surface (`config()`) SHALL be separated from the structure (`deployment()`), and
+   `#[create]` SHALL mark the fields an operator may set only at create.
+3. THE spec and the shipped `definition.tkd` SHALL make clear which parts are author-owned engine identity
+   (kinds, builder verbs, the bridge — changed only by a `tkp` rebuild) and which are operator-owned
+   configuration (the `.tkd` — changed by an ordinary `apply`).
+
+### Requirement 11: Engine identity vs configuration revision
+
+**User Story:** As an operator, I want the engine identity derived from the `tkp` that interprets my
+`.tkd` — never declared in the `.tkd` — so that version stamping is reliable and a `.tkd` edit can never
+silently change engine behaviour.
+
+#### Acceptance Criteria
+
+1. THE running `tkp` SHALL expose the engine identity it provides (the interpreter + vocabulary + kinds +
+   bridge, keyed by `source_tree_hash`); the provisioner's binding SHALL derive from it, never from a
+   deployment's `.tkd`.
+2. THE `.tkd` SHALL NOT declare or pin an engine/language version; a reference to a kind, field, or
+   construct the running `tkp` does not provide SHALL be rejected per Requirements 2 and 3 (subset), not
+   via a program-declared version.
+3. WHEN the interpreter, builder vocabulary, kinds, or a bridge changes, THEN it SHALL constitute an
+   engine-identity change handled by the provisioner's `upgrade` path, distinct from a `.tkd` edit (which
+   is an ordinary `apply`, recorded as a new `config_revision`).
 
 ### Requirement 12: Closed runtime context and security posture
 
-**User Story:** As an operator, I want the DSL confined to a closed, typed runtime context and the
-compiled kind library with no ambient authority, so that a deployment definition can never read host
-secrets, reach the OS environment / network / arbitrary filesystem, or execute host code.
+**User Story:** As an operator, I want the `.tkd` confined to a closed context and the author's vocabulary
+with no ambient authority, so that a definition can never read host secrets, reach the OS/network/
+arbitrary filesystem, or execute host code.
 
 #### Acceptance Criteria
 
-1. THE program SHALL access no OS environment, network, clock, or arbitrary filesystem; the only
-   external data a program may read at execution is the closed, typed `RuntimeContext` injected by
-   `tkp`. THERE SHALL be no environment-variable or key-based lookup construct in the language.
-2. WHERE a workload requires secret-bearing material (e.g. cloud credentials), THE program SHALL only
-   *declare the need* through a typed field (such as `aws_auth`), AND `tkp` SHALL perform the injection
-   at materialization, so secret values never enter the program, its evaluation, or its output.
-3. THE compiler's diagnostics SHALL reference names and source spans only, never resolved
-   `RuntimeContext` values, so no secret is echoed to logs or telemetry.
-4. THE compiler SHALL enforce resource bounds (maximum file count, per-file and total bytes, import
-   depth, and AST nesting/size) and SHALL refuse with a diagnostic rather than consume unbounded
-   resources on adversarial input.
-5. THE program SHALL exercise no authority beyond composition over the fixed kind library, the
-   deployment-local files (Requirement 13), and the closed `RuntimeContext`; host-code execution from a
-   program SHALL be impossible.
+1. THE `.tkd` SHALL access no OS environment, network, clock, or arbitrary filesystem; the only external
+   data it may read at interpretation is the closed `Cx`. THERE SHALL be no environment-variable or
+   key-based lookup construct in the language.
+2. WHERE a workload requires secret-bearing material (cloud credentials), THE `.tkd` SHALL only *declare
+   the need* through a typed field (`aws: Some(region)`), AND `tkp`/the realizer SHALL perform the
+   injection at materialization, so secret values never enter the `.tkd`, its evaluation, or its output.
+   *(Documented deviation: the AWS edge is resolved author-side at realize time, reading live `HOME`/`AWS_*`,
+   so a realized DSQL manifest is not hermetic — the `.tkd` authoring is; the realizer boundary is the
+   sanctioned exception.)*
+3. THE interpreter SHALL surface every failure as an `EvalError`/diagnostic and SHALL NOT panic on any
+   operator-reachable path (asserted by a no-panic fuzz test).
+4. THE `.tkd` SHALL exercise no authority beyond composing the author's kinds/vocabulary over the closed
+   `Cx`; host-code execution from a definition SHALL be impossible (reject-by-default subset).
 
-### Requirement 13: Modular deployment definition and import containment
+### Requirement 13: Runtime context (implicit `Cx`) and recorded-identity precedence
 
-**User Story:** As an operator, I want to split a deployment definition across multiple `.platform`
-files contained within the deployment, so that large platforms stay maintainable while the definition
-remains a bounded, auditable, tamper-evident unit that nothing outside the deployment can influence.
-
-#### Acceptance Criteria
-
-1. A deployment definition MAY comprise multiple `.platform` files within the deployment root, composed
-   into one program via relative `use` imports.
-2. WHEN resolving a `use` import, THEN the target SHALL be a relative path with no `..` component and no
-   absolute prefix, AND after symlink canonicalization its real path SHALL be strictly within the
-   deployment root; any violation SHALL be a diagnostic and SHALL prevent compilation (fail-closed).
-3. THE deployment definition SHALL have a maximum folder depth of one below the deployment root; a file
-   deeper than one directory level SHALL be a diagnostic.
-4. THE import graph SHALL be acyclic (a cycle is a diagnostic), AND the composed program SHALL be
-   deterministic regardless of file read order (files composed in a stable path-sorted order),
-   preserving Requirement 4.2.
-5. WHEN declarations are composed across files, THEN name resolution SHALL span the whole composed
-   program, AND a duplicate top-level declaration across files SHALL be a diagnostic (no silent
-   shadowing).
-6. THE deployment definition's content digest SHALL be computed over the sorted `(relative_path,
-   sha256)` set of its files and SHALL be the artifact the provisioner records, retains, and verifies
-   (Requirement 11).
-
-### Requirement 14: Runtime context definition (implicit + declared providers)
-
-**User Story:** As an operator, I want the runtime context to combine values delivered implicitly by
-`tkp` with values I declare from a canonical, version-fixed set of providers, so that a deployment can
-wire the host data it needs without the DSL gaining ambient authority.
+**User Story:** As an operator, I want the definition to read the small set of context values it needs
+(project name, region) while identity-bearing values stay authoritative, so a deployment wires host data
+without the DSL gaining ambient authority.
 
 #### Acceptance Criteria
 
-1. THE `RuntimeContext` SHALL comprise (a) an **implicit** set delivered by the `tkp` kind library — at
-   minimum `deployment_dir`, and `home` where the platform requires it — and (b) an
-   operator-**declared** set bound, in a `context` declaration within the deployment definition, to
-   providers from the canonical catalog.
-2. THE canonical provider catalog SHALL be **fixed by the `tkp` `(language, kind-library)` version** and
-   derived from the existing platforms; it SHALL include the **`env`** provider (named host environment
-   variables). New providers SHALL be added only by an engine upgrade (Requirement 9.3), never declared
-   by an operator program.
-3. WHERE a declared context value is secret-bearing (e.g. an `env` variable resolved via `env.secret`),
-   THE value SHALL be typed `Secret<…>` and SHALL be subject to the secret-taint rules (Requirement
-   12.3): it SHALL NOT appear in any diagnostic and SHALL flow only into resource parameters typed to
-   accept secrets.
-4. THE DSL composition SHALL read context only as typed `ctx.<field>` values; it SHALL NOT name or read
-   a provider directly — provider resolution is performed solely by `tkp` at execution and injected as
-   the closed `RuntimeContext`.
-5. WHERE a workload requires the standard cloud credential chain, THE program MAY declare it via the
-   `aws_auth` convenience, which `tkp` SHALL satisfy by resolving the standard credential chain (the
-   `env` provider plus the platform's credential-file location from the implicit `home`) and injecting
-   it at materialization — with no secret value entering the program.
-6. WHEN a declared `env` variable is absent at execution, THEN `tkp` SHALL surface it per the field's
-   optionality (an optional field resolves to none; a required one is a host-runtime error), and SHALL
-   NOT silently substitute a value.
-7. THE following SHALL NOT be modelled as context providers, being either composition or host-runtime
-   concerns: AWS Secrets Manager secrets (a resource kind consumed by a container `value_from`
-   reference), the provisioner's own credential chain and STS caller-identity check (host-runtime auth),
-   and `region` (an operator input).
-8. WHERE a `RuntimeContext` value is **recorded** with the deployment (an identity-bearing input such as
-   `region`, or `account`), THE recorded value SHALL be authoritative; IF an ambient host source (e.g. an
-   environment variable) supplies a differing value, THE provisioner SHALL surface it as a retarget and
-   SHALL require explicit operator confirmation before using the differing value, never silently
-   overriding the recorded one.
-9. WHERE a `RuntimeContext` value is **machine-local ambient** (e.g. `deployment_dir`, `home`), THE host
-   SHALL supply it without confirmation, AND it SHALL NOT be persisted with the deployment — it is
-   re-derived per host, consistent with the ambient-never-retained rule.
+1. THE `Cx` injected at interpretation SHALL expose `project_name` and `region` to `deployment(cfg, cx)`;
+   `deployment_dir` SHALL be host-supplied, used author-side (in `Cx` helpers and the realizer), and
+   SHALL NOT be surfaced to the `.tkd`.
+2. WHERE an identity-bearing value is **recorded** with the deployment (`region`, and any future
+   `account`), THE recorded value SHALL be authoritative; IF an ambient host source supplies a differing
+   value, THE provisioner SHALL surface it as a retarget and require explicit operator confirmation, never
+   silently overriding the recorded one. *(Current gap: `region` is not persisted in `metadata.json` and
+   is carried only in the `.tkd`'s `config()` for DSQL; `Cx.region` (and `Cx.project_name`, from the
+   deployment name) sourcing is unfinished — part of Roadmap R5.)*
+3. WHERE a context value is **machine-local ambient** (`deployment_dir`), THE host SHALL supply it without
+   confirmation, AND it SHALL NOT be persisted — it is re-derived per host (the ambient-never-retained
+   rule); rollback restores the definition, never the context.
 
-### Requirement 15: Resource output references
+## Roadmap (retained, not part of the current contract)
 
-**User Story:** As a platform engineer, I want a resource parameter to reference another resource's
-provisioned output (a cluster ARN, a bucket name, a secret ARN), so that dependent resources are wired
-correctly without hard-coding values that only exist after provisioning.
+These were part of the original design and remain desirable, but are **not implemented** and are **not**
+current requirements. They are recorded here so the direction is not lost. Each would be an
+engine-identity change (a `tkp` upgrade), never a `.tkd`-only edit.
 
-#### Acceptance Criteria
+### R1: Multi-file `.tkd` composition with import containment
 
-1. THE DSL SHALL support an **output reference** expression `<resource>.<output>` usable in a resource
-   parameter, a container secret reference, or a writeback target.
-2. WHEN a program uses an output reference, THEN lowering SHALL create a dependency edge from the
-   referencing resource to the referenced resource AND record a deferred binding; the value SHALL be
-   resolved by the engine during apply, in dependency order, from the referenced resource's provisioned
-   state — never at compile time or at execute-to-composition time.
-3. WHERE an output reference names a resource absent from the composition, or an output the referenced
-   kind does not declare, THE compiler SHALL emit a diagnostic and SHALL NOT lower.
-4. THE referenced output's value SHALL NOT be required at compile time; a composition MAY contain
-   unresolved output references whose concrete values the provider supplies during apply. Determinism
-   (Requirement 4.2) applies to the composition structure and the set of references, not to
-   provider-assigned output values.
-5. WHERE an output reference is a secret-bearing container reference (e.g. a Secrets Manager secret
-   consumed via `value_from`), THE secret value SHALL be resolved by the runtime (e.g. ECS) at
-   materialization and SHALL NOT enter the program or the `RuntimeContext` (reinforcing Requirement
-   14.7).
+A deployment definition MAY grow beyond a single file, composed by a fail-closed relative import: no
+`..`, no absolute path, canonicalised within the deployment root, folder depth ≤ 1, acyclic, composed in
+a stable path-sorted order, with the content digest taken over the sorted `(relative_path, sha256)` set.
+The interpreted subset currently has **no import construct**; the definition is a single
+`definition.tkd`. Adding composition requires an interpreter change (a new subset item + the resolver) and
+would move the digest from a single file to the file set.
 
-### Requirement 16: Authored-in-crate definition; operator selects and supplies inputs
+### R2: Declared context providers (`context {}` / `env` / `env.secret`)
 
-**User Story:** As a platform author, I want a platform's `.platform` definition to live in the platform
-crate as the authored structural artifact, while operators merely select the platform and supply input
-values, so that platform structure is owned and reviewed once where it is built — not hand-written per
-deployment — and a deployment still pins its own persisted copy.
+Beyond the implicit `Cx` (`project_name`, `region`), a definition MAY declare additional context values
+bound to a canonical, version-fixed provider catalog — at minimum `env "NAME"` (→ `String?`) and
+`env.secret "NAME"` (→ `Secret<String>?`, subject to taint rules: never in a diagnostic, only into
+secret-accepting parameters). New providers would arrive only by engine upgrade, never declared by an
+operator. The current implementation exposes no declared-provider block; the compose AWS edge is handled
+author-side by the `Service { aws: Some(region) }` flag and the realizer, not a declared `env` provider.
 
-#### Acceptance Criteria
+### R3: Migrate the remaining compiled platforms to `.tkd`
 
-1. THE `.platform` definition for a platform SHALL be a platform-author artifact authored in that
-   platform's crate (`platforms/{local,compose,ecs,…}`) on the reusable `tokeira-platform-dsl`, the DSL
-   analog of today's `config.rs`/`modules.rs`/`services.rs`; it SHALL NOT be generated as an operator
-   starter, and there SHALL be no starter-generator for it.
-2. WHEN an operator instantiates a deployment, THEN their inputs SHALL be the selected platform plus
-   that platform's typed input values (Requirement 8); the operator SHALL NOT be required to author the
-   structural definition.
-3. WHEN `tkr deployment create` runs, THEN it SHALL persist the selected platform's authored definition
-   (the complete `.platform` file set) into the deployment as the deployment-married configuration, and
-   subsequent `plan`/`apply` SHALL compile that persisted copy, never the live platform-crate file
-   (Requirement 1.2).
-4. THE persistence and retention mechanics of the persisted definition — its storage location,
-   versioning against the compiling `tkp`'s `(language, kind-library)` version, re-materialization, and
-   rollback — SHALL be owned by the `platform-provisioner-binary` (`tkp`) spec; this spec owns only the
-   language, the compiler, a platform's use of the DSL, the authored definition, and the create-time
-   hand-off.
-5. WHERE an operator subsequently edits a deployment's persisted definition (structural or value), THE
-   change SHALL be an ordinary `apply` on the same `tkp` (no rebuild), consistent with Requirement 8.2;
-   editing the live platform-crate file SHALL NOT alter an existing deployment whose definition is
-   already persisted.
-6. THE envelope of such evolution SHALL be the running `tkp`'s `(language, kind-library)` version: an
-   edited definition that stays within it (any composition of the kinds/constructs that `tkp` provides)
-   SHALL be an ordinary `apply`; an edit that references a kind, field, provider, or language construct
-   the running `tkp` does not provide SHALL be rejected by the compiler (Requirements 2.2, 9.2) and SHALL
-   become possible only through an engine upgrade to a `tkp` that provides it (Requirement 9.3) — never
-   by a program-declared version. Evolution is therefore unbounded in composition but bounded by the
-   engine version, and the boundary is enforced by the compiler, not by policy.
+`platforms/{compose,ecs,local}` are still compiled platforms. Each SHOULD be re-expressed as a
+`HostBridge` + kinds + builder realizers + a shipped `definition.tkd`, at parity with its current
+compiled definition, reusing the shared `tokeira-tkd` interpreter (as `compose-syn` and `eks` do). ECS in
+particular exercises richer output-reference wiring (IAM policy needing a cluster ARN, ALB listener target
+groups, secrets-by-reference) that the compose surface does not.
+
+### R4: Typed writeback closure
+
+The shipped writeback uses dotted-key strings (`d.writeback("infrastructure.dsql.endpoint", …)`), which
+hardcode the `TokeiraConfig` schema as strings. The intended form is a typed closure
+`d.writeback(|t: &mut TokeiraConfig| { t.infrastructure.dsql.endpoint = cluster.output("…"); … })`,
+accepted by the interpreter as a structural special-form and lowered to the same entries — removing the
+magic strings. This is a correctness enhancement (typed paths), not a convenience, and is deferred.
+
+### R5: Reconcile `storage`/`region` between `metadata.json` and the `.tkd`
+
+`storage` currently lives in **two** places: `metadata.json.storage` (the CLI registry, set from
+`--storage` at create — `apps/tkr/src/metadata.rs`) and the `.tkd`'s `config().storage` (the interpreter's
+only input). `tkr deployment create` seeds the `.tkd` verbatim, so `--storage dsql` is recorded in
+`metadata.json` but **not** reflected in the seeded `.tkd`, and `--region` is dropped for compose
+entirely. The reconciliation SHOULD make the `.tkd`'s `config()` the single source of truth for
+`storage`/`region` — either `create` patches the seeded `.tkd` from `--storage`/`--region`, or
+`metadata.json` carries only a *derived* copy for `tkr list`. The `Cx.project_name`/`Cx.region` wiring
+(from the deployment name and the recorded configuration) and the `#[create]` retarget check against the
+recorded prior config value land with the same work — the tkr/tkp lifecycle wiring (tasks.md task 4).

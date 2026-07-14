@@ -406,3 +406,85 @@ version stamping stays reliable, so that everyday refinement is a normal apply r
    config revision, NOT an `upgrade` and NOT a two-binary rollback.
 4. A new `tkp` version (and the `upgrade`/rollback machinery) SHALL be required only when the engine
    identity changes (a resource-implementation/behavioral change), never for desired-state refinement.
+
+### Requirement 14: Per-platform provisioner and three-part provenance
+
+**User Story:** As a platform author, I want each `tkp` built from the IaC engine + resource providers +
+exactly one deployment platform, and a deployment's provenance to record all three things that determine
+its realized state — engine, platform, and deployment definition — so that a provisioner is small, its
+identity names precisely what it provisions, and "what produced this deployment" is fully verifiable.
+
+#### Acceptance Criteria
+
+1. A `tkp` SHALL be composed of **the IaC engine + resource providers + exactly one deployment platform**
+   (that platform's kind library, builder vocabulary, and `.tkd` interpreter). The target SHALL NOT be a
+   single multi-platform provisioner; `apps/tkp`'s current `local`+`compose-syn` bundling is transitional.
+2. THE platform-agnostic provisioner surface — lifecycle verbs, binding gate, operation lock, state
+   envelope, `describe`, config-revision machinery — SHALL live in a shared library
+   (`tokeira-provisioner-cli`), and each per-platform binary SHALL inject its platform through a narrow
+   seam (`ProvisionerPlatform`: `infra_plan|apply|destroy`) and link **only** that platform's crates.
+3. A deployment's recorded provenance SHALL be exactly three parts: **(a) engine identity** (the IaC engine
+   + resource providers, as a source closure), **(b) platform** (kind library + builder vocabulary +
+   interpreter), **(c) deployment definition** (the `.tkd`, digested). (a)+(b) are compiled into `tkp` and
+   together form the **EngineIdentity** / binding `source_tree_hash`; (c) is data and forms the
+   `config_revision`. A change to (a) or (b) is an engine-identity change (upgrade/rollback, Req 4/9); a
+   change to (c) is a config revision (ordinary apply/revert, Req 13).
+4. WHEN `tkr deployment create --platform <p>` runs, THEN it SHALL obtain and bind the `<p>` provisioner
+   (Req 6.5), never a generic one; `describe` SHALL surface all three provenance parts (engine+platform
+   identity, and the current `config_revision` + definition digest).
+
+### Requirement 15: Reproducible provisioner build (Dagger, local + CI parity)
+
+**User Story:** As an operator, I want a deployment's `tkp` produced by one reproducible build that runs
+identically on my machine or in trusted CI, keyed by engine identity so equivalent deployments reuse one
+verified artifact, so that "create a deployment" *requests a provisioner bundle* — reuse, download, or
+build — rather than compiling a unique binary each time. (Rationale: [Proposal 005](./proposals/005-provisioner-bundles-and-binding.md).)
+
+#### Acceptance Criteria
+
+1. THE `tkp` build SHALL be a single **Dagger** function (`build_provisioner`) runnable locally (local
+   Dagger Engine) or on trusted CI (Buildkite invoking the same function), producing a **ProvisionerBundle**
+   (per-target artifacts + integrity manifest + test evidence + build metadata).
+2. THE bundle SHALL be content-addressed by **EngineIdentity** — the engine+platform closure: the
+   source-closure digest, the `Cargo.lock`-**closure** digest (the locked versions reachable from the
+   provisioner, NOT the whole workspace lock), toolchain, build-container digest, feature set, and profile
+   — deliberately **excluding** the deployment definition digest, so N deployments on one engine identity
+   reuse one bundle.
+3. WHEN `create` needs a provisioner, THEN it SHALL resolve an existing verified bundle for the identity
+   from a Tokeira-controlled content-addressed store and build only on a miss; a cache hit SHALL be
+   **re-verified** (bytes re-hashed against the manifest, authority sufficient, not revoked) before binding.
+   Caching accelerates production; it never grants admission.
+4. A **BuildAuthority** (`LocalDeveloper` | `TrustedCi`) SHALL be recorded and gate admission: a production
+   deployment SHALL require trusted-CI provenance (protected commit, tests passed), and the artifact store
+   SHALL be partitioned/write-gated by authority so a lower-trust artifact cannot satisfy a higher-trust
+   deployment. This axis is orthogonal to `BuildMode` (Req 1).
+
+### Requirement 16: Source snapshotting for build fidelity
+
+**User Story:** As a developer running concurrent AI agents over one workspace (each in its own worktree),
+I want a `tkp` build to freeze the source it builds from, so that the recorded engine identity always
+matches the bytes produced and two concurrent creates cannot observe a mutating tree.
+
+#### Acceptance Criteria
+
+1. Building a `tkp` SHALL first **freeze** the engine+platform source closure into an immutable,
+   content-addressed **snapshot** (via a Rust git SDK — `gix`/`git2`, no shelling out); `EngineIdentity`
+   SHALL be computed over the snapshot, and the build SHALL consume the snapshot, never the live working
+   tree — **atomic with respect to source** (snapshot → derive identity → build).
+2. WHERE the authority is `LocalDeveloper` and the tree is dirty, THE snapshot SHALL capture the working
+   tree (staged + unstaged) into a content-addressed object **without mutating the working tree, the index,
+   or any ref** — built via a temporary-index `write-tree` (or the equivalent in-process `gix` tree write),
+   NOT the porcelain `git stash` (which reverts the tree and writes `refs/stash`). Untracked source files
+   within the provisioner closure SHALL **by default cause `create` to refuse, listing them**; the operator
+   opts them in with `--include-untracked`, which stages them into the temporary index (decision 9).
+3. WHERE the authority is `TrustedCi`, THE snapshot SHALL be an immutable, reachable, protected commit, and
+   the build request SHALL pin that commit.
+4. THE snapshot reference + digest SHALL be recorded in the build request and in the bound deployment's
+   provenance, so the exact source that produced the `tkp` is auditable. Because each agent works in its own
+   worktree, a `create` snapshots that worktree's state; concurrent creates freeze independently.
+5. `EngineIdentity`'s source digest SHALL key on the snapshot **`tree`** object (pure content), NOT a
+   `commit`. WHERE a reachable audit handle is wanted, a `commit-tree` wrapper SHALL be **deterministic** —
+   a fixed synthetic committer identity and fixed timestamps (so identical `(tree, parent)` yields an
+   identical commit), with a **parentless** fallback on an unborn/detached `HEAD`. THE snapshot commit SHALL
+   by default be recorded by oid only; a `refs/tokeira/snapshots/<engine-identity>` ref SHALL pin it **only
+   under `TrustedCi`** (decision 10).

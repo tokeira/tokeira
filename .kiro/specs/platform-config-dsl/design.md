@@ -1,760 +1,523 @@
-# Design
+# Design Document
 
 ## Overview
 
-The platform configuration DSL replaces the compiled, fixed-arity platform definition (today
-`platforms/compose/src/{config,compose,modules,services,images,observability_config,gates}.rs`) with a
-**strongly-typed, total language** whose programs describe a deployment's infra+services. A **compiler
-embedded in `tkp`** processes a **deployment definition** (one or more `.platform` files under a
-deployment root) in two distinct phases:
+A tokeira deployment's platform — its modules, resources, services, their typed parameters, and their
+wiring — is authored as a **deployment definition** written in a small, fixed subset of Rust and stored
+as a **`.tkd`** file. The bound provisioner (`tkp`) **interprets** the `.tkd` at plan/apply time (it is
+never compiled into the binary) and turns it into the in-memory deployment the IaC and runtime engines
+already consume. Because the definition is *interpreted data*, editing it — a value or the structure — is
+an ordinary `apply`, never a rebuild.
 
-- **Compile (pure, total, deterministic):** resolve `use` imports within the deployment root → lex
-  (`logos`) → parse (`chumsky`) → resolve → type-check → lower to a typed, executable **Program** (IR).
-  No I/O into the language; diagnostics rendered with `ariadne`.
-- **Execute (in `tkp`, with the runtime context):** `tkp` evaluates the Program against an injected
-  **`RuntimeContext`** (deployment dir, home, region — a closed, typed record) to produce a
-  **Composition**: the `InfraComposition` the IaC engine consumes, the deploy-engine `Service` set, the
-  `Image` set, and declarative writeback targets.
+A definition has two halves, both ordinary Rust:
 
-The binary carries a **fixed library of typed resource/service/image kinds** — the executable Rust
-implementations and their compiled assets (templates, dashboards). The DSL describes only their
-**composition**; it never defines a kind's behaviour, and it has **no ambient authority** — no OS
-environment, network, clock, or arbitrary filesystem. Secrets are *declared, never read*. Compile-time
-purity makes plans reproducible; the runtime context enters only at execution, supplied explicitly by
-the host (effects at the edge).
+- **`config()`** returns the **operator surface**: a value of the platform's config type (`struct`/`enum`
+  types the definition itself declares). Overriding a default *is* editing this literal — flipping
+  `storage: Storage::InMemory` to `Storage::Dsql { .. }` is the whole edit.
+- **`deployment(cfg, cx)`** returns the **structure**: it reads the resolved config and the injected
+  context and calls a fixed builder vocabulary (`d.module`, `d.resource`, `d.service`, `d.writeback`,
+  `r.output`) to describe the deployment.
 
-**Terminology.** *Deployment* — the provisioned reality + the thing described. *Deployment definition*
-— the rooted set of `.platform` files that describes it (the retained, digested artifact). *Deployment
-root* — the boundary directory; nothing resolves outside it. *Program* — the in-memory compiled form
-the compiler builds from a definition.
+The interpreter is the platform-agnostic **`tokeira-tkd`** crate. It parses the `.tkd` with
+[`syn`](https://docs.rs/syn), enforces the **interpreted subset** (a reject-by-default allow-list), and
+walks it into the platform's deployment type. It is generic over a platform-supplied **`HostBridge`**:
+the interpreter holds host values opaquely and routes every host operation (construct a kind, call a
+builder verb, read a context field) through the bridge, so it names no concrete kind and needs no
+`Box<dyn Any>`. Each platform implements one bridge; `platforms/compose-syn` (`ComposeBridge`) and
+`platforms/eks` (`EksBridge`) share the one interpreter.
 
-**Authoring origin (Req 16).** A `.platform` definition is a **platform-author artifact** authored in
-the owning platform crate (`platforms/{local,compose,ecs,…}`) — the DSL analog of today's
-`config.rs`/`modules.rs`/`services.rs` it replaces. It is **not** generated for the operator and there
-is no starter-generator. The operator's interaction is **select a platform + supply input values**
-(Req 8); `tkr deployment create` then **persists** the authored file set into the deployment, and every
-subsequent `plan`/`apply` compiles that **persisted copy**, never the live crate file — so a deployment
-pins its definition independently of later crate edits. The persistence/retention mechanics belong to
-`platform-provisioner-binary`; this spec owns the language, compiler, and the authored definition.
+This split is the whole point:
 
-**Evolution envelope (Req 16.6).** Once persisted, a definition is freely **evolvable** — structurally
-or by value — as ordinary `apply`s, because it is data, not compiled Rust. The boundary is the running
-`tkp`'s `(language, kind-library)` version, enforced by the compiler: any composition of the kinds and
-constructs `tkp` provides applies directly; a reference to a kind/field/provider/construct the running
-`tkp` lacks is a compile rejection (Properties 3, 12) that becomes possible only via an engine upgrade
-to a `tkp` that provides it (Req 9.3). Evolution is unbounded in composition, bounded by engine version.
+- **Engine identity** — the interpreter (`tokeira-tkd`), each platform's builder vocabulary + kinds +
+  bridge — is compiled Rust, covered by the provisioner's `source_tree_hash`. Changing it mints a `tkp`
+  version and gates an `upgrade`.
+- **Configuration revision** — the `.tkd` — is data the bound `tkp` reads. Editing it is a plan, recorded
+  as a monotonic `config_revision`. It can never become an engine-identity change, *because* the
+  interpreted subset only lets a `.tkd` **name** the versioned vocabulary — no new kind, no I/O, no
+  apply-logic (see [Security posture](#security-posture)).
 
-This design is scoped to the **compose platform** as the worked example. ECS and Local parity follow on
-the same machinery (Requirement 10).
+**Scope of this document.** `platforms/compose-syn` is the reference platform and the source of every
+ground-truth citation here. `platforms/eks` is the second platform on the same interpreter. The
+remaining compiled platforms (`platforms/{compose,ecs,local}`) are migration targets, not yet on the
+`.tkd` model (see [Multi-platform status](#multi-platform-status)).
 
-> **Adopted refinement (governing):** This design adopts
-> `proposals/001-platform-framework-and-realizer.md` **in full** — the generic `tokeira-platform`
-> framework crate and its `Realizer` seam, the generic `ConfigurationRevision` config type, the
-> `Composition*` IR naming, compile-time `FieldSpec` defaults, `RealizeContext`, and the `platform/` +
-> `inputs.toml` on-disk layout. Where this document and Proposal 001 differ, **Proposal 001 governs**;
-> tasks 10–13 are its realization.
+> **Historical note.** An earlier design used a bespoke `logos`/`chumsky`/`ariadne` compiler, a
+> `Composition` IR, a `KindLibrary`/`Realizer`/`DslPlatform` framework, multi-file `.platform` files, and
+> an `inputs.toml`. None of that shipped in that form; it is preserved in
+> [`proposals/HISTORY.md`](./proposals/HISTORY.md). The decision trail is Proposals 001–004.
 
-## Dependencies and Non-Goals
+## Audience: platform author vs operator
 
-- **Consumed by** `.kiro/specs/platform-provisioner-binary/`: the engine identity it binds against is
-  the `(language, kind-library)` version compiled into `tkp`; the **deployment definition** is the
-  deployment-married configuration it records, retains (as a file set + digest), and rolls back. This
-  spec owns the language, compiler, and lowering.
-- **Substrate (decided):** bespoke front end on `logos` (lexer) + `chumsky` (parser) + `ariadne`
-  (diagnostics). Not embedding Nickel/Dhall/KCL.
-- **Non-goals:** defining resource *behaviour* in the DSL (stays compiled Rust); a Turing-complete or
-  effectful language; OS-environment access of any kind; the running server's `tokeirad.toml`
-  (`TokeiraConfig`); adding new resource *kinds* (a kind-library code change, i.e. an engine-identity
-  change handled by the provisioner's `upgrade`).
+The DSL serves two roles, and the design keeps their surfaces distinct (Requirement 10).
 
-## Worked example — the compose platform (modular)
+| | **Platform author** | **Operator** |
+|---|---|---|
+| Who | Engineer building a platform (e.g. `compose-syn`, `eks`) | User instantiating a deployment |
+| Writes | The Rust *engine identity*: the builder vocabulary, the kinds, the `HostBridge`, and the shipped default `definition.tkd` | The `.tkd`'s `config()` values, and optionally the `deployment()` structure |
+| Owns | What kinds exist, what they realize to, what the operator *may* express | The deployment's configuration revision |
+| Changes via | A `tkp` rebuild (engine-identity change → `upgrade`) | An ordinary `apply` (no rebuild) |
+| Constrained by | Rust, review, the engine's traits | The interpreted subset (may only name the author's vocabulary) |
 
-A deployment definition under the deployment root, depth ≤ 1, composed by relative `use`:
+The author ships a starting `definition.tkd` with the platform crate (exposed as `DEFAULT_TKD`);
+`tkr deployment create` persists a copy into the deployment. From then on the operator owns that copy.
+`#[create]` fields mark the parts an operator may set only once.
 
-```
-<deployment root>/
-  compose.platform        # root: platform decl, inputs, shared lets, use, namespaces, writeback
-  infra.platform          # module local_state; module dsql (conditional)
-  runtime.platform        # module runtime
-  observability.platform  # module observability + observability_config resource
-  images.platform         # image declarations
-```
+## The deployment definition (`.tkd`)
 
-`compose.platform` (root):
+The definition is Rust syntax, but the interpreter accepts only a fixed subset. Two halves.
 
-```
-// Compiled by tkp's compose kind-library. The (language, kind-library) version is derived by the
-// compiler and recorded by the provisioner, never declared here (Req 9).
-platform compose {
-  use "infra.platform"
-  use "runtime.platform"
-  use "observability.platform"
-  use "images.platform"
+### The config surface — `config()`
 
-  // Inputs — operator-tunable values (Req 8). Declaration order is irrelevant; resolution is whole-program.
-  input project_name:   String  = "tokeira"
-  input storage:        Storage  = InMemory          // sum type; carries DSQL data when present
-  input tokeirad_image: String   = "tokeirad:latest"
-  input grpc_port:      Port     = 7233
-  input metrics_port:   Port     = 9090
-  input tokeirad_replicas:   Int = 1
-  input mimir_image:    String   = "grafana/mimir:3.0.6"
-  input loki_image:     String   = "grafana/loki:3.7.1"
-  input grafana_image:  String   = "grafana/grafana-oss:12.4.3"
-  input alloy_image:    String   = "grafana/alloy:v1.16.0"
-  input aws_cli_image:  String   = "public.ecr.aws/aws-cli/aws-cli:latest"
-  input busybox_image:  String   = "public.ecr.aws/docker/library/busybox:latest"
-  input grafana_port:   Port     = 3000
-  input mimir_replicas: Int = 1
-  input loki_replicas:  Int = 1
-  input grafana_replicas: Int = 1
-  input alloy_replicas: Int = 1
+The config type is `struct`/`enum` types the definition declares, and `config()` returns the default
+value. This *is* the operator's editable surface.
 
-  // Shared, pure path building over the closed RuntimeContext (ctx). No OS access.
-  //   ctx.deployment_dir : Path,  ctx.home : Path,  ctx.region : String
-  let state_dir  = ctx.deployment_dir / ".tokeira-state"
-  let config_dir = ctx.deployment_dir / "config"
+```rust
+enum DsqlMode { Managed, Preexisting }
 
-  namespaces [ "default" ]
-
-  // Declarative writeback (collect_writeback): what tkp writes to tokeirad.toml after infra apply.
-  // tkp performs the effectful state read + write; the DSL only names source → target.
-  writeback when storage is Dsql {
-    "infrastructure.storage"                  = "dsql",
-    "infrastructure.dsql.endpoint"            = dsql.cluster.cluster_endpoint,
-    "infrastructure.dsql.region"              = storage.region,
-    "infrastructure.dsql.rate_limiter_table"  = dsql.rate_limiter.table_name,
-    "infrastructure.dsql.conn_lease_table"    = dsql.conn_lease.table_name,
-  }
-}
-```
-
-`infra.platform` (remote-state + conditional DSQL):
-
-```
-// remote_state_module → the local state directory resource.
-module local_state {
-  resource state_dir = LocalStateDir { }
+enum Storage {
+    InMemory,
+    Dsql { region: String, mode: DsqlMode, endpoint: Option<String>, arn: Option<String> },
 }
 
-// DsqlModule — present only under DSQL storage. The typed sum makes "preexisting requires endpoint /
-// managed forbids it" a *type* obligation on the DsqlCluster kind (Req 5.2).
-module dsql when storage is Dsql {
-  depends_on [ local_state ]
-  // `storage as Dsql(d)` binds the variant payload within a conditionally-present module.
-  resource cluster      = DsqlCluster   { mode: d.mode, region: d.region, endpoint: d.endpoint, arn: d.arn }
-  resource rate_limiter = DynamoDbTable { hash_key: "pk", ttl: "ttl_epoch" }
-  resource conn_lease   = DynamoDbTable { hash_key: "pk", ttl: "ttl_epoch" }
+struct Compose {
+    #[create]                 // create-time-immutable; editing it later is a retarget tkp refuses
+    storage: Storage,
+    tokeirad: Tokeirad,
+    observability: Observability,
 }
-```
 
-`runtime.platform`:
-
-```
-module runtime {
-  depends_on match storage { Dsql(_) => [ observability ], _ => [ local_state ] }
-
-  service tokeirad = ComposeService {
-    image:    tokeirad_image,
-    replicas: tokeirad_replicas,
-    ports:    [ port(grpc_port), port(metrics_port) ],
-    // Declares the credential need; tkp injects the ~/.aws mount + AWS_* secrets at materialization.
-    // The DSL never names or reads a secret (Req 12.2).
-    aws_auth: match storage { Dsql(_) => true, _ => false },
-    volumes:  [ bind(ctx.deployment_dir / "tokeirad.toml", "/etc/tokeira/tokeirad.toml", ro) ],
-    env:      match storage {
-                Dsql(d) => { "TOKEIRA_CONFIG": "/etc/tokeira/tokeirad.toml", "AWS_REGION": d.region },
-                _       => { "TOKEIRA_CONFIG": "/etc/tokeira/tokeirad.toml" },
-              },
-    command:  [ ],
-  }
-}
-```
-
-`observability.platform` (note the config-files resource every service depends on):
-
-```
-module observability {
-  depends_on match storage { Dsql(_) => [ local_state, dsql ], _ => [ local_state, runtime ] }
-
-  // ObservabilityConfigFilesResource — the kind renders ~16 files (alloy/mimir/loki configs,
-  // grafana datasources/dashboards, alert rules, dashboard JSON) from these params; the *templates
-  // and dashboards are compiled assets of the kind*, not part of the deployment definition.
-  resource observability_config = ObservabilityConfigFiles {
-    metrics_target_host: "tokeirad",
-    metrics_target_port: metrics_port,
-    cluster:    project_name,
-    deployment: project_name,
-  }
-
-  service mimir = ComposeService {
-    image: mimir_image, replicas: mimir_replicas, ports: [ "9009:9009" ],
-    volumes: [ bind(state_dir / "mimir", "/data", rw),
-               bind(config_dir / "mimir.yaml", "/etc/mimir/mimir.yaml", rw),
-               bind(config_dir / "mimir/rules", "/data/mimir/rules", rw) ],
-    command: [ "--config.file=/etc/mimir/mimir.yaml" ],
-    depends_on: [ observability_config ],
-  }
-  service loki = ComposeService {
-    image: loki_image, replicas: loki_replicas, ports: [ "3100:3100" ],
-    volumes: [ bind(state_dir / "loki", "/loki", rw),
-               bind(config_dir / "loki.yaml", "/etc/loki/loki.yaml", rw) ],
-    command: [ "--config.file=/etc/loki/loki.yaml" ],
-    depends_on: [ observability_config ],
-  }
-  service grafana = ComposeService {
-    image: grafana_image, replicas: grafana_replicas, ports: [ port(grafana_port) ],
-    volumes: [ bind(state_dir / "grafana", "/var/lib/grafana", rw),
-               bind(config_dir / "grafana/provisioning", "/etc/grafana/provisioning/", rw),
-               bind(config_dir / "grafana/dashboards", "/var/lib/grafana/dashboards/", rw) ],
-    env: { "GF_SECURITY_ADMIN_USER": "admin", "GF_SECURITY_ADMIN_PASSWORD": "admin",
-           "GF_METRICS_ENABLED": "true" },
-    depends_on: [ observability_config, mimir, loki ],
-  }
-  service alloy = ComposeService {
-    image: alloy_image, replicas: alloy_replicas, ports: [ "4317:4317", "4318:4318" ],
-    volumes: [ bind("/var/run/docker.sock", "/var/run/docker.sock", rw),
-               bind(config_dir / "alloy.alloy", "/etc/alloy/config.alloy", rw) ],
-    command: [ "run", "/etc/alloy/config.alloy" ],
-    depends_on: [ observability_config, tokeirad, mimir, loki ],   // cross-module refs resolve by name
-  }
-}
-```
-
-`images.platform` (the deploy-engine image registry):
-
-```
-// tokeirad is built locally; the rest are mirrored from upstream. desired_ref/writeback are the kind's.
-image tokeirad      = Build  { repository: "tokeira/tokeirad" }                      // writeback: tokeirad.image
-image grafana_mimir = Mirror { repository: "tokeira/grafana-mimir", upstream: mimir_image }
-image grafana_loki  = Mirror { repository: "tokeira/grafana-loki",  upstream: loki_image }
-image grafana       = Mirror { repository: "tokeira/grafana",       upstream: grafana_image }
-image grafana_alloy = Mirror { repository: "tokeira/grafana-alloy", upstream: alloy_image }
-image aws_cli       = Mirror { repository: "tokeira/aws-cli",       upstream: aws_cli_image }
-image busybox       = Mirror { repository: "tokeira/busybox",       upstream: busybox_image }
-```
-
-Conventions (locked): `Path` for filesystem values; `/` is path-join; `++` is **list concatenation
-only**; record merge is **spread** `{ ..a, key: v }`; field assignment is always explicit `key: expr`;
-bare identifiers are lexically-resolved references (no implicit import); `ctx.*` are reads of the
-closed `RuntimeContext` — never OS access. The deploy-apply gate `validate_local_build` and the `Ops`
-verbs (`scale`/`logs`/`port_mappings`) are **host-runtime**, not DSL.
-
-## Construct correspondence
-
-Every construct in the compiled compose platform has a DSL analog or is a host-runtime concern.
-
-| Current Rust construct (source) | DSL analog / disposition |
-|---------------------------------|--------------------------|
-| `iac::Module` (`modules.rs`) | `module <name> { … }`; ownership is lexical |
-| `Module::dependencies()`, storage-conditional | `depends_on <expr>` (conditionable via `match`) |
-| conditional module presence (DsqlModule only under DSQL) | `module <name> when <cond> { … }` |
-| `LocalStateModule` / `LocalStateResource` (`remote_state_module`) | `module local_state { resource state_dir = LocalStateDir { } }` |
-| `DsqlCluster`, `DynamoDbTable` (`modules.rs`) | `resource … = DsqlCluster/DynamoDbTable { … }` |
-| `ObservabilityConfigFilesResource` (+ askama templates, dashboards) | `resource observability_config = ObservabilityConfigFiles { …params }`; templates/dashboards are compiled kind assets |
-| `ComposeService` (`compose.rs`) | `service <id> = ComposeService { … }` |
-| `OwnedComposeResource` (IaC) + `ComposeWorkload` (deploy-engine) | one `service` declaration **lowers to both** an infra `Resource` and a deploy-engine `Service` |
-| `module_for_service` | lexical module of the declaration |
-| `Service::dependencies()` (grafana/alloy) + `ComposeService.depends_on` | `depends_on: [ … ]` on the service |
-| conditional DSQL env/volumes (`compose_services`) | `match storage { … }` + list `++` / record spread |
-| AWS credential passthrough (host `std::env` reads) | `aws_auth` sugar → `tkp` resolves the `env` credential chain + `~/.aws` (implicit `home`) and injects at materialization (Req 14.5); the `env` provider is the general mechanism |
-| `ComposeService.healthcheck` | optional `healthcheck` field on the kind schema |
-| `images::construct()` (`images/`) — Build + Mirror | `image <name> = Build/Mirror { … }`; `desired_ref`/`writeback_targets` are the kind's |
-| `required_namespaces` | `namespaces [ "default" ]` |
-| `Ops::valid_services` / `desired_replicas` | derived from the declared `service` set + each service's `replicas` |
-| `collect_writeback` | `writeback when … { key = <module>.<resource>.<output> }` (tkp performs the write) |
-| `register_infra_extensions` (ComposePlatform handle, AWS clients) | **host-runtime** — provider handles, not the DSL |
-| `create_infra_store` / `create_deploy_store` / `hydrate_config` | **host-runtime** — provisioner/state concern |
-| `gates::validate_local_build` (deploy-apply image gate) | **host-runtime** gate |
-| `Ops::scale` / `logs` / `port_mappings` | **host-runtime** operational verbs |
-
-The line: anything that *describes* the desired graph is a DSL analog; anything that *performs an
-effect or supplies the world* (credentials, provider clients, state stores, the writeback write, the
-build gate, operational verbs) is host-runtime and crosses the boundary as `RuntimeContext` in or
-writeback targets / declared needs (`aws_auth`) out.
-
-> ECS preview (deferred parity pass): the Grafana admin secret is **not** a context provider — it is a
-> `SecretsManagerSecret` **resource kind** (generated password) consumed by a container `value_from`
-> **reference**, resolved by ECS at task start. It belongs to the kind library + composition, not the
-> `RuntimeContext`. Recorded here so the ECS pass models it as a resource/reference, not a provider.
-
-## ECS parity pass
-
-ECS exercises the same machinery as compose with a larger kind library and one new language feature. It
-needs **no context providers** (it uses inputs + host-runtime AWS auth + IAM task roles + S3 state, not
-`deployment_dir`/`env`), confirming `env` is compose-specific.
-
-**New language feature — output references** (Req 15). ECS resources consume provisioned outputs of
-other resources, resolved at apply: the DSQL IAM role policy needs the cluster ARN
-(`DsqlIamRoleResource::create` reads `cluster.properties["cluster_arn"]`), the ALB listener needs its
-target groups, container secrets reference a secret resource. The DSL models `<resource>.<output>`,
-lowering to a dependency edge + deferred binding (see `OutputRef`).
-
-**Module/dependency chain (static `depends_on`):** `remote-state → { images, networking } → dsql →
-cluster → observability → services`.
-
-**Kind library additions** (more `KindSchema` impls, no new language): `Vpc`, `SecurityGroup`,
-`VpcEndpoint` (Interface/Gateway), `Alb`/`AlbTargetGroup`/`AlbListener`, `EcsCluster`, `LaunchTemplate`,
-`Asg`, `CapacityProvider`, `IamRole`/`IamInstanceProfile`, `S3Bucket`/`S3Object`,
-`SecretsManagerSecret`, `SsmParameter` (secure), `CloudMapNamespace`, `TaskDefinition`, `EcsService`,
-`DsqlCluster`/`DsqlConnectionEndpoint`, and adopted variants for preexisting DSQL.
-
-Representative snippet (the novel parts only — output refs, the managed/preexisting sum, secret by
-reference, IAM-grant wiring):
-
-```
-// dsql is an input sum, mirroring compose `storage`:
-//   input dsql: DsqlMode = Managed
-//   DsqlMode = Managed | Preexisting { endpoint, management_endpoint_id, connection_endpoint_id,
-//                                      runtime_role_arn, admin_role_arn }
-module dsql {
-  depends_on [ networking ]
-  match dsql {
-    Managed => {
-      resource cluster       = DsqlCluster           { mode: Managed, region: ctx.region }
-      resource conn_endpoint = DsqlConnectionEndpoint { vpc: networking.vpc, cluster: cluster }
-      // output reference: the policy needs the ARN, known only after the cluster is created (Req 15)
-      resource runtime_role  = DsqlIamRole { action: "dsql:DbConnect",      cluster_arn: cluster.cluster_arn }
-      resource admin_role    = DsqlIamRole { action: "dsql:DbConnectAdmin", cluster_arn: cluster.cluster_arn }
+fn config() -> Compose {
+    Compose {
+        storage: Storage::InMemory,   // flip to Dsql { .. } for persistence — that is the whole edit
+        tokeirad: Tokeirad { image: "tokeirad:latest".into(), replicas: 1, grpc_port: 7233, metrics_port: 9090 },
+        observability: /* … */
     }
-    Preexisting(p) => {
-      // adopt: record by id/arn; the kind creates and deletes nothing
-      resource conn_endpoint = AdoptedDsqlEndpoint { endpoint_id: p.connection_endpoint_id }
-      resource runtime_role  = AdoptedIamRole      { role_arn: p.runtime_role_arn }
-      resource admin_role    = AdoptedIamRole      { role_arn: p.admin_role_arn }
-    }
-  }
-}
-
-module observability {
-  depends_on [ cluster ]
-  resource grafana_admin = SecretsManagerSecret { value: generated_password(len: 32), username: "admin" }
-  service grafana = EcsService {
-    // by-reference: ECS resolves the value at task start; it never enters the program or RuntimeContext
-    secrets: { "GRAFANA_ADMIN_PASSWORD": value_from(grafana_admin, key: "password") },
-    grants:  [ secret_read(grafana_admin) ],   // task-role read grant wired from the same reference
-    // … task def, service-connect, placement …
-  }
 }
 ```
 
-**Confirmations (reuse, not new):** secrets are purely by-reference (no value in the DSL/context — the
-strongest form of the Req 14.7 posture); IAM policy documents and the per-service Alloy config (an SSM
-secure parameter) are **kind-internal templates** parameterized by typed params, like the observability
-askama templates; DSQL managed/preexisting is the typed-sum conditional (adopt behaviour kind-internal);
-ALB is an enum input + conditional-required `certificate_arn` (validation-parity pattern); `hydrate_config`
-and `prototypical_server_config` are **host-runtime** (state↔config plumbing and starter generation),
-not DSL.
+- **`#[create]`** marks a create-time-immutable field. On apply, the value in `config()` is diffed against
+  the recorded baseline; a changed `#[create]` field is a **retarget** the provisioner refuses (it would
+  rename or replace live resources), not a reconcile. Every other field reconciles freely.
+- **`#[require(<expr>)]`** attaches a constraint to a config type, evaluated against the resolved config
+  before `deployment()` runs (e.g. "`Preexisting` needs an endpoint"). A false result aborts the apply
+  with the constraint's span.
 
-## Architecture
+`config()` must be **host-free** — it may contain only data (structs/enums/scalars), never a kind or
+builder handle. The interpreter enforces this (`tokeira-tkd::interpret`), because the `#[create]` diff
+compares config values structurally and a host handle is not comparable.
 
-```mermaid
-flowchart TD
-  def["deployment definition (.platform files under deployment root)"] --> resolve_use["resolve `use` (contained, depth ≤ 1, acyclic, path-sorted)"]
-  resolve_use --> lex["logos: lex"]
-  lex --> parse["chumsky: parse (recovery)"]
-  parse --> ast["AST (composed program)"]
-  ast --> check["resolve names + types + parity validation + bounds"]
-  check --> ir["typed Program (IR)"]
-  ir -. "compile ends (pure, total, no I/O into language)" .-> exec
-  ctx["RuntimeContext (closed, tkp-injected)"] --> exec["evaluate (pure fn of IR × ctx)"]
-  exec --> comp["Composition: InfraComposition + Services + Images + writeback"]
-  comp --> engine["IaC / deploy engines: plan / apply (+ tkp credential injection)"]
-  resolve_use -.-> diag["ariadne diagnostics (multi-source)"]
-  lex -.-> diag
-  parse -.-> diag
-  check -.-> diag
-  exec -.-> diag
+### The structure — `deployment(cfg, cx)`
+
+`deployment` reads the resolved config `cfg` and the injected context `cx`, and calls the builder
+vocabulary. Every call records a piece of the deployment; nothing executes an effect.
+
+| Builder verb | Produces | Notes |
+|---|---|---|
+| `Deployment::new(&["default", …])` | the deployment + its namespaces | |
+| `d.module(name, &[needs…])` → `ModuleRef` | an IaC module (resource grouping) + module-level deps | |
+| `d.resource(&m, id, Kind { … })` → `ResourceRef` | an IaC resource of a fixed kind | kind from the author's vocabulary |
+| `d.service(&m, name, Service { … })` | a workload — realizes to **both** an infra resource and a deploy-engine service | member of module `m`; `needs` are deploy-ordering deps |
+| `r.output(name)` → `Output` | a deferred reference to a resource's provisioned output | resolved from `InfraState` post-apply |
+| `d.writeback(key, value)` | a server-config writeback entry | value is a literal or an `Output` |
+
+Context is read as `cx.project_name` / `cx.region`. The operator's `.tkd` never names a host path: volume
+anchors are the path-free `cx.state(sub, at)`, `cx.config(sub, at)`, and `cx.docker_sock()`
+(`platforms/compose-syn/src/context.rs`). The realizer resolves them to concrete host paths at apply.
+
+The kinds an author exposes (compose: `platforms/compose-syn/src/kinds.rs`) are `LocalStateDir`,
+`DsqlCluster`, `DynamoDbTable`, `ObservabilityConfigFiles`, and `Service`. Each is a typed struct
+implementing `Kind` (`fn realize(&self, cx) -> Box<dyn iac::Resource>`), building its `tokeira-compose` /
+`tokeira-aws` engine resource directly. A `Service` additionally carries author-mechanic flags
+(`server_config: bool`, `aws: Option<String>`) that the operator only *declares*; the realizer performs
+the `tokeirad.toml` mount and the AWS credential edge (see [Security posture](#security-posture)).
+
+The canonical worked example is the shipped compose definition,
+[`platforms/compose-syn/definition.tkd`](../../../platforms/compose-syn/definition.tkd): `config()` plus a
+`deployment()` that declares `local_state`, a conditional `dsql` module (under
+`if let Storage::Dsql { .. }`), the `observability` module (config-files resource + mimir/loki/grafana/
+alloy services), the `runtime` module (`tokeirad`), and the DSQL writeback.
+
+### The interpreted subset (the boundary)
+
+`syn` parses all of Rust; the interpreter walks only a fixed allow-list and **rejects everything else**
+before evaluation. Reject-by-default *is* the security model (`tokeira-tkd::subset`).
+
+- **Allowed items:** `struct`/`enum` definitions (the config schema), the `config()` and
+  `deployment(...)` functions, and pure helper `fn`s; `impl` blocks only as `#[require]` carriers.
+- **Allowed attributes:** `#[create]`, `#[require(<expr>)]`, `#[derive(..)]` (ignored), doc comments.
+- **Allowed expressions:** struct/enum literals (with `..Kind::EMPTY` spread for author kinds), array/
+  tuple literals, field access, `let`, `if`/`if let`/`match` (value-producing), method calls **only** on
+  the builder/handles/`cx` (validated against the bridge's method set), `format!`/`vec!`/`matches!`, and
+  `&`/`.clone()`/`.into()`/`.to_string()` (identity during lowering).
+- **Allowed patterns:** enum-variant binding (`Storage::Dsql { region, .. }`), tuple, ident, wildcard.
+- **Rejected (unit-tested as such):** `for`/`while`/`loop`, `unsafe`, `async`/`.await`, `?`, closures
+  (except the future writeback closure), arbitrary function calls, any `std::env`/`std::fs`/`std::path`/
+  `.exists()`/`.join()`, and any macro outside the three whitelisted.
+
+## The interpreter (`tokeira-tkd`)
+
+The interpreter is platform-agnostic. `interpret(src, bridge, cx)` runs the pipeline
+(`crates/tokeira-tkd/src/lib.rs`):
+
+1. **Parse** — `syn::parse_file(src)`.
+2. **Collect schema** — `schema::collect` builds the type table and fn table and records `#[create]`/
+   `#[require]`.
+3. **Subset check** — `subset::check` runs the reject-by-default allow-list **before any evaluation**; an
+   out-of-subset definition is rejected, never run.
+4. **Eval `config()`** — walk to the resolved config `Value`; reject if it contains a host handle.
+5. **Admission** — evaluate `#[require]` constraints against the config (and, on re-apply, the `#[create]`
+   retarget diff — `retarget_check`).
+6. **Eval `deployment(cfg, cx)`** — walk the body, dispatching every host operation through the bridge,
+   and `HostBridge::finish` unwraps the return into the platform's `Deployment`.
+
+The one runtime value type is `tokeira_tkd::Value<H>` — scalars, `Vec`/`Tuple`/`Opt`, `Struct`/`Enum`
+(config types modelled generically from the `.tkd`'s own AST), and `Host(H)` (the platform's opaque
+handles). New kinds and config types are new bridge entries and new structs — **zero** new `Value`
+variants — which is what makes the interpreter reusable across platforms.
+
+### The `HostBridge` seam
+
+A platform implements `tokeira_tkd::HostBridge`, the only place platform types are named. Its surface
+(`crates/tokeira-tkd/src/bridge.rs`; compose impl `platforms/compose-syn/src/bridge.rs`):
+
+- `type Host` — the platform's closed handle enum (compose `HostObj`: `Deployment`, `Module`, `Resource`,
+  `Output`, `Kind`, `Vol`, `Cx`). Dispatch keys on the handle's tag, so a receiver-type error is
+  structural, never a downcast.
+- `type Cx` / `type Output` — the platform's context and deployment types.
+- `is_kind` / `knows_method` / `knows_assoc` — the allow-list the subset check consults, so an unknown
+  kind or method is a *spanned reject*, not a runtime panic.
+- `construct_kind` / `kind_defaults` — build a kind from a resolved field map (the per-kind "reflection"
+  Rust lacks, written once per kind); `kind_defaults` supplies the `..Service::EMPTY` overlay image.
+- `assoc` / `call_method` / `host_field` — `Deployment::new`, the builder verbs, and `cx.<field>` reads.
+- `cx_host` / `finish` — inject the context handle and unwrap the final `Deployment`.
+
+The interpreter has **no operator-reachable panic**: post-subset the receiver kind is proven, so the only
+`unreachable!`s are the proven receiver matches; every other path returns `EvalError`.
+
+## Realization: from `.tkd` to the engine
+
+The builder vocabulary and kinds (`platforms/compose-syn/src/{builder,kinds}.rs`) realize the recorded
+deployment **directly** to engine types — there is no intermediate IR:
+
+- A **kind** realizes to a `Box<dyn tokeira_iac::Resource>` via `Kind::realize(&self, cx)`
+  (`DsqlCluster` → `tokeira_aws::DsqlCluster`, `DynamoDbTable` → `tokeira_aws::DynamoDbTable`,
+  `ObservabilityConfigFiles` → the config-files resource, `LocalStateDir` → the state-dir resource).
+- A **service** realizes two ways: as an infra `iac::Resource` and as a deploy-engine `Service` workload
+  (`Service::to_compose_service` → `tokeira_compose::ComposeService`). `to_compose_service` is the sole
+  owner of the relocated author mechanics (host-path volume resolution, the conditional `tokeirad.toml`
+  mount, the DSQL AWS edge), kept byte-identical to the compiled compose platform.
+
+The provisioner consumes the interpreted deployment through a thin adapter
+(`platforms/compose-syn/src/adapter.rs`): `TkdDeployment` implements `tokeira_orchestrator::Deployment`
+and `Ops`, projecting `remote_state_module`/`infra_modules` from `realize_module`, `services` from
+`realize_workloads`, `required_namespaces` from `namespaces`, and `collect_writeback` from
+`writeback_entries` (resolving each deferred `Output` handle against the post-apply `InfraState`).
+`prototypical_config` returns `DEFAULT_TKD`. Day-2 verbs (`scale`/`logs`/`ports`) that need the live
+platform are driven through `tkp`, not tkr's facade.
+
+## Deployment directory, lifecycle, and configuration (authoritative)
+
+This section is the authoritative account of **where a deployment's pieces live on disk, who writes each
+one and when, what precisely defines its configuration, and how that configuration is represented once
+persisted.** It is ground-truthed against `platforms/compose-syn` (`definition.tkd`, `src/context.rs`
+`Cx`, `src/lib.rs` `DEFAULT_TKD`, `src/adapter.rs`).
+
+### Config taxonomy — four distinct things, four homes
+
+1. **Definition (structure + operator config)** — modules, resources, services, wiring, writeback, **and**
+   the operator's chosen input values. All of it lives in one interpreted **`definition.tkd`**:
+   `deployment(cfg, cx)` is the structure; `config()` is the operator surface. The platform author ships
+   the file (`DEFAULT_TKD`); `tkr deployment create` persists a copy into the deployment; every
+   `plan`/`apply` interprets that **persisted copy**, never the crate file. It is the deployment's
+   **configuration revision** — data, not compiled code.
+2. **Deployment registry (`metadata.json`)** — the CLI-side record `tkr` keeps per deployment
+   (`apps/tkr/src/metadata.rs` `DeploymentMetadata`): `name`, `id`, `platform`, **`storage`**
+   (`in-memory` | `dsql`), **`status`** (`created` | `running` | `stopped`), and `created_at`/`updated_at`.
+   The engine never reads or writes it — only the operator CLI does. `storage` is set once from the
+   `--storage` flag at create; `status` starts `Created` and is advanced by `update_status` (deploy apply /
+   scale-down; local also reconciles against `tokeirad.pid`). This record names *who* the deployment is and
+   *what state the CLI thinks it is in* — it is **not** the deployment definition, and it does **not**
+   currently hold `project_name` or `region` (see [Where storage, region, and status
+   live](#where-storage-region-and-status-live)).
+3. **Ambient context** — `deployment_dir` and the host paths derived from it. Supplied by the host every
+   invocation and **never persisted, never surfaced to the `.tkd`**: `Cx` exposes only `project_name` and
+   `region` to `deployment(cfg, cx)`; path math lives author-side in `Cx` helpers and the service
+   realizer. Rollback restores the definition, never the context.
+4. **Server runtime config** — `tokeirad.toml` (`TokeiraConfig`). **Not** the DSL's, but a first-class
+   **create-time artifact**: `create` seeds a **prototypical `tokeirad.toml`** (from
+   `prototypical_server_config(storage, region)` — for DSQL it sets `infrastructure.storage`, a placeholder
+   `dsql.endpoint`, and the region) so the operator can edit server-config defaults **before** the first
+   apply. Apply then **writes back** the discovered values (`infrastructure.dsql.endpoint`, the
+   coordination-table names — the keys the `.tkd`'s `writeback` names) on top of the operator's edits.
+   *(Current gap: the compose branch of `create` does not yet seed `tokeirad.toml` — only `local`/`ecs` do
+   — `apps/tkr/src/deployment_dir.rs`; the machinery (`prototypical_server_config`) exists. Tracked in
+   `tasks.md` task 4.)*
+
+Everything else on disk is **derived or runtime state**, not config.
+
+### Layout
+
+```
+<tkr-state-root>/<name>/
+  definition.tkd        # (1) the authored, interpreted definition — written verbatim at create
+  metadata.json         # (2) CLI registry: name, id, platform, storage, status, created_at, updated_at
+  state/                # WRITTEN at create (empty); engine CAS state fills it at apply
+  tokeirad.toml         # (4) SERVER config — seeded (prototypical) at create; writeback-updated at apply
+  docker-compose.yml    #     GENERATED at apply (compose provider artifact)
+  config/               #     GENERATED at apply (observability config files + dashboards)
+  .tokeira-state/       #     container runtime data volumes (mimir / loki / grafana)
+  .latest               #     (in the parent) name of the most-recently-selected deployment
 ```
 
-`use` resolution and compile are I/O-free *into the language* (the compiler reads only files inside the
-deployment root) and terminating. Execute is a pure total function of `(Program, RuntimeContext)`; only
-`tkp` performs effects — resolving the runtime context and reading the definition before, injecting
-credentials and applying the composition (and writeback) after.
-
-## Security Posture
-
-The deployment definition is treated as untrusted input; the compiler is the trust boundary. The
-guarantees:
-
-1. **No ambient authority.** Compilation does no I/O into the language; execution reads only the closed
-   `RuntimeContext` and the compiled kind library. No OS environment, network, clock, or arbitrary
-   filesystem — and **no environment-variable or key-based lookup construct exists** in the language
-   (Req 12.1).
-2. **Import containment is the boundary primitive.** Every `use` is relative and downward; after
-   symlink canonicalization the real path MUST be strictly within the deployment root; `..`, absolute
-   paths, symlink escapes, and folder depth > 1 are fail-closed diagnostics. The compiler never reads a
-   file outside the deployment root (Req 13.2, 13.3).
-3. **Secrets are declared, never read.** A workload's credential need is a typed declaration
-   (`aws_auth`); `tkp` performs the injection at materialization. Secret values never enter the
-   program, its evaluation, or its output (Req 12.2).
-4. **Secret hygiene in diagnostics.** Diagnostics carry names and spans only — never resolved
-   `RuntimeContext` values — so nothing is echoed to logs/telemetry (Req 12.3).
-5. **Bounded compile.** Totality bars non-termination; explicit caps (file count, per-file and total
-   bytes, import depth, AST nesting/size) bar resource exhaustion on adversarial input (Req 12.4).
-6. **Definition integrity.** The content digest over the sorted `(relative_path, sha256)` set is what
-   the provisioner records, retains, and verifies; tampering is detectable; rollback restores the exact
-   file set (Req 13.6, Req 11).
-
-## Modular deployment definition and import containment
-
-A definition is one or more `.platform` files under the deployment root, composed into a single program:
-
-- **`use "relative.platform"`** includes another file; the composed program is the union of all files'
-  top-level declarations (`input`, `let`, `module`, `image`, `namespaces`, `writeback`).
-- **Resolution is fail-closed and deterministic:** targets are relative, no `..`, no absolute;
-  canonicalized real path strictly within the deployment root; folder depth ≤ 1; the include graph is a
-  cycle-checked DAG; files are composed in stable **path-sorted** order so the program is identical
-  regardless of read order (Req 13.4).
-- **Whole-program name resolution:** names resolve across the composed program; a duplicate top-level
-  declaration across files is a diagnostic — no silent shadowing (Req 13.5).
-- **The artifact** is the file set + its digest; the provisioner retains and rolls back the set.
-
-## Runtime context and providers
-
-`RuntimeContext` is resolved by `tkp` and injected at execution; the composition reads only typed
-`ctx.<field>` values and can never name or read a provider (Req 14.4). Two parts:
-
-- **Implicit** — kind-library-delivered, platform-specific. Derived from the platforms: `deployment_dir`
-  (local/compose/ecs) and `home` (compose, for the `~/.aws` mount). `tkp` always provides these.
-- **Declared** — an operator `context { }` block binding fields to a canonical provider catalog **fixed
-  by the `(language, kind-library)` version**. Derived strictly from the platforms, the catalog is just
-  `env`:
-
-  | Provider | Yields | Evidenced by |
-  |----------|--------|--------------|
-  | `env "NAME"` / `env.secret "NAME"` | `String?` / `Secret<String>?` | compose AWS credential passthrough (`compose.rs` `std::env` reads) |
-
-  ```
-  context {
-    extra_flag           = env "TOKEIRA_EXTRA"          // String?
-    custom_token: Secret = env.secret "CUSTOM_TOKEN"    // Secret<String>?, tainted
-  }
-  ```
-
-Everything else is *not* runtime context: the Grafana admin secret (ECS) is a `SecretsManagerSecret`
-**resource** consumed by a container `value_from` **reference** (composition, not context); the
-provisioner's own AWS credential chain and STS caller-identity check are **host-runtime auth/validation**;
-`region` is an **input**. New providers (a secret-value provider, Vault, …) arrive only via an engine
-upgrade (Req 9.3, Req 14.2).
-
-**`aws_auth` is sugar over the standard chain.** `aws_auth: true` tells `tkp` to resolve the standard AWS
-credential chain (the `env` provider plus the `~/.aws` location from the implicit `home`) and inject it
-into the container at materialization — so the common case needs no explicit `context` block and no
-secret value enters the program (Req 14.5).
-
-**Determinism.** Provider resolution is effectful and may vary between applies (a changed env value); the
-language stays deterministic *given* the resolved `RuntimeContext`, which `tkp` resolves once and injects
-(Property 2). The variability lives at the `tkp` edge.
-
-**Precedence (recorded vs ambient).** `RuntimeContext` fields split by meaning. **Recorded
-identity-bearing** values (`region`, later `account`) are persisted with the deployment at creation and
-are authoritative: a differing ambient/host source is a *retarget* that `tkp` surfaces and that requires
-explicit operator confirmation — never a silent override (mirroring the deployment-lock mis-apply guard).
-**Machine-local ambient** values (`deployment_dir`, `home`) are supplied by the host per invocation, need
-no confirmation, and are not persisted (re-derived per host — the ambient-never-retained rule). So
-precedence is *recorded identity > ambient host > defaults*, with confirmation required only on a
-conflict against a recorded identity value (Req 14.8, 14.9).
-
-## Components and Interfaces
-
-New crate `tokeira-platform-dsl` (engine surface; part of `source_tree_hash`):
-
-- **Import resolver** — `fn assemble(root: &Path) -> Result<SourceSet, Vec<Diag>>`; resolves `use`
-  within the deployment root with the containment rules and bounds; returns the path-sorted source set.
-- **Lexer** (`logos`) — `enum Token` with spans.
-- **Parser** (`chumsky`) — `fn parse(SourceSet) -> Result<ast::Program, Vec<Diag>>`; recursive grammar,
-  error recovery, multi-source spans, one-pass multi-error reporting.
-- **Resolver + type checker** — `fn check(ast::Program, &KindLibrary) -> Result<ir::Program, Vec<Diag>>`;
-  whole-program name resolution, type checking against kind schemas, parity validation, duplicate-decl
-  detection. No partial IR escapes on error (Req 3.3).
-- **Evaluator** — `fn evaluate(&ir::Program, &RuntimeContext) -> Result<Composition, Vec<Diag>>`; pure,
-  total; the only path from program to engine input; asserts the engine composition invariants before
-  returning (Req 7.2).
-- **Kind library** — `trait KindSchema { fn kind_id() -> KindId; fn params() -> ParamSchema;
-  fn validate(&Value) -> Result<(), Vec<Constraint>>; fn lower(&Value, &RuntimeContext) -> LoweredKind }`,
-  implemented per resource/service/image kind, registered in a `KindLibrary`. How a compiled
-  `Resource`/`Service`/`Image` advertises its typed parameter schema, its constraints (canonical ports,
-  cpu/mem, capacity, sufficiency, preexisting-requires-endpoint), and its lowering. Kinds also carry
-  compiled assets (e.g. `ObservabilityConfigFiles`'s askama templates + dashboards).
-- **Diagnostics** (`ariadne`) — `struct Diag { span, severity, message, hint }`; human + `--json`.
-- **`RuntimeContext`** — the host-injected closed record (see Data Models).
-- **Lowering target** — `tokeira_iac::InfraComposition`, `Vec<Box<dyn deploy_engine::Service>>`,
-  `Vec<Box<dyn deploy_engine::Image>>`, `Vec<WritebackTarget>`. A `ComposeService` declaration lowers
-  into both an infra `Resource` and a deploy-engine `Service` (today's `OwnedComposeResource` +
-  `ComposeWorkload`). An `aws_auth: true` service emits a `CredentialNeed` the host honours at
-  materialization.
-
-## Data Models
-
-- **`ast::Program`** — `{ platform: Ident, items: Vec<Item> }` (no version field — a program pins none);
-  `Item ∈ { Use, Input, Let, Module, Image, Namespaces, Writeback }`; expressions cover literals,
-  records, lists, name refs, `.` access, `match`, `if`, `when`, `++`, spread, and builtin calls
-  (`port`, `bind`, path-join). Every node carries a `Span` and a source id (multi-file).
-- **`ir::Program`** — type-checked, name-resolved: bindings by resolved symbol, module tree with
-  resolved (and conditioned) dependency edges, kind references resolved to `KindId`, expressions
-  annotated with `Type`. Deterministic function of the definition (Req 4.2).
-- **`Type`** — `String | Int | Bool | Port | Path | List<T> | Record<fields> | Enum(name) |
-  Optional<T> | KindRef(KindId)`. Sum types (`Storage = InMemory | Dsql { mode, endpoint, arn, region }`)
-  model conditional requirements as types (Req 5.2).
-- **`RuntimeContext`** — the closed record `tkp` injects, in two parts:
-  - **implicit** (kind-library-delivered, platform-specific): at minimum `deployment_dir: PathBuf`, and
-    `home: PathBuf` where the platform needs it (compose's `~/.aws`).
-  - **declared** (operator `context { }` block): fields bound to canonical providers and resolved by
-    `tkp`; secret-bearing fields are `Secret<T>` (taint rules, Req 12.3).
-  **Closed**: the composition reads only typed `ctx.<field>` values and names no provider; no OS-env,
-  network, clock, or arbitrary-filesystem access from the language. **Ambient, never retained** —
-  rollback restores the definition, never the context (Req 12.1, Req 14). `region` is an *input*, not
-  context.
-- **`KindId`** — `{ name: String }`; a program references a kind by name only; the running `tkp`
-  resolves names within its single kind-library version, which it exposes for the provisioner to record
-  (Req 9.1).
-- **`SourceSet`** — the path-sorted `Vec<(RelPath, String)>` of definition files, plus the content
-  digest over the sorted `(RelPath, sha256)` pairs (Req 13.6).
-- **`Composition`** — `{ infra: InfraComposition, services: Vec<Box<dyn Service>>,
-  images: Vec<Box<dyn Image>>, writeback: Vec<WritebackTarget>, credential_needs: Vec<CredentialNeed> }`.
-- **`WritebackTarget`** — `{ key: String, source: OutputRef }`; the declarative form of
-  `collect_writeback`; `tkp` resolves the output from post-apply state and performs the write.
-- **`OutputRef`** — `{ resource: ResourceId, output: String }`; a first-class expression usable in a
-  resource parameter, a container secret reference (`value_from`), or a writeback target. Lowers to a
-  dependency edge **plus** a deferred binding the engine resolves at apply from the referenced
-  resource's provisioned state — exactly as `DsqlIamRoleResource::create` reads the cluster ARN today.
-  Generalizes the writeback-only output reference; an unresolved value at compile time is expected
-  (Req 15).
-- **`CredentialNeed`** — `{ service: Ident, kind: AwsAuth }`; emitted by `aws_auth: true`; honoured by
-  `tkp` at materialization (the `~/.aws` mount + `AWS_*` injection). Carries no secret value.
+At `tkr deployment create` the intended artifacts are `definition.tkd`, `metadata.json`, a prototypical
+`tokeirad.toml`, and an empty `state/`; `docker-compose.yml`, `config/`, and `.tokeira-state/` are produced
+by `apply`. *(Current gap: the compose branch of `create` — `apps/tkr/src/deployment_dir.rs` — writes only
+`definition.tkd` + `metadata.json` + `state/`, not yet the prototypical `tokeirad.toml`; the legacy
+`local`/`ecs` platforms seed `tokeirad.toml` plus a `deployment.toml`, the latter unused by the `.tkd`
+model.)* `ctx.deployment_dir` is `<name>/`. `definition.tkd` sits **directly at the deployment root as a
+single file** — the interpreted subset has no `use`/import construct, so there is no containment
+subdirectory (multi-file composition is a roadmap item; see `requirements.md`).
+
+### Lifecycle — who writes what, when
+
+- **`tkr deployment create`** seeds the config the operator will edit before the first apply: the shipped
+  `definition.tkd`, `metadata.json` (identity + `storage` + `status = Created`), a **prototypical
+  `tokeirad.toml`** (server-config defaults, from `prototypical_server_config(storage, region)`), and an
+  empty `state/`. No `docker-compose.yml` and no engine artifacts yet — those are apply outputs.
+  **Current gaps** (`apps/tkr/src/deployment_dir.rs` `create`): the compose branch (a) does not yet seed
+  `tokeirad.toml`, and (b) writes the `.tkd` **verbatim**, so `--storage`/`--region` are recorded in
+  `metadata.json` but not baked into the seeded `config()` (which keeps `storage: Storage::InMemory`).
+  Both are tracked as the create-completeness work in `tasks.md` task 4 / Roadmap R5. See [Where storage,
+  region, and status live](#where-storage-region-and-status-live).
+- **Operator edit** — the operator edits `definition.tkd` (a `config()` value, or the `deployment()`
+  structure). Data, not a rebuild. A `#[create]` change is refused as a retarget; every other edit
+  reconciles.
+- **`tkr infra|deploy plan|apply`** (forwarded to the bound `tkp`) — `tkp` interprets `definition.tkd`
+  against the injected `Cx` → a deployment; the realizer *generates* `docker-compose.yml` and `config/`
+  and writes engine `state/`; the writeback updates `tokeirad.toml` from post-apply infra outputs. Apply
+  records a monotonically increasing `config_revision` in the deployment state envelope. Generated
+  artifacts are **derived and reproducible**, never retained as config source.
+
+### What defines the config, precisely
+
+A deployment's configuration is **exactly**:
+
+```
+config  ==  definition.tkd (digested)                                   # structure + config() values (incl. storage) + #[create] + writeback
+          + the injected Cx (project_name, region)                       # identity/ambient supplied at interpret time
+          + (tokeira-tkd interpreter, builder vocabulary, kinds, bridge)  # the engine identity, compiled into tkp
+```
+
+Given those three, `interpret(definition.tkd, bridge, cx)` → the platform deployment → every generated
+artifact is reproducible. So **only the first is retained and digested as the configuration revision**;
+the third is the **engine identity** the provisioner binds (`source_tree_hash`), never the `.tkd`. The
+content digest is over `definition.tkd`. `metadata.json` is a **CLI registry**, not an input to
+interpretation — the interpreter never reads it.
+
+### Configuration when persisted
+
+The persisted representation is deliberately minimal and legible:
+
+- **`definition.tkd`** — the operator-editable config revision (including the `config().storage` choice),
+  digested by the provisioner. A `git diff` of it is a complete, reviewable change to the deployment.
+- **`metadata.json`** — the CLI registry (`name`, `id`, `platform`, `storage`, `status`, timestamps).
+  Written and read only by `tkr`; changing its field set is a breaking change for on-disk deployments
+  (prefer additive optional fields — `apps/tkr/src/metadata.rs`).
+- **`config_revision`** (in the deployment state envelope, owned by `platform-provisioner-binary`) —
+  monotonic; bumped on each mutating apply. An edit that changes only `config()` values or `deployment()`
+  structure is a new `config_revision`, never an engine-identity change. *(Not yet wired for compose — the
+  interpret→apply path is a remaining task.)*
+
+There is **no** separate `inputs.toml`: operator value choices live in the `.tkd`'s `config()`.
+
+### Where storage, region, and status live
+
+Because these three are the parts most likely to be looked for, and because two of them currently live in
+more than one place, they are called out explicitly:
+
+- **`status`** — only in `metadata.json` (`DeploymentStatus`: `created`/`running`/`stopped`). Purely a
+  CLI-observed lifecycle state; the engine and the `.tkd` never carry it.
+- **`storage`** — in **two** places that are **not yet reconciled**: `metadata.json.storage` (the CLI's
+  record, set from `--storage` at create) and the `.tkd`'s `config().storage` (what the interpreter
+  actually reads). `create` seeds the `.tkd` verbatim, so `--storage dsql` is recorded in `metadata.json`
+  but **not** reflected in the seeded `.tkd`. The interpreter reads only the `.tkd`, so the `.tkd` is the
+  effective source of truth for realization; `metadata.json.storage` is a CLI convenience that can drift.
+  The choice also parameterizes the prototypical `tokeirad.toml` (`infrastructure.storage` + the DSQL
+  region/endpoint placeholder) that `create` seeds — so all three must agree.
+- **`region`** — currently **only** in the `.tkd` (`Storage::Dsql { region }`); it is **not** persisted in
+  `metadata.json`, and the `--region` flag is dropped for compose at create. The injected `Cx` also
+  carries `region` at interpret time, but the `tkr`/`tkp` wiring that populates `Cx.region` (and
+  `Cx.project_name` from the deployment `name`) is unfinished.
 
-## Correctness Properties
+Reconciling this — either patching the seeded `.tkd` from `--storage`/`--region` at create, or making the
+`.tkd` the sole source and deriving `metadata.json.storage` from it — is a tracked item (`requirements.md`
+→ Roadmap R5). The intended end state: the `.tkd`'s `config()` is authoritative for `storage`/`region`,
+`metadata.json` carries at most a derived copy for `tkr list`, and a changed `#[create]` field
+(`storage`) is caught by the `retarget_check` against the recorded prior config value.
 
-### Property 1: Compilation is pure and total
+### Boundary with `tkp`
 
-*For any* deployment definition, compilation (resolve → lex → parse → resolve → type-check → lower)
-SHALL read only files within the deployment root, perform no other I/O into the language, and terminate.
+This spec defines the **shape** of the config artifact (`definition.tkd`) and how it is interpreted. The
+**versioning, provenance stamping, integrity manifest, retention, the deployment state envelope, and the
+monotonic `config_revision`** are the provisioner's (`platform-provisioner-binary`). This spec writes the
+create-time artifacts and interprets them; it does not stamp, version, or retain them.
 
-**Validates: Requirements 4.1, 4.3**
+## Security posture
 
-### Property 2: Execution is deterministic given the runtime context
+The definition is untrusted input; the interpreter is the trust boundary (Requirement 12).
 
-*For any* compiled Program and *any* `RuntimeContext`, repeated evaluation SHALL yield an identical
-Composition — the same resources, services, images, ids, dependency edges, and module ownership.
+1. **No ambient authority.** Interpretation reads only the closed `Cx` and the platform's kinds/vocabulary
+   through the bridge. The subset admits no `std::env`/`std::fs`/network/clock/OS construct, and no
+   env/key lookup exists in the language.
+2. **Reject-by-default subset.** The allow-list runs before evaluation; anything outside it is a spanned
+   diagnostic and never runs. This is what makes a `.tkd` edit *structurally* a config revision and never
+   an engine-identity change.
+3. **`config()` is host-free.** A kind/builder handle can never appear in the config surface, so the
+   `#[create]` diff always compares comparable data.
+4. **Secrets are declared, never read.** A workload's credential need is a typed flag (`aws: Some(region)`
+   → the `~/.aws` mount + `AWS_*` forwarding); the secret values never enter the `.tkd`, its evaluation,
+   or its output. **Documented deviation:** the AWS edge is resolved *author-side at realize time*
+   (`Service::to_compose_service` reads live `HOME`/`AWS_*`), so the realized DSQL manifest is not
+   hermetic — the `.tkd` authoring is hermetic, the sanctioned realizer boundary is not. No consumer
+   should expect a deterministic realized artifact under DSQL.
+5. **No operator-reachable panic.** The interpreter returns `EvalError` on every reachable path; a fuzz
+   test asserts malformed input yields diagnostics, never a panic.
 
-**Validates: Requirements 4.2**
+## Multi-platform status
 
-### Property 3: Unknown kind, unknown field, or missing required parameter is rejected
+The DSL is already multi-platform on one interpreter (Requirement 9):
 
-*For any* program that references a kind absent from the running kind library, supplies a parameter not
-in a kind's schema, or omits a required one, the compiler SHALL emit a diagnostic and SHALL NOT lower.
+| Platform | Crate | State |
+|---|---|---|
+| Compose | `platforms/compose-syn` (`ComposeBridge`) | Reference platform; fidelity-proven against the compiled definition |
+| EKS | `platforms/eks` (`EksBridge`) | Second bridge on `tokeira-tkd`; its own kinds + config structs (`ServiceManifest`, `IngressRule`) |
+| Compose (legacy), ECS, Local | `platforms/{compose,ecs,local}` | Compiled platforms, **not** yet on the `.tkd` model — migration targets (roadmap) |
 
-**Validates: Requirements 2.2, 2.3, 3.1, 3.2**
+A new platform is: a `HostBridge` impl, its kinds + builder realizers, and a shipped `definition.tkd`.
+The interpreter is not touched — which is exactly why `tokeira-tkd` was extracted out of `compose-syn`.
 
-### Property 4: Unresolved names are rejected
+## Correctness properties
 
-*For any* program containing a name reference that resolves to no in-scope binding, the compiler SHALL
-emit a diagnostic and SHALL NOT lower.
+Property tests are tagged `// Feature: platform-config-dsl, Property N`.
 
-**Validates: Requirements 3.1**
+### Property 1: Interpretation is deterministic given the context
 
-### Property 5: Validation parity is enforced at compile time
+*For any* `.tkd` and *any* `Cx`, repeated `interpret` SHALL yield an identical deployment — the same
+resources, services, ids, dependency edges, module ownership, and writeback entries.
 
-*For any* program violating a Validation Parity Policy rule (canonical ports, cpu/memory pairing,
-capacity range, task-resource sufficiency, non-empty CIDR/AZs, or the DSQL
-`preexisting`-requires-endpoint / `managed`-forbids-endpoint typed sum), the compiler SHALL emit a
-diagnostic and SHALL NOT lower.
+**Validates: Requirement 3**
 
-**Validates: Requirements 5.1, 5.2, 5.3**
+### Property 2: Out-of-subset definitions are rejected before evaluation
 
-### Property 6: No partial composition escapes on error
+*For any* `.tkd` containing a construct outside the interpreted subset (a loop, a non-whitelisted call,
+`std::env`/`std::fs`, an unknown macro, an unknown kind or method), `subset::check` SHALL return a spanned
+diagnostic and the definition SHALL NOT be evaluated.
 
-*For any* program that fails any compile phase, no Composition (partial or whole) SHALL be passed to the
-IaC or deploy engines.
+**Validates: Requirements 3, 12**
 
-**Validates: Requirements 3.3**
+### Property 3: `config()` is host-free
 
-### Property 7: Lowering preserves identity and is the sole constructor path
+*For any* `.tkd` whose `config()` evaluates to a value containing an author kind/handle, `interpret` SHALL
+reject it before admission.
 
-*For any* valid program, lowering SHALL preserve every declared resource id, dependency edge, and module
-ownership; a `ComposeService` declaration SHALL lower to both an infra `Resource` and a deploy-engine
-`Service`; and no engine object SHALL be produced except by a kind in the library.
+**Validates: Requirement 4**
 
-**Validates: Requirements 7.1, 7.3**
+### Property 4: `#[create]` change is a retarget; other edits reconcile
 
-### Property 8: Lowered compositions satisfy the engine invariants
+*For any* two config values differing in a `#[create]` field, `retarget_check` SHALL report a retarget;
+*for any* two differing only in non-`#[create]` fields, it SHALL report none.
 
-*For any* program whose lowering would yield a duplicate module/resource id, a `desired` resource absent
-from `known`, a dependency absent without an external declaration, or a dependency cycle, the compiler
-SHALL emit a diagnostic instead of returning a Composition.
+**Validates: Requirements 4, 11**
 
-**Validates: Requirements 7.2**
+### Property 5: `#[require]` gates admission
 
-### Property 9: Diagnostics are located and recovered
+*For any* config violating a `#[require]` constraint, `interpret` SHALL abort with the constraint's span
+before `deployment()` runs.
 
-*For any* rejected definition, each diagnostic SHALL carry a source (file + span) and a message; *for
-any* definition with multiple independent errors, the compiler SHALL report more than one in a single
-pass.
+**Validates: Requirement 4**
 
-**Validates: Requirements 6.1, 6.2**
+### Property 6: A service lowers to both an infra resource and a deploy-engine workload
 
-### Property 10: Value-only edits change only values
+*For any* `d.service(...)`, realization SHALL produce both a `tokeira_iac::Resource` and a
+`tokeira_deploy_engine::Service`, and no engine object SHALL be produced except by a kind's `realize`.
 
-*For any* two programs differing only in input values (not structure), their lowered Compositions SHALL
-differ only in those values, with identical resource sets, ids, dependencies, and module ownership, and
-SHALL require no change of `(language, kind-library)` version.
+**Validates: Requirement 2**
 
-**Validates: Requirements 8.2**
+### Property 7: Output references resolve at apply, not at interpretation
 
-### Property 11: Unbound or mistyped inputs are rejected
+*For any* `r.output(name)` used in a writeback, interpretation SHALL record a deferred handle and SHALL
+NOT require the value; the adapter SHALL resolve it from the referenced resource's post-apply `InfraState`.
+An output naming a resource absent from the deployment SHALL yield no writeback value.
 
-*For any* required input left unbound, or bound to a value of the wrong type, the compiler SHALL emit a
-diagnostic and SHALL NOT lower.
+**Validates: Requirement 5**
 
-**Validates: Requirements 8.3**
+### Property 8: Fidelity — interpreted `.tkd` equals the compiled reference
 
-### Property 12: The program pins no version; the version is derived from the compiler
+*For any* config mode (InMemory, DSQL), the deployment realized from `definition.tkd` SHALL match the
+compiled reference (`definition.rs` → the engine `ComposeDeployment`): same workload shape, namespaces,
+per-module resource identity (id/type/module/deps), and writeback keys/values.
 
-*For any* program, the source SHALL contain no language or kind-library version; the
-`(language, kind-library)` version SHALL be derived solely from the compiling `tkp` and exposed for the
-provisioner to record. A reference to a kind, field, or construct the running library does not provide
-is rejected by Property 3 — never via a program-declared version.
+**Validates: Requirement 9**
 
-**Validates: Requirements 9.2**
+### Property 9: Writeback projects only declared keys
 
-### Property 13: Compose parity
+*For any* `.tkd`, `collect_writeback` SHALL emit exactly the keys the definition declares, resolving
+literal values directly and `Output` values from `InfraState`; it SHALL NOT write any other key of
+`TokeiraConfig`.
 
-*For any* current `ComposeConfig` (both storage modes), the equivalent deployment definition SHALL lower
-— for the same inputs and runtime context — to a Composition equivalent to today's: the same compose
-services (mimir, loki, tokeirad, grafana, alloy) with their replicas, the `local_state` and (under
-DSQL) `dsql` infra resources, the `observability_config` resource with every observability service
-depending on it, the same image set (Build + 6 mirrors), the `default` namespace, the same dependency
-edges, and the same module ownership.
+**Validates: Requirement 6**
 
-**Validates: Requirements 10.1, 10.2, 10.3**
+### Property 10: No ambient authority; interpretation never panics
 
-### Property 14: Retained definition round-trips
+*For any* `.tkd` (well-formed or adversarial), interpretation SHALL read no OS environment, network,
+clock, or filesystem path, and SHALL return a value or an `EvalError`/diagnostic — never a panic.
 
-*For any* deployment definition the provisioner records, recompiling the retained file set under the
-paired `(language, kind-library)` version SHALL reproduce the same Program (and thus, with the same
-runtime context, the same Composition); a rollback checkpoint SHALL pair a definition with a version
-able to compile it.
+**Validates: Requirement 12**
 
-**Validates: Requirements 11.1, 11.3**
+### Property 11: The digest defines the config revision
 
-### Property 15: No ambient authority; the closed context is the only external read
+*For any* `definition.tkd`, its content digest SHALL be stable across reads and SHALL change iff the file
+changes; recomputing the deployment from the retained `definition.tkd` under the recorded engine identity
+SHALL reproduce the same deployment (with the same `Cx`).
 
-*For any* program, evaluation SHALL read no data other than the closed `RuntimeContext` and the kind
-library; the language SHALL provide no construct to read the OS environment, network, clock, or any
-filesystem path outside the deployment definition, and no construct to execute host code.
+**Validates: Requirements 7, 8**
 
-**Validates: Requirements 12.1, 12.5**
-
-### Property 16: Secrets are declared, never read or echoed
-
-*For any* program, no secret-bearing value SHALL be readable by the program; a credential need SHALL be
-expressible only as a typed declaration (`aws_auth`) honoured by `tkp` at materialization; and *for any*
-diagnostic, no resolved `RuntimeContext` value SHALL appear in its text.
-
-**Validates: Requirements 12.2, 12.3**
-
-### Property 17: Import containment is fail-closed
-
-*For any* `use` whose target is absolute, contains `..`, escapes the deployment root after symlink
-canonicalization, or exceeds folder depth 1, the compiler SHALL emit a diagnostic and SHALL NOT compile;
-the compiler SHALL never read a file outside the deployment root.
-
-**Validates: Requirements 13.2, 13.3**
-
-### Property 18: Compile is bounded
-
-*For any* deployment definition exceeding the configured bounds (file count, per-file or total bytes,
-import depth, AST nesting/size), the compiler SHALL refuse with a diagnostic rather than consume
-unbounded resources.
-
-**Validates: Requirements 12.4**
-
-### Property 19: Definition composition is deterministic and digest-stable
-
-*For any* deployment definition, the composed program SHALL be identical regardless of file read order
-(path-sorted composition), an import cycle SHALL be a diagnostic, a duplicate top-level declaration
-across files SHALL be a diagnostic, and the content digest over the sorted `(relative_path, sha256)`
-set SHALL be stable and SHALL change iff any file changes.
-
-**Validates: Requirements 13.4, 13.5, 13.6**
-
-### Property 20: Runtime context is implicit + declared; the composition names no provider
-
-*For any* program, the composition SHALL read context only as typed `ctx.<field>` values and SHALL
-contain no provider reference; the provider catalog SHALL be fixed by the running `tkp` version; the
-`env` provider SHALL resolve only operator-declared names; and a secret-typed context value SHALL be
-subject to the taint rules of Property 16.
-
-**Validates: Requirements 14.1, 14.2, 14.4**
-
-### Property 21: Output references create dependency edges and resolve at apply
-
-*For any* output reference `<resource>.<output>` in a program, lowering SHALL add a dependency edge to
-the referenced resource and SHALL NOT require the output value at compile time; the value SHALL be
-resolved by the engine during apply from the referenced resource's provisioned state; an output
-reference to a resource absent from the composition or to an output the kind does not declare SHALL be a
-diagnostic.
-
-**Validates: Requirements 15.2, 15.3**
-
-### Property 22: Recorded identity context is authoritative over ambient sources
-
-*For any* recorded identity-bearing `RuntimeContext` value (e.g. `region`), evaluation SHALL use the
-recorded value; *for any* ambient host source that supplies a differing value, the provisioner SHALL
-require explicit operator confirmation and SHALL NOT silently override the recorded value; *for any*
-machine-local ambient value (`deployment_dir`, `home`), the host value SHALL be used without confirmation
-and SHALL NOT be persisted.
-
-**Validates: Requirements 14.8, 14.9**
-
-### Property 23: The authored definition is the persisted copy; applies never read the live crate file
-
-*For any* deployment created from a platform, the definition compiled by every `plan`/`apply` SHALL be
-the file set persisted at create, byte-for-byte — not the platform-crate file; *for any* subsequent edit
-to the live platform-crate `.platform` file, an already-created deployment's lowered Composition SHALL be
-unchanged until its persisted definition is itself edited. (The persistence mechanics are owned by
-`platform-provisioner-binary`; this property fixes the contract this spec depends on: compilation reads
-the persisted copy.)
-
-**Validates: Requirements 16.1, 16.3, 16.5**
-
-## Error Handling
+## Error handling
 
 | Condition | Handling |
 |-----------|----------|
-| `use` absolute / contains `..` / escapes root / depth > 1 | fail-closed diagnostic; file never read (Property 17) |
-| Import cycle / duplicate top-level declaration | diagnostic; no compile (Property 19) |
-| Definition exceeds resource bounds | diagnostic; bounded refusal (Property 18) |
-| Lex / parse error | `ariadne` diagnostic at source+span; recovered where possible; one-pass multi-error (Req 6.2) |
-| Unresolved name | type-phase diagnostic at the reference (Property 4) |
-| Unknown kind / unknown field / missing required | type diagnostic; no lowering (Property 3) |
-| Wrong-typed value / unbound required input | type diagnostic; no lowering (Property 11) |
-| Parity-rule violation | validation diagnostic naming the field/constraint; no lowering (Property 5) |
-| Composition-invariant violation (dup id, `desired ⊄ known`, missing dep, cycle) | diagnostic instead of a Composition (Property 8) |
-| Attempt to read OS env / network / unbounded fs | impossible — no such construct exists (Property 15) |
-| Declared `env` context var absent at execution | optional field → `none`; required → host-runtime error; never silent substitution (Req 14.6) |
-| Output reference to a missing resource or undeclared output | compile diagnostic; no lowering (Property 21) |
-| Any compile failure | no partial Composition reaches the engines (Property 6) |
-| Effectful failure (writeback output missing, credential injection, build gate) | host-runtime error surfaced by `tkp`, outside the language |
+| Out-of-subset construct (loop, closure, arbitrary call, `std::env`/`std::fs`, unknown macro) | `subset::check` spanned diagnostic; never evaluated (Property 2) |
+| Unknown kind / unknown method / unknown associated fn | subset diagnostic (bridge `is_kind`/`knows_method`/`knows_assoc`) (Property 2) |
+| Unknown / missing / misspelled kind field | `EvalError` at construction — `construct_kind` consumes the field map and rejects leftovers (Property 6) |
+| `config()` contains an author kind/handle | `interpret` rejects before admission (Property 3) |
+| `#[create]` field changed vs recorded baseline | `retarget_check` → retarget refused, not reconciled (Property 4) |
+| `#[require]` constraint false | admission abort with the constraint's span (Property 5) |
+| Output reference to a resource absent from the deployment | no writeback value emitted for that key (Property 7) |
+| Malformed / adversarial `.tkd` | `EvalError` or diagnostics; never a panic (Property 10) |
+| Realize-time effect failure (AWS edge, filesystem) | surfaced by `tkp` at apply, outside the language |
 
-## Testing Strategy
+## Testing strategy
 
-- **Unit:** import resolver containment (relative/`..`/absolute/symlink-escape/depth); lexer token/span
-  round-trips; parser AST + recovery; whole-program name resolution + duplicate-decl; type-checker
-  accept/reject per rule; each kind's `validate` (parity constraints); lowering of one `ComposeService`
-  to both an infra `Resource` and a deploy-engine `Service`; `aws_auth` → `CredentialNeed`; the
-  `port`/`bind`/path-join builtins.
-- **Property (proptest):** Properties 1–19, tagged to their requirements. Notably: P2/P19 determinism
-  over arbitrary file orders and runtime contexts; P5 generates parity-violating programs; P10 generates
-  value-only deltas; P13 generates arbitrary `ComposeConfig`s, derives the equivalent definition, and
-  asserts composition equivalence against today's `compose_services()` + module assembly + images;
-  P17 generates adversarial `use` paths and asserts no out-of-root read.
-- **Integration (no live AWS, no Docker):** compile-then-execute the worked multi-file definition
-  against a synthetic `RuntimeContext` for both `InMemory` and `Dsql`; assert the lowered
-  `InfraComposition`, service set, image set, namespaces, and writeback targets equal those the current
-  compiled platform produces for the same config.
-- **Diagnostics snapshot tests:** rendered `ariadne` output for representative errors (unknown kind,
-  mistyped input, preexisting-without-endpoint, `use` escaping the root) — asserting no secret value
-  ever appears.
+- **Fidelity oracle (the spine).** `platforms/compose-syn/tests` proves the three-way lock: the
+  interpreted `definition.tkd` equals the compiled `definition.rs` equals the engine `ComposeDeployment`,
+  for both InMemory and DSQL — workload shape, namespaces, per-module resource identity (id/type/module/
+  deps), and writeback keys/values (Property 8). The compiled `definition.rs` is retained as the
+  differential oracle.
+- **Per-kind round-trip.** Each kind is built from a fully-populated field map and asserted equal to the
+  compiled-literal construction, field for field (the highest-risk surface — e.g. the nine-field
+  `ObservabilityConfigFiles`), backstopping the synchronous shape oracle.
+- **Subset reject fixtures.** Targeted `.tkd` snippets (a `for` loop, a non-writeback closure,
+  `std::env`, `.exists()`, an unknown macro/method/kind, an un-placed-kind `let`) each assert a spanned
+  reject (Property 2).
+- **No-panic fuzz.** Malformed token input asserts clean diagnostics, never a panic (Property 10).
+- **Admission.** `#[create]` retarget and `#[require]` fixtures (Properties 4, 5); a `replicas` edit
+  reconciles.
 - No tests require live AWS credentials, network, or Docker.
+
+## Future directions
+
+These are captured as the roadmap in `requirements.md` and are **not** part of the current contract:
+multi-file `.tkd` composition with `use` import containment; declared `context {}` providers
+(`env`/`env.secret` with `Secret<T>` taint) beyond the implicit `Cx`; the typed `|t: &mut TokeiraConfig|`
+writeback closure (replacing the dotted-key form); and migrating the remaining compiled platforms
+(`compose`, `ecs`, `local`) onto the `.tkd` interpreter.

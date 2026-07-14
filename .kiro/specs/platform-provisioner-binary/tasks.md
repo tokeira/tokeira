@@ -428,6 +428,77 @@ multi-consumer decision) are out of scope.
         as runtime config/data wherever possible so refinement is a plan, not a rebuild; reserve `tkp`
         rebuilds for behavioral engine/resource-impl changes (Req 13.4).
 
+- [ ] 15. Per-platform provisioner — the `tkp` shell + clean split (Requirement 14)
+  - [ ] 15.1 Extract `crates/tokeira-provisioner-cli` (lib): move the platform-agnostic shell out of
+        `apps/tkp` — the mutating-verb contract, binding-gate orchestration, operation-lock wrapper, state
+        envelope, `describe`, Day-0 stamp, `config_history`, and the clap dispatch — generic over a
+        `ProvisionerPlatform` seam whose methods are the **platform-realized** verbs
+        (`infra_plan|apply|destroy`, `deploy_plan|apply`, `scale`, `schema_apply`, `image_push|mirror`),
+        each able to return a first-class `NotApplicable` (+ `label`). Depends on `tokeira-provisioner`
+        (domain); NOT folded into it. Refit the current `apps/tkp` as the first consumer (Local + ComposeSyn
+        impls) with **no behavior change** — workspace green. _Requirements: 14.2_
+  - [ ] 15.2 The shell's clap surface is **namespaced to mirror `tkr`** (`tkp infra plan|apply|destroy`,
+        etc. — Req 7.3, transparent forwarding), with Day-0 stamping an **internal** create step, not an
+        operator `tkp init` verb. _Requirements: 7.3, 6.5_
+  - [ ] 15.3 Implement the **full** lifecycle surface — no verb is "planned" (design §Command behaviour and
+        outputs): the mutating-verb contract (gate → lock → plan → confirm → apply → revision/envelope →
+        report) for `infra apply|destroy`, `deploy apply`, `scale`, `schema apply`, `image push|mirror`,
+        `revert`, `upgrade`, `rollback`, `resume`; the read-only verbs (`describe`, `infra/deploy plan`);
+        and `describe`'s **two views** — operator (default, short) and verification/debug (`--json`;
+        `--verbose` human). Conditional verbs return `NotApplicable` cleanly (e.g. `schema` on in-memory).
+        _Requirements: 13.2, 14.1_
+  - [ ] 15.4 Split into per-platform binaries: `apps/tkp-compose` (`tokeira-provisioner-cli` + a
+        `ComposePlatform` seam impl + `tokeira-compose-syn`/`-compose`/`-iac`/`-orchestrator`, **no `local`**)
+        and `apps/tkp-local`; retire the bundled `apps/tkp`. _Requirements: 14.1_
+  - [ ] 15.5 Repoint `tkr`: `create` resolves the per-platform source (`tkp-compose`) and copies it to
+        `<deployment>/tkp`; the launcher runs `<deployment>/tkp`; `deployment_dir::place_provisioner`
+        resolves the platform-specific binary (currently `which("tkp")`). _Requirements: 14.4, 6.5_
+
+- [ ] 16. Engine identity + build authority (Requirement 15; [Proposal 005](./proposals/005-provisioner-bundles-and-binding.md))
+  - [ ] 16.1 Define `EngineIdentity` (**closure-scoped**: provisioner source-closure digest + `Cargo.lock`-
+        **closure** digest + toolchain + build-container digest + feature set + profile) and `BuildAuthority`
+        (`LocalDeveloper` | `TrustedCi`) in `tokeira-provisioner`. This completes 14.1's narrowing (14.4):
+        the digest is over the provisioner closure, not the whole workspace — else a `tkr`-only dep bump
+        re-keys every identity. _Requirements: 15.2, 13.1_
+  - [ ] 16.2 Re-key the integrity manifest / `BinaryStore` from `version+target` → `EngineIdentity+target`;
+        record `BuildAuthority`; `create` re-verifies bytes (re-hash vs manifest) + authority-vs-policy +
+        not-revoked before binding (caching never grants admission). _Requirements: 15.3, 15.4, 4.2_
+
+- [ ] 17. Source snapshotting for build fidelity (Requirement 16)
+  - [ ] 17.1 Add a Rust git SDK (`gix` pure-Rust preferred, else `git2`) — a **new** workspace dependency —
+        and a snapshot module: freeze the provisioner source closure into an immutable, content-addressed
+        ref via a **temporary-index `write-tree`** (or the in-process `gix` equivalent) — seed a throwaway
+        index from the current one, stage the closure into it (tracked staged + unstaged changes; **untracked
+        `.rs` refuse-by-default, listed — `--include-untracked` to opt in**, decision 9), and write a `tree`,
+        leaving the working tree, real index, and all refs untouched. NOT the porcelain `git stash` (reverts
+        the tree, writes `refs/stash`); `git stash create` is the nearest intuition but omits untracked
+        files. `TrustedCi` → a pinned, reachable, protected commit. _Requirements: 16.1, 16.2, 16.3_
+  - [ ] 17.2 Key `EngineIdentity`'s source digest on the snapshot **`tree` oid** (pure content), never a
+        `commit` oid. Wrap the tree with `commit-tree` for a reachable audit handle — **fixed** synthetic
+        identity + **fixed** timestamps (deterministic: same `(tree, parent)` → same commit; committer
+        supplied, not read from git config), with a **parentless** fallback on an unborn/detached `HEAD`.
+        Record the ref + tree digest in the build request and the bound deployment's provenance; feed the
+        snapshot to the build, never the live tree — atomic (snapshot → derive → build). Retention: **record
+        the oid only by default; pin `refs/tokeira/snapshots/<engine-identity>` only under `TrustedCi`**
+        (decision 10). _Requirements: 16.1, 16.4, 16.5_
+
+- [ ] 18. Reproducible Dagger build + bundle, wired into create (Requirements 15, 14)
+  - [ ] 18.1 A Dagger `build_provisioner(source_snapshot, request) -> ProvisionerBundle` function
+        (validate closure → compute `EngineIdentity` → build `tkp` per target → run tests → checksum +
+        measure artifacts → package), runnable locally (local Dagger Engine) and on Buildkite (the **same**
+        function). Reuses the `dagger-client` boundary (`tokeira-build`). _Requirements: 15.1_
+  - [ ] 18.2 A Tokeira-controlled content-addressed bundle store (S3 CAS keyed by `EngineIdentity ×
+        BuildAuthority × target`, + a per-deployment copy for self-contained rollback): resolve-or-build;
+        cache-hit re-verification; authority-partitioned/write-gated; a revocation deny-list honoured at
+        bind. Not GitHub Actions artifacts. _Requirements: 15.3, 15.4, 5_
+  - [ ] 18.3 Wire `tkr deployment create` inception to **request a bundle**: resolve `EngineIdentity` →
+        resolve an existing verified bundle (build via Dagger on a miss) → verify → retain in the deployment
+        → Day-0 stamp. Phasing: Phase 0 native-cargo dev binding (the current `place_provisioner` copy) →
+        Phase 1 the split (task 15) → Phase 2 hermetic Dagger + CAS → Phase 3 Buildkite + the admission gate.
+        _Requirements: 6.5, 14.4_
+  - [ ] 18.4 Thin GitHub Action → Buildkite trigger (optional dispatch/approval front-end only, never the
+        build implementation or artifact channel). _Requirements: 15.1_
+
 ## Task Dependency Graph
 
 ```json
@@ -440,7 +511,9 @@ multi-consumer decision) are out of scope.
     { "wave": 5, "tasks": ["6", "6.1", "6.2"] },
     { "wave": 6, "tasks": ["8", "8.1", "8.2", "8.3", "8.4", "8.5", "12.2", "14.2", "14.3"] },
     { "wave": 7, "tasks": ["9", "9.1", "9.2", "10", "10.1", "10.2"] },
-    { "wave": 8, "tasks": ["7", "7.1"] }
+    { "wave": 8, "tasks": ["7", "7.1"] },
+    { "wave": 9, "tasks": ["15", "15.1", "15.2", "15.3", "15.4", "15.5"] },
+    { "wave": 10, "tasks": ["16", "16.1", "16.2", "17", "17.1", "17.2", "18", "18.1", "18.2", "18.3", "18.4"] }
   ]
 }
 ```

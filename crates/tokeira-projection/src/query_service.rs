@@ -14,7 +14,7 @@ use crate::visibility_api::{
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use tokeira_types::{ArchetypeId, NamespaceId, SearchAttributes};
+use tokeira_types::{ArchetypeId, NamespaceId};
 use uuid::Uuid;
 
 use crate::{
@@ -22,6 +22,12 @@ use crate::{
     store::VisibilityStore,
     types::{GroupByField, PageBounds, PageToken, RollupDimension, SortOrder, SystemField},
 };
+
+/// A caller-supplied visibility expression that cannot be parsed, typed, or
+/// resolved against the namespace search-attribute registry.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidVisibilityQuery(pub String);
 
 pub struct VisibilityQueryService<S> {
     store: S,
@@ -43,7 +49,9 @@ where
         req: ListWorkflowExecutionsRequest,
     ) -> Result<ListWorkflowExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store)
+            .await
+            .map_err(|error| InvalidVisibilityQuery(error.to_string()))?;
         // Scope to the workflow archetype so the shared index never lists
         // activities (or other archetypes) through the workflow endpoint
         // (Requirement 13.1). Set after compiling the user query — no escape.
@@ -71,7 +79,9 @@ where
         req: CountWorkflowExecutionsRequest,
     ) -> Result<CountWorkflowExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store)
+            .await
+            .map_err(|error| InvalidVisibilityQuery(error.to_string()))?;
         // Workflow-scoped count: the unfiltered grouped paths below already pin
         // `ArchetypeId::WORKFLOW` on the rollup; pin it on the filtered path too so
         // a query-filtered count never spans archetypes (Requirement 13.1).
@@ -132,7 +142,9 @@ where
         req: ListActivityExecutionsRequest,
     ) -> Result<ListActivityExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store)
+            .await
+            .map_err(|error| InvalidVisibilityQuery(error.to_string()))?;
         // Force the activity archetype the edge resolved; no caller escape (Req 13.1).
         filter.archetype = Some(archetype_id);
         let page = PageBounds {
@@ -159,7 +171,9 @@ where
         req: CountActivityExecutionsRequest,
     ) -> Result<CountActivityExecutionsResponse> {
         let namespace_id = parse_namespace(&req.namespace)?;
-        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store).await?;
+        let mut filter = compile_filter(req.query.as_deref(), namespace_id, &self.store)
+            .await
+            .map_err(|error| InvalidVisibilityQuery(error.to_string()))?;
         filter.archetype = Some(archetype_id);
         let group_by = parse_group_by(req.group_by.as_deref(), namespace_id, &self.store).await?;
         let result = match (&filter.expr, &group_by) {
@@ -324,9 +338,9 @@ fn map_activity_summary(row: crate::types::ExecutionRow) -> ActivityExecutionSum
         state_transition_count: row.transition_count,
         state_size_bytes: row.history_size_bytes,
         execution_duration: row.execution_duration,
-        // The list query does not load the SA index (same as the workflow summary);
-        // activities contribute no user search attributes anyway (24.3).
-        search_attributes: SearchAttributes::default(),
+        // The row carries the custom attributes that selected it. Returning that
+        // full image matches v1.31.0 and lets clients inspect the matched value.
+        search_attributes: row.search_attributes,
     }
 }
 

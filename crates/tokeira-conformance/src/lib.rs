@@ -129,6 +129,34 @@ pub struct KeySpec {
 /// `Wired` set always equals the set of keys a real accessor reads — which is
 /// exactly the honesty boundary the spec requires.
 pub static KEY_CLASSIFICATION: &[KeySpec] = &[
+    // Standalone-activity admission is a namespace-scoped frontend policy read
+    // live on every activity RPC (`Config.Enabled(namespace)` in
+    // `chasm/lib/activity/frontend.go @ v1.31.0`). The conformance corpus turns
+    // it on in suite setup while the production default remains false.
+    KeySpec {
+        key: "activity.enableStandalone",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
+    // Standalone Describe/Poll read both values at long-poll admission. The
+    // corpus overrides them per sub-test to keep deadline assertions fast.
+    KeySpec {
+        key: "activity.longPollTimeout",
+        value_type: ValueType::Duration,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "activity.longPollBuffer",
+        value_type: ValueType::Duration,
+        disposition: Disposition::Wired,
+    },
+    // ListActivityExecutions caps each request at this namespace policy
+    // (`chasm/lib/activity/config.go @ v1.31.0`).
+    KeySpec {
+        key: "frontend.visibilityMaxPageSize",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
     // Proving consumer (Tier 3.22): the reported-problems threshold, consulted
     // live where `TemporalReportedProblems` is derived on Describe / at the
     // WFT-failure check. Wired here because this change adds that accessor.
@@ -415,6 +443,7 @@ mod tests {
     const REPORTED_PROBLEMS_KEY: &str =
         "system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute";
     const CALLBACK_ALLOWED_ADDRESSES_KEY: &str = "component.callbacks.allowedAddresses";
+    const STANDALONE_ACTIVITIES_KEY: &str = "activity.enableStandalone";
 
     /// The classification table is internally consistent: keys are unique, and
     /// the reported-problems threshold — the proving wired consumer — is present
@@ -432,6 +461,10 @@ mod tests {
         let reported = classification(REPORTED_PROBLEMS_KEY).expect("reported-problems classified");
         assert_eq!(reported.disposition, Disposition::Wired);
         assert_eq!(reported.value_type, ValueType::Int);
+        let standalone =
+            classification(STANDALONE_ACTIVITIES_KEY).expect("standalone activities classified");
+        assert_eq!(standalone.disposition, Disposition::Wired);
+        assert_eq!(standalone.value_type, ValueType::Bool);
     }
 
     /// A fresh registry: set on a wired key is observed live; clear reverts to

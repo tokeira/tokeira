@@ -263,33 +263,31 @@ fn proto_duration_to_nanos(value: Option<&prost_types::Duration>) -> i64 {
     }
 }
 
-/// The retry-policy scalars the standalone activity needs, with Temporal's defaults
-/// applied — mirroring `retrypolicy.EnsureDefaults` over `DefaultDefaultRetrySettings`
-/// (`common/retrypolicy/retry_policy.go @ v1.31.0`), which the standalone Start path
-/// applies via `DefaultActivityRetryPolicy` before persisting
-/// (`chasm/lib/activity/frontend.go:362-419 @ v1.31.0`). tokeira is config-as-constant,
-/// so the constant defaults stand in for the dynamic-config default. Returns
-/// `(initial_interval_nanos, backoff_coefficient, maximum_interval_nanos, maximum_attempts)`.
-fn defaulted_retry_fields(
+/// Return the normalized standalone-activity retry policy that v1.31.0 persists and
+/// exposes through Describe. Tokeira uses the release defaults as constants rather
+/// than dynamic configuration (`chasm/lib/activity/frontend.go:362-419 @ v1.31.0`).
+fn defaulted_retry_policy(
     policy: Option<&tokeira_proto::common::RetryPolicy>,
-) -> (i64, f64, i64, i32) {
+) -> tokeira_proto::common::RetryPolicy {
     // EnsureDefaults: InitialInterval 1s, BackoffCoefficient 2.0, MaximumInterval
     // 100 × InitialInterval, MaximumAttempts 0 (unlimited).
-    let mut initial = proto_duration_to_nanos(policy.and_then(|p| p.initial_interval.as_ref()));
-    if initial == 0 {
-        initial = 1_000_000_000;
+    let mut normalized = policy.cloned().unwrap_or_default();
+    if proto_duration_to_nanos(normalized.initial_interval.as_ref()) == 0 {
+        normalized.initial_interval = Some(prost_types::Duration {
+            seconds: 1,
+            nanos: 0,
+        });
     }
-    let mut coefficient = policy.map(|p| p.backoff_coefficient).unwrap_or(0.0);
-    if coefficient == 0.0 {
-        coefficient = 2.0;
+    if normalized.backoff_coefficient == 0.0 {
+        normalized.backoff_coefficient = 2.0;
     }
-    let mut maximum = proto_duration_to_nanos(policy.and_then(|p| p.maximum_interval.as_ref()));
-    if maximum == 0 {
+    if proto_duration_to_nanos(normalized.maximum_interval.as_ref()) == 0 {
         // DefaultDefaultRetrySettings.MaximumIntervalCoefficient = 100.
-        maximum = initial.saturating_mul(100);
+        let maximum =
+            proto_duration_to_nanos(normalized.initial_interval.as_ref()).saturating_mul(100);
+        normalized.maximum_interval = nanos_to_proto_duration(maximum);
     }
-    let maximum_attempts = policy.map(|p| p.maximum_attempts).unwrap_or(0);
-    (initial, coefficient, maximum, maximum_attempts)
+    normalized
 }
 
 /// Build a `PollActivityTaskQueueResponse` for a standalone-activity task served
@@ -318,9 +316,9 @@ fn chasm_activity_poll_response(
         heartbeat_timeout: nanos_to_proto_duration(task.heartbeat_nanos),
         scheduled_time: nanos_to_proto_timestamp(task.scheduled_time_nanos),
         started_time: nanos_to_proto_timestamp(task.started_time_nanos),
-        // current_attempt_scheduled_time mirrors scheduled_time for a single-attempt
-        // dispatch (no separate per-attempt schedule clock is tracked yet).
-        current_attempt_scheduled_time: nanos_to_proto_timestamp(task.scheduled_time_nanos),
+        // Retry attempts are scheduled from the prior completion plus backoff, while
+        // `scheduled_time` remains the original execution schedule.
+        current_attempt_scheduled_time: nanos_to_proto_timestamp(task.attempt_scheduled_time_nanos),
         priority: decode_echo(&task.priority),
         header: decode_echo(&task.header),
         heartbeat_details: (!task.heartbeat_details.is_empty())
@@ -369,6 +367,17 @@ fn pending_activity_state(status: ActivityStatus) -> tokeira_proto::enums::Pendi
 /// (`<= 0`).
 fn nanos_to_proto_duration(nanos: i64) -> Option<prost_types::Duration> {
     (nanos > 0).then_some(prost_types::Duration {
+        seconds: nanos / 1_000_000_000,
+        nanos: (nanos % 1_000_000_000) as i32,
+    })
+}
+
+/// Convert a normalized timeout to a proto duration while retaining an explicit
+/// zero. Standalone Describe always populates its timeout messages, including
+/// unset values normalized to zero (`chasm/lib/activity/activity.go @ v1.31.0`).
+fn timeout_to_proto_duration(nanos: i64) -> Option<prost_types::Duration> {
+    let nanos = nanos.max(0);
+    Some(prost_types::Duration {
         seconds: nanos / 1_000_000_000,
         nanos: (nanos % 1_000_000_000) as i32,
     })
@@ -431,16 +440,17 @@ fn chasm_activity_outcome(
         }
         ActivityStatus::Terminated => Value::Failure(Failure {
             message: description.failure.clone(),
-            failure_info: Some(FailureInfo::TerminatedFailureInfo(
-                TerminatedFailureInfo::default(),
-            )),
+            failure_info: Some(FailureInfo::TerminatedFailureInfo(TerminatedFailureInfo {
+                identity: description.terminate_identity.clone(),
+            })),
             ..Default::default()
         }),
         ActivityStatus::Canceled => Value::Failure(Failure {
             message: description.failure.clone(),
-            failure_info: Some(FailureInfo::CanceledFailureInfo(
-                CanceledFailureInfo::default(),
-            )),
+            failure_info: Some(FailureInfo::CanceledFailureInfo(CanceledFailureInfo {
+                details: decode_echo(&description.canceled_details),
+                identity: description.cancel_identity.clone(),
+            })),
             ..Default::default()
         }),
         // A timeout records a structured `Failure` (with `TimeoutFailureInfo`) as its
@@ -469,6 +479,14 @@ fn chasm_activity_outcome(
 fn chasm_last_failure(
     description: &crate::chasm_activity::ActivityDescription,
 ) -> Option<tokeira_proto::failure::Failure> {
+    // Termination/cancellation have terminal outcome failures but are not failed
+    // attempts, so v1.31.0 leaves `info.last_failure` unset.
+    if matches!(
+        description.status,
+        ActivityStatus::Terminated | ActivityStatus::Canceled
+    ) {
+        return None;
+    }
     if !description.failure_payload.is_empty()
         && let Ok(failure) =
             tokeira_proto::failure::Failure::decode(description.failure_payload.as_slice())
@@ -496,10 +514,10 @@ fn chasm_activity_info(
         status: activity_execution_status(description.status) as i32,
         run_state: pending_activity_state(description.status) as i32,
         task_queue: description.task_queue.clone(),
-        schedule_to_close_timeout: nanos_to_proto_duration(description.schedule_to_close_nanos),
-        schedule_to_start_timeout: nanos_to_proto_duration(description.schedule_to_start_nanos),
-        start_to_close_timeout: nanos_to_proto_duration(description.start_to_close_nanos),
-        heartbeat_timeout: nanos_to_proto_duration(description.heartbeat_nanos),
+        schedule_to_close_timeout: timeout_to_proto_duration(description.schedule_to_close_nanos),
+        schedule_to_start_timeout: timeout_to_proto_duration(description.schedule_to_start_nanos),
+        start_to_close_timeout: timeout_to_proto_duration(description.start_to_close_nanos),
+        heartbeat_timeout: timeout_to_proto_duration(description.heartbeat_nanos),
         attempt: description.attempt,
         schedule_time: nanos_to_proto_timestamp(description.scheduled_time_nanos),
         // schedule_time + schedule_to_close_timeout, populated only when that timeout
@@ -534,10 +552,22 @@ fn chasm_activity_info(
         canceled_reason: description.cancel_reason.clone(),
         state_transition_count: description.execution_vt.transition_count,
         last_worker_identity: description.worker_identity.clone(),
+        current_retry_interval: nanos_to_proto_duration(description.current_retry_interval_nanos),
+        last_attempt_complete_time: nanos_to_proto_timestamp(
+            description.last_attempt_complete_time_nanos,
+        ),
+        next_attempt_schedule_time: (description.status == ActivityStatus::Scheduled
+            && description.attempt > 1)
+            .then(|| nanos_to_proto_timestamp(description.attempt_scheduled_time_nanos))
+            .flatten(),
         // Describe-echo fields stored opaque at Start and returned verbatim (Req 5).
-        retry_policy: decode_echo(&description.retry_policy),
+        retry_policy: decode_echo(&description.retry_policy)
+            .or_else(|| Some(defaulted_retry_policy(None))),
         priority: decode_echo(&description.priority),
-        search_attributes: decode_echo(&description.search_attributes),
+        // v1.31.0 always allocates SearchAttributes for the visibility projection,
+        // even when its indexed-fields map is empty (`activity.go @ v1.31.0`).
+        search_attributes: decode_echo(&description.search_attributes)
+            .or_else(|| Some(tokeira_proto::common::SearchAttributes::default())),
         header: decode_echo(&description.header),
         user_metadata: decode_echo(&description.user_metadata),
         ..Default::default()
@@ -894,7 +924,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .map(|q| q.name.clone())
                 .unwrap_or_default();
             if let Some(task) = bridge
-                .poll_activity_task(&task_queue, &req.identity)
+                .poll_activity_task_waiting(&task_queue, &req.identity)
                 .await?
             {
                 debug!(%task_queue, "poll_activity_task_queue served standalone activity");
@@ -938,6 +968,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     &req.task_token,
                     &namespace_id.0.to_string(),
                     result,
+                    req.identity,
                 )
                 .await?;
             debug!("respond_activity_task_completed (standalone) success");
@@ -991,6 +1022,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     failure,
                     failure_payload,
                     heartbeat_details,
+                    req.identity,
                 )
                 .await?;
             return Ok(Response::new(translate::respond_activity_failed_to_proto()));
@@ -1372,6 +1404,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     &req.activity_id,
                     &req.run_id,
                     result,
+                    req.identity,
                 )
                 .await?;
             return Ok(Response::new(
@@ -1422,6 +1455,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     failure,
                     failure_payload,
                     heartbeat_details,
+                    req.identity,
                 )
                 .await?;
             return Ok(Response::new(
@@ -1451,8 +1485,13 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             && bridge.owns_task_token(&req.task_token)
         {
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+            let details = req.details.map(|p| p.encode_to_vec()).unwrap_or_default();
             bridge
-                .respond_activity_task_canceled(&req.task_token, &namespace_id.0.to_string())
+                .respond_activity_task_canceled(
+                    &req.task_token,
+                    &namespace_id.0.to_string(),
+                    details,
+                )
                 .await?;
             return Ok(Response::new(
                 translate::respond_activity_canceled_to_proto(),
@@ -1478,8 +1517,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             && req.workflow_id.is_empty()
         {
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
+            let details = req.details.map(|p| p.encode_to_vec()).unwrap_or_default();
             bridge
-                .cancel_by_id(&namespace_id.0.to_string(), &req.activity_id, &req.run_id)
+                .cancel_by_id(
+                    &namespace_id.0.to_string(),
+                    &req.activity_id,
+                    &req.run_id,
+                    details,
+                )
                 .await?;
             return Ok(Response::new(
                 translate::respond_activity_canceled_by_id_to_proto(),
@@ -2737,8 +2782,11 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         // result into scalar fields on the activity state (the pure crate is
         // proto-free). Computed before `req.retry_policy` is moved into the opaque
         // describe-echo bytes below.
-        let (retry_initial, retry_coefficient, retry_maximum, retry_max_attempts) =
-            defaulted_retry_fields(req.retry_policy.as_ref());
+        let retry_policy = defaulted_retry_policy(req.retry_policy.as_ref());
+        let retry_initial = proto_duration_to_nanos(retry_policy.initial_interval.as_ref());
+        let retry_coefficient = retry_policy.backoff_coefficient;
+        let retry_maximum = proto_duration_to_nanos(retry_policy.maximum_interval.as_ref());
+        let retry_max_attempts = retry_policy.maximum_attempts;
         let start = crate::chasm_activity::StartActivity {
             namespace_id: namespace_id.0.to_string(),
             activity_id: req.activity_id,
@@ -2765,11 +2813,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             // DescribeActivityExecution (Req 5). Encoded here at the edge boundary so
             // the component holds only bytes.
             header: req.header.map(|h| h.encode_to_vec()).unwrap_or_default(),
-            retry_policy: req
-                .retry_policy
-                .as_ref()
-                .map(|r| r.encode_to_vec())
-                .unwrap_or_default(),
+            retry_policy: retry_policy.encode_to_vec(),
             // Fold the (defaulted) retry policy into scalar fields so the pure retry
             // decision needs no proto. Defaults match v1.31.0's `EnsureDefaults`.
             retry_initial_interval_nanos: retry_initial,
@@ -3019,7 +3063,9 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         let key = self
             .activity_execution_key(bridge, &req.namespace, req.activity_id, req.run_id)
             .await?;
-        bridge.terminate(key, req.reason, req.request_id).await?;
+        bridge
+            .terminate(key, req.reason, req.request_id, req.identity)
+            .await?;
         Ok(Response::new(
             workflowservice::TerminateActivityExecutionResponse {},
         ))
@@ -3221,16 +3267,18 @@ mod tests {
         let description = crate::chasm_activity::ActivityDescription {
             status: ActivityStatus::Terminated,
             failure: "test termination".to_owned(),
+            terminate_identity: "terminator".to_owned(),
             ..Default::default()
         };
         let outcome = chasm_activity_outcome(&description).expect("terminal outcome");
         match outcome.value {
             Some(activity_v1::activity_execution_outcome::Value::Failure(failure)) => {
                 assert_eq!(failure.message, "test termination");
-                assert!(matches!(
-                    failure.failure_info,
-                    Some(FailureInfo::TerminatedFailureInfo(_))
-                ));
+                let Some(FailureInfo::TerminatedFailureInfo(info)) = failure.failure_info else {
+                    panic!("expected terminated failure info");
+                };
+                assert_eq!(info.identity, "terminator");
+                assert!(chasm_last_failure(&description).is_none());
             }
             other => panic!("expected failure outcome, got {other:?}"),
         }
@@ -3336,6 +3384,36 @@ mod tests {
                 .execution_duration
                 .is_none(),
             "execution_duration must be unset while running"
+        );
+    }
+
+    #[test]
+    fn chasm_describe_defaults_match_normalized_start_request() {
+        // validateAndPopulateStartRequest materializes retry defaults before CHASM
+        // persists the request, and buildActivityExecutionInfo returns explicit zero
+        // timeout/search-attribute messages (`frontend.go` and `activity.go @ v1.31.0`).
+        let info = chasm_activity_info(
+            "act-1".to_owned(),
+            "run-1".to_owned(),
+            &crate::chasm_activity::ActivityDescription::default(),
+        );
+
+        for timeout in [
+            info.schedule_to_close_timeout,
+            info.schedule_to_start_timeout,
+            info.start_to_close_timeout,
+            info.heartbeat_timeout,
+        ] {
+            assert_eq!(timeout, Some(prost_types::Duration::default()));
+        }
+        let retry = info.retry_policy.expect("normalized retry policy");
+        assert_eq!(retry.initial_interval.expect("initial").seconds, 1);
+        assert_eq!(retry.backoff_coefficient, 2.0);
+        assert_eq!(retry.maximum_interval.expect("maximum").seconds, 100);
+        assert_eq!(retry.maximum_attempts, 0);
+        assert_eq!(
+            info.search_attributes,
+            Some(tokeira_proto::common::SearchAttributes::default())
         );
     }
 

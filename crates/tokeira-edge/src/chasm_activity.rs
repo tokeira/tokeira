@@ -53,6 +53,56 @@ use tokeira_types::ArchetypeId;
 
 use crate::errors::{EdgeError, EdgeResult};
 
+/// Temporal's namespace-scoped standalone-activity admission setting.
+///
+/// `chasm/lib/activity/config.go @ v1.31.0` defines the false default and
+/// `chasm/lib/activity/frontend.go @ v1.31.0` consults it on every request.
+#[cfg(feature = "conformance")]
+const STANDALONE_ACTIVITIES_KEY: &str = "activity.enableStandalone";
+#[cfg(feature = "conformance")]
+const ACTIVITY_LONG_POLL_TIMEOUT_KEY: &str = "activity.longPollTimeout";
+#[cfg(feature = "conformance")]
+const ACTIVITY_LONG_POLL_BUFFER_KEY: &str = "activity.longPollBuffer";
+
+#[cfg(not(feature = "conformance"))]
+fn standalone_activities_enabled(configured: bool) -> bool {
+    configured
+}
+
+#[cfg(feature = "conformance")]
+fn standalone_activities_enabled(configured: bool) -> bool {
+    // The override is compiled out of production. Reading it live is required
+    // because the functional corpus applies the namespace setting after the
+    // out-of-process server has started.
+    tokeira_conformance::overrides()
+        .get_bool(STANDALONE_ACTIVITIES_KEY)
+        .unwrap_or(configured)
+}
+
+#[cfg(not(feature = "conformance"))]
+fn activity_long_poll_timeout(configured: std::time::Duration) -> std::time::Duration {
+    configured
+}
+
+#[cfg(feature = "conformance")]
+fn activity_long_poll_timeout(configured: std::time::Duration) -> std::time::Duration {
+    tokeira_conformance::overrides()
+        .get_duration(ACTIVITY_LONG_POLL_TIMEOUT_KEY)
+        .unwrap_or(configured)
+}
+
+#[cfg(not(feature = "conformance"))]
+fn activity_long_poll_buffer(configured: std::time::Duration) -> std::time::Duration {
+    configured
+}
+
+#[cfg(feature = "conformance")]
+fn activity_long_poll_buffer(configured: std::time::Duration) -> std::time::Duration {
+    tokeira_conformance::overrides()
+        .get_duration(ACTIVITY_LONG_POLL_BUFFER_KEY)
+        .unwrap_or(configured)
+}
+
 /// Attributes for starting a standalone activity (the edge-domain form the gRPC
 /// handler translates the proto request into).
 #[derive(Debug, Clone)]
@@ -161,6 +211,8 @@ pub struct ActivityDescription {
     pub heartbeat_nanos: i64,
     /// Last scheduled time in Unix nanoseconds.
     pub scheduled_time_nanos: i64,
+    /// Scheduled time of the current attempt, including retry backoff.
+    pub attempt_scheduled_time_nanos: i64,
     /// Last started time in Unix nanoseconds (`0` = not started).
     pub started_time_nanos: i64,
     /// Identity of the worker that polled/started the current attempt (empty until
@@ -190,9 +242,19 @@ pub struct ActivityDescription {
     /// The cancel request's reason (empty until cancel requested) — echoed on
     /// `info.canceled_reason`.
     pub cancel_reason: String,
+    /// Identity of the client that requested cancellation.
+    pub cancel_identity: String,
+    /// Encoded cancellation acknowledgement details.
+    pub canceled_details: Vec<u8>,
     /// The terminate request's `request_id` (empty until terminated) — the
     /// idempotency/conflict key for a repeated `TerminateActivityExecution`.
     pub terminate_request_id: String,
+    /// Identity of the client that terminated the activity.
+    pub terminate_identity: String,
+    /// Completion time of the previous attempt.
+    pub last_attempt_complete_time_nanos: i64,
+    /// Backoff interval selected for the current retry.
+    pub current_retry_interval_nanos: i64,
 }
 
 /// A worker-facing activity task: the dispatched attempt a polling worker receives,
@@ -223,6 +285,8 @@ pub struct PolledActivityTask {
     pub heartbeat_nanos: i64,
     /// Schedule time in Unix nanoseconds — `poll.scheduled_time`.
     pub scheduled_time_nanos: i64,
+    /// Scheduled time of this attempt, including retry backoff.
+    pub attempt_scheduled_time_nanos: i64,
     /// Started time in Unix nanoseconds (the pickup time recorded by this poll) —
     /// `poll.started_time`.
     pub started_time_nanos: i64,
@@ -408,6 +472,7 @@ struct DispatchEntry {
 #[derive(Debug, Default)]
 pub struct ActivityDispatchQueue {
     queues: Mutex<HashMap<String, VecDeque<DispatchEntry>>>,
+    dispatch_available: tokio::sync::Notify,
 }
 
 impl ActivityDispatchQueue {
@@ -419,6 +484,9 @@ impl ActivityDispatchQueue {
     fn enqueue(&self, task_queue: String, entry: DispatchEntry) {
         if let Ok(mut queues) = self.queues.lock() {
             queues.entry(task_queue).or_default().push_back(entry);
+            // A timeout may produce a retry while a worker is long-polling this
+            // standalone queue. One committed dispatch wakes one poller.
+            self.dispatch_available.notify_one();
         }
     }
 
@@ -435,6 +503,22 @@ impl ActivityDispatchQueue {
             .iter()
             .position(|entry| entry.fire_at.is_none_or(|at| at <= now))?;
         queue.remove(pos)
+    }
+
+    /// Return the earliest delayed dispatch deadline on `task_queue`.
+    fn next_due_at(&self, task_queue: &str) -> Option<i64> {
+        let queues = self.queues.lock().ok()?;
+        queues
+            .get(task_queue)?
+            .iter()
+            .filter_map(|entry| entry.fire_at)
+            .min()
+    }
+
+    fn has_seen_queue(&self, task_queue: &str) -> bool {
+        self.queues
+            .lock()
+            .is_ok_and(|queues| queues.contains_key(task_queue))
     }
 }
 
@@ -512,7 +596,7 @@ impl ActivityBridge {
 
     /// Whether standalone activities are enabled.
     pub fn is_enabled(&self) -> bool {
-        self.config.enable_standalone
+        standalone_activities_enabled(self.config.enable_standalone)
     }
 
     /// The configured max length for user-supplied ids (activity id, run id),
@@ -525,14 +609,14 @@ impl ActivityBridge {
     /// Server-side describe/poll long-poll timeout (`activity.longPollTimeout`,
     /// default 20s @ v1.31.0). The wait returns an empty response when it elapses.
     pub fn long_poll_timeout(&self) -> std::time::Duration {
-        self.config.long_poll_timeout
+        activity_long_poll_timeout(self.config.long_poll_timeout)
     }
 
     /// Slack subtracted from the caller's deadline so an empty long-poll response
     /// is sent before the caller times out (`activity.longPollBuffer`, default 1s
     /// @ v1.31.0).
     pub fn long_poll_buffer(&self) -> std::time::Duration {
-        self.config.long_poll_buffer
+        activity_long_poll_buffer(self.config.long_poll_buffer)
     }
 
     /// The registry-assigned archetype id for the activity component. The
@@ -555,7 +639,7 @@ impl ActivityBridge {
     /// The enable gate (Requirement 11.10): when off, every operation is rejected
     /// with the targeted-release `Unimplemented` status.
     fn ensure_enabled(&self) -> EdgeResult<()> {
-        if self.config.enable_standalone {
+        if self.is_enabled() {
             Ok(())
         } else {
             Err(EdgeError::Unimplemented(
@@ -739,7 +823,13 @@ impl ActivityBridge {
         )
         .await?;
         if was_scheduled {
-            self.apply_event(key, ActivityEvent::Canceled).await?;
+            self.apply_event(
+                key,
+                ActivityEvent::Canceled {
+                    details: Vec::new(),
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -753,6 +843,7 @@ impl ActivityBridge {
         key: ExecutionKey,
         reason: String,
         request_id: String,
+        identity: String,
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let description = self.describe(key.clone()).await?;
@@ -765,8 +856,15 @@ impl ActivityBridge {
             }
             return Ok(());
         }
-        self.apply_event(key, ActivityEvent::Terminated { reason, request_id })
-            .await
+        self.apply_event(
+            key,
+            ActivityEvent::Terminated {
+                reason,
+                identity,
+                request_id,
+            },
+        )
+        .await
     }
 
     /// Resolve the current run for `activity_id` in `namespace_id` — the run a bare-id
@@ -823,8 +921,13 @@ impl ActivityBridge {
     }
 
     /// Worker-facing: record successful completion.
-    pub async fn record_completed(&self, key: ExecutionKey, result: Vec<u8>) -> EdgeResult<()> {
-        self.apply_event(key, ActivityEvent::Completed { result })
+    pub async fn record_completed(
+        &self,
+        key: ExecutionKey,
+        result: Vec<u8>,
+        identity: String,
+    ) -> EdgeResult<()> {
+        self.apply_event(key, ActivityEvent::Completed { result, identity })
             .await
     }
 
@@ -840,6 +943,7 @@ impl ActivityBridge {
         failure: String,
         failure_payload: Vec<u8>,
         last_heartbeat_details: Vec<u8>,
+        identity: String,
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let reference = self.activity_ref(key);
@@ -860,6 +964,7 @@ impl ActivityBridge {
                 let event = match retryable.then(|| retry_decision(&state, now, override_nanos)) {
                     Some(RetryOutcome::Reschedule(interval)) => ActivityEvent::Rescheduled {
                         failure: failure.clone(),
+                        identity: identity.clone(),
                         last_heartbeat_details: last_heartbeat_details.clone(),
                         interval_nanos: interval,
                     },
@@ -867,6 +972,7 @@ impl ActivityBridge {
                     _ => ActivityEvent::Failed {
                         failure: failure.clone(),
                         failure_payload: failure_payload.clone(),
+                        identity: identity.clone(),
                         last_heartbeat_details: last_heartbeat_details.clone(),
                     },
                 };
@@ -968,6 +1074,7 @@ impl ActivityBridge {
                 start_to_close_nanos: state.start_to_close_nanos,
                 heartbeat_nanos: state.heartbeat_nanos,
                 scheduled_time_nanos: state.scheduled_time_nanos,
+                attempt_scheduled_time_nanos: state.attempt_scheduled_time_nanos,
                 // The pickup time this poll just recorded (state was read pre-start,
                 // so use the value handed to record_started, not state).
                 started_time_nanos: started_at,
@@ -979,17 +1086,58 @@ impl ActivityBridge {
         Ok(None)
     }
 
+    /// Poll a standalone activity, waiting when this queue has a delayed retry or a
+    /// started attempt whose timeout may produce one. A never-seen standalone queue
+    /// still returns immediately so the shared RPC can fall through to ordinary
+    /// workflow activities.
+    pub async fn poll_activity_task_waiting(
+        &self,
+        task_queue: &str,
+        worker_identity: &str,
+    ) -> EdgeResult<Option<PolledActivityTask>> {
+        let queue = self.dispatch_queue.as_ref().ok_or_else(|| {
+            EdgeError::Internal("activity dispatch queue not attached".to_owned())
+        })?;
+        loop {
+            // Register before the empty check so a racing enqueue leaves a permit
+            // instead of stranding this long poll.
+            let dispatch_available = queue.dispatch_available.notified();
+            if let Some(task) = self.poll_activity_task(task_queue, worker_identity).await? {
+                return Ok(Some(task));
+            }
+            if let Some(due_at) = queue.next_due_at(task_queue) {
+                let remaining = due_at.saturating_sub(self.engine.now());
+                if remaining <= 0 {
+                    continue;
+                }
+                // A retry is committed before it is advertised to matching. Waiting
+                // for its release instant prevents an early empty response.
+                tokio::time::sleep(std::time::Duration::from_nanos(
+                    u64::try_from(remaining).unwrap_or(u64::MAX),
+                ))
+                .await;
+            } else if queue.has_seen_queue(task_queue) {
+                // A started attempt can time out and enqueue its retry later.
+                dispatch_available.await;
+            } else {
+                return Ok(None);
+            }
+        }
+    }
+
     /// Worker-facing: complete the activity attempt named by `task_token`.
     pub async fn respond_activity_task_completed(
         &self,
         task_token: &[u8],
         request_namespace_id: &str,
         result: Vec<u8>,
+        identity: String,
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let token = ActivityTaskToken::decode(task_token)?;
         self.validate_token(&token, request_namespace_id).await?;
-        self.record_completed(token.execution_key(), result).await
+        self.record_completed(token.execution_key(), result, identity)
+            .await
     }
 
     /// Worker-facing: fail the activity attempt named by `task_token`. `failure` is
@@ -1004,6 +1152,7 @@ impl ActivityBridge {
         failure: String,
         failure_payload: Vec<u8>,
         last_heartbeat_details: Vec<u8>,
+        identity: String,
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let token = ActivityTaskToken::decode(task_token)?;
@@ -1013,6 +1162,7 @@ impl ActivityBridge {
             failure,
             failure_payload,
             last_heartbeat_details,
+            identity,
         )
         .await
     }
@@ -1029,11 +1179,12 @@ impl ActivityBridge {
         &self,
         task_token: &[u8],
         request_namespace_id: &str,
+        details: Vec<u8>,
     ) -> EdgeResult<()> {
         self.ensure_enabled()?;
         let token = ActivityTaskToken::decode(task_token)?;
         self.validate_token(&token, request_namespace_id).await?;
-        self.apply_event(token.execution_key(), ActivityEvent::Canceled)
+        self.apply_event(token.execution_key(), ActivityEvent::Canceled { details })
             .await
     }
 
@@ -1091,9 +1242,10 @@ impl ActivityBridge {
         activity_id: &str,
         run_id: &str,
         result: Vec<u8>,
+        identity: String,
     ) -> EdgeResult<()> {
         let token = self.by_id_token(namespace_id, activity_id, run_id).await?;
-        self.respond_activity_task_completed(&token, namespace_id, result)
+        self.respond_activity_task_completed(&token, namespace_id, result, identity)
             .await
     }
 
@@ -1110,6 +1262,7 @@ impl ActivityBridge {
         failure: String,
         failure_payload: Vec<u8>,
         last_heartbeat_details: Vec<u8>,
+        identity: String,
     ) -> EdgeResult<()> {
         let token = self.by_id_token(namespace_id, activity_id, run_id).await?;
         self.respond_activity_task_failed(
@@ -1118,6 +1271,7 @@ impl ActivityBridge {
             failure,
             failure_payload,
             last_heartbeat_details,
+            identity,
         )
         .await
     }
@@ -1129,9 +1283,10 @@ impl ActivityBridge {
         namespace_id: &str,
         activity_id: &str,
         run_id: &str,
+        details: Vec<u8>,
     ) -> EdgeResult<()> {
         let token = self.by_id_token(namespace_id, activity_id, run_id).await?;
-        self.respond_activity_task_canceled(&token, namespace_id)
+        self.respond_activity_task_canceled(&token, namespace_id, details)
             .await
     }
 
@@ -1361,6 +1516,7 @@ impl ActivityBridge {
                         match retry_decision(&state, now, 0) {
                             RetryOutcome::Reschedule(interval) => ActivityEvent::Rescheduled {
                                 failure: format!("activity {} timeout", timeout_type.as_str()),
+                                identity: state.last_worker_identity.clone(),
                                 last_heartbeat_details: Vec::new(),
                                 interval_nanos: interval,
                             },
@@ -1407,6 +1563,7 @@ fn description_from(
         start_to_close_nanos: state.start_to_close_nanos,
         heartbeat_nanos: state.heartbeat_nanos,
         scheduled_time_nanos: state.scheduled_time_nanos,
+        attempt_scheduled_time_nanos: state.attempt_scheduled_time_nanos,
         started_time_nanos: state.started_time_nanos,
         worker_identity: state.last_worker_identity,
         close_time_nanos: state.close_time_nanos,
@@ -1419,7 +1576,12 @@ fn description_from(
         heartbeat_details: state.last_heartbeat_details,
         cancel_request_id: state.cancel_request_id,
         cancel_reason: state.cancel_reason,
+        cancel_identity: state.cancel_identity,
+        canceled_details: state.canceled_details,
         terminate_request_id: state.terminate_request_id,
+        terminate_identity: state.terminate_identity,
+        last_attempt_complete_time_nanos: state.last_attempt_complete_time_nanos,
+        current_retry_interval_nanos: state.current_retry_interval_nanos,
     })
 }
 
@@ -1571,6 +1733,8 @@ mod tests {
     use tokeira_storage::InMemoryChasmNodeStore;
 
     const SEC: i64 = 1_000_000_000;
+    #[cfg(feature = "conformance")]
+    static CONFORMANCE_OVERRIDE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn engine() -> Arc<ChasmEngine> {
         let mut builder = Registry::builder();
@@ -1740,7 +1904,7 @@ mod tests {
             .await
             .expect("started");
         bridge
-            .record_completed(key.clone(), vec![9, 9])
+            .record_completed(key.clone(), vec![9, 9], "worker-1".to_owned())
             .await
             .expect("completed");
 
@@ -1789,11 +1953,69 @@ mod tests {
 
     #[tokio::test]
     async fn gate_off_returns_unimplemented() {
+        #[cfg(feature = "conformance")]
+        let _override_guard = CONFORMANCE_OVERRIDE_TEST_LOCK
+            .lock()
+            .expect("conformance override test lock");
+        #[cfg(feature = "conformance")]
+        tokeira_conformance::overrides().clear(STANDALONE_ACTIVITIES_KEY);
         let bridge = bridge(false);
         let err = bridge.start(start_request()).await.unwrap_err();
         assert!(
             matches!(err, EdgeError::Unimplemented(ref m) if m == "Standalone activity is disabled")
         );
+    }
+
+    #[cfg(feature = "conformance")]
+    #[test]
+    fn conformance_overrides_control_activity_policy_live() {
+        let _override_guard = CONFORMANCE_OVERRIDE_TEST_LOCK
+            .lock()
+            .expect("conformance override test lock");
+        let overrides = tokeira_conformance::overrides();
+        overrides.clear(STANDALONE_ACTIVITIES_KEY);
+        overrides.clear(ACTIVITY_LONG_POLL_TIMEOUT_KEY);
+        overrides.clear(ACTIVITY_LONG_POLL_BUFFER_KEY);
+        let bridge = bridge(false);
+        assert!(!bridge.is_enabled());
+        assert_eq!(
+            bridge.long_poll_timeout(),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(bridge.long_poll_buffer(), std::time::Duration::from_secs(1));
+
+        overrides
+            .set(
+                STANDALONE_ACTIVITIES_KEY,
+                tokeira_conformance::OverrideValue::Bool(true),
+            )
+            .expect("standalone-activity override is wired");
+        overrides
+            .set(
+                ACTIVITY_LONG_POLL_TIMEOUT_KEY,
+                tokeira_conformance::OverrideValue::Duration(std::time::Duration::from_millis(10)),
+            )
+            .expect("activity long-poll timeout override is wired");
+        overrides
+            .set(
+                ACTIVITY_LONG_POLL_BUFFER_KEY,
+                tokeira_conformance::OverrideValue::Duration(std::time::Duration::from_secs(29)),
+            )
+            .expect("activity long-poll buffer override is wired");
+        assert!(bridge.is_enabled());
+        assert_eq!(
+            bridge.long_poll_timeout(),
+            std::time::Duration::from_millis(10)
+        );
+        assert_eq!(
+            bridge.long_poll_buffer(),
+            std::time::Duration::from_secs(29)
+        );
+
+        overrides.clear(STANDALONE_ACTIVITIES_KEY);
+        overrides.clear(ACTIVITY_LONG_POLL_TIMEOUT_KEY);
+        overrides.clear(ACTIVITY_LONG_POLL_BUFFER_KEY);
+        assert!(!bridge.is_enabled());
     }
 
     #[tokio::test]
@@ -1927,7 +2149,13 @@ mod tests {
 
         let details = vec![1, 2, 3, 4];
         bridge
-            .record_failed(key.clone(), "boom".to_owned(), Vec::new(), details.clone())
+            .record_failed(
+                key.clone(),
+                "boom".to_owned(),
+                Vec::new(),
+                details.clone(),
+                "worker-1".to_owned(),
+            )
             .await
             .expect("failed");
 
@@ -1952,7 +2180,13 @@ mod tests {
             .await
             .expect("started");
         bridge
-            .record_failed(key2.clone(), "boom".to_owned(), Vec::new(), Vec::new())
+            .record_failed(
+                key2.clone(),
+                "boom".to_owned(),
+                Vec::new(),
+                Vec::new(),
+                "worker-1".to_owned(),
+            )
             .await
             .expect("failed");
         assert!(
@@ -2006,7 +2240,7 @@ mod tests {
         );
 
         bridge
-            .record_completed(key.clone(), vec![9, 9])
+            .record_completed(key.clone(), vec![9, 9], "worker-1".to_owned())
             .await
             .expect("completed");
         let done = bridge.describe(key).await.unwrap();
@@ -2021,7 +2255,12 @@ mod tests {
         let key = key_of(&req);
         bridge.start(req).await.expect("start");
         bridge
-            .terminate(key.clone(), "operator stop".to_owned(), String::new())
+            .terminate(
+                key.clone(),
+                "operator stop".to_owned(),
+                String::new(),
+                "operator".to_owned(),
+            )
             .await
             .expect("terminate");
         assert_eq!(
@@ -2137,7 +2376,12 @@ mod tests {
         );
 
         bridge
-            .respond_activity_task_completed(&task.task_token, &key.namespace_id, vec![7, 7])
+            .respond_activity_task_completed(
+                &task.task_token,
+                &key.namespace_id,
+                vec![7, 7],
+                "worker-1".to_owned(),
+            )
             .await
             .expect("complete");
         let done = bridge.describe(key).await.unwrap();
@@ -2173,13 +2417,23 @@ mod tests {
         // from `Terminated`.
         let namespace_id = key.namespace_id.clone();
         bridge
-            .terminate(key, "operator stop".to_owned(), String::new())
+            .terminate(
+                key,
+                "operator stop".to_owned(),
+                String::new(),
+                "operator".to_owned(),
+            )
             .await
             .expect("terminate");
         // A response to a terminal activity is rejected NotFound — the attempt the
         // token named no longer exists (token validation, v1.31.0).
         let err = bridge
-            .respond_activity_task_completed(&task.task_token, &namespace_id, vec![1])
+            .respond_activity_task_completed(
+                &task.task_token,
+                &namespace_id,
+                vec![1],
+                "worker-1".to_owned(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, EdgeError::NotFound(_)));
@@ -2335,15 +2589,30 @@ mod tests {
         let key = key_of(&req);
         bridge.start(req).await.expect("start");
         bridge
-            .terminate(key.clone(), "stop".to_owned(), "t-1".to_owned())
+            .terminate(
+                key.clone(),
+                "stop".to_owned(),
+                "t-1".to_owned(),
+                "operator".to_owned(),
+            )
             .await
             .expect("terminate");
         bridge
-            .terminate(key.clone(), "stop".to_owned(), "t-1".to_owned())
+            .terminate(
+                key.clone(),
+                "stop".to_owned(),
+                "t-1".to_owned(),
+                "operator".to_owned(),
+            )
             .await
             .expect("same request id is idempotent");
         match bridge
-            .terminate(key.clone(), "stop".to_owned(), "t-2".to_owned())
+            .terminate(
+                key.clone(),
+                "stop".to_owned(),
+                "t-2".to_owned(),
+                "operator".to_owned(),
+            )
             .await
         {
             Err(EdgeError::FailedPrecondition(m)) => {
@@ -2430,7 +2699,12 @@ mod tests {
             .expect("poll")
             .expect("a queued task");
         bridge
-            .respond_activity_task_completed(&task.task_token, &key.namespace_id, Vec::new())
+            .respond_activity_task_completed(
+                &task.task_token,
+                &key.namespace_id,
+                Vec::new(),
+                "worker-1".to_owned(),
+            )
             .await
             .expect("complete");
         match bridge
@@ -2471,7 +2745,7 @@ mod tests {
             .expect("request cancel");
 
         bridge
-            .respond_activity_task_canceled(&task.task_token, &key.namespace_id)
+            .respond_activity_task_canceled(&task.task_token, &key.namespace_id, Vec::new())
             .await
             .expect("canceled");
         assert_eq!(
@@ -2497,12 +2771,17 @@ mod tests {
             .expect("poll")
             .expect("a queued task");
         bridge
-            .respond_activity_task_completed(&task.task_token, &key.namespace_id, vec![1])
+            .respond_activity_task_completed(
+                &task.task_token,
+                &key.namespace_id,
+                vec![1],
+                "worker-1".to_owned(),
+            )
             .await
             .expect("complete");
 
         let err = bridge
-            .respond_activity_task_canceled(&task.task_token, &key.namespace_id)
+            .respond_activity_task_canceled(&task.task_token, &key.namespace_id, Vec::new())
             .await
             .unwrap_err();
         assert!(matches!(err, EdgeError::NotFound(_)));
@@ -2525,7 +2804,12 @@ mod tests {
             .expect("a queued task");
 
         let err = bridge
-            .respond_activity_task_completed(&task.task_token, "some-other-namespace", vec![1])
+            .respond_activity_task_completed(
+                &task.task_token,
+                "some-other-namespace",
+                vec![1],
+                "worker-1".to_owned(),
+            )
             .await
             .unwrap_err();
         match err {
@@ -2574,7 +2858,12 @@ mod tests {
         let tampered = wire.encode_to_vec();
 
         let err = bridge
-            .respond_activity_task_completed(&tampered, &key.namespace_id, vec![1])
+            .respond_activity_task_completed(
+                &tampered,
+                &key.namespace_id,
+                vec![1],
+                "worker-1".to_owned(),
+            )
             .await
             .unwrap_err();
         match err {

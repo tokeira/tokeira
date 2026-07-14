@@ -75,6 +75,9 @@ pub enum ActivityEvent {
     Rescheduled {
         /// Recorded failure message from the prior attempt.
         failure: String,
+        /// Identity reported with the failed attempt. This can differ from the
+        /// polling identity and therefore replaces `last_worker_identity`.
+        identity: String,
         /// Encoded `Payloads` of the prior attempt's last heartbeat details, carried
         /// across the retry so the next attempt's poll observes them
         /// (`HeartbeatDetailsAvailableOnRetry`). Empty when none; an empty value does
@@ -98,6 +101,8 @@ pub enum ActivityEvent {
     Completed {
         /// Serialized result payload.
         result: Vec<u8>,
+        /// Identity reported by the worker completing the attempt.
+        identity: String,
     },
     /// The activity failed terminally.
     Failed {
@@ -108,6 +113,8 @@ pub enum ActivityEvent {
         /// describe outcome round-trips it exactly (empty when the caller has only a
         /// message).
         failure_payload: Vec<u8>,
+        /// Identity reported by the worker failing the attempt.
+        identity: String,
         /// Encoded `Payloads` of the worker's last heartbeat details supplied on the
         /// fail request, recorded onto the activity so describe echoes them
         /// (`statemachine.go:220 @ v1.31.0`). Empty when none were supplied.
@@ -124,11 +131,16 @@ pub enum ActivityEvent {
         reason: String,
     },
     /// The cancel was acknowledged.
-    Canceled,
+    Canceled {
+        /// Encoded `Payloads` supplied by the acknowledging worker.
+        details: Vec<u8>,
+    },
     /// An operator terminated the activity.
     Terminated {
         /// Termination reason.
         reason: String,
+        /// Identity of the terminating client.
+        identity: String,
         /// The terminate request's `request_id`, stored for idempotency/conflict
         /// detection on a repeated terminate (`activity.go:359-370 @ v1.31.0`).
         request_id: String,
@@ -167,7 +179,7 @@ impl ActivityEvent {
             ActivityEvent::Completed { .. } => "Completed",
             ActivityEvent::Failed { .. } => "Failed",
             ActivityEvent::CancelRequested { .. } => "CancelRequested",
-            ActivityEvent::Canceled => "Canceled",
+            ActivityEvent::Canceled { .. } => "Canceled",
             ActivityEvent::Terminated { .. } => "Terminated",
             ActivityEvent::Heartbeat { .. } => "Heartbeat",
             ActivityEvent::TimedOut { .. } => "TimedOut",
@@ -191,7 +203,7 @@ pub fn legal_target(from: ActivityStatus, event: &ActivityEvent) -> Option<Activ
         ActivityEvent::CancelRequested { .. } => {
             legal(&[Scheduled, Started, CancelRequested], CancelRequested)
         }
-        ActivityEvent::Canceled => legal(&[CancelRequested], Canceled),
+        ActivityEvent::Canceled { .. } => legal(&[CancelRequested], Canceled),
         ActivityEvent::Terminated { .. } => {
             legal(&[Scheduled, Started, CancelRequested], Terminated)
         }
@@ -246,6 +258,7 @@ pub fn apply(
         }
         ActivityEvent::Rescheduled {
             failure,
+            identity,
             last_heartbeat_details,
             interval_nanos,
         } => {
@@ -258,7 +271,13 @@ pub fn apply(
             // The per-attempt anchor is the retry's start time.
             let retry_scheduled = now + *interval_nanos;
             state.attempt_scheduled_time_nanos = retry_scheduled;
+            state.last_attempt_complete_time_nanos = now;
+            state.current_retry_interval_nanos = *interval_nanos;
             state.failure = failure.clone();
+            // Completion/failure request identity is authoritative for the last
+            // worker, even when it differs from the poll identity
+            // (`chasm/lib/activity/statemachine.go @ v1.31.0`).
+            state.last_worker_identity = identity.clone();
             state.started_time_nanos = 0;
             // Carry the prior attempt's heartbeat details forward; an empty value
             // must not clobber details already recorded (mirrors the Failed-path
@@ -302,16 +321,19 @@ pub fn apply(
                 )?;
             }
         }
-        ActivityEvent::Completed { result } => {
+        ActivityEvent::Completed { result, identity } => {
             state.result = result.clone();
+            state.last_worker_identity = identity.clone();
         }
         ActivityEvent::Failed {
             failure,
             failure_payload,
+            identity,
             last_heartbeat_details,
         } => {
             state.failure = failure.clone();
             state.failure_payload = failure_payload.clone();
+            state.last_worker_identity = identity.clone();
             // Only overwrite when the worker supplied details, mirroring v1.31.0's
             // `if details := req.GetLastHeartbeatDetails(); details != nil` guard
             // (`statemachine.go:220`) — an empty field must not clobber details a
@@ -321,7 +343,7 @@ pub fn apply(
             }
         }
         ActivityEvent::CancelRequested {
-            identity: _,
+            identity,
             request_id,
             reason,
         } => {
@@ -331,13 +353,20 @@ pub fn apply(
             // v1.31.0, which tokeira does not yet surface.
             state.cancel_request_id = request_id.clone();
             state.cancel_reason = reason.clone();
+            state.cancel_identity = identity.clone();
         }
-        ActivityEvent::Canceled => {
+        ActivityEvent::Canceled { details } => {
             state.failure = "Activity canceled".to_owned();
+            state.canceled_details = details.clone();
         }
-        ActivityEvent::Terminated { reason, request_id } => {
+        ActivityEvent::Terminated {
+            reason,
+            identity,
+            request_id,
+        } => {
             state.failure = reason.clone();
             state.terminate_request_id = request_id.clone();
+            state.terminate_identity = identity.clone();
         }
         // Record the latest heartbeat details and time; status is unchanged (the
         // `to == from` target above), so the attempt is untouched. The heartbeat
@@ -594,7 +623,10 @@ mod tests {
         let mut ctx = TestCtx::new(0);
         let err = apply(
             &mut state,
-            ActivityEvent::Completed { result: vec![1] },
+            ActivityEvent::Completed {
+                result: vec![1],
+                identity: "worker-1".to_owned(),
+            },
             &mut ctx,
         )
         .unwrap_err();
@@ -668,12 +700,16 @@ mod tests {
         .expect("started");
         apply(
             &mut state,
-            ActivityEvent::Completed { result: vec![9, 9] },
+            ActivityEvent::Completed {
+                result: vec![9, 9],
+                identity: "worker-2".to_owned(),
+            },
             &mut ctx,
         )
         .expect("completed");
         assert_eq!(state.status(), ActivityStatus::Completed);
         assert_eq!(state.result, vec![9, 9]);
+        assert_eq!(state.last_worker_identity, "worker-2");
     }
 
     #[test]
@@ -699,7 +735,10 @@ mod tests {
 
         apply(
             &mut state,
-            ActivityEvent::Completed { result: vec![] },
+            ActivityEvent::Completed {
+                result: vec![],
+                identity: "worker-1".to_owned(),
+            },
             &mut ctx,
         )
         .expect("completed");

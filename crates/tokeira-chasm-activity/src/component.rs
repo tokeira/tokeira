@@ -11,6 +11,7 @@
 //! data field and one transient field, and the runtime engine materializes the
 //! component from that one root node.
 
+use prost::Message as _;
 use tokeira_chasm::{
     ChasmError, Context, ContextMetadata, EngineComponent, Field, Library, Lifecycle,
     LifecycleState, MutableContext, RegistryBuilder, RootComponent, SearchAttributeProvider,
@@ -99,6 +100,7 @@ impl RootComponent for ActivityExecution {
         self.apply(
             ActivityEvent::Terminated {
                 reason: reason.reason.clone(),
+                identity: reason.identity.clone().unwrap_or_default(),
                 // The chasm root-component terminate hook (used by the engine's
                 // generic terminate path) carries no request_id; the standalone
                 // request_id-dedup path goes through the bridge's `terminate`.
@@ -138,8 +140,9 @@ impl VisibilityContributor for ActivityExecution {
             // contributed as system fields, not user search attributes: status is a
             // column (`status_keyword`), and the activity type / task queue are the
             // generic `execution_type`/`task_queue` columns the edge exposes under
-            // those SA names (design "Record shape"). `search_attributes` therefore
-            // carries no user EAV rows for this archetype.
+            // those SA names (design "Record shape"). Caller-supplied custom search
+            // attributes remain EAV rows and must be decoded into the projection
+            // snapshot so List/Count can query them (`activity.go @ v1.31.0`).
             status_keyword: api_status_name(status).to_owned(),
             lifecycle_state: lifecycle_for(status),
             execution_type: (!state.activity_type.is_empty()).then(|| state.activity_type.clone()),
@@ -150,7 +153,7 @@ impl VisibilityContributor for ActivityExecution {
             // the snapshot is fully recomputable from node state — the repair
             // scanner's precondition (Req 10.11).
             close_time_unix_nanos: (state.close_time_nanos != 0).then_some(state.close_time_nanos),
-            search_attributes: Default::default(),
+            search_attributes: decode_search_attributes(&state.search_attributes),
             memo: Default::default(),
         })
     }
@@ -162,9 +165,20 @@ impl VisibilityContributor for ActivityExecution {
 /// no snapshot. Lives here (not in the runtime/bootstrap) so the prost decode stays
 /// in the crate that owns `ActivityState`.
 pub fn rebuild_visibility_snapshot(data: &[u8]) -> Option<VisibilitySnapshot> {
-    use prost::Message as _;
     let state = ActivityState::decode(data).ok()?;
     ActivityExecution::new(state).visibility_snapshot()
+}
+
+/// Decode the public Start request's search-attribute envelope into the shared
+/// typed projection model. Invalid bytes cannot enter through the validated edge,
+/// but repair remains total and treats corrupt legacy data as no attributes.
+fn decode_search_attributes(bytes: &[u8]) -> tokeira_types::SearchAttributes {
+    tokeira_proto::common::SearchAttributes::decode(bytes)
+        .ok()
+        .and_then(|attrs| {
+            tokeira_proto::conversions::common::search_attributes_to_domain(&attrs).ok()
+        })
+        .unwrap_or_default()
 }
 
 /// The fine-grained internal activity-status name (legacy string SA hook).
@@ -295,6 +309,32 @@ mod tests {
         assert_eq!(snap.start_time_unix_nanos, Some(42));
         assert_eq!(snap.close_time_unix_nanos, None);
         assert!(snap.search_attributes.0.is_empty());
+    }
+
+    #[test]
+    fn visibility_snapshot_carries_custom_search_attributes() {
+        let attributes = tokeira_proto::common::SearchAttributes {
+            indexed_fields: [(
+                "ActivityCustomKeyword".to_owned(),
+                tokeira_proto::conversions::common::search_attr_value_to_payload(
+                    &tokeira_types::SearchAttrValue::Keyword("blue".to_owned()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let state = ActivityState {
+            search_attributes: attributes.encode_to_vec(),
+            ..ActivityState::default()
+        };
+
+        let snapshot = ActivityExecution::new(state)
+            .visibility_snapshot()
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.search_attributes.0.get("ActivityCustomKeyword"),
+            Some(&tokeira_types::SearchAttrValue::Keyword("blue".to_owned()))
+        );
     }
 
     #[test]

@@ -246,6 +246,25 @@ pub struct ActivityState {
     /// attempt.
     #[prost(int64, tag = "33")]
     pub attempt_scheduled_time_nanos: i64,
+    /// Identity of the client that requested cancellation. The canceled outcome
+    /// reports this requester (not the worker acknowledging cancellation), matching
+    /// `CanceledFailureInfo.identity` (`statemachine.go @ v1.31.0`).
+    #[prost(string, tag = "34")]
+    pub cancel_identity: String,
+    /// Encoded `Payloads` supplied when the worker acknowledged cancellation.
+    #[prost(bytes = "vec", tag = "35")]
+    pub canceled_details: Vec<u8>,
+    /// Identity of the client that terminated the activity, surfaced through the
+    /// terminal outcome's `TerminatedFailureInfo`.
+    #[prost(string, tag = "36")]
+    pub terminate_identity: String,
+    /// Completion time of the previous attempt, used with the current retry
+    /// interval to project the next attempt's schedule time.
+    #[prost(int64, tag = "37")]
+    pub last_attempt_complete_time_nanos: i64,
+    /// Backoff selected for the currently scheduled retry attempt.
+    #[prost(int64, tag = "38")]
+    pub current_retry_interval_nanos: i64,
 }
 
 // `status()` and `set_status()` accessors for the `status` enumeration field are

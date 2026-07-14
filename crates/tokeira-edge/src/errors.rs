@@ -280,6 +280,11 @@ impl From<anyhow::Error> for EdgeError {
         if let Some(not_ready) = value.downcast_ref::<tokeira_runtime::WorkflowNotReady>() {
             return Self::WorkflowNotReady(not_ready.message.to_string());
         }
+        // Visibility syntax/type/unknown-attribute failures are client query
+        // errors, not projection failures (`List/CountActivityExecutions @ v1.31.0`).
+        if let Some(invalid) = value.downcast_ref::<tokeira_projection::InvalidVisibilityQuery>() {
+            return Self::BadRequest(invalid.to_string());
+        }
         // A query that outlived its deadline surfaces v1.31.0's frontend
         // rewrite (workflow_handler.go:3178-3180).
         if value

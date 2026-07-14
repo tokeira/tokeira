@@ -125,6 +125,9 @@ const NON_RETRYABLE_ACTIVITY_SENTINEL: &str = "__tokeira_non_retryable__";
 const CALLBACK_URL_MAX_LENGTH: usize = 1000;
 const CALLBACK_HEADER_MAX_SIZE: usize = 8 * 1024;
 const MAX_CALLBACKS_PER_WORKFLOW: usize = 32;
+// `FrontendVisibilityMaxPageSize` in `common/dynamicconfig/constants.go @
+// v1.31.0`; standalone activities reuse it in `chasm/lib/activity/config.go`.
+const FRONTEND_VISIBILITY_MAX_PAGE_SIZE: usize = 1000;
 #[cfg(feature = "conformance")]
 const CALLBACK_URL_MAX_LENGTH_KEY: &str = "frontend.callbackURLMaxLength";
 #[cfg(feature = "conformance")]
@@ -133,6 +136,8 @@ const CALLBACK_HEADER_MAX_SIZE_KEY: &str = "frontend.callbackHeaderMaxLength";
 const MAX_CALLBACKS_PER_WORKFLOW_KEY: &str = "system.maxCallbacksPerWorkflow";
 #[cfg(feature = "conformance")]
 const CALLBACK_ALLOWED_ADDRESSES_KEY: &str = "component.callbacks.allowedAddresses";
+#[cfg(feature = "conformance")]
+const FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY: &str = "frontend.visibilityMaxPageSize";
 const SYSTEM_CALLBACK_URL: &str = "temporal://system";
 const CHASM_INTERNAL_CALLBACK_URL: &str = "temporal://internal";
 // `frontend.maxlinksPerRequest` / `frontend.linkMaxSize` defaults
@@ -146,6 +151,20 @@ fn proto_duration_to_time(value: Option<&prost_types::Duration>) -> Option<time:
         time::Duration::seconds(duration.seconds)
             + time::Duration::nanoseconds(i64::from(duration.nanos))
     })
+}
+
+#[cfg(not(feature = "conformance"))]
+fn frontend_visibility_max_page_size() -> usize {
+    FRONTEND_VISIBILITY_MAX_PAGE_SIZE
+}
+
+#[cfg(feature = "conformance")]
+fn frontend_visibility_max_page_size() -> usize {
+    tokeira_conformance::overrides()
+        .get_i64(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(FRONTEND_VISIBILITY_MAX_PAGE_SIZE)
 }
 
 /// Translate a workflow **execution/run** timeout, applying Temporal's
@@ -2968,10 +2987,18 @@ fn split_count_group_by(
 pub fn list_activity_request_to_edge(
     req: workflowservice::ListActivityExecutionsRequest,
 ) -> Result<ListActivityExecutionsRequest, ProtoConversionError> {
+    let max_page_size = frontend_visibility_max_page_size();
     Ok(ListActivityExecutionsRequest {
         namespace: req.namespace,
         query: non_empty(req.query),
-        page_size: req.page_size.max(0) as usize,
+        // Temporal defaults zero to the configured maximum and caps larger
+        // requests at that same live namespace setting
+        // (`chasm/lib/activity/frontend.go @ v1.31.0`).
+        page_size: if req.page_size <= 0 {
+            max_page_size
+        } else {
+            (req.page_size as usize).min(max_page_size)
+        },
         next_page_token: if req.next_page_token.is_empty() {
             None
         } else {
@@ -2983,10 +3010,11 @@ pub fn list_activity_request_to_edge(
 pub fn count_activity_request_to_edge(
     req: workflowservice::CountActivityExecutionsRequest,
 ) -> Result<CountActivityExecutionsRequest, ProtoConversionError> {
+    let (query, group_by) = split_count_group_by(&req.query)?;
     Ok(CountActivityExecutionsRequest {
         namespace: req.namespace,
-        query: non_empty(req.query),
-        group_by: None,
+        query,
+        group_by,
     })
 }
 
@@ -3667,10 +3695,11 @@ pub fn count_activity_response_to_proto(
             .groups
             .into_iter()
             .map(|group| AggregationGroup {
-                group_values: vec![tokeira_proto::common::Payload {
-                    data: group.value.into_bytes(),
-                    ..Default::default()
-                }],
+                // Aggregation values use the same JSON/plain payload envelope as
+                // visibility search attributes; raw bytes lack codec metadata.
+                group_values: vec![search_attr_value_to_payload(
+                    &tokeira_types::SearchAttrValue::Keyword(group.value),
+                )],
                 count: group.count,
             })
             .collect(),
@@ -6499,6 +6528,42 @@ mod tests {
     use tokeira_kernel::state::WorkflowVersioningInfo;
     use tokeira_proto::public::temporal::api::{filter::v1 as filter, taskqueue::v1 as taskqueue};
     use tokeira_types::RunKey;
+
+    #[cfg(feature = "conformance")]
+    static VISIBILITY_PAGE_SIZE_OVERRIDE_TEST_LOCK: std::sync::Mutex<()> =
+        std::sync::Mutex::new(());
+
+    #[test]
+    fn activity_count_extracts_execution_status_group_by() {
+        let request = workflowservice::CountActivityExecutionsRequest {
+            namespace: "default".to_owned(),
+            query: "ActivityType = 'Payment' GROUP BY ExecutionStatus".to_owned(),
+        };
+
+        let translated = count_activity_request_to_edge(request).expect("valid group by");
+        assert_eq!(
+            translated.query.as_deref(),
+            Some("ActivityType = 'Payment'")
+        );
+        assert_eq!(translated.group_by.as_deref(), Some("ExecutionStatus"));
+    }
+
+    #[test]
+    fn activity_count_group_value_is_decodable_keyword_payload() {
+        let response = count_activity_response_to_proto(CountActivityExecutionsResponse {
+            total_count: 3,
+            groups: vec![tokeira_projection::GroupCount {
+                value: "Running".to_owned(),
+                count: 3,
+            }],
+        });
+
+        let payload = &response.groups[0].group_values[0];
+        assert_eq!(
+            search_attr_payload_to_domain(payload).expect("decodable group value"),
+            tokeira_types::SearchAttrValue::Keyword("Running".to_owned())
+        );
+    }
 
     #[test]
     fn execution_config_preserves_start_user_metadata() {
@@ -9399,5 +9464,54 @@ mod tests {
             }
             other => panic!("responses[1] must be the update response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn activity_list_page_size_defaults_and_caps_at_v131_limit() {
+        #[cfg(feature = "conformance")]
+        let _override_guard = VISIBILITY_PAGE_SIZE_OVERRIDE_TEST_LOCK
+            .lock()
+            .expect("visibility page-size override test lock");
+        #[cfg(feature = "conformance")]
+        tokeira_conformance::overrides().clear(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY);
+        let translate = |page_size| {
+            list_activity_request_to_edge(workflowservice::ListActivityExecutionsRequest {
+                page_size,
+                ..Default::default()
+            })
+            .expect("translate activity list")
+            .page_size
+        };
+
+        assert_eq!(translate(0), FRONTEND_VISIBILITY_MAX_PAGE_SIZE);
+        assert_eq!(translate(-1), FRONTEND_VISIBILITY_MAX_PAGE_SIZE);
+        assert_eq!(translate(7), 7);
+        assert_eq!(translate(2000), FRONTEND_VISIBILITY_MAX_PAGE_SIZE);
+    }
+
+    #[cfg(feature = "conformance")]
+    #[test]
+    fn activity_list_page_size_reads_conformance_override_live() {
+        let _override_guard = VISIBILITY_PAGE_SIZE_OVERRIDE_TEST_LOCK
+            .lock()
+            .expect("visibility page-size override test lock");
+        let overrides = tokeira_conformance::overrides();
+        overrides.clear(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY);
+        overrides
+            .set(
+                FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY,
+                tokeira_conformance::OverrideValue::Int(1),
+            )
+            .expect("visibility max-page-size override is wired");
+
+        let translated =
+            list_activity_request_to_edge(workflowservice::ListActivityExecutionsRequest {
+                page_size: 2,
+                ..Default::default()
+            })
+            .expect("translate activity list");
+        assert_eq!(translated.page_size, 1);
+
+        overrides.clear(FRONTEND_VISIBILITY_MAX_PAGE_SIZE_KEY);
     }
 }

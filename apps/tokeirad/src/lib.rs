@@ -1092,10 +1092,11 @@ where
             background_cancel.clone(),
         );
         // Spawn the CHASM timer sweeper (`chasm-activity-timeouts-and-retry`): nothing
-        // else fires armed activity timeouts. The bridge is its `TimeoutEvaluator`, so
-        // the timeout/retry semantics stay pure behind the edge while the runtime owns
-        // only the clock+loop. Gated on standalone activities, the sole timer source.
-        if standalone_enabled {
+        // else fires armed activity timeouts. A conformance build must keep it ready
+        // even when the boot-time default is off, because the corpus enables
+        // `activity.enableStandalone` live after server startup. Production retains
+        // the configured gate and pays no idle sweep cost.
+        if standalone_enabled || cfg!(feature = "conformance") {
             spawn_chasm_timer_sweeper(
                 sweeper_engine,
                 activity_bridge.clone(),

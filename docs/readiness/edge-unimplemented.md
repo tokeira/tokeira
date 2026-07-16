@@ -10,7 +10,7 @@
 > `crates/tokeira-edge/src/grpc/{workflow_service,operator_service}.rs`.
 > **Regenerate:** grep those two files for `unimplemented` and `deferred_unary!`, then drop any RPC that
 > `excluded.md`/`decisions.md` classifies as out-of-surface.
-> **As of:** regenerated on top of commit `e2650eaa` · 2026-06-25.
+> **As of:** regenerated for Tier 6.34 · 2026-07-15.
 
 ## Work to be done
 
@@ -29,11 +29,6 @@ only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
 | `ListWorkers` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
 | `FetchWorkerConfig` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
 | `UpdateWorkerConfig` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
-| `CreateWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
-| `DescribeWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
-| `DeleteWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
-| `ListWorkflowRules` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
-| `TriggerWorkflowRule` | Workflow | `deferred_unary!` | `workflow-rules` | No spec (placeholder) |
 | `StartActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
 | `DescribeActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
 | `PollActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
@@ -64,7 +59,6 @@ This list is **minimal and complete** when:
 | `RemoveSearchAttributes` | Search attributes (operator) |
 | `AddOrUpdateRemoteCluster`, `RemoveRemoteCluster`, `ListClusters` | Remote-cluster registry |
 | `DescribeWorker`, `ListWorkers`, `FetchWorkerConfig`, `UpdateWorkerConfig` | Worker inventory |
-| Workflow-rule RPCs (×5) | Workflow rules |
 | Standalone-activity RPCs (×8) | Standalone Activities (Public Preview) |
 
 To re-verify: confirm each row still maps to a `supported.md` feature area, and that no `supported.md`
@@ -78,5 +72,7 @@ area has an RPC answering `UNIMPLEMENTED` that is absent from this list.
   with `FailedPrecondition` when unconfigured); they are tracked under `worker-deployments`.
 - The activity by-ID RPCs (`RecordActivityTaskHeartbeatById`, etc.) are **not** here — they were
   implemented via `api-conformance-activity-by-id`.
+- Workflow-rule CRUD is no longer deferred. `TriggerWorkflowRule` is also absent because its exact
+  `UNIMPLEMENTED` response is the behavior Temporal v1.31.0 itself serves, not remaining work.
 - `ExecuteMultiOperation` is **not** here — implemented (Update-with-Start) via
   `api-conformance-multi-operation`.

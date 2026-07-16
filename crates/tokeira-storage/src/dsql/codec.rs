@@ -10,7 +10,7 @@
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use tokeira_kernel::{ActivityState, HistoryEvent, ProjectionOp, TimerState, WorkflowState};
-use tokeira_types::{Payloads, ProjectionCursor};
+use tokeira_types::{Payloads, ProjectionCursor, WorkflowRuleRecord};
 
 use crate::{BacklogPayload, ProjectionContext, StoredWorkerDeployment};
 
@@ -135,6 +135,16 @@ pub fn encode_worker_deployment(record: &StoredWorkerDeployment) -> Result<Vec<u
 
 /// Deserialize one Worker Deployment registry document.
 pub fn decode_worker_deployment(bytes: &[u8]) -> Result<StoredWorkerDeployment> {
+    decode(bytes)
+}
+
+/// Serialize one namespace Workflow Rule record.
+pub fn encode_workflow_rule(record: &WorkflowRuleRecord) -> Result<Vec<u8>> {
+    encode(record)
+}
+
+/// Deserialize one namespace Workflow Rule record.
+pub fn decode_workflow_rule(bytes: &[u8]) -> Result<WorkflowRuleRecord> {
     decode(bytes)
 }
 

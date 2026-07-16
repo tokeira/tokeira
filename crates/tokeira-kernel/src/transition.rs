@@ -142,6 +142,24 @@ pub enum DispatchOp {
         /// same-revision independent activity that must not drag the workflow
         /// into a transition (`recordactivitytaskstarted/api.go:188 @ v1.31.0`).
         dispatch_revision: i64,
+        /// Activity stamp captured when this task was enqueued.
+        ///
+        /// The activity-start path compares this dispatch-time stamp against the
+        /// live activity stamp and drops the task on a mismatch. Every mutation
+        /// that supersedes an outstanding dispatch — pause, unpause, reset,
+        /// options update — bumps the stamp, so a stale offer (e.g. an earlier
+        /// retry publish or an old-queue offer after a task-queue move) is
+        /// fenced out (`recordactivitytaskstarted/api.go` stamp check @ v1.31.0).
+        stamp: u64,
+        /// Wall-clock time at which this task becomes eligible for delivery.
+        ///
+        /// The runtime publisher holds the broker offer until this time, so
+        /// unpause/reset with a jitter window land in `[now, now+jitter)` like
+        /// v1.31.0's `RegenerateActivityRetryTask(now + rand.Int63n(jitter))`
+        /// (activity.go:368-370 @ v1.31.0). Immediate dispatch uses a past
+        /// instant. The durable dispatch row is written immediately regardless,
+        /// so recovery is unaffected.
+        dispatch_at: OffsetDateTime,
         schedule_to_close_timeout: Option<Duration>,
         schedule_to_start_timeout: Option<Duration>,
         start_to_close_timeout: Option<Duration>,

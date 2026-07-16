@@ -27,26 +27,28 @@ use prost::Message as _;
 use time::OffsetDateTime;
 use tokeira_compatibility::{FEATURE_MATRIX, FeatureState};
 use tokeira_kernel::{
-    CancelRequest, FieldChange, HistoryEvent, HistoryEventKind, LoadedRun, NexusResolution,
-    ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest, TerminateRequest,
-    UpdateActivityOptionsRequest as KernelUpdateActivityOptionsRequest,
-    WorkflowTaskCompletedRequest,
+    ActivityRetryPolicyPatch, CancelRequest, FieldChange, HistoryEvent, HistoryEventKind,
+    LoadedRun, NexusResolution, ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest,
+    TerminateRequest, WorkflowTaskCompletedRequest,
 };
+use tokeira_proto::public::temporal::api::rules::v1::{WorkflowRule, WorkflowRuleSpec};
 use tokeira_runtime::{
-    ActivityTokenResolutionError, BatchError, BatchOperationEntry, BatchOperationStore,
-    BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry, CreateDeployment,
-    CreateVersion, DeleteDeployment, DeleteVersion, DeleteWorkflowRequest, DeploymentPage,
-    DeploymentView, DescribeVersion, InMemoryBroker, ListDeployments, MultiOperationError,
-    MultiOperationResult, NexusTaskBroker, NexusTaskToken, OverlapDecision, OverlapPolicy,
-    PendingUpdateTransport, QueryResult, RegisterPolledDeployment, ResetWorkflowResult,
-    ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager,
-    SetManagerOutcome, SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult,
-    StartedActivityTask, StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore,
-    TaskQueueVersioningView, UpdateComputeConfig, UpdateLifecycleError, UpdateLifecycleSnapshot,
-    UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig,
-    VersionMetadataView, VersionView, WorkerRegistry, WorkflowActivation, WorkflowDeletion,
-    WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus, compute_matching_times,
-    decide_overlap, schedule_workflow_id, scheduled_workflow_search_attributes,
+    ActivityTokenResolutionError, BatchActivityOptionsPatch, BatchError, BatchOperationEntry,
+    BatchOperationStore, BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry,
+    CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion, DeleteWorkflowRequest,
+    DeploymentPage, DeploymentView, DescribeVersion, InMemoryBroker, ListDeployments,
+    MultiOperationError, MultiOperationResult, NexusTaskBroker, NexusTaskToken, OverlapDecision,
+    OverlapPolicy, PendingUpdateTransport, QueryResult, RegisterPolledDeployment,
+    ResetWorkflowResult, ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent,
+    SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome,
+    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, StartedWorkflowTask,
+    TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView,
+    UpdateActivitiesOptionsRequest, UpdateComputeConfig, UpdateLifecycleError,
+    UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
+    ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistry, WorkflowActivation,
+    WorkflowDeletion, WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus,
+    compute_matching_times, decide_overlap, schedule_workflow_id,
+    scheduled_workflow_search_attributes,
 };
 use tokeira_storage::{
     ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
@@ -72,7 +74,7 @@ use crate::{
     poller_registry::{ActivePoller, PollerRegistry},
     routing::{EdgeRouter, ensure_local},
     translate::{
-        CountActivityExecutionsRequest, CountActivityExecutionsResponse,
+        ActivityTarget, CountActivityExecutionsRequest, CountActivityExecutionsResponse,
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
         DeleteWorkflowExecutionRequest, DescribeTaskQueueRequest, DescribeTaskQueueResponse,
         DescribeWorkflowExecutionRequest, ExecuteMultiOperationOutcome,
@@ -80,34 +82,67 @@ use crate::{
         ListActivityExecutionsResponse, ListNamespacesResponse as EdgeListNamespacesResponse,
         ListTaskQueuePartitionsRequest, ListTaskQueuePartitionsResponse,
         ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, MultiOperationFailure,
-        NamespaceCapabilities, NamespaceDescription, NamespaceStateUpdate,
-        PauseWorkflowExecutionRequest, PauseWorkflowExecutionResponse,
+        NamespaceCapabilities, NamespaceDescription, NamespaceStateUpdate, PauseActivityRequest,
+        PauseActivityResponse, PauseWorkflowExecutionRequest, PauseWorkflowExecutionResponse,
         PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest,
         PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto, QueryWorkflowRequest,
         QueryWorkflowResponse, RecordActivityTaskHeartbeatByIdRequest,
         RecordActivityTaskHeartbeatByIdResponse, RecordActivityTaskHeartbeatRequest,
         RecordActivityTaskHeartbeatResponse, RegisterNamespaceRequest,
         RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
-        ResetWorkflowExecutionRequest, ResetWorkflowExecutionResponse,
-        RespondActivityTaskCanceledByIdRequest, RespondActivityTaskCanceledByIdResponse,
-        RespondActivityTaskCanceledRequest, RespondActivityTaskCanceledResponse,
-        RespondActivityTaskCompletedByIdRequest, RespondActivityTaskCompletedByIdResponse,
-        RespondActivityTaskCompletedRequest, RespondActivityTaskCompletedResponse,
-        RespondActivityTaskFailedByIdRequest, RespondActivityTaskFailedByIdResponse,
-        RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
-        RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
-        SignalWithStartWorkflowExecutionRequest, SignalWithStartWorkflowExecutionResponse,
-        SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
-        StartWorkflowExecutionRequest, StartWorkflowExecutionResponse, SystemCapabilities,
-        SystemInfo, TaskQueueConfig, TaskQueuePartition, TerminateWorkflowExecutionRequest,
-        TerminateWorkflowExecutionResponse, UnpauseWorkflowExecutionRequest,
+        ResetActivityRequest, ResetActivityResponse, ResetWorkflowExecutionRequest,
+        ResetWorkflowExecutionResponse, RespondActivityTaskCanceledByIdRequest,
+        RespondActivityTaskCanceledByIdResponse, RespondActivityTaskCanceledRequest,
+        RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedByIdRequest,
+        RespondActivityTaskCompletedByIdResponse, RespondActivityTaskCompletedRequest,
+        RespondActivityTaskCompletedResponse, RespondActivityTaskFailedByIdRequest,
+        RespondActivityTaskFailedByIdResponse, RespondActivityTaskFailedRequest,
+        RespondActivityTaskFailedResponse, RespondWorkflowTaskCompletedRequest,
+        RespondWorkflowTaskCompletedResponse, SignalWithStartWorkflowExecutionRequest,
+        SignalWithStartWorkflowExecutionResponse, SignalWorkflowExecutionRequest,
+        SignalWorkflowExecutionResponse, StartWorkflowExecutionRequest,
+        StartWorkflowExecutionResponse, SystemCapabilities, SystemInfo, TaskQueueConfig,
+        TaskQueuePartition, TerminateWorkflowExecutionRequest, TerminateWorkflowExecutionResponse,
+        UnpauseActivityRequest, UnpauseActivityResponse, UnpauseWorkflowExecutionRequest,
         UnpauseWorkflowExecutionResponse, UpdateActivityOptionsRequest,
         UpdateActivityOptionsResponse, UpdateNamespaceRequest,
         UpdateWorkflowExecutionOptionsRequest, UpdateWorkflowExecutionOptionsResponse,
         UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse, VersioningOverrideChange,
         WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
     },
+    workflow_rules::{WorkflowRuleError, WorkflowRuleStore},
 };
+
+#[cfg(feature = "conformance")]
+const WORKFLOW_RULES_ENABLED_KEY: &str = "frontend.workflowRulesAPIsEnabled";
+
+#[cfg(not(feature = "conformance"))]
+pub(crate) fn workflow_rules_enabled() -> bool {
+    false
+}
+
+pub(crate) fn workflow_rule_crud_admitted(enabled: bool) -> bool {
+    enabled
+}
+
+#[cfg(feature = "conformance")]
+pub(crate) fn workflow_rules_enabled() -> bool {
+    // v1.31.0 reads this namespace policy at every CRUD request
+    // (`service/frontend/workflow_handler.go:6985-7088 @ v1.31.0`).
+    tokeira_conformance::overrides()
+        .get_bool(WORKFLOW_RULES_ENABLED_KEY)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn activity_offer_requires_rule_evaluation(_crud_gate_at_poll_admission: bool) -> bool {
+    // The frontend flag gates only Workflow Rule CRUD. Temporal history reads
+    // stored namespace rules at activity-start time without consulting it, so
+    // a long poll admitted under a prior flag value must still evaluate the
+    // current rules when work is offered
+    // (`recordactivitytaskstarted/api.go:332-372 @ v1.31.0`).
+    true
+}
 
 #[derive(Clone, Debug)]
 pub struct BatchDispatchContext {
@@ -154,27 +189,122 @@ fn worker_identity_from_request(identity: String) -> Option<WorkerIdentity> {
     }
 }
 
-fn build_update_activity_options_command(
+fn activity_control_target(
+    target: ActivityTarget,
+) -> EdgeResult<tokeira_kernel::ActivityControlTarget> {
+    match target {
+        ActivityTarget::Id(activity_id) => {
+            Ok(tokeira_kernel::ActivityControlTarget::Id(activity_id))
+        }
+        ActivityTarget::Type(activity_type) => {
+            Ok(tokeira_kernel::ActivityControlTarget::Type(activity_type))
+        }
+        // Temporal v1.31.0 serves the `match_all` / `unpause_all` selectors on the
+        // wire, but every history handler resolves activities by switching only on
+        // Id/Type (`getActivityIDs` in unpauseactivity/resetactivity/
+        // updateactivityoptions api.go @ v1.31.0). An all-target request therefore
+        // resolves to an empty id set and returns activity-not-found — even for
+        // the server's own batch worker. Match that rather than silently mutating
+        // every pending activity.
+        ActivityTarget::MatchAll => Err(EdgeError::NotFound(
+            "activity not found: match_all/unpause_all selectors are not served by v1.31.0"
+                .to_string(),
+        )),
+    }
+}
+
+fn activity_control_request_context(
     ctx: &EdgeContext,
-    activity_id: String,
-    req: &UpdateActivityOptionsRequest,
-) -> EdgeResult<KernelUpdateActivityOptionsRequest> {
-    if req.restore_original {
+    identity: &str,
+    now: OffsetDateTime,
+) -> RequestContext {
+    RequestContext {
+        request_id: RequestId(ctx.request_id.as_str().to_string()),
+        caller_identity: (!identity.is_empty()).then(|| identity.to_string()),
+        received_at: now,
+    }
+}
+
+fn validate_activity_jitter(jitter: Option<time::Duration>) -> EdgeResult<()> {
+    if jitter.is_some_and(time::Duration::is_negative) {
         return Err(EdgeError::BadRequest(
-            "restore_original is not supported by update_activity_options yet".to_string(),
+            "activity jitter must not be negative".to_string(),
         ));
     }
-    let options = req
-        .activity_options
-        .as_ref()
+    Ok(())
+}
+
+fn build_update_activity_options_command(
+    ctx: &EdgeContext,
+    req: &UpdateActivityOptionsRequest,
+) -> EdgeResult<UpdateActivitiesOptionsRequest> {
+    let patch = build_activity_options_patch(
+        req.target.clone(),
+        req.activity_options.as_ref(),
+        &req.update_mask,
+        req.restore_original,
+        // Direct RPC: v1.31.0's updateactivityoptions only rejects
+        // restore_original combined with a non-empty parsed field mask; a
+        // populated ActivityOptions body alongside restore is accepted and
+        // ignored (updateactivityoptions/api.go:37-43 @ v1.31.0).
+        false,
+    )?;
+    Ok(UpdateActivitiesOptionsRequest {
+        target: patch.target,
+        task_queue: patch.task_queue,
+        schedule_to_close_timeout: patch.schedule_to_close_timeout,
+        schedule_to_start_timeout: patch.schedule_to_start_timeout,
+        start_to_close_timeout: patch.start_to_close_timeout,
+        heartbeat_timeout: patch.heartbeat_timeout,
+        retry_policy: patch.retry_policy,
+        restore_original_options: patch.restore_original_options,
+        request: RequestContext {
+            request_id: RequestId(ctx.request_id.as_str().to_string()),
+            caller_identity: worker_identity_from_request(req.identity.clone())
+                .map(|identity| identity.0),
+            received_at: ctx.received_at,
+        },
+        now: OffsetDateTime::now_utc(),
+    })
+}
+
+pub(crate) fn build_activity_options_patch(
+    target: ActivityTarget,
+    activity_options: Option<&crate::translate::ActivityOptions>,
+    update_mask: &[String],
+    restore_original: bool,
+    // Whether a populated ActivityOptions body alongside `restore_original` is an
+    // error. StartBatchOperation validates this up front and rejects it
+    // (`TestActivityBatchUpdateOptionsFailed`), while the direct per-workflow RPC
+    // accepts and ignores it. The mask conflict is rejected on both paths.
+    restore_forbids_options: bool,
+) -> EdgeResult<BatchActivityOptionsPatch> {
+    if restore_original {
+        if !update_mask.is_empty() || (restore_forbids_options && activity_options.is_some()) {
+            return Err(EdgeError::BadRequest(
+                "Both UpdateMask and RestoreOriginal are provided".to_string(),
+            ));
+        }
+        return Ok(BatchActivityOptionsPatch {
+            target: activity_control_target(target)?,
+            task_queue: FieldChange::Unchanged,
+            schedule_to_close_timeout: FieldChange::Unchanged,
+            schedule_to_start_timeout: FieldChange::Unchanged,
+            start_to_close_timeout: FieldChange::Unchanged,
+            heartbeat_timeout: FieldChange::Unchanged,
+            retry_policy: ActivityRetryPolicyPatch::default(),
+            restore_original_options: true,
+        });
+    }
+    let options = activity_options
         .ok_or_else(|| EdgeError::BadRequest("activity_options is required".to_string()))?;
-    let task_queue_selected = option_field_selected(&req.update_mask, "task_queue");
+    let task_queue_selected = option_field_selected(update_mask, "task_queue");
     let schedule_to_close_selected =
-        option_field_selected(&req.update_mask, "schedule_to_close_timeout");
+        option_field_selected(update_mask, "schedule_to_close_timeout");
     let schedule_to_start_selected =
-        option_field_selected(&req.update_mask, "schedule_to_start_timeout");
-    let start_to_close_selected = option_field_selected(&req.update_mask, "start_to_close_timeout");
-    let heartbeat_selected = option_field_selected(&req.update_mask, "heartbeat_timeout");
+        option_field_selected(update_mask, "schedule_to_start_timeout");
+    let start_to_close_selected = option_field_selected(update_mask, "start_to_close_timeout");
+    let heartbeat_selected = option_field_selected(update_mask, "heartbeat_timeout");
 
     let task_queue = if task_queue_selected {
         match options.task_queue.as_ref() {
@@ -189,8 +319,9 @@ fn build_update_activity_options_command(
         FieldChange::Unchanged
     };
 
-    let command = KernelUpdateActivityOptionsRequest {
-        activity_id,
+    let retry_policy = build_activity_retry_policy_patch(update_mask, options)?;
+    let patch = BatchActivityOptionsPatch {
+        target: activity_control_target(target)?,
         task_queue,
         schedule_to_close_timeout: optional_duration_change(
             schedule_to_close_selected,
@@ -205,25 +336,70 @@ fn build_update_activity_options_command(
             options.start_to_close_timeout,
         ),
         heartbeat_timeout: optional_duration_change(heartbeat_selected, options.heartbeat_timeout),
-        request: RequestContext {
-            request_id: RequestId(ctx.request_id.as_str().to_string()),
-            caller_identity: worker_identity_from_request(req.identity.clone())
-                .map(|identity| identity.0),
-            received_at: ctx.received_at,
-        },
-        now: OffsetDateTime::now_utc(),
+        retry_policy,
+        restore_original_options: false,
     };
-    if matches!(command.task_queue, FieldChange::Unchanged)
-        && matches!(command.schedule_to_close_timeout, FieldChange::Unchanged)
-        && matches!(command.schedule_to_start_timeout, FieldChange::Unchanged)
-        && matches!(command.start_to_close_timeout, FieldChange::Unchanged)
-        && matches!(command.heartbeat_timeout, FieldChange::Unchanged)
+    if matches!(patch.task_queue, FieldChange::Unchanged)
+        && matches!(patch.schedule_to_close_timeout, FieldChange::Unchanged)
+        && matches!(patch.schedule_to_start_timeout, FieldChange::Unchanged)
+        && matches!(patch.start_to_close_timeout, FieldChange::Unchanged)
+        && matches!(patch.heartbeat_timeout, FieldChange::Unchanged)
+        && patch.retry_policy == ActivityRetryPolicyPatch::default()
     {
         return Err(EdgeError::BadRequest(
             "update_activity_options requires at least one changed option".to_string(),
         ));
     }
-    Ok(command)
+    Ok(patch)
+}
+
+fn build_activity_retry_policy_patch(
+    update_mask: &[String],
+    options: &crate::translate::ActivityOptions,
+) -> EdgeResult<ActivityRetryPolicyPatch> {
+    let replacement_selected = option_field_selected(update_mask, "retry_policy");
+    let nested_selected = [
+        "retry_policy.initial_interval",
+        "retry_policy.backoff_coefficient",
+        "retry_policy.maximum_interval",
+        "retry_policy.maximum_attempts",
+        "retry_policy.non_retryable_error_types",
+    ]
+    .into_iter()
+    .any(|field| option_field_selected(update_mask, field));
+    let source = (replacement_selected || nested_selected)
+        .then_some(options.retry_policy.as_ref())
+        .flatten();
+    if nested_selected && source.is_none() {
+        return Err(EdgeError::BadRequest(
+            "RetryPolicy is not provided".to_string(),
+        ));
+    }
+    let mut patch = ActivityRetryPolicyPatch::default();
+    if replacement_selected {
+        patch.replacement = FieldChange::Set(options.retry_policy.clone());
+        return Ok(patch);
+    }
+    let Some(source) = source else {
+        return Ok(patch);
+    };
+    if option_field_selected(update_mask, "retry_policy.initial_interval") {
+        patch.initial_interval = FieldChange::Set(source.initial_interval);
+    }
+    if option_field_selected(update_mask, "retry_policy.backoff_coefficient") {
+        patch.backoff_coefficient = FieldChange::Set(source.backoff_coefficient);
+    }
+    if option_field_selected(update_mask, "retry_policy.maximum_interval") {
+        patch.maximum_interval = FieldChange::Set(source.maximum_interval);
+    }
+    if option_field_selected(update_mask, "retry_policy.maximum_attempts") {
+        patch.maximum_attempts = FieldChange::Set(source.maximum_attempts);
+    }
+    if option_field_selected(update_mask, "retry_policy.non_retryable_error_types") {
+        patch.non_retryable_error_types =
+            FieldChange::Set(source.non_retryable_error_types.clone());
+    }
+    Ok(patch)
 }
 
 fn optional_duration_change(
@@ -239,11 +415,41 @@ fn optional_duration_change(
 
 fn option_field_selected(update_mask: &[String], field: &str) -> bool {
     if update_mask.is_empty() {
-        return true;
+        return false;
     }
-    update_mask
-        .iter()
-        .any(|path| path == field || path == &format!("activity_options.{field}"))
+    let camel = field
+        .split('_')
+        .enumerate()
+        .map(|(index, segment)| {
+            if index == 0 {
+                segment.to_string()
+            } else {
+                let mut chars = segment.chars();
+                chars
+                    .next()
+                    .map(|value| value.to_ascii_uppercase())
+                    .into_iter()
+                    .chain(chars)
+                    .collect::<String>()
+            }
+        })
+        .collect::<String>();
+    update_mask.iter().any(|path| {
+        path == field
+            || path == &camel
+            || path == &format!("activity_options.{field}")
+            || path == &format!("activityOptions.{camel}")
+            // A nested mask path selects its parent field. Temporal's canonical
+            // path for the task-queue message is `taskQueue.name` (the field is a
+            // `TaskQueue` message, not a scalar), which `util.ParseFieldMask`
+            // camelizes segment-by-segment; a bare `taskQueue` is ignored by
+            // v1.31.0's merge. Accepting the `.name` subpaths keeps the canonical
+            // client mask working. Scalar timeout fields never carry a subpath.
+            || path.starts_with(&format!("{field}."))
+            || path.starts_with(&format!("{camel}."))
+            || path.starts_with(&format!("activity_options.{field}."))
+            || path.starts_with(&format!("activityOptions.{camel}."))
+    })
 }
 
 #[async_trait]
@@ -370,6 +576,36 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         timeout: std::time::Duration,
     ) -> Result<Option<StartedActivityTask>>;
 
+    /// Poll an activity offer without starting it so workflow rules can run at
+    /// the v1.31.0 activity-start boundary.
+    async fn poll_activity_task_offer(
+        &self,
+        _queue: tokeira_types::QueueKey,
+        _worker_identity: tokeira_types::WorkerIdentity,
+        _timeout: std::time::Duration,
+    ) -> Result<Option<tokeira_runtime::ActivityTaskOffer>> {
+        Err(anyhow!(
+            "activity offer polling is not supported by this runtime"
+        ))
+    }
+
+    /// Commit Started after edge policy accepts a previously polled offer.
+    async fn start_activity_task_offer(
+        &self,
+        _offer: tokeira_runtime::ActivityTaskOffer,
+        _worker_identity: tokeira_types::WorkerIdentity,
+    ) -> Result<Option<StartedActivityTask>> {
+        Err(anyhow!(
+            "activity offer start is not supported by this runtime"
+        ))
+    }
+
+    /// Return a previously polled offer to the broker when the edge cannot
+    /// decide its fate — e.g. a transient failure while evaluating workflow
+    /// rules — so the task is not stranded until a shard takeover. Defaults to a
+    /// no-op for runtimes that do not support offer polling.
+    async fn republish_activity_offer(&self, _offer: tokeira_runtime::ActivityTaskOffer) {}
+
     /// Return a poller-count delta after a successful activity poll, if the
     /// matching plane currently observes pressure on that physical queue.
     async fn activity_poller_scaling_decision(
@@ -443,7 +679,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         token: ActivityTaskToken,
         details: Option<Payloads>,
         identity: Option<tokeira_types::WorkerIdentity>,
-    ) -> Result<bool>;
+    ) -> Result<tokeira_runtime::ActivityHeartbeatOutcome>;
 
     async fn resolve_activity_token(
         &self,
@@ -473,10 +709,37 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     async fn update_activity_options(
         &self,
         run_key: RunKey,
-        req: KernelUpdateActivityOptionsRequest,
+        req: UpdateActivitiesOptionsRequest,
     ) -> Result<WorkflowMutationOutcome> {
         let _ = (run_key, req);
         Err(anyhow!("update_activity_options is not implemented"))
+    }
+
+    async fn pause_activities(
+        &self,
+        run_key: RunKey,
+        req: tokeira_kernel::PauseActivityRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let _ = (run_key, req);
+        Err(anyhow!("pause_activities is not implemented"))
+    }
+
+    async fn unpause_activities(
+        &self,
+        run_key: RunKey,
+        req: tokeira_runtime::UnpauseActivitiesRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let _ = (run_key, req);
+        Err(anyhow!("unpause_activities is not implemented"))
+    }
+
+    async fn reset_activities(
+        &self,
+        run_key: RunKey,
+        req: tokeira_runtime::ResetActivitiesRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let _ = (run_key, req);
+        Err(anyhow!("reset_activities is not implemented"))
     }
 
     async fn terminate_workflow(
@@ -845,6 +1108,7 @@ pub struct WorkflowService {
     schedule_store: Arc<ScheduleStore>,
     task_queue_config_store: Arc<dyn TaskQueueConfigStore>,
     batch_store: Arc<BatchOperationStore>,
+    workflow_rules: WorkflowRuleStore,
     eager_dispatch_config: EagerDispatchConfig,
     task_queue_rate_limiter: TaskQueueRateLimiter,
 }
@@ -1130,6 +1394,7 @@ impl WorkflowService {
         task_queue_config_store: Arc<dyn TaskQueueConfigStore>,
         batch_store: Arc<BatchOperationStore>,
     ) -> Self {
+        let workflow_rules = WorkflowRuleStore::new(repo.clone());
         Self {
             runtime,
             worker_deployments: None,
@@ -1152,6 +1417,7 @@ impl WorkflowService {
             schedule_store,
             task_queue_config_store,
             batch_store,
+            workflow_rules,
             eager_dispatch_config: EagerDispatchConfig::default(),
             task_queue_rate_limiter: TaskQueueRateLimiter::default(),
         }
@@ -1209,6 +1475,11 @@ impl WorkflowService {
 
     pub fn batch_store(&self) -> Arc<BatchOperationStore> {
         self.batch_store.clone()
+    }
+
+    /// Return the shared namespace workflow-rule registry.
+    pub fn workflow_rule_store(&self) -> WorkflowRuleStore {
+        self.workflow_rules.clone()
     }
 
     pub async fn resolve_namespace_id(
@@ -1571,6 +1842,117 @@ impl WorkflowService {
         .await
     }
 
+    /// Create one namespace workflow rule after authorization.
+    pub async fn create_workflow_rule(
+        &self,
+        headers: &HeaderMap,
+        namespace: String,
+        spec: WorkflowRuleSpec,
+        identity: String,
+        description: String,
+    ) -> EdgeResult<WorkflowRule> {
+        let namespace_label = namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "create_workflow_rule",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                self.interceptors
+                    .begin(headers, Some(&namespace), Action::WorkflowRulesWrite, false)
+                    .await?;
+                self.workflow_rules
+                    .create(
+                        to_internal::namespace_id_for(&namespace),
+                        spec,
+                        identity,
+                        description,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .map_err(workflow_rule_error_to_edge)
+            },
+        )
+        .await
+    }
+
+    /// Read one namespace workflow rule after authorization.
+    pub async fn describe_workflow_rule(
+        &self,
+        headers: &HeaderMap,
+        namespace: String,
+        rule_id: String,
+    ) -> EdgeResult<WorkflowRule> {
+        let namespace_label = namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "describe_workflow_rule",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                self.interceptors
+                    .begin(headers, Some(&namespace), Action::WorkflowRulesRead, false)
+                    .await?;
+                self.workflow_rules
+                    .describe(to_internal::namespace_id_for(&namespace), &rule_id)
+                    .await
+                    .map_err(workflow_rule_error_to_edge)
+            },
+        )
+        .await
+    }
+
+    /// Delete one namespace workflow rule after authorization.
+    pub async fn delete_workflow_rule(
+        &self,
+        headers: &HeaderMap,
+        namespace: String,
+        rule_id: String,
+    ) -> EdgeResult<()> {
+        let namespace_label = namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "delete_workflow_rule",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                self.interceptors
+                    .begin(headers, Some(&namespace), Action::WorkflowRulesWrite, false)
+                    .await?;
+                self.workflow_rules
+                    .delete(to_internal::namespace_id_for(&namespace), &rule_id)
+                    .await
+                    .map_err(workflow_rule_error_to_edge)
+            },
+        )
+        .await
+    }
+
+    /// List active namespace workflow rules after authorization.
+    pub async fn list_workflow_rules(
+        &self,
+        headers: &HeaderMap,
+        namespace: String,
+    ) -> EdgeResult<Vec<WorkflowRule>> {
+        let namespace_label = namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "list_workflow_rules",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                self.interceptors
+                    .begin(headers, Some(&namespace), Action::WorkflowRulesRead, false)
+                    .await?;
+                self.workflow_rules
+                    .list(to_internal::namespace_id_for(&namespace))
+                    .await
+                    .map_err(workflow_rule_error_to_edge)
+            },
+        )
+        .await
+    }
+
     pub async fn start_batch_operation(
         &self,
         headers: &HeaderMap,
@@ -1919,6 +2301,80 @@ impl WorkflowService {
             .await
             .map_err(EdgeError::from)?;
         self.notify_history_run_key(result.successor_run_key, 0)
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn unpause_activity_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+        target: tokeira_kernel::ActivityControlTarget,
+        reset_attempts: bool,
+        reset_heartbeat: bool,
+        jitter: Option<time::Duration>,
+    ) -> EdgeResult<()> {
+        ensure_local(
+            self.router
+                .route_workflow(&ctx.namespace_name, &workflow_ref.workflow_id)
+                .await?,
+        )?;
+        validate_activity_jitter(jitter)?;
+        let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
+        let now = OffsetDateTime::now_utc();
+        let outcome = self
+            .runtime
+            .unpause_activities(
+                run_key,
+                tokeira_runtime::UnpauseActivitiesRequest {
+                    target,
+                    reset_attempts,
+                    reset_heartbeat,
+                    jitter,
+                    request: batch_request_context(ctx),
+                    now,
+                },
+            )
+            .await
+            .map_err(EdgeError::from)?;
+        self.notify_history_run_key(run_key, outcome.last_event_id)
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn update_activity_options_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+        patch: BatchActivityOptionsPatch,
+    ) -> EdgeResult<()> {
+        ensure_local(
+            self.router
+                .route_workflow(&ctx.namespace_name, &workflow_ref.workflow_id)
+                .await?,
+        )?;
+        let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
+        let now = OffsetDateTime::now_utc();
+        let outcome = self
+            .runtime
+            .update_activity_options(
+                run_key,
+                UpdateActivitiesOptionsRequest {
+                    target: patch.target,
+                    task_queue: patch.task_queue,
+                    schedule_to_close_timeout: patch.schedule_to_close_timeout,
+                    schedule_to_start_timeout: patch.schedule_to_start_timeout,
+                    start_to_close_timeout: patch.start_to_close_timeout,
+                    heartbeat_timeout: patch.heartbeat_timeout,
+                    retry_policy: patch.retry_policy,
+                    restore_original_options: patch.restore_original_options,
+                    request: batch_request_context(ctx),
+                    now,
+                },
+            )
+            .await
+            .map_err(EdgeError::from)?;
+        self.notify_history_run_key(run_key, outcome.last_event_id)
             .await;
         Ok(())
     }
@@ -4467,6 +4923,8 @@ impl WorkflowService {
                     poller.completed();
                     return Ok(None);
                 }
+                // The runtime evaluates durable rules when the broker offer is about to become a
+                // Started transition. Poll admission deliberately carries no CRUD-gate decision.
                 let started = self
                     .runtime
                     .poll_activity_task(internal.queue, internal.worker_identity, internal.timeout)
@@ -4645,7 +5103,7 @@ impl WorkflowService {
                     .begin(headers, None, Action::RecordActivityTaskHeartbeat, false)
                     .await?;
 
-                let cancel_requested = self
+                let outcome = self
                     .runtime
                     .record_activity_heartbeat(
                         req.token,
@@ -4655,7 +5113,11 @@ impl WorkflowService {
                     .await
                     .map_err(EdgeError::from)?;
 
-                Ok(RecordActivityTaskHeartbeatResponse { cancel_requested })
+                Ok(RecordActivityTaskHeartbeatResponse {
+                    cancel_requested: outcome.cancel_requested,
+                    activity_paused: outcome.activity_paused,
+                    activity_reset: outcome.activity_reset,
+                })
             },
         )
         .await
@@ -4726,9 +5188,19 @@ impl WorkflowService {
                 {
                     Ok(token) => token,
                     Err(ActivityTokenResolutionError::ActivityNotStarted { .. }) => {
-                        return Ok(RecordActivityTaskHeartbeatByIdResponse {
-                            cancel_requested: false,
-                        });
+                        // v1.31.0's by-id heartbeat builds a token with an empty
+                        // scheduled/started event id and calls the same history
+                        // RPC as the token path. `IsActivityTaskNotFoundForToken`
+                        // (activity_util.go:58 @ v1.31.0, invoked with nil
+                        // `isCompletedByID`) returns not-found whenever
+                        // `StartedEventId` is empty — there is no by-id exemption
+                        // for an unstarted activity, and the token heartbeat path
+                        // already rejects it the same way.
+                        return Err(EdgeError::NotFound(
+                            "invalid activityID or activity already timed out or invoking \
+                             workflow is completed"
+                                .to_string(),
+                        ));
                     }
                     Err(error) => {
                         return Err(self.map_activity_resolution_error(
@@ -4739,7 +5211,7 @@ impl WorkflowService {
                         ));
                     }
                 };
-                let cancel_requested = self
+                let outcome = self
                     .runtime
                     .record_activity_heartbeat(
                         token,
@@ -4748,7 +5220,11 @@ impl WorkflowService {
                     )
                     .await
                     .map_err(EdgeError::from)?;
-                Ok(RecordActivityTaskHeartbeatByIdResponse { cancel_requested })
+                Ok(RecordActivityTaskHeartbeatByIdResponse {
+                    cancel_requested: outcome.cancel_requested,
+                    activity_paused: outcome.activity_paused,
+                    activity_reset: outcome.activity_reset,
+                })
             },
         )
         .await
@@ -4941,15 +5417,6 @@ impl WorkflowService {
                     .interceptors
                     .begin(headers, None, Action::UpdateActivityOptions, false)
                     .await?;
-                let activity_id = match &req.target {
-                    crate::translate::ActivityTarget::Id(activity_id) => activity_id.clone(),
-                    crate::translate::ActivityTarget::Type(_)
-                    | crate::translate::ActivityTarget::MatchAll => {
-                        return Err(EdgeError::Unimplemented(
-                            "bulk activity option updates are not implemented".to_string(),
-                        ));
-                    }
-                };
                 let run_key = self
                     .resolve_execution_run_key(
                         &req.namespace,
@@ -4957,21 +5424,169 @@ impl WorkflowService {
                         req.run_id.as_deref(),
                     )
                     .await?;
-                let command =
-                    build_update_activity_options_command(&ctx, activity_id.clone(), &req)?;
+                let command = build_update_activity_options_command(&ctx, &req)?;
                 let outcome = self
                     .runtime
                     .update_activity_options(run_key, command)
                     .await
                     .map_err(EdgeError::from)?;
                 let activity_options = self
-                    .load_activity_options(run_key, &req.namespace, &req.workflow_id, &activity_id)
+                    .load_activity_options_for_target(
+                        run_key,
+                        &req.namespace,
+                        &req.workflow_id,
+                        &req.target,
+                    )
                     .await?;
                 self.notify_history_run_key(run_key, outcome.last_event_id)
                     .await;
                 Ok(UpdateActivityOptionsResponse {
                     activity_options: Some(activity_options),
                 })
+            },
+        )
+        .await
+    }
+
+    pub async fn pause_activity(
+        &self,
+        headers: &HeaderMap,
+        req: PauseActivityRequest,
+    ) -> EdgeResult<PauseActivityResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "pause_activity",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::PauseActivity, false)
+                    .await?;
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
+                let now = time::OffsetDateTime::now_utc();
+                let outcome = self
+                    .runtime
+                    .pause_activities(
+                        run_key,
+                        tokeira_kernel::PauseActivityRequest {
+                            target: activity_control_target(req.target)?,
+                            identity: req.identity.clone(),
+                            reason: req.reason,
+                            rule_id: None,
+                            request: activity_control_request_context(&ctx, &req.identity, now),
+                            now,
+                        },
+                    )
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(run_key, outcome.last_event_id)
+                    .await;
+                Ok(PauseActivityResponse)
+            },
+        )
+        .await
+    }
+
+    pub async fn unpause_activity(
+        &self,
+        headers: &HeaderMap,
+        req: UnpauseActivityRequest,
+    ) -> EdgeResult<UnpauseActivityResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "unpause_activity",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::UnpauseActivity, false)
+                    .await?;
+                validate_activity_jitter(req.jitter)?;
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
+                let now = time::OffsetDateTime::now_utc();
+                let outcome = self
+                    .runtime
+                    .unpause_activities(
+                        run_key,
+                        tokeira_runtime::UnpauseActivitiesRequest {
+                            target: activity_control_target(req.target)?,
+                            reset_attempts: req.reset_attempts,
+                            reset_heartbeat: req.reset_heartbeat,
+                            jitter: req.jitter,
+                            request: activity_control_request_context(&ctx, &req.identity, now),
+                            now,
+                        },
+                    )
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(run_key, outcome.last_event_id)
+                    .await;
+                Ok(UnpauseActivityResponse)
+            },
+        )
+        .await
+    }
+
+    pub async fn reset_activity(
+        &self,
+        headers: &HeaderMap,
+        req: ResetActivityRequest,
+    ) -> EdgeResult<ResetActivityResponse> {
+        let namespace_label = req.namespace.clone();
+        self.observe_edge_call(
+            headers,
+            "reset_activity",
+            Some(namespace_label.as_str()),
+            None,
+            async move {
+                let ctx = self
+                    .interceptors
+                    .begin(headers, None, Action::ResetActivity, false)
+                    .await?;
+                validate_activity_jitter(req.jitter)?;
+                let run_key = self
+                    .resolve_execution_run_key(
+                        &req.namespace,
+                        &req.workflow_id,
+                        req.run_id.as_deref(),
+                    )
+                    .await?;
+                let now = time::OffsetDateTime::now_utc();
+                let outcome = self
+                    .runtime
+                    .reset_activities(
+                        run_key,
+                        tokeira_runtime::ResetActivitiesRequest {
+                            target: activity_control_target(req.target)?,
+                            reset_heartbeat: req.reset_heartbeat,
+                            keep_paused: req.keep_paused,
+                            jitter: req.jitter,
+                            restore_original_options: req.restore_original_options,
+                            request: activity_control_request_context(&ctx, &req.identity, now),
+                            now,
+                        },
+                    )
+                    .await
+                    .map_err(EdgeError::from)?;
+                self.notify_history_run_key(run_key, outcome.last_event_id)
+                    .await;
+                Ok(ResetActivityResponse)
             },
         )
         .await
@@ -5775,12 +6390,12 @@ impl WorkflowService {
         }
     }
 
-    async fn load_activity_options(
+    async fn load_activity_options_for_target(
         &self,
         run_key: RunKey,
         namespace: &str,
         workflow_id: &str,
-        activity_id: &str,
+        target: &ActivityTarget,
     ) -> EdgeResult<crate::translate::ActivityOptions> {
         let loaded = self.repo.load_run(run_key).await.map_err(EdgeError::from)?;
         let tokeira_kernel::LoadedRun::Existing(state) = loaded else {
@@ -5789,15 +6404,19 @@ impl WorkflowService {
                 workflow_id: workflow_id.to_string(),
             });
         };
-        let activity =
-            state
-                .activities
-                .get(activity_id)
-                .ok_or_else(|| EdgeError::ActivityNotFound {
-                    namespace: namespace.to_string(),
-                    workflow_id: workflow_id.to_string(),
-                    activity_id: activity_id.to_string(),
-                })?;
+        // Reuse the kernel's selector predicate/label so this response-builder
+        // resolves exactly the set the command mutated (MatchAll is already
+        // rejected upstream at command construction, so it cannot reach here).
+        let kernel_target = activity_control_target(target.clone())?;
+        let activity = state
+            .activities
+            .values()
+            .rfind(|activity| kernel_target.matches(activity))
+            .ok_or_else(|| EdgeError::ActivityNotFound {
+                namespace: namespace.to_string(),
+                workflow_id: workflow_id.to_string(),
+                activity_id: kernel_target.label(),
+            })?;
         Ok(crate::translate::ActivityOptions {
             task_queue: Some(activity.task_queue.0.clone()),
             schedule_to_close_timeout: activity.schedule_to_close_timeout,
@@ -6257,6 +6876,24 @@ fn batch_error_to_edge(
     }
 }
 
+fn workflow_rule_error_to_edge(error: WorkflowRuleError) -> EdgeError {
+    match error {
+        WorkflowRuleError::AlreadyExists => {
+            EdgeError::BadRequest("Workflow Rule with this ID already exists.".to_string())
+        }
+        WorkflowRuleError::NotFound => {
+            EdgeError::BadRequest("Workflow Rule with this ID not Found.".to_string())
+        }
+        WorkflowRuleError::LimitExceeded => {
+            EdgeError::BadRequest("Workflow Rule limit exceeded. Max: 10".to_string())
+        }
+        WorkflowRuleError::InvalidExpiration => {
+            EdgeError::BadRequest("workflow rule expiration time is invalid".to_string())
+        }
+        WorkflowRuleError::Storage(message) => EdgeError::Internal(message),
+    }
+}
+
 fn map_update_lifecycle_error(
     error: anyhow::Error,
     namespace: &str,
@@ -6484,9 +7121,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        EmptyVisibilityApi, ExecutionResolver, WorkflowService, apply_matrix_capability_field,
+        EmptyVisibilityApi, ExecutionResolver, WorkflowService,
+        activity_offer_requires_rule_evaluation, apply_matrix_capability_field,
         build_update_activity_options_command, collect_eager_activity_specs,
         system_capabilities_with_matrix_overlay, worker_identity_from_request,
+        workflow_rule_crud_admitted,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -7147,6 +7786,27 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        // Feature: workflow-rules, Property 6: poll-admission independence
+        fn property_activity_offer_policy_ignores_crud_gate_at_poll_admission(
+            crud_gate_at_poll_admission in any::<bool>(),
+        ) {
+            prop_assert!(activity_offer_requires_rule_evaluation(
+                crud_gate_at_poll_admission
+            ));
+        }
+
+        #[test]
+        // Feature: workflow-rules, Property 2: gate-before-validation precedence
+        fn property_workflow_rule_crud_admission_depends_only_on_gate(
+            enabled in any::<bool>(),
+            _request_body_is_valid in any::<bool>(),
+        ) {
+            prop_assert_eq!(workflow_rule_crud_admitted(enabled), enabled);
+        }
+
         #[test]
         fn property_collect_eager_activity_specs_respects_limit(
             commands in prop::collection::vec(arb_workflow_command(), 0..20),
@@ -7220,11 +7880,7 @@ mod tests {
                 activity_type: None,
             };
 
-            let command = build_update_activity_options_command(
-                &test_edge_context(),
-                "activity-1".to_string(),
-                &req,
-            )
+            let command = build_update_activity_options_command(&test_edge_context(), &req)
             .expect("non-empty mask should select at least one field");
 
             prop_assert_eq!(

@@ -2582,37 +2582,122 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     );
     // === End Worker Deployments block ===
 
-    // === Workflow Rules — deferred to workflow-rules spec ===
-    deferred_unary!(
-        create_workflow_rule,
-        CreateWorkflowRuleRequest,
-        CreateWorkflowRuleResponse,
-        "workflow-rules"
-    );
-    deferred_unary!(
-        describe_workflow_rule,
-        DescribeWorkflowRuleRequest,
-        DescribeWorkflowRuleResponse,
-        "workflow-rules"
-    );
-    deferred_unary!(
-        delete_workflow_rule,
-        DeleteWorkflowRuleRequest,
-        DeleteWorkflowRuleResponse,
-        "workflow-rules"
-    );
-    deferred_unary!(
-        list_workflow_rules,
-        ListWorkflowRulesRequest,
-        ListWorkflowRulesResponse,
-        "workflow-rules"
-    );
-    deferred_unary!(
-        trigger_workflow_rule,
-        TriggerWorkflowRuleRequest,
-        TriggerWorkflowRuleResponse,
-        "workflow-rules"
-    );
+    // === Workflow Rules ===
+    async fn create_workflow_rule(
+        &self,
+        request: Request<workflowservice::CreateWorkflowRuleRequest>,
+    ) -> Result<Response<workflowservice::CreateWorkflowRuleResponse>, Status> {
+        if !crate::workflow_service::workflow_rule_crud_admitted(
+            crate::workflow_service::workflow_rules_enabled(),
+        ) {
+            return Err(Status::unimplemented(
+                "method CreateWorkflowRule not supported",
+            ));
+        }
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+        let spec = req
+            .spec
+            .ok_or_else(|| Status::invalid_argument("Rule Specification is not set."))?;
+        if spec.id.is_empty() {
+            return Err(Status::invalid_argument("Workflow Rule ID is not set."));
+        }
+        // v1.31.0 accepts but does not act on force_scan or request_id in
+        // CreateWorkflowRule (`workflow_handler.go:6979-7022 @ v1.31.0`).
+        // Preserving that no-op contract is safer than making a future-looking
+        // field an admission failure.
+        let rule = self
+            .inner
+            .create_workflow_rule(&headers, req.namespace, spec, req.identity, req.description)
+            .await?;
+        Ok(Response::new(workflowservice::CreateWorkflowRuleResponse {
+            rule: Some(rule),
+            job_id: String::new(),
+        }))
+    }
+
+    async fn describe_workflow_rule(
+        &self,
+        request: Request<workflowservice::DescribeWorkflowRuleRequest>,
+    ) -> Result<Response<workflowservice::DescribeWorkflowRuleResponse>, Status> {
+        if !crate::workflow_service::workflow_rule_crud_admitted(
+            crate::workflow_service::workflow_rules_enabled(),
+        ) {
+            return Err(Status::unimplemented(
+                "method DescribeWorkflowRule not supported",
+            ));
+        }
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+        if req.rule_id.is_empty() {
+            return Err(Status::invalid_argument("Workflow Rule ID is not set."));
+        }
+        let rule = self
+            .inner
+            .describe_workflow_rule(&headers, req.namespace, req.rule_id)
+            .await?;
+        Ok(Response::new(
+            workflowservice::DescribeWorkflowRuleResponse { rule: Some(rule) },
+        ))
+    }
+
+    async fn delete_workflow_rule(
+        &self,
+        request: Request<workflowservice::DeleteWorkflowRuleRequest>,
+    ) -> Result<Response<workflowservice::DeleteWorkflowRuleResponse>, Status> {
+        if !crate::workflow_service::workflow_rule_crud_admitted(
+            crate::workflow_service::workflow_rules_enabled(),
+        ) {
+            return Err(Status::unimplemented(
+                "method DeleteWorkflowRule not supported",
+            ));
+        }
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+        if req.rule_id.is_empty() {
+            return Err(Status::invalid_argument("Workflow Rule ID is not set."));
+        }
+        self.inner
+            .delete_workflow_rule(&headers, req.namespace, req.rule_id)
+            .await?;
+        Ok(Response::new(
+            workflowservice::DeleteWorkflowRuleResponse {},
+        ))
+    }
+
+    async fn list_workflow_rules(
+        &self,
+        request: Request<workflowservice::ListWorkflowRulesRequest>,
+    ) -> Result<Response<workflowservice::ListWorkflowRulesResponse>, Status> {
+        if !crate::workflow_service::workflow_rule_crud_admitted(
+            crate::workflow_service::workflow_rules_enabled(),
+        ) {
+            return Err(Status::unimplemented(
+                "method ListWorkflowRules not supported",
+            ));
+        }
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+        let rules = self
+            .inner
+            .list_workflow_rules(&headers, req.namespace)
+            .await?;
+        Ok(Response::new(workflowservice::ListWorkflowRulesResponse {
+            rules,
+            next_page_token: Vec::new(),
+        }))
+    }
+
+    async fn trigger_workflow_rule(
+        &self,
+        _request: Request<workflowservice::TriggerWorkflowRuleRequest>,
+    ) -> Result<Response<workflowservice::TriggerWorkflowRuleResponse>, Status> {
+        // This is the target behavior, not an implementation backlog: the
+        // v1.31.0 frontend handler unconditionally returns this exact error.
+        Err(Status::unimplemented(
+            "method TriggerWorkflowRule not supported",
+        ))
+    }
     // === End Workflow Rules block ===
 
     async fn update_task_queue_config(
@@ -3177,21 +3262,33 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     }
     async fn pause_activity(
         &self,
-        _request: Request<workflowservice::PauseActivityRequest>,
+        request: Request<workflowservice::PauseActivityRequest>,
     ) -> Result<Response<workflowservice::PauseActivityResponse>, Status> {
-        Err(Status::unimplemented("pause_activity"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::pause_activity_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        self.inner.pause_activity(&headers, edge_req).await?;
+        Ok(Response::new(translate::pause_activity_to_proto()))
     }
     async fn unpause_activity(
         &self,
-        _request: Request<workflowservice::UnpauseActivityRequest>,
+        request: Request<workflowservice::UnpauseActivityRequest>,
     ) -> Result<Response<workflowservice::UnpauseActivityResponse>, Status> {
-        Err(Status::unimplemented("unpause_activity"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::unpause_activity_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        self.inner.unpause_activity(&headers, edge_req).await?;
+        Ok(Response::new(translate::unpause_activity_to_proto()))
     }
     async fn reset_activity(
         &self,
-        _request: Request<workflowservice::ResetActivityRequest>,
+        request: Request<workflowservice::ResetActivityRequest>,
     ) -> Result<Response<workflowservice::ResetActivityResponse>, Status> {
-        Err(Status::unimplemented("reset_activity"))
+        let headers = metadata_to_header_map(request.metadata());
+        let edge_req = translate::reset_activity_to_edge(request.into_inner())
+            .map_err(proto_conversion_status)?;
+        self.inner.reset_activity(&headers, edge_req).await?;
+        Ok(Response::new(translate::reset_activity_to_proto()))
     }
 }
 
@@ -3555,7 +3652,7 @@ mod tests {
             _token: tokeira_types::ActivityTaskToken,
             _details: Option<tokeira_types::Payloads>,
             _identity: Option<tokeira_types::WorkerIdentity>,
-        ) -> Result<bool> {
+        ) -> Result<tokeira_runtime::ActivityHeartbeatOutcome> {
             unreachable!()
         }
 
@@ -3724,7 +3821,7 @@ mod tests {
             _token: tokeira_types::ActivityTaskToken,
             _details: Option<tokeira_types::Payloads>,
             _identity: Option<tokeira_types::WorkerIdentity>,
-        ) -> Result<bool> {
+        ) -> Result<tokeira_runtime::ActivityHeartbeatOutcome> {
             unreachable!()
         }
 
@@ -3891,7 +3988,7 @@ mod tests {
             _token: tokeira_types::ActivityTaskToken,
             _details: Option<tokeira_types::Payloads>,
             _identity: Option<tokeira_types::WorkerIdentity>,
-        ) -> Result<bool> {
+        ) -> Result<tokeira_runtime::ActivityHeartbeatOutcome> {
             unreachable!()
         }
 
@@ -4263,36 +4360,14 @@ mod tests {
         );
         assert_deferred_rpc!(grpc, list_workers, ListWorkersRequest, "worker-config");
 
-        assert_deferred_rpc!(
-            grpc,
-            create_workflow_rule,
-            CreateWorkflowRuleRequest,
-            "workflow-rules"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            describe_workflow_rule,
-            DescribeWorkflowRuleRequest,
-            "workflow-rules"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            delete_workflow_rule,
-            DeleteWorkflowRuleRequest,
-            "workflow-rules"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            list_workflow_rules,
-            ListWorkflowRulesRequest,
-            "workflow-rules"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            trigger_workflow_rule,
-            TriggerWorkflowRuleRequest,
-            "workflow-rules"
-        );
+        let status = grpc
+            .trigger_workflow_rule(Request::new(
+                workflowservice::TriggerWorkflowRuleRequest::default(),
+            ))
+            .await
+            .expect_err("v1.31.0 leaves TriggerWorkflowRule unimplemented");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert_eq!(status.message(), "method TriggerWorkflowRule not supported");
 
         assert_deferred_rpc!(
             grpc,

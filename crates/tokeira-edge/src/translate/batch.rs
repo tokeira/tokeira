@@ -4,9 +4,14 @@
 //! shape is runtime-owned. These functions keep generated protobuf details out
 //! of the runtime store.
 
+use proto_batch::{
+    batch_operation_unpause_activities::Activity as BatchUnpauseActivity,
+    batch_operation_update_activity_options::Activity as BatchUpdateActivity,
+};
 use thiserror::Error;
 use tokeira_proto::{
-    common as proto_common, enums, public::temporal::api::batch::v1 as proto_batch, workflowservice,
+    common as proto_common, common::reset_options::Target as ProtoResetTarget, enums,
+    public::temporal::api::batch::v1 as proto_batch, workflowservice,
 };
 use tokeira_runtime::{
     BatchOperationInfo, BatchOperationParams, BatchOperationSnapshot, BatchOperationState,
@@ -153,11 +158,37 @@ pub fn start_batch_request_to_edge(
             ));
         }
         workflowservice::start_batch_operation_request::Operation::UnpauseActivitiesOperation(
-            _,
+            op,
         ) => {
-            return Err(BatchTranslateError::Unsupported(
-                "BatchOperationUnpauseActivities",
-            ));
+            let target = match op
+                .activity
+                .ok_or(BatchTranslateError::MissingField(
+                    "BatchOperationUnpauseActivities.activity",
+                ))?
+            {
+                BatchUnpauseActivity::Type(activity_type) if !activity_type.trim().is_empty() => {
+                    tokeira_kernel::ActivityControlTarget::Type(activity_type)
+                }
+                BatchUnpauseActivity::MatchAll(true) => {
+                    tokeira_kernel::ActivityControlTarget::All
+                }
+                _ => {
+                    return Err(BatchTranslateError::InvalidArgument(
+                        "batch unpause activity selector must be a non-empty type or match_all=true"
+                            .to_string(),
+                    ));
+                }
+            };
+            (
+                BatchOperationType::UnpauseActivity,
+                BatchOperationParams::UnpauseActivity {
+                    identity: op.identity,
+                    target,
+                    reset_attempts: op.reset_attempts,
+                    reset_heartbeat: op.reset_heartbeat,
+                    jitter: crate::grpc::translate::proto_duration_to_time(op.jitter.as_ref()),
+                },
+            )
         }
         workflowservice::start_batch_operation_request::Operation::ResetActivitiesOperation(_) => {
             return Err(BatchTranslateError::Unsupported(
@@ -165,11 +196,47 @@ pub fn start_batch_request_to_edge(
             ));
         }
         workflowservice::start_batch_operation_request::Operation::UpdateActivityOptionsOperation(
-            _,
+            op,
         ) => {
-            return Err(BatchTranslateError::Unsupported(
-                "BatchOperationUpdateActivityOptions",
-            ));
+            let target = match op
+                .activity
+                .ok_or(BatchTranslateError::MissingField(
+                    "BatchOperationUpdateActivityOptions.activity",
+                ))?
+            {
+                BatchUpdateActivity::Type(activity_type) if !activity_type.trim().is_empty() => {
+                    crate::translate::ActivityTarget::Type(activity_type)
+                }
+                BatchUpdateActivity::MatchAll(true) => crate::translate::ActivityTarget::MatchAll,
+                _ => {
+                    return Err(BatchTranslateError::InvalidArgument(
+                        "batch update activity selector must be a non-empty type or match_all=true"
+                            .to_string(),
+                    ));
+                }
+            };
+            let options = op
+                .activity_options
+                .as_ref()
+                .map(crate::grpc::translate::activity_options_to_edge);
+            let update_mask = op.update_mask.map(|mask| mask.paths).unwrap_or_default();
+            let patch = crate::workflow_service::build_activity_options_patch(
+                target,
+                options.as_ref(),
+                &update_mask,
+                op.restore_original,
+                // StartBatchOperation rejects restore_original combined with a
+                // populated options body up front (TestActivityBatchUpdateOptionsFailed).
+                true,
+            )
+            .map_err(|error| BatchTranslateError::InvalidArgument(error.to_string()))?;
+            (
+                BatchOperationType::UpdateActivityOptions,
+                BatchOperationParams::UpdateActivityOptions {
+                    identity: op.identity,
+                    patch,
+                },
+            )
         }
     };
 
@@ -268,6 +335,10 @@ pub fn batch_operation_type_to_proto(value: BatchOperationType) -> enums::BatchO
         BatchOperationType::Signal => enums::BatchOperationType::Signal,
         BatchOperationType::Delete => enums::BatchOperationType::Delete,
         BatchOperationType::Reset => enums::BatchOperationType::Reset,
+        BatchOperationType::UnpauseActivity => enums::BatchOperationType::UnpauseActivity,
+        BatchOperationType::UpdateActivityOptions => {
+            enums::BatchOperationType::UpdateActivityOptions
+        }
     }
 }
 
@@ -308,14 +379,15 @@ fn reset_target_from_proto(
     value: &proto_batch::BatchOperationReset,
 ) -> Result<BatchResetTarget, BatchTranslateError> {
     if let Some(options) = &value.options {
-        use proto_common::reset_options::Target;
         return match options.target.as_ref() {
-            Some(Target::WorkflowTaskId(event_id)) => {
+            Some(ProtoResetTarget::WorkflowTaskId(event_id)) => {
                 Ok(BatchResetTarget::WorkflowTaskId(*event_id))
             }
-            Some(Target::FirstWorkflowTask(_)) => Ok(BatchResetTarget::FirstWorkflowTask),
-            Some(Target::LastWorkflowTask(_)) => Ok(BatchResetTarget::LastWorkflowTask),
-            Some(Target::BuildId(build_id)) => Ok(BatchResetTarget::BuildId(build_id.clone())),
+            Some(ProtoResetTarget::FirstWorkflowTask(_)) => Ok(BatchResetTarget::FirstWorkflowTask),
+            Some(ProtoResetTarget::LastWorkflowTask(_)) => Ok(BatchResetTarget::LastWorkflowTask),
+            Some(ProtoResetTarget::BuildId(build_id)) => {
+                Ok(BatchResetTarget::BuildId(build_id.clone()))
+            }
             None => Err(BatchTranslateError::MissingField("reset.options.target")),
         };
     }
@@ -363,6 +435,8 @@ mod tests {
             Just(BatchOperationType::Signal),
             Just(BatchOperationType::Delete),
             Just(BatchOperationType::Reset),
+            Just(BatchOperationType::UnpauseActivity),
+            Just(BatchOperationType::UpdateActivityOptions),
         ]
     }
 

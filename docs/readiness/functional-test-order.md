@@ -77,7 +77,7 @@ dependency then cost.
 | # | Suite | Exercises |
 |---|-------|-----------|
 | 33 | `TestStandaloneActivityTestSuite` | First-class activity executions (C1). |
-| 34 | `TestActivityApiResetClientTestSuite`, `TestActivityAPIUpdateClientTestSuite`, `TestActivityApiBatchUpdateOptionsClientTestSuite`, `TestActivityApiRulesClientTestSuite` | Activity control surfaces — **confirm overlap with deprecated aliases** (`excluded.md` §4) before relying on these. |
+| 34 | `TestActivityApiResetClientTestSuite`, `TestActivityAPIUpdateClientTestSuite`, `TestActivityApiBatchUpdateOptionsClientTestSuite`, `TestActivityApiRulesClientTestSuite` | Workflow-scoped activity control and rules — confirmed in-surface for v1.31.0; clean in Tier 6.34. |
 
 ### Tier 7 — Nexus
 

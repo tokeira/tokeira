@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityOp, ActivityPauseInfo, ActivityResolvedRequest, ActivityState, BasicKernel,
-    CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState,
+    ActivityControlTarget, ActivityOp, ActivityPauseInfo, ActivityResolvedRequest, ActivityState,
+    BasicKernel, CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState,
     CallbackTrigger, CancelRequest, ChildResolution, ChildResolvedRequest,
     ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
     CompletionCallbackAttemptedRequest, DispatchOp, ExternalCancelResolvedRequest,
@@ -674,6 +674,8 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
         id.into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: id.into(),
@@ -709,6 +711,8 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
         id.into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: id.into(),
@@ -813,12 +817,16 @@ fn make_unpause_workflow_request() -> UnpauseWorkflowRequest {
 
 fn make_update_activity_options_request(activity_id: &str) -> UpdateActivityOptionsRequest {
     UpdateActivityOptionsRequest {
-        activity_id: activity_id.into(),
+        target: ActivityControlTarget::Id(activity_id.into()),
         task_queue: FieldChange::Set(TaskQueueName("activity-updated".into())),
         schedule_to_close_timeout: FieldChange::Set(Some(Duration::minutes(3))),
         schedule_to_start_timeout: FieldChange::Set(Some(Duration::seconds(45))),
         start_to_close_timeout: FieldChange::Set(Some(Duration::minutes(2))),
         heartbeat_timeout: FieldChange::Set(Some(Duration::seconds(30))),
+        retry_policy: Default::default(),
+        original_options: BTreeMap::new(),
+        restore_original_options: false,
+        reschedule_at: BTreeMap::new(),
         request: request_context("update-activity-req"),
         now: now(),
     }
@@ -826,9 +834,10 @@ fn make_update_activity_options_request(activity_id: &str) -> UpdateActivityOpti
 
 fn make_pause_activity_request(activity_id: &str) -> PauseActivityRequest {
     PauseActivityRequest {
-        activity_id: activity_id.into(),
+        target: ActivityControlTarget::Id(activity_id.into()),
         identity: "operator".into(),
         reason: "pause activity".into(),
+        rule_id: None,
         request: request_context("pause-activity-req"),
         now: now(),
     }
@@ -836,7 +845,10 @@ fn make_pause_activity_request(activity_id: &str) -> PauseActivityRequest {
 
 fn make_unpause_activity_request(activity_id: &str) -> UnpauseActivityRequest {
     UnpauseActivityRequest {
-        activity_id: activity_id.into(),
+        target: ActivityControlTarget::Id(activity_id.into()),
+        reset_attempts: false,
+        reset_heartbeat: false,
+        dispatch_at: now(),
         request: request_context("unpause-activity-req"),
         now: now(),
     }
@@ -844,8 +856,12 @@ fn make_unpause_activity_request(activity_id: &str) -> UnpauseActivityRequest {
 
 fn make_reset_activity_request(activity_id: &str) -> ResetActivityRequest {
     ResetActivityRequest {
-        activity_id: activity_id.into(),
+        target: ActivityControlTarget::Id(activity_id.into()),
         reset_heartbeat: true,
+        keep_paused: false,
+        dispatch_at: now(),
+        original_options: BTreeMap::new(),
+        restore_original_options: false,
         request: request_context("reset-activity-req"),
         now: now(),
     }
@@ -856,8 +872,12 @@ fn make_reset_activity_request_with_heartbeat_policy(
     reset_heartbeat: bool,
 ) -> ResetActivityRequest {
     ResetActivityRequest {
-        activity_id: activity_id.into(),
+        target: ActivityControlTarget::Id(activity_id.into()),
         reset_heartbeat,
+        keep_paused: false,
+        dispatch_at: now(),
+        original_options: BTreeMap::new(),
+        restore_original_options: false,
         request: request_context(if reset_heartbeat {
             "reset-activity-clear-heartbeat"
         } else {
@@ -1657,6 +1677,8 @@ fn terminate_with_activities_and_timers() {
         "activity-2".into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -1828,6 +1850,8 @@ fn reset_cleans_up_activities_and_timers() {
         "activity-2".into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -2000,6 +2024,8 @@ fn pause_workflow_happy_path() {
         "activity-2".into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -2131,6 +2157,8 @@ fn unpause_workflow_happy_path() {
         "activity-2".into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -2530,6 +2558,113 @@ fn pause_activity_unknown_activity() {
 }
 
 #[test]
+fn rule_driven_pause_activity_skips_request_dedupe() {
+    // A rule-driven pause (rule_id set) is a state-idempotent internal action and
+    // must not record a permanent per-run request-dedupe entry: otherwise a
+    // re-pause after the operator unpauses would dedupe to a no-op while the poll
+    // seam still drops the offer, stranding the activity unpaused-but-undelivered.
+    let mut req = make_pause_activity_request("activity-1");
+    req.rule_id = Some("rule-1".into());
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state_with_activity("activity-1")),
+            Command::PauseActivity(req),
+        )
+        .unwrap();
+    assert!(
+        transition.request_dedupe_ops.is_empty(),
+        "rule-driven pause must not record a request-dedupe entry"
+    );
+    assert!(
+        transition.next_state.activities["activity-1"]
+            .pause_info
+            .is_some(),
+        "the activity is still paused"
+    );
+}
+
+#[test]
+fn manual_pause_activity_records_request_dedupe() {
+    // A manual operator pause (rule_id None) keeps request dedupe so idempotent
+    // retries with the same request id are no-ops.
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(make_open_state_with_activity("activity-1")),
+            Command::PauseActivity(make_pause_activity_request("activity-1")),
+        )
+        .unwrap();
+    assert_eq!(transition.request_dedupe_ops.len(), 1);
+}
+
+#[test]
+fn unpause_workflow_skips_started_and_individually_paused_activities() {
+    // Workflow pause only suppressed dispatch for scheduled activities. On
+    // unpause, a running attempt keeps executing and an individually-paused
+    // activity must stay paused, so neither is re-enqueued — re-dispatching them
+    // would leak a durable dispatch row that no worker can start.
+    let mut state = make_paused_state_with_activity("scheduled-act");
+    let base = state.activities["scheduled-act"].clone();
+
+    let mut started = base.clone();
+    started.activity_id = "started-act".into();
+    started.schedule_event_id = 8;
+    started.started_at = Some(OffsetDateTime::UNIX_EPOCH);
+    started.started_event_id = Some(9);
+    state.activities.insert("started-act".into(), started);
+
+    let mut paused = base.clone();
+    paused.activity_id = "paused-act".into();
+    paused.schedule_event_id = 10;
+    paused.pause_info = Some(ActivityPauseInfo {
+        pause_time: OffsetDateTime::UNIX_EPOCH,
+        identity: "operator".into(),
+        reason: "hold".into(),
+        rule_id: None,
+    });
+    state.activities.insert("paused-act".into(), paused);
+
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::UnpauseWorkflow(make_unpause_workflow_request()),
+        )
+        .unwrap();
+
+    let dispatched: Vec<_> = transition
+        .dispatch_ops
+        .iter()
+        .filter_map(|op| match op {
+            DispatchOp::EnqueueActivityTask { activity_id, .. } => Some(activity_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dispatched,
+        vec!["scheduled-act".to_string()],
+        "only the scheduled activity is re-enqueued"
+    );
+    let upserted: Vec<_> = transition
+        .activity_ops
+        .iter()
+        .filter_map(|op| match op {
+            ActivityOp::Upsert(activity) => Some(activity.activity_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(upserted, vec!["scheduled-act".to_string()]);
+    assert!(
+        transition.next_state.activities["started-act"]
+            .started_event_id
+            .is_some()
+    );
+    assert!(
+        transition.next_state.activities["paused-act"]
+            .pause_info
+            .is_some()
+    );
+}
+
+#[test]
 fn unpause_activity_happy_path() {
     let mut state = make_open_state_with_activity("activity-1");
     if let Some(activity) = state.activities.get_mut("activity-1") {
@@ -2537,6 +2672,7 @@ fn unpause_activity_happy_path() {
             pause_time: now(),
             identity: "operator".into(),
             reason: "pause".into(),
+            rule_id: None,
         });
         activity.stamp = 1;
     }
@@ -2557,14 +2693,15 @@ fn unpause_activity_happy_path() {
 }
 
 #[test]
-fn unpause_activity_not_paused() {
-    let reject = kernel()
+fn unpause_activity_not_paused_is_noop() {
+    let transition = kernel()
         .apply(
             LoadedRun::Existing(make_open_state_with_activity("activity-1")),
             Command::UnpauseActivity(make_unpause_activity_request("activity-1")),
         )
-        .unwrap_err();
-    assert_eq!(reject, Reject::ActivityNotPaused("activity-1".into()));
+        .unwrap();
+    assert!(transition.activity_ops.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
 }
 
 #[test]
@@ -3174,6 +3311,8 @@ fn workflow_execution_timed_out_with_entities() {
         "activity-2".into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-2".into(),
@@ -3995,6 +4134,8 @@ fn reject_duplicate_activity_id() {
         "dup".into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "dup".into(),
@@ -5294,6 +5435,8 @@ fn with_pending_activity_started_wft() -> WorkflowState {
         "activity-1".into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-1".into(),

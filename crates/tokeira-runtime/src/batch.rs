@@ -11,8 +11,9 @@ use std::sync::{
 
 use dashmap::DashMap;
 use thiserror::Error;
-use time::OffsetDateTime;
-use tokeira_types::{NamespaceId, Payloads};
+use time::{Duration, OffsetDateTime};
+use tokeira_kernel::{ActivityControlTarget, ActivityRetryPolicyPatch, FieldChange};
+use tokeira_types::{NamespaceId, Payloads, TaskQueueName};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -25,6 +26,10 @@ pub enum BatchOperationType {
     Signal,
     Delete,
     Reset,
+    /// Unpause matching pending activities in every selected workflow.
+    UnpauseActivity,
+    /// Patch matching pending activity options in every selected workflow.
+    UpdateActivityOptions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +61,26 @@ pub enum BatchOperationParams {
         target: BatchResetTarget,
         reason: String,
     },
+    /// Workflow-scoped activity-unpause parameters carried by a batch.
+    UnpauseActivity {
+        /// Client identity recorded on each workflow mutation.
+        identity: String,
+        /// Activity type/all selector; batch activity operations do not admit ids.
+        target: ActivityControlTarget,
+        /// Whether unpause resets the attempt counter.
+        reset_attempts: bool,
+        /// Whether unpause clears heartbeat details.
+        reset_heartbeat: bool,
+        /// Maximum randomized redispatch delay.
+        jitter: Option<Duration>,
+    },
+    /// Workflow-scoped activity-options patch carried by a batch.
+    UpdateActivityOptions {
+        /// Client identity recorded on each workflow mutation.
+        identity: String,
+        /// Fully validated patch, without per-run request context.
+        patch: BatchActivityOptionsPatch,
+    },
 }
 
 impl BatchOperationParams {
@@ -65,9 +90,36 @@ impl BatchOperationParams {
             | BatchOperationParams::Cancel { identity }
             | BatchOperationParams::Signal { identity, .. }
             | BatchOperationParams::Delete { identity }
-            | BatchOperationParams::Reset { identity, .. } => identity,
+            | BatchOperationParams::Reset { identity, .. }
+            | BatchOperationParams::UnpauseActivity { identity, .. }
+            | BatchOperationParams::UpdateActivityOptions { identity, .. } => identity,
         }
     }
+}
+
+/// Validated activity-options mutation shared by every workflow in a batch.
+///
+/// Request identity and admission time are deliberately absent: the edge adds
+/// fresh per-run request context when it dispatches each batch item, preventing
+/// two batches from colliding in a workflow's request-deduplication window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchActivityOptionsPatch {
+    /// Pending activities selected by type or all.
+    pub target: ActivityControlTarget,
+    /// New task queue, if selected by the field mask.
+    pub task_queue: FieldChange<TaskQueueName>,
+    /// New schedule-to-close timeout, if selected.
+    pub schedule_to_close_timeout: FieldChange<Option<Duration>>,
+    /// New schedule-to-start timeout, if selected.
+    pub schedule_to_start_timeout: FieldChange<Option<Duration>>,
+    /// New start-to-close timeout, if selected.
+    pub start_to_close_timeout: FieldChange<Option<Duration>>,
+    /// New heartbeat timeout, if selected.
+    pub heartbeat_timeout: FieldChange<Option<Duration>>,
+    /// Retry-policy field-mask patch.
+    pub retry_policy: ActivityRetryPolicyPatch,
+    /// Whether every selected activity restores its first-schedule options.
+    pub restore_original_options: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

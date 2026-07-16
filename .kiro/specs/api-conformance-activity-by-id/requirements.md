@@ -2,7 +2,12 @@
 
 ## Introduction
 
-Implement six currently-stubbed activity RPCs in the Tokeira edge layer, bringing them from `Stubbed` (returning `tonic::Status::unimplemented`) to `Implemented`. Five of the six RPCs are "ById" variants that resolve activities using `(namespace, workflow_id, run_id, activity_id)` instead of decoding an opaque task token. The sixth is the token-based `RespondActivityTaskCanceled` which is stubbed despite the Complete and Failed token paths already existing. A deprecated `UpdateActivityOptions` RPC is also included for backward compatibility.
+Implement workflow-scoped activity API conformance in the Tokeira edge/runtime path. The original scope
+covered the ById response RPCs and token-based cancellation; this revision also accounts for
+`UpdateActivityOptions`, `PauseActivity`, `UnpauseActivity`, and `ResetActivity`, which Temporal
+v1.31.0 serves as public RPCs. Their API comments announce a future deprecation, but API v1.62.8
+contains neither a formal deprecation marker nor the named replacement RPCs. They are therefore
+part of the v1.31.0 behavioural target rather than excluded aliases.
 
 This is child spec #1 of the `api-conformance-tracker` umbrella.
 
@@ -17,14 +22,70 @@ This is child spec #1 of the `api-conformance-tracker` umbrella.
 - **Task_Token**: An opaque byte sequence that SDKs pass back to the server to identify which task they are responding to.
 - **Heartbeat**: A periodic signal from an activity worker indicating the activity is still alive. Returns whether cancellation has been requested.
 - **Activity_Resolution**: A kernel command that resolves a pending activity as Completed, Failed, or Canceled.
-- **UpdateActivityOptions**: A deprecated Temporal API that hot-patches timeout and routing options on a pending activity without canceling it.
+- **UpdateActivityOptions**: A workflow-scoped API that hot-patches the options on one or more
+  pending activities without adding history events.
+- **Activity pause**: Durable pending-activity metadata that suppresses a future retry/start while
+  allowing an already-running attempt to finish.
+- **Activity reset**: A workflow-scoped mutation that resets attempt/timer state and optionally
+  heartbeat progress, pause state, and original options.
 
 ## Target State
 
-`ImplementedSubset`. ById activity completion/failure/cancel/heartbeat,
-token-based cancel, and single-id `UpdateActivityOptions` are implemented. Bulk
-`UpdateActivityOptions` targets (`type` and `match_all`) remain explicitly
-unsupported and keep this spec out of full `Implemented` status.
+`Implemented`. All v1.31.0 workflow-scoped activity targets and option fields are handled with the
+same lifecycle behavior, validation, and response semantics as the targeted server. Fields present
+only in the newer vendored API remain governed by the two-pin compatibility policy and do not
+silently broaden the v1.31.0 claim.
+
+## Evidence From Current Code
+
+- **Wire shape:** `proto/upstream/temporal/api/workflowservice/v1/request_response.proto` and
+  `service.proto`; Temporal v1.31.0 shipped API v1.62.8.
+- **Target behavior:** `service/frontend/workflow_handler.go`,
+  `service/history/api/{pauseactivity,unpauseactivity,resetactivity,updateactivityoptions}/api.go`,
+  and `service/history/workflow/activity.go @ v1.31.0`.
+- **Current Tokeira substrate:** command types in `crates/tokeira-kernel/src/command.rs`, transitions
+  in `crates/tokeira-kernel/src/kernel.rs`, durable heartbeat details in
+  `crates/tokeira-kernel/src/state.rs`, and public stubs/wiring in
+  `crates/tokeira-edge/src/grpc/workflow_service.rs`.
+- **Known mismatch to correct:** the existing reset command cannot represent `keep_paused`, jitter,
+  restore-original options, or the next-instance heartbeat-reset marker; the existing unpause
+  transition rejects an already-unpaused activity although v1.31.0 treats it as a no-op.
+- **Ownership correction:** the kernel stores and deterministically mutates pause/reset flags, while
+  `commit_activity_retry` consumes those flags during retry preparation and the raw runtime
+  heartbeat transition persists heartbeat details and projects response flags.
+- **Token validation:** `RecordActivityTaskHeartbeat`, Complete, Failed, and Canceled all call
+  `IsActivityTaskNotFoundForToken`; for a non-empty scheduled event id it rejects an attempt mismatch
+  (`service/history/api/activity_util.go:58-78 @ v1.31.0`). Reset does not create an exception to this
+  shared validator.
+- **Spec ownership:** this revision supersedes stale activity-management assumptions without
+  reopening the completed `kernel-pause-activity-management` Feature-11 record.
+
+## Activity-Control Field Policy
+
+### `PauseActivityRequest`
+
+| Field | Target policy | Error if invalid | Persistence/side-effect impact |
+|---|---|---|---|
+| `namespace` | Resolve the namespace | Namespace status from the standard resolver | None before resolution |
+| `execution` | Require workflow id; empty run id selects current run | `INVALID_ARGUMENT` for missing workflow id | Selects one authoritative run |
+| `identity` | Store in manual pause info | None | Audit metadata only |
+| `activity.id` | Pause the matching pending activity | Activity-not-found when absent | Mutates one pending activity |
+| `activity.type` | Pause every pending activity of the type | Activity-not-found when no match | Mutates all matches |
+| `reason` | Store in manual pause info | None | Audit metadata only |
+
+### `ResetActivityRequest`
+
+| Field | Target policy | Error if invalid | Persistence/side-effect impact |
+|---|---|---|---|
+| `namespace` | Resolve the namespace | Namespace status from the standard resolver | None before resolution |
+| `execution` | Require workflow id; empty run id selects current run | `INVALID_ARGUMENT` for missing workflow id | Selects one authoritative run |
+| `identity` | Preserve as caller identity | None | Audit/attribution only |
+| `activity.id` | Reset the matching pending activity | Activity-not-found when absent | Mutates one pending activity |
+| `activity.type` | Reset every pending activity of the type | Activity-not-found when no match | Mutates all matches |
+| `reset_heartbeat` | Clear heartbeat state for the new instance | None | Sets durable reset intent and clears on retry/start |
+| `keep_paused` | Preserve pause only when true | None | Otherwise clears pause on a scheduled activity |
+| `jitter` | Schedule a retry in the half-open interval `[now, now+jitter)` | Invalid duration conversion | Regenerates retry dispatch/timers |
+| `restore_original_options` | Reload options from the first schedule event | `INVALID_ARGUMENT` if that event is absent/invalid | Restores task queue, timeouts, and retry policy |
 
 ## Terminal-State Error Policy
 
@@ -59,7 +120,7 @@ unsupported and keep this spec out of full `Implemented` status.
 1. WHEN a `RecordActivityTaskHeartbeatById` request is received with valid identifiers for a started activity, THE Edge SHALL delegate to the same runtime heartbeat path used by the token-based `RecordActivityTaskHeartbeat`.
 2. WHEN the heartbeat succeeds, THE Edge SHALL return a response containing the `cancel_requested` flag reflecting whether cancellation has been requested for the activity.
 3. IF the resolved activity has started but is not currently tracked by the runtime heartbeat store, THEN THE Edge SHALL return a successful response with `cancel_requested` set to false.
-4. IF the resolved activity has not started (no `started_event_id`), THEN THE Edge SHALL return a successful response with `cancel_requested` set to false without delegating to the runtime heartbeat path.
+4. IF the resolved activity has not started (no `started_event_id`), THEN THE Edge SHALL return a gRPC `NOT_FOUND` status, matching v1.31.0: the by-id heartbeat builds a token with an empty scheduled/started event id and calls the same history RPC as the token path, where `IsActivityTaskNotFoundForToken` (`service/history/api/activity_util.go:58 @ v1.31.0`, invoked with a nil `isCompletedByID`) returns not-found whenever `StartedEventId` is empty. There is no by-id exemption, and the token-based heartbeat path already rejects an unstarted activity the same way.
 5. WHEN a `RecordActivityTaskHeartbeatById` request includes a `details` payload, THE Edge SHALL pass the details to the runtime heartbeat path.
 6. THE token-based and ById heartbeat handlers SHALL share a runtime heartbeat API that accepts the optional heartbeat `details` payload, so both paths preserve identical heartbeat metadata.
 
@@ -106,16 +167,23 @@ unsupported and keep this spec out of full `Implemented` status.
 
 ### Requirement 7: Update Activity Options
 
-**User Story:** As an operator using a legacy SDK, I want to update timeout and routing options on a running activity, so that I can adjust activity behavior without canceling and re-scheduling it.
+**User Story:** As an operator, I want to update options on pending activities, so that I can adjust
+their behavior without canceling and re-scheduling them.
 
 #### Acceptance Criteria
 
 1. WHEN an `UpdateActivityOptions` request is received with valid identifiers and at least one changed option, THE Edge SHALL delegate to the kernel's `UpdateActivityOptions` command.
-2. THE Edge SHALL support updating the following fields: `schedule_to_close_timeout`, `schedule_to_start_timeout`, `start_to_close_timeout`, `heartbeat_timeout`, and `task_queue`.
+2. THE activity-options path SHALL support field-mask updates for task queue, all four activity
+   timeouts, and every retry-policy field served by v1.31.0.
 3. IF the referenced activity does not exist in the resolved run, THEN THE Edge SHALL return a gRPC `NOT_FOUND` status.
 4. WHEN the update is committed, THE Edge SHALL return a response containing the updated `ActivityOptions` reflecting the new values.
-5. IF the request targets activities by `type` or `match_all` rather than a single `activity_id`, THEN THE Edge SHALL return a gRPC `UNIMPLEMENTED` status indicating that bulk activity option updates are not yet supported.
+5. WHEN the request targets an activity type, THE runtime SHALL update every pending activity of
+   that type.
 6. IF the request targets a scheduled but not-yet-started activity, THEN THE Edge SHALL allow the update to proceed because activity options are attached to the pending activity state and do not require a started activity token.
+7. WHEN `restore_original` is true, THE runtime SHALL restore options from the activity's first
+   `ActivityTaskScheduled` event.
+8. IF `restore_original` is combined with an update mask or replacement options, THEN THE Edge SHALL
+   return `INVALID_ARGUMENT` before mutation.
 
 ### Requirement 8: ById Token Construction
 
@@ -136,3 +204,90 @@ unsupported and keep this spec out of full `Implemented` status.
 
 1. WHEN a ById activity RPC includes a non-empty `identity` field, THE Edge SHALL propagate the identity to the runtime as the `worker_identity` parameter.
 2. WHEN a ById activity RPC has an empty `identity` field, THE Edge SHALL pass `None` as the `worker_identity` to the runtime.
+
+### Requirement 10: Pause Workflow-Scoped Activities
+
+**User Story:** As an operator, I want to pause a pending activity by id or type, so that a retry or
+future start is held without aborting an attempt that is already running.
+
+#### Acceptance Criteria
+
+1. WHEN `PauseActivity` targets an existing unpaused scheduled activity, THE runtime SHALL persist
+   manual pause info and fence its outstanding dispatch.
+2. WHEN `PauseActivity` targets an already-paused activity, THE runtime SHALL return success without
+   changing its pause metadata or stamp.
+3. WHEN `PauseActivity` targets a running activity, THE runtime SHALL allow that running attempt to
+   complete successfully.
+4. WHEN a running paused activity fails with a retry remaining, THE runtime SHALL retain it paused.
+5. WHEN a heartbeat is recorded for a paused running activity, THE response SHALL set
+   `activity_paused` to true.
+6. WHEN `PauseActivity` targets an activity type, THE runtime SHALL pause every pending activity of
+   that type.
+7. IF no pending activity matches the selected id or type, THEN THE Edge SHALL return the
+   v1.31.0 activity-not-found status.
+8. WHEN `PauseActivity` succeeds, THE runtime SHALL add no workflow history event and schedule no
+   workflow task.
+9. WHEN a running paused activity is parked after failure, THE runtime SHALL clear its started event,
+   start version, started time, and request id.
+10. WHEN a running paused activity is parked after failure, THE runtime SHALL suppress retry
+    dispatch.
+11. WHEN a running paused activity is parked after failure, THE runtime SHALL increment its attempt.
+
+### Requirement 11: Reset Workflow-Scoped Activities
+
+**User Story:** As an operator, I want to reset pending activities by id or type, so that attempt,
+timer, heartbeat, pause, and original-option state can be restarted predictably.
+
+#### Acceptance Criteria
+
+1. WHEN `ResetActivity` targets a scheduled retry, THE runtime SHALL reset its attempt to one and
+   regenerate dispatch immediately unless jitter or retained pause delays it.
+2. WHEN `ResetActivity` targets a running activity, THE runtime SHALL reset the future-attempt state
+   without dispatching a concurrent replacement attempt.
+3. WHEN `reset_heartbeat` is true on a running activity, THE kernel SHALL persist next-instance
+   heartbeat-reset intent without clearing heartbeat details from the current attempt.
+4. WHEN `keep_paused` is true for a paused activity, THE runtime SHALL keep it paused after reset.
+5. WHEN `keep_paused` is false for a paused scheduled activity, THE runtime SHALL clear the pause and
+   make it eligible for dispatch.
+6. WHEN `restore_original_options` is true, THE runtime SHALL restore task queue, timeouts, and retry
+   policy from the first schedule event.
+7. WHEN a positive jitter is supplied for a dispatchable reset, THE runtime SHALL choose a schedule
+   time in the half-open interval `[now, now+jitter)`.
+8. WHEN `ResetActivity` targets an activity type, THE runtime SHALL reset every pending activity of
+   that type.
+9. IF no pending activity matches the selected id or type, THEN THE Edge SHALL return the v1.31.0
+   activity-not-found status.
+10. WHEN `ResetActivity` succeeds, THE runtime SHALL add no workflow history event and schedule no
+    workflow task.
+11. WHEN a post-reset heartbeat token still matches the activity attempt and start version, THE
+    runtime SHALL accept the heartbeat and return `activity_reset = true`.
+12. IF a post-reset heartbeat or completion token's attempt no longer matches the reset activity,
+    THEN THE runtime SHALL reject it as activity-task-not-found through the shared v1.31.0 validator.
+13. WHEN retry preparation advances a reset activity to its next attempt, THE runtime SHALL clear
+    heartbeat details when next-instance reset intent is set.
+14. WHEN retry preparation advances a reset activity to its next attempt, THE runtime SHALL clear
+    both the activity-reset and heartbeat-reset intent flags.
+
+### Requirement 12: Unpause Workflow-Scoped Activities
+
+**User Story:** As an operator, I want to resume paused activities, so that held work can continue
+with optional attempt, heartbeat, and jitter reset behavior.
+
+#### Acceptance Criteria
+
+1. WHEN `UnpauseActivity` targets a paused scheduled activity, THE runtime SHALL clear pause state
+   and regenerate dispatch.
+2. WHEN `UnpauseActivity` targets an activity that is not paused, THE runtime SHALL return success
+   without changing it.
+3. WHEN `reset_attempts` is true, THE runtime SHALL reset the activity attempt to one.
+4. WHEN `reset_heartbeat` is true, THE runtime SHALL clear heartbeat details and heartbeat timing.
+5. WHEN positive jitter is supplied, THE runtime SHALL choose the resumed schedule time in the
+   half-open interval `[now, now+jitter)`.
+6. WHEN the target is an activity type or all activities, THE runtime SHALL apply the operation to
+   every matching pending activity.
+7. IF no pending activity matches the selected id or type, THEN THE Edge SHALL return the v1.31.0
+   activity-not-found status.
+8. WHEN `UnpauseActivity` succeeds, THE runtime SHALL add no workflow history event and schedule no
+   workflow task.
+9. WHEN a paused activity is actually unpaused, THE kernel SHALL increment its activity stamp even
+   if the activity is currently running.

@@ -11,8 +11,8 @@ use tokeira_types::{
 use crate::{
     event::{ActivityResolution, HistoryEventKind},
     state::{
-        CompletionCallback, Link, OnConflictOptions, ParentClosePolicy, Priority, UserMetadata,
-        VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef,
+        ActivityState, CompletionCallback, Link, OnConflictOptions, ParentClosePolicy, Priority,
+        UserMetadata, VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef,
     },
 };
 
@@ -156,9 +156,10 @@ pub struct CompletionCallbackAttemptedRequest {
 ///
 /// Used when a caller may leave a field alone, set it to a new
 /// value, or explicitly remove it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum FieldChange<T> {
     /// The field should keep its current value.
+    #[default]
     Unchanged,
     /// The field should be replaced with the given value.
     Set(T),
@@ -766,8 +767,8 @@ pub struct UnpauseWorkflowRequest {
 /// pending activity without canceling it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpdateActivityOptionsRequest {
-    /// Activity to update (must be in the open set).
-    pub activity_id: String,
+    /// Pending activities selected from one authoritative state image.
+    pub target: ActivityControlTarget,
     /// New task queue, if changing.
     pub task_queue: FieldChange<TaskQueueName>,
     /// New schedule-to-close timeout, if changing.
@@ -778,18 +779,159 @@ pub struct UpdateActivityOptionsRequest {
     pub start_to_close_timeout: FieldChange<Option<Duration>>,
     /// New heartbeat timeout, if changing.
     pub heartbeat_timeout: FieldChange<Option<Duration>>,
+    /// Retry-policy fields selected by the request field mask.
+    pub retry_policy: ActivityRetryPolicyPatch,
+    /// Original options resolved from each matching schedule event.
+    ///
+    /// Populated only for `restore_original`; the runtime owns the history
+    /// read, while the kernel applies the supplied snapshots atomically.
+    pub original_options: BTreeMap<String, ActivityOriginalOptions>,
+    /// Whether this request restores the supplied original options rather than
+    /// applying field changes.
+    pub restore_original_options: bool,
+    /// Concrete retry eligibility times computed by the runtime for scheduled
+    /// matches whose timers must be regenerated.
+    pub reschedule_at: BTreeMap<String, OffsetDateTime>,
     /// Caller-supplied request context for dedupe and tracing.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }
 
-/// Request to pause a specific activity. Paused activities
-/// are not dispatched until explicitly unpaused.
+/// Field-mask patch for one activity retry policy.
+///
+/// Keeping nested fields explicit lets a type-targeted request merge against
+/// each matching activity's current policy without the edge first collapsing
+/// distinct policies into one replacement value.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ActivityRetryPolicyPatch {
+    /// Replace the complete policy when the mask selects `retry_policy`.
+    pub replacement: FieldChange<Option<RetryPolicy>>,
+    /// Replace only `initial_interval`.
+    pub initial_interval: FieldChange<Duration>,
+    /// Replace only `backoff_coefficient`.
+    pub backoff_coefficient: FieldChange<f64>,
+    /// Replace only `maximum_interval`.
+    pub maximum_interval: FieldChange<Option<Duration>>,
+    /// Replace only `maximum_attempts`.
+    pub maximum_attempts: FieldChange<u32>,
+    /// Replace only `non_retryable_error_types`.
+    pub non_retryable_error_types: FieldChange<Vec<String>>,
+}
+
+impl ActivityRetryPolicyPatch {
+    /// Apply this field-mask patch to an activity retry policy in place.
+    ///
+    /// Shared by the kernel (which mutates the persisted activity) and the
+    /// runtime (which precomputes the resulting retry backoff) so the retry
+    /// timing can never be derived from a different policy than the one stored.
+    /// Returns `Err` with a static reason when a nested field is selected but
+    /// no base policy exists to merge into.
+    pub fn apply_to(&self, policy: &mut Option<RetryPolicy>) -> Result<(), &'static str> {
+        match &self.replacement {
+            FieldChange::Set(replacement) => *policy = replacement.clone(),
+            FieldChange::Clear => *policy = None,
+            FieldChange::Unchanged => {}
+        }
+
+        let nested_change = !matches!(self.initial_interval, FieldChange::Unchanged)
+            || !matches!(self.backoff_coefficient, FieldChange::Unchanged)
+            || !matches!(self.maximum_interval, FieldChange::Unchanged)
+            || !matches!(self.maximum_attempts, FieldChange::Unchanged)
+            || !matches!(self.non_retryable_error_types, FieldChange::Unchanged);
+        if !nested_change {
+            return Ok(());
+        }
+        let policy = policy
+            .as_mut()
+            .ok_or("retry-policy subfields require an existing retry policy")?;
+        if let FieldChange::Set(value) = &self.initial_interval {
+            policy.initial_interval = *value;
+        }
+        if let FieldChange::Set(value) = &self.backoff_coefficient {
+            policy.backoff_coefficient = *value;
+        }
+        match &self.maximum_interval {
+            FieldChange::Set(value) => policy.maximum_interval = *value,
+            FieldChange::Clear => policy.maximum_interval = None,
+            FieldChange::Unchanged => {}
+        }
+        if let FieldChange::Set(value) = &self.maximum_attempts {
+            policy.maximum_attempts = *value;
+        }
+        if let FieldChange::Set(value) = &self.non_retryable_error_types {
+            policy.non_retryable_error_types.clone_from(value);
+        }
+        Ok(())
+    }
+}
+
+/// Deterministic target selector for workflow-scoped activity management.
+///
+/// The kernel evaluates the selector against one authoritative state image so
+/// a type/all operation cannot partially commit when the matching set changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivityControlTarget {
+    /// Select one exact activity identifier.
+    Id(String),
+    /// Select every pending activity with the exact activity type.
+    Type(String),
+    /// Select every pending activity in the run.
+    All,
+}
+
+impl ActivityControlTarget {
+    /// Whether this selector matches a single pending activity.
+    ///
+    /// Shared by the kernel, runtime, and edge so the same activity set is
+    /// resolved at every layer — a divergent predicate would let the runtime
+    /// precompute options/reschedule maps for a different set than the kernel
+    /// mutates.
+    pub fn matches(&self, activity: &ActivityState) -> bool {
+        match self {
+            Self::Id(activity_id) => activity.activity_id == *activity_id,
+            Self::Type(activity_type) => activity.activity_type == *activity_type,
+            Self::All => true,
+        }
+    }
+
+    /// Human-readable label for activity-not-found diagnostics.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Id(activity_id) => activity_id.clone(),
+            Self::Type(activity_type) => format!("type={activity_type}"),
+            Self::All => "all activities".to_string(),
+        }
+    }
+}
+
+/// Original activity options resolved from the first schedule event.
+///
+/// The runtime performs the history read and supplies this deterministic value
+/// only when reset requests `restore_original_options`; the kernel never reads
+/// storage or fabricates historical defaults.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActivityOriginalOptions {
+    /// Original task queue.
+    pub task_queue: TaskQueueName,
+    /// Original schedule-to-close timeout.
+    pub schedule_to_close_timeout: Option<Duration>,
+    /// Original schedule-to-start timeout.
+    pub schedule_to_start_timeout: Option<Duration>,
+    /// Original start-to-close timeout.
+    pub start_to_close_timeout: Option<Duration>,
+    /// Original heartbeat timeout.
+    pub heartbeat_timeout: Option<Duration>,
+    /// Original retry policy.
+    pub retry_policy: Option<RetryPolicy>,
+}
+
+/// Request to pause one or more matching activities. Paused activities are not
+/// dispatched until explicitly unpaused.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PauseActivityRequest {
-    /// Activity to pause (must be in the open set).
-    pub activity_id: String,
+    /// Activities to pause (at least one must match the open set).
+    pub target: ActivityControlTarget,
     /// Identity of the caller who issued the pause.
     pub identity: String,
     /// Human-readable reason for the pause.
@@ -798,27 +940,46 @@ pub struct PauseActivityRequest {
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
+    /// Namespace workflow rule that caused the pause, or `None` for a manual request.
+    #[serde(default)]
+    pub rule_id: Option<String>,
 }
 
-/// Request to resume a paused activity and re-dispatch it.
+/// Request to resume matching paused activities and re-dispatch scheduled ones.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnpauseActivityRequest {
-    /// Activity to unpause (must be paused).
-    pub activity_id: String,
+    /// Activities to unpause (at least one pending activity must match).
+    pub target: ActivityControlTarget,
+    /// Whether to reset the attempt baseline to one.
+    pub reset_attempts: bool,
+    /// Whether to clear the latest heartbeat details immediately.
+    pub reset_heartbeat: bool,
+    /// Runtime-selected time at which scheduled matches become eligible for
+    /// dispatch. Supplying the concrete time keeps jitter outside the kernel.
+    pub dispatch_at: OffsetDateTime,
     /// Caller-supplied request context for dedupe and tracing.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }
 
-/// Request to reset a pending activity back to attempt 1
-/// and re-dispatch it.
+/// Request to reset matching pending activities back to attempt 1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResetActivityRequest {
-    /// Activity to reset (must be in the open set).
-    pub activity_id: String,
-    /// Whether to also clear heartbeat progress.
+    /// Activities to reset (at least one must match the open set).
+    pub target: ActivityControlTarget,
+    /// Whether to clear heartbeat progress when the next instance is prepared.
     pub reset_heartbeat: bool,
+    /// Whether a paused activity remains paused after reset.
+    pub keep_paused: bool,
+    /// Runtime-selected time at which scheduled matches become eligible for
+    /// dispatch. Supplying the concrete time keeps jitter outside the kernel.
+    pub dispatch_at: OffsetDateTime,
+    /// Original per-activity options resolved by the runtime from schedule
+    /// history. Empty means options are not being restored.
+    pub original_options: BTreeMap<String, ActivityOriginalOptions>,
+    /// Whether every selected activity must restore the options above.
+    pub restore_original_options: bool,
     /// Caller-supplied request context for dedupe and tracing.
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.

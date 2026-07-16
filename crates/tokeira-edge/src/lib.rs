@@ -154,6 +154,7 @@ pub mod request_id;
 pub mod routing;
 pub mod routing_cache;
 pub mod translate;
+pub mod workflow_rules;
 pub mod workflow_service;
 
 pub use batch_engine::*;

@@ -1782,6 +1782,7 @@ where
                                 activity_id: activity.activity_id.clone(),
                                 activity_type: activity.activity_type.clone(),
                                 is_started: activity.started_at.is_some(),
+                                cancel_requested: activity.cancel_requested,
                                 attempt: activity.attempt,
                                 maximum_attempts: activity
                                     .retry_policy
@@ -1818,8 +1819,17 @@ where
                                         identity: info.identity.clone(),
                                         paused_time: info.pause_time,
                                         reason: info.reason.clone(),
+                                        rule_id: info.rule_id.clone(),
                                     }
                                 }),
+                                activity_options: tokeira_edge::translate::ActivityOptions {
+                                    task_queue: Some(activity.task_queue.0.clone()),
+                                    schedule_to_close_timeout: activity.schedule_to_close_timeout,
+                                    schedule_to_start_timeout: activity.schedule_to_start_timeout,
+                                    start_to_close_timeout: activity.start_to_close_timeout,
+                                    heartbeat_timeout: activity.heartbeat_timeout,
+                                    retry_policy: activity.retry_policy.clone(),
+                                },
                             },
                         )
                         .collect(),
@@ -1874,6 +1884,7 @@ where
                             identity: info.identity.clone(),
                             paused_time: info.pause_time,
                             reason: info.reason.clone(),
+                            rule_id: None,
                         }
                     }),
                     execution_expiration_time: state.workflow_execution_timeout.map(|timeout| {

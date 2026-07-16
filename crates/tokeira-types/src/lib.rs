@@ -54,6 +54,8 @@ pub mod tokens;
 pub mod visibility;
 /// Worker heartbeat observations and store contracts.
 pub mod worker_heartbeat;
+/// Transport-neutral durable Workflow Rule records.
+pub mod workflow_rules;
 
 pub use execution::*;
 pub use ids::*;
@@ -68,3 +70,4 @@ pub use task_queue::*;
 pub use tokens::*;
 pub use visibility::*;
 pub use worker_heartbeat::*;
+pub use workflow_rules::*;

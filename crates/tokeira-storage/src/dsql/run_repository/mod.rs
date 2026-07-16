@@ -19,7 +19,7 @@ use tokeira_kernel::{
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads, QueueKey,
     RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
-    WorkerIdentity, WorkflowId, dsql_spread_uuid,
+    WorkerIdentity, WorkflowId, WorkflowRuleRecord, dsql_spread_uuid,
 };
 use tracing::{Instrument, instrument};
 use uuid::Uuid;
@@ -29,8 +29,9 @@ use crate::{
     CurrentExecutionConflictPolicy, DbClass, DeleteRunRequest, DeleteRunResult,
     DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
     ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-    WorkerDeploymentVersionKey, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
-    metrics, workflow_is_open_and_pinned_to_version, workflow_projection_context,
+    WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
+    WorkflowTimeoutSweepEntry, deleted_workflow_projection_context, metrics,
+    workflow_is_open_and_pinned_to_version, workflow_projection_context,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -91,6 +92,7 @@ mod leases;
 mod load;
 mod timers;
 mod visibility;
+mod workflow_rules;
 
 #[cfg(test)]
 use activity::{ActivityDispatchRow, activity_dispatch_from_row, collect_activity_sweep_entries};
@@ -464,6 +466,39 @@ impl RunRepository for DsqlRunRepository {
     ) -> Result<bool> {
         self.do_has_open_pinned_workflows(namespace_id, version)
             .await
+    }
+
+    async fn create_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule: WorkflowRuleRecord,
+        max_rules: usize,
+    ) -> Result<WorkflowRuleCreateResult> {
+        self.do_create_workflow_rule(namespace_id, rule, max_rules)
+            .await
+    }
+
+    async fn get_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule_id: &str,
+    ) -> Result<Option<WorkflowRuleRecord>> {
+        self.do_get_workflow_rule(namespace_id, rule_id).await
+    }
+
+    async fn delete_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule_id: &str,
+    ) -> Result<WorkflowRuleDeleteResult> {
+        self.do_delete_workflow_rule(namespace_id, rule_id).await
+    }
+
+    async fn list_workflow_rules(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<WorkflowRuleRecord>> {
+        self.do_list_workflow_rules(namespace_id).await
     }
 
     async fn commit_transition(
@@ -1286,6 +1321,7 @@ mod tests {
             42,
             3,
             17,
+            5,
             codec::encode_payloads(&payloads).unwrap(),
         );
 
@@ -1297,6 +1333,7 @@ mod tests {
         assert_eq!(task.schedule_event_id, 42);
         assert_eq!(task.attempt, 3);
         assert_eq!(task.dispatch_revision, 17);
+        assert_eq!(task.stamp, 5);
         assert_eq!(task.queue.namespace_id, namespace_id);
         assert_eq!(task.queue.task_kind, TaskKind::Activity);
         assert_eq!(
@@ -1676,6 +1713,8 @@ mod tests {
     fn sample_activity_state(seed: u64) -> ActivityState {
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: format!("activity-{seed}"),

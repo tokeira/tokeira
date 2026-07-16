@@ -152,7 +152,7 @@ impl WorkflowRuntimeApi for FakeRuntime {
         _token: ActivityTaskToken,
         _details: Option<Payloads>,
         _identity: Option<tokeira_types::WorkerIdentity>,
-    ) -> Result<bool> {
+    ) -> Result<tokeira_runtime::ActivityHeartbeatOutcome> {
         unreachable!()
     }
 

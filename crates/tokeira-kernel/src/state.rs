@@ -635,6 +635,19 @@ pub struct ActivityState {
     /// Monotonic stamp incremented on pause/unpause/option
     /// changes to invalidate in-flight deliveries.
     pub stamp: u64,
+    /// Whether an explicit activity reset applies to the currently running
+    /// incarnation. Heartbeat responses project this independently from
+    /// cancellation and pause until retry preparation consumes it
+    /// (`ActivityReset`, `service/history/workflow/activity.go @ v1.31.0`).
+    #[serde(default)]
+    pub activity_reset: bool,
+    /// Deferred instruction to clear heartbeat details when retry preparation
+    /// creates the next incarnation. A reset must not erase progress that the
+    /// still-running worker may continue to heartbeat before it completes or
+    /// fails (`ResetHeartbeats`, `service/history/workflow/activity.go @
+    /// v1.31.0`).
+    #[serde(default)]
+    pub reset_heartbeats: bool,
 }
 
 /// Metadata recorded when a workflow is paused.
@@ -660,6 +673,9 @@ pub struct ActivityPauseInfo {
     pub identity: String,
     /// Human-readable reason for the pause.
     pub reason: String,
+    /// Namespace workflow rule that caused the pause, or `None` for a manual request.
+    #[serde(default)]
+    pub rule_id: Option<String>,
 }
 
 /// Durable state for a single open timer.

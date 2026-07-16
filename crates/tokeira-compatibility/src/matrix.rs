@@ -32,14 +32,35 @@ const ACTIVITY_EXECUTION_RPCS: &[&str] = &[
     "WorkflowService.DeleteActivityExecution",
     "WorkflowService.DescribeActivityExecution",
     "WorkflowService.ListActivityExecutions",
-    "WorkflowService.PauseActivity",
     "WorkflowService.PollActivityExecution",
     "WorkflowService.RequestCancelActivityExecution",
-    "WorkflowService.ResetActivity",
     "WorkflowService.StartActivityExecution",
     "WorkflowService.TerminateActivityExecution",
+];
+
+const ACTIVITY_MANAGEMENT_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
+    kind: CompatibilitySurfaceKind::Rpc,
+    identifier: "WorkflowService.WorkflowScopedActivityManagement",
+}];
+const ACTIVITY_MANAGEMENT_RPCS: &[&str] = &[
+    "WorkflowService.PauseActivity",
+    "WorkflowService.ResetActivity",
     "WorkflowService.UnpauseActivity",
     "WorkflowService.UpdateActivityOptions",
+];
+const ACTIVITY_MANAGEMENT_EVIDENCE: &[CompatibilityEvidence] = &[
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "Temporal functional corpus TestActivityApiResetClientTestSuite @ v1.31.0: 6 pass / 0 fail (repeated fresh-process runs)",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "Temporal functional corpus TestActivityAPIUpdateClientTestSuite @ v1.31.0: 5 pass / 0 fail (2 consecutive fresh-process runs)",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "Temporal functional corpus TestActivityApiBatchUpdateOptionsClientTestSuite @ v1.31.0: 3 pass / 0 fail (2 consecutive fresh-process runs)",
+    },
 ];
 
 const ACTIVITY_TASK_LIFECYCLE_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
@@ -431,6 +452,17 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         }],
     },
     FeatureEntry {
+        id: "activity-management",
+        name: "Workflow-scoped activity management",
+        state: FeatureState::Implemented,
+        surfaces: ACTIVITY_MANAGEMENT_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: ACTIVITY_MANAGEMENT_RPCS,
+        notes: "UpdateActivityOptions, PauseActivity, UnpauseActivity, and ResetActivity implement the served v1.31.0 workflow-scoped activity lifecycle, including id/type/all targeting, retry-policy and restore-original option updates, reset/pause heartbeat flags, and paused-retry parking. Their API comments announce a future deprecation, but v1.31.0 has no replacement RPCs and keeps them in surface.",
+        evidence: ACTIVITY_MANAGEMENT_EVIDENCE,
+    },
+    FeatureEntry {
         id: "activity-task-lifecycle",
         name: "Activity task lifecycle",
         state: FeatureState::Partial,
@@ -697,13 +729,16 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
     FeatureEntry {
         id: "workflow-rules",
         name: "Workflow rules",
-        state: FeatureState::Unsupported,
+        state: FeatureState::Partial,
         surfaces: WORKFLOW_RULE_SURFACES,
         capability_field: None,
-        dynamic_config_key: None,
+        dynamic_config_key: Some("frontend.workflowRulesAPIsEnabled"),
         rpcs: WORKFLOW_RULE_RPCS,
-        notes: "Workflow rules are not implemented in the current runtime.",
-        evidence: &[],
+        notes: "The default-off v1.31.0 gate, CRUD surface, target-conformant TriggerWorkflowRule rejection, ActivityType equality predicate, and ActivityPause evaluation at initial and retry dispatch are implemented. The registry is process-local and automatic evaluation does not yet implement the complete visibility/activity predicate language, so restart durability and the broader predicate surface remain open.",
+        evidence: &[CompatibilityEvidence {
+            kind: crate::CompatibilityEvidenceKind::Test,
+            reference: "Temporal functional corpus TestActivityApiRulesClientTestSuite @ v1.31.0: 5 pass / 0 fail (2 consecutive fresh-process runs)",
+        }],
     },
     FeatureEntry {
         id: "workflow-signal",

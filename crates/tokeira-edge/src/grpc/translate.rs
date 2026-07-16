@@ -146,7 +146,9 @@ const CHASM_INTERNAL_CALLBACK_URL: &str = "temporal://internal";
 const MAX_LINKS_PER_REQUEST: usize = 10;
 const LINK_MAX_SIZE: usize = 4000;
 
-fn proto_duration_to_time(value: Option<&prost_types::Duration>) -> Option<time::Duration> {
+pub(crate) fn proto_duration_to_time(
+    value: Option<&prost_types::Duration>,
+) -> Option<time::Duration> {
     value.map(|duration| {
         time::Duration::seconds(duration.seconds)
             + time::Duration::nanoseconds(i64::from(duration.nanos))
@@ -3473,10 +3475,20 @@ fn pending_activity_to_proto(
         activity_type: Some(proto_common::ActivityType {
             name: act.activity_type.clone(),
         }),
-        state: if act.is_started {
-            enums::PendingActivityState::Started as i32
-        } else {
-            enums::PendingActivityState::Scheduled as i32
+        // Temporal computes CANCEL_REQUESTED first, ahead of started/scheduled
+        // (`GetActivityState`, activity.go:53-61 @ v1.31.0), and the paused
+        // adjustment only rewrites SCHEDULED→PAUSED and STARTED→PAUSE_REQUESTED,
+        // explicitly leaving CANCEL_REQUESTED untouched (activity.go:168-178). So
+        // a cancel-requested activity reports CANCEL_REQUESTED even while paused.
+        // Below that, a pause does not stop an already-running worker invocation,
+        // which is why a paused-but-started activity is PAUSE_REQUESTED (it has
+        // only observed the request) while a paused-and-scheduled one is PAUSED.
+        state: match (act.cancel_requested, act.paused, act.is_started) {
+            (true, _, _) => enums::PendingActivityState::CancelRequested as i32,
+            (false, true, true) => enums::PendingActivityState::PauseRequested as i32,
+            (false, true, false) => enums::PendingActivityState::Paused as i32,
+            (false, false, true) => enums::PendingActivityState::Started as i32,
+            (false, false, false) => enums::PendingActivityState::Scheduled as i32,
         },
         attempt: act.attempt as i32,
         maximum_attempts: act.maximum_attempts as i32,
@@ -3491,16 +3503,24 @@ fn pending_activity_to_proto(
         pause_info: act.pause_info.as_ref().map(|info| {
             workflow::pending_activity_info::PauseInfo {
                 pause_time: Some(to_proto_timestamp(info.paused_time)),
-                paused_by: Some(
-                    workflow::pending_activity_info::pause_info::PausedBy::Manual(
+                paused_by: Some(match info.rule_id.as_ref() {
+                    Some(rule_id) => workflow::pending_activity_info::pause_info::PausedBy::Rule(
+                        workflow::pending_activity_info::pause_info::Rule {
+                            rule_id: rule_id.clone(),
+                            identity: info.identity.clone(),
+                            reason: info.reason.clone(),
+                        },
+                    ),
+                    None => workflow::pending_activity_info::pause_info::PausedBy::Manual(
                         workflow::pending_activity_info::pause_info::Manual {
                             identity: info.identity.clone(),
                             reason: info.reason.clone(),
                         },
                     ),
-                ),
+                }),
             }
         }),
+        activity_options: Some(activity_options_to_proto(&act.activity_options)),
         ..Default::default()
     }
 }
@@ -5750,8 +5770,8 @@ pub fn record_heartbeat_to_proto(
 ) -> workflowservice::RecordActivityTaskHeartbeatResponse {
     workflowservice::RecordActivityTaskHeartbeatResponse {
         cancel_requested: resp.cancel_requested,
-        activity_paused: false,
-        activity_reset: false,
+        activity_paused: resp.activity_paused,
+        activity_reset: resp.activity_reset,
     }
 }
 
@@ -5773,12 +5793,12 @@ pub fn record_activity_heartbeat_by_id_to_proto(
 ) -> workflowservice::RecordActivityTaskHeartbeatByIdResponse {
     workflowservice::RecordActivityTaskHeartbeatByIdResponse {
         cancel_requested: resp.cancel_requested,
-        activity_paused: false,
-        activity_reset: false,
+        activity_paused: resp.activity_paused,
+        activity_reset: resp.activity_reset,
     }
 }
 
-fn activity_options_to_edge(
+pub(crate) fn activity_options_to_edge(
     value: &activity_proto::ActivityOptions,
 ) -> crate::translate::ActivityOptions {
     crate::translate::ActivityOptions {
@@ -5845,6 +5865,94 @@ pub fn update_activity_options_to_proto(
             .as_ref()
             .map(activity_options_to_proto),
     }
+}
+
+pub fn pause_activity_to_edge(
+    req: workflowservice::PauseActivityRequest,
+) -> Result<crate::translate::PauseActivityRequest, ProtoConversionError> {
+    use workflowservice::pause_activity_request::Activity;
+    let execution = req.execution.ok_or(ProtoConversionError::MissingField(
+        "PauseActivityRequest.execution",
+    ))?;
+    let target = match req.activity.ok_or(ProtoConversionError::MissingField(
+        "PauseActivityRequest.activity",
+    ))? {
+        Activity::Id(activity_id) => crate::translate::ActivityTarget::Id(activity_id),
+        Activity::Type(activity_type) => crate::translate::ActivityTarget::Type(activity_type),
+    };
+    Ok(crate::translate::PauseActivityRequest {
+        namespace: req.namespace,
+        workflow_id: execution.workflow_id,
+        run_id: non_empty(execution.run_id),
+        identity: req.identity,
+        target,
+        reason: req.reason,
+    })
+}
+
+pub fn pause_activity_to_proto() -> workflowservice::PauseActivityResponse {
+    workflowservice::PauseActivityResponse {}
+}
+
+pub fn unpause_activity_to_edge(
+    req: workflowservice::UnpauseActivityRequest,
+) -> Result<crate::translate::UnpauseActivityRequest, ProtoConversionError> {
+    use workflowservice::unpause_activity_request::Activity;
+    let execution = req.execution.ok_or(ProtoConversionError::MissingField(
+        "UnpauseActivityRequest.execution",
+    ))?;
+    let target = match req.activity.ok_or(ProtoConversionError::MissingField(
+        "UnpauseActivityRequest.activity",
+    ))? {
+        Activity::Id(activity_id) => crate::translate::ActivityTarget::Id(activity_id),
+        Activity::Type(activity_type) => crate::translate::ActivityTarget::Type(activity_type),
+        Activity::UnpauseAll(_) => crate::translate::ActivityTarget::MatchAll,
+    };
+    Ok(crate::translate::UnpauseActivityRequest {
+        namespace: req.namespace,
+        workflow_id: execution.workflow_id,
+        run_id: non_empty(execution.run_id),
+        identity: req.identity,
+        target,
+        reset_attempts: req.reset_attempts,
+        reset_heartbeat: req.reset_heartbeat,
+        jitter: proto_duration_to_time(req.jitter.as_ref()),
+    })
+}
+
+pub fn unpause_activity_to_proto() -> workflowservice::UnpauseActivityResponse {
+    workflowservice::UnpauseActivityResponse {}
+}
+
+pub fn reset_activity_to_edge(
+    req: workflowservice::ResetActivityRequest,
+) -> Result<crate::translate::ResetActivityRequest, ProtoConversionError> {
+    use workflowservice::reset_activity_request::Activity;
+    let execution = req.execution.ok_or(ProtoConversionError::MissingField(
+        "ResetActivityRequest.execution",
+    ))?;
+    let target = match req.activity.ok_or(ProtoConversionError::MissingField(
+        "ResetActivityRequest.activity",
+    ))? {
+        Activity::Id(activity_id) => crate::translate::ActivityTarget::Id(activity_id),
+        Activity::Type(activity_type) => crate::translate::ActivityTarget::Type(activity_type),
+        Activity::MatchAll(_) => crate::translate::ActivityTarget::MatchAll,
+    };
+    Ok(crate::translate::ResetActivityRequest {
+        namespace: req.namespace,
+        workflow_id: execution.workflow_id,
+        run_id: non_empty(execution.run_id),
+        identity: req.identity,
+        target,
+        reset_heartbeat: req.reset_heartbeat,
+        keep_paused: req.keep_paused,
+        jitter: proto_duration_to_time(req.jitter.as_ref()),
+        restore_original_options: req.restore_original_options,
+    })
+}
+
+pub fn reset_activity_to_proto() -> workflowservice::ResetActivityResponse {
+    workflowservice::ResetActivityResponse {}
 }
 
 // ── Advanced workflow endpoint translations ──
@@ -8445,15 +8553,21 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_cancel_requested_propagation() {
+    fn heartbeat_control_flags_propagate_independently() {
         let resp = crate::translate::RecordActivityTaskHeartbeatResponse {
             cancel_requested: true,
+            activity_paused: true,
+            activity_reset: true,
         };
         let proto = record_heartbeat_to_proto(resp);
         assert!(proto.cancel_requested);
+        assert!(proto.activity_paused);
+        assert!(proto.activity_reset);
 
         let resp = crate::translate::RecordActivityTaskHeartbeatResponse {
             cancel_requested: false,
+            activity_paused: false,
+            activity_reset: false,
         };
         let proto = record_heartbeat_to_proto(resp);
         assert!(!proto.cancel_requested);
@@ -9487,6 +9601,53 @@ mod tests {
         assert_eq!(translate(-1), FRONTEND_VISIBILITY_MAX_PAGE_SIZE);
         assert_eq!(translate(7), 7);
         assert_eq!(translate(2000), FRONTEND_VISIBILITY_MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn pending_activity_state_distinguishes_parked_and_running_pauses() {
+        let description =
+            |cancel_requested, paused, is_started| crate::translate::PendingActivityDescription {
+                activity_id: "activity-1".to_string(),
+                activity_type: "activity-type".to_string(),
+                is_started,
+                cancel_requested,
+                attempt: 1,
+                maximum_attempts: 0,
+                scheduled_at: OffsetDateTime::UNIX_EPOCH,
+                started_at: is_started.then_some(OffsetDateTime::UNIX_EPOCH),
+                last_failure: None,
+                heartbeat_details: None,
+                last_worker_identity: String::new(),
+                paused,
+                pause_info: None,
+                activity_options: crate::translate::ActivityOptions::default(),
+            };
+
+        let parked = pending_activity_to_proto(&description(false, true, false));
+        assert_eq!(
+            parked.state,
+            enums::PendingActivityState::Paused as i32,
+            "a paused scheduled retry must be projected as parked"
+        );
+
+        let running = pending_activity_to_proto(&description(false, true, true));
+        assert_eq!(
+            running.state,
+            enums::PendingActivityState::PauseRequested as i32,
+            "a paused running invocation remains active on its worker"
+        );
+
+        // Cancellation takes precedence over the paused/started projection:
+        // Temporal computes CANCEL_REQUESTED first and its pause adjustment does
+        // not rewrite it (activity.go:53-61,168-178 @ v1.31.0).
+        for is_started in [false, true] {
+            let cancelling = pending_activity_to_proto(&description(true, true, is_started));
+            assert_eq!(
+                cancelling.state,
+                enums::PendingActivityState::CancelRequested as i32,
+                "a cancel-requested activity reports CANCEL_REQUESTED even while paused"
+            );
+        }
     }
 
     #[cfg(feature = "conformance")]

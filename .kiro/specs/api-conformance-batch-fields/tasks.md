@@ -17,6 +17,10 @@ Complete batch action field handling and batch response projection while preserv
     - Update-options actions call the workflow-options runtime path for each target.
     - Reset actions pass reapply/current-run-only/exclude fields to the kernel reset command.
     - _Requirements: 1.1, 1.2, 1.3_
+  - [x] 1.4 Add `BatchOperationUpdateActivityOptions` translation, durable action state, and dispatch
+    - Preserve identity, type/match-all selector, options, update mask, and restore-original.
+    - Delegate each workflow mutation to the single-workflow activity-options runtime path.
+    - _Requirements: 1.5, 2.1, 3.2_
 
 - [ ] 2. Complete lifecycle projection
   - [ ] 2.1 Persist supported request metadata in `BatchOperationStore`
@@ -34,6 +38,10 @@ Complete batch action field handling and batch response projection while preserv
     - _Requirements: 2.2, 2.3_
   - [ ] 3.3 Property test: Stop Idempotence
     - _Requirements: 2.4_
+  - [ ] 3.4 Property test: Property 4 — Batch activity-options equivalence
+    - Use a reference model for at least 100 generated action/workflow/activity sets.
+    - Tag: `// Feature: api-conformance-batch-fields, Property 4: batch activity-options equivalence`
+    - _Requirements: 1.5, 2.1_
 
 - [ ] 4. Checkpoint
   - Run `cargo +nightly fmt --all --check`.
@@ -46,9 +54,9 @@ Complete batch action field handling and batch response projection while preserv
 {
   "waves": [
     { "id": 0, "tasks": ["1.1"] },
-    { "id": 1, "tasks": ["1.2", "1.3", "2.1"] },
+    { "id": 1, "tasks": ["1.2", "1.3", "1.4", "2.1"] },
     { "id": 2, "tasks": ["2.2", "2.3"] },
-    { "id": 3, "tasks": ["3.1", "3.2", "3.3"] },
+    { "id": 3, "tasks": ["3.1", "3.2", "3.3", "3.4"] },
     { "id": 4, "tasks": ["4"] }
   ]
 }

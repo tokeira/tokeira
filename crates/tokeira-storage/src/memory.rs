@@ -8,7 +8,7 @@
 //! current pointer after close without falling back to an older surviving run.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
     time::Instant,
 };
@@ -22,7 +22,7 @@ use tokeira_kernel::{
 };
 use tokeira_types::{
     ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor, QueueKey,
-    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId,
+    RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, WorkflowId, WorkflowRuleRecord,
 };
 use tokio::sync::Mutex;
 
@@ -35,9 +35,9 @@ use crate::{
         DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult, LeaseOutcome, LeaseRepository,
         NexusSweepEntry, ProjectionBatch, ProjectionLog, ProjectionRecord, RequestRecord,
         RunRepository, StoredWorkerDeployment, TransitionAuditRecord, WftTimeoutSweepEntry,
-        WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkflowTimeoutSweepEntry,
-        deleted_workflow_projection_context, workflow_is_open_and_pinned_to_version,
-        workflow_projection_context,
+        WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
+        WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
+        workflow_is_open_and_pinned_to_version, workflow_projection_context,
     },
     metrics as storage_metrics,
 };
@@ -80,6 +80,8 @@ struct StoreState {
     runs: HashMap<RunKey, WorkflowState>,
     /// Worker Deployment registry records by namespace/name.
     worker_deployments: HashMap<DeploymentKey, StoredWorkerDeployment>,
+    /// Durable namespace Workflow Rules in deterministic id order.
+    workflow_rules: HashMap<NamespaceId, BTreeMap<String, WorkflowRuleRecord>>,
     /// Per-deployment conflict-token high-water-mark.
     ///
     /// The conflict token must increase monotonically across the entire
@@ -316,6 +318,87 @@ impl RunRepository for InMemoryStore {
             .any(|state| workflow_is_open_and_pinned_to_version(state, namespace_id, version)))
     }
 
+    async fn create_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule: WorkflowRuleRecord,
+        max_rules: usize,
+    ) -> Result<WorkflowRuleCreateResult> {
+        let mut store = self.inner.lock().await;
+        let rules = store.workflow_rules.entry(namespace_id).or_default();
+        if rules.contains_key(&rule.id) {
+            return Ok(WorkflowRuleCreateResult::AlreadyExists);
+        }
+        if rules.len() >= max_rules
+            && let Some(eviction_id) = rules
+                .values()
+                .filter_map(|candidate| {
+                    candidate
+                        .expiration_time
+                        .map(|expiration| (expiration, candidate.id.as_str()))
+                })
+                .min_by(|left, right| left.cmp(right))
+                .map(|(_, id)| id.to_string())
+        {
+            // Temporal evicts the earliest expiring entry only when Create needs capacity; an
+            // expired entry otherwise remains visible to Describe/List
+            // (`service/frontend/namespace_handler.go @ v1.31.0`).
+            rules.remove(&eviction_id);
+        }
+        if rules.len() >= max_rules {
+            return Ok(WorkflowRuleCreateResult::LimitExceeded);
+        }
+        rules.insert(rule.id.clone(), rule);
+        Ok(WorkflowRuleCreateResult::Created)
+    }
+
+    async fn get_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule_id: &str,
+    ) -> Result<Option<WorkflowRuleRecord>> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .workflow_rules
+            .get(&namespace_id)
+            .and_then(|rules| rules.get(rule_id))
+            .cloned())
+    }
+
+    async fn delete_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule_id: &str,
+    ) -> Result<WorkflowRuleDeleteResult> {
+        let mut store = self.inner.lock().await;
+        let deleted = store
+            .workflow_rules
+            .get_mut(&namespace_id)
+            .and_then(|rules| rules.remove(rule_id))
+            .is_some();
+        Ok(if deleted {
+            WorkflowRuleDeleteResult::Deleted
+        } else {
+            WorkflowRuleDeleteResult::NotFound
+        })
+    }
+
+    async fn list_workflow_rules(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<WorkflowRuleRecord>> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .workflow_rules
+            .get(&namespace_id)
+            .map(|rules| rules.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
     #[tracing::instrument(name = "storage.commit_transition", skip(self, transition), fields(run_key = %run_key.0, expected_seq = transition.expected_seq.0, epoch = epoch.0))]
     async fn commit_transition(
         &self,
@@ -533,6 +616,10 @@ impl RunRepository for InMemoryStore {
                         entry.task.input = activity.input.clone();
                         entry.task.schedule_event_id = activity.schedule_event_id;
                         entry.task.attempt = activity.attempt;
+                        // Keep the dispatch row's stamp in step with the activity
+                        // so a recovery-reconstructed task is never spuriously
+                        // fenced at start.
+                        entry.task.stamp = activity.stamp;
                         entry.schedule_to_close_timeout = activity.schedule_to_close_timeout;
                         entry.schedule_to_start_timeout = activity.schedule_to_start_timeout;
                         entry.start_to_close_timeout = activity.start_to_close_timeout;
@@ -571,6 +658,9 @@ impl RunRepository for InMemoryStore {
                 schedule_event_id,
                 attempt,
                 dispatch_revision,
+                stamp,
+                // Delivery timing is not durable; the row is written immediately.
+                dispatch_at: _,
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
@@ -591,6 +681,7 @@ impl RunRepository for InMemoryStore {
                             schedule_event_id: *schedule_event_id,
                             attempt: *attempt,
                             dispatch_revision: *dispatch_revision,
+                            stamp: *stamp,
                         },
                         schedule_to_close_timeout: *schedule_to_close_timeout,
                         schedule_to_start_timeout: *schedule_to_start_timeout,
@@ -2243,6 +2334,8 @@ mod tests {
     fn activity_state(activity_id: &str) -> tokeira_kernel::ActivityState {
         tokeira_kernel::ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: activity_id.into(),
@@ -2294,6 +2387,8 @@ mod tests {
                 schedule_event_id: 7,
                 attempt: 1,
                 dispatch_revision: 0,
+                stamp: 0,
+                dispatch_at: OffsetDateTime::UNIX_EPOCH,
                 schedule_to_close_timeout: None,
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
@@ -2350,6 +2445,8 @@ mod tests {
                 schedule_event_id: 7,
                 attempt: 1,
                 dispatch_revision: 0,
+                stamp: 0,
+                dispatch_at: OffsetDateTime::UNIX_EPOCH,
                 schedule_to_close_timeout: None,
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
@@ -2418,6 +2515,8 @@ mod tests {
                 schedule_event_id: 7,
                 attempt: 1,
                 dispatch_revision: 0,
+                stamp: 0,
+                dispatch_at: OffsetDateTime::UNIX_EPOCH,
                 schedule_to_close_timeout: None,
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
@@ -2433,6 +2532,7 @@ mod tests {
             pause_time: fixed_now(),
             identity: "tester".to_owned(),
             reason: "maintenance".to_owned(),
+            rule_id: None,
         });
         let mut pause_transition = start_transition(run_key);
         pause_transition.expected_seq = TransitionSeq(1);
@@ -2478,6 +2578,8 @@ mod tests {
                     schedule_event_id: 7,
                     attempt: 1,
                     dispatch_revision: 0,
+                    stamp: 0,
+                    dispatch_at: OffsetDateTime::UNIX_EPOCH,
                     schedule_to_close_timeout: None,
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
@@ -2529,6 +2631,7 @@ mod tests {
             pause_time: fixed_now(),
             identity: "tester".to_owned(),
             reason: "maintenance".to_owned(),
+            rule_id: None,
         });
         transition.activity_ops.push(ActivityOp::Upsert(paused));
         store
@@ -2552,6 +2655,8 @@ mod tests {
                 schedule_event_id: 7,
                 attempt: 1,
                 dispatch_revision: 0,
+                stamp: 0,
+                dispatch_at: OffsetDateTime::UNIX_EPOCH,
                 schedule_to_close_timeout: None,
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
@@ -2635,6 +2740,8 @@ mod tests {
                     schedule_event_id: 42,
                     attempt: 3,
                     dispatch_revision: 0,
+                    stamp: 0,
+                    dispatch_at: OffsetDateTime::UNIX_EPOCH,
                     schedule_to_close_timeout: Some(Duration::seconds(30)),
                     schedule_to_start_timeout: Some(Duration::seconds(10)),
                     start_to_close_timeout: Some(Duration::seconds(20)),
@@ -2678,6 +2785,8 @@ mod tests {
                     schedule_event_id: 42,
                     attempt: 3,
                     dispatch_revision: 0,
+                    stamp: 0,
+                    dispatch_at: OffsetDateTime::UNIX_EPOCH,
                     schedule_to_close_timeout: None,
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
@@ -2730,6 +2839,8 @@ mod tests {
                     schedule_event_id: 42,
                     attempt: 3,
                     dispatch_revision: 0,
+                    stamp: 0,
+                    dispatch_at: OffsetDateTime::UNIX_EPOCH,
                     schedule_to_close_timeout: None,
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
@@ -2759,6 +2870,8 @@ mod tests {
                     schedule_event_id: 99,
                     attempt: 1,
                     dispatch_revision: 0,
+                    stamp: 0,
+                    dispatch_at: OffsetDateTime::UNIX_EPOCH,
                     schedule_to_close_timeout: None,
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
@@ -2791,6 +2904,8 @@ mod tests {
                         schedule_event_id: idx as i64,
                         attempt: 1,
                         dispatch_revision: 0,
+                        stamp: 0,
+                        dispatch_at: OffsetDateTime::UNIX_EPOCH,
                         schedule_to_close_timeout: None,
                         schedule_to_start_timeout: None,
                         start_to_close_timeout: None,
@@ -2826,6 +2941,7 @@ mod tests {
                                 schedule_event_id: idx as i64,
                                 attempt: 1,
                                 dispatch_revision: 0,
+                                stamp: 0,
                             }
                         },
                         scheduled_at: fixed_now(),
@@ -3229,6 +3345,7 @@ mod tests {
                         schedule_event_id: 7,
                         attempt: 1,
                         dispatch_revision: 0,
+                        stamp: 0,
                     },
                     scheduled_at: fixed_now(),
                     insertion_seq: 999,
@@ -3265,6 +3382,8 @@ mod tests {
                 schedule_event_id: 3,
                 attempt: 1,
                 dispatch_revision: 0,
+                stamp: 0,
+                dispatch_at: OffsetDateTime::UNIX_EPOCH,
                 schedule_to_close_timeout: None,
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
@@ -3309,6 +3428,8 @@ mod tests {
             schedule_event_id: 3,
             attempt: 1,
             dispatch_revision: 0,
+            stamp: 0,
+            dispatch_at: OffsetDateTime::UNIX_EPOCH,
             schedule_to_close_timeout: None,
             schedule_to_start_timeout: None,
             start_to_close_timeout: None,
@@ -3925,6 +4046,8 @@ mod tests {
                     let act_id = format!("act-{idx}");
                     let act = tokeira_kernel::ActivityState {
                         cancel_requested: false,
+                        activity_reset: false,
+                        reset_heartbeats: false,
                         started_identity: None,
                         retry_last_worker_identity: None,
                         activity_id: act_id.clone(),
@@ -3996,6 +4119,8 @@ mod tests {
                             schedule_event_id: idx as i64,
                             attempt: 1,
                             dispatch_revision: 0,
+                            stamp: 0,
+                            dispatch_at: OffsetDateTime::UNIX_EPOCH,
                             schedule_to_close_timeout: Some(
                                 Duration::seconds(30),
                             ),
@@ -4206,6 +4331,7 @@ mod tests {
                             reason: format!("terminated-{suffix}"),
                             details: None,
                             identity: "history-service".to_string(),
+                            links: Vec::new(),
                         },
                     ));
                     transition.request_dedupe_ops.push(RequestDedupeOp {
@@ -4226,6 +4352,8 @@ mod tests {
                         schedule_event_id: index as i64 + 1,
                         attempt: 1,
                         dispatch_revision: 0,
+                        stamp: 0,
+                        dispatch_at: OffsetDateTime::UNIX_EPOCH,
                         schedule_to_close_timeout: None,
                         schedule_to_start_timeout: None,
                         start_to_close_timeout: None,
@@ -4253,6 +4381,7 @@ mod tests {
                                     schedule_event_id: index as i64 + 1,
                                     attempt: 1,
                                     dispatch_revision: 0,
+                                    stamp: 0,
                                 },
                                 scheduled_at: fixed_now(),
                                 insertion_seq: index as u64,

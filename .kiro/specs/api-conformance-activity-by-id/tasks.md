@@ -2,7 +2,9 @@
 
 ## Overview
 
-Implement six currently-stubbed activity RPCs in `tokeira-edge`, a new `cancel_activity_task` runtime method, runtime-owned activity token resolution, and the edge-side wiring for the existing kernel `UpdateActivityOptions` command. The edge resolves workflow identifiers to `RunKey`, then asks the runtime to resolve activity tokens before delegating to the same runtime paths as the token-based handlers. Property-based tests validate the 10 correctness properties from the design.
+Complete the workflow-scoped activity API surface. Tasks 1–10 record the already-landed ById and
+single-id option-update work; Tasks 11 onward close the v1.31.0 activity-control and bulk-option gaps.
+Property-based tests validate all 15 correctness properties from the revised design.
 
 ## Tasks
 
@@ -167,16 +169,97 @@ Implement six currently-stubbed activity RPCs in `tokeira-edge`, a new `cancel_a
 - [x] 10. Final checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
+- [x] 11. Correct the deterministic activity-management model
+  - [x] 11.1 Record the owner gate required by the functional-conformance handover before changing
+    activity-management shape.
+    - The existing reset request cannot represent `keep_paused`, jitter, restore-original options,
+      or durable next-instance heartbeat reset; do not emulate these through multiple edge commits.
+    - The owner approved this revised `api-conformance-activity-by-id` spec as the active work order;
+      the completed Feature-11 spec remains a frozen implementation record.
+    - _Requirements: 10.1–10.11, 11.1–11.14, 12.1–12.9_
+  - [x] 11.2 Make pause idempotent and distinguish scheduled from running attempts.
+    - A scheduled activity is fenced; a running activity remains completable and is held only if it
+      reaches a retryable failure.
+    - _Requirements: 10.1, 10.2, 10.3_
+  - [x] 11.3 Carry reset flags and next-instance heartbeat-reset intent in authoritative state.
+    - Apply `keep_paused`, jitter, restore-original options, and running-vs-scheduled dispatch in one
+      fenced transition.
+    - _Requirements: 11.1–11.7, 11.10_
+  - [x] 11.4 Make unpause of an already-unpaused activity a successful no-op, apply reset flags, and
+    bump the stamp for every actual unpause, including a running activity.
+    - _Requirements: 12.1–12.5, 12.8, 12.9_
+
+- [x] 12. Add runtime-owned selector resolution and activity-control APIs
+  - [x] 12.1 Resolve id/type selectors against one loaded authoritative run.
+    - Reject an empty match set before mutation; do not expose partial multi-activity commits.
+    - _Requirements: 7.3, 7.5, 10.6, 10.7, 11.8, 11.9, 12.6, 12.7_
+  - [x] 12.2 Add `pause_activities`, `unpause_activities`, and `reset_activities` to the runtime API
+    and production adapter.
+    - _Requirements: 10.1–10.11, 11.1–11.14, 12.1–12.9_
+  - [x] 12.3 Return durable pause and reset flags from the raw runtime heartbeat transition.
+    - Preserve `cancel_requested`; populate `activity_paused` and `activity_reset` independently.
+    - Keep the shared attempt validator used by heartbeat and completion: matching post-reset tokens
+      remain valid, while a token whose attempt differs from authoritative state is stale.
+    - _Requirements: 10.5, 11.11, 11.12_
+  - [x] 12.4 Correct retry preparation for paused and reset activities.
+    - A retryable failure while paused increments the attempt, clears started-attempt fields, and
+      suppresses dispatch while retaining the pause.
+    - When the next attempt is prepared, consume heartbeat-reset intent and clear both reset flags so
+      a later retry cannot repeat the reset side effects.
+    - _Requirements: 10.4, 10.9–10.11, 11.13, 11.14_
+
+- [x] 13. Complete public gRPC translation and handlers
+  - [x] 13.1 Add exhaustive proto translation for Pause, Unpause, and Reset request selectors/flags.
+    - _Requirements: 10.1–10.11, 11.1–11.14, 12.1–12.9_
+  - [x] 13.2 Replace all three public stubs with translate → resolve → runtime-delegate handlers.
+    - _Requirements: 10.1–10.11, 11.1–11.14, 12.1–12.9_
+  - [x] 13.3 Complete UpdateActivityOptions retry-policy, type-target, and restore-original behavior.
+    - _Requirements: 7.1–7.8_
+
+- [ ] 14. Required property tests for activity-control semantics
+  - [x] 14.1 Property test: Property 11 — pause lifecycle fidelity (minimum 100 cases).
+    - Tag: `// Feature: api-conformance-activity-by-id, Property 11: pause lifecycle fidelity`
+    - _Requirements: 10.1–10.4, 10.6, 10.8–10.11_
+  - [ ] 14.2 Property test: Property 12 — heartbeat flag and validator fidelity (minimum 100 cases).
+    - Tag: `// Feature: api-conformance-activity-by-id, Property 12: heartbeat flag and validator fidelity`
+    - _Requirements: 10.5, 11.11, 11.12_
+  - [x] 14.3 Property test: Property 13 — reset lifecycle fidelity (minimum 100 cases).
+    - Tag: `// Feature: api-conformance-activity-by-id, Property 13: reset lifecycle fidelity`
+    - _Requirements: 11.1–11.8, 11.10, 11.13, 11.14_
+  - [x] 14.4 Property test: Property 14 — unpause lifecycle fidelity (minimum 100 cases).
+    - Tag: `// Feature: api-conformance-activity-by-id, Property 14: unpause lifecycle fidelity`
+    - _Requirements: 12.1–12.6, 12.8, 12.9_
+  - [ ] 14.5 Property test: Property 15 — rejection preserves activity state (minimum 100 cases).
+    - Tag: `// Feature: api-conformance-activity-by-id, Property 15: rejection preserves activity state`
+    - _Requirements: 7.3, 7.8, 10.7, 11.9, 12.7_
+
+- [ ] 15. Checkpoint: focused crates compile, lint, and tests pass
+  - Run nightly formatting plus focused kernel/runtime/edge checks and tests.
+
+- [x] 16. Functional conformance
+  - [x] 16.1 Run `TestActivityApiResetClientTestSuite` twice against fresh `tokeirad` processes.
+    - _Requirements: 10.1–10.11, 11.1–11.14, 12.1–12.9_
+  - [x] 16.2 Run the UpdateActivityOptions and batch activity-options suites twice.
+    - _Requirements: 7.1–7.8_
+
 ## Notes
 
 - All property tests are required — they validate externally-visible correctness contracts.
 - Each task references specific requirements for traceability
 - Checkpoints ensure incremental validation
-- Property tests validate universal correctness properties from the design document (P1–P10)
+- Property tests validate universal correctness properties from the design document (P1–P15)
 - Unit tests validate specific examples and edge cases
-- The kernel already has `UpdateActivityOptionsRequest` with `FieldChange<T>` — no kernel struct changes needed
+- The completed Feature-11 spec remains frozen; Tasks 11–16 and the associated requirements/design
+  in this owning spec supersede its stale behavioral assumptions without rewriting its history.
+- The kernel already has `UpdateActivityOptionsRequest` with `FieldChange<T>` for the implemented
+  single-id subset; completing retry-policy, type targeting, and restore-original behavior may extend
+  the deterministic request shape.
 - The runtime already has `ActivityResolution::Canceled` — only the new `cancel_activity_task` method is needed
 - All handlers follow the established edge pattern: translate → resolve → delegate → notify
+- Heartbeat, completion, failure, and cancellation retain their shared attempt validator. Temporal
+  v1.31.0 does not define a reset exception: matching tokens remain valid and mismatched tokens are stale.
+- Tasks 11–16 supersede the old `ImplementedSubset` assumption without rewriting the completed
+  implementation history in Tasks 1–10.
 
 ## Task Dependency Graph
 
@@ -190,7 +273,14 @@ Implement six currently-stubbed activity RPCs in `tokeira-edge`, a new `cancel_a
     { "id": 4, "tasks": ["5.2", "5.3", "6.1", "6.2", "6.3", "6.4"] },
     { "id": 5, "tasks": ["6.5", "7.1"] },
     { "id": 6, "tasks": ["9.1"] },
-    { "id": 7, "tasks": ["9.2", "9.3"] }
+    { "id": 7, "tasks": ["9.2", "9.3"] },
+    { "id": 8, "tasks": ["11.1"] },
+    { "id": 9, "tasks": ["11.2", "11.3", "11.4"] },
+    { "id": 10, "tasks": ["12.1", "12.2", "12.3", "12.4"] },
+    { "id": 11, "tasks": ["13.1", "13.2", "13.3"] },
+    { "id": 12, "tasks": ["14.1", "14.2", "14.3", "14.4", "14.5"] },
+    { "id": 13, "tasks": ["15"] },
+    { "id": 14, "tasks": ["16.1", "16.2"] }
   ]
 }
 ```

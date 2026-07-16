@@ -53,6 +53,7 @@ pub mod timeout;
 pub mod update;
 pub mod wft_timeout;
 pub mod worker_registry;
+mod workflow_rules;
 
 pub use activity_timeout::*;
 pub use backlog::*;

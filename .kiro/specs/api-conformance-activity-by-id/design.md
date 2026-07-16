@@ -2,9 +2,42 @@
 
 ## Overview
 
-This design implements six currently-stubbed activity RPCs in the Tokeira edge layer, bringing them from `Stubbed` (returning `tonic::Status::unimplemented`) to `Implemented`. The approach reuses the existing execution-home resolution and runtime delegation infrastructure. The edge resolves workflow identifiers to `RunKey`; the runtime constructs `ActivityTaskToken` values from authoritative activity and shard state before the handlers converge with the existing token-based paths.
+This design completes the workflow-scoped activity API surface: the ById worker-response paths plus
+`UpdateActivityOptions`, `PauseActivity`, `UnpauseActivity`, and `ResetActivity`. The approach reuses
+execution-home resolution and the existing deterministic activity-management commands. It is derived
+from the vendored wire schema and `service/history/workflow/activity.go @ v1.31.0`; the API comments'
+future-deprecation notice does not remove these served RPCs from the target surface.
 
 The design follows the edge's established pattern: translate → resolve → delegate → notify. No workflow semantics are added to the edge; the runtime and kernel remain the authority on activity lifecycle.
+
+## Post-review corrections (2026-07-15)
+
+A multi-agent code review of the delivered diff surfaced ten confirmed defects/divergences; the
+following corrections were applied (see also the golden coverage in `kernel/tests/golden_tests.rs`):
+
+- **Rule-pause is not request-deduped.** A rule-driven `PauseActivity` (`rule_id` set) no longer
+  emits a `RequestDedupeOp`; the permanent per-run dedupe record was fencing a legitimate re-pause
+  after an operator unpause, stranding the activity. Manual pauses keep dedupe.
+- **Rule-eval failure republishes the offer.** The poll seam republishes a consumed broker offer to
+  the broker (`republish_activity_offer`) when rule evaluation errors transiently, rather than
+  dropping it.
+- **Timers suspend while paused.** The activity-timeout scanner skips activities with `pause_info`
+  set (matching `timer_sequence.go:181-183`), which also covers a paused activity whose tracking was
+  rebuilt on shard recovery; `record_scheduled` preserves `original_scheduled_at` across re-dispatch
+  so unpause does not grant a fresh schedule-to-close budget.
+- **Attempt-1 reschedule is not shifted.** `UpdateActivityOptions` treats attempt-1 as carrying no
+  retry backoff (`GetNextScheduledTime` leaves attempt-1 unchanged).
+- **`InvalidActivityOptions` → `INVALID_ARGUMENT`** at the edge (was an internal error).
+- **`match_all` / `unpause_all` → `NOT_FOUND`**, matching v1.31.0's Id/Type-only history handlers.
+- **Describe `CANCEL_REQUESTED` precedence** is computed ahead of paused/started, with
+  `cancel_requested` plumbed through `PendingActivityDescription`.
+- **Heartbeat-by-id on an unstarted activity → `NOT_FOUND`** (Requirement 2.4, corrected).
+- **Canonical `taskQueue.name` field-mask path** is accepted for the task-queue update.
+- **Task-queue-change start fence** consumes a stale offer left on the old queue after a queue move.
+
+One item is deferred with rationale: durable stamp-fencing of a retry whose backoff is *lengthened*
+by `UpdateActivityOptions` needs a `activity_dispatch` schema migration and is tracked separately; the
+queue-change vector above is fenced without it.
 
 ## Architecture
 
@@ -55,9 +88,34 @@ This uses the existing kernel `UpdateActivityOptions` command, which patches tim
 
 `UpdateActivityOptions` does not use `resolve_activity_token` and does not require `started_event_id`. Activity options live on the pending activity state, so a scheduled-but-not-yet-started activity can be updated. Missing activities are reported by the update command path as `NOT_FOUND`; unstarted activities are not `FAILED_PRECONDITION` for this RPC.
 
-This spec implements `UpdateActivityOptions` for the `ActivityTarget::Id` variant only, matching the proto's `(workflow_id, run_id, activity_id)` addressing. The existing edge DTO's `ActivityTarget::Type` and `ActivityTarget::MatchAll` variants are used by other RPCs, such as pause and unpause activity, which are out of scope for this spec.
+The runtime resolves all v1.31.0 target variants against one loaded run and applies the mutation to
+the selected pending activities. Retry-policy field-mask updates and restore-original read the first
+`ActivityTaskScheduled` event; the edge never fabricates defaults or silently drops selected fields.
 
-The upstream proto supports `target.id`, `target.type`, and `target.match_all`. This spec implements `target.id` only. Requests with `target.type` or `target.match_all` SHALL return `UNIMPLEMENTED` with a message indicating the variant is not yet supported. A future spec may implement bulk targeting.
+### Pause, Unpause, and Reset
+
+The gRPC layer translates the selector and flags, resolves the workflow run, and delegates one
+semantic request. The runtime selects matching pending activities and commits one deterministic
+transition. Selection and mutation must share the same fenced state image; a sequence of independent
+single-activity commits would expose partial success under concurrent activity completion.
+
+Pause is idempotent. A scheduled activity is fenced against delivery, while a running activity is
+allowed to finish; only a retryable failure remains paused. Heartbeat responses expose the durable
+pause bit through `activity_paused`.
+
+Reset distinguishes current and next instances. It resets the attempt baseline to one, regenerates a
+scheduled retry immediately (subject to jitter and pause), does not start a second attempt beside a
+running one, and carries `reset_heartbeat` as durable next-instance intent. The current attempt may
+continue recording heartbeat details while its token remains valid; retry preparation clears those
+details for the next attempt. `restore_original_options` reads the original schedule event. This is
+the behavior in `service/history/workflow/activity.go @ v1.31.0`.
+
+The current kernel commands are useful substrate but not yet a faithful representation: reset lacks
+`keep_paused`, jitter, restore-original, and next-instance heartbeat-reset intent; unpause rejects an
+already-unpaused activity; pause always rewrites metadata and fences even a running attempt. The
+owner gate for correcting that shape is recorded in this spec. The completed
+`kernel-pause-activity-management` Feature-11 spec remains a frozen implementation record rather than
+the owner of this conformance correction.
 
 ## Components and Interfaces
 
@@ -70,6 +128,9 @@ pub async fn respond_activity_task_failed_by_id(&self, headers: &HeaderMap, req:
 pub async fn respond_activity_task_canceled_by_id(&self, headers: &HeaderMap, req: RespondActivityTaskCanceledByIdRequest) -> EdgeResult<RespondActivityTaskCanceledResponse>;
 pub async fn record_activity_task_heartbeat_by_id(&self, headers: &HeaderMap, req: RecordActivityTaskHeartbeatByIdRequest) -> EdgeResult<RecordActivityTaskHeartbeatResponse>;
 pub async fn update_activity_options(&self, headers: &HeaderMap, req: UpdateActivityOptionsRequest) -> EdgeResult<UpdateActivityOptionsResponse>;
+pub async fn pause_activity(&self, headers: &HeaderMap, req: PauseActivityRequest) -> EdgeResult<PauseActivityResponse>;
+pub async fn unpause_activity(&self, headers: &HeaderMap, req: UnpauseActivityRequest) -> EdgeResult<UnpauseActivityResponse>;
+pub async fn reset_activity(&self, headers: &HeaderMap, req: ResetActivityRequest) -> EdgeResult<ResetActivityResponse>;
 
 // Token-based cancel (unblocking existing stub)
 pub async fn respond_activity_task_canceled(&self, headers: &HeaderMap, req: RespondActivityTaskCanceledRequest) -> EdgeResult<RespondActivityTaskCanceledResponse>;
@@ -182,13 +243,56 @@ async fn record_activity_heartbeat(
 
 `resolve_activity_token` loads the run, finds the pending activity, validates that it has started for completion/failure/cancel handlers, and fills `schedule_event_id`, `attempt`, and `shard_epoch` using runtime-owned state. It returns `ActivityTokenResolutionError` directly so the edge handler can map not-found and not-started cases to the correct gRPC status instead of collapsing them to `Internal`.
 
-The heartbeat runtime API is widened to accept `details` because `RecordActivityTaskHeartbeatById` and token-based `RecordActivityTaskHeartbeat` must share the same implementation path. If the heartbeat store does not yet persist details, the implementation still accepts and forwards the payload through the runtime boundary so storage support can be added without changing the edge contract again.
+The heartbeat runtime API accepts `details` because `RecordActivityTaskHeartbeatById` and token-based
+`RecordActivityTaskHeartbeat` share the same implementation path. Tokeira persists those details
+through a raw runtime transition in `runtime/activity.rs`; heartbeat flag projection therefore also
+belongs in runtime rather than a new kernel heartbeat command.
 
 The concrete runtime submits `Command::ActivityResolved` with `ActivityResolution::Canceled { details }`, following the same validation and submission pattern as `complete_activity_task`. The edge adapter calls the concrete method and converts `CommitResult` to `WorkflowMutationOutcome`.
 
 ### Existing Kernel Command (for UpdateActivityOptions)
 
 The kernel already defines `UpdateActivityOptionsRequest` using `FieldChange<T>` in `crates/tokeira-kernel/src/command.rs`. The edge handler maps selected proto fields to `FieldChange::Set(value)`, explicit clears to `FieldChange::Clear`, and absent or unmasked fields to `FieldChange::Unchanged`. No new kernel types are needed.
+
+### Activity-management runtime boundary
+
+```rust
+async fn pause_activities(
+    &self,
+    run_key: RunKey,
+    request: PauseActivitiesRequest,
+) -> Result<WorkflowMutationOutcome>;
+
+async fn reset_activities(
+    &self,
+    run_key: RunKey,
+    request: ResetActivitiesRequest,
+) -> Result<WorkflowMutationOutcome>;
+```
+
+These methods accept the selector, not a preselected id list. Runtime-owned selection keeps the
+read/mutate set within the authoritative transition. The production adapter never loops over public
+single-id calls.
+
+### Kernel/runtime ownership split
+
+- **Kernel:** deterministically records pause/reset state, applies option snapshots and preselected
+  resume times, distinguishes scheduled from started activities, and emits the resulting activity and
+  dispatch operations.
+- **Runtime retry path:** `commit_activity_retry` parks a failed paused activity by incrementing the
+  attempt, clearing started fields, and suppressing dispatch. It also consumes next-instance
+  heartbeat-reset intent and clears both reset flags, matching `UpdateActivityInfoForRetries`
+  (`service/history/workflow/activity.go:52-97 @ v1.31.0`).
+- **Runtime heartbeat path:** the raw heartbeat transition persists details and returns independent
+  `cancel_requested`, `activity_paused`, and `activity_reset` flags.
+- **Edge:** translates those three flags without deciding lifecycle state.
+
+Reset does not relax task-token validation. `RecordActivityTaskHeartbeat` calls
+`IsActivityTaskNotFoundForToken`, which compares the token attempt when scheduled-event id is nonzero
+(`service/history/api/recordactivitytaskheartbeat/api.go:55-90` and
+`service/history/api/activity_util.go:58-78 @ v1.31.0`). Complete, Failed, and Canceled use the same
+helper. Consequently, a reset attempt-1 worker remains valid when the state is reset to one, while a
+higher-attempt token made stale by the reset is rejected as activity-task-not-found.
 
 ### Shared ById Resolution Helper
 
@@ -342,6 +446,47 @@ ActivityNotStarted {
 
 **Validates: Requirements 7.1, 7.2, 7.4, 7.6**
 
+### Property 11: Pause lifecycle fidelity
+
+*For any* open run, valid id/type selector, and subsequent retryable-failure transition, activity
+pause behavior SHALL equal a reference model that mutates exactly the matches, preserves repeated
+pauses, fences only scheduled work, parks a failed paused attempt with its attempt incremented and
+started fields cleared, and emits no retry dispatch.
+
+**Validates: Requirements 10.1, 10.2, 10.3, 10.4, 10.6, 10.8, 10.9, 10.10, 10.11**
+
+### Property 12: Heartbeat flag and validator fidelity
+
+*For any* started activity and heartbeat sequence before and after reset, runtime heartbeat behavior
+SHALL equal the v1.31.0 model: matching tokens persist details and independently project cancel,
+pause, and reset flags, while attempt/start-version mismatches return activity-task-not-found.
+
+**Validates: Requirements 10.5, 11.11, 11.12**
+
+### Property 13: Reset lifecycle fidelity
+
+*For any* pending activity state, reset-flag combination, and subsequent retry preparation, reset
+SHALL follow the v1.31.0 reference model for attempt, running-vs-scheduled dispatch, pause retention,
+deferred heartbeat clearing and flag consumption, jitter bounds, original-option restoration, and
+the exact requested id/type set.
+
+**Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8, 11.10, 11.13, 11.14**
+
+### Property 14: Unpause lifecycle fidelity
+
+*For any* pending activity set and unpause request, unpause SHALL equal a reference model that affects
+exactly the selected activities, treats already-unpaused matches as no-ops, bumps the stamp for every
+actual unpause, applies reset flags, and regenerates eligible scheduled work within the jitter bound.
+
+**Validates: Requirements 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.8, 12.9**
+
+### Property 15: Rejection preserves activity state
+
+*For any* activity-management request that matches no pending activity or carries an invalid
+exclusive option combination, the authoritative run state SHALL remain byte-identical.
+
+**Validates: Requirements 7.3, 7.8, 10.7, 11.9, 12.7**
+
 ## Error Handling
 
 | Condition | Error | gRPC Status |
@@ -355,6 +500,9 @@ ActivityNotStarted {
 | Shard epoch mismatch (runtime validation) | `EdgeError::Internal` | `UNAVAILABLE` (retry) |
 | Missing required fields in proto | `ProtoConversionError::MissingField` | `INVALID_ARGUMENT` |
 | Runtime commit conflict | Retry internally (OCC) | Transparent to caller |
+| No activity matches id/type selector | Activity not found | v1.31.0 activity-not-found status |
+| `restore_original` combined with replacements | Bad request | `INVALID_ARGUMENT` |
+| Original schedule event absent or malformed | Bad request | `INVALID_ARGUMENT` |
 
 ### Error Ordering
 
@@ -380,6 +528,11 @@ This ensures the most specific error is returned first, and no mutation is submi
 - Scheduled-but-not-started activity: verify completion/failure/cancel handlers return `FAILED_PRECONDITION` and `UpdateActivityOptions` is allowed
 - History lane notification: verify notification is triggered after successful commit
 - Heartbeat with untracked activity: verify `cancel_requested = false`
+- Pause idempotence and scheduled-versus-running fencing
+- Reset of a running activity does not create a concurrent attempt
+- Reset-heartbeat accepts a still-valid current-attempt heartbeat and clears details on retry advance
+- Reset of a higher attempt rejects the now-stale token through the ordinary shared validator
+- Keep-paused true/false and restore-original option cases
 
 ### Property Tests (proptest, minimum 100 iterations)
 
@@ -391,6 +544,11 @@ Property-based tests using `proptest` to verify universal properties:
 - **Feature: api-conformance-activity-by-id, Property 8**: Generate random identity strings (empty and non-empty), verify propagation
 - **Feature: api-conformance-activity-by-id, Property 9**: Generate random byte sequences, verify INVALID_ARGUMENT for non-deserializable tokens
 - **Feature: api-conformance-activity-by-id, Property 10**: Generate random option subsets, verify field application
+- **Feature: api-conformance-activity-by-id, Property 11**: Generate activity state/selector pairs and compare pause behavior to a reference model
+- **Feature: api-conformance-activity-by-id, Property 12**: Generate heartbeat/pause/reset state and token-validity sequences and compare flags plus rejection behavior
+- **Feature: api-conformance-activity-by-id, Property 13**: Generate reset flag/state combinations and compare to the v1.31.0 reset model
+- **Feature: api-conformance-activity-by-id, Property 14**: Generate unpause flag/state combinations and compare to the v1.31.0 unpause model
+- **Feature: api-conformance-activity-by-id, Property 15**: Generate rejected requests and assert byte-identical state
 
 ### Integration Tests
 
@@ -398,3 +556,4 @@ Property-based tests using `proptest` to verify universal properties:
 - Retry behavior: fail activity via ById with retryable error → verify re-dispatch
 - Token-based cancel: complete the cancel flow that was previously stubbed
 - UpdateActivityOptions: update timeouts → verify subsequent activity dispatch uses new values
+- Pause/Reset: run `TestActivityApiResetClientTestSuite` against the real gRPC service

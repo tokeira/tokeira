@@ -102,10 +102,10 @@
 | `WorkflowService.RespondActivityTaskFailedById` | Stable/normal | **Stubbed** | Stubbed (`UNIMPLEMENTED`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:526` | Returns gRPC UNIMPLEMENTED. |
 | `WorkflowService.RespondActivityTaskCanceled` | Stable/normal | **Stubbed** | Stubbed (`UNIMPLEMENTED`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:532` | Returns gRPC UNIMPLEMENTED. |
 | `WorkflowService.RespondActivityTaskCanceledById` | Stable/normal | **Stubbed** | Stubbed (`UNIMPLEMENTED`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:538` | Returns gRPC UNIMPLEMENTED. |
-| `WorkflowService.UpdateActivityOptions` | Deprecated | **Stubbed** | Stubbed (`UNIMPLEMENTED`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:1571` | Returns gRPC UNIMPLEMENTED. |
-| `WorkflowService.PauseActivity` | Deprecated | **Stubbed** | Stubbed (`UNIMPLEMENTED`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:1583` | Returns gRPC UNIMPLEMENTED. |
-| `WorkflowService.UnpauseActivity` | Deprecated | **Stubbed** | Stubbed (`UNIMPLEMENTED`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:1589` | Returns gRPC UNIMPLEMENTED. |
-| `WorkflowService.ResetActivity` | Deprecated | **Stubbed** | Stubbed (`UNIMPLEMENTED`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:1595` | Returns gRPC UNIMPLEMENTED. |
+| `WorkflowService.UpdateActivityOptions` | Stable/normal | **Implemented** | Handler present | Tier 6.34: direct 5/5 and batch 3/3, twice | Supports id/type/all selectors, retry-policy masks, and restore-original behavior. The v1.31.0 API only announces future deprecation. |
+| `WorkflowService.PauseActivity` | Stable/normal | **Implemented** | Handler present | Tier 6.34 reset/control suite: 6/6 repeatedly | Idempotent workflow-scoped pause with scheduled-only fencing and heartbeat projection. |
+| `WorkflowService.UnpauseActivity` | Stable/normal | **Implemented** | Handler present | Tier 6.34 reset/control suite: 6/6 repeatedly | Supports id/type targeting, reset flags, jitter, and already-unpaused no-op behavior. |
+| `WorkflowService.ResetActivity` | Stable/normal | **Implemented** | Handler present | Tier 6.34 reset/control suite: 6/6 repeatedly | Implements attempt reset, keep-paused, restore-original, jitter, and deferred heartbeat reset. |
 
 ## Queries and updates
 
@@ -228,11 +228,11 @@
 
 | RPC | API flag | Implementation | Code status | Evidence | Notes |
 |---|---|---|---|---|---|
-| `WorkflowService.CreateWorkflowRule` | Stable/normal | **Deferred** | Deferred (`workflow-rules`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:1377` | Deferred via workflow-rules spec; returns UNIMPLEMENTED. |
-| `WorkflowService.DescribeWorkflowRule` | Stable/normal | **Deferred** | Deferred (`workflow-rules`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:1383` | Deferred via workflow-rules spec; returns UNIMPLEMENTED. |
-| `WorkflowService.DeleteWorkflowRule` | Stable/normal | **Deferred** | Deferred (`workflow-rules`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:1389` | Deferred via workflow-rules spec; returns UNIMPLEMENTED. |
-| `WorkflowService.ListWorkflowRules` | Stable/normal | **Deferred** | Deferred (`workflow-rules`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:1395` | Deferred via workflow-rules spec; returns UNIMPLEMENTED. |
-| `WorkflowService.TriggerWorkflowRule` | Stable/normal | **Deferred** | Deferred (`workflow-rules`) | `crates/tokeira-edge/src/grpc/workflow_service.rs:1401` | Deferred via workflow-rules spec; returns UNIMPLEMENTED. |
+| `WorkflowService.CreateWorkflowRule` | Stable/normal | **Partial** | Handler present | Tier 6.34 rules suite: 5/5 twice | Default-off gate and corpus CRUD behavior pass; registry durability and full predicates remain open. |
+| `WorkflowService.DescribeWorkflowRule` | Stable/normal | **Partial** | Handler present | Tier 6.34 rules suite: 5/5 twice | Reads the current process-local namespace registry. |
+| `WorkflowService.DeleteWorkflowRule` | Stable/normal | **Partial** | Handler present | Tier 6.34 rules suite: 5/5 twice | Deletes future rule matches without unpausing existing activities. |
+| `WorkflowService.ListWorkflowRules` | Stable/normal | **Partial** | Handler present | Tier 6.34 rules suite: 5/5 twice | Returns the full current namespace rule set and an empty page token. |
+| `WorkflowService.TriggerWorkflowRule` | Stable/normal | **Implemented** | Target-conformant `UNIMPLEMENTED` | `workflow_handler.go @ v1.31.0` | v1.31.0 unconditionally returns `method TriggerWorkflowRule not supported`; Tokeira matches it exactly. |
 
 ## First-class activity executions
 

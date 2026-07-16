@@ -15,12 +15,13 @@ use anyhow::{Result, anyhow};
 use smallvec::{SmallVec, smallvec};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityOp, ActivityResolution, ActivityResolvedRequest, BasicKernel, Command,
-    CronContinuation, DispatchOp, FieldChange, HistoryEvent, HistoryEventKind, LoadedRun,
-    PauseWorkflowRequest, RetryState, SignalRequest, SignalWithStartRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, Transition, UnpauseWorkflowRequest,
-    UpdateExecutionOptionsRequest, UpdateRequest, WorkflowCommand, WorkflowIdConflictPolicy,
-    WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest,
+    ActivityControlTarget, ActivityOp, ActivityResolution, ActivityResolvedRequest,
+    ActivityRetryPolicyPatch, BasicKernel, Command, CronContinuation, DispatchOp, FieldChange,
+    HistoryEvent, HistoryEventKind, LoadedRun, PauseActivityRequest, PauseWorkflowRequest,
+    RetryState, SignalRequest, SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest,
+    TerminateRequest, Transition, UnpauseWorkflowRequest, UpdateExecutionOptionsRequest,
+    UpdateRequest, WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowState,
+    WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{
     CommitResult, DeleteRunRequest, DeleteRunResult, DispatchableActivityTask,
@@ -30,8 +31,8 @@ use tokeira_storage::{
 use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, Headers,
     HeartbeatStore, IncarnationId, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
-    RetryPolicy, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
-    WorkerIdentity, WorkflowTaskToken, execution_home_bundle,
+    RequestId, RetryPolicy, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName,
+    TransitionSeq, WorkerIdentity, WorkflowTaskToken, execution_home_bundle,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -81,6 +82,7 @@ use crate::{
         run_wft_timeout_scanner,
     },
     worker_registry::{WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata},
+    workflow_rules::{matching_pause_rule, pause_info_for_rule},
 };
 
 mod activity;
@@ -1293,6 +1295,22 @@ where
         }
         Ok(count)
     }
+
+    /// Return a previously polled offer to the broker without starting it.
+    ///
+    /// Used when a transient failure (e.g. a storage error while evaluating
+    /// workflow rules) prevents the edge from deciding a polled offer's fate:
+    /// the offer was already removed from the broker, so it must be put back or
+    /// the task is stranded until a shard takeover republishes the durable row.
+    pub async fn republish_activity_offer(&self, offer: ActivityTaskOffer) {
+        if let Err(error) = self
+            .activity_broker
+            .publish_activity_task(offer.task, Some(&self.delivery_metrics))
+            .await
+        {
+            tracing::warn!(?error, "failed to republish activity offer");
+        }
+    }
 }
 
 /// Whether a command originates from an external caller (client/edge) rather
@@ -1388,6 +1406,18 @@ impl WorkflowActivation {
     }
 }
 
+/// An activity task matched by a poll but not yet durably started.
+///
+/// Callers may inspect namespace workflow rules before converting this offer
+/// into `StartedActivityTask`; dropping it leaves the activity unstarted.
+#[derive(Clone, Debug)]
+pub struct ActivityTaskOffer {
+    /// Broker offer whose durable premise must still be checked before start.
+    pub task: tokeira_storage::DispatchableActivityTask,
+    /// Matching admission instant used for schedule-to-start accounting.
+    pub entered_at: tokio::time::Instant,
+}
+
 /// An activity task that has been polled and started.
 #[derive(Clone, Debug)]
 pub struct StartedActivityTask {
@@ -1432,6 +1462,85 @@ pub struct StartedActivityTask {
     /// Heartbeat interval; missing heartbeats trigger
     /// a timeout.
     pub heartbeat_timeout: Option<Duration>,
+}
+
+/// Durable flags returned after recording an activity heartbeat.
+///
+/// The three controls are independent in Temporal's wire response; collapsing
+/// them to a single cancellation boolean loses pause/reset instructions that a
+/// still-running worker must observe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActivityHeartbeatOutcome {
+    /// Whether cooperative cancellation has been requested.
+    pub cancel_requested: bool,
+    /// Whether the activity is paused for any subsequent retry.
+    pub activity_paused: bool,
+    /// Whether the current run has been explicitly reset.
+    pub activity_reset: bool,
+}
+
+/// Runtime input for a workflow-scoped activity-options mutation.
+///
+/// The runtime resolves schedule-history snapshots and retry eligibility times
+/// before constructing the deterministic kernel command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateActivitiesOptionsRequest {
+    /// Pending activities selected by id, type, or all.
+    pub target: ActivityControlTarget,
+    /// New task queue, if selected by the field mask.
+    pub task_queue: FieldChange<TaskQueueName>,
+    /// New schedule-to-close timeout, if selected.
+    pub schedule_to_close_timeout: FieldChange<Option<Duration>>,
+    /// New schedule-to-start timeout, if selected.
+    pub schedule_to_start_timeout: FieldChange<Option<Duration>>,
+    /// New start-to-close timeout, if selected.
+    pub start_to_close_timeout: FieldChange<Option<Duration>>,
+    /// New heartbeat timeout, if selected.
+    pub heartbeat_timeout: FieldChange<Option<Duration>>,
+    /// Retry-policy field-mask patch.
+    pub retry_policy: ActivityRetryPolicyPatch,
+    /// Whether every selected activity restores its first-schedule options.
+    pub restore_original_options: bool,
+    /// Caller context used for request dedupe.
+    pub request: RequestContext,
+    /// Admission time supplied to the deterministic transition.
+    pub now: OffsetDateTime,
+}
+
+/// Runtime input for `UnpauseActivity` after wire translation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnpauseActivitiesRequest {
+    /// Pending activities selected by id, type, or all.
+    pub target: ActivityControlTarget,
+    /// Whether the attempt baseline resets to one.
+    pub reset_attempts: bool,
+    /// Whether existing heartbeat details are cleared.
+    pub reset_heartbeat: bool,
+    /// Maximum random delay before a scheduled activity becomes eligible.
+    pub jitter: Option<Duration>,
+    /// Caller context used for request dedupe.
+    pub request: RequestContext,
+    /// Admission time supplied to the deterministic transition.
+    pub now: OffsetDateTime,
+}
+
+/// Runtime input for `ResetActivity` after wire translation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResetActivitiesRequest {
+    /// Pending activities selected by id, type, or all.
+    pub target: ActivityControlTarget,
+    /// Whether heartbeat details clear when the next instance is prepared.
+    pub reset_heartbeat: bool,
+    /// Whether a currently paused activity remains paused.
+    pub keep_paused: bool,
+    /// Maximum random delay before a scheduled reset becomes eligible.
+    pub jitter: Option<Duration>,
+    /// Whether options are restored from the first schedule event.
+    pub restore_original_options: bool,
+    /// Caller context used for request dedupe.
+    pub request: RequestContext,
+    /// Admission time supplied to the deterministic transition.
+    pub now: OffsetDateTime,
 }
 
 #[cfg(test)]
@@ -2248,6 +2357,8 @@ mod tests {
                     schedule_event_id: 11,
                     attempt: 2,
                     dispatch_revision: 0,
+                    stamp: 0,
+                    dispatch_at: OffsetDateTime::UNIX_EPOCH,
                     schedule_to_close_timeout: None,
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,

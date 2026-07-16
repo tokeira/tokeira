@@ -179,6 +179,29 @@ async fn apply_operation(
                 .reset_workflow_batch_internal(ctx, workflow_ref, fork_event_id, reason.clone())
                 .await
         }
+        BatchOperationParams::UnpauseActivity {
+            target,
+            reset_attempts,
+            reset_heartbeat,
+            jitter,
+            ..
+        } => {
+            service
+                .unpause_activity_batch_internal(
+                    ctx,
+                    workflow_ref,
+                    target.clone(),
+                    *reset_attempts,
+                    *reset_heartbeat,
+                    *jitter,
+                )
+                .await
+        }
+        BatchOperationParams::UpdateActivityOptions { patch, .. } => {
+            service
+                .update_activity_options_batch_internal(ctx, workflow_ref, patch.clone())
+                .await
+        }
     }
 }
 

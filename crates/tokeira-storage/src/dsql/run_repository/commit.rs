@@ -369,6 +369,7 @@ async fn write_transition(
             schedule_event_id,
             attempt,
             dispatch_revision,
+            stamp,
             ..
         } = op
         {
@@ -384,6 +385,7 @@ async fn write_transition(
                 *schedule_event_id,
                 *attempt,
                 *dispatch_revision,
+                *stamp,
             )
             .await?;
         }
@@ -544,6 +546,7 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     schedule_event_id: i64,
     attempt: u32,
     dispatch_revision: i64,
+    stamp: u64,
 ) -> Result<()> {
     let key = DsqlRunRepository::activity_dispatch_key(run_key, activity_id);
     let deployment = queue.deployment.as_ref().map(|value| value.0.as_str());
@@ -551,8 +554,8 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     sqlx::query(
         "INSERT INTO activity_dispatch
          (key, run_key, activity_id, shard_id, queue_namespace, queue_name, task_kind,
-          deployment, build_id, schedule_event_id, attempt, dispatch_revision, input_data, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+          deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp, input_data, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now())
          ON CONFLICT (key) DO UPDATE SET
              shard_id = EXCLUDED.shard_id,
              queue_namespace = EXCLUDED.queue_namespace,
@@ -563,6 +566,7 @@ async fn upsert_activity_dispatch_from_dispatch_op(
              schedule_event_id = EXCLUDED.schedule_event_id,
              attempt = EXCLUDED.attempt,
              dispatch_revision = EXCLUDED.dispatch_revision,
+             stamp = EXCLUDED.stamp,
              input_data = EXCLUDED.input_data",
     )
     .bind(key)
@@ -577,6 +581,7 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     .bind(schedule_event_id)
     .bind(i32::try_from(attempt)?)
     .bind(dispatch_revision)
+    .bind(i64::try_from(stamp).unwrap_or(i64::MAX))
     .bind(codec::encode_payloads(input)?)
     .execute(&mut **tx)
     .await?;
@@ -606,7 +611,8 @@ async fn update_existing_activity_dispatch(
              schedule_event_id = $8,
              attempt = $9,
              dispatch_revision = $10,
-             input_data = $11
+             stamp = $11,
+             input_data = $12
          WHERE key = $1",
     )
     .bind(key)
@@ -625,6 +631,10 @@ async fn update_existing_activity_dispatch(
             .map(|info| info.revision_number)
             .unwrap_or_default(),
     )
+    // Keep the durable dispatch row's stamp in step with the activity so a
+    // recovery-reconstructed task carries the current stamp and is never
+    // spuriously fenced at start.
+    .bind(i64::try_from(activity.stamp).unwrap_or(i64::MAX))
     .bind(codec::encode_payloads(&activity.input)?)
     .execute(&mut **tx)
     .await?;

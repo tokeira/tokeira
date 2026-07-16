@@ -86,23 +86,88 @@ where
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<StartedActivityTask>> {
-        let offered = match self
+        let Some(offer) = self
+            .poll_activity_task_offer(queue, worker_identity.clone(), timeout_after)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.start_activity_task_offer(offer, worker_identity).await
+    }
+
+    /// Poll matching without committing the Started transition.
+    ///
+    /// The edge uses this narrow seam to evaluate namespace workflow rules at
+    /// the same "about to start" point as v1.31.0. The offer remains only a
+    /// delivery premise; the subsequent start call still revalidates durable
+    /// run state and commits atomically.
+    pub async fn poll_activity_task_offer(
+        &self,
+        queue: QueueKey,
+        worker_identity: WorkerIdentity,
+        timeout_after: tokio::time::Duration,
+    ) -> Result<Option<ActivityTaskOffer>> {
+        match self
             .activity_broker
             .poll_activity_task_for_worker(&queue, &worker_identity, timeout_after)
             .await?
         {
-            Some(offered) => {
+            Some((task, entered_at)) => {
                 self.delivery_metrics.record_poll_success(&queue);
-                offered
+                Ok(Some(ActivityTaskOffer { task, entered_at }))
             }
             None => {
                 self.delivery_metrics.record_poll_timeout(&queue);
-                return Ok(None);
+                Ok(None)
             }
-        };
+        }
+    }
 
-        self.start_activity_task(&offered.0, offered.1, &worker_identity)
+    /// Revalidate and start a previously polled activity offer.
+    pub async fn start_activity_task_offer(
+        &self,
+        offer: ActivityTaskOffer,
+        worker_identity: WorkerIdentity,
+    ) -> Result<Option<StartedActivityTask>> {
+        self.start_activity_task(&offer.task, offer.entered_at, &worker_identity)
             .await
+    }
+
+    async fn pause_activity_for_matching_workflow_rule(
+        &self,
+        state: &WorkflowState,
+        activity: &tokeira_kernel::ActivityState,
+        backoff_interval_seconds: Option<i64>,
+    ) -> Result<bool> {
+        let rules = self.repo.list_workflow_rules(state.namespace_id).await?;
+        let now = OffsetDateTime::now_utc();
+        let Some(rule) =
+            matching_pause_rule(state, activity, &rules, now, backoff_interval_seconds)
+        else {
+            return Ok(false);
+        };
+        let rule_id = rule.id.clone();
+        self.pause_activities(
+            state.run_key,
+            PauseActivityRequest {
+                target: ActivityControlTarget::Id(activity.activity_id.clone()),
+                identity: rule.created_by_identity.clone(),
+                reason: rule.description.clone(),
+                request: RequestContext {
+                    request_id: RequestId(format!(
+                        "workflow-rule-{rule_id}-{}-{}",
+                        activity.activity_id, activity.attempt
+                    )),
+                    caller_identity: (!rule.created_by_identity.is_empty())
+                        .then(|| rule.created_by_identity.clone()),
+                    received_at: now,
+                },
+                now,
+                rule_id: Some(rule_id),
+            },
+        )
+        .await?;
+        Ok(true)
     }
 
     /// Eagerly claim a specific activity task by `(run_key, activity_id)`
@@ -313,13 +378,13 @@ where
         Ok(result)
     }
 
-    /// Record an activity heartbeat, returning whether cancellation has been
-    /// requested for this activity.
+    /// Record an activity heartbeat and return the independent worker-control
+    /// flags attached to the authoritative activity state.
     ///
-    /// `Ok(true)` tells the worker to begin cooperative cancellation. The
-    /// heartbeat persists progress on durable activity state without emitting
-    /// history, matching Temporal's mutable activity-info update
-    /// (`service/history/workflow/mutable_state_impl.go:1956 @ v1.31.0`).
+    /// The heartbeat persists progress on durable activity state without
+    /// emitting history, matching Temporal's mutable activity-info update.
+    /// Its response returns cancel, pause, and reset independently
+    /// (`recordactivitytaskheartbeat/api.go:103-105 @ v1.31.0`).
     /// Volatile tracking remains responsible only for timeout and cooperative
     /// cancellation liveness.
     pub async fn record_activity_heartbeat(
@@ -327,7 +392,7 @@ where
         token: ActivityTaskToken,
         details: Option<Payloads>,
         identity: Option<WorkerIdentity>,
-    ) -> Result<bool> {
+    ) -> Result<ActivityHeartbeatOutcome> {
         let mut attempts = 0u32;
         loop {
             // Identity failures are the typed [`ActivityTaskNotFound`] —
@@ -384,7 +449,11 @@ where
                 .activities
                 .insert(token.activity_id.clone(), next_activity.clone());
 
-            let cancel_requested = next_activity.cancel_requested;
+            let outcome = ActivityHeartbeatOutcome {
+                cancel_requested: next_activity.cancel_requested,
+                activity_paused: next_activity.pause_info.is_some(),
+                activity_reset: next_activity.activity_reset,
+            };
             let transition = Transition {
                 expected_seq: state.transition_seq,
                 next_state,
@@ -431,7 +500,10 @@ where
                             OffsetDateTime::now_utc(),
                         )
                         .unwrap_or(false);
-                    return Ok(cancel_requested || tracking_cancel);
+                    return Ok(ActivityHeartbeatOutcome {
+                        cancel_requested: outcome.cancel_requested || tracking_cancel,
+                        ..outcome
+                    });
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                     if attempts >= self.config.max_occ_retries {
@@ -691,12 +763,41 @@ where
             let Some(current) = state.activities.get(&task.activity_id).cloned() else {
                 return Ok(None);
             };
+            // Durable dispatch rows are deleted by the pause transition, but
+            // an ephemeral broker offer may already be in flight. Recheck the
+            // authoritative pause bits before starting so that stale offer is
+            // consumed without defeating either workflow- or activity-level
+            // pause (`PauseActivity`, activity.go:263-284 @ v1.31.0).
+            if state.status == ExecutionStatus::Paused || current.pause_info.is_some() {
+                return Ok(None);
+            }
             if current.attempt != task.attempt
                 || current.schedule_event_id != task.schedule_event_id
             {
                 return Ok(None);
             }
+            // Fence a superseded offer via the activity stamp. Every mutation
+            // that invalidates an outstanding dispatch — pause, unpause, reset,
+            // and options updates (including a task-queue move or a lengthened
+            // retry backoff) — bumps the stamp, so an offer published before the
+            // change carries a stale stamp and must not start the activity. This
+            // is v1.31.0's `ObsoleteMatchingTask` stamp check
+            // (recordactivitytaskstarted/api.go @ v1.31.0).
+            if current.stamp != task.stamp {
+                return Ok(None);
+            }
             if current.started_event_id.is_some() {
+                return Ok(None);
+            }
+
+            // All delivery shapes converge here: ordinary long-poll and eager claim both call
+            // `start_activity_task`. Reading durable rules immediately before Started avoids the
+            // frontend gate/poll-admission race and mirrors
+            // `recordactivitytaskstarted/api.go:332-372 @ v1.31.0`.
+            if self
+                .pause_activity_for_matching_workflow_rule(&state, &current, None)
+                .await?
+            {
                 return Ok(None);
             }
 
@@ -1042,6 +1143,20 @@ pub(crate) struct ActivityRetryDeps<R> {
     pub tracking: ActivityTrackingState,
 }
 
+impl<R> Clone for ActivityRetryDeps<R> {
+    fn clone(&self) -> Self {
+        Self {
+            repo: self.repo.clone(),
+            shard_owner: self.shard_owner.clone(),
+            controller_managed_placement: self.controller_managed_placement,
+            max_occ_retries: self.max_occ_retries,
+            broker: self.broker.clone(),
+            delivery_metrics: self.delivery_metrics.clone(),
+            tracking: self.tracking.clone(),
+        }
+    }
+}
+
 /// The staleness fence for a retry commit: which activity incarnation the
 /// caller decided to retry. The commit revalidates `(expected_attempt,
 /// expected_schedule_event_id)` against reloaded durable state so a
@@ -1103,7 +1218,6 @@ where
         // timer, not immediately (`UpdateActivityInfoForRetries`,
         // activity.go:74 + GenerateActivityRetryTasks @ v1.31.0).
         let dispatch_at = OffsetDateTime::now_utc() + backoff;
-        next_activity.current_attempt_scheduled_at = Some(dispatch_at);
         // The failed attempt's failure is durable retry bookkeeping,
         // surfaced by Describe as LastFailure and by the next
         // ActivityTaskStarted's last_failure (`RetryLastFailure`,
@@ -1116,6 +1230,36 @@ where
         // itself is deliberately NOT cleared
         // (`UpdateActivityInfoForRetries`, activity.go:81 @ v1.31.0).
         next_activity.retry_last_worker_identity = next_activity.started_identity.clone();
+        // Reset-heartbeat applies to the NEXT instance, never destructively to
+        // a still-running worker. Retry preparation is the point at which
+        // v1.31.0 clears those details, then always consumes both reset flags
+        // so a later retry cannot repeat the reset side effects
+        // (`UpdateActivityInfoForRetries`, activity.go:63-97 @ v1.31.0).
+        if next_activity.reset_heartbeats {
+            next_activity.heartbeat_details = None;
+        }
+        next_activity.activity_reset = false;
+        next_activity.reset_heartbeats = false;
+        if next_activity.pause_info.is_none() {
+            let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
+            if let Some(rule) = matching_pause_rule(
+                &state,
+                &next_activity,
+                &rules,
+                OffsetDateTime::now_utc(),
+                Some(backoff.whole_seconds()),
+            ) {
+                // Retry preparation knows a next attempt exists, so this is the first retry-rule
+                // evaluation point. Terminal failures never enter this function
+                // (`mutable_state_impl.go:6274 @ v1.31.0`). Persisting the pause in the same
+                // transition prevents any retry dispatch from escaping between the decision and
+                // the state change.
+                next_activity.pause_info =
+                    Some(pause_info_for_rule(rule, OffsetDateTime::now_utc()));
+            }
+        }
+        let paused = next_activity.pause_info.is_some();
+        next_activity.current_attempt_scheduled_at = (!paused).then_some(dispatch_at);
         next_state
             .activities
             .insert(activity_id.to_string(), next_activity.clone());
@@ -1133,7 +1277,7 @@ where
                 .clone()
                 .or_else(|| state.build_id.clone()),
         };
-        let dispatch_task = DispatchableActivityTask {
+        let dispatch_task = (!paused).then(|| DispatchableActivityTask {
             run_key,
             queue: queue.clone(),
             activity_id: next_activity.activity_id.clone(),
@@ -1145,15 +1289,15 @@ where
                 .as_ref()
                 .map(|info| info.revision_number)
                 .unwrap_or_default(),
-        };
-        let transition = Transition {
-            expected_seq: state.transition_seq,
-            next_state,
-            history_events: SmallVec::new(),
-            request_dedupe_ops: SmallVec::new(),
-            activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
-            timer_ops: SmallVec::new(),
-            dispatch_ops: smallvec![DispatchOp::EnqueueActivityTask {
+            stamp: next_activity.stamp,
+        });
+        let dispatch_ops = if paused {
+            // A retryable failure advances and clears the running attempt, but
+            // a paused activity is parked without a retry timer or dispatch
+            // (`RetryActivity`, mutable_state_impl.go:6278-6289 @ v1.31.0).
+            SmallVec::new()
+        } else {
+            smallvec![DispatchOp::EnqueueActivityTask {
                 queue,
                 activity_id: next_activity.activity_id.clone(),
                 input: next_activity.input.clone(),
@@ -1164,11 +1308,25 @@ where
                     .as_ref()
                     .map(|info| info.revision_number)
                     .unwrap_or_default(),
+                stamp: next_activity.stamp,
+                // The retry path commits directly (bypassing the lane/publisher)
+                // and does its own backoff-delayed publish below, so this only
+                // stamps the durable row; carry the retry time for fidelity.
+                dispatch_at,
                 schedule_to_close_timeout: next_activity.schedule_to_close_timeout,
                 schedule_to_start_timeout: next_activity.schedule_to_start_timeout,
                 start_to_close_timeout: next_activity.start_to_close_timeout,
                 heartbeat_timeout: next_activity.heartbeat_timeout,
-            }],
+            }]
+        };
+        let transition = Transition {
+            expected_seq: state.transition_seq,
+            next_state,
+            history_events: SmallVec::new(),
+            request_dedupe_ops: SmallVec::new(),
+            activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
+            timer_ops: SmallVec::new(),
+            dispatch_ops,
             projection_ops: SmallVec::new(),
         };
 
@@ -1197,8 +1355,15 @@ where
             .await?
         {
             CommitResult::Applied { .. } => {
+                if paused {
+                    deps.tracking.remove(run_key, activity_id);
+                    return Ok(());
+                }
                 deps.tracking
                     .record_retry(run_key, activity_id, dispatch_at);
+                let Some(dispatch_task) = dispatch_task else {
+                    return Err(anyhow!("dispatchable activity retry missing after commit"));
+                };
                 if backoff.is_positive() {
                     // Backoff-delayed dispatch: the commit above already
                     // recorded the future schedule time durably; the publish
@@ -1207,19 +1372,36 @@ where
                     // restart inside the window relies on the timeout
                     // scanner's schedule anchors rather than this in-memory
                     // timer.
-                    let broker = deps.broker.clone();
-                    let metrics = deps.delivery_metrics.clone();
+                    let timer_deps = deps.clone();
                     let activity_id = activity_id.to_string();
                     let delay = std::time::Duration::from_millis(
                         backoff.whole_milliseconds().max(0) as u64,
                     );
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
-                        if let Err(error) = broker
-                            .publish_activity_task(dispatch_task, Some(&metrics))
+                        match prepare_activity_retry_publish(&timer_deps, &dispatch_task, backoff)
                             .await
                         {
-                            tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish backoff-delayed activity retry");
+                            Ok(true) => {
+                                if let Err(error) = timer_deps
+                                    .broker
+                                    .publish_activity_task(
+                                        dispatch_task,
+                                        Some(&timer_deps.delivery_metrics),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish backoff-delayed activity retry");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                // Rule evaluation is a correctness gate. On an unavailable
+                                // authoritative read, recovery may reconstruct the durable
+                                // dispatch later; publishing without the check could defeat a
+                                // namespace pause policy.
+                                tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to evaluate workflow rules for backoff-delayed activity retry");
+                            }
                         }
                     });
                 } else if let Err(error) = deps
@@ -1242,6 +1424,102 @@ where
     }
 }
 
+/// Revalidate a delayed retry and apply any rule created during its backoff.
+///
+/// Temporal evaluates the namespace's current Workflow Rules from its retry-timer path before
+/// adding the activity to matching (`timer_queue_active_task_executor.go:945-977 @ v1.31.0`).
+/// Returning `false` suppresses publication when the retry was superseded or became paused.
+async fn prepare_activity_retry_publish<R>(
+    deps: &ActivityRetryDeps<R>,
+    task: &DispatchableActivityTask,
+    backoff: time::Duration,
+) -> Result<bool>
+where
+    R: RunRepository + 'static,
+{
+    let mut attempts = 0u32;
+    loop {
+        let LoadedRun::Existing(state) = deps.repo.load_run(task.run_key).await? else {
+            return Ok(false);
+        };
+        if !state.is_open() {
+            return Ok(false);
+        }
+        let Some(current) = state.activities.get(&task.activity_id).cloned() else {
+            return Ok(false);
+        };
+        if current.attempt != task.attempt
+            || current.schedule_event_id != task.schedule_event_id
+            || current.stamp != task.stamp
+            || current.started_event_id.is_some()
+            || current.pause_info.is_some()
+        {
+            return Ok(false);
+        }
+
+        let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
+        let now = OffsetDateTime::now_utc();
+        let Some(rule) =
+            matching_pause_rule(&state, &current, &rules, now, Some(backoff.whole_seconds()))
+        else {
+            return Ok(true);
+        };
+
+        let mut next_state = state.clone();
+        next_state.transition_seq = state.transition_seq.next();
+        let mut next_activity = current;
+        next_activity.stamp += 1;
+        next_activity.current_attempt_scheduled_at = None;
+        next_activity.pause_info = Some(pause_info_for_rule(rule, now));
+        next_state
+            .activities
+            .insert(task.activity_id.clone(), next_activity.clone());
+        let transition = Transition {
+            expected_seq: state.transition_seq,
+            next_state,
+            history_events: SmallVec::new(),
+            request_dedupe_ops: SmallVec::new(),
+            activity_ops: smallvec![ActivityOp::Upsert(next_activity)],
+            timer_ops: SmallVec::new(),
+            dispatch_ops: SmallVec::new(),
+            projection_ops: SmallVec::new(),
+        };
+        let (bundle, commit_epoch) = {
+            let owner = deps.shard_owner.read().unwrap();
+            let bundle_id = execution_home_bundle(
+                state.namespace_id.0.as_bytes(),
+                state.workflow_id.0.as_bytes(),
+                owner.shard_count(),
+            );
+            let local_epoch = owner.epoch_of(bundle_id).unwrap_or(ShardEpoch::ZERO);
+            let epoch = if deps.controller_managed_placement {
+                local_epoch
+            } else {
+                ShardEpoch::ZERO
+            };
+            (bundle_id, epoch)
+        };
+
+        match deps
+            .repo
+            .commit_transition_for_bundle(task.run_key, bundle, transition, commit_epoch)
+            .await?
+        {
+            CommitResult::Applied { .. } => {
+                deps.tracking.remove(task.run_key, &task.activity_id);
+                return Ok(false);
+            }
+            CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
+                if attempts >= deps.max_occ_retries {
+                    return Err(anyhow!("workflow-rule retry-timer pause OCC exhausted"));
+                }
+                attempts += 1;
+            }
+            CommitResult::Duplicate => return Ok(false),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1255,10 +1533,11 @@ mod tests {
         ContinueAsNewVersioningBehavior, VersioningBehavior, VersioningOverride,
         WorkerDeploymentVersionRef, WorkflowVersioningInfo,
     };
-    use tokeira_storage::InMemoryStore;
+    use tokeira_storage::{InMemoryStore, WorkflowRuleCreateResult};
     use tokeira_types::{
         BuildId as RuntimeBuildId, DeploymentId, LogicalTaskSeq, Memo, NamespaceId, Payload,
-        SearchAttributes, TaskKind, TaskQueueName, WorkflowId, WorkflowType,
+        RequestId, SearchAttributes, TaskKind, TaskQueueName, WorkflowId, WorkflowRuleAction,
+        WorkflowRuleRecord, WorkflowRuleTrigger, WorkflowType,
     };
 
     use super::*;
@@ -1469,6 +1748,8 @@ mod tests {
         let started_at = scheduled_at + Duration::seconds(1);
         let activity = tokeira_kernel::ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "activity-1".to_string(),
@@ -1530,6 +1811,366 @@ mod tests {
         (state, token, queue)
     }
 
+    fn pause_rule(id: &str, predicate: &str) -> WorkflowRuleRecord {
+        WorkflowRuleRecord {
+            id: id.to_string(),
+            create_time: now(),
+            created_by_identity: "rule-owner".to_string(),
+            description: "policy pause".to_string(),
+            trigger: WorkflowRuleTrigger::ActivityStart {
+                predicate: predicate.to_string(),
+            },
+            visibility_query: String::new(),
+            actions: vec![WorkflowRuleAction::ActivityPause],
+            expiration_time: None,
+        }
+    }
+
+    async fn seed_scheduled_activity(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        repo: &InMemoryStore,
+    ) -> (WorkflowState, QueueKey, DispatchableActivityTask) {
+        let mut state = open_state(None);
+        let run_key = state.run_key;
+        let scheduled_at = OffsetDateTime::now_utc();
+        let activity = tokeira_kernel::ActivityState {
+            cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
+            started_identity: None,
+            retry_last_worker_identity: None,
+            activity_id: "activity-1".to_string(),
+            activity_type: "activity-type".to_string(),
+            schedule_event_id: 7,
+            task_queue: TaskQueueName("activity-q".to_string()),
+            deployment: None,
+            build_id: None,
+            input: payloads(b"input"),
+            header: None,
+            attempt: 1,
+            retry_policy: Some(retry_policy()),
+            schedule_to_close_timeout: Some(Duration::minutes(5)),
+            schedule_to_start_timeout: Some(Duration::seconds(30)),
+            start_to_close_timeout: Some(Duration::minutes(1)),
+            heartbeat_timeout: Some(Duration::seconds(10)),
+            scheduled_at,
+            current_attempt_scheduled_at: Some(scheduled_at),
+            started_at: None,
+            started_event_id: None,
+            last_failure: None,
+            heartbeat_details: None,
+            pause_info: None,
+            stamp: 0,
+        };
+        state
+            .activities
+            .insert(activity.activity_id.clone(), activity.clone());
+        let queue = QueueKey {
+            namespace_id: state.namespace_id,
+            task_queue: activity.task_queue.clone(),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+        let task = DispatchableActivityTask {
+            run_key,
+            queue: queue.clone(),
+            activity_id: activity.activity_id.clone(),
+            input: activity.input.clone(),
+            schedule_event_id: activity.schedule_event_id,
+            attempt: activity.attempt,
+            dispatch_revision: 0,
+            stamp: activity.stamp,
+        };
+        let transition = Transition {
+            expected_seq: TransitionSeq::ZERO,
+            next_state: state.clone(),
+            history_events: SmallVec::new(),
+            request_dedupe_ops: SmallVec::new(),
+            activity_ops: smallvec![ActivityOp::Upsert(activity)],
+            timer_ops: SmallVec::new(),
+            dispatch_ops: SmallVec::new(),
+            projection_ops: SmallVec::new(),
+        };
+        repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .expect("seed scheduled activity state");
+        runtime
+            .activity_broker
+            .publish_activity_task(task.clone(), Some(&runtime.delivery_metrics))
+            .await
+            .expect("publish scheduled activity");
+        (state, queue, task)
+    }
+
+    #[tokio::test]
+    async fn ordinary_and_eager_starts_apply_the_same_rule_before_started() {
+        for eager in [false, true] {
+            let repo = Arc::new(InMemoryStore::default());
+            let runtime = TokeiraRuntime::new(
+                repo.clone(),
+                1,
+                LaneConfig::default(),
+                TimerScannerConfig::default(),
+                WorkflowTimeoutScannerConfig::default(),
+                BacklogConfig::default(),
+            );
+            let (state, queue, task) = seed_scheduled_activity(&runtime, &repo).await;
+            assert_eq!(
+                repo.create_workflow_rule(
+                    state.namespace_id,
+                    pause_rule("pause", "ActivityType = 'activity-type'"),
+                    10,
+                )
+                .await
+                .expect("store rule"),
+                WorkflowRuleCreateResult::Created,
+            );
+
+            let started = if eager {
+                runtime
+                    .try_claim_activity_task(
+                        queue,
+                        task.run_key,
+                        task.activity_id.clone(),
+                        WorkerIdentity("worker".to_string()),
+                    )
+                    .await
+                    .expect("eager claim")
+            } else {
+                runtime
+                    .poll_activity_task(
+                        queue,
+                        WorkerIdentity("worker".to_string()),
+                        tokio::time::Duration::from_millis(100),
+                    )
+                    .await
+                    .expect("ordinary poll")
+            };
+            assert!(started.is_none());
+            let LoadedRun::Existing(after) = repo.load_run(task.run_key).await.unwrap() else {
+                panic!("seeded run should exist");
+            };
+            let pause = after.activities[&task.activity_id]
+                .pause_info
+                .as_ref()
+                .expect("rule must pause before Started");
+            assert_eq!(pause.rule_id.as_deref(), Some("pause"));
+            assert!(
+                after.activities[&task.activity_id]
+                    .started_event_id
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    // Feature: workflow-rules, Property 6: poll-admission independence
+    async fn rule_created_after_poll_admission_still_pauses_before_started() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = Arc::new(TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        ));
+        let (state, queue, task) = seed_scheduled_activity(&runtime, &repo).await;
+        runtime
+            .activity_broker
+            .try_claim_activity_task(&queue, task.run_key, &task.activity_id)
+            .await
+            .expect("remove the seed offer before admitting the test poll");
+
+        let polling_runtime = runtime.clone();
+        let polling_queue = queue.clone();
+        let poll = tokio::spawn(async move {
+            polling_runtime
+                .poll_activity_task(
+                    polling_queue,
+                    WorkerIdentity("worker".to_string()),
+                    tokio::time::Duration::from_secs(5),
+                )
+                .await
+        });
+        loop {
+            if runtime
+                .activity_broker
+                .queues_with_waiters()
+                .await
+                .contains(&queue)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // The poll is now parked under the pre-rule admission state. Creating the rule and only
+        // then publishing the offer deterministically induces the ordering that the former edge
+        // gate snapshot mishandled.
+        repo.create_workflow_rule(
+            state.namespace_id,
+            pause_rule("after-admission", "ActivityType = 'activity-type'"),
+            10,
+        )
+        .await
+        .expect("store rule after poll admission");
+        runtime
+            .activity_broker
+            .publish_activity_task(task.clone(), Some(&runtime.delivery_metrics))
+            .await
+            .expect("publish after rule creation");
+
+        assert!(
+            poll.await
+                .expect("poll task should not panic")
+                .expect("poll should not fail")
+                .is_none()
+        );
+        let LoadedRun::Existing(after) = repo.load_run(task.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        let activity = &after.activities[&task.activity_id];
+        assert!(activity.started_event_id.is_none());
+        assert_eq!(
+            activity
+                .pause_info
+                .as_ref()
+                .and_then(|pause| pause.rule_id.as_deref()),
+            Some("after-admission"),
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_rule_applies_only_when_failure_has_a_next_attempt() {
+        for retryable in [false, true] {
+            let repo = Arc::new(InMemoryStore::default());
+            let runtime = TokeiraRuntime::new(
+                repo.clone(),
+                1,
+                LaneConfig::default(),
+                TimerScannerConfig::default(),
+                WorkflowTimeoutScannerConfig::default(),
+                BacklogConfig::default(),
+            );
+            let (state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
+            repo.create_workflow_rule(
+                state.namespace_id,
+                pause_rule("retry-pause", "Attempts >= 2"),
+                10,
+            )
+            .await
+            .expect("store retry rule");
+
+            runtime
+                .fail_activity_task(token.clone(), payload(b"failure"), None, !retryable, None)
+                .await
+                .expect("activity failure");
+            let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
+                panic!("seeded run should exist");
+            };
+            if retryable {
+                let retried = &after.activities[&token.activity_id];
+                assert_eq!(retried.attempt, 2);
+                assert_eq!(
+                    retried
+                        .pause_info
+                        .as_ref()
+                        .and_then(|pause| pause.rule_id.as_deref()),
+                    Some("retry-pause"),
+                );
+                assert!(retried.current_attempt_scheduled_at.is_none());
+            } else {
+                assert!(!after.activities.contains_key(&token.activity_id));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_timer_applies_rule_created_during_backoff_before_publish() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
+        let backoff = Duration::minutes(1);
+        let deps = runtime.activity_retry_deps();
+        commit_activity_retry(
+            &deps,
+            ActivityRetryTarget {
+                run_key: token.run_key,
+                activity_id: &token.activity_id,
+                expected_attempt: token.attempt,
+                expected_schedule_event_id: token.schedule_event_id,
+            },
+            2,
+            backoff,
+            Some(payload(b"retryable")),
+        )
+        .await
+        .expect("commit delayed retry");
+
+        let LoadedRun::Existing(retried) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("seeded run should exist after retry");
+        };
+        let activity = retried.activities[&token.activity_id].clone();
+        let task = DispatchableActivityTask {
+            run_key: token.run_key,
+            queue: queue.clone(),
+            activity_id: activity.activity_id.clone(),
+            input: activity.input.clone(),
+            schedule_event_id: activity.schedule_event_id,
+            attempt: activity.attempt,
+            dispatch_revision: 0,
+            stamp: activity.stamp,
+        };
+        assert_eq!(
+            repo.list_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+        );
+
+        repo.create_workflow_rule(
+            state.namespace_id,
+            pause_rule("during-backoff", "Attempts >= 2"),
+            10,
+        )
+        .await
+        .expect("store rule during retry backoff");
+        assert!(
+            !prepare_activity_retry_publish(&deps, &task, backoff)
+                .await
+                .expect("evaluate delayed retry")
+        );
+
+        let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("seeded run should exist after timer evaluation");
+        };
+        let paused = &after.activities[&token.activity_id];
+        assert_eq!(
+            paused
+                .pause_info
+                .as_ref()
+                .and_then(|pause| pause.rule_id.as_deref()),
+            Some("during-backoff"),
+        );
+        assert!(paused.current_attempt_scheduled_at.is_none());
+        assert!(
+            repo.list_dispatchable_activity_tasks(&queue, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn heartbeat_details_persist_and_return_on_retry_poll() {
         let repo = Arc::new(InMemoryStore::default());
@@ -1544,11 +2185,11 @@ mod tests {
         let (_state, token, queue) = seed_started_activity(&runtime, &repo, None).await;
         let details = payloads(b"checkpoint-1");
 
-        let cancel_requested = runtime
+        let outcome = runtime
             .record_activity_heartbeat(token.clone(), Some(details.clone()), None)
             .await
             .expect("heartbeat should persist");
-        assert!(!cancel_requested);
+        assert_eq!(outcome, ActivityHeartbeatOutcome::default());
         let LoadedRun::Existing(after_heartbeat) = repo.load_run(token.run_key).await.unwrap()
         else {
             panic!("seeded run should exist");
@@ -1591,6 +2232,121 @@ mod tests {
             started.current_attempt_scheduled_time,
             retried.current_attempt_scheduled_at
         );
+    }
+
+    #[tokio::test]
+    async fn running_pause_projects_on_heartbeat_and_parks_retry() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let (_state, token, _queue) = seed_started_activity(&runtime, &repo, None).await;
+        let now = OffsetDateTime::now_utc();
+        runtime
+            .pause_activities(
+                token.run_key,
+                tokeira_kernel::PauseActivityRequest {
+                    target: ActivityControlTarget::Id(token.activity_id.clone()),
+                    identity: "operator".to_string(),
+                    reason: "investigate".to_string(),
+                    rule_id: None,
+                    request: RequestContext {
+                        request_id: RequestId("pause-running".to_string()),
+                        caller_identity: Some("operator".to_string()),
+                        received_at: now,
+                    },
+                    now,
+                },
+            )
+            .await
+            .expect("running activity should pause");
+
+        let outcome = runtime
+            .record_activity_heartbeat(token.clone(), Some(payloads(b"running")), None)
+            .await
+            .expect("running token remains valid after pause");
+        assert!(outcome.activity_paused);
+        assert!(!outcome.activity_reset);
+
+        runtime
+            .fail_activity_task(token.clone(), payload(b"retryable"), None, false, None)
+            .await
+            .expect("paused retryable failure should park");
+        let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        let parked = &after.activities[&token.activity_id];
+        assert_eq!(parked.attempt, 2);
+        assert!(parked.pause_info.is_some());
+        assert!(parked.started_at.is_none());
+        assert!(parked.started_event_id.is_none());
+        assert!(parked.current_attempt_scheduled_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn running_reset_defers_heartbeat_clear_until_retry_preparation() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        );
+        let original = payloads(b"before-reset");
+        let (_state, token, _queue) =
+            seed_started_activity(&runtime, &repo, Some(original.clone())).await;
+        let now = OffsetDateTime::now_utc();
+        runtime
+            .reset_activities(
+                token.run_key,
+                ResetActivitiesRequest {
+                    target: ActivityControlTarget::Id(token.activity_id.clone()),
+                    reset_heartbeat: true,
+                    keep_paused: false,
+                    jitter: None,
+                    restore_original_options: false,
+                    request: RequestContext {
+                        request_id: RequestId("reset-running".to_string()),
+                        caller_identity: Some("operator".to_string()),
+                        received_at: now,
+                    },
+                    now,
+                },
+            )
+            .await
+            .expect("running activity should reset");
+        let LoadedRun::Existing(reset_state) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        let reset = &reset_state.activities[&token.activity_id];
+        assert_eq!(reset.heartbeat_details, Some(original));
+        assert!(reset.activity_reset);
+        assert!(reset.reset_heartbeats);
+
+        let outcome = runtime
+            .record_activity_heartbeat(token.clone(), Some(payloads(b"after-reset")), None)
+            .await
+            .expect("attempt-one token remains valid after reset");
+        assert!(outcome.activity_reset);
+
+        runtime
+            .fail_activity_task(token.clone(), payload(b"retryable"), None, false, None)
+            .await
+            .expect("retry preparation should consume reset flags");
+        let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        let retried = &after.activities[&token.activity_id];
+        assert!(retried.heartbeat_details.is_none());
+        assert!(!retried.activity_reset);
+        assert!(!retried.reset_heartbeats);
     }
 
     proptest! {

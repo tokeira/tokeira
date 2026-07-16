@@ -4,25 +4,25 @@ use proptest::prelude::*;
 use prost::Message;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityOp, ActivityPauseInfo, ActivityResolution, ActivityResolvedRequest, ActivityState,
-    BasicKernel, CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState,
-    CallbackTrigger, CancelRequest, ChildResolution, ChildResolvedRequest,
-    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
-    CompletionCallbackAttemptedRequest, ContinueAsNewVersioningBehavior, DispatchOp,
-    ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-    ExternalSignalResult, ExternalWorkflowExecution, FieldChange, Link, LoadedRun,
-    NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
-    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
-    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Priority,
-    Reject, ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryContinuation,
-    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
-    TimerDueRequest, TimerOp, TimerState, Transition, UnpauseActivityRequest,
-    UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
-    UpdateProtocolBody, UpdateRequest, UserMetadata, VersioningBehavior, VersioningOverride,
-    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
-    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
-    WorkflowVersioningInfo,
+    ActivityControlTarget, ActivityOp, ActivityPauseInfo, ActivityResolution,
+    ActivityResolvedRequest, ActivityState, BasicKernel, CallbackAttemptOutcome,
+    CallbackCompletionOutcome, CallbackSpec, CallbackState, CallbackTrigger, CancelRequest,
+    ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult,
+    ChildWorkflowState, Command, CompletionCallback, CompletionCallbackAttemptedRequest,
+    ContinueAsNewVersioningBehavior, DispatchOp, ExternalCancelResolvedRequest,
+    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
+    ExternalWorkflowExecution, FieldChange, Link, LoadedRun, NexusOperationResolvedRequest,
+    NexusResolution, NexusTimeoutType, ParentClosePolicy, PauseActivityRequest, PauseInfo,
+    PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
+    PendingUpdate, PendingWorkflowTask, Priority, Reject, ReplayContext, RequestDedupeOp,
+    ResetActivityRequest, ResetRequest, RetryContinuation, RetryState, SignalRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState, Transition,
+    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, UserMetadata,
+    VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType, WorkflowVersioningInfo,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -245,6 +245,8 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
         activity_id.into(),
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: activity_id.into(),
@@ -517,12 +519,16 @@ fn arb_update_activity_options_request(
     )
         .prop_map(move |(task_queue, s2c, s2s, stc, hb, request_id)| {
             UpdateActivityOptionsRequest {
-                activity_id: activity_id.clone(),
+                target: ActivityControlTarget::Id(activity_id.clone()),
                 task_queue,
                 schedule_to_close_timeout: s2c,
                 schedule_to_start_timeout: s2s,
                 start_to_close_timeout: stc,
                 heartbeat_timeout: hb,
+                retry_policy: Default::default(),
+                original_options: BTreeMap::new(),
+                restore_original_options: false,
+                reschedule_at: BTreeMap::new(),
                 request: request_context(&request_id, now),
                 now,
             }
@@ -535,9 +541,10 @@ fn arb_pause_activity_request(
 ) -> impl Strategy<Value = PauseActivityRequest> {
     (arb_small_string(), arb_small_string(), arb_small_string()).prop_map(
         move |(identity, reason, request_id)| PauseActivityRequest {
-            activity_id: activity_id.clone(),
+            target: ActivityControlTarget::Id(activity_id.clone()),
             identity,
             reason,
+            rule_id: None,
             request: request_context(&request_id, now),
             now,
         },
@@ -549,7 +556,10 @@ fn arb_unpause_activity_request(
     now: OffsetDateTime,
 ) -> impl Strategy<Value = UnpauseActivityRequest> {
     arb_small_string().prop_map(move |request_id| UnpauseActivityRequest {
-        activity_id: activity_id.clone(),
+        target: ActivityControlTarget::Id(activity_id.clone()),
+        reset_attempts: false,
+        reset_heartbeat: false,
+        dispatch_at: now,
         request: request_context(&request_id, now),
         now,
     })
@@ -561,8 +571,12 @@ fn arb_reset_activity_request(
 ) -> impl Strategy<Value = ResetActivityRequest> {
     (any::<bool>(), arb_small_string()).prop_map(move |(reset_heartbeat, request_id)| {
         ResetActivityRequest {
-            activity_id: activity_id.clone(),
+            target: ActivityControlTarget::Id(activity_id.clone()),
             reset_heartbeat,
+            keep_paused: false,
+            dispatch_at: now,
+            original_options: BTreeMap::new(),
+            restore_original_options: false,
             request: request_context(&request_id, now),
             now,
         }
@@ -1287,6 +1301,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     pause_time: now,
                     identity: "operator".into(),
                     reason: "pause".into(),
+                    rule_id: None,
                 });
                 activity.stamp = 1;
             }
@@ -2894,6 +2909,8 @@ proptest! {
             "activity-2".into(),
             ActivityState {
                 cancel_requested: false,
+                activity_reset: false,
+                reset_heartbeats: false,
                 started_identity: None,
                 retry_last_worker_identity: None,
                 activity_id: "activity-2".into(),
@@ -3106,6 +3123,8 @@ proptest! {
             "activity-2".into(),
             ActivityState {
                 cancel_requested: false,
+                activity_reset: false,
+                reset_heartbeats: false,
                 started_identity: None,
                 retry_last_worker_identity: None,
                 activity_id: "activity-2".into(),
@@ -3470,6 +3489,51 @@ proptest! {
     }
 
     #[test]
+    // Feature: api-conformance-activity-by-id, Property 11: pause lifecycle fidelity
+    fn property_pause_preserves_repeated_metadata_and_fences_only_scheduled(
+        req in arb_pause_activity_request("activity-1".into(), fixed_now()),
+        already_paused in any::<bool>(),
+        started in any::<bool>(),
+        initial_stamp in 0u64..10_000,
+    ) {
+        let now = fixed_now();
+        let mut state = with_activity(make_open_state(now), "activity-1");
+        let original_pause = ActivityPauseInfo {
+            pause_time: now - Duration::seconds(1),
+            identity: "first-operator".to_string(),
+            reason: "first-reason".to_string(),
+            rule_id: None,
+        };
+        let activity = state.activities.get_mut("activity-1").unwrap();
+        activity.stamp = initial_stamp;
+        activity.pause_info = already_paused.then(|| original_pause.clone());
+        if started {
+            activity.started_at = Some(now);
+            activity.started_event_id = Some(8);
+        }
+
+        let transition = kernel().apply(
+            LoadedRun::Existing(state),
+            Command::PauseActivity(req.clone()),
+        ).unwrap();
+        let after = &transition.next_state.activities["activity-1"];
+        if already_paused {
+            prop_assert_eq!(after.pause_info.as_ref(), Some(&original_pause));
+            prop_assert_eq!(after.stamp, initial_stamp);
+            prop_assert!(transition.activity_ops.is_empty());
+        } else {
+            prop_assert_eq!(after.pause_info.as_ref(), Some(&ActivityPauseInfo {
+                pause_time: req.now,
+                identity: req.identity,
+                reason: req.reason,
+                rule_id: req.rule_id,
+            }));
+            prop_assert_eq!(after.stamp, initial_stamp + u64::from(!started));
+            prop_assert_eq!(transition.activity_ops.len(), 1);
+        }
+    }
+
+    #[test]
     fn property_63_update_activity_options_mutates_specified_fields_correctly(
         req in arb_update_activity_options_request("activity-1".into(), fixed_now())
     ) {
@@ -3509,13 +3573,20 @@ proptest! {
     }
 
     #[test]
+    // Feature: api-conformance-activity-by-id, Property 14: unpause lifecycle fidelity
     fn property_64_pause_and_unpause_activity_manage_pause_info(
         pause_req in arb_pause_activity_request("activity-1".into(), fixed_now()),
         unpause_req in arb_unpause_activity_request("activity-1".into(), fixed_now()),
         workflow_paused in any::<bool>(),
+        activity_started in any::<bool>(),
     ) {
         let now = fixed_now();
         let mut state = with_activity(make_open_state(now), "activity-1");
+        if activity_started {
+            let activity = state.activities.get_mut("activity-1").unwrap();
+            activity.started_at = Some(now);
+            activity.started_event_id = Some(8);
+        }
         if workflow_paused {
             state = with_paused_status(state, now, "pause-req");
         }
@@ -3525,10 +3596,12 @@ proptest! {
             Command::PauseActivity(pause_req.clone()),
         ).unwrap();
         let paused_activity = paused.next_state.activities.get("activity-1").unwrap();
+        let paused_stamp = paused_activity.stamp;
         prop_assert_eq!(paused_activity.pause_info.clone(), Some(ActivityPauseInfo {
             pause_time: pause_req.now,
             identity: pause_req.identity,
             reason: pause_req.reason,
+            rule_id: pause_req.rule_id,
         }));
 
         let unpaused = kernel().apply(
@@ -3537,21 +3610,25 @@ proptest! {
         ).unwrap();
         let unpaused_activity = unpaused.next_state.activities.get("activity-1").unwrap();
         prop_assert_eq!(unpaused_activity.pause_info.clone(), None);
+        prop_assert_eq!(unpaused_activity.stamp, paused_stamp + 1);
         let activity_dispatches = unpaused.dispatch_ops.iter().filter(|op| matches!(op, DispatchOp::EnqueueActivityTask { .. })).count();
-        prop_assert_eq!(activity_dispatches, if workflow_paused { 0 } else { 1 });
+        prop_assert_eq!(activity_dispatches, if workflow_paused || activity_started { 0 } else { 1 });
     }
 
     #[test]
-    fn property_65_unpause_activity_rejects_non_paused_activity(req in arb_unpause_activity_request("activity-1".into(), fixed_now())) {
+    // Feature: api-conformance-activity-by-id, Property 14: unpause lifecycle fidelity
+    fn property_65_unpause_activity_treats_non_paused_activity_as_noop(req in arb_unpause_activity_request("activity-1".into(), fixed_now())) {
         let now = fixed_now();
-        let result = kernel().apply(
+        let transition = kernel().apply(
             LoadedRun::Existing(with_activity(make_open_state(now), "activity-1")),
             Command::UnpauseActivity(req),
-        );
-        prop_assert_eq!(result, Err(tokeira_kernel::Reject::ActivityNotPaused("activity-1".into())));
+        ).unwrap();
+        prop_assert!(transition.activity_ops.is_empty());
+        prop_assert!(transition.dispatch_ops.is_empty());
     }
 
     #[test]
+    // Feature: api-conformance-activity-by-id, Property 13: reset lifecycle fidelity
     fn property_66_reset_activity_resets_attempt_and_dispatches_conditionally(
         req in arb_reset_activity_request("activity-1".into(), fixed_now()),
         workflow_paused in any::<bool>(),

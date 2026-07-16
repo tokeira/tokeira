@@ -65,7 +65,6 @@ v1.31.0 ships these but marks them **deprecated**; the GA replacements are in [`
 | Surface | Replacement in v1.31.0 |
 |---------|------------------------|
 | Deployment v0 — `DescribeDeployment`, `ListDeployments`, `GetDeploymentReachability`, `GetCurrentDeployment`, `SetCurrentDeployment` | GA Worker Deployments |
-| Activity-control aliases — `PauseActivity`, `UnpauseActivity`, `ResetActivity` | the standalone-activity control verbs |
 | Worker Versioning V1/V2 **enabled-path semantics** — version sets, versioning rules, rule-computed reachability behind `UpdateWorkerBuildIdCompatibility`, `GetWorkerBuildIdCompatibility`, `UpdateWorkerVersioningRules`, `GetWorkerVersioningRules`, `GetWorkerTaskReachability` | GA Worker Deployments |
 
 The V1/V2 enabled path is reachable only through non-default dynamic config
@@ -73,6 +72,12 @@ The V1/V2 enabled path is reachable only through non-default dynamic config
 the five RPCs themselves stay **in-surface as their stock-default rejections** — the exact
 `PERMISSION_DENIED` errors a default-configuration v1.31.0 server produces. Decision record with the
 full factual case: [`worker-versioning.md`](./worker-versioning.md).
+
+`PauseActivity`, `UnpauseActivity`, and `ResetActivity` are deliberately absent from this section.
+Temporal v1.31.0 serves all three public RPCs. Their API comments say that they “will be deprecated
+soon” and their HTTP bindings use an `activities-deprecated` path, but API `v1.62.8` does not mark
+the RPCs formally deprecated and does not contain the named `*ActivityExecution` replacements.
+They therefore remain part of the v1.31.0 conformance surface; see [`supported.md`](./supported.md).
 
 ## Related pages
 

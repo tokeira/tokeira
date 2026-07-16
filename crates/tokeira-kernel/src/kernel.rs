@@ -20,9 +20,9 @@ use tokeira_types::{
 
 use crate::{
     command::{
-        ActivityResolvedRequest, CallbackAttemptOutcome, CancelRequest, ChildResolution,
-        ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult, Command,
-        CompletionCallbackAttemptedRequest, ContinueAsNewInitiator, CronContinuation,
+        ActivityControlTarget, ActivityResolvedRequest, CallbackAttemptOutcome, CancelRequest,
+        ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult,
+        Command, CompletionCallbackAttemptedRequest, ContinueAsNewInitiator, CronContinuation,
         ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
         ExternalSignalResult, FieldChange, MemoPatch, NexusOperationResolvedRequest,
         NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
@@ -1111,41 +1111,22 @@ impl BasicKernel {
                     .activities
                     .get_mut(&activity_id)
                     .expect("activity must exist");
+                // Only scheduled activities had their dispatch suppressed by the
+                // workflow pause. A running attempt keeps executing, and an
+                // individually-paused activity must stay paused, so re-enqueuing
+                // either one recreates a durable dispatch row that no worker can
+                // ever start — the poll seam just re-consumes and drops the offer
+                // on every sweep. Leave them untouched.
+                if activity.started_event_id.is_some() || activity.pause_info.is_some() {
+                    continue;
+                }
                 activity.stamp += 1;
                 activity.clone()
             };
             builder
                 .activity_ops
                 .push(ActivityOp::Upsert(snapshot.clone()));
-            builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
-                queue: QueueKey {
-                    namespace_id: builder.state.namespace_id,
-                    task_queue: snapshot.task_queue.clone(),
-                    task_kind: tokeira_types::TaskKind::Activity,
-                    deployment: snapshot
-                        .deployment
-                        .clone()
-                        .or_else(|| builder.state.deployment.clone()),
-                    build_id: snapshot
-                        .build_id
-                        .clone()
-                        .or_else(|| builder.state.build_id.clone()),
-                },
-                activity_id: snapshot.activity_id.clone(),
-                input: snapshot.input.clone(),
-                schedule_event_id: snapshot.schedule_event_id,
-                attempt: snapshot.attempt,
-                dispatch_revision: builder
-                    .state
-                    .versioning_info
-                    .as_ref()
-                    .map(|info| info.revision_number)
-                    .unwrap_or_default(),
-                schedule_to_close_timeout: snapshot.schedule_to_close_timeout,
-                schedule_to_start_timeout: snapshot.schedule_to_start_timeout,
-                start_to_close_timeout: snapshot.start_to_close_timeout,
-                heartbeat_timeout: snapshot.heartbeat_timeout,
-            });
+            enqueue_activity_dispatch(&mut builder, &snapshot);
         }
 
         builder.projection_ops.push(ProjectionOp::UpsertExecution {
@@ -1168,54 +1149,71 @@ impl BasicKernel {
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
-        builder
-            .state
-            .activities
-            .get(&req.activity_id)
-            .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
+        let activity_ids = matching_activity_ids(&builder.state, &req.target);
+        if activity_ids.is_empty() {
+            return Err(Reject::UnknownActivity(req.target.label()));
+        }
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
 
-        let snapshot = {
+        for activity_id in activity_ids {
             let activity = builder
                 .state
                 .activities
-                .get_mut(&req.activity_id)
+                .get_mut(&activity_id)
                 .expect("activity must exist");
-            match req.task_queue {
-                FieldChange::Set(task_queue) => activity.task_queue = task_queue,
-                FieldChange::Clear | FieldChange::Unchanged => {}
-            }
-            match req.schedule_to_close_timeout {
-                FieldChange::Set(v) => activity.schedule_to_close_timeout = v,
-                FieldChange::Clear => activity.schedule_to_close_timeout = None,
-                FieldChange::Unchanged => {}
-            }
-            match req.schedule_to_start_timeout {
-                FieldChange::Set(v) => activity.schedule_to_start_timeout = v,
-                FieldChange::Clear => activity.schedule_to_start_timeout = None,
-                FieldChange::Unchanged => {}
-            }
-            match req.start_to_close_timeout {
-                FieldChange::Set(v) => activity.start_to_close_timeout = v,
-                FieldChange::Clear => activity.start_to_close_timeout = None,
-                FieldChange::Unchanged => {}
-            }
-            match req.heartbeat_timeout {
-                FieldChange::Set(v) => activity.heartbeat_timeout = v,
-                FieldChange::Clear => activity.heartbeat_timeout = None,
-                FieldChange::Unchanged => {}
+            if req.restore_original_options {
+                let original = req.original_options.get(&activity_id).ok_or_else(|| {
+                    Reject::InvalidActivityOptions(format!(
+                        "original options missing for activity `{activity_id}`"
+                    ))
+                })?;
+                activity.task_queue = original.task_queue.clone();
+                activity.schedule_to_close_timeout = original.schedule_to_close_timeout;
+                activity.schedule_to_start_timeout = original.schedule_to_start_timeout;
+                activity.start_to_close_timeout = original.start_to_close_timeout;
+                activity.heartbeat_timeout = original.heartbeat_timeout;
+                activity.retry_policy = original.retry_policy.clone();
+            } else {
+                match &req.task_queue {
+                    FieldChange::Set(task_queue) => activity.task_queue = task_queue.clone(),
+                    FieldChange::Clear | FieldChange::Unchanged => {}
+                }
+                apply_optional_duration_change(
+                    &mut activity.schedule_to_close_timeout,
+                    &req.schedule_to_close_timeout,
+                );
+                apply_optional_duration_change(
+                    &mut activity.schedule_to_start_timeout,
+                    &req.schedule_to_start_timeout,
+                );
+                apply_optional_duration_change(
+                    &mut activity.start_to_close_timeout,
+                    &req.start_to_close_timeout,
+                );
+                apply_optional_duration_change(
+                    &mut activity.heartbeat_timeout,
+                    &req.heartbeat_timeout,
+                );
+                req.retry_policy
+                    .apply_to(&mut activity.retry_policy)
+                    .map_err(|reason| Reject::InvalidActivityOptions(reason.to_string()))?;
             }
             activity.stamp += 1;
-            activity.clone()
-        };
-        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
+            if activity.started_at.is_none()
+                && let Some(reschedule_at) = req.reschedule_at.get(&activity_id)
+            {
+                activity.current_attempt_scheduled_at = Some(*reschedule_at);
+            }
+            builder
+                .activity_ops
+                .push(ActivityOp::Upsert(activity.clone()));
+        }
         Ok(builder.finish())
     }
 
-    /// Pause a single activity. The activity stays in the pending set
-    /// but will not be dispatched until unpaused.
+    /// Pause all activities selected from one authoritative state image.
     fn apply_pause_activity(
         &self,
         loaded: LoadedRun,
@@ -1223,34 +1221,60 @@ impl BasicKernel {
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
-        builder
-            .state
-            .activities
-            .get(&req.activity_id)
-            .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
-        builder.request_dedupe_ops.push(RequestDedupeOp {
-            request_id: req.request.request_id.clone(),
-        });
-        let snapshot = {
+        let activity_ids = matching_activity_ids(&builder.state, &req.target);
+        if activity_ids.is_empty() {
+            return Err(Reject::UnknownActivity(req.target.label()));
+        }
+        // v1.31.0 pause is idempotent by state, with NO request-id dedupe on
+        // either path: `PauseActivityRequest` has no request_id field, and
+        // `PauseActivity` (activity.go:272) is a no-op `if ai.Paused`. A rule
+        // pause is a direct mutable-state mutation — `ActivityMatchWorkflowRules`
+        // (mutable_state_impl.go:9237) calls `PauseActivity(ms, id, {RuleId})`
+        // with no request id. Tokeira layers its own per-external-RPC dedupe on
+        // top; that is harmless for a manual operator pause (each RPC gets a
+        // unique request id) but the rule path synthesizes a DETERMINISTIC
+        // request id, so running it through the permanent per-run dedupe table
+        // fenced a legitimate re-pause after unpause (same rule/activity/attempt
+        // → dedupe no-op while the poll seam dropped the offer → strand). The
+        // rule path is internal, so it skips dedupe to match v1.31.0.
+        if req.rule_id.is_none() {
+            builder.request_dedupe_ops.push(RequestDedupeOp {
+                request_id: req.request.request_id.clone(),
+            });
+        }
+        for activity_id in activity_ids {
             let activity = builder
                 .state
                 .activities
-                .get_mut(&req.activity_id)
+                .get_mut(&activity_id)
                 .expect("activity must exist");
+            // Temporal treats a repeated pause as a literal no-op: retaining
+            // the first operator's metadata and, critically, its delivery
+            // fence (`PauseActivity`, activity.go:263-284 @ v1.31.0).
+            if activity.pause_info.is_some() {
+                continue;
+            }
+            // A running worker is allowed to finish. Only an unstarted
+            // dispatch is fenced; bumping a running activity's stamp would
+            // make its legitimate completion stale (activity.go:275-279 @
+            // v1.31.0).
+            if activity.started_event_id.is_none() {
+                activity.stamp += 1;
+            }
             activity.pause_info = Some(ActivityPauseInfo {
                 pause_time: req.now,
-                identity: req.identity,
-                reason: req.reason,
+                identity: req.identity.clone(),
+                reason: req.reason.clone(),
+                rule_id: req.rule_id.clone(),
             });
-            activity.stamp += 1;
-            activity.clone()
-        };
-        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
+            builder
+                .activity_ops
+                .push(ActivityOp::Upsert(activity.clone()));
+        }
         Ok(builder.finish())
     }
 
-    /// Resume a paused activity and re-enqueue it for dispatch
-    /// (unless the whole workflow is paused).
+    /// Resume all selected paused activities and re-enqueue scheduled matches.
     fn apply_unpause_activity(
         &self,
         loaded: LoadedRun,
@@ -1258,59 +1282,54 @@ impl BasicKernel {
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
+        let activity_ids = matching_activity_ids(&builder.state, &req.target);
+        if activity_ids.is_empty() {
+            return Err(Reject::UnknownActivity(req.target.label()));
+        }
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        let snapshot = {
-            let activity = builder
-                .state
-                .activities
-                .get_mut(&req.activity_id)
-                .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
-            if activity.pause_info.is_none() {
-                return Err(Reject::ActivityNotPaused(req.activity_id));
-            }
-            activity.pause_info = None;
-            activity.stamp += 1;
-            activity.clone()
-        };
-        if builder.state.status != ExecutionStatus::Paused {
-            builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
-                queue: QueueKey {
-                    namespace_id: builder.state.namespace_id,
-                    task_queue: snapshot.task_queue.clone(),
-                    task_kind: tokeira_types::TaskKind::Activity,
-                    deployment: snapshot
-                        .deployment
-                        .clone()
-                        .or_else(|| builder.state.deployment.clone()),
-                    build_id: snapshot
-                        .build_id
-                        .clone()
-                        .or_else(|| builder.state.build_id.clone()),
-                },
-                activity_id: snapshot.activity_id.clone(),
-                input: snapshot.input.clone(),
-                schedule_event_id: snapshot.schedule_event_id,
-                attempt: snapshot.attempt,
-                dispatch_revision: builder
+        for activity_id in activity_ids {
+            let snapshot = {
+                let activity = builder
                     .state
-                    .versioning_info
-                    .as_ref()
-                    .map(|info| info.revision_number)
-                    .unwrap_or_default(),
-                schedule_to_close_timeout: snapshot.schedule_to_close_timeout,
-                schedule_to_start_timeout: snapshot.schedule_to_start_timeout,
-                start_to_close_timeout: snapshot.start_to_close_timeout,
-                heartbeat_timeout: snapshot.heartbeat_timeout,
-            });
+                    .activities
+                    .get_mut(&activity_id)
+                    .expect("selected activity must exist");
+                // v1.31.0 skips already-unpaused matches rather than failing
+                // the whole type-targeted request
+                // (`processUnpauseActivityRequest`, unpauseactivity/api.go).
+                if activity.pause_info.is_none() {
+                    continue;
+                }
+                activity.pause_info = None;
+                // Every actual unpause invalidates the previous delivery,
+                // including a currently running attempt
+                // (`unpauseActivityInfo`, activity.go:381-386 @ v1.31.0).
+                activity.stamp += 1;
+                if req.reset_attempts {
+                    activity.attempt = 1;
+                }
+                if req.reset_heartbeat {
+                    activity.heartbeat_details = None;
+                }
+                if activity.started_event_id.is_none() {
+                    activity.current_attempt_scheduled_at = Some(req.dispatch_at);
+                }
+                activity.clone()
+            };
+            if builder.state.status != ExecutionStatus::Paused
+                && snapshot.started_event_id.is_none()
+            {
+                enqueue_activity_dispatch(&mut builder, &snapshot);
+            }
+            builder.activity_ops.push(ActivityOp::Upsert(snapshot));
         }
-        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
         Ok(builder.finish())
     }
 
-    /// Reset an activity's attempt counter and re-dispatch it,
-    /// giving the worker a fresh start without losing the schedule event.
+    /// Reset all selected activities while keeping the current running attempt
+    /// eligible to heartbeat or complete when its token still matches.
     fn apply_reset_activity(
         &self,
         loaded: LoadedRun,
@@ -1318,54 +1337,81 @@ impl BasicKernel {
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
         let mut builder = TransitionBuilder::new(state, req.now);
+        let activity_ids = matching_activity_ids(&builder.state, &req.target);
+        if activity_ids.is_empty() {
+            return Err(Reject::UnknownActivity(req.target.label()));
+        }
+        if req.restore_original_options
+            && activity_ids
+                .iter()
+                .any(|activity_id| !req.original_options.contains_key(activity_id))
+        {
+            return Err(Reject::ResetConstraintViolation {
+                reason: "original activity options are missing from schedule history".to_string(),
+            });
+        }
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
-        let snapshot = {
-            let activity = builder
-                .state
-                .activities
-                .get_mut(&req.activity_id)
-                .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
-            if req.reset_heartbeat {
-                activity.heartbeat_details = None;
-            }
-            activity.attempt = 1;
-            activity.stamp += 1;
-            activity.clone()
-        };
-        if builder.state.status != ExecutionStatus::Paused {
-            builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
-                queue: QueueKey {
-                    namespace_id: builder.state.namespace_id,
-                    task_queue: snapshot.task_queue.clone(),
-                    task_kind: tokeira_types::TaskKind::Activity,
-                    deployment: snapshot
-                        .deployment
-                        .clone()
-                        .or_else(|| builder.state.deployment.clone()),
-                    build_id: snapshot
-                        .build_id
-                        .clone()
-                        .or_else(|| builder.state.build_id.clone()),
-                },
-                activity_id: snapshot.activity_id.clone(),
-                input: snapshot.input.clone(),
-                schedule_event_id: snapshot.schedule_event_id,
-                attempt: snapshot.attempt,
-                dispatch_revision: builder
+        for activity_id in activity_ids {
+            let snapshot = {
+                let activity = builder
                     .state
-                    .versioning_info
-                    .as_ref()
-                    .map(|info| info.revision_number)
-                    .unwrap_or_default(),
-                schedule_to_close_timeout: snapshot.schedule_to_close_timeout,
-                schedule_to_start_timeout: snapshot.schedule_to_start_timeout,
-                start_to_close_timeout: snapshot.start_to_close_timeout,
-                heartbeat_timeout: snapshot.heartbeat_timeout,
-            });
+                    .activities
+                    .get_mut(&activity_id)
+                    .expect("selected activity must exist");
+                let was_started = activity.started_event_id.is_some();
+                let was_paused = activity.pause_info.is_some();
+
+                activity.attempt = 1;
+                activity.activity_reset = true;
+                if req.reset_heartbeat {
+                    // The current running instance may continue heartbeating;
+                    // retry preparation consumes this flag and clears details
+                    // for the next instance (activity.go:63-97,286-379 @
+                    // v1.31.0).
+                    activity.reset_heartbeats = true;
+                }
+
+                if let Some(original) = req.original_options.get(&activity_id) {
+                    activity.task_queue = original.task_queue.clone();
+                    activity.schedule_to_close_timeout = original.schedule_to_close_timeout;
+                    activity.schedule_to_start_timeout = original.schedule_to_start_timeout;
+                    activity.start_to_close_timeout = original.start_to_close_timeout;
+                    activity.heartbeat_timeout = original.heartbeat_timeout;
+                    activity.retry_policy = original.retry_policy.clone();
+                    // Restoring options invalidates their timers separately
+                    // from any scheduled-reset regeneration
+                    // (`ResetActivity`, activity.go:326-343 @ v1.31.0).
+                    activity.stamp += 1;
+                }
+
+                if was_started || (was_paused && req.keep_paused) {
+                    activity.clone()
+                } else {
+                    activity.stamp += 1;
+                    if was_paused {
+                        activity.pause_info = None;
+                    }
+                    if req.reset_heartbeat {
+                        // No worker owns a scheduled activity, so there is no
+                        // current-instance heartbeat stream to preserve.
+                        activity.heartbeat_details = None;
+                    }
+                    activity.current_attempt_scheduled_at = Some(req.dispatch_at);
+                    activity.clone()
+                }
+            };
+
+            let retained_pause = snapshot.pause_info.is_some() && req.keep_paused;
+            if builder.state.status != ExecutionStatus::Paused
+                && snapshot.started_event_id.is_none()
+                && !retained_pause
+            {
+                enqueue_activity_dispatch(&mut builder, &snapshot);
+            }
+            builder.activity_ops.push(ActivityOp::Upsert(snapshot));
         }
-        builder.activity_ops.push(ActivityOp::Upsert(snapshot));
         Ok(builder.finish())
     }
 
@@ -3016,12 +3062,6 @@ impl BasicKernel {
         // v1.31.0's post-reset `taskRefresher.Refresh` regenerates exactly these
         // activity transfer tasks (state_rebuilder.go:141 @ v1.31.0).
         if is_reset {
-            let dispatch_revision = builder
-                .state
-                .versioning_info
-                .as_ref()
-                .map(|info| info.revision_number)
-                .unwrap_or_default();
             let pending_activities: Vec<_> = builder
                 .state
                 .activities
@@ -3030,30 +3070,7 @@ impl BasicKernel {
                 .cloned()
                 .collect();
             for activity in pending_activities {
-                builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
-                    queue: QueueKey {
-                        namespace_id: builder.state.namespace_id,
-                        task_queue: activity.task_queue.clone(),
-                        task_kind: tokeira_types::TaskKind::Activity,
-                        deployment: activity
-                            .deployment
-                            .clone()
-                            .or_else(|| builder.state.deployment.clone()),
-                        build_id: activity
-                            .build_id
-                            .clone()
-                            .or_else(|| builder.state.build_id.clone()),
-                    },
-                    activity_id: activity.activity_id.clone(),
-                    input: activity.input.clone(),
-                    schedule_event_id: activity.schedule_event_id,
-                    attempt: activity.attempt,
-                    dispatch_revision,
-                    schedule_to_close_timeout: activity.schedule_to_close_timeout,
-                    schedule_to_start_timeout: activity.schedule_to_start_timeout,
-                    start_to_close_timeout: activity.start_to_close_timeout,
-                    heartbeat_timeout: activity.heartbeat_timeout,
-                });
+                enqueue_activity_dispatch(&mut builder, &activity);
             }
         }
         // Buffered events flush immediately after the WFT-failed event, before
@@ -3763,6 +3780,8 @@ impl BasicKernel {
                     activity_id.clone(),
                     ActivityState {
                         cancel_requested: false,
+                        activity_reset: false,
+                        reset_heartbeats: false,
                         started_identity: None,
                         retry_last_worker_identity: None,
                         activity_id: activity_id.clone(),
@@ -4140,6 +4159,79 @@ fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
     Ok(state)
 }
 
+/// Resolve an activity-control selector against one deterministic state image.
+/// `activities` is a `BTreeMap`, so type/all targeting produces stable effect
+/// order without an additional sort.
+fn matching_activity_ids(state: &WorkflowState, target: &ActivityControlTarget) -> Vec<String> {
+    // Keyed lookup for the common single-id path; the type/all paths reuse the
+    // shared `ActivityControlTarget::matches` predicate so kernel, runtime, and
+    // edge all resolve the same set.
+    if let ActivityControlTarget::Id(activity_id) = target {
+        return if state.activities.contains_key(activity_id) {
+            vec![activity_id.clone()]
+        } else {
+            Vec::new()
+        };
+    }
+    state
+        .activities
+        .values()
+        .filter(|activity| target.matches(activity))
+        .map(|activity| activity.activity_id.clone())
+        .collect()
+}
+
+fn apply_optional_duration_change(
+    target: &mut Option<Duration>,
+    change: &FieldChange<Option<Duration>>,
+) {
+    match change {
+        FieldChange::Set(value) => *target = *value,
+        FieldChange::Clear => *target = None,
+        FieldChange::Unchanged => {}
+    }
+}
+
+/// Emit the standard durable activity dispatch effect for a state snapshot.
+fn enqueue_activity_dispatch(builder: &mut TransitionBuilder, activity: &ActivityState) {
+    builder.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+        queue: QueueKey {
+            namespace_id: builder.state.namespace_id,
+            task_queue: activity.task_queue.clone(),
+            task_kind: tokeira_types::TaskKind::Activity,
+            deployment: activity
+                .deployment
+                .clone()
+                .or_else(|| builder.state.deployment.clone()),
+            build_id: activity
+                .build_id
+                .clone()
+                .or_else(|| builder.state.build_id.clone()),
+        },
+        activity_id: activity.activity_id.clone(),
+        input: activity.input.clone(),
+        schedule_event_id: activity.schedule_event_id,
+        attempt: activity.attempt,
+        dispatch_revision: builder
+            .state
+            .versioning_info
+            .as_ref()
+            .map(|info| info.revision_number)
+            .unwrap_or_default(),
+        stamp: activity.stamp,
+        // Eligibility time. Unpause/reset set `current_attempt_scheduled_at` to
+        // the runtime-chosen (possibly jittered) time; anything already past
+        // means immediate delivery.
+        dispatch_at: activity
+            .current_attempt_scheduled_at
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+        schedule_to_close_timeout: activity.schedule_to_close_timeout,
+        schedule_to_start_timeout: activity.schedule_to_start_timeout,
+        start_to_close_timeout: activity.start_to_close_timeout,
+        heartbeat_timeout: activity.heartbeat_timeout,
+    });
+}
+
 /// Merge a memo patch using Temporal's null-means-delete semantics.
 ///
 /// This helper is shared by the live transition and history replay so recovery
@@ -4219,6 +4311,8 @@ fn apply_workflow_command(
 
             let activity = ActivityState {
                 cancel_requested: false,
+                activity_reset: false,
+                reset_heartbeats: false,
                 started_identity: None,
                 retry_last_worker_identity: None,
                 activity_id: activity_id.clone(),
@@ -4271,6 +4365,11 @@ fn apply_workflow_command(
                     .as_ref()
                     .map(|info| info.revision_number)
                     .unwrap_or_default(),
+                // A freshly scheduled activity is at stamp 0; a later pause or
+                // options update bumps it and fences this initial dispatch.
+                stamp: 0,
+                // Initial dispatch is immediate.
+                dispatch_at: OffsetDateTime::UNIX_EPOCH,
                 schedule_to_close_timeout,
                 schedule_to_start_timeout,
                 start_to_close_timeout,
@@ -6247,6 +6346,12 @@ pub enum Reject {
     /// in the open set.
     #[error("unknown activity: {0}")]
     UnknownActivity(String),
+    /// A prevalidated activity-options request is internally inconsistent.
+    ///
+    /// Public field validation belongs at the edge; this protects the pure
+    /// transition from applying an incomplete runtime-supplied restore map.
+    #[error("invalid activity options: {0}")]
+    InvalidActivityOptions(String),
     /// An operation referenced a timer that does not exist in
     /// the open set.
     #[error("unknown timer: {0}")]
@@ -6329,10 +6434,6 @@ pub enum Reject {
     /// paused.
     #[error("workflow is not paused")]
     NotPaused,
-    /// An activity unpause was requested but the activity is
-    /// not paused.
-    #[error("activity is not paused: {0}")]
-    ActivityNotPaused(String),
     /// A reset command violated a structural constraint (e.g.
     /// invalid fork event ID).
     #[error("reset constraint violation: {reason}")]

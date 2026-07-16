@@ -46,6 +46,7 @@ v1.31.0 (release notes / proto). Areas Temporal labels experimental or pre-relea
 | Workflow lifecycle | Start, SignalWithStart, RequestCancel, Terminate, Reset, Delete, ExecuteMultiOperation | GA |
 | Workflow tasks | PollWorkflowTaskQueue, RespondWorkflowTaskCompleted/Failed, ResetStickyTaskQueue | GA |
 | Activities (worker-dispatched) | PollActivityTaskQueue, RecordActivityTaskHeartbeat(/ById), RespondActivityTask{Completed,Failed,Canceled}(/ById) | GA |
+| Workflow-scoped activity management | UpdateActivityOptions, PauseActivity, UnpauseActivity, ResetActivity | Public and served — the API comments announce a future deprecation, but v1.62.8 has no formal deprecation marker or replacement RPC |
 | Signals | SignalWorkflowExecution | GA |
 | Queries | QueryWorkflow, RespondQueryTaskCompleted | GA |
 | Updates | UpdateWorkflowExecution, PollWorkflowExecutionUpdate | GA |

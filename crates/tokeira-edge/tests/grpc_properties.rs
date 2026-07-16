@@ -1038,6 +1038,7 @@ fn arb_pending_activity() -> impl Strategy<Value = PendingActivityDescription> {
                 activity_id,
                 activity_type,
                 is_started,
+                cancel_requested: false,
                 attempt,
                 maximum_attempts,
                 scheduled_at: OffsetDateTime::from_unix_timestamp(scheduled_at).unwrap(),
@@ -1048,6 +1049,7 @@ fn arb_pending_activity() -> impl Strategy<Value = PendingActivityDescription> {
                 last_worker_identity: String::new(),
                 paused: false,
                 pause_info: None,
+                activity_options: tokeira_edge::translate::ActivityOptions::default(),
             },
         )
 }

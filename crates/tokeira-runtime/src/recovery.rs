@@ -680,6 +680,8 @@ mod tests {
                             schedule_event_id: idx as i64,
                             attempt: 1,
                             dispatch_revision: 0,
+                            stamp: 0,
+                            dispatch_at: OffsetDateTime::UNIX_EPOCH,
                             schedule_to_close_timeout: None,
                             schedule_to_start_timeout: None,
                             start_to_close_timeout: None,
@@ -1001,6 +1003,8 @@ mod tests {
                 let mut t = start_transition(run_key);
                 let act = ActivityState {
                     cancel_requested: false,
+                    activity_reset: false,
+                    reset_heartbeats: false,
                     started_identity: None,
                     retry_last_worker_identity: None,
                     activity_id: "act-1".into(),

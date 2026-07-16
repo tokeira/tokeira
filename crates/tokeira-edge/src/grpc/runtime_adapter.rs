@@ -3,9 +3,8 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokeira_kernel::{
-    CancelRequest, Command, LoadedRun, NexusResolution, ResetRequest, SignalRequest, StartRequest,
-    TerminateRequest, UpdateActivityOptionsRequest as KernelUpdateActivityOptionsRequest,
-    WorkflowTaskCompletedRequest,
+    CancelRequest, LoadedRun, NexusResolution, ResetRequest, SignalRequest, StartRequest,
+    TerminateRequest, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
     ActivityTokenResolutionError, CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion,
@@ -14,8 +13,9 @@ use tokeira_runtime::{
     RegisterPolledDeployment, RegistryError, ResetWorkflowResult, SetCurrent, SetCurrentOutcome,
     SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome, SignalWithStartResult,
     StartWorkflowResult, StartedActivityTask, TaskQueueVersioningView, TokeiraRuntime,
-    UpdateComputeConfig, UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution,
-    UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView, VersionView, WorkflowDeletion,
+    UpdateActivitiesOptionsRequest, UpdateComputeConfig, UpdateLifecycleSnapshot, UpdateMetadata,
+    UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView,
+    VersionView, WorkflowDeletion,
 };
 use tokeira_storage::{
     CommitResult, ConflictToken, DeploymentKey, DeploymentTaskQueueType, RunRepository,
@@ -230,6 +230,31 @@ where
             .await
     }
 
+    async fn poll_activity_task_offer(
+        &self,
+        queue: tokeira_types::QueueKey,
+        worker_identity: tokeira_types::WorkerIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<Option<tokeira_runtime::ActivityTaskOffer>> {
+        self.runtime
+            .poll_activity_task_offer(queue, worker_identity, timeout)
+            .await
+    }
+
+    async fn start_activity_task_offer(
+        &self,
+        offer: tokeira_runtime::ActivityTaskOffer,
+        worker_identity: tokeira_types::WorkerIdentity,
+    ) -> Result<Option<StartedActivityTask>> {
+        self.runtime
+            .start_activity_task_offer(offer, worker_identity)
+            .await
+    }
+
+    async fn republish_activity_offer(&self, offer: tokeira_runtime::ActivityTaskOffer) {
+        self.runtime.republish_activity_offer(offer).await;
+    }
+
     async fn activity_poller_scaling_decision(
         &self,
         queue: &tokeira_types::QueueKey,
@@ -365,10 +390,37 @@ where
         token: ActivityTaskToken,
         details: Option<Payloads>,
         identity: Option<tokeira_types::WorkerIdentity>,
-    ) -> Result<bool> {
+    ) -> Result<tokeira_runtime::ActivityHeartbeatOutcome> {
         self.runtime
             .record_activity_heartbeat(token, details, identity)
             .await
+    }
+
+    async fn pause_activities(
+        &self,
+        run_key: RunKey,
+        req: tokeira_kernel::PauseActivityRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let result = self.runtime.pause_activities(run_key, req).await?;
+        commit_result_to_outcome(result)
+    }
+
+    async fn unpause_activities(
+        &self,
+        run_key: RunKey,
+        req: tokeira_runtime::UnpauseActivitiesRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let result = self.runtime.unpause_activities(run_key, req).await?;
+        commit_result_to_outcome(result)
+    }
+
+    async fn reset_activities(
+        &self,
+        run_key: RunKey,
+        req: tokeira_runtime::ResetActivitiesRequest,
+    ) -> Result<WorkflowMutationOutcome> {
+        let result = self.runtime.reset_activities(run_key, req).await?;
+        commit_result_to_outcome(result)
     }
 
     async fn resolve_activity_token(
@@ -395,12 +447,9 @@ where
     async fn update_activity_options(
         &self,
         run_key: RunKey,
-        req: KernelUpdateActivityOptionsRequest,
+        req: UpdateActivitiesOptionsRequest,
     ) -> Result<WorkflowMutationOutcome> {
-        let result = self
-            .runtime
-            .submit(run_key, Command::UpdateActivityOptions(req))
-            .await?;
+        let result = self.runtime.update_activity_options(run_key, req).await?;
         commit_result_to_outcome(result)
     }
 

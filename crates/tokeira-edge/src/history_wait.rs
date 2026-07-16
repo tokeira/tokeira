@@ -16,10 +16,11 @@ use tokeira_storage::{
     ActivitySweepEntry, BacklogEntry, BundleLease, CommitResult, DeleteRunRequest, DeleteRunResult,
     DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository,
     NexusSweepEntry, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-    WorkflowTimeoutSweepEntry,
+    WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, WorkflowId,
+    WorkflowRuleRecord,
 };
 use tokio::sync::{RwLock, watch};
 
@@ -120,6 +121,40 @@ where
 
     async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>> {
         self.inner.read_transition_audit(run_key).await
+    }
+
+    async fn create_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule: WorkflowRuleRecord,
+        max_rules: usize,
+    ) -> Result<WorkflowRuleCreateResult> {
+        self.inner
+            .create_workflow_rule(namespace_id, rule, max_rules)
+            .await
+    }
+
+    async fn get_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule_id: &str,
+    ) -> Result<Option<WorkflowRuleRecord>> {
+        self.inner.get_workflow_rule(namespace_id, rule_id).await
+    }
+
+    async fn delete_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule_id: &str,
+    ) -> Result<WorkflowRuleDeleteResult> {
+        self.inner.delete_workflow_rule(namespace_id, rule_id).await
+    }
+
+    async fn list_workflow_rules(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<WorkflowRuleRecord>> {
+        self.inner.list_workflow_rules(namespace_id).await
     }
 
     async fn commit_transition(
@@ -355,5 +390,56 @@ where
         epoch: ShardEpoch,
     ) -> Result<LeaseOutcome> {
         self.inner.relinquish_bundle(bundle, owner, epoch).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokeira_storage::InMemoryStore;
+    use tokeira_types::{WorkflowRuleAction, WorkflowRuleTrigger};
+
+    #[tokio::test]
+    async fn workflow_rule_storage_delegates_through_history_notifier() {
+        let inner = Arc::new(InMemoryStore::default());
+        let repo = HistoryNotifyingRepository::new(inner, HistoryWaitRegistry::default());
+        let namespace_id = NamespaceId::new();
+        let rule = WorkflowRuleRecord {
+            id: "pause".to_string(),
+            create_time: OffsetDateTime::UNIX_EPOCH,
+            created_by_identity: "operator".to_string(),
+            description: "policy".to_string(),
+            trigger: WorkflowRuleTrigger::ActivityStart {
+                predicate: "ActivityType = 'type'".to_string(),
+            },
+            visibility_query: String::new(),
+            actions: vec![WorkflowRuleAction::ActivityPause],
+            expiration_time: None,
+        };
+
+        assert_eq!(
+            repo.create_workflow_rule(namespace_id, rule.clone(), 10)
+                .await
+                .expect("create through wrapper"),
+            WorkflowRuleCreateResult::Created,
+        );
+        assert_eq!(
+            repo.get_workflow_rule(namespace_id, &rule.id)
+                .await
+                .expect("get through wrapper"),
+            Some(rule.clone()),
+        );
+        assert_eq!(
+            repo.list_workflow_rules(namespace_id)
+                .await
+                .expect("list through wrapper"),
+            vec![rule],
+        );
+        assert_eq!(
+            repo.delete_workflow_rule(namespace_id, "pause")
+                .await
+                .expect("delete through wrapper"),
+            WorkflowRuleDeleteResult::Deleted,
+        );
     }
 }

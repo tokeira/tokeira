@@ -1085,6 +1085,268 @@ where
             .await
     }
 
+    /// Pause every pending activity selected by one workflow-scoped request.
+    /// Selector evaluation and mutation occur inside the kernel transition, so
+    /// type targeting cannot expose partial success.
+    pub async fn pause_activities(
+        &self,
+        run_key: RunKey,
+        request: tokeira_kernel::PauseActivityRequest,
+    ) -> Result<CommitResult> {
+        self.submit(run_key, Command::PauseActivity(request)).await
+    }
+
+    /// Update options for every matching pending activity in one transition.
+    ///
+    /// Schedule-event reads and retry-time recomputation happen here because
+    /// they require storage and backoff math. The kernel receives only the
+    /// resulting option snapshots and concrete eligibility timestamps
+    /// (`service/history/api/updateactivityoptions/api.go @ v1.31.0`).
+    pub async fn update_activity_options(
+        &self,
+        run_key: RunKey,
+        request: UpdateActivitiesOptionsRequest,
+    ) -> Result<CommitResult> {
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Err(anyhow!("run not found while updating activity options"));
+        };
+        let original_options = if request.restore_original_options {
+            self.original_activity_options(run_key, &state, &request.target)
+                .await?
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        let mut reschedule_at = std::collections::BTreeMap::new();
+        for activity in state
+            .activities
+            .values()
+            .filter(|activity| request.target.matches(activity))
+            .filter(|activity| activity.started_at.is_none())
+        {
+            // Attempt 1 has never been through a retry, so it carries no backoff
+            // delay: its next schedule time is simply its current schedule time.
+            // Only genuine retries (attempt > 1) reproject eligibility from the
+            // policy — `GetNextScheduledTime` leaves attempt-1 unchanged
+            // (activity.go:231 @ v1.31.0). Applying `initial_interval` here (the
+            // saturating exponent-0 backoff) would shift a scheduled attempt-1
+            // activity's Describe time and spawn a spurious delayed publish.
+            let backoff_for = |policy: Option<&tokeira_types::RetryPolicy>| -> Duration {
+                if activity.attempt <= 1 {
+                    Duration::ZERO
+                } else {
+                    policy
+                        .map(|policy| {
+                            crate::retry::compute_retry_backoff(
+                                policy,
+                                activity.attempt.saturating_sub(1),
+                            )
+                        })
+                        .unwrap_or(Duration::ZERO)
+                }
+            };
+            let old_backoff = backoff_for(activity.retry_policy.as_ref());
+            let anchor = activity
+                .current_attempt_scheduled_at
+                .map(|scheduled_at| scheduled_at - old_backoff)
+                .unwrap_or(request.now);
+            let new_policy = if request.restore_original_options {
+                original_options
+                    .get(&activity.activity_id)
+                    .and_then(|options| options.retry_policy.clone())
+            } else {
+                patched_retry_policy(activity.retry_policy.clone(), &request.retry_policy)?
+            };
+            let new_backoff = backoff_for(new_policy.as_ref());
+            reschedule_at.insert(activity.activity_id.clone(), anchor + new_backoff);
+        }
+
+        let result = self
+            .submit(
+                run_key,
+                Command::UpdateActivityOptions(tokeira_kernel::UpdateActivityOptionsRequest {
+                    target: request.target,
+                    task_queue: request.task_queue,
+                    schedule_to_close_timeout: request.schedule_to_close_timeout,
+                    schedule_to_start_timeout: request.schedule_to_start_timeout,
+                    start_to_close_timeout: request.start_to_close_timeout,
+                    heartbeat_timeout: request.heartbeat_timeout,
+                    retry_policy: request.retry_policy,
+                    original_options,
+                    restore_original_options: request.restore_original_options,
+                    reschedule_at: reschedule_at.clone(),
+                    request: request.request,
+                    now: request.now,
+                }),
+            )
+            .await?;
+
+        if let CommitResult::Applied { new_state } = &result {
+            for (activity_id, dispatch_at) in reschedule_at {
+                let Some(activity) = new_state.activities.get(&activity_id) else {
+                    continue;
+                };
+                if activity.started_at.is_some() || activity.pause_info.is_some() {
+                    continue;
+                }
+                self.activity_tracking
+                    .record_retry(run_key, &activity_id, dispatch_at);
+                let task = DispatchableActivityTask {
+                    run_key,
+                    queue: QueueKey {
+                        namespace_id: new_state.namespace_id,
+                        task_queue: activity.task_queue.clone(),
+                        task_kind: TaskKind::Activity,
+                        deployment: activity
+                            .deployment
+                            .clone()
+                            .or_else(|| new_state.deployment.clone()),
+                        build_id: activity
+                            .build_id
+                            .clone()
+                            .or_else(|| new_state.build_id.clone()),
+                    },
+                    activity_id: activity.activity_id.clone(),
+                    input: activity.input.clone(),
+                    schedule_event_id: activity.schedule_event_id,
+                    attempt: activity.attempt,
+                    dispatch_revision: new_state
+                        .versioning_info
+                        .as_ref()
+                        .map(|info| info.revision_number)
+                        .unwrap_or_default(),
+                    // The options update bumped the activity stamp; the republish
+                    // carries the new stamp so any pre-update offer is fenced.
+                    stamp: activity.stamp,
+                };
+                let delay = dispatch_at - OffsetDateTime::now_utc();
+                if delay.is_positive() {
+                    let broker = self.activity_broker.clone();
+                    let metrics = self.delivery_metrics.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            delay.whole_milliseconds().max(0) as u64,
+                        ))
+                        .await;
+                        if let Err(error) = broker.publish_activity_task(task, Some(&metrics)).await
+                        {
+                            tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish rescheduled activity after option update");
+                        }
+                    });
+                } else if let Err(error) = self
+                    .activity_broker
+                    .publish_activity_task(task, Some(&self.delivery_metrics))
+                    .await
+                {
+                    tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish rescheduled activity after option update");
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Unpause matching activities and apply the optional reset controls.
+    pub async fn unpause_activities(
+        &self,
+        run_key: RunKey,
+        request: UnpauseActivitiesRequest,
+    ) -> Result<CommitResult> {
+        let dispatch_at = jittered_dispatch_at(request.now, request.jitter);
+        self.submit(
+            run_key,
+            Command::UnpauseActivity(tokeira_kernel::UnpauseActivityRequest {
+                target: request.target,
+                reset_attempts: request.reset_attempts,
+                reset_heartbeat: request.reset_heartbeat,
+                dispatch_at,
+                request: request.request,
+                now: request.now,
+            }),
+        )
+        .await
+    }
+
+    /// Reset matching activities, resolving original options from schedule
+    /// history before the deterministic kernel transition when requested.
+    pub async fn reset_activities(
+        &self,
+        run_key: RunKey,
+        request: ResetActivitiesRequest,
+    ) -> Result<CommitResult> {
+        let original_options = if request.restore_original_options {
+            let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+                return Err(anyhow!("run not found while resetting activities"));
+            };
+            self.original_activity_options(run_key, &state, &request.target)
+                .await?
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        let dispatch_at = jittered_dispatch_at(request.now, request.jitter);
+        self.submit(
+            run_key,
+            Command::ResetActivity(tokeira_kernel::ResetActivityRequest {
+                target: request.target,
+                reset_heartbeat: request.reset_heartbeat,
+                keep_paused: request.keep_paused,
+                dispatch_at,
+                original_options,
+                restore_original_options: request.restore_original_options,
+                request: request.request,
+                now: request.now,
+            }),
+        )
+        .await
+    }
+
+    async fn original_activity_options(
+        &self,
+        run_key: RunKey,
+        state: &tokeira_kernel::WorkflowState,
+        target: &ActivityControlTarget,
+    ) -> Result<std::collections::BTreeMap<String, tokeira_kernel::ActivityOriginalOptions>> {
+        let history = self.repo.read_history(run_key, 0, usize::MAX).await?;
+        // Index the schedule events once so a type/all restore is O(H + A)
+        // rather than a full-history scan per matching activity.
+        let events_by_id: std::collections::HashMap<i64, &_> = history
+            .iter()
+            .map(|event| (event.event_id, event))
+            .collect();
+        let mut options = std::collections::BTreeMap::new();
+        for activity in state
+            .activities
+            .values()
+            .filter(|activity| target.matches(activity))
+        {
+            let scheduled = events_by_id
+                .get(&activity.schedule_event_id)
+                .ok_or_else(|| anyhow!("activity schedule event not found"))?;
+            let HistoryEventKind::ActivityTaskScheduled {
+                task_queue,
+                retry_policy,
+                schedule_to_close_timeout,
+                schedule_to_start_timeout,
+                start_to_close_timeout,
+                heartbeat_timeout,
+                ..
+            } = &scheduled.kind
+            else {
+                return Err(anyhow!("activity schedule event has invalid type"));
+            };
+            options.insert(
+                activity.activity_id.clone(),
+                tokeira_kernel::ActivityOriginalOptions {
+                    task_queue: task_queue.clone(),
+                    schedule_to_close_timeout: *schedule_to_close_timeout,
+                    schedule_to_start_timeout: *schedule_to_start_timeout,
+                    start_to_close_timeout: *start_to_close_timeout,
+                    heartbeat_timeout: *heartbeat_timeout,
+                    retry_policy: retry_policy.clone(),
+                },
+            );
+        }
+        Ok(options)
+    }
+
     /// Reset a workflow execution and synchronously materialize the replayed successor.
     pub async fn reset_workflow(
         &self,
@@ -1474,6 +1736,37 @@ fn apply_client_cron_signal_backoff(request: &mut SignalWithStartRequest) -> Res
     }
     request.workflow_start_delay = Some(cron_initial_backoff(cron_schedule, request.now)?);
     Ok(())
+}
+
+/// Choose a re-dispatch time within the half-open interval `[now, now + jitter)`
+/// when a positive jitter window is supplied, matching v1.31.0's
+/// `scheduleTime = now + rand.Int63n(jitter)` for unpause/reset
+/// (`service/history/workflow/activity.go:368-370 @ v1.31.0`). The publisher then
+/// holds the offer until this instant. Entropy comes from a fresh v4 UUID's
+/// bytes, so no extra dependency is pulled in; a zero or absent jitter (every
+/// current test) yields `now`, i.e. immediate dispatch.
+fn jittered_dispatch_at(now: OffsetDateTime, jitter: Option<Duration>) -> OffsetDateTime {
+    let Some(jitter) = jitter.filter(|jitter| jitter.is_positive()) else {
+        return now;
+    };
+    let jitter_nanos = jitter.whole_nanoseconds().max(1) as u128;
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let entropy = u64::from_le_bytes(bytes[0..8].try_into().expect("16-byte uuid")) as u128;
+    let offset_nanos = (entropy % jitter_nanos) as i64;
+    now + Duration::nanoseconds(offset_nanos)
+}
+
+/// Precompute the retry policy an `UpdateActivityOptions` field-mask patch would
+/// produce, reusing the kernel's single `apply_to` implementation so the backoff
+/// the runtime schedules against always matches the policy the kernel persists.
+fn patched_retry_policy(
+    mut policy: Option<tokeira_types::RetryPolicy>,
+    patch: &ActivityRetryPolicyPatch,
+) -> Result<Option<tokeira_types::RetryPolicy>> {
+    patch
+        .apply_to(&mut policy)
+        .map_err(|reason| anyhow!(reason))?;
+    Ok(policy)
 }
 
 #[cfg(test)]

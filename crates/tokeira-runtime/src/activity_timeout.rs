@@ -96,6 +96,14 @@ impl ActivityTrackingState {
 
     /// Begin tracking a freshly scheduled activity, anchoring both the
     /// schedule-to-close and schedule-to-start clocks at `now`.
+    ///
+    /// When an entry already exists — a re-dispatch after unpause, reset, or
+    /// workflow unpause — the schedule-to-close anchor (`original_scheduled_at`)
+    /// is preserved so the overall deadline still spans from the first schedule,
+    /// matching Temporal's absolute schedule-to-close deadline
+    /// (`timer_sequence.go:266-277 @ v1.31.0`). Only the per-attempt dispatch and
+    /// start/heartbeat clocks reset. Without this, an unpaused activity would be
+    /// granted a fresh full schedule-to-close budget on every resume.
     pub fn record_scheduled(
         &self,
         run_key: RunKey,
@@ -104,19 +112,29 @@ impl ActivityTrackingState {
         now: OffsetDateTime,
     ) {
         let activity_id = activity_id.into();
-        self.inner.lock().unwrap().insert(
-            (run_key, activity_id.clone()),
-            ActivityTrackingEntry {
-                run_key,
-                shard_id,
-                activity_id,
-                original_scheduled_at: now,
-                last_dispatched_at: now,
-                started_at: None,
-                last_heartbeat_at: None,
-                cancel_requested: false,
-            },
-        );
+        let mut guard = self.inner.lock().unwrap();
+        match guard.get_mut(&(run_key, activity_id.clone())) {
+            Some(entry) => {
+                entry.last_dispatched_at = now;
+                entry.started_at = None;
+                entry.last_heartbeat_at = None;
+            }
+            None => {
+                guard.insert(
+                    (run_key, activity_id.clone()),
+                    ActivityTrackingEntry {
+                        run_key,
+                        shard_id,
+                        activity_id,
+                        original_scheduled_at: now,
+                        last_dispatched_at: now,
+                        started_at: None,
+                        last_heartbeat_at: None,
+                        cancel_requested: false,
+                    },
+                );
+            }
+        }
     }
 
     /// Record a redispatch on retry: advance the schedule-to-start anchor and
@@ -365,6 +383,17 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
             tracking.remove(entry.run_key, &entry.activity_id);
             continue;
         };
+
+        // Temporal suspends all four activity timers while an activity is paused:
+        // `LoadAndSortActivityTimers` skips paused activities
+        // (timer_sequence.go:181-183 @ v1.31.0), so a pending timer task hitting
+        // a paused activity fires nothing. The entry is left tracked (not removed)
+        // so evaluation resumes on unpause with the original schedule-to-close
+        // anchor intact. Reloading state each scan also means a paused activity
+        // whose tracking was rebuilt on shard recovery is skipped here too.
+        if activity.pause_info.is_some() {
+            continue;
+        }
 
         let Some(violation) = evaluate_activity_timeout(&entry, &activity, now) else {
             continue;
@@ -675,6 +704,8 @@ mod tests {
     fn sample_activity() -> ActivityState {
         ActivityState {
             cancel_requested: false,
+            activity_reset: false,
+            reset_heartbeats: false,
             started_identity: None,
             retry_last_worker_identity: None,
             activity_id: "a".into(),

@@ -8,6 +8,8 @@ Batch operation handlers exist, but some action fields are dropped. This design 
 
 - Depends on `api-conformance-signal-headers` for the signal path that receives batch signal headers.
 - Depends on `api-conformance-workflow-options` for the single-workflow update-options runtime path applied by batch dispatch.
+- Depends on `api-conformance-activity-by-id` for the single-workflow activity-options selector,
+  restore-original, and field-mask semantics applied by batch dispatch.
 - Reset reapply configuration is threaded through the batch reset dispatch path to the kernel reset command.
 - This spec does not change the review/confirm model; it only ensures upstream request fields are not silently dropped.
 
@@ -34,6 +36,8 @@ flowchart LR
 - `crates/tokeira-edge/src/grpc/workflow_service.rs`: start/stop/describe/list handlers remain the ingress path.
 - `crates/tokeira-runtime/src/batch.rs`: persist supported metadata and progress.
 - Signal header support depends on `api-conformance-signal-headers`; this spec wires those fields through the batch dispatcher.
+- `BatchOperationUpdateActivityOptions` is stored as a typed action and dispatched through the same
+  runtime API as `UpdateActivityOptions`; the batch layer does not reinterpret masks or defaults.
 
 ## Correctness Properties
 
@@ -55,6 +59,14 @@ Stopping a terminal batch returns success without changing terminal state.
 
 **Validates:** Requirement 2.4.
 
+### Property 4: Batch activity-options equivalence
+
+*For any* valid batch activity-options action and selected workflow set, dispatching the batch SHALL
+produce the same per-workflow activity mutations as invoking `UpdateActivityOptions` with the same
+identity, selector, options, mask, and restore flag on each workflow exactly once.
+
+**Validates:** Requirements 1.5, 2.1.
+
 ## Error Handling
 
 | Condition | Error | gRPC status |
@@ -67,3 +79,4 @@ Stopping a terminal batch returns success without changing terminal state.
 - Translator tests for each batch action variant.
 - Property tests for field preservation and progress counts.
 - Integration tests for start, stop, describe, and list.
+- A reference-model PBT for batch activity-options equivalence, minimum 100 cases.

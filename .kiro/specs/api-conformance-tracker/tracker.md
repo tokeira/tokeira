@@ -88,7 +88,7 @@
 | RespondActivityTaskFailedById | Stubbed | Implemented |
 | RespondActivityTaskCanceledById | Stubbed | Implemented |
 | RespondActivityTaskCanceled | Stubbed | Implemented |
-| UpdateActivityOptions | Stubbed | Implemented |
+| UpdateActivityOptions | Implemented | Implemented |
 
 ### Spec 2: `api-conformance-workflow-describe`
 
@@ -267,11 +267,11 @@ Gaps: update workflow execution options, reset reapply type, current-run-only, r
 
 | RPC | Current | Target |
 |-----|---------|--------|
-| CreateWorkflowRule | Deferred | Implemented |
-| DescribeWorkflowRule | Deferred | Implemented |
-| DeleteWorkflowRule | Deferred | Implemented |
-| ListWorkflowRules | Deferred | Implemented |
-| TriggerWorkflowRule | Deferred | Implemented |
+| CreateWorkflowRule | Partial | Implemented |
+| DescribeWorkflowRule | Partial | Implemented |
+| DeleteWorkflowRule | Partial | Implemented |
+| ListWorkflowRules | Partial | Implemented |
+| TriggerWorkflowRule | Target-conformant `UNIMPLEMENTED` | Target-conformant `UNIMPLEMENTED` |
 
 ### Existing: `worker-config-management` (P4)
 
@@ -337,10 +337,10 @@ These RPCs are already Partial and will reach Implemented through the field-leve
 | GetDeploymentReachability (deprecated) | Stubbed | worker-deployments |
 | GetCurrentDeployment (deprecated) | Stubbed | worker-deployments |
 | SetCurrentDeployment (deprecated) | Stubbed | worker-deployments |
-| UpdateActivityOptions (deprecated) | Stubbed | spec 1 |
-| PauseActivity (deprecated) | Stubbed | activity-executions-first-class |
-| UnpauseActivity (deprecated) | Stubbed | activity-executions-first-class |
-| ResetActivity (deprecated) | Stubbed | activity-executions-first-class |
+| UpdateActivityOptions (future-deprecation comment only) | Implemented | `api-conformance-activity-by-id` |
+| PauseActivity (future-deprecation comment only) | Implemented | `api-conformance-activity-by-id` |
+| UnpauseActivity (future-deprecation comment only) | Implemented | `api-conformance-activity-by-id` |
+| ResetActivity (future-deprecation comment only) | Implemented | `api-conformance-activity-by-id` |
 
 ---
 

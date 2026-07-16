@@ -240,6 +240,7 @@ pub(crate) async fn drain_once<R>(
                             schedule_event_id,
                             attempt,
                             dispatch_revision,
+                            stamp,
                         } => {
                             if let Err(error) = activity_broker
                                 .publish_activity_task(
@@ -251,6 +252,7 @@ pub(crate) async fn drain_once<R>(
                                         schedule_event_id,
                                         attempt,
                                         dispatch_revision,
+                                        stamp,
                                     },
                                     Some(metrics),
                                 )
@@ -332,6 +334,7 @@ fn activity_to_backlog_entry(task: &crate::broker::TimestampedActivityTask) -> B
             schedule_event_id: task.task.schedule_event_id,
             attempt: task.task.attempt,
             dispatch_revision: task.task.dispatch_revision,
+            stamp: task.task.stamp,
         },
         scheduled_at: task.scheduled_at,
         insertion_seq: 0,
@@ -844,6 +847,7 @@ mod tests {
                             schedule_event_id: 42,
                             attempt,
                             dispatch_revision: 0,
+                            stamp: 0,
                         },
                         scheduled_at: OffsetDateTime::now_utc(),
                         insertion_seq: 1,

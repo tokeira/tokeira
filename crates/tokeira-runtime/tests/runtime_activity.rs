@@ -486,12 +486,16 @@ async fn update_activity_options_applies_field_changes_to_scheduled_activity() -
         .submit(
             run_key,
             Command::UpdateActivityOptions(UpdateActivityOptionsRequest {
-                activity_id: "activity-1".to_string(),
+                target: tokeira_kernel::ActivityControlTarget::Id("activity-1".to_string()),
                 task_queue: FieldChange::Set(TaskQueueName("activity-q-b".to_string())),
                 schedule_to_close_timeout: FieldChange::Set(Some(Duration::minutes(9))),
                 schedule_to_start_timeout: FieldChange::Unchanged,
                 start_to_close_timeout: FieldChange::Set(Some(Duration::minutes(2))),
                 heartbeat_timeout: FieldChange::Clear,
+                retry_policy: tokeira_kernel::ActivityRetryPolicyPatch::default(),
+                original_options: std::collections::BTreeMap::new(),
+                restore_original_options: false,
+                reschedule_at: std::collections::BTreeMap::new(),
                 request: RequestContext {
                     request_id: RequestId("req-update-activity-options".to_string()),
                     caller_identity: Some("operator".to_string()),

@@ -24,7 +24,7 @@ use tokeira_types::{
     ArchetypeId, ExecutionRef, ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload,
     Payloads, ProjectionCursor, QueueKey, RequestId, RunId, RunKey, SearchAttrValue,
     SearchAttributes, ShardEpoch, ShardId, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
-    WorkerIdentity, WorkflowId, WorkflowType,
+    WorkerIdentity, WorkflowId, WorkflowRuleRecord, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -154,6 +154,26 @@ pub enum DeploymentCasResult {
     NotFound,
     /// The create operation targeted an existing record.
     AlreadyExists,
+}
+
+/// Atomic result of creating a namespace Workflow Rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowRuleCreateResult {
+    /// The rule was stored, possibly after capacity-driven expiration eviction.
+    Created,
+    /// The namespace already contains the requested rule id.
+    AlreadyExists,
+    /// No capacity was available after applying v1.31.0's eviction rule.
+    LimitExceeded,
+}
+
+/// Atomic result of deleting a namespace Workflow Rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowRuleDeleteResult {
+    /// The named rule was removed.
+    Deleted,
+    /// The namespace did not contain the named rule.
+    NotFound,
 }
 
 /// Stored form of `RoutingConfigUpdateState`.
@@ -539,6 +559,48 @@ pub trait RunRepository: Send + Sync {
         Ok(false)
     }
 
+    /// Atomically create a durable namespace Workflow Rule.
+    ///
+    /// When the namespace is at `max_rules`, the implementation first evicts the stored rule with
+    /// the earliest non-null expiration time, matching namespace configuration behavior in
+    /// `service/frontend/namespace_handler.go @ v1.31.0`.
+    async fn create_workflow_rule(
+        &self,
+        _namespace_id: NamespaceId,
+        _rule: WorkflowRuleRecord,
+        _max_rules: usize,
+    ) -> Result<WorkflowRuleCreateResult> {
+        Err(anyhow!("workflow rule storage is not supported"))
+    }
+
+    /// Load one durable namespace Workflow Rule without applying expiration filtering.
+    async fn get_workflow_rule(
+        &self,
+        _namespace_id: NamespaceId,
+        _rule_id: &str,
+    ) -> Result<Option<WorkflowRuleRecord>> {
+        Ok(None)
+    }
+
+    /// Delete one durable namespace Workflow Rule atomically.
+    async fn delete_workflow_rule(
+        &self,
+        _namespace_id: NamespaceId,
+        _rule_id: &str,
+    ) -> Result<WorkflowRuleDeleteResult> {
+        Ok(WorkflowRuleDeleteResult::NotFound)
+    }
+
+    /// List every durable Workflow Rule for a namespace in stable id order.
+    ///
+    /// Expired records remain visible until explicit deletion or capacity eviction.
+    async fn list_workflow_rules(
+        &self,
+        _namespace_id: NamespaceId,
+    ) -> Result<Vec<WorkflowRuleRecord>> {
+        Ok(Vec::new())
+    }
+
     /// Atomically persist a kernel-produced transition.
     ///
     /// The implementation must check `transition.expected_seq`
@@ -740,6 +802,12 @@ pub struct DispatchableActivityTask {
     /// target revision. Persisting the stamp keeps backlog replay from
     /// reinterpreting an old dispatch under a newer routing config.
     pub dispatch_revision: i64,
+    /// Activity stamp captured when this task was dispatched.
+    ///
+    /// Activity start drops the task when this no longer equals the live
+    /// activity stamp, fencing an offer that a later pause/unpause/reset/options
+    /// update has superseded.
+    pub stamp: u64,
 }
 
 /// Durable payload stored for one backlog task.
@@ -768,6 +836,11 @@ pub enum BacklogPayload {
         /// workflow deployment transitions.
         #[serde(default)]
         dispatch_revision: i64,
+        /// Activity stamp captured when this task was dispatched, carried so a
+        /// grace-demoted offer is still fenced at start against a superseding
+        /// mutation. Defaults to zero for backlog rows written before stamping.
+        #[serde(default)]
+        stamp: u64,
     },
 }
 
@@ -1179,6 +1252,37 @@ fn projection_context(
                 );
             }
         }
+        let mut pause_entries = Vec::new();
+        if let Some(pause) = state.pause_info.as_ref() {
+            pause_entries.push(format!("Workflow:{}", state.workflow_id.0));
+            if !pause.reason.is_empty() {
+                pause_entries.push(format!("Reason:{}", pause.reason));
+            }
+        }
+        let paused_activity_types = state
+            .activities
+            .values()
+            .filter(|activity| activity.pause_info.is_some())
+            .map(|activity| activity.activity_type.as_str())
+            .collect::<BTreeSet<_>>();
+        pause_entries.extend(
+            paused_activity_types
+                .into_iter()
+                .map(|activity_type| format!("property:activityType={activity_type}")),
+        );
+        if !pause_entries.is_empty() {
+            // Temporal regenerates this server-managed KeywordList from the
+            // current workflow/activity pause state on every mutation; batch
+            // activity operations discover targets through the same visibility
+            // attribute (`buildTemporalPauseInfoEntries`,
+            // mutable_state_impl.go:6431-6475 @ v1.31.0).
+            search_attributes.0.insert(
+                "TemporalPauseInfo".to_owned(),
+                SearchAttrValue::KeywordList(pause_entries),
+            );
+        } else {
+            search_attributes.0.remove("TemporalPauseInfo");
+        }
         if state.external_payload_count > 0 {
             search_attributes.0.insert(
                 "TemporalExternalPayloadCount".to_owned(),
@@ -1471,6 +1575,40 @@ where
         (**self)
             .has_open_pinned_workflows(namespace_id, version)
             .await
+    }
+
+    async fn create_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule: WorkflowRuleRecord,
+        max_rules: usize,
+    ) -> Result<WorkflowRuleCreateResult> {
+        (**self)
+            .create_workflow_rule(namespace_id, rule, max_rules)
+            .await
+    }
+
+    async fn get_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule_id: &str,
+    ) -> Result<Option<WorkflowRuleRecord>> {
+        (**self).get_workflow_rule(namespace_id, rule_id).await
+    }
+
+    async fn delete_workflow_rule(
+        &self,
+        namespace_id: NamespaceId,
+        rule_id: &str,
+    ) -> Result<WorkflowRuleDeleteResult> {
+        (**self).delete_workflow_rule(namespace_id, rule_id).await
+    }
+
+    async fn list_workflow_rules(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Vec<WorkflowRuleRecord>> {
+        (**self).list_workflow_rules(namespace_id).await
     }
 
     async fn commit_transition(

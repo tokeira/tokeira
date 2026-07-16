@@ -9,6 +9,9 @@ This spec completes field-level conformance for batch operation RPCs: start, sto
 - **Batch operation:** A server-managed operation over a visibility-selected set of workflow executions.
 - **Batch action:** Signal, cancel, terminate, delete, reset, or update-options action applied to each target.
 - **Batch progress:** Counts and state exposed through describe/list.
+- **Batch activity-options action:** `BatchOperationUpdateActivityOptions`, which applies one
+  field-mask-controlled activity-options mutation to every visibility-selected workflow and every
+  matching pending activity within each workflow.
 
 ## Target State
 
@@ -23,6 +26,8 @@ escape hatches.
 - Current handlers: batch methods in `workflow_service.rs`.
 - Unsupported-field entry: `Batch Operations` in `UNSUPPORTED_FIELDS.md`.
 - Runtime/store: `BatchOperationStore`, batch dispatcher, visibility paging.
+- Target activity-options behavior: `service/history/api/updateactivityoptions/api.go @ v1.31.0`;
+  batch wire shape: `proto/upstream/temporal/api/batch/v1/message.proto`.
 
 ## Batch Action Field Policy
 
@@ -34,6 +39,18 @@ escape hatches.
 | Reset basic fields | Partial | Preserve supported reset only | Reset conformance |
 | Reset reapply/current-run-only/exclude fields | Not supported | Thread to kernel reset command | Reset command support |
 | Update workflow execution options | Not supported | Apply per target using workflow-options runtime path | `api-conformance-workflow-options` |
+| Update activity options | Not supported | Preserve selector, options, mask, restore flag, and apply the single-workflow activity-options path to every selected workflow | `api-conformance-activity-by-id` |
+
+### `BatchOperationUpdateActivityOptions` Field Policy
+
+| Field | Target policy | Error if invalid | Persistence/side-effect impact |
+|---|---|---|---|
+| `identity` | Preserve on every per-workflow mutation | None | Caller attribution |
+| `activity.type` | Update each matching pending activity in each target workflow | Per-target activity-not-found contributes a batch failure | Selects matching activities |
+| `activity.match_all` | Update every pending activity in each target workflow | `INVALID_ARGUMENT` when false/absent as a selector | Selects all pending activities |
+| `activity_options` | Preserve the full activity-options message | `INVALID_ARGUMENT` for malformed selected fields | Updates selected options |
+| `update_mask` | Apply only selected fields | `INVALID_ARGUMENT` for unsupported paths | Controls mutation fields |
+| `restore_original` | Restore options from each activity's first schedule event | `INVALID_ARGUMENT` when combined with replacements | Restores selected activities |
 
 ## Requirements
 
@@ -47,6 +64,9 @@ escape hatches.
 2. WHEN `BatchOperationUpdateWorkflowExecutionOptions` is present, THE batch dispatcher SHALL apply the update options runtime path to every target workflow.
 3. WHEN reset reapply fields are present, THE batch reset path SHALL thread reapply configuration to the kernel reset command.
 4. Batch fields SHALL never be silently dropped.
+5. WHEN `BatchOperationUpdateActivityOptions` is present, THE batch dispatcher SHALL preserve its
+   identity, selector, activity options, update mask, and restore-original flag for every target
+   workflow.
 
 ### Requirement 2: Lifecycle Response Completeness
 

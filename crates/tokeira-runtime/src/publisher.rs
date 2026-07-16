@@ -1701,33 +1701,69 @@ where
                         schedule_event_id,
                         attempt,
                         dispatch_revision,
+                        stamp,
+                        dispatch_at,
                         ..
                     } = op
                     {
-                        if let Err(error) = self
+                        let task = DispatchableActivityTask {
+                            run_key,
+                            queue: queue.clone(),
+                            activity_id: activity_id.clone(),
+                            input: input.clone(),
+                            schedule_event_id: *schedule_event_id,
+                            attempt: *attempt,
+                            dispatch_revision: *dispatch_revision,
+                            stamp: *stamp,
+                        };
+                        let now = OffsetDateTime::now_utc();
+                        let delay = *dispatch_at - now;
+                        // The offer becomes eligible at `dispatch_at`; anchor the
+                        // schedule-to-start clock there (immediate dispatch uses
+                        // `now`). record_scheduled preserves the schedule-to-close
+                        // anchor across re-dispatch.
+                        let effective = if delay.is_positive() {
+                            *dispatch_at
+                        } else {
+                            now
+                        };
+                        self.activity_tracking.record_scheduled(
+                            run_key,
+                            shard_for(run_key, self.shard_count),
+                            activity_id.clone(),
+                            effective,
+                        );
+                        if delay.is_positive() {
+                            // Jitter/eligibility delay (unpause/reset): hold the
+                            // broker offer until the runtime-chosen time, matching
+                            // v1.31.0's RegenerateActivityRetryTask timer. The
+                            // durable dispatch row was already committed, so a
+                            // crash during the delay is recovered by the sweeper.
+                            let broker = self.activity_broker.clone();
+                            let metrics = self.delivery_metrics.clone();
+                            let activity_id = activity_id.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    delay.whole_milliseconds().max(0) as u64,
+                                ))
+                                .await;
+                                if let Err(error) =
+                                    broker.publish_activity_task(task, Some(&metrics)).await
+                                {
+                                    tracing::warn!(
+                                        ?error,
+                                        ?run_key,
+                                        activity_id,
+                                        "failed to publish delayed activity task"
+                                    );
+                                }
+                            });
+                        } else if let Err(error) = self
                             .activity_broker
-                            .publish_activity_task(
-                                DispatchableActivityTask {
-                                    run_key,
-                                    queue: queue.clone(),
-                                    activity_id: activity_id.clone(),
-                                    input: input.clone(),
-                                    schedule_event_id: *schedule_event_id,
-                                    attempt: *attempt,
-                                    dispatch_revision: *dispatch_revision,
-                                },
-                                Some(&self.delivery_metrics),
-                            )
+                            .publish_activity_task(task, Some(&self.delivery_metrics))
                             .await
                         {
                             tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish activity task");
-                        } else {
-                            self.activity_tracking.record_scheduled(
-                                run_key,
-                                shard_for(run_key, self.shard_count),
-                                activity_id.clone(),
-                                OffsetDateTime::now_utc(),
-                            );
                         }
                     }
                 }

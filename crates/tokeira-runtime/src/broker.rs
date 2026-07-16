@@ -1464,6 +1464,7 @@ mod tests {
             schedule_event_id: 7,
             attempt: 1,
             dispatch_revision: 0,
+            stamp: 0,
         }
     }
 

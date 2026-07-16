@@ -129,6 +129,14 @@ pub struct KeySpec {
 /// `Wired` set always equals the set of keys a real accessor reads — which is
 /// exactly the honesty boundary the spec requires.
 pub static KEY_CLASSIFICATION: &[KeySpec] = &[
+    // Workflow-rule CRUD and evaluation are namespace frontend policy. The
+    // v1.31.0 corpus enables the otherwise-false gate in suite setup
+    // (`service/frontend/workflow_handler.go:6985-7088 @ v1.31.0`).
+    KeySpec {
+        key: "frontend.workflowRulesAPIsEnabled",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
     // Standalone-activity admission is a namespace-scoped frontend policy read
     // live on every activity RPC (`Config.Enabled(namespace)` in
     // `chasm/lib/activity/frontend.go @ v1.31.0`). The conformance corpus turns

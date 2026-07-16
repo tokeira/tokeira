@@ -431,6 +431,8 @@ pub struct PauseInfoDescription {
     pub identity: String,
     pub paused_time: OffsetDateTime,
     pub reason: String,
+    /// Rule provenance for an automatic pause; absent means manual intervention.
+    pub rule_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -438,6 +440,12 @@ pub struct PendingActivityDescription {
     pub activity_id: String,
     pub activity_type: String,
     pub is_started: bool,
+    /// Whether cancellation has been requested for this still-pending activity
+    /// (`ActivityInfo.CancelRequested`). Temporal's `GetActivityState` reports
+    /// `CANCEL_REQUESTED` ahead of started/scheduled and the pause adjustment
+    /// leaves it untouched (`workflow/activity.go:53-61,168-178 @ v1.31.0`), so
+    /// this takes precedence over the paused/started state.
+    pub cancel_requested: bool,
     pub attempt: u32,
     pub maximum_attempts: u32,
     pub scheduled_at: OffsetDateTime,
@@ -455,6 +463,8 @@ pub struct PendingActivityDescription {
     pub last_worker_identity: String,
     pub paused: bool,
     pub pause_info: Option<PauseInfoDescription>,
+    /// Current mutable activity options, including any management-API updates.
+    pub activity_options: ActivityOptions,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -723,6 +733,8 @@ pub struct RecordActivityTaskHeartbeatRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordActivityTaskHeartbeatResponse {
     pub cancel_requested: bool,
+    pub activity_paused: bool,
+    pub activity_reset: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -738,6 +750,8 @@ pub struct RecordActivityTaskHeartbeatByIdRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordActivityTaskHeartbeatByIdResponse {
     pub cancel_requested: bool,
+    pub activity_paused: bool,
+    pub activity_reset: bool,
 }
 
 // ── Advanced workflow endpoint DTOs ──

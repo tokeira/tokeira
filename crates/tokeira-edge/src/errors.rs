@@ -268,6 +268,28 @@ impl From<anyhow::Error> for EdgeError {
                     .to_string(),
             );
         }
+        if let Some(tokeira_runtime::KernelRejected(tokeira_kernel::Reject::UnknownActivity(
+            activity,
+        ))) = value.downcast_ref::<tokeira_runtime::KernelRejected>()
+        {
+            return Self::NotFound(format!("activity not found for ID: {activity}"));
+        }
+        if let Some(tokeira_runtime::KernelRejected(
+            tokeira_kernel::Reject::ResetConstraintViolation { reason },
+        )) = value.downcast_ref::<tokeira_runtime::KernelRejected>()
+        {
+            return Self::BadRequest(reason.clone());
+        }
+        // A rejected activity-options patch (an unmergeable retry-policy subfield,
+        // or — under a rare race — a type/all match set that grew a member with no
+        // resolved original options) is a client-argument error, matching
+        // v1.31.0's `INVALID_ARGUMENT` for these cases, not an internal fault.
+        if let Some(tokeira_runtime::KernelRejected(
+            tokeira_kernel::Reject::InvalidActivityOptions(reason),
+        )) = value.downcast_ref::<tokeira_runtime::KernelRejected>()
+        {
+            return Self::BadRequest(reason.clone());
+        }
         // An invalid workflow command fails the WFT server-side and errors the
         // completion with INVALID_ARGUMENT carrying the cause message — the
         // corpus asserts err.Error() == "UnhandledCommand" exactly

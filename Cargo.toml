@@ -149,8 +149,24 @@ unreachable_pub = "warn"
 dbg_macro = "warn"
 undocumented_unsafe_blocks = "deny" # every retained unsafe block carries // SAFETY:
 
+# The daily release profile favours *diagnosability*: tokeirad runs with
+# `panic = "abort"` (a violated fencing or history invariant must die, not limp
+# on), so a production abort must yield a resolvable backtrace — symbols kept,
+# line tables retained. Overflow checks stay on because a silently wrapped
+# counter (a fencing token ordering *below* the floor) is strictly worse than
+# an abort.
 [profile.release]
+lto = "thin"
+debug = "line-tables-only"
+strip = "none"
+overflow-checks = true
+panic = "abort"
+
+# Shipped artifacts (provenance-stamped Versioned builds): maximum optimization
+# on top of `release`, still unstripped for the same diagnosability reason.
+# BuildMode comes from tokeira-build-info, not the cargo profile, so provenance
+# semantics are unchanged by which profile builds the binary.
+[profile.dist]
+inherits = "release"
 lto = "fat"
 codegen-units = 1
-strip = "symbols"
-panic = "abort"

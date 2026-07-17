@@ -88,15 +88,25 @@ kache init      # writes rustc-wrapper into ~/.cargo/config.toml; installs the l
 kache doctor    # verify wiring; note the store path it reports
 ```
 
-> **Verify at install, don't trust this doc:** several knob names circulating in kache
-> write-ups (`KACHE_MAX_SIZE`, `KACHE_DISABLED`, `KACHE_VERIFY_RESTORES`) are absent from
-> the public docs as of July 2026. `kache gc [--max-age <dur>]` (LRU + age eviction) and
-> `KACHE_BASE_DIR` / `KACHE_CACHE_EXECUTABLES` are documented. Confirm the store-size cap
-> and the per-shell disable knob against `kache doctor` / `kache --help` output when
-> installing, and correct this section if the names differ.
+> **Verified at install (kache v0.10.0, 2026-07-17), directly against the binary:** the
+> knobs absent from the public docs do exist — `KACHE_MAX_SIZE` (store LRU cap; exported
+> as `50G` in the shell profile here), `KACHE_DISABLED` (per-shell escape hatch),
+> `KACHE_CACHE_EXECUTABLES`, `KACHE_VERIFY_RESTORES`, `KACHE_BASE_DIR`, `KACHE_CONFIG`,
+> `KACHE_LOCAL_ONLY`. `kache gc [--max-age <dur>]` handles age eviction on top of the
+> LRU cap. The store lives at `~/Library/Caches/kache` on macOS. One more doctor-confirmed
+> nuance: the launchd daemon is **optional for local-only use** (it serves remote
+> sync/planner); its checks in `kache doctor` are informational. Re-verify this box when
+> upgrading kache — it releases fast.
 
-After install, one cold `cargo check --workspace` in the main checkout populates the
-store; every worktree created afterwards restores from it.
+After install, one cold `cargo check --workspace` populates the store; every worktree
+created afterwards restores from it. Note the daemon must be reachable during that seed
+build — a build run in the gap between `kache init` and the daemon coming up passes
+through silently and stores nothing (this happened on first install here; `kache stats`
+showing zero entries after a build is the tell).
+
+Measured on this workspace at install (2026-07-17): cold worktree `cargo check
+--workspace` = 2m36s; the next fresh worktree's first check = **45s**, with 763 units
+restored from the store and only build scripts + proc-macros recompiling.
 
 ## The agents
 
@@ -274,8 +284,8 @@ safe: worst case, the next build restores from the store.
   since it's tracked, every worktree opened in Zed inherits it. The extra artifacts
   dedupe through the kache store like any other target dir. If RA's per-save check feels
   slower once kache lands (incremental is off under the wrapper), the escape hatch is
-  RA's `cargo.extraEnv` / `check.extraEnv` in the same file, setting kache's disable
-  knob (name confirmed by `kache doctor`) for RA's cargo invocations only.
+  RA's `cargo.extraEnv` / `check.extraEnv` in the same file, setting `KACHE_DISABLED=1`
+  for RA's cargo invocations only.
 
 ## Sources
 

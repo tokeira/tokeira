@@ -79,7 +79,8 @@ rollback (reverting a deployment's recorded version + state to a retained checkp
   not carry before-images.
 - **Binding / operation marker** — the binding names the single binary authorized to operate (`A` or `B`,
   flipped atomically, never "pending"); the separate operation marker records an in-flight
-  upgrade/rollback (phase + resumable progress) and gates resume/rollback until it closes.
+  upgrade/rollback (phase + resumable progress) and, until it closes, permits only the in-flight verb
+  (re-running it resumes), `rollback`, and `describe`. There is no dedicated `resume` verb.
 - **Rollback** — the deliberate revert to [A final] by **forward reconciliation toward the retained
   configuration revision**, never by inverting recorded before-images and never a reverse migration
   (Proposal 002). For an engine-identity upgrade it is two operations: the superseded binary **deletes
@@ -149,7 +150,7 @@ so that safety is strict where it matters and friction is absent where it would 
 
 #### Acceptance Criteria
 
-1. WHEN an applying operation (`apply`, `destroy`, `scale`, `schema setup`, `image push`/`mirror`)
+1. WHEN an applying operation (`apply`, `destroy`, `scale`)
    begins, THEN the provisioner SHALL compare its build mode and source-tree digest to the deployment's
    recorded provenance before any mutation.
 2. WHERE the recorded deployment is `versioned` AND the running binary does not match it, THE provisioner
@@ -241,8 +242,8 @@ a version boundary by accident.
    report the deployment identity, the recorded provenance (or explicit unknown), the binding verdict of
    the running binary, the integrity manifest, and the state-format/CAS facts, AND it SHALL NOT mutate
    state NOR refuse on a non-matching binding.
-2. WHEN an applying command (`tkr infra apply`/`destroy`, `tkr deploy apply`, `tkr scale`,
-   `tkr schema setup`, `tkr image push`/`mirror`) begins, THEN the launched `tkp` SHALL enforce the
+2. WHEN an applying command (`tkr infra apply`/`destroy`, `tkr deploy apply`, `tkr scale`)
+   begins, THEN the launched `tkp` SHALL enforce the
    binding gate (Requirement 2): on a `versioned` deployment refuse unless `Match` (no override); on a
    `dev` deployment with a `dev` binary apply and re-stamp with a non-authoritative warning.
 3. WHEN the operator runs `tkr deployment upgrade` with a `versioned` binary, THEN it SHALL run the
@@ -275,12 +276,14 @@ stamped binary married to it, and neither surface carries the other's concerns.
    local dev build) for a `dev` deployment; **rollback** (bound B then retained A) — and execute it; a
    checksum mismatch SHALL abort before execution. `tkr` SHALL NOT itself mutate.
 3. THE `tkp` CLI SHALL be specialized to the deployment lifecycle and SHALL NOT carry the operator/global
-   surface (developer/CI tasks, compatibility, workstation, deployment registry, or workspace
-   `image build`); its lifecycle verb structure SHALL align with `tkr`'s so that forwarding is
-   transparent.
-4. WHERE an image operation targets a deployment's own registry (`image push`, `image mirror`), THE
-   `tkp`/deployment surface SHALL own it; WHERE an image operation builds from workspace sources
-   (`image build`), THE operator surface `tkr` SHALL own it.
+   surface (developer/CI tasks, compatibility, workstation, deployment registry, DSQL `schema`, or **any**
+   image operation `build`/`push`/`mirror`); its lifecycle verb structure SHALL align with `tkr`'s so that
+   forwarding is transparent.
+4. THE operator surface `tkr` SHALL own **all** image operations — `image build` (workspace sources),
+   `image push` (the deployment's workload image to its registry), and `image mirror` (external
+   base/dependency images); `tkp` SHALL carry no image verb. Where an image operation writes back a
+   deployment's config (a pushed digest), that digest is ordinary config for `tkp` to reconcile on its next
+   apply (a config revision), not a `tkp`-owned action.
 
 ### Requirement 8: Deployment lock (mis-apply guard)
 

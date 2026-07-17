@@ -122,8 +122,8 @@ multi-consumer decision) are out of scope.
 - [~] 8. Provisioner binary + specialized CLI (`apps/tkp`, binary `tkp`) (Requirements 6, 7)
   - [x] 8.1 Create the `apps/tkp` binary crate + its own clap surface scoped to the deployment lifecycle
         (no operator/global verbs). DONE: `apps/tkp` with the full lifecycle surface —
-        `init` / `describe` / `plan` (read-only) / `apply` / `destroy` / `revert` / `upgrade` / `rollback`
-        (`resume` still stubbed). Links `tokeira-provisioner` + `tokeira-state` plus the engine/platform
+        `init` / `describe` / `plan` (read-only) / `apply` / `destroy` / `revert` / `upgrade` / `rollback`.
+        Links `tokeira-provisioner` + `tokeira-state` plus the engine/platform
         stack (`tokeira-orchestrator` + `tokeira-iac` + the `local` and `compose-syn` platforms +
         `tokeira-compose` for the live Docker handle). The deployment-level **envelope store**
         (`Box<dyn DeploymentStore<DeploymentStateEnvelope>>`, a local `CasStore` under
@@ -135,11 +135,12 @@ multi-consumer decision) are out of scope.
         `check_binding` verdict + whether it proceeds / is authoritative, the integrity manifest summary,
         state-head presence, and operation/lock status. Tests: uninitialized→Unknown-refuses,
         recorded-Match, dev-binary-on-versioned→ModeRegression. Smoke-verified.
-  - [x] 8.3 Embed the binding gate (task 3) in the applying verbs `apply`, `destroy`, `scale`,
-        `schema setup`, `image push|mirror`: versioned deployments refuse on non-`Match` (no override);
+  - [x] 8.3 Embed the binding gate (task 3) in the applying verbs `apply`, `destroy`, `scale`:
+        versioned deployments refuse on non-`Match` (no override);
         dev deployments take the `DevIterate` re-stamp+warn path (Req 6.2). `plan` surfaces the verdict
-        and annotates without refusing (Req 2.5). DONE (compose-syn focus; `scale`/`schema`/`image` are
-        ECS/AWS/DSQL verbs, deferred with ECS): `tkp/src/gate.rs` `evaluate_gate` →
+        and annotates without refusing (Req 2.5). DONE (compose-syn focus; `scale` is an ECS/AWS verb
+        deferred with ECS — `schema` and all image ops are `tkr`-owned, not `tkp` verbs):
+        `tkp/src/gate.rs` `evaluate_gate` →
         `GateOutcome::{Proceed{authoritative}, Refuse{verdict, reason}}` implements the 3.2/3.3 policy.
         `apply`, `destroy`, and `revert` (`apply.rs`/`destroy.rs`/`revert.rs`) all evaluate the gate
         **before any mutation** (versioned refuses non-`Match`; dev warns + proceeds on `DevIterate`;
@@ -155,7 +156,7 @@ multi-consumer decision) are out of scope.
         dev-iterate-restamp), destroy (needs-`--yes` / unstamped-refuse / local-teardown), compose-syn
         dispatch (detect / plan-interprets-reference-`.tkd` (7 resources) / invalid-`.tkd`-rejected). CLI
         smoke-verified end to end (init → apply → apply → revert → destroy). *Remaining (deferred with ECS):
-        the ECS platform + the `scale`/`schema`/`image` operator verbs.*
+        the ECS platform + the `scale` operator verb (`schema` and all image ops are `tkr`-owned, not `tkp` verbs).*
   - [~] 8.4 `upgrade`: atomic ownership transfer first (task 5.3) — flip binding → B, capture [A final]
         (incl. A's prior configuration-revision ref), open the marker, before any mutation; then run
         state-schema migrations, apply B's plan. DONE (first increment): `tkp upgrade` (`tkp/src/upgrade.rs`)
@@ -163,9 +164,9 @@ multi-consumer decision) are out of scope.
         VersionedAdvance/Promotion), then the **atomic ownership transfer** (`begin_upgrade` + one CAS save,
         before any mutation), then applies B's plan (local infra apply — shared with `apply`), then
         `close_operation` + save. Tests: `upgrade_refuses_an_unstamped_deployment`,
-        `upgrade_refuses_versioned_to_dev_restamp`. *Remaining: state-schema migrations (task 5.1),
-        multi-platform apply, the audit change log, the advisory baseline drift gate, and `resume` of an
-        interrupted transfer.* MAY record an **ids-only audit change log** (`id + op`,
+        `upgrade_refuses_versioned_to_dev_restamp`. *Remaining (→ task 19.2 / 19.4): multi-platform apply
+        (real re-provisioning vs local's empty apply), state-schema migrations (task 5.1), the audit change
+        log, the advisory baseline drift gate, and marker-driven recovery on re-run.* MAY record an **ids-only audit change log** (`id + op`,
         no before-images) for observability; rollback needs no before-images (Proposal 002). Close the
         marker. Handles the versioned advance and the dev → versioned promotion; refuses downgrade,
         same-semver/different-hash, and re-stamp back to `dev`; the only verb that authoritatively advances
@@ -180,9 +181,11 @@ multi-consumer decision) are out of scope.
         apply of the retained revision), then `complete_rollback` clears the marker and consumes the
         checkpoint. Tests: `begin_rollback_repins_to_checkpoint_and_completes`,
         `begin_rollback_without_checkpoint_errors`, `rollback_refuses_without_a_checkpoint`,
-        `rollback_repins_to_the_checkpoint_engine`. *Remaining: the two-binary orchestration (`tkr` relaunches
-        A for the reconcile), the real `destroy_selected` delete-only over live resources, both-binary
-        checksum verification, and holding the operation lock across the sequence (12.2).* Preconditions
+        `rollback_repins_to_the_checkpoint_engine`. *Remaining (→ task 19.3): the two-binary orchestration
+        (`tkr` relaunches A for the reconcile), the real `destroy_selected` delete-only over live resources,
+        and both-binary checksum verification. (The single-process lock across the sequence is DONE via 12.2
+        + `main.rs`'s `with_operation_lock`; holding it across the two-binary relaunch is part of 19.3.)*
+        Preconditions
         (exhaustive, before any destructive work): acquire the remote
         operation lock (task 12), verify **both** binaries' checksums, confirm the checkpoint + retained
         prior configuration revision exist, persist the operation marker. Undo (B): `destroy_selected`
@@ -221,14 +224,15 @@ multi-consumer decision) are out of scope.
         reconcile).*
   - [~] 9.2 Relocate the deployment-lifecycle verbs to forward to `tkp` (build phase: move, don't shim);
         keep `tkr deployment create|list|use|lock|unlock|destroy`, dev/ci/compat/workstation, `version`,
-        `config`, and `image build` owned by `tkr`; `image push|mirror` forward to `tkp` (Req 7.3, 7.4).
-        PARTIAL (ECS-safe increment, by explicit scope decision): added `tkr deployment
-        describe|apply|upgrade|rollback` forwarding through the launcher to the bound `tkp`. The
-        pre-existing in-process verbs (`infra`, `deploy`, `scale`, `schema`, `image push|mirror`) are
-        deliberately UNCHANGED: `tkp` does not yet carry `scale`/`schema`/`image` (deferred with ECS), and
-        `tkr`'s `compose` platform is the legacy `ComposeDeployment` (`deployment.toml`), not `tkp`'s
-        compose-syn (`definition.tkd`) — only `local` deployments forward transparently today. *The full
-        move-don't-shim relocation lands with ECS + tkp verb parity.*
+        `config`, `schema` (DSQL, `tkr`-native), and **all** image ops (`image build`/`push`/`mirror`) owned
+        by `tkr` (Req 7.3, 7.4). PARTIAL (ECS-safe increment, by explicit scope decision): added `tkr
+        deployment describe|apply|upgrade|rollback` forwarding through the launcher to the bound `tkp`. The
+        pre-existing in-process verbs (`infra`, `deploy`, `scale`) are
+        deliberately UNCHANGED: `tkp` does not yet carry `scale` (deferred with ECS); `schema` and all image
+        ops stay `tkr`-owned and are never forwarded to `tkp`. `tkr`'s `compose` platform is the legacy
+        `ComposeDeployment` (`deployment.toml`), not `tkp`'s compose-syn (`definition.tkd`) — only `local`
+        deployments forward transparently today. *The full move-don't-shim relocation lands with ECS + tkp
+        verb parity.*
 
 - [x] 10. Deployment lock (Requirement 8)
   - [x] 10.1 Add `tkr deployment lock [<name>]` / `unlock`: write/clear a durable `lock.toml` (name +
@@ -433,7 +437,7 @@ multi-consumer decision) are out of scope.
         `apps/tkp` — the mutating-verb contract, binding-gate orchestration, operation-lock wrapper, state
         envelope, `describe`, Day-0 stamp, `config_history`, and the clap dispatch — generic over a
         `ProvisionerPlatform` seam whose methods are the **platform-realized** verbs
-        (`infra_plan|apply|destroy`, `deploy_plan|apply`, `scale`, `schema_apply`, `image_push|mirror`),
+        (`infra_plan|apply|destroy`, `deploy_plan|apply`, `scale`),
         each able to return a first-class `NotApplicable` (+ `label`). Depends on `tokeira-provisioner`
         (domain); NOT folded into it. Refit the current `apps/tkp` as the first consumer (Local + ComposeSyn
         impls) with **no behavior change** — workspace green. _Requirements: 14.2_
@@ -442,11 +446,12 @@ multi-consumer decision) are out of scope.
         operator `tkp init` verb. _Requirements: 7.3, 6.5_
   - [ ] 15.3 Implement the **full** lifecycle surface — no verb is "planned" (design §Command behaviour and
         outputs): the mutating-verb contract (gate → lock → plan → confirm → apply → revision/envelope →
-        report) for `infra apply|destroy`, `deploy apply`, `scale`, `schema apply`, `image push|mirror`,
-        `revert`, `upgrade`, `rollback`, `resume`; the read-only verbs (`describe`, `infra/deploy plan`);
-        and `describe`'s **two views** — operator (default, short) and verification/debug (`--json`;
-        `--verbose` human). Conditional verbs return `NotApplicable` cleanly (e.g. `schema` on in-memory).
-        _Requirements: 13.2, 14.1_
+        report) for `infra apply|destroy`, `deploy apply`, `scale`, `revert`,
+        `upgrade`, `rollback`; the read-only verbs (`describe`, `infra/deploy plan`); and
+        `describe`'s **two views** — operator (default, short) and verification/debug (`--json`;
+        `--verbose` human). Conditional verbs return `NotApplicable` cleanly (e.g. `scale` where the
+        platform has no scale dimension). Database schema is **out of scope** (`tokeira-storage`-owned,
+        applied by `tokeirad`) — no `schema` verb, no `tokeira-storage` link. _Requirements: 13.2, 14.1_
   - [ ] 15.4 Split into per-platform binaries: `apps/tkp-compose` (`tokeira-provisioner-cli` + a
         `ComposePlatform` seam impl + `tokeira-compose-syn`/`-compose`/`-iac`/`-orchestrator`, **no `local`**)
         and `apps/tkp-local`; retire the bundled `apps/tkp`. _Requirements: 14.1_
@@ -499,6 +504,37 @@ multi-consumer decision) are out of scope.
   - [ ] 18.4 Thin GitHub Action → Buildkite trigger (optional dispatch/approval front-end only, never the
         build implementation or artifact channel). _Requirements: 15.1_
 
+- [ ] 19. Complete the revisions & ownership verbs (Requirements 4, 9, 13; Proposal 002)
+      The verbs are wired and their envelope state-machines are tested, but exercised only against the
+      `local` platform's empty apply. This task brings them to completion against real platforms.
+      (`revert` (task 14.3) is already complete as a single-binary flow; its only remaining dependency is
+      that the platform `apply` it drives becomes real — covered by task 15 + the compose-syn exercise.)
+      `resume` is **dropped** — recovery is by re-running the interrupted verb (19.4).
+  - [ ] 19.1 `describe` — **two views** (design §Command behaviour and outputs). Split today's single
+        consolidated view into a short **operator** view (default: name/id, platform, storage, short engine
+        identity, binding status, `config_revision`, health, last operation) and a **verification/debug**
+        view (`--verbose`; `--json` already emits the full record): the complete per-artifact integrity
+        manifest (SHA-256), the closure-scoped `EngineIdentity` fields (task 16), the source-snapshot ref
+        (task 17), the retained-revision list, and the operation marker + lock holder. Never gates.
+        _Requirements: 13.2_ (depends on 16, 17 for the identity/snapshot fields)
+  - [ ] 19.2 `upgrade` — real cross-engine re-provisioning. Dispatch "apply B's plan" through the
+        per-platform seam (task 15) so a versioned advance reconciles the **real** footprint (compose-syn),
+        not `local`'s empty apply; populate the `MigrationRegistry` (task 5.1) so a state-schema transition
+        actually migrates the envelope/state docs; record the ids-only audit change log; add the advisory
+        baseline drift gate (refuse-and-surface live drift from `[A final]`, Req 4.7). _Requirements: 4.5,
+        4.6, 4.7, 9_ (depends on 15)
+  - [ ] 19.3 `rollback` — two-binary orchestration + real resources. `tkr` relaunches `A` to perform the
+        reconcile after `B`'s re-pin (today `B` runs the whole sequence in one process); implement the real
+        `Engine::destroy_selected` delete-only pass over live resources (`keys(S_B) − keys(S_A)`, reverse-dep
+        order, fail-closed, idempotent); verify **both** binaries' checksums before any destructive work;
+        hold the operation lock across the relaunch boundary (extend 12.2 from single-process to two-binary).
+        _Requirements: 9; Proposal 002_ (depends on 15 and the `tkr` launcher, tasks 9/10)
+  - [ ] 19.4 Marker-driven recovery (**replaces the dropped `resume` verb**). An interrupted `upgrade`/
+        `rollback` is recovered by **re-running that same verb**: its steps are idempotent and read the
+        operation marker's `phase` to skip completed work. While a marker is open, only the in-flight verb
+        (re-run resumes), `rollback` (abort an interrupted upgrade forward to A), and `describe` are
+        permitted; every other mutating verb refuses. Remove the `tkp resume` stub. _Requirements: 9.7, 11_
+
 ## Task Dependency Graph
 
 ```json
@@ -513,7 +549,8 @@ multi-consumer decision) are out of scope.
     { "wave": 7, "tasks": ["9", "9.1", "9.2", "10", "10.1", "10.2"] },
     { "wave": 8, "tasks": ["7", "7.1"] },
     { "wave": 9, "tasks": ["15", "15.1", "15.2", "15.3", "15.4", "15.5"] },
-    { "wave": 10, "tasks": ["16", "16.1", "16.2", "17", "17.1", "17.2", "18", "18.1", "18.2", "18.3", "18.4"] }
+    { "wave": 10, "tasks": ["16", "16.1", "16.2", "17", "17.1", "17.2", "18", "18.1", "18.2", "18.3", "18.4"] },
+    { "wave": 11, "tasks": ["19", "19.1", "19.2", "19.3", "19.4"] }
   ]
 }
 ```
@@ -563,8 +600,9 @@ multi-consumer decision) are out of scope.
   real exercise of this is the ECS platform bring-up, which runs entirely in the dev regime; its expected
   fix-and-reapply churn is absorbed by `DevIterate` without versioning friction.
 - The provisioner is a **new, deployment-married binary** (`apps/tkp`, binary `tkp` — small-form sibling
-  of `tkr`) with a specialized lifecycle CLI — `describe`, `plan`, `apply`, `destroy`, `scale`, `schema`,
-  `status`, deployment-scoped `image push|mirror`, and the version-transition verbs `upgrade`/`rollback`.
+  of `tkr`) with a specialized lifecycle CLI — `describe`, `plan`, `apply`, `destroy`, `scale`, and the
+  version-transition verbs `upgrade`/`rollback` (DSQL `schema` and all image ops are `tkr`-owned, not `tkp`
+  verbs).
   It
   is **not** `tkr` with fewer flags presented to operators; operators drive `tkr`'s existing command
   structure and `tkr` forwards lifecycle verbs to the checksum-verified `tkp`. `tkr` never mutates a
@@ -587,9 +625,10 @@ multi-consumer decision) are out of scope.
 - The deployment **lock** (`tkr deployment lock`/`unlock`) is a durable, cross-session mis-apply guard
   (name + identity fingerprint in `lock.toml`), orthogonal to the version-binding gate: it confines
   mutation to the locked deployment, never blocks reads, and fails closed on a stale/changed lock.
-- Image scoping: `image push`/`mirror` are deployment-scoped (they target the deployment's own ECR and
-  write back its config) and live on the provisioner surface; `image build` builds from workspace sources
-  and stays on `tkr`.
+- Image scoping: **all** image operations (`image build`, `image push`, `image mirror`) live on `tkr`;
+  `tkp` provisions the registry (an infra resource) but never populates it, so it carries no image verb. A
+  `tkr image push` writes the resolved digest into config, which `tkp` reconciles on its next apply as an
+  ordinary config revision.
 - The state-format `schema_version` (serialization shape) and the CAS generation (concurrency token) are
   distinct from the provisioner provenance version; do not conflate the three.
 - Trust always flows from the CAS-guarded manifest checksum, never from a stored or fetched binary blob.

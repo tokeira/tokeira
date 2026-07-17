@@ -8,7 +8,9 @@
 //! This is the scaffold. `describe` (read-only, never gates) is implemented and
 //! exercises the provisioner foundation — provenance stamping, the binding gate,
 //! the integrity verifier, and the deployment state envelope. The applying verbs
-//! (`apply`/`upgrade`/`rollback`/`resume`) land with the engine wiring.
+//! (`apply`/`upgrade`/`rollback`) land with the engine wiring. An interrupted
+//! `upgrade`/`rollback` recovers by re-running that verb (idempotent, marker-driven);
+//! there is no separate `resume` verb.
 
 use std::path::{Path, PathBuf};
 
@@ -64,8 +66,6 @@ enum Command {
     Upgrade(LifecycleArgs),
     /// Roll back to the retained prior configuration revision. (Not yet implemented.)
     Rollback(LifecycleArgs),
-    /// Resume an interrupted operation. (Not yet implemented.)
-    Resume(LifecycleArgs),
 }
 
 #[derive(Args)]
@@ -139,10 +139,6 @@ async fn main() -> Result<()> {
             let dir = args.deployment_dir;
             lock::with_operation_lock(&dir, "rollback", || rollback::rollback(&dir)).await
         }
-        Command::Resume(_) => anyhow::bail!(
-            "not yet implemented: `resume` (continuing an interrupted operation from the marker) \
-             is a follow-on — describe/apply/upgrade/rollback are available today"
-        ),
     }
 }
 

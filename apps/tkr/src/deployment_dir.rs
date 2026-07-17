@@ -159,8 +159,9 @@ impl DeploymentResolver {
             )
         })?;
         let dest = self.path(name).join(PROVISIONER_BIN);
-        fs::copy(&source, &dest)
-            .with_context(|| format!("failed to copy {} -> {}", source.display(), dest.display()))?;
+        fs::copy(&source, &dest).with_context(|| {
+            format!("failed to copy {} -> {}", source.display(), dest.display())
+        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

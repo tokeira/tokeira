@@ -238,7 +238,11 @@ fn forwarded_infra_verb(action: &InfraAction) -> (&'static str, Vec<String>) {
         InfraAction::Apply { .. } => ("apply", Vec::new()),
         InfraAction::Destroy { yes, .. } => (
             "destroy",
-            if *yes { vec!["--yes".to_string()] } else { Vec::new() },
+            if *yes {
+                vec!["--yes".to_string()]
+            } else {
+                Vec::new()
+            },
         ),
         InfraAction::Status => ("describe", Vec::new()),
     }
@@ -855,13 +859,25 @@ mod tests {
         let dir = deployments.path("test-compose");
 
         let tkd = fs::read_to_string(dir.join("definition.tkd")).unwrap();
-        assert!(tkd.contains("fn deployment"), "seeds the compose `.tkd` structure");
-        assert!(tkd.contains("Storage::InMemory"), "in-memory keeps the shipped config()");
+        assert!(
+            tkd.contains("fn deployment"),
+            "seeds the compose `.tkd` structure"
+        );
+        assert!(
+            tkd.contains("Storage::InMemory"),
+            "in-memory keeps the shipped config()"
+        );
         assert!(tkd.contains("Observability"), "and the platform's kinds");
         // Server config is seeded (prototypical, editable pre-apply); no legacy
         // in-process `deployment.toml`.
-        assert!(dir.join(TOKEIRAD_TOML).exists(), "seeds a prototypical tokeirad.toml");
-        assert!(!dir.join(DEPLOYMENT_TOML).exists(), "no legacy deployment.toml");
+        assert!(
+            dir.join(TOKEIRAD_TOML).exists(),
+            "seeds a prototypical tokeirad.toml"
+        );
+        assert!(
+            !dir.join(DEPLOYMENT_TOML).exists(),
+            "no legacy deployment.toml"
+        );
         assert!(dir.join("state").exists(), "state dir created");
     }
 }

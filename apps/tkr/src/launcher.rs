@@ -29,7 +29,6 @@ use anyhow::{Context, Result, bail};
 use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, Target};
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchClass {
     Bound,

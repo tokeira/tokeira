@@ -42,7 +42,7 @@ release-signing infrastructure, and the single-shared-binary-vs-SDK multi-consum
 
 `tkp` is married to one deployment and exposes a **lifecycle-only** surface. The operator/global surface —
 `deployment create|list|use|lock|unlock|destroy`, `dev`, `ci`, `compat`, `workstation`, `version`,
-`config`, and `image build` — lives only on `tkr`. `tkp`'s verbs are **namespaced to mirror `tkr`**, so an
+`config`, `schema`, and all image ops (`image build`/`push`/`mirror`) — lives only on `tkr`. `tkp`'s verbs are **namespaced to mirror `tkr`**, so an
 operator only ever types `tkr` and forwarding is a transparent pass-through (`tkr infra plan` →
 `tkp infra plan`; Req 7.3):
 
@@ -58,30 +58,36 @@ tkp --deployment-dir <dir> <command>
   deploy plan            preview the workload Delta; read-only
   deploy apply           reconcile the workload to desired; gated + locked
   scale <dim>=<n> …      change workload capacity; a config-revision + workload apply; gated + locked
-  schema apply           apply the storage schema (DSQL); gated + locked; NotApplicable on in-memory
-
-  # Registry — the deployment's own image supply
-  image push             push the workspace image to the deployment's registry; writes back the ref
-  image mirror           mirror external base/dependency images into that registry
 
   # Revisions & ownership — advance, restore, recover
   describe [--json]      identity + provenance + binding + state; two views; never gates
   revert --to <rev>      restore a prior config revision; same-engine re-apply; gated + locked
   upgrade                advance to a new engine identity (candidate B); gated + locked (Req 9)
   rollback               forward-reconcile to the retained prior revision (Proposal 002)
-  resume                 resume an interrupted operation from the operation marker
 ```
 
+Recovery from an interrupted `upgrade`/`rollback` is **re-running that same verb** — its steps are
+idempotent and read the operation marker to skip completed work; there is no separate `resume` verb.
+
 Full behaviour, outputs, gating, and locking for each verb are specified in
-**§Command behaviour and outputs**. Three structural rules the shape encodes:
+**§Command behaviour and outputs**. Five structural rules the shape encodes:
 
 - **No operator `init`.** The Day-0 provenance stamp + integrity manifest are written as an *internal* step
   of `tkr deployment create` inception (Req 6.5), not a verb an operator types.
 - **`describe` never gates.** It is the deployment-scoped counterpart to `tkr version` and must report
   precisely when the applying verbs would refuse — so diagnosis works on a drifted or mismatched deployment.
 - **Verbs are complete but conditionally realized.** The surface is the same for every platform; where a
-  platform or storage cannot honor a verb (e.g. `schema` on in-memory storage), the verb returns a
+  platform cannot honor a verb (e.g. `scale` on a platform with no scale dimension), the verb returns a
   first-class **`NotApplicable`** result — never a missing subcommand and never a crash.
+- **Database schema is out of scope.** `tkp` provisions the DSQL cluster as an *infrastructure resource*,
+  but applying the database schema/migrations is application-runtime state owned by `tokeira-storage` and
+  applied when `tokeirad` connects — not a provisioning step. So `tkp` exposes **no `schema` verb** and does
+  **not** link `tokeira-storage`; this also keeps a schema migration from masquerading as an
+  engine-identity change (it is neither engine code nor desired-state config that `tkp` reconciles).
+- **Image supply is entirely `tkr`.** `image build`, `image push`, and `image mirror` all live on `tkr` —
+  `tkp` provisions the registry (an infra resource) but never populates it, so it carries **no image verb**.
+  A `tkr image push` writes the resolved digest into the deployment's config; `tkp` reconciles that on its
+  next apply as an ordinary config revision, so image supply needs no `tkp` surface.
 
 Every command takes `--deployment-dir` (the deployment it operates on); because `tkr` places `tkp` *inside*
 that dir, the same bytes always operate the same deployment. Which binary actually runs for a given verb —
@@ -263,18 +269,21 @@ The operator only ever types `tkr`. `tkr` owns the registry and global tasks out
 lifecycle verbs to the bound `tkp`:
 
 - **Owned by `tkr`:** `deployment create | list | use | lock | unlock | destroy`, `dev`, `ci`, `compat`,
-  `workstation`, `version`, `config`, and `image build` (builds from workspace sources; needs the source
-  tree, not a deployment).
-- **Forwarded to `tkp`:** `infra plan|apply|destroy`, `deploy plan|apply`, `scale`, `schema`,
-  `image push|mirror`, and `deployment describe | upgrade | rollback`.
+  `workstation`, `version`, `config`, `schema` (DSQL schema setup/status — a `tkr`-native command that
+  connects to the deployment's store directly; **never a `tkp` verb**, so `tkp` needs no `tokeira-storage`
+  link), and **all** image operations — `image build` (workspace sources), `image push` (the deployment's
+  workload image to its registry), and `image mirror` (external base/dependency images). `tkp` carries no
+  image verb.
+- **Forwarded to `tkp`:** `infra plan|apply|destroy`, `deploy plan|apply`, `scale`, and
+  `deployment describe | upgrade | rollback`.
 
 `tkp` carries the lifecycle-only surface enumerated in [§`tkp` command structure](#tkp-command-structure)
 (namespaced to mirror `tkr`) — never the operator/global surface.
 `describe` is the deployment-scoped counterpart to `tkr version`: it reports identity, recorded
 provenance, the binding verdict, the integrity manifest, and state facts, honors `--json`, and never
-gates (it must work precisely when the applying verbs would refuse). `image push`/`mirror` are
-deployment-scoped (they target the deployment's own ECR and write back its config); `image build` is a
-workspace concern and stays on `tkr`.
+gates (it must work precisely when the applying verbs would refuse). **All** image operations
+(`image build`, `image push`, `image mirror`) stay on `tkr`; `tkp` provisions the registry but never
+populates it — a `tkr image push` writes the digest into config, which `tkp` reconciles on its next apply.
 
 `tkr` resolves which binary to run by **launch class**:
 
@@ -321,13 +330,14 @@ even on a gate mismatch**, so an operator can diagnose a refusal.
 | `deploy plan` | read-only | report | no | As `infra plan`, over the workload (tokeirad services) universe. |
 | `deploy apply` | mutating | block | yes | Reconcile the workload to desired. Output as `infra apply`. |
 | `scale` | mutating | block | yes | Fold `<dim>=<n>` into a config revision, then a workload apply. Output: capacity Delta + new revision. `NotApplicable` if the platform has no scale dimension. |
-| `schema apply` | mutating | block | yes | Apply the storage schema/migrations to the managed store (DSQL). `NotApplicable` when storage is in-memory. Output: migrations applied + resulting schema version. |
-| `image push` | mutating | block | yes | Push the workspace image to the deployment's own registry; write the resolved digest ref back into config (a config revision). Output: pushed ref. |
-| `image mirror` | mutating | block | yes | Mirror external base/dependency images into that registry. Output: mirrored refs. |
 | `revert --to <rev>` | mutating | block | yes | Restore revision `<rev>`'s retained config source and re-apply with the **same** engine; produces a *new* forward revision equal to `<rev>` (Req 13.3). Refuses a non-prior or unretained target. |
 | `upgrade` | mutating | permit `Candidate` | yes | Runs candidate **B** (launch class Candidate-upgrade); migrates A→B, re-records the manifest for B, stamps the transition. Sequence in §Upgrade and rollback. |
 | `rollback` | mutating | permit `Rollback` | yes (continuous) | B undoes what it created; the binding re-pins to A; A forward-reconciles its retained prior revision. One lock across the whole sequence (12.2). |
-| `resume` | recovery | per marker | yes | Read the operation marker; resume or safely unwind an interrupted upgrade/rollback. Output: what was resumed and the resulting binding. |
+
+An interrupted `upgrade`/`rollback` has **no dedicated recovery verb**: re-running the same verb resumes it
+(idempotent steps keyed to the marker's recorded phase), and while a marker is open only that verb,
+`rollback` (to abort an interrupted upgrade forward to A), and `describe` are permitted — every other
+mutating verb refuses.
 
 **`describe` — two views.** `describe` answers "what is this deployment, and can it be operated?" in two
 registers over the *same* envelope, and never gates in either:
@@ -357,9 +367,10 @@ lifting. Upgrade and rollback add only orchestration on top of it.
 binary authorized to operate — `A` *or* `B`, never a third "pending" value. Whether an upgrade or
 rollback is mid-flight is a separate **operation marker** (`UpgradeInFlight | RollbackInFlight | none`)
 recording the phase and resumable progress (and, optionally, an ids-only audit change log — never
-before-images). The marker — not the binding — gates the deployment to
-`resume`/`rollback`/`describe` while an operation is open; the remote operation lock provides mutual
-exclusion. Splitting these two concerns removes any ambiguous binding state.
+before-images). The marker — not the binding — gates the deployment while an operation is open: only the
+in-flight verb (`upgrade` or `rollback`, whose re-run resumes it), `rollback` (to abort an interrupted
+upgrade forward to A), and `describe` are permitted; the remote operation lock provides mutual exclusion.
+Splitting these two concerns removes any ambiguous binding state.
 
 **Upgrade transfers ownership atomically, *before* mutating.** The first act of `upgrade` is a single CAS
 commit that, together: flips the binding to **B**, captures a clone of **[A final]** as the checkpoint
@@ -519,9 +530,9 @@ S3 binary + config retention is what makes it self-contained.
   `crates/tokeira-provisioner`.
 - **Operation** — the in-flight marker: `{ operation_id, kind: UpgradeInFlight | RollbackInFlight,
   phase, progress }` (resumable step markers; optionally an ids-only `ChangeLog`, never before-images).
-  While present it gates the deployment to
-  `resume`/`rollback`/`describe`; it records progress so an interrupted upgrade or rollback resumes; it
-  closes on success. `None` in steady state.
+  While present it gates the deployment to the in-flight verb (re-run resumes it), `rollback`, and
+  `describe`; it records progress so an interrupted upgrade or rollback resumes on re-run; it closes on
+  success. `None` in steady state.
 - **OperationLock** — `{ holder, acquired_at, renewed_at, expires_at, operation }`. The remote
   mutual-exclusion lease (distinct from the operator `lock.toml`).
 - **DeploymentStateEnvelope** — the single deployment-level authority: `{ schema_version, deployment_id,
@@ -588,8 +599,8 @@ platform-realized surface. So:
   read-only verbs (§Command behaviour and outputs), the binding-gate orchestration, the operation-lock
   wrapper, the state envelope, `describe` (two views), the internal Day-0 stamp, `config_history`, and the
   clap dispatch, generic over a `ProvisionerPlatform` seam whose methods are the platform-realized verbs —
-  `infra_plan|apply|destroy`, `deploy_plan|apply`, `scale`, `schema_apply`, `image_push|mirror` (each able to
-  return `NotApplicable`) — plus `label`. It depends on `tokeira-provisioner` (the domain library: stamps,
+  `infra_plan|apply|destroy`, `deploy_plan|apply`, `scale` (each able to return `NotApplicable`) — plus
+  `label`. It depends on `tokeira-provisioner` (the domain library: stamps,
   binding, integrity, migration) — the shell is a distinct layer, not folded in.
 - **`apps/tkp-compose`** (bin, `tkp-compose`) = `tokeira-provisioner-cli` + a `ComposePlatform` impl of the
   seam + `tokeira-compose-syn`/`-compose`/`-iac`/`-orchestrator`. **No `local`.** `apps/tkp-local` mirrors
@@ -801,7 +812,7 @@ required, and the `config_revision` SHALL advance. Reverting to a prior config r
 | `rollback`, a B-authored resource kind B can no longer instantiate | Refuse (fail closed); surface it rather than dropping it (Req 9.6). |
 | `upgrade` begins | First act is one atomic CAS commit: binding → B, capture [A final] checkpoint, open the operation marker — *before* any provider mutation; a crash thereafter recovers as B, never A (Req 4). |
 | `upgrade`, live diverges from recorded [A final] | Advisory baseline gate MAY refuse-and-surface ("reconcile before upgrading"); it never lets B authoritatively reconcile A's drift (Req 4). |
-| `upgrade` or `rollback` interrupted | Resume from the operation marker (`phase` + resumable step markers; every step idempotent); the binding already names the operating binary, so recovery relaunches the correct one (Req 9.7). |
+| `upgrade` or `rollback` interrupted | Re-run the interrupted verb; its idempotent, marker-driven steps resume from the recorded `phase` (no separate `resume` verb). The binding already names the operating binary, so recovery relaunches the correct one (Req 9.7). |
 | Delete id absent from `known` | Error; never remove from state without deleting the live resource (Req 10.1). |
 | `describe()` `Unsupported` | Do not prune; drive `delete()` from persisted state or fail (Req 10.3). |
 | Two concurrent mutations of one deployment | Second refuses/waits on the remote operation lock (Req 11). |

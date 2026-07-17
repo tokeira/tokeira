@@ -129,6 +129,35 @@ pub struct KeySpec {
 /// `Wired` set always equals the set of keys a real accessor reads — which is
 /// exactly the honesty boundary the spec requires.
 pub static KEY_CLASSIFICATION: &[KeySpec] = &[
+    // The Nexus HTTP authorization adapter consults this gate live before it
+    // surfaces an authorizer failure. Denials are never exposed by the gate.
+    KeySpec {
+        key: "frontend.exposeAuthorizerErrors",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
+    // Task-token namespace mismatch validation is a frontend admission rule
+    // read after authorization, matching the v1.31.0 interceptor gate.
+    KeySpec {
+        key: "frontend.enableTokenNamespaceEnforcement",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
+    // Temporal scopes this gate per namespace. Tokeira's harness registry is
+    // intentionally process-global, so the override collapses that scope while
+    // the static production setting remains `[policy.authorization].principal_attribution`.
+    KeySpec {
+        key: "frontend.enablePrincipalPropagation",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
+    // Cross-namespace workflow commands are re-authorized at the edge before
+    // their workflow-task completion reaches the authoritative runtime.
+    KeySpec {
+        key: "system.enableCrossNamespaceCommands",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
     // Workflow-rule CRUD and evaluation are namespace frontend policy. The
     // v1.31.0 corpus enables the otherwise-false gate in suite setup
     // (`service/frontend/workflow_handler.go:6985-7088 @ v1.31.0`).
@@ -452,6 +481,12 @@ mod tests {
         "system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute";
     const CALLBACK_ALLOWED_ADDRESSES_KEY: &str = "component.callbacks.allowedAddresses";
     const STANDALONE_ACTIVITIES_KEY: &str = "activity.enableStandalone";
+    const AUTH_BOOL_KEYS: &[&str] = &[
+        "frontend.enablePrincipalPropagation",
+        "frontend.exposeAuthorizerErrors",
+        "frontend.enableTokenNamespaceEnforcement",
+        "system.enableCrossNamespaceCommands",
+    ];
 
     /// The classification table is internally consistent: keys are unique, and
     /// the reported-problems threshold — the proving wired consumer — is present
@@ -473,6 +508,11 @@ mod tests {
             classification(STANDALONE_ACTIVITIES_KEY).expect("standalone activities classified");
         assert_eq!(standalone.disposition, Disposition::Wired);
         assert_eq!(standalone.value_type, ValueType::Bool);
+        for key in AUTH_BOOL_KEYS {
+            let auth = classification(key).expect("authorization key classified");
+            assert_eq!(auth.disposition, Disposition::Wired);
+            assert_eq!(auth.value_type, ValueType::Bool);
+        }
     }
 
     /// A fresh registry: set on a wired key is observed live; clear reverts to
@@ -500,6 +540,31 @@ mod tests {
             .expect("wired set");
         overrides.reset();
         assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+    }
+
+    #[test]
+    fn authorization_bool_keys_follow_registry_lifecycle() {
+        // Feature: authorization-foundation, Property 7: all four live auth
+        // gates share the same typed set/clear/reset semantics (Requirement 9).
+        let overrides = ConformanceOverrides::default();
+        for key in AUTH_BOOL_KEYS {
+            assert_eq!(overrides.get_bool(key), None);
+            overrides
+                .set(key, OverrideValue::Bool(true))
+                .expect("auth key is wired");
+            assert_eq!(overrides.get_bool(key), Some(true));
+            overrides.clear(key);
+            assert_eq!(overrides.get_bool(key), None);
+        }
+        for key in AUTH_BOOL_KEYS {
+            overrides
+                .set(key, OverrideValue::Bool(false))
+                .expect("auth key is wired");
+        }
+        overrides.reset();
+        for key in AUTH_BOOL_KEYS {
+            assert_eq!(overrides.get_bool(key), None);
+        }
     }
 
     /// Keys are matched case-insensitively. The fork bridge delivers

@@ -296,7 +296,12 @@ impl OperatorService {
     ) -> EdgeResult<DeleteNamespaceResponse> {
         let _ctx = self
             .interceptors
-            .begin(headers, None, Action::OperatorWrite, false)
+            .begin(
+                headers,
+                req.namespace.as_deref(),
+                Action::DeleteNamespace,
+                false,
+            )
             .await?;
         let config = self.namespace_deletion()?.clone();
 
@@ -388,7 +393,7 @@ impl OperatorService {
     pub async fn cluster_info(&self, headers: &HeaderMap) -> EdgeResult<ClusterInfo> {
         let _ctx = self
             .interceptors
-            .begin(headers, None, Action::OperatorRead, false)
+            .begin(headers, None, Action::GetClusterInfo, false)
             .await?;
 
         self.api.cluster_info().await.map_err(EdgeError::from)
@@ -401,7 +406,7 @@ impl OperatorService {
     ) -> EdgeResult<Vec<SearchAttributeDefinition>> {
         let _ctx = self
             .interceptors
-            .begin(headers, namespace, Action::OperatorRead, false)
+            .begin(headers, namespace, Action::ListSearchAttributes, false)
             .await?;
 
         self.api
@@ -418,7 +423,7 @@ impl OperatorService {
     ) -> EdgeResult<()> {
         let _ctx = self
             .interceptors
-            .begin(headers, Some(namespace), Action::OperatorWrite, false)
+            .begin(headers, Some(namespace), Action::AddSearchAttributes, false)
             .await?;
 
         self.api
@@ -435,7 +440,12 @@ impl OperatorService {
     ) -> EdgeResult<()> {
         let _ctx = self
             .interceptors
-            .begin(headers, Some(namespace), Action::OperatorWrite, false)
+            .begin(
+                headers,
+                Some(namespace),
+                Action::RemoveSearchAttributes,
+                false,
+            )
             .await?;
 
         self.api
@@ -445,8 +455,8 @@ impl OperatorService {
     }
 
     // === Nexus endpoint admin (global resources; authz-gated like every other
-    // operator RPC). Create/Update/Delete require `OperatorWrite`; Get/List require
-    // `OperatorRead`. `namespace = None` because endpoints are cluster-global. Each
+    // operator RPC). All five require cluster Admin in v1.31.0, including Get/List.
+    // `namespace = None` because endpoints are cluster-global. Each
     // first passes the operator interceptor, then delegates to the admin — closing
     // the gap where the bare gRPC stubs bypassed authorization entirely. ===
 
@@ -457,7 +467,7 @@ impl OperatorService {
     ) -> EdgeResult<tokeira_proto::operatorservice::CreateNexusEndpointResponse> {
         let _ctx = self
             .interceptors
-            .begin(headers, None, Action::OperatorWrite, false)
+            .begin(headers, None, Action::CreateNexusEndpoint, false)
             .await?;
         self.nexus_admin("create_nexus_endpoint")?.create(req).await
     }
@@ -469,7 +479,7 @@ impl OperatorService {
     ) -> EdgeResult<tokeira_proto::operatorservice::GetNexusEndpointResponse> {
         let _ctx = self
             .interceptors
-            .begin(headers, None, Action::OperatorRead, false)
+            .begin(headers, None, Action::GetNexusEndpoint, false)
             .await?;
         self.nexus_admin("get_nexus_endpoint")?.get(req).await
     }
@@ -481,7 +491,7 @@ impl OperatorService {
     ) -> EdgeResult<tokeira_proto::operatorservice::UpdateNexusEndpointResponse> {
         let _ctx = self
             .interceptors
-            .begin(headers, None, Action::OperatorWrite, false)
+            .begin(headers, None, Action::UpdateNexusEndpoint, false)
             .await?;
         self.nexus_admin("update_nexus_endpoint")?.update(req).await
     }
@@ -493,7 +503,7 @@ impl OperatorService {
     ) -> EdgeResult<tokeira_proto::operatorservice::DeleteNexusEndpointResponse> {
         let _ctx = self
             .interceptors
-            .begin(headers, None, Action::OperatorWrite, false)
+            .begin(headers, None, Action::DeleteNexusEndpoint, false)
             .await?;
         self.nexus_admin("delete_nexus_endpoint")?.delete(req).await
     }
@@ -505,7 +515,7 @@ impl OperatorService {
     ) -> EdgeResult<tokeira_proto::operatorservice::ListNexusEndpointsResponse> {
         let _ctx = self
             .interceptors
-            .begin(headers, None, Action::OperatorRead, false)
+            .begin(headers, None, Action::ListNexusEndpoints, false)
             .await?;
         self.nexus_admin("list_nexus_endpoints")?.list(req).await
     }

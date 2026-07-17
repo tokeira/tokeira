@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use tokeira_kernel::StartRequest;
 use tokeira_runtime::StartedWorkflowTask;
 use tokeira_storage::RunRepository;
+use tokeira_types::NamespaceId;
 
 use crate::{
     translate::{
@@ -39,11 +40,16 @@ pub fn signal_response(outcome: WorkflowMutationOutcome) -> SignalWorkflowExecut
 pub async fn poll_response(
     started: StartedWorkflowTask,
     repo: &dyn RunRepository,
+    namespace_id: NamespaceId,
 ) -> Result<PollWorkflowTaskQueueResponse> {
     let after_event_id = workflow_task_history_after_event_id(&started);
-    let mut history = repo
-        .read_history(started.run_key, after_event_id, usize::MAX)
+    let attributed_history = repo
+        .read_attributed_history(started.run_key, after_event_id, usize::MAX)
         .await?;
+    let (mut history, mut history_principals): (Vec<_>, Vec<_>) = attributed_history
+        .into_iter()
+        .map(|attributed| (attributed.event, attributed.principal))
+        .unzip();
     // Transient-suffix synthesis (spec transient-wft Req B.7): a transient
     // (attempt>1) task's Scheduled/Started events are never persisted — the
     // poll response synthesizes them at the virtual ids so the worker's
@@ -68,6 +74,7 @@ pub async fn poll_response(
                 attempt: started.token.attempt,
             },
         });
+        history_principals.push(None);
         history.push(tokeira_kernel::HistoryEvent {
             event_id: started.token.started_event_id,
             happened_at: started.started_time,
@@ -84,9 +91,10 @@ pub async fn poll_response(
                 suggest_continue_as_new: false,
             },
         });
+        history_principals.push(None);
     }
     Ok(PollWorkflowTaskQueueResponse {
-        task_token: serde_json::to_vec(&started.token)?,
+        task_token: crate::task_token::encode(started.token.clone(), namespace_id)?,
         started_event_id: started.token.started_event_id,
         previous_started_event_id: started.previous_started_event_id,
         attempt: started.token.attempt,
@@ -98,6 +106,7 @@ pub async fn poll_response(
             run_key: started.run_key,
             task_queue: started.task_queue.0,
             history,
+            history_principals,
         },
         query: None,
         queries: HashMap::new(),
@@ -129,11 +138,19 @@ pub fn completed_response(
     }
 }
 
+/// Project a started activity into the public poll response.
+///
+/// `workflow_namespace` is the admitted current namespace name, while
+/// `namespace_id` is sealed only into the task-token envelope. Keeping those
+/// inputs distinct prevents stable identity from leaking into the SDK-visible
+/// namespace field (`recordactivitytaskstarted/api.go:270 @ v1.31.0`).
 pub fn poll_activity_response(
     started: tokeira_runtime::StartedActivityTask,
+    namespace_id: NamespaceId,
+    workflow_namespace: &str,
 ) -> Result<crate::translate::PollActivityTaskQueueResponse> {
     Ok(crate::translate::PollActivityTaskQueueResponse {
-        task_token: serde_json::to_vec(&started.token)?,
+        task_token: crate::task_token::encode(started.token.clone(), namespace_id)?,
         activity_id: started.activity_id,
         run_id: started.run_id,
         activity_type: started.activity_type,
@@ -141,7 +158,7 @@ pub fn poll_activity_response(
         attempt: started.attempt,
         workflow_id: started.workflow_id,
         workflow_type: started.workflow_type,
-        workflow_namespace: started.workflow_namespace,
+        workflow_namespace: workflow_namespace.to_owned(),
         run_key: started.run_key,
         header: started.header,
         retry_policy: started.retry_policy,
@@ -263,12 +280,13 @@ pub fn update_response(
 mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
-    use tokeira_runtime::StartedWorkflowTask;
+    use tokeira_runtime::{StartedActivityTask, StartedWorkflowTask};
     use tokeira_types::{
-        LogicalTaskSeq, RunKey, ShardEpoch, TaskQueueName, WorkflowId, WorkflowTaskToken,
+        ActivityTaskToken, LogicalTaskSeq, Payloads, RunId, RunKey, ShardEpoch, TaskQueueName,
+        WorkflowId, WorkflowTaskToken,
     };
 
-    use super::workflow_task_history_after_event_id;
+    use super::{poll_activity_response, workflow_task_history_after_event_id};
 
     fn started_task(previous_started_event_id: i64, is_sticky_match: bool) -> StartedWorkflowTask {
         let run_key = RunKey::new();
@@ -293,7 +311,40 @@ mod tests {
         }
     }
 
+    fn started_activity_task() -> StartedActivityTask {
+        let run_key = RunKey::new();
+        StartedActivityTask {
+            run_key,
+            run_id: RunId(uuid::Uuid::nil()),
+            activity_id: "activity".to_owned(),
+            activity_type: "activity-type".to_owned(),
+            task_queue: TaskQueueName("queue".to_owned()),
+            token: ActivityTaskToken {
+                run_key,
+                activity_id: "activity".to_owned(),
+                schedule_event_id: 5,
+                attempt: 1,
+                shard_epoch: ShardEpoch::ZERO,
+            },
+            input: Payloads::default(),
+            attempt: 1,
+            workflow_id: "workflow".to_owned(),
+            workflow_type: "workflow-type".to_owned(),
+            header: None,
+            retry_policy: None,
+            heartbeat_details: None,
+            scheduled_time: OffsetDateTime::UNIX_EPOCH,
+            current_attempt_scheduled_time: Some(OffsetDateTime::UNIX_EPOCH),
+            started_time: OffsetDateTime::UNIX_EPOCH,
+            schedule_to_close_timeout: None,
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+        }
+    }
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
         #[test]
         fn partial_history_offset_requires_sticky_match(previous_started_event_id in -10i64..10_000, is_sticky_match in any::<bool>()) {
             let started = started_task(previous_started_event_id, is_sticky_match);
@@ -304,6 +355,27 @@ mod tests {
             };
 
             prop_assert_eq!(workflow_task_history_after_event_id(&started), expected);
+        }
+
+        // Feature: authorization-foundation, correction property: activity namespace projection
+        #[test]
+        fn activity_response_uses_namespace_name_not_stable_id(
+            namespace in "[a-z][a-z0-9-]{0,31}"
+        ) {
+            let namespace_id = crate::translate::to_internal::namespace_id_for(&namespace);
+            let response = poll_activity_response(
+                started_activity_task(),
+                namespace_id,
+                &namespace,
+            )
+            .expect("activity response translates");
+
+            prop_assert_eq!(response.workflow_namespace, namespace);
+            let (_, token_namespace_id) = crate::task_token::decode::<ActivityTaskToken>(
+                &response.task_token,
+            )
+            .expect("activity token decodes");
+            prop_assert_eq!(token_namespace_id, Some(namespace_id));
         }
     }
 }

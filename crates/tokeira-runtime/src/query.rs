@@ -142,6 +142,7 @@ mod tests {
             request: RequestContext {
                 request_id: RequestId(format!("req-{wf_id}")),
                 caller_identity: None,
+                principal: None,
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),
@@ -582,6 +583,7 @@ mod tests {
                     request: RequestContext {
                         request_id: RequestId("term".into()),
                         caller_identity: None,
+                        principal: None,
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -660,6 +662,9 @@ mod tests {
                 commands: Vec::new(),
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: OffsetDateTime::now_utc(),
             })
             .await

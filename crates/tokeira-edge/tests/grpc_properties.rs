@@ -564,6 +564,7 @@ fn expected_code(err: &EdgeError) -> Code {
         EdgeError::QueryFailed { .. } => Code::InvalidArgument,
         EdgeError::QueryTimedOut => Code::DeadlineExceeded,
         EdgeError::Unauthorized(_) => Code::Unauthenticated,
+        EdgeError::PermissionDenied { .. } => Code::PermissionDenied,
         EdgeError::Forbidden { .. } => Code::PermissionDenied,
         EdgeError::NamespaceNotFound(_)
         | EdgeError::WorkflowNotFound { .. }
@@ -912,6 +913,7 @@ fn arb_poll_response() -> impl Strategy<Value = PollWorkflowTaskQueueResponse> {
                     run_id: RunId(Uuid::from_u128(run_key)),
                     task_queue,
                     history: Vec::new(),
+                    history_principals: Vec::new(),
                 },
                 query: None,
                 queries: Default::default(),
@@ -1820,7 +1822,7 @@ proptest! {
         let edge =
             respond_activity_completed_to_edge(proto)
                 .unwrap();
-        prop_assert_eq!(edge.token, token);
+        prop_assert_eq!(deserialize_activity_token(&edge.task_token).unwrap(), token);
     }
 }
 

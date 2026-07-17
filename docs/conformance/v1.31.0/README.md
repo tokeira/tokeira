@@ -42,9 +42,10 @@ The surface is defined across three companion pages, partitioned by Temporal's o
 - **[`excluded.md`](./excluded.md)** — what is outside the surface, with factual reasons: features
   Temporal labels **experimental / pre-release**, **internal** (non-public) surfaces, and RPCs **absent
   from v1.31.0** (the `v1.62.11`-only Nexus operation-execution RPCs).
-- **[`decisions.md`](./decisions.md)** — surfaces present in v1.31.0 but **still under decision**:
-  authentication/authorization (to be resolved before first release). The deprecated worker-versioning
-  V1/V2 surface is resolved — see [`worker-versioning.md`](./worker-versioning.md).
+- **[`decisions.md`](./decisions.md)** — surfaces present in v1.31.0 but **still under decision**
+  (none currently open). Authentication/authorization is resolved — see
+  [`authorization.md`](./authorization.md); the deprecated worker-versioning V1/V2 surface is
+  resolved — see [`worker-versioning.md`](./worker-versioning.md).
 
 ## How the contract is established (ground truth)
 
@@ -65,7 +66,12 @@ v1.31.0 would return for the same execution lineage?"
   in Temporal's terms.
 - [`excluded.md`](./excluded.md) — what is outside the surface (experimental/pre-release, internal,
   absent from v1.31.0), with reasons.
-- [`decisions.md`](./decisions.md) — surfaces present in v1.31.0 that are still under decision.
+- [`decisions.md`](./decisions.md) — surfaces present in v1.31.0 that are still under decision
+  (none currently open).
+- [`authorization.md`](./authorization.md) — the resolved authentication/authorization decision:
+  in-surface in two layers (stock-default no-op parity; configured JWT + Principal Attribution);
+  bearer-only at the edge, TLS terminated upstream; plus the tokeira-native AWS IAM bearer
+  extension.
 - [`worker-versioning.md`](./worker-versioning.md) — the resolved Worker Versioning V1/V2 decision:
   GA Worker Deployments only; the five deprecated RPCs conform as stock-default rejections.
 - [`configuration.md`](./configuration.md) — the complete v1.31.0 configuration surface (564 dynamic-config

@@ -5,13 +5,14 @@
 //! detects timed-out Nexus operations.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use opentelemetry::KeyValue;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
@@ -578,21 +579,65 @@ impl NexusEndpointRegistry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Worker-visible Nexus task token.
+///
+/// The field numbers are the exact `temporal.server.api.token.v1.NexusTask`
+/// wire contract from `proto/internal/temporal/server/api/token/v1/message.proto
+/// @ v1.31.0`. That server-internal proto is not part of Tokeira's vendored public
+/// API tree, so the compatible prost message lives beside the broker that authors it.
+/// Private workflow routing is deliberately absent and retained in
+/// [`NexusTaskCorrelation`] instead.
+#[derive(Clone, PartialEq, Message)]
 pub struct NexusTaskToken {
-    pub run_key: RunKey,
-    pub operation_id: String,
-    pub scheduled_event_id: i64,
+    /// Stable namespace UUID of the worker target.
+    #[prost(string, tag = "1")]
+    pub namespace_id: String,
+    /// Normal Nexus task-queue name used for poll delivery.
+    #[prost(string, tag = "2")]
+    pub task_queue: String,
+    /// Server-authored UUID identifying one outstanding dispatch.
+    #[prost(string, tag = "3")]
+    pub task_id: String,
 }
 
 impl NexusTaskToken {
+    /// Encode the token with protobuf, matching Temporal's task-token serializer.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(self).map_err(Into::into)
+        Ok(self.encode_to_vec())
     }
 
+    /// Decode the Temporal v1.31.0 protobuf token shape.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(|error| anyhow!("invalid nexus task token: {error}"))
+        <Self as Message>::decode(bytes)
+            .map_err(|error| anyhow!("Error deserializing task token.: {error}"))
     }
+}
+
+/// Private delivery route retained by Tokeira for one worker-visible Nexus
+/// `task_id`.
+///
+/// The token exposes only the stable worker-delivery identity. Tokeira keeps
+/// its private routing address beside the disposable delivery queue, so neither
+/// workflow authority nor an HTTP waiter leaks onto the wire. Workflow routing
+/// is reconstructible from authoritative pending state; HTTP routing is scoped
+/// to the lifetime of the current caller.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NexusTaskCorrelation {
+    /// Route a worker outcome to the authoritative pending workflow operation.
+    Workflow {
+        /// Run owning the pending operation.
+        run_key: RunKey,
+        /// Pending-operation key within the run.
+        operation_id: String,
+        /// Scheduled-event fence for stale-result rejection.
+        scheduled_event_id: i64,
+    },
+    /// Deliver one worker response to the caller-facing HTTP request that
+    /// synchronously dispatched this task.
+    Http {
+        /// Opaque ID understood only by the edge-owned waiter registry.
+        waiter_id: String,
+    },
 }
 
 /// Routes an async Nexus completion back to the originator's pending operation.
@@ -838,6 +883,70 @@ pub enum NexusTaskRequest {
         /// the op never started (no handler token).
         operation_token: String,
     },
+    /// Caller-facing HTTP request admitted and normalized by the compatibility
+    /// edge. Every field is transport-neutral; public protobuf construction
+    /// remains in `tokeira-edge`.
+    Http(NexusHttpTaskRequest),
+}
+
+/// Neutral caller-facing Nexus request envelope carried by the disposable
+/// runtime delivery broker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NexusHttpTaskRequest {
+    /// Eligible caller headers, normalized to lower-case keys.
+    pub header: BTreeMap<String, String>,
+    /// Time at which the edge admitted the request.
+    pub scheduled_time: OffsetDateTime,
+    /// Whether the caller accepts Temporal failure envelopes.
+    pub temporal_failure_responses: bool,
+    /// Resolved endpoint name, empty for namespace/task-queue dispatch.
+    pub endpoint: String,
+    /// Deadline used to compute the remaining worker request timeout at poll.
+    pub dispatch_deadline: OffsetDateTime,
+    /// Start or cancellation request data.
+    pub variant: NexusHttpTaskRequestVariant,
+}
+
+/// Variant-specific fields for a neutral caller-facing Nexus request.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NexusHttpTaskRequestVariant {
+    /// Start a Nexus operation.
+    StartOperation {
+        /// Nexus service name.
+        service: String,
+        /// Nexus operation name.
+        operation: String,
+        /// Caller idempotency key.
+        request_id: String,
+        /// Callback URL for asynchronous completion.
+        callback: String,
+        /// Converted Temporal payload, populated only after authorization.
+        payload: Option<Payload>,
+        /// Callback headers with the `Nexus-Callback-` prefix removed.
+        callback_header: BTreeMap<String, String>,
+        /// Caller links.
+        links: Vec<NexusTaskLink>,
+    },
+    /// Cancel a previously-started Nexus operation.
+    CancelOperation {
+        /// Nexus service name.
+        service: String,
+        /// Nexus operation name.
+        operation: String,
+        /// Compatibility copy of the operation token.
+        operation_id: String,
+        /// Handler-authored operation token.
+        operation_token: String,
+    },
+}
+
+/// Neutral Nexus link represented as the protocol URL and type strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NexusTaskLink {
+    /// Link target URL.
+    pub url: String,
+    /// Nexus link type.
+    pub link_type: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -846,20 +955,29 @@ pub struct NexusTask {
     pub request: NexusTaskRequest,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct NexusTaskBroker {
     inner: Arc<AsyncMutex<NexusBrokerState>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct NexusBrokerState {
     ready: HashMap<(NamespaceId, TaskQueueName), VecDeque<NexusTask>>,
+    /// Private result routes keyed by the UUID carried in the protobuf token.
+    /// A response atomically removes its entry so duplicate and late responses
+    /// cannot resolve a different delivery.
+    outstanding: HashMap<String, NexusTaskCorrelation>,
     /// Per-queue wake handles (see `tokeira-runtime::broker`'s per-queue wake
     /// pattern): a publish wakes only pollers on that namespace+task-queue.
     wakes: HashMap<(NamespaceId, TaskQueueName), Arc<Notify>>,
 }
 
 impl NexusTaskBroker {
+    /// Publish an already-authored task without a completion route.
+    ///
+    /// This remains for poll-only tests and one-way fixtures. Production
+    /// workflow dispatch uses [`Self::publish_workflow`] so a response route is
+    /// registered before the task becomes visible.
     pub async fn publish(
         &self,
         namespace_id: NamespaceId,
@@ -872,6 +990,106 @@ impl NexusTaskBroker {
         let wake = inner.wakes.entry(key).or_default().clone();
         drop(inner);
         wake.notify_waiters();
+    }
+
+    /// Publish a workflow-originated task and retain its private response route.
+    ///
+    /// Correlation insertion and queue visibility happen under the same lock;
+    /// therefore even an immediately responding worker cannot beat registration.
+    pub async fn publish_workflow(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: TaskQueueName,
+        run_key: RunKey,
+        operation_id: String,
+        scheduled_event_id: i64,
+        request: NexusTaskRequest,
+    ) {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let token = NexusTaskToken {
+            namespace_id: namespace_id.0.to_string(),
+            task_queue: task_queue.0.clone(),
+            task_id: task_id.clone(),
+        };
+        let key = (namespace_id, task_queue);
+        let mut inner = self.inner.lock().await;
+        inner.outstanding.insert(
+            task_id,
+            NexusTaskCorrelation::Workflow {
+                run_key,
+                operation_id,
+                scheduled_event_id,
+            },
+        );
+        inner
+            .ready
+            .entry(key.clone())
+            .or_default()
+            .push_back(NexusTask { token, request });
+        let wake = inner.wakes.entry(key).or_default().clone();
+        drop(inner);
+        wake.notify_waiters();
+    }
+
+    /// Publish a caller-facing HTTP task and return its delivery lease.
+    ///
+    /// The opaque waiter route is inserted under the same lock that makes the
+    /// task pollable. This Tokeira-native atomic publication ensures an
+    /// immediately responding worker can always find the caller correlation,
+    /// preserving the v1.31.0 observable dispatch contract.
+    pub async fn publish_http(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: TaskQueueName,
+        waiter_id: String,
+        request: NexusTaskRequest,
+    ) -> NexusHttpDispatchLease {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let token = NexusTaskToken {
+            namespace_id: namespace_id.0.to_string(),
+            task_queue: task_queue.0.clone(),
+            task_id: task_id.clone(),
+        };
+        let key = (namespace_id, task_queue);
+        let mut inner = self.inner.lock().await;
+        inner
+            .outstanding
+            .insert(task_id.clone(), NexusTaskCorrelation::Http { waiter_id });
+        inner
+            .ready
+            .entry(key.clone())
+            .or_default()
+            .push_back(NexusTask { token, request });
+        let wake = inner.wakes.entry(key).or_default().clone();
+        drop(inner);
+        wake.notify_waiters();
+        NexusHttpDispatchLease {
+            task_id: Some(task_id),
+            broker: self.clone(),
+        }
+    }
+
+    /// Atomically consume the response route for `task_id`.
+    ///
+    /// Unknown, expired, and repeated responses return `None` without touching
+    /// any other outstanding task.
+    pub async fn consume(&self, task_id: &str) -> Option<NexusTaskCorrelation> {
+        self.inner.lock().await.outstanding.remove(task_id)
+    }
+
+    async fn expire_http(&self, task_id: &str) {
+        let mut inner = self.inner.lock().await;
+        if !matches!(
+            inner.outstanding.get(task_id),
+            Some(NexusTaskCorrelation::Http { .. })
+        ) {
+            return;
+        }
+        inner.outstanding.remove(task_id);
+        for ready in inner.ready.values_mut() {
+            ready.retain(|task| task.token.task_id != task_id);
+        }
+        inner.ready.retain(|_, ready| !ready.is_empty());
     }
 
     pub async fn poll(
@@ -955,10 +1173,61 @@ impl NexusTaskBroker {
     /// Remove all not-yet-delivered Nexus tasks owned by a deleted run.
     pub async fn remove_run(&self, run_key: RunKey) {
         let mut inner = self.inner.lock().await;
+        let removed_task_ids: HashSet<_> = inner
+            .outstanding
+            .iter()
+            .filter_map(|(task_id, correlation)| match correlation {
+                NexusTaskCorrelation::Workflow { run_key: owner, .. } if *owner == run_key => {
+                    Some(task_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        inner
+            .outstanding
+            .retain(|task_id, _| !removed_task_ids.contains(task_id));
         for ready in inner.ready.values_mut() {
-            ready.retain(|task| task.token.run_key != run_key);
+            ready.retain(|task| !removed_task_ids.contains(&task.token.task_id));
         }
         inner.ready.retain(|_, ready| !ready.is_empty());
+    }
+}
+
+/// Lease for one in-flight caller-facing Nexus dispatch.
+///
+/// Dropping the HTTP request removes its private route and any not-yet-polled
+/// task. This is transport cleanup only: caller-facing Nexus dispatch has no
+/// durable workflow fact to preserve or recover.
+#[derive(Debug)]
+pub struct NexusHttpDispatchLease {
+    task_id: Option<String>,
+    broker: NexusTaskBroker,
+}
+
+impl NexusHttpDispatchLease {
+    /// Deterministically remove this caller-facing delivery route.
+    ///
+    /// HTTP handlers use this on every normal return, including timeout. The
+    /// `Drop` fallback remains necessary when client cancellation drops the
+    /// handler future before it can run this finalizer.
+    pub async fn cancel(mut self) {
+        if let Some(task_id) = self.task_id.take() {
+            self.broker.expire_http(&task_id).await;
+        }
+    }
+}
+
+impl Drop for NexusHttpDispatchLease {
+    fn drop(&mut self) {
+        let Some(task_id) = self.task_id.take() else {
+            return;
+        };
+        let broker = self.broker.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                broker.expire_http(&task_id).await;
+            });
+        }
     }
 }
 
@@ -1500,19 +1769,201 @@ mod tests {
     proptest! {
         #[test]
         fn property_task_token_roundtrip(
-            run in any::<u128>(),
-            operation_id in "[a-z0-9_-]{1,24}",
-            scheduled_event_id in 0i64..10_000,
+            namespace in any::<u128>(),
+            task_queue in "[a-z0-9_-]{1,24}",
+            task_id in "[a-z0-9_-]{1,24}",
         ) {
             let token = NexusTaskToken {
-                run_key: RunKey(Uuid::from_u128(run)),
-                operation_id,
-                scheduled_event_id,
+                namespace_id: Uuid::from_u128(namespace).to_string(),
+                task_queue,
+                task_id,
             };
             let encoded = token.encode().expect("token should encode");
             let decoded = NexusTaskToken::decode(&encoded).expect("token should decode");
             prop_assert_eq!(decoded, token);
         }
+    }
+
+    // Feature: edge-nexus-task-transport, Property 3: Correlation single consumption
+    proptest! {
+        #[test]
+        fn property_correlation_single_consumption(
+            namespace_seed in any::<u128>(),
+            queue_suffix in "[a-z]{1,8}",
+            first_operation in "[a-z0-9_-]{1,16}",
+            second_operation in "[a-z0-9_-]{1,16}",
+        ) {
+            let rt = Runtime::new().expect("runtime");
+            rt.block_on(async move {
+                let broker = NexusTaskBroker::default();
+                let namespace_id = NamespaceId(Uuid::from_u128(namespace_seed));
+                let task_queue = TaskQueueName(format!("queue-{queue_suffix}"));
+                let first_run = RunKey::new();
+                let second_run = RunKey::new();
+
+                broker
+                    .publish_workflow(
+                        namespace_id,
+                        task_queue.clone(),
+                        first_run,
+                        first_operation.clone(),
+                        1,
+                        NexusTaskRequest::CancelOperation {
+                            service: "svc".to_owned(),
+                            operation: "cancel".to_owned(),
+                            operation_id: first_operation.clone(),
+                            operation_token: "token-a".to_owned(),
+                        },
+                    )
+                    .await;
+                broker
+                    .publish_workflow(
+                        namespace_id,
+                        task_queue.clone(),
+                        second_run,
+                        second_operation.clone(),
+                        2,
+                        NexusTaskRequest::CancelOperation {
+                            service: "svc".to_owned(),
+                            operation: "cancel".to_owned(),
+                            operation_id: second_operation.clone(),
+                            operation_token: "token-b".to_owned(),
+                        },
+                    )
+                    .await;
+
+                let first = broker
+                    .poll(namespace_id, task_queue.clone(), tokio::time::Duration::ZERO)
+                    .await
+                    .expect("first task");
+                let second = broker
+                    .poll(namespace_id, task_queue, tokio::time::Duration::ZERO)
+                    .await
+                    .expect("second task");
+
+                prop_assert_eq!(
+                    broker.consume(&first.token.task_id).await,
+                    Some(NexusTaskCorrelation::Workflow {
+                        run_key: first_run,
+                        operation_id: first_operation,
+                        scheduled_event_id: 1,
+                    })
+                );
+                prop_assert_eq!(broker.consume(&first.token.task_id).await, None);
+                prop_assert_eq!(
+                    broker.consume(&second.token.task_id).await,
+                    Some(NexusTaskCorrelation::Workflow {
+                        run_key: second_run,
+                        operation_id: second_operation,
+                        scheduled_event_id: 2,
+                    })
+                );
+                Ok(())
+            })?;
+        }
+    }
+
+    // Feature: edge-nexus-task-transport, Property 6: workflow and caller-facing
+    // deliveries retain disjoint private result routes behind identical public tokens.
+    proptest! {
+        #[test]
+        fn property_correlation_route_separation(
+            namespace_seed in any::<u128>(),
+            queue_suffix in "[a-z]{1,8}",
+            operation_id in "[a-z0-9_-]{1,16}",
+            waiter_id in "[a-z0-9_-]{1,16}",
+        ) {
+            let rt = Runtime::new().expect("runtime");
+            rt.block_on(async move {
+                let broker = NexusTaskBroker::default();
+                let namespace_id = NamespaceId(Uuid::from_u128(namespace_seed));
+                let task_queue = TaskQueueName(format!("queue-{queue_suffix}"));
+                let run_key = RunKey::new();
+                broker
+                    .publish_workflow(
+                        namespace_id,
+                        task_queue.clone(),
+                        run_key,
+                        operation_id.clone(),
+                        7,
+                        NexusTaskRequest::CancelOperation {
+                            service: "svc".to_owned(),
+                            operation: "cancel".to_owned(),
+                            operation_id: operation_id.clone(),
+                            operation_token: "workflow-token".to_owned(),
+                        },
+                    )
+                    .await;
+                let _http_lease = broker
+                    .publish_http(
+                        namespace_id,
+                        task_queue.clone(),
+                        waiter_id.clone(),
+                        NexusTaskRequest::CancelOperation {
+                            service: "svc".to_owned(),
+                            operation: "cancel".to_owned(),
+                            operation_id: "http-op".to_owned(),
+                            operation_token: "http-token".to_owned(),
+                        },
+                    )
+                    .await;
+
+                let workflow = broker
+                    .poll(namespace_id, task_queue.clone(), tokio::time::Duration::ZERO)
+                    .await
+                    .expect("workflow task");
+                let http = broker
+                    .poll(namespace_id, task_queue, tokio::time::Duration::ZERO)
+                    .await
+                    .expect("HTTP task");
+                prop_assert_eq!(
+                    broker.consume(&workflow.token.task_id).await,
+                    Some(NexusTaskCorrelation::Workflow {
+                        run_key,
+                        operation_id,
+                        scheduled_event_id: 7,
+                    })
+                );
+                prop_assert_eq!(
+                    broker.consume(&http.token.task_id).await,
+                    Some(NexusTaskCorrelation::Http { waiter_id })
+                );
+                Ok(())
+            })?;
+        }
+    }
+
+    #[test]
+    fn canceling_http_delivery_lease_removes_undelivered_task_and_route() {
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(async move {
+            let broker = NexusTaskBroker::default();
+            let namespace_id = NamespaceId(Uuid::new_v4());
+            let task_queue = TaskQueueName("queue".to_owned());
+            let lease = broker
+                .publish_http(
+                    namespace_id,
+                    task_queue.clone(),
+                    "waiter".to_owned(),
+                    NexusTaskRequest::CancelOperation {
+                        service: "svc".to_owned(),
+                        operation: "cancel".to_owned(),
+                        operation_id: "op".to_owned(),
+                        operation_token: "token".to_owned(),
+                    },
+                )
+                .await;
+            let task_id = lease.task_id.clone().expect("task ID");
+            lease.cancel().await;
+
+            assert!(
+                broker
+                    .poll(namespace_id, task_queue, tokio::time::Duration::ZERO)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(broker.consume(&task_id).await, None);
+        });
     }
 
     #[test]
@@ -1576,9 +2027,9 @@ mod tests {
 
                 let first = NexusTask {
                     token: NexusTaskToken {
-                        run_key: RunKey::new(),
-                        operation_id: first_operation.clone(),
-                        scheduled_event_id: 1,
+                        namespace_id: namespace_a.0.to_string(),
+                        task_queue: queue_a.0.clone(),
+                        task_id: first_operation.clone(),
                     },
                     request: NexusTaskRequest::CancelOperation {
                         service: "svc".to_string(),
@@ -1589,9 +2040,9 @@ mod tests {
                 };
                 let second = NexusTask {
                     token: NexusTaskToken {
-                        run_key: RunKey::new(),
-                        operation_id: second_operation.clone(),
-                        scheduled_event_id: 2,
+                        namespace_id: namespace_b.0.to_string(),
+                        task_queue: queue_b.0.clone(),
+                        task_id: second_operation.clone(),
                     },
                     request: NexusTaskRequest::CancelOperation {
                         service: "svc".to_string(),
@@ -1602,9 +2053,9 @@ mod tests {
                 };
                 let third = NexusTask {
                     token: NexusTaskToken {
-                        run_key: RunKey::new(),
-                        operation_id: third_operation.clone(),
-                        scheduled_event_id: 3,
+                        namespace_id: namespace_a.0.to_string(),
+                        task_queue: queue_a.0.clone(),
+                        task_id: third_operation.clone(),
                     },
                     request: NexusTaskRequest::CancelOperation {
                         service: "svc".to_string(),

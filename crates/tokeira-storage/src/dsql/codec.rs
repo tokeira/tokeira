@@ -10,7 +10,7 @@
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use tokeira_kernel::{ActivityState, HistoryEvent, ProjectionOp, TimerState, WorkflowState};
-use tokeira_types::{Payloads, ProjectionCursor, WorkflowRuleRecord};
+use tokeira_types::{EventPrincipal, Payloads, ProjectionCursor, WorkflowRuleRecord};
 
 use crate::{BacklogPayload, ProjectionContext, StoredWorkerDeployment};
 
@@ -51,6 +51,16 @@ pub fn encode_history_events(events: &[HistoryEvent]) -> Result<Vec<u8>> {
 
 /// Deserialize a committed history batch.
 pub fn decode_history_events(bytes: &[u8]) -> Result<Vec<HistoryEvent>> {
+    decode(bytes)
+}
+
+/// Serialize the batch-aligned history-principal sidecar.
+pub fn encode_history_principals(principals: &[Option<EventPrincipal>]) -> Result<Vec<u8>> {
+    encode(&principals)
+}
+
+/// Deserialize the batch-aligned history-principal sidecar.
+pub fn decode_history_principals(bytes: &[u8]) -> Result<Vec<Option<EventPrincipal>>> {
     decode(bytes)
 }
 

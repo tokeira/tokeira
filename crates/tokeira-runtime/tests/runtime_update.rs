@@ -74,6 +74,7 @@ async fn update_completed_notifies_waiting_caller() -> Result<()> {
             ],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -149,6 +150,7 @@ async fn update_rejected_notifies_waiting_caller() -> Result<()> {
             ],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -218,6 +220,7 @@ async fn update_accepted_wait_returns_stage_without_outcome() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -353,6 +356,7 @@ async fn poll_update_waits_for_history_stage_or_returns_reached_stage() -> Resul
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -436,6 +440,7 @@ async fn terminal_update_outcome_survives_runtime_recreation() -> Result<()> {
             ],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -613,6 +618,7 @@ async fn update_timeout_does_not_block_late_completion_commit() -> Result<()> {
             ],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -681,6 +687,7 @@ async fn run_close_notifies_waiting_update_callers() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -796,6 +803,7 @@ async fn multiple_updates_resolved_in_single_wft() -> Result<()> {
             ],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -975,6 +983,7 @@ fn request_context(request_id: &str) -> RequestContext {
     RequestContext {
         request_id: RequestId(request_id.into()),
         caller_identity: Some("tester".into()),
+        principal: None,
         received_at: OffsetDateTime::now_utc(),
     }
 }

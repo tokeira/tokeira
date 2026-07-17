@@ -1,7 +1,10 @@
 pub mod loader;
 pub use loader::{ConfigLoaderError, load_config, write_config_toml};
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -223,6 +226,240 @@ pub struct PolicyConfig {
     pub nexus_endpoint_limits: NexusEndpointLimitsConfig,
     #[serde(default)]
     pub nexus_completion: NexusCompletionConfig,
+    /// Configured identity sources and authorization policy. Absence preserves
+    /// the stock permissive server.
+    #[serde(default)]
+    pub authorization: Option<AuthorizationConfig>,
+}
+
+/// Presence-enabled authentication and authorization policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationConfig {
+    /// Stamp server-computed principals on history when enforcement is active.
+    #[serde(default)]
+    pub principal_attribution: bool,
+    /// Expose authorizer implementation errors rather than the generic denial.
+    #[serde(default)]
+    pub expose_authorizer_errors: bool,
+    /// JWT identity-source profiles.
+    #[serde(default)]
+    pub jwt: JwtAuthorizationConfig,
+    /// Optional AWS IAM presigned-STS identity source.
+    #[serde(default)]
+    pub aws_iam: Option<AwsIamAuthorizationConfig>,
+}
+
+impl AuthorizationConfig {
+    /// Whether at least one identity source activates enforcement.
+    pub fn has_identity_source(&self) -> bool {
+        !self.jwt.issuers.is_empty() || self.aws_iam.is_some()
+    }
+}
+
+/// JWT authorization profiles.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JwtAuthorizationConfig {
+    /// Issuer profiles routed by exact `iss` claim.
+    #[serde(default)]
+    pub issuers: Vec<JwtIssuerConfig>,
+}
+
+/// One exact-issuer JWT verification profile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JwtIssuerConfig {
+    /// Stable operator label for logs and metrics.
+    #[serde(default)]
+    pub name: String,
+    /// Exact case-sensitive token `iss` value.
+    #[serde(default)]
+    pub issuer: String,
+    /// JWKS document URI.
+    #[serde(default)]
+    pub jwks_uri: String,
+    /// Optional exact audience. Blank disables audience validation.
+    #[serde(default)]
+    pub audience: String,
+    /// Optional human duration (`ms`, `s`, `m`, or `h`) for JWKS refresh.
+    #[serde(default)]
+    pub refresh_interval: Option<String>,
+    /// JWT array claim containing Temporal `namespace:role` entries.
+    #[serde(default = "default_permissions_claim")]
+    pub permissions_claim: String,
+    /// Subject-to-role augmentation rules.
+    #[serde(default)]
+    pub grants: Vec<JwtGrantConfig>,
+}
+
+impl Default for JwtIssuerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            issuer: String::new(),
+            jwks_uri: String::new(),
+            audience: String::new(),
+            refresh_interval: None,
+            permissions_claim: default_permissions_claim(),
+            grants: Vec::new(),
+        }
+    }
+}
+
+impl JwtIssuerConfig {
+    /// Parsed refresh cadence after [`TokeiraConfig::validate`] has accepted it.
+    pub fn refresh_interval_duration(&self) -> Option<std::time::Duration> {
+        self.refresh_interval
+            .as_deref()
+            .and_then(parse_positive_duration)
+    }
+}
+
+/// Subject-pattern role grants for one JWT issuer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JwtGrantConfig {
+    /// Full-string, case-sensitive subject pattern.
+    #[serde(default)]
+    pub match_sub: String,
+    /// Temporal `namespace:role` grants.
+    #[serde(default)]
+    pub grant: Vec<String>,
+}
+
+/// AWS IAM presigned-STS identity-source configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsIamAuthorizationConfig {
+    /// ARN-to-role rules; at least one is required when the table is present.
+    #[serde(default)]
+    pub grants: Vec<AwsIamGrantConfig>,
+}
+
+/// ARN-pattern role grants.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsIamGrantConfig {
+    /// Full-string, case-sensitive STS caller-ARN pattern.
+    #[serde(default)]
+    pub match_arn: String,
+    /// Temporal `namespace:role` grants.
+    #[serde(default)]
+    pub grant: Vec<String>,
+}
+
+fn default_permissions_claim() -> String {
+    "permissions".to_owned()
+}
+
+fn validate_authorization(authorization: &AuthorizationConfig, errors: &mut Vec<ValidationError>) {
+    let mut names = HashSet::new();
+    let mut issuers = HashSet::new();
+    for (index, issuer) in authorization.jwt.issuers.iter().enumerate() {
+        let base = format!("policy.authorization.jwt.issuers[{index}]");
+        for (field, value) in [
+            ("name", issuer.name.as_str()),
+            ("issuer", issuer.issuer.as_str()),
+            ("jwks_uri", issuer.jwks_uri.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                errors.push(ValidationError::Field {
+                    field: format!("{base}.{field}"),
+                    message: "must not be blank".to_owned(),
+                });
+            }
+        }
+        if !issuer.name.trim().is_empty() && !names.insert(issuer.name.clone()) {
+            errors.push(ValidationError::Field {
+                field: format!("{base}.name"),
+                message: format!("duplicate issuer profile name {:?}", issuer.name),
+            });
+        }
+        if !issuer.issuer.trim().is_empty() && !issuers.insert(issuer.issuer.clone()) {
+            errors.push(ValidationError::Field {
+                field: format!("{base}.issuer"),
+                message: format!("duplicate issuer URL {:?}", issuer.issuer),
+            });
+        }
+        if let Some(interval) = issuer.refresh_interval.as_deref()
+            && parse_positive_duration(interval).is_none()
+        {
+            errors.push(ValidationError::Field {
+                field: format!("{base}.refresh_interval"),
+                message: "must be a positive duration using ms, s, m, or h".to_owned(),
+            });
+        }
+        for (rule_index, rule) in issuer.grants.iter().enumerate() {
+            validate_grants_rule(
+                &format!("{base}.grants[{rule_index}].match_sub"),
+                &format!("{base}.grants[{rule_index}].grant"),
+                &rule.match_sub,
+                &rule.grant,
+                errors,
+            );
+        }
+    }
+
+    if let Some(aws_iam) = authorization.aws_iam.as_ref() {
+        if aws_iam.grants.is_empty() {
+            errors.push(ValidationError::Field {
+                field: "policy.authorization.aws_iam.grants".to_owned(),
+                message: "must contain at least one ARN grant rule".to_owned(),
+            });
+        }
+        for (index, rule) in aws_iam.grants.iter().enumerate() {
+            validate_grants_rule(
+                &format!("policy.authorization.aws_iam.grants[{index}].match_arn"),
+                &format!("policy.authorization.aws_iam.grants[{index}].grant"),
+                &rule.match_arn,
+                &rule.grant,
+                errors,
+            );
+        }
+    }
+}
+
+fn validate_grants_rule(
+    pattern_field: &str,
+    grant_field: &str,
+    pattern: &str,
+    grants: &[String],
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Err(error) = tokeira_auth::GlobPattern::new(pattern) {
+        errors.push(ValidationError::Field {
+            field: pattern_field.to_owned(),
+            message: error.to_string(),
+        });
+    }
+    for (index, grant) in grants.iter().enumerate() {
+        if let Err(error) = tokeira_auth::parse_grant(grant) {
+            errors.push(ValidationError::Field {
+                field: format!("{grant_field}[{index}]"),
+                message: error.to_string(),
+            });
+        }
+    }
+}
+
+fn parse_positive_duration(value: &str) -> Option<std::time::Duration> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 0.001)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60.0)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600.0)
+    } else {
+        return None;
+    };
+    let seconds = number.parse::<f64>().ok()? * multiplier;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(seconds))
 }
 
 /// Async Nexus operation completion-callback delivery (`nexus-async-completion` spec).
@@ -533,6 +770,7 @@ impl Default for PolicyConfig {
             compatibility: CompatibilityConfig::default(),
             nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
             nexus_completion: NexusCompletionConfig::default(),
+            authorization: None,
         }
     }
 }
@@ -819,6 +1057,9 @@ impl TokeiraConfig {
                 message: "must be greater than or equal to 1.0".to_string(),
             });
         }
+        if let Some(authorization) = self.policy.authorization.as_ref() {
+            validate_authorization(authorization, &mut errors);
+        }
         let placement = &self.infrastructure.placement;
         if placement.heartbeat_interval_ms == 0 {
             errors.push(ValidationError::Field {
@@ -1086,6 +1327,129 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn authorization_section_is_presence_enabled_and_flags_are_inert_without_sources() {
+        let absent: TokeiraConfig = toml::from_str("").expect("empty config");
+        assert!(absent.policy.authorization.is_none());
+        absent.validate().expect("stock defaults");
+
+        let flags_only: TokeiraConfig = toml::from_str(
+            r#"
+                [policy.authorization]
+                principal_attribution = true
+                expose_authorizer_errors = true
+            "#,
+        )
+        .expect("flags-only config");
+        let authorization = flags_only.policy.authorization.as_ref().expect("section");
+        assert!(!authorization.has_identity_source());
+        flags_only.validate().expect("inert flags are valid");
+    }
+
+    #[test]
+    fn authorization_identity_sources_parse_and_validate() {
+        let config: TokeiraConfig = toml::from_str(
+            r#"
+                [policy.authorization]
+                principal_attribution = true
+
+                [[policy.authorization.jwt.issuers]]
+                name = "eks-prod"
+                issuer = "https://issuer.example/id/ABC"
+                jwks_uri = "https://issuer.example/id/ABC/keys"
+                audience = "tokeira"
+                refresh_interval = "1m"
+
+                [[policy.authorization.jwt.issuers.grants]]
+                match_sub = "system:serviceaccount:prod:*"
+                grant = ["prod:worker", "prod:write"]
+
+                [policy.authorization.aws_iam]
+                [[policy.authorization.aws_iam.grants]]
+                match_arn = "arn:aws:sts::123456789012:assumed-role/tokeira-worker-*"
+                grant = ["prod:worker"]
+            "#,
+        )
+        .expect("authorization config");
+        config.validate().expect("valid authorization config");
+        let authorization = config.policy.authorization.expect("section");
+        assert!(authorization.has_identity_source());
+        assert_eq!(
+            authorization.jwt.issuers[0].permissions_claim,
+            "permissions"
+        );
+    }
+
+    #[test]
+    fn authorization_validation_names_every_invalid_field() {
+        let config: TokeiraConfig = toml::from_str(
+            r#"
+                [policy.authorization]
+
+                [[policy.authorization.jwt.issuers]]
+                name = "duplicate"
+                issuer = "https://issuer.example"
+                jwks_uri = ""
+                refresh_interval = "never"
+                [[policy.authorization.jwt.issuers.grants]]
+                match_sub = ""
+                grant = ["prod:unknown"]
+
+                [[policy.authorization.jwt.issuers]]
+                name = "duplicate"
+                issuer = "https://issuer.example"
+                jwks_uri = "https://issuer.example/keys"
+
+                [[policy.authorization.jwt.issuers]]
+
+                [policy.authorization.aws_iam]
+            "#,
+        )
+        .expect("structurally valid config");
+        let ConfigError::Validation(errors) = config.validate().expect_err("must fail") else {
+            panic!("expected validation error");
+        };
+        let fields = errors
+            .iter()
+            .map(|error| match error {
+                ValidationError::Field { field, .. } => field.as_str(),
+            })
+            .collect::<Vec<_>>();
+        for expected in [
+            "policy.authorization.jwt.issuers[0].jwks_uri",
+            "policy.authorization.jwt.issuers[0].refresh_interval",
+            "policy.authorization.jwt.issuers[0].grants[0].match_sub",
+            "policy.authorization.jwt.issuers[0].grants[0].grant[0]",
+            "policy.authorization.jwt.issuers[1].name",
+            "policy.authorization.jwt.issuers[1].issuer",
+            "policy.authorization.jwt.issuers[2].name",
+            "policy.authorization.jwt.issuers[2].issuer",
+            "policy.authorization.jwt.issuers[2].jwks_uri",
+            "policy.authorization.aws_iam.grants",
+        ] {
+            assert!(
+                fields.contains(&expected),
+                "missing validation for {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_rejects_tls_listener_configuration() {
+        // The edge authenticates bearer material only and receives TLS from an
+        // upstream terminator. Rejecting these plausible listener knobs keeps
+        // that architecture explicit instead of silently accepting dead config
+        // (`authorization-foundation` Requirement 10.2).
+        for field in ["tls", "tls_cert_file", "tls_key_file", "client_ca_file"] {
+            let error = toml::from_str::<TokeiraConfig>(&format!(
+                "[policy.authorization]\n{field} = true\n"
+            ))
+            .expect_err("authorization TLS listener fields must be unknown")
+            .to_string();
+            assert!(error.contains(field), "{error}");
+        }
+    }
 
     // Defaults mirror v1.31.0's callbacks retry policy (1s initial, 1h max, 2x, no cap)
     // and a co-located loopback HTTP listener for temporal://system firing.
@@ -1569,6 +1933,7 @@ mod tests {
                         compatibility: CompatibilityConfig::default(),
                         nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
                         nexus_completion: NexusCompletionConfig::default(),
+                        authorization: None,
                     },
                     capacity: CapacityConfig {
                         performance: PerformanceConfig {

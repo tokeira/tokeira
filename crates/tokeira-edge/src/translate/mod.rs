@@ -23,8 +23,8 @@ use tokeira_kernel::{
     state::{ParentClosePolicy, WorkflowVersioningInfo},
 };
 use tokeira_types::{
-    ActivityTaskToken, BuildId, DeploymentId, ExecutionStatus, Headers, Memo, Payload, Payloads,
-    RetryPolicy, RunId, RunKey, SearchAttributes, TaskKind, WorkflowId,
+    BuildId, DeploymentId, ExecutionStatus, Headers, Memo, Payload, Payloads, RetryPolicy, RunId,
+    RunKey, SearchAttributes, TaskKind, WorkflowId,
 };
 
 pub mod batch;
@@ -260,6 +260,8 @@ pub struct WorkflowTaskPayloadDto {
     pub run_id: RunId,
     pub task_queue: String,
     pub history: Vec<HistoryEvent>,
+    /// Server-computed attribution aligned with `history`.
+    pub history_principals: Vec<Option<tokeira_types::EventPrincipal>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -652,7 +654,8 @@ pub struct PollActivityTaskQueueResponse {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RespondActivityTaskCompletedRequest {
-    pub token: ActivityTaskToken,
+    pub namespace: String,
+    pub task_token: Vec<u8>,
     pub result: Payloads,
     pub identity: String,
 }
@@ -675,7 +678,8 @@ pub struct RespondActivityTaskCompletedByIdResponse;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RespondActivityTaskFailedRequest {
-    pub token: ActivityTaskToken,
+    pub namespace: String,
+    pub task_token: Vec<u8>,
     pub failure: Payload,
     pub failure_error_type: Option<String>,
     pub is_non_retryable: bool,
@@ -702,7 +706,8 @@ pub struct RespondActivityTaskFailedByIdResponse;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RespondActivityTaskCanceledRequest {
-    pub token: ActivityTaskToken,
+    pub namespace: String,
+    pub task_token: Vec<u8>,
     pub details: Option<Payloads>,
     pub identity: String,
 }
@@ -725,7 +730,8 @@ pub struct RespondActivityTaskCanceledByIdResponse;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordActivityTaskHeartbeatRequest {
-    pub token: ActivityTaskToken,
+    pub namespace: String,
+    pub task_token: Vec<u8>,
     pub details: Option<Payloads>,
     pub identity: String,
 }
@@ -906,6 +912,8 @@ pub struct GetWorkflowExecutionHistoryRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GetWorkflowExecutionHistoryResponse {
     pub history: Vec<HistoryEvent>,
+    /// Server-computed attribution aligned with `history`.
+    pub history_principals: Vec<Option<tokeira_types::EventPrincipal>>,
     pub next_page_token: Vec<u8>,
 }
 
@@ -921,6 +929,8 @@ pub struct GetWorkflowExecutionHistoryReverseRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GetWorkflowExecutionHistoryReverseResponse {
     pub history: Vec<HistoryEvent>,
+    /// Server-computed attribution aligned with `history`.
+    pub history_principals: Vec<Option<tokeira_types::EventPrincipal>>,
     pub next_page_token: Vec<u8>,
 }
 

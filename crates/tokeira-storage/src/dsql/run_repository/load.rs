@@ -108,6 +108,21 @@ impl DsqlRunRepository {
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
+        Ok(self
+            .do_read_attributed_history(run_key, after_event_id, limit)
+            .await?
+            .into_iter()
+            .map(|attributed| attributed.event)
+            .collect())
+    }
+
+    #[instrument(name = "dsql.read_attributed_history", skip(self), fields(run_key = %run_key.0, after_event_id, limit))]
+    pub(super) async fn do_read_attributed_history(
+        &self,
+        run_key: RunKey,
+        after_event_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AttributedHistoryEvent>> {
         let result = record_dsql_operation!(
             self,
             "read_history",
@@ -122,8 +137,8 @@ impl DsqlRunRepository {
                 let mut permit = self.director.acquire(DbClass::Read).await?;
                 // History is stored in transition batches. A batch may straddle
                 // `after_event_id`, so decoding and per-event filtering remain in Rust.
-                let rows = sqlx::query_as::<_, (i64, i64, Vec<u8>)>(
-                    "SELECT first_event_id, last_event_id, events_data
+                let rows = sqlx::query_as::<_, (i64, i64, Vec<u8>, Option<Vec<u8>>)>(
+                    "SELECT first_event_id, last_event_id, events_data, principals_data
              FROM history_batch
              WHERE run_key = $1 AND last_event_id > $2
              ORDER BY first_event_id ASC",
@@ -135,12 +150,14 @@ impl DsqlRunRepository {
                 metrics::record_dsql_rows_read("read_history", rows.len());
 
                 let mut events = Vec::new();
-                for (_first_event_id, _last_event_id, events_data) in rows {
-                    for event in codec::decode_history_events(&events_data)? {
-                        if event.event_id <= after_event_id {
+                for (_first_event_id, _last_event_id, events_data, principals_data) in rows {
+                    for attributed in
+                        decode_attributed_history_batch(&events_data, principals_data.as_deref())?
+                    {
+                        if attributed.event.event_id <= after_event_id {
                             continue;
                         }
-                        events.push(event);
+                        events.push(attributed);
                         if events.len() == effective_limit {
                             return Ok(events);
                         }
@@ -276,14 +293,16 @@ impl DsqlRunRepository {
                     successor_run_id,
                 );
 
-                let history_rows = sqlx::query_as::<_, (Vec<u8>, i64, i64)>(
-                    "SELECT events_data, first_event_id, last_event_id FROM history_batch
+                let history_rows =
+                    sqlx::query_as::<_, (Vec<u8>, Option<Vec<u8>>, i64, i64)>(
+                    "SELECT events_data, principals_data, first_event_id, last_event_id FROM history_batch
              WHERE run_key = $1 ORDER BY first_event_id ASC",
                 )
                 .bind(base_run_key.0)
                 .fetch_all(&mut *tx)
                 .await?;
                 let mut copied_events = Vec::new();
+                let mut copied_principals = Vec::new();
                 let mut found_fork = false;
                 // Reset materialization copies only the committed prefix BEFORE the
                 // fork event: the fork is the WFT-FINISH event being reset, and
@@ -292,13 +311,17 @@ impl DsqlRunRepository {
                 // Replay then derives the successor state — ending with the reset
                 // WFT still started, ready for the ResetWorkflow failure — avoiding
                 // a second source of truth for reset snapshots.
-                for (events_data, _first_event_id, _last_event_id) in history_rows {
-                    for event in codec::decode_history_events(&events_data)? {
-                        if event.event_id == fork_event_id {
+                for (events_data, principals_data, _first_event_id, _last_event_id) in history_rows
+                {
+                    for attributed in
+                        decode_attributed_history_batch(&events_data, principals_data.as_deref())?
+                    {
+                        if attributed.event.event_id == fork_event_id {
                             found_fork = true;
                             break;
                         }
-                        copied_events.push(event);
+                        copied_events.push(attributed.event);
+                        copied_principals.push(attributed.principal);
                     }
                     if found_fork {
                         break;
@@ -352,6 +375,7 @@ impl DsqlRunRepository {
                     successor_run_key,
                     successor_state.transition_seq,
                     &copied_events,
+                    &copied_principals,
                 )
                 .await?;
                 crate::dsql::run_repository::commit::upsert_current_execution_start(
@@ -383,5 +407,110 @@ impl DsqlRunRepository {
                 Ok(())
             }
         )
+    }
+}
+
+fn decode_attributed_history_batch(
+    events_data: &[u8],
+    principals_data: Option<&[u8]>,
+) -> Result<Vec<AttributedHistoryEvent>> {
+    let events = codec::decode_history_events(events_data)?;
+    let principals = match principals_data {
+        Some(bytes) => codec::decode_history_principals(bytes)?,
+        None => vec![None; events.len()],
+    };
+    if events.len() != principals.len() {
+        bail!(
+            "corrupt history batch: {} events but {} principal entries",
+            events.len(),
+            principals.len()
+        );
+    }
+    Ok(events
+        .into_iter()
+        .zip(principals)
+        .map(|(event, principal)| AttributedHistoryEvent { event, principal })
+        .collect())
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use time::{Duration, OffsetDateTime};
+    use tokeira_kernel::{HistoryEvent, HistoryEventKind};
+    use tokeira_types::{EventPrincipal, LogicalTaskSeq, TaskQueueName};
+
+    use super::*;
+
+    fn event(event_id: i64) -> HistoryEvent {
+        HistoryEvent {
+            event_id,
+            happened_at: OffsetDateTime::UNIX_EPOCH,
+            kind: HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: LogicalTaskSeq(event_id as u64),
+                task_queue: TaskQueueName("queue".into()),
+                workflow_task_timeout: Duration::seconds(10),
+                attempt: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn null_principal_sidecar_reads_legacy_batch_as_unattributed() {
+        // Feature: authorization-foundation, Property 5: rows committed before
+        // the nullable sidecar existed retain absent field-303 attribution.
+        let events = vec![event(1), event(2)];
+        let events_data = codec::encode_history_events(&events).expect("encode history");
+
+        let decoded = decode_attributed_history_batch(&events_data, None)
+            .expect("NULL sidecar is the legacy representation");
+
+        assert_eq!(
+            decoded,
+            events
+                .into_iter()
+                .map(|event| AttributedHistoryEvent {
+                    event,
+                    principal: None,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn attributed_batch_preserves_alignment_and_half_empty_principal() {
+        let events = vec![event(1), event(2)];
+        let principals = vec![
+            Some(EventPrincipal {
+                principal_type: "jwt".into(),
+                name: String::new(),
+            }),
+            None,
+        ];
+        let events_data = codec::encode_history_events(&events).expect("encode history");
+        let principals_data =
+            codec::encode_history_principals(&principals).expect("encode principals");
+
+        let decoded = decode_attributed_history_batch(&events_data, Some(&principals_data))
+            .expect("decode aligned sidecar");
+
+        assert_eq!(decoded[0].principal, principals[0]);
+        assert_eq!(decoded[1].principal, None);
+    }
+
+    #[test]
+    fn principal_sidecar_length_mismatch_is_corruption() {
+        let events_data =
+            codec::encode_history_events(&[event(1), event(2)]).expect("encode history");
+        let principals_data =
+            codec::encode_history_principals(&[None]).expect("encode deliberately short sidecar");
+
+        let error = decode_attributed_history_batch(&events_data, Some(&principals_data))
+            .expect_err("misaligned sidecar must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("corrupt history batch: 2 events but 1 principal entries")
+        );
     }
 }

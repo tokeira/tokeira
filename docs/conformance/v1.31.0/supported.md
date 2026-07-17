@@ -7,8 +7,8 @@
 > Measured progress is tracked separately in [`../../readiness/conformance.md`](../../readiness/conformance.md).
 >
 > Features Temporal labels **experimental / pre-release**, internal surfaces, and RPCs absent from
-> v1.31.0 are in [`excluded.md`](./excluded.md). Surfaces still under decision are in
-> [`decisions.md`](./decisions.md).
+> v1.31.0 are in [`excluded.md`](./excluded.md). Surfaces still under decision would be in
+> [`decisions.md`](./decisions.md) (none currently open).
 
 ## What "conforming at the API level" means
 
@@ -39,7 +39,8 @@ v1.31.0 ships) these total **121 RPCs**:
 
 Each area below is part of the v1.31.0 surface. The maturity column quotes Temporal's own designation for
 v1.31.0 (release notes / proto). Areas Temporal labels experimental or pre-release are **not** here — see
-[`excluded.md`](./excluded.md); areas under decision are in [`decisions.md`](./decisions.md).
+[`excluded.md`](./excluded.md); any area under decision would be in [`decisions.md`](./decisions.md)
+(none currently open).
 
 | Feature area | Representative RPCs | v1.31.0 maturity (Temporal) |
 |--------------|---------------------|-----------------------------|
@@ -65,6 +66,7 @@ v1.31.0 (release notes / proto). Areas Temporal labels experimental or pre-relea
 | **Nexus** | PollNexusTaskQueue, RespondNexusTask{Completed,Failed}; OperatorService endpoint CRUD | **GA** — see [below](#nexus) |
 | **Worker Deployments** | Describe/Delete/ListWorkerDeployment, SetWorkerDeploymentManager, Describe/Delete/Set{Current,Ramping}/UpdateMetadata Version | **GA** — see [below](#worker-deployments) |
 | **Standalone Activities** | StartActivityExecution, Describe/Poll/List/Count/RequestCancel/Terminate/DeleteActivityExecution | **Public Preview** — see [below](#standalone-activities) |
+| **Authentication / authorization** | (no RPCs — a config-gated interceptor surface plus `HistoryEvent.principal`) | GA, default off — see [below](#authentication-and-authorization) |
 
 ## Nexus
 
@@ -121,6 +123,32 @@ The RPC surface is `StartActivityExecution`, `DescribeActivityExecution`, `PollA
 `ListActivityExecutions`, `CountActivityExecutions`, `RequestCancelActivityExecution`,
 `TerminateActivityExecution`, `DeleteActivityExecution`.
 
+## Authentication and authorization
+
+Resolved 2026-07-16 — decision record: [`authorization.md`](./authorization.md). This surface has
+**no gRPC service**: it is a server interceptor pair (a `ClaimMapper` and an `Authorizer`) selected
+by configuration, plus **Principal Attribution** — v1.31.0's server-computed
+`HistoryEvent.principal` (field 303). Conformance targets it in two layers:
+
+1. **Stock default** — the zero-value `authorization` config selects the no-op pair: every caller
+   is treated as a cluster admin, every call is allowed, and no event carries a principal. This is
+   the out-of-the-box v1.31.0 behaviour and the baseline every other feature area above is
+   measured against.
+2. **Configured** — with `authorizer: "default"` / `claimMapper: "default"` and a JWKS key source,
+   v1.31.0 validates `authorization: Bearer <JWT>` metadata (RS256/ES256), maps the `permissions`
+   claim (`namespace:role` entries; `temporal-system` pseudo-namespace) onto a
+   Worker/Reader/Writer/Admin role model, authorizes each RPC by its scope/access classification,
+   denies with `PERMISSION_DENIED: "Request unauthorized."`, and — when
+   `frontend.enablePrincipalPropagation` is enabled — stamps the authenticated
+   `Principal{type, name}` onto the history events each request produces, spoof-proofed by
+   unconditional inbound-header stripping.
+
+The related dynamic-config keys (`frontend.enablePrincipalPropagation`,
+`frontend.exposeAuthorizerErrors`, `frontend.enableTokenNamespaceEnforcement`,
+`system.enableCrossNamespaceCommands`) are part of the configured layer's fidelity bar. mTLS-derived
+identity at the edge and the Go claim-mapper/authorizer plugin points are outside the surface —
+see [`excluded.md`](./excluded.md) and the decision record.
+
 ## Field-level fidelity is part of the surface
 
 RPC presence is necessary but not sufficient. API-level conformance means each request/response **field**
@@ -134,6 +162,7 @@ otherwise responds.
 
 - [`excluded.md`](./excluded.md) — experimental/pre-release features, internal surfaces, and RPCs absent
   from v1.31.0, each with Temporal's own designation as the reason.
-- [`decisions.md`](./decisions.md) — surfaces still under decision.
+- [`decisions.md`](./decisions.md) — the decisions ledger (none currently open).
+- [`authorization.md`](./authorization.md) — the resolved authentication/authorization decision record.
 - [`../../readiness/conformance.md`](../../readiness/conformance.md) — measured progress toward this
   surface.

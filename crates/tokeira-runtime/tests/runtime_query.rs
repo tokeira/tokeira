@@ -120,6 +120,7 @@ async fn closed_run_query_with_explicit_run_id_still_dispatches() -> Result<()> 
                 request: RequestContext {
                     request_id: RequestId("term-1".into()),
                     caller_identity: Some("tester".into()),
+                    principal: None,
                     received_at: OffsetDateTime::now_utc(),
                 },
                 now: OffsetDateTime::now_utc(),
@@ -314,6 +315,7 @@ fn pause_request(request_id: &str) -> PauseWorkflowRequest {
         request: RequestContext {
             request_id: RequestId(request_id.into()),
             caller_identity: Some("operator".into()),
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),
@@ -327,6 +329,7 @@ fn unpause_request(request_id: &str) -> UnpauseWorkflowRequest {
         request: RequestContext {
             request_id: RequestId(request_id.into()),
             caller_identity: Some("operator".into()),
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),
@@ -397,6 +400,7 @@ async fn start_workflow(
             request: RequestContext {
                 request_id: RequestId("start-1".into()),
                 caller_identity: Some("tester".into()),
+                principal: None,
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),
@@ -438,6 +442,7 @@ async fn quiesce_workflow(
             commands: Vec::new(),
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;

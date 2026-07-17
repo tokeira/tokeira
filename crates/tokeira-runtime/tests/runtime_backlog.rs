@@ -64,6 +64,7 @@ fn sample_start_request(
         request: RequestContext {
             request_id: RequestId(format!("req-{workflow_id}")),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),

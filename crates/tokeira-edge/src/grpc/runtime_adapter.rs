@@ -345,10 +345,11 @@ where
         token: ActivityTaskToken,
         result: Payloads,
         worker_identity: Option<tokeira_types::WorkerIdentity>,
+        request: RequestContext,
     ) -> Result<WorkflowMutationOutcome> {
         let commit = self
             .runtime
-            .complete_activity_task(token, result, worker_identity)
+            .complete_activity_task(token, result, worker_identity, request)
             .await?;
         commit_result_to_outcome(commit)
     }
@@ -360,6 +361,7 @@ where
         failure_error_type: Option<String>,
         is_non_retryable: bool,
         worker_identity: Option<tokeira_types::WorkerIdentity>,
+        request: RequestContext,
     ) -> Result<()> {
         self.runtime
             .fail_activity_task(
@@ -368,6 +370,7 @@ where
                 failure_error_type,
                 is_non_retryable,
                 worker_identity,
+                request,
             )
             .await
     }
@@ -377,10 +380,11 @@ where
         token: ActivityTaskToken,
         details: Option<Payloads>,
         worker_identity: Option<tokeira_types::WorkerIdentity>,
+        request: RequestContext,
     ) -> Result<WorkflowMutationOutcome> {
         let result = self
             .runtime
-            .cancel_activity_task(token, details, worker_identity)
+            .cancel_activity_task(token, details, worker_identity, request)
             .await?;
         commit_result_to_outcome(result)
     }
@@ -438,9 +442,10 @@ where
         run_key: RunKey,
         activity_id: &str,
         identity: tokeira_types::WorkerIdentity,
+        request: RequestContext,
     ) -> Result<ActivityTaskToken> {
         self.runtime
-            .force_start_activity_for_completion(run_key, activity_id, identity)
+            .force_start_activity_for_completion(run_key, activity_id, identity, request)
             .await
     }
 

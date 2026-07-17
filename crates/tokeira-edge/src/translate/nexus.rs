@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use time::OffsetDateTime;
 use tokeira_kernel::NexusResolution;
 use tokeira_proto::{
     conversions::common::{
@@ -14,7 +15,7 @@ use tokeira_proto::{
     public::temporal::api::{failure::v1 as failure_proto, nexus::v1 as nexus_v1},
     workflowservice,
 };
-use tokeira_runtime::NexusTaskRequest;
+use tokeira_runtime::{NexusHttpTaskRequestVariant, NexusTaskRequest};
 use tokeira_types::{Payload, Payloads, TaskQueueName};
 
 #[derive(Debug, Error)]
@@ -111,9 +112,6 @@ pub fn poll_response_to_proto(
 pub fn completed_request_to_edge(
     req: workflowservice::RespondNexusTaskCompletedRequest,
 ) -> Result<RespondNexusTaskCompletedRequest, NexusTranslateError> {
-    if req.namespace.trim().is_empty() {
-        return Err(NexusTranslateError::MissingField("namespace"));
-    }
     Ok(RespondNexusTaskCompletedRequest {
         namespace: req.namespace,
         identity: req.identity,
@@ -131,9 +129,6 @@ pub fn completed_request_to_edge(
 pub fn failed_request_to_edge(
     req: workflowservice::RespondNexusTaskFailedRequest,
 ) -> Result<RespondNexusTaskFailedRequest, NexusTranslateError> {
-    if req.namespace.trim().is_empty() {
-        return Err(NexusTranslateError::MissingField("namespace"));
-    }
     Ok(RespondNexusTaskFailedRequest {
         namespace: req.namespace,
         identity: req.identity,
@@ -216,6 +211,64 @@ pub fn nexus_task_to_proto_request(
                 },
             )),
         }),
+        NexusTaskRequest::Http(request) => {
+            let mut header = request.header.clone();
+            let remaining = (request.dispatch_deadline - OffsetDateTime::now_utc())
+                .max(time::Duration::ZERO)
+                .whole_milliseconds();
+            let timeout = format!("{remaining}ms");
+            header.insert("request-timeout".to_owned(), timeout.clone());
+            // v1.31.0 duplicates this spelling for the Java SDK while retaining
+            // the canonical lower-case Nexus header.
+            header.insert("Request-Timeout".to_owned(), timeout);
+            let variant = match &request.variant {
+                NexusHttpTaskRequestVariant::StartOperation {
+                    service,
+                    operation,
+                    request_id,
+                    callback,
+                    payload,
+                    callback_header,
+                    links,
+                } => nexus_v1::request::Variant::StartOperation(nexus_v1::StartOperationRequest {
+                    service: service.clone(),
+                    operation: operation.clone(),
+                    request_id: request_id.clone(),
+                    callback: callback.clone(),
+                    payload: payload.as_ref().map(payload_from_domain),
+                    callback_header: callback_header.clone(),
+                    links: links
+                        .iter()
+                        .map(|link| nexus_v1::Link {
+                            url: link.url.clone(),
+                            r#type: link.link_type.clone(),
+                        })
+                        .collect(),
+                }),
+                NexusHttpTaskRequestVariant::CancelOperation {
+                    service,
+                    operation,
+                    operation_id,
+                    operation_token,
+                } => {
+                    nexus_v1::request::Variant::CancelOperation(nexus_v1::CancelOperationRequest {
+                        service: service.clone(),
+                        operation: operation.clone(),
+                        operation_id: operation_id.clone(),
+                        operation_token: operation_token.clone(),
+                    })
+                }
+            };
+            Ok(nexus_v1::Request {
+                header,
+                scheduled_time: Some(to_proto_timestamp(request.scheduled_time)),
+                capabilities: Some(nexus_v1::request::Capabilities {
+                    temporal_failure_responses: request.temporal_failure_responses,
+                }),
+                endpoint: request.endpoint.clone(),
+                variant: Some(variant),
+            })
+        }
     }
 }
 
@@ -230,12 +283,11 @@ pub fn nexus_task_to_proto_request(
 /// and emit a caller resolution the SDK does not expect.
 pub fn proto_response_to_resolution(
     response: nexus_v1::Response,
-    expected_operation_id: &str,
     op: &NexusOperationContext,
 ) -> Result<Option<NexusResolution>, NexusTranslateError> {
     match response.variant {
         Some(nexus_v1::response::Variant::StartOperation(start)) => {
-            proto_start_response_to_resolution(start, expected_operation_id, op).map(Some)
+            proto_start_response_to_resolution(start, op).map(Some)
         }
         Some(nexus_v1::response::Variant::CancelOperation(_)) => Ok(None),
         None => Err(NexusTranslateError::MissingField("response.variant")),
@@ -296,13 +348,12 @@ fn operation_error_to_resolution(
 
 // v1.62-sync: reads deprecated `start_operation_response::Async::operation_id`
 // for wire-compat with v0.4-era Nexus clients. v1.62 renames to
-// `operation_token`; the mismatch-check above still uses the deprecated
-// field because the expected_operation_id callers supply is the v0.4 shape.
-// Migration to `operation_token` is task 4.7 / 8.1.
+// `operation_token`. The handler-authored token is intentionally independent
+// of Tokeira's private scheduled-operation key: v1.31.0 accepts and persists
+// the handler value without comparing the two.
 #[allow(deprecated)]
 pub fn proto_start_response_to_resolution(
     response: nexus_v1::StartOperationResponse,
-    expected_operation_id: &str,
     op: &NexusOperationContext,
 ) -> Result<NexusResolution, NexusTranslateError> {
     match response.variant {
@@ -320,13 +371,6 @@ pub fn proto_start_response_to_resolution(
             })
         }
         Some(nexus_v1::start_operation_response::Variant::AsyncSuccess(async_success)) => {
-            if async_success.operation_id != expected_operation_id {
-                tracing::warn!(
-                    expected_operation_id,
-                    returned_operation_id = async_success.operation_id,
-                    "nexus async start returned mismatched operation_id"
-                );
-            }
             // The handler's async token: v1.62 carries it in `operation_token`;
             // fall back to the deprecated `operation_id` for v0.4-era handlers
             // that only set the old field. This becomes the started event's
@@ -681,6 +725,38 @@ mod tests {
     }
 
     #[test]
+    fn http_task_translation_adds_the_remaining_dispatch_timeout_at_poll() {
+        let now = OffsetDateTime::now_utc();
+        let request = NexusTaskRequest::Http(tokeira_runtime::NexusHttpTaskRequest {
+            header: BTreeMap::from([("x-caller".to_owned(), "value".to_owned())]),
+            scheduled_time: now,
+            temporal_failure_responses: true,
+            endpoint: "endpoint".to_owned(),
+            dispatch_deadline: now + time::Duration::seconds(30),
+            variant: NexusHttpTaskRequestVariant::CancelOperation {
+                service: "service".to_owned(),
+                operation: "operation".to_owned(),
+                operation_id: "token".to_owned(),
+                operation_token: "token".to_owned(),
+            },
+        });
+
+        let translated = nexus_task_to_proto_request(&request).expect("translation");
+        assert_eq!(translated.header.get("x-caller"), Some(&"value".to_owned()));
+        let canonical = translated
+            .header
+            .get("request-timeout")
+            .expect("canonical timeout");
+        assert_eq!(translated.header.get("Request-Timeout"), Some(canonical));
+        let milliseconds = canonical
+            .strip_suffix("ms")
+            .expect("millisecond unit")
+            .parse::<i64>()
+            .expect("numeric timeout");
+        assert!(milliseconds > 0 && milliseconds <= 30_000);
+    }
+
+    #[test]
     fn outbound_tags_map_v1_31_0_outcome_taxonomy() {
         // RespondNexusTaskCompleted: async start → `pending`, no failure source.
         let async_started = nexus_v1::Response {
@@ -838,7 +914,7 @@ mod tests {
         }
     }
 
-    // Feature: edge-nexus-task-transport, Property 3: Request translation preserves stored fields
+    // Feature: edge-nexus-task-transport, Property 4: Request translation preserves stored fields
     proptest! {
         #[test]
         fn property_request_translation_preserves_start_fields(
@@ -903,7 +979,7 @@ mod tests {
         }
     }
 
-    // Feature: edge-nexus-task-transport, Property 4: Response translation correctness
+    // Response translation regression coverage for every worker outcome variant.
     proptest! {
         #[test]
         fn property_response_translation_correctness(
@@ -928,7 +1004,7 @@ mod tests {
                     },
                 )),
             };
-            match proto_response_to_resolution(sync, &operation_id, &NexusOperationContext::default())
+            match proto_response_to_resolution(sync, &NexusOperationContext::default())
                 .expect("sync success")
                 .expect("sync success resolves the op")
             {
@@ -953,7 +1029,7 @@ mod tests {
                 )),
             };
             prop_assert_eq!(
-                proto_response_to_resolution(async_response, &operation_id, &NexusOperationContext::default()).expect("async success"),
+                proto_response_to_resolution(async_response, &NexusOperationContext::default()).expect("async success"),
                 Some(NexusResolution::Started {
                     operation_token: operation_id.clone(),
                     links: Vec::new()
@@ -968,7 +1044,7 @@ mod tests {
             // A cancel-ack does not resolve the operation (v1.31.0 decouples cancel-ack from
             // resolution; the op resolves via its completion).
             prop_assert_eq!(
-                proto_response_to_resolution(cancel, &operation_id, &NexusOperationContext::default()).expect("cancel"),
+                proto_response_to_resolution(cancel, &NexusOperationContext::default()).expect("cancel"),
                 None
             );
 

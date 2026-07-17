@@ -15,7 +15,11 @@ use tokeira_proto::adminservice::{
     admin_service_server::{AdminService as AdminServiceGrpcApi, AdminServiceServer},
 };
 
-use crate::{grpc::translate::execution_status_to_proto, workflow_service::WorkflowService};
+use crate::{
+    Action,
+    grpc::{metadata::metadata_to_header_map, translate::execution_status_to_proto},
+    workflow_service::WorkflowService,
+};
 
 #[derive(Clone)]
 pub struct AdminServiceGrpc {
@@ -40,6 +44,10 @@ impl AdminServiceGrpcApi for AdminServiceGrpc {
         &self,
         request: Request<adminservice::DescribeMutableStateRequest>,
     ) -> Result<Response<DescribeMutableStateResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        self.inner
+            .admit_request(&headers, None, Action::DescribeMutableState, false)
+            .await?;
         let req = request.into_inner();
         let execution = req
             .execution

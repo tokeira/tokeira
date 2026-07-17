@@ -35,12 +35,34 @@ use tokeira_proto::{
         workflow::v1 as workflow_proto,
     },
 };
+use tokeira_types::EventPrincipal;
 
 /// Serialize a slice of kernel history events into
 /// proto-encoded bytes representing a
 /// `temporal.api.history.v1.History` message.
 pub fn serialize_history(events: &[HistoryEvent]) -> Vec<u8> {
     history_to_proto(events).encode_to_vec()
+}
+
+/// Serialize history with server-computed event attribution.
+///
+/// The two slices must be index-aligned; storage enforces that invariant when
+/// decoding each batch and the edge preserves it while filtering/paging.
+pub fn serialize_history_with_principals(
+    events: &[HistoryEvent],
+    principals: &[Option<EventPrincipal>],
+) -> Vec<u8> {
+    debug_assert_eq!(events.len(), principals.len());
+    history::History {
+        events: events
+            .iter()
+            .zip(principals)
+            .map(|(event, principal)| {
+                history_event_to_proto_with_principal(event, principal.as_ref())
+            })
+            .collect(),
+    }
+    .encode_to_vec()
 }
 
 /// Return the public protobuf-encoded size of a complete history.
@@ -102,6 +124,14 @@ fn history_to_proto(events: &[HistoryEvent]) -> history::History {
 /// Convert a single kernel `HistoryEvent` to its proto
 /// representation.
 pub fn history_event_to_proto(event: &HistoryEvent) -> history::HistoryEvent {
+    history_event_to_proto_with_principal(event, None)
+}
+
+/// Convert one kernel event and its durable attribution to public history.
+pub fn history_event_to_proto_with_principal(
+    event: &HistoryEvent,
+    principal: Option<&EventPrincipal>,
+) -> history::HistoryEvent {
     history::HistoryEvent {
         event_id: event.event_id,
         event_time: Some(to_proto_timestamp(event.happened_at)),
@@ -111,6 +141,10 @@ pub fn history_event_to_proto(event: &HistoryEvent) -> history::HistoryEvent {
         links: event_links(event),
         worker_may_ignore: event_worker_may_ignore(event),
         task_id: event_task_id(event),
+        principal: principal.map(|principal| proto_common::Principal {
+            r#type: principal.principal_type.clone(),
+            name: principal.name.clone(),
+        }),
         ..Default::default()
     }
 }
@@ -3746,6 +3780,38 @@ mod tests {
     //
     // The following test adds an explicit assertion that all four timeout
     // fields survive serialization.
+    #[test]
+    fn history_serializer_emits_durable_principal_field_303() {
+        // Feature: authorization-foundation, Property 5: the public history
+        // projection reproduces the stored principal exactly, including a
+        // half-empty authenticated identity (Requirements 7.3, 7.5).
+        let event = HistoryEvent {
+            event_id: 1,
+            happened_at: OffsetDateTime::UNIX_EPOCH,
+            kind: HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: LogicalTaskSeq(1),
+                task_queue: TaskQueueName("queue".into()),
+                workflow_task_timeout: time::Duration::seconds(10),
+                attempt: 1,
+            },
+        };
+        let principal = EventPrincipal {
+            principal_type: "jwt".into(),
+            name: String::new(),
+        };
+
+        let proto = history_event_to_proto_with_principal(&event, Some(&principal));
+
+        assert_eq!(
+            proto.principal,
+            Some(proto_common::Principal {
+                r#type: "jwt".into(),
+                name: String::new(),
+            })
+        );
+        assert_eq!(history_event_to_proto(&event).principal, None);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 

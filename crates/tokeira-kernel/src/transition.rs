@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    ExecutionStatus, Headers, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestId,
-    RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName, TransitionSeq, WorkflowId,
-    WorkflowType,
+    EventPrincipal, ExecutionStatus, Headers, Memo, NamespaceId, Payload, Payloads, QueueKey,
+    RequestId, RetryPolicy, RunId, RunKey, SearchAttributes, TaskQueueName, TransitionSeq,
+    WorkflowId, WorkflowType,
 };
 
 use crate::{
@@ -30,6 +30,12 @@ pub struct Transition {
     pub next_state: WorkflowState,
     /// History events appended by this transition.
     pub history_events: SmallVec<[HistoryEvent; 8]>,
+    /// Server-computed attribution aligned one-for-one with `history_events`.
+    ///
+    /// This sidecar keeps the positional postcard encoding of `HistoryEvent`
+    /// stable while allowing storage to persist field-303 attribution
+    /// atomically with each history batch.
+    pub event_principals: SmallVec<[Option<EventPrincipal>; 8]>,
     /// Request IDs to persist for idempotent deduplication.
     pub request_dedupe_ops: SmallVec<[RequestDedupeOp; 1]>,
     /// Activity state mutations (upsert or delete).

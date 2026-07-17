@@ -8,7 +8,7 @@ v1.31.0-faithful validation, error codes, and runtime dispatch integration. Ever
 `TestNexusEndpointsFunctionalSuite` + `TestNexusAPIValidationTestSuite` ≈ 17 tests; not the ~80
 operation-execution tests).
 
-## Status — IMPLEMENTED (reconciled 2026-06-22)
+## Status — IMPLEMENTED (reconciled 2026-07-16)
 
 The implementation landed but the checkboxes below were never reconciled. Verified against the
 current tree on 2026-06-22 (code read end-to-end + `cargo test -p tokeira-edge --lib nexus_endpoint`
@@ -33,8 +33,12 @@ current tree on 2026-06-22 (code read end-to-end + `cargo test -p tokeira-edge -
 
 Remaining: the dedicated property tests P1–P4 were **not** authored as `proptest` blocks — the
 behaviour is covered by 13 example-based unit tests (`nexus_endpoint::tests::*`) plus the store/registry
-tests in `nexus.rs`/`lib.rs`. The operator conformance measurement of `TestNexusEndpointsFunctionalSuite`
-(15) + `TestNexusAPIValidationTestSuite` (2) has not been run to confirm the ≈17-test denominator.
+tests in `nexus.rs`/`lib.rs`. Tier 7.35 measured `TestNexusEndpointsFunctionalSuite` against the
+v1.31.0 corpus on 2026-07-16: **42 active leaves / 0 fail / 0 skip**, with **54 passing runner outcomes
+including parents**, twice consecutively in fresh processes. Tokeira's existing OperatorService
+implementation passed without a product change; the Temporal Shape-2 seam needed an adapter from the
+corpus's private MatchingService/persistence views to Tokeira's public endpoint registry. Tier 7.36
+still needs to measure `TestNexusAPIValidationTestSuite`; the P1–P4 proptest work also remains open.
 
 ## Tasks
 

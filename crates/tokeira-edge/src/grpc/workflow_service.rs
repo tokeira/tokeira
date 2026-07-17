@@ -32,6 +32,7 @@ use tokeira_chasm_activity::ActivityStatus;
 use tokeira_proto::public::temporal::api::activity::v1 as activity_v1;
 
 use crate::{
+    Action,
     grpc::{
         errors::{
             proto_conversion_status, worker_versioning_v1_disabled_status,
@@ -1320,22 +1321,17 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::RespondWorkflowTaskFailedResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
-        let token: tokeira_types::WorkflowTaskToken = serde_json::from_slice(&req.task_token)
-            .map_err(|error| Status::invalid_argument(format!("invalid task token: {error}")))?;
         let failure_cause = translate::wft_failed_cause_from_proto(req.cause);
         let failure_details = req
             .failure
             .as_ref()
             .map(tokeira_proto::conversions::common::failure_to_payload);
-        debug!(
-            cause = req.cause,
-            run_key = ?token.run_key,
-            "respond_workflow_task_failed"
-        );
+        debug!(cause = req.cause, "respond_workflow_task_failed");
         self.inner
             .respond_workflow_task_failed(
                 &headers,
-                token,
+                req.namespace,
+                req.task_token,
                 failure_cause,
                 failure_details,
                 req.identity,
@@ -1688,7 +1684,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             }
         };
         self.inner
-            .respond_query_task_completed(&headers, req.task_token, result)
+            .respond_query_task_completed(&headers, req.namespace, req.task_token, result)
             .await?;
         Ok(Response::new(
             workflowservice::RespondQueryTaskCompletedResponse {},
@@ -2818,16 +2814,23 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
 
     // === Activity Executions (standalone) ===
     //
-    // Start/cancel/terminate/delete are served live through the CHASM
-    // [`ActivityBridge`] when attached; the bridge applies the per-namespace
-    // enable gate (off → `UNIMPLEMENTED`, ground-truthed to
-    // `chasm/lib/activity/frontend.go:36 @ v1.31.0`). Describe/poll/list/count
-    // stay deferred until the read-side proto mapping (`ActivityExecutionInfo` /
-    // `ActivityExecutionOutcome`) lands.
+    // All standalone-activity handlers enter the shared edge admission seam
+    // before their feature gate or field validation. This mirrors the frontend
+    // authorization interceptor running before handlers in v1.31.0 while keeping
+    // CHASM execution in Tokeira's existing component bridge.
     async fn start_activity_execution(
         &self,
         request: Request<workflowservice::StartActivityExecutionRequest>,
     ) -> Result<Response<workflowservice::StartActivityExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        self.inner
+            .admit_request(
+                &headers,
+                Some(&request.get_ref().namespace),
+                Action::StartActivityExecution,
+                false,
+            )
+            .await?;
         let Some(bridge) = &self.chasm_activity else {
             return Err(Status::unimplemented(
                 "start_activity_execution is not implemented; tracked in spec activity-executions-first-class",
@@ -2928,6 +2931,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::DescribeActivityExecutionRequest>,
     ) -> Result<Response<workflowservice::DescribeActivityExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        self.inner
+            .admit_request(
+                &headers,
+                Some(&request.get_ref().namespace),
+                Action::DescribeActivityExecution,
+                !request.get_ref().long_poll_token.is_empty(),
+            )
+            .await?;
         let Some(bridge) = &self.chasm_activity else {
             return Err(Status::unimplemented(
                 "describe_activity_execution is not implemented; tracked in spec activity-executions-first-class",
@@ -3021,6 +3033,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::PollActivityExecutionRequest>,
     ) -> Result<Response<workflowservice::PollActivityExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        self.inner
+            .admit_request(
+                &headers,
+                Some(&request.get_ref().namespace),
+                Action::PollActivityExecution,
+                true,
+            )
+            .await?;
         let Some(bridge) = &self.chasm_activity else {
             return Err(Status::unimplemented(
                 "poll_activity_execution is not implemented; tracked in spec activity-executions-first-class",
@@ -3095,6 +3116,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::RequestCancelActivityExecutionRequest>,
     ) -> Result<Response<workflowservice::RequestCancelActivityExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        self.inner
+            .admit_request(
+                &headers,
+                Some(&request.get_ref().namespace),
+                Action::RequestCancelActivityExecution,
+                false,
+            )
+            .await?;
         let Some(bridge) = &self.chasm_activity else {
             return Err(Status::unimplemented(
                 "request_cancel_activity_execution is not implemented; tracked in spec activity-executions-first-class",
@@ -3127,6 +3157,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::TerminateActivityExecutionRequest>,
     ) -> Result<Response<workflowservice::TerminateActivityExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        self.inner
+            .admit_request(
+                &headers,
+                Some(&request.get_ref().namespace),
+                Action::TerminateActivityExecution,
+                false,
+            )
+            .await?;
         let Some(bridge) = &self.chasm_activity else {
             return Err(Status::unimplemented(
                 "terminate_activity_execution is not implemented; tracked in spec activity-executions-first-class",
@@ -3159,6 +3198,15 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::DeleteActivityExecutionRequest>,
     ) -> Result<Response<workflowservice::DeleteActivityExecutionResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        self.inner
+            .admit_request(
+                &headers,
+                Some(&request.get_ref().namespace),
+                Action::DeleteActivityExecution,
+                false,
+            )
+            .await?;
         let Some(bridge) = &self.chasm_activity else {
             return Err(Status::unimplemented(
                 "delete_activity_execution is not implemented; tracked in spec activity-executions-first-class",
@@ -3320,6 +3368,7 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
+    use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokio::sync::Notify;
     use tonic::Request;
@@ -3346,13 +3395,14 @@ mod tests {
         deployment::v1::WorkerDeploymentVersion, nexus::v1 as nexus_v1, worker::v1 as worker_v1,
     };
     use tokeira_runtime::{
-        NexusTask, NexusTaskBroker, NexusTaskRequest, NexusTaskToken, WorkerRegistry,
+        NexusHttpTaskRequest, NexusHttpTaskRequestVariant, NexusTask, NexusTaskBroker,
+        NexusTaskRequest, NexusTaskToken, WorkerRegistry,
     };
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
     use tokeira_types::{
-        LogicalTaskSeq, Memo, Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey,
-        SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity, WorkerInstanceKey,
-        WorkflowId, WorkflowType,
+        EventPrincipal, LogicalTaskSeq, Memo, Payloads, QueueKey, RequestContext, RequestId, RunId,
+        RunKey, SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity,
+        WorkerInstanceKey, WorkflowId, WorkflowType,
     };
 
     #[test]
@@ -3632,6 +3682,7 @@ mod tests {
             _token: tokeira_types::ActivityTaskToken,
             _result: tokeira_types::Payloads,
             _worker_identity: Option<tokeira_types::WorkerIdentity>,
+            _request: tokeira_types::RequestContext,
         ) -> Result<WorkflowMutationOutcome> {
             unreachable!()
         }
@@ -3643,6 +3694,7 @@ mod tests {
             _failure_error_type: Option<String>,
             _is_non_retryable: bool,
             _worker_identity: Option<tokeira_types::WorkerIdentity>,
+            _request: tokeira_types::RequestContext,
         ) -> Result<()> {
             unreachable!()
         }
@@ -3801,6 +3853,7 @@ mod tests {
             _token: tokeira_types::ActivityTaskToken,
             _result: tokeira_types::Payloads,
             _worker_identity: Option<tokeira_types::WorkerIdentity>,
+            _request: tokeira_types::RequestContext,
         ) -> Result<WorkflowMutationOutcome> {
             unreachable!()
         }
@@ -3812,6 +3865,7 @@ mod tests {
             _failure_error_type: Option<String>,
             _is_non_retryable: bool,
             _worker_identity: Option<tokeira_types::WorkerIdentity>,
+            _request: tokeira_types::RequestContext,
         ) -> Result<()> {
             unreachable!()
         }
@@ -3968,6 +4022,7 @@ mod tests {
             _token: tokeira_types::ActivityTaskToken,
             _result: tokeira_types::Payloads,
             _worker_identity: Option<tokeira_types::WorkerIdentity>,
+            _request: tokeira_types::RequestContext,
         ) -> Result<WorkflowMutationOutcome> {
             unreachable!()
         }
@@ -3979,6 +4034,7 @@ mod tests {
             _failure_error_type: Option<String>,
             _is_non_retryable: bool,
             _worker_identity: Option<tokeira_types::WorkerIdentity>,
+            _request: tokeira_types::RequestContext,
         ) -> Result<()> {
             unreachable!()
         }
@@ -4381,59 +4437,20 @@ mod tests {
             UpdateWorkerConfigRequest,
             "worker-config-management"
         );
-
-        assert_deferred_rpc!(
-            grpc,
-            start_activity_execution,
-            StartActivityExecutionRequest,
-            "activity-executions-first-class"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            describe_activity_execution,
-            DescribeActivityExecutionRequest,
-            "activity-executions-first-class"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            poll_activity_execution,
-            PollActivityExecutionRequest,
-            "activity-executions-first-class"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            list_activity_executions,
-            ListActivityExecutionsRequest,
-            "activity-executions-first-class"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            count_activity_executions,
-            CountActivityExecutionsRequest,
-            "activity-executions-first-class"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            request_cancel_activity_execution,
-            RequestCancelActivityExecutionRequest,
-            "activity-executions-first-class"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            terminate_activity_execution,
-            TerminateActivityExecutionRequest,
-            "activity-executions-first-class"
-        );
-        assert_deferred_rpc!(
-            grpc,
-            delete_activity_execution,
-            DeleteActivityExecutionRequest,
-            "activity-executions-first-class"
-        );
     }
 
     fn nexus_test_service(
         runtime: Arc<dyn WorkflowRuntimeApi>,
+    ) -> (WorkflowServiceGrpc, NexusTaskBroker) {
+        nexus_test_service_with_waiters(
+            runtime,
+            crate::nexus_http::NexusHttpWaiterRegistry::default(),
+        )
+    }
+
+    fn nexus_test_service_with_waiters(
+        runtime: Arc<dyn WorkflowRuntimeApi>,
+        nexus_http_waiters: crate::nexus_http::NexusHttpWaiterRegistry,
     ) -> (WorkflowServiceGrpc, NexusTaskBroker) {
         let cache = Arc::new(StaticNamespaceCache);
         let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
@@ -4461,7 +4478,8 @@ mod tests {
                 Arc::new(tokeira_runtime::ScheduleStore::default()),
                 Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
-            );
+            )
+            .with_nexus_http_waiters(nexus_http_waiters);
         (WorkflowServiceGrpc::new(service), nexus_broker)
     }
 
@@ -5404,10 +5422,11 @@ mod tests {
         );
         let grpc = WorkflowServiceGrpc::new(service);
 
+        let namespace_id = crate::translate::to_internal::namespace_id_for("default");
         let response = grpc
             .respond_query_task_completed(Request::new(
                 workflowservice::RespondQueryTaskCompletedRequest {
-                    task_token: b"missing".to_vec(),
+                    task_token: format!("query-task:{}:queue:missing", namespace_id.0).into_bytes(),
                     completed_type: tokeira_proto::enums::QueryResultType::Answered as i32,
                     query_result: Some(tokeira_proto::common::Payloads::default()),
                     error_message: String::new(),
@@ -5450,7 +5469,8 @@ mod tests {
             Arc::new(LocalOnlyRouter),
         );
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let task_token = b"legacy-query".to_vec();
+        let namespace_id = crate::translate::to_internal::namespace_id_for("default");
+        let task_token = format!("query-task:{}:queue:legacy-query", namespace_id.0).into_bytes();
         service
             .insert_legacy_query_waiter(task_token.clone(), tx)
             .await;
@@ -5488,6 +5508,17 @@ mod tests {
         RunKey,
         RunId,
     ) {
+        history_test_service_with_principal(None).await
+    }
+
+    async fn history_test_service_with_principal(
+        principal: Option<EventPrincipal>,
+    ) -> (
+        WorkflowServiceGrpc,
+        Arc<HistoryNotifyingRepository<tokeira_storage::InMemoryStore>>,
+        RunKey,
+        RunId,
+    ) {
         let cache = Arc::new(InMemoryNamespaceCache::new());
         cache
             .insert(ResolvedNamespace::active("default"))
@@ -5500,7 +5531,7 @@ mod tests {
 
         let run_key = RunKey::new();
         let run_id = RunId(Uuid::new_v4());
-        seed_started_run(repo.as_ref(), run_key, run_id).await;
+        seed_started_run(repo.as_ref(), run_key, run_id, principal).await;
 
         let service = WorkflowService::new_with_history_wait_registry(
             Arc::new(PollNoneRuntime),
@@ -5524,6 +5555,7 @@ mod tests {
         repo: &HistoryNotifyingRepository<tokeira_storage::InMemoryStore>,
         run_key: RunKey,
         run_id: RunId,
+        principal: Option<EventPrincipal>,
     ) {
         let start = StartRequest {
             initiator: None,
@@ -5571,6 +5603,7 @@ mod tests {
             request: RequestContext {
                 request_id: RequestId("seed-start".to_string()),
                 caller_identity: None,
+                principal,
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),
@@ -5605,6 +5638,7 @@ mod tests {
                     request: RequestContext {
                         request_id: RequestId("sig-1".to_string()),
                         caller_identity: None,
+                        principal: None,
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -5659,6 +5693,45 @@ mod tests {
         assert!(
             response.next_page_token.is_empty(),
             "snapshot read of a caught-up workflow must return an empty page token"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_rpc_reads_back_half_empty_durable_principal() {
+        // Feature: authorization-foundation, Property 5: the public history
+        // RPC returns the batch-aligned sidecar verbatim; an authenticated
+        // empty subject remains present rather than collapsing to anonymous.
+        let expected = tokeira_proto::common::Principal {
+            r#type: "jwt".to_owned(),
+            name: String::new(),
+        };
+        let (grpc, _repo, _run_key, run_id) =
+            history_test_service_with_principal(Some(EventPrincipal {
+                principal_type: expected.r#type.clone(),
+                name: expected.name.clone(),
+            }))
+            .await;
+
+        let response = grpc
+            .get_workflow_execution_history(Request::new(history_request(
+                run_id,
+                false,
+                Vec::new(),
+            )))
+            .await
+            .expect("history call should succeed")
+            .into_inner();
+        let events = response.history.expect("history").events;
+
+        assert!(!events.is_empty());
+        let committed_principals = events
+            .iter()
+            .filter(|event| event.event_id <= 2)
+            .map(|event| event.principal.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            committed_principals,
+            vec![Some(expected.clone()), Some(expected)]
         );
     }
 
@@ -5934,9 +6007,9 @@ mod tests {
                 TaskQueueName("nexus-q".to_string()),
                 NexusTask {
                     token: NexusTaskToken {
-                        run_key: RunKey(Uuid::from_u128(7)),
-                        operation_id: "op-1".to_string(),
-                        scheduled_event_id: 11,
+                        namespace_id: namespace_id_for("default").0.to_string(),
+                        task_queue: "nexus-q".to_string(),
+                        task_id: Uuid::from_u128(7).to_string(),
                     },
                     request: NexusTaskRequest::StartOperation {
                         service: "svc".to_string(),
@@ -5984,16 +6057,17 @@ mod tests {
             .await
             .expect_err("empty token should fail");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), "Task token not set on request.");
     }
 
     #[tokio::test]
-    async fn respond_nexus_task_completed_rejects_missing_response() {
+    async fn respond_nexus_task_completed_does_not_invent_missing_response_validation() {
         let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let token = NexusTaskToken {
-            run_key: RunKey::new(),
-            operation_id: "op-1".to_string(),
-            scheduled_event_id: 1,
+            namespace_id: namespace_id_for("default").0.to_string(),
+            task_queue: "nexus-q".to_string(),
+            task_id: Uuid::new_v4().to_string(),
         }
         .encode()
         .expect("token");
@@ -6007,8 +6081,9 @@ mod tests {
                 },
             ))
             .await
-            .expect_err("missing response should fail");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            .expect_err("unknown delivery should fail after response admission");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        assert_eq!(error.message(), "Nexus task not found or already expired");
     }
 
     #[tokio::test]
@@ -6031,7 +6106,369 @@ mod tests {
             .await
             .expect_err("malformed token should fail");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("invalid nexus task token"));
+        assert_eq!(error.message(), "Error deserializing task token.");
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_completed_rejects_invalid_token_fields_exactly() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+
+        for (token, expected) in [
+            (
+                NexusTaskToken {
+                    namespace_id: namespace_id_for("default").0.to_string(),
+                    task_queue: String::new(),
+                    task_id: Uuid::new_v4().to_string(),
+                },
+                "Invalid TaskToken.",
+            ),
+            (
+                NexusTaskToken {
+                    namespace_id: String::new(),
+                    task_queue: "nexus-q".to_string(),
+                    task_id: Uuid::new_v4().to_string(),
+                },
+                "Namespace not set on request.",
+            ),
+        ] {
+            let error = grpc
+                .respond_nexus_task_completed(Request::new(
+                    workflowservice::RespondNexusTaskCompletedRequest {
+                        namespace: "default".to_string(),
+                        task_token: token.encode().expect("token"),
+                        response: Some(nexus_v1::Response::default()),
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .expect_err("invalid token fields must fail");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert_eq!(error.message(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_methods_reject_token_namespace_mismatch_before_delivery_lookup() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let token = NexusTaskToken {
+            namespace_id: namespace_id_for("default").0.to_string(),
+            task_queue: "nexus-q".to_string(),
+            task_id: Uuid::new_v4().to_string(),
+        }
+        .encode()
+        .expect("token");
+
+        let completed = grpc
+            .respond_nexus_task_completed(Request::new(
+                workflowservice::RespondNexusTaskCompletedRequest {
+                    namespace: "external".to_string(),
+                    task_token: token.clone(),
+                    response: Some(nexus_v1::Response::default()),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("token namespace must win");
+        assert_eq!(completed.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            completed.message(),
+            "Operation requested with a token from a different namespace."
+        );
+
+        let failed = grpc
+            .respond_nexus_task_failed(Request::new(
+                workflowservice::RespondNexusTaskFailedRequest {
+                    namespace: "external".to_string(),
+                    task_token: token,
+                    error: Some(nexus_v1::HandlerError::default()),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("token namespace must win");
+        assert_eq!(failed.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            failed.message(),
+            "Operation requested with a token from a different namespace."
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_completed_validates_operation_token_before_task_token() {
+        let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let operation_token = "long".repeat(2_000);
+        let error = grpc
+            .respond_nexus_task_completed(Request::new(
+                workflowservice::RespondNexusTaskCompletedRequest {
+                    namespace: "default".to_string(),
+                    task_token: b"not-protobuf".to_vec(),
+                    response: Some(nexus_v1::Response {
+                        variant: Some(nexus_v1::response::Variant::StartOperation(
+                            nexus_v1::StartOperationResponse {
+                                variant: Some(
+                                    nexus_v1::start_operation_response::Variant::AsyncSuccess(
+                                        nexus_v1::start_operation_response::Async {
+                                            operation_token,
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            },
+                        )),
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("oversized operation token must be checked first");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "operation token length exceeds allowed limit (8000/4096)"
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_methods_validate_failure_shapes_before_consumption() {
+        let (grpc, broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+        let token = publish_test_workflow_nexus_task(&broker, RunKey::new()).await;
+        let decoded = NexusTaskToken::decode(&token).expect("token");
+
+        let completed = grpc
+            .respond_nexus_task_completed(Request::new(
+                workflowservice::RespondNexusTaskCompletedRequest {
+                    namespace: "default".to_string(),
+                    task_token: token.clone(),
+                    response: Some(nexus_v1::Response {
+                        variant: Some(nexus_v1::response::Variant::StartOperation(
+                            nexus_v1::StartOperationResponse {
+                                variant: Some(
+                                    nexus_v1::start_operation_response::Variant::OperationError(
+                                        nexus_v1::UnsuccessfulOperationError {
+                                            operation_state: "failed".to_string(),
+                                            failure: Some(nexus_v1::Failure {
+                                                details: b"not valid JSON".to_vec(),
+                                                ..Default::default()
+                                            }),
+                                        },
+                                    ),
+                                ),
+                            },
+                        )),
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("invalid operation failure details must fail");
+        assert_eq!(completed.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            completed.message(),
+            "failure details must be JSON serializable"
+        );
+        assert!(
+            broker.consume(&decoded.task_id).await.is_some(),
+            "frontend validation must leave the private delivery route outstanding"
+        );
+
+        let failed_token = publish_test_workflow_nexus_task(&broker, RunKey::new()).await;
+        let failed = grpc
+            .respond_nexus_task_failed(Request::new(
+                workflowservice::RespondNexusTaskFailedRequest {
+                    namespace: "default".to_string(),
+                    task_token: failed_token,
+                    error: Some(nexus_v1::HandlerError {
+                        failure: Some(nexus_v1::Failure {
+                            details: b"not valid JSON".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("invalid handler failure details must fail");
+        assert_eq!(failed.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            failed.message(),
+            "failure details must be JSON serializable"
+        );
+
+        let modern_token = publish_test_workflow_nexus_task(&broker, RunKey::new()).await;
+        let modern = grpc
+            .respond_nexus_task_failed(Request::new(
+                workflowservice::RespondNexusTaskFailedRequest {
+                    namespace: "default".to_string(),
+                    task_token: modern_token,
+                    failure: Some(tokeira_proto::failure::Failure::default()),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("modern failures require NexusHandlerFailureInfo");
+        assert_eq!(modern.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            modern.message(),
+            "request Failure must contain error or failure with NexusHandlerFailureInfo"
+        );
+    }
+
+    // Feature: edge-nexus-task-transport, Property 5: any invalid JSON failure
+    // is rejected before the worker's private delivery correlation is consumed.
+    proptest! {
+        #[test]
+        fn property_nexus_validation_precedes_correlation_consumption(
+            details in proptest::collection::vec(any::<u8>(), 1..64)
+                .prop_filter("details must not be valid JSON", |value| {
+                    serde_json::from_slice::<serde_json::Value>(value).is_err()
+                }),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async move {
+                let (grpc, broker) =
+                    nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
+                let token = publish_test_workflow_nexus_task(&broker, RunKey::new()).await;
+                let decoded = NexusTaskToken::decode(&token).expect("token");
+                let error = grpc
+                    .respond_nexus_task_completed(Request::new(
+                        workflowservice::RespondNexusTaskCompletedRequest {
+                            namespace: "default".to_string(),
+                            task_token: token,
+                            response: Some(nexus_v1::Response {
+                                variant: Some(nexus_v1::response::Variant::StartOperation(
+                                    nexus_v1::StartOperationResponse {
+                                        variant: Some(
+                                            nexus_v1::start_operation_response::Variant::OperationError(
+                                                nexus_v1::UnsuccessfulOperationError {
+                                                    operation_state: "failed".to_string(),
+                                                    failure: Some(nexus_v1::Failure {
+                                                        details,
+                                                        ..Default::default()
+                                                    }),
+                                                },
+                                            ),
+                                        ),
+                                    },
+                                )),
+                            }),
+                            ..Default::default()
+                        },
+                    ))
+                    .await
+                    .expect_err("invalid details must fail");
+                assert_eq!(error.code(), tonic::Code::InvalidArgument);
+                assert_eq!(
+                    error.message(),
+                    "failure details must be JSON serializable"
+                );
+                assert!(broker.consume(&decoded.task_id).await.is_some());
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_completed_routes_workflow_correlation_once() {
+        let runtime = Arc::new(NexusRecordingRuntime::new(true));
+        let (grpc, broker) = nexus_test_service(runtime.clone());
+        let run_key = RunKey::new();
+        let token = publish_test_workflow_nexus_task(&broker, run_key).await;
+        let request = workflowservice::RespondNexusTaskCompletedRequest {
+            namespace: "default".to_string(),
+            task_token: token.clone(),
+            response: Some(nexus_v1::Response {
+                variant: Some(nexus_v1::response::Variant::StartOperation(
+                    nexus_v1::StartOperationResponse {
+                        variant: Some(nexus_v1::start_operation_response::Variant::SyncSuccess(
+                            nexus_v1::start_operation_response::Sync::default(),
+                        )),
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
+
+        grpc.respond_nexus_task_completed(Request::new(request.clone()))
+            .await
+            .expect("known workflow correlation must route");
+        let recorded = runtime.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, run_key);
+        assert_eq!(recorded[0].1, "op-1");
+        assert_eq!(recorded[0].2, 1);
+        assert!(matches!(recorded[0].3, NexusResolution::Completed { .. }));
+
+        let repeated = grpc
+            .respond_nexus_task_completed(Request::new(request))
+            .await
+            .expect_err("delivery correlation is single-use");
+        assert_eq!(repeated.code(), tonic::Code::NotFound);
+        assert_eq!(
+            repeated.message(),
+            "Nexus task not found or already expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_nexus_task_completed_routes_http_correlation_only_to_edge_waiter() {
+        let waiters = crate::nexus_http::NexusHttpWaiterRegistry::default();
+        let mut waiter = waiters.register();
+        let runtime = Arc::new(NexusRecordingRuntime::new(true));
+        let (grpc, broker) = nexus_test_service_with_waiters(runtime.clone(), waiters);
+        let namespace_id = namespace_id_for("default");
+        let task_queue = TaskQueueName("nexus-q".to_string());
+        let _lease = broker
+            .publish_http(
+                namespace_id,
+                task_queue.clone(),
+                waiter.id().to_string(),
+                NexusTaskRequest::Http(NexusHttpTaskRequest {
+                    header: BTreeMap::new(),
+                    scheduled_time: OffsetDateTime::UNIX_EPOCH,
+                    temporal_failure_responses: false,
+                    endpoint: String::new(),
+                    dispatch_deadline: OffsetDateTime::UNIX_EPOCH,
+                    variant: NexusHttpTaskRequestVariant::CancelOperation {
+                        service: "svc".to_string(),
+                        operation: "op".to_string(),
+                        operation_id: "worker-token".to_string(),
+                        operation_token: "worker-token".to_string(),
+                    },
+                }),
+            )
+            .await;
+        let task = broker
+            .poll(namespace_id, task_queue, std::time::Duration::ZERO)
+            .await
+            .expect("published HTTP task");
+        let response = nexus_v1::Response {
+            variant: Some(nexus_v1::response::Variant::CancelOperation(
+                nexus_v1::CancelOperationResponse {},
+            )),
+        };
+
+        grpc.respond_nexus_task_completed(Request::new(
+            workflowservice::RespondNexusTaskCompletedRequest {
+                namespace: "default".to_string(),
+                task_token: task.token.encode().expect("token"),
+                response: Some(response.clone()),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("HTTP correlation must be acknowledged");
+
+        assert_eq!(
+            waiter.outcome().await.expect("waiter outcome"),
+            crate::nexus_http::NexusHttpWorkerOutcome::Completed(response)
+        );
+        assert!(
+            runtime.recorded().is_empty(),
+            "caller-facing delivery must not touch workflow state"
+        );
     }
 
     #[tokio::test]
@@ -6043,15 +6480,10 @@ mod tests {
         // kernel-rejection-is-swallowed behaviour is covered for the failed path by
         // respond_nexus_task_failed_kernel_rejection_returns_success.)
         let runtime = Arc::new(NexusRecordingRuntime::new(true));
-        let (grpc, _broker) = nexus_test_service(runtime.clone());
+        let (grpc, broker) = nexus_test_service(runtime.clone());
 
-        let token = NexusTaskToken {
-            run_key: RunKey::new(),
-            operation_id: "op-1".to_string(),
-            scheduled_event_id: 1,
-        }
-        .encode()
-        .expect("token");
+        let run_key = RunKey::new();
+        let token = publish_test_workflow_nexus_task(&broker, run_key).await;
         grpc.respond_nexus_task_completed(Request::new(
             workflowservice::RespondNexusTaskCompletedRequest {
                 namespace: "default".to_string(),
@@ -6094,6 +6526,7 @@ mod tests {
             .await
             .expect_err("empty token should fail");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), "Task token not set on request.");
     }
 
     #[tokio::test]
@@ -6101,9 +6534,9 @@ mod tests {
         let (grpc, _broker) = nexus_test_service(Arc::new(NexusRecordingRuntime::new(true)));
 
         let token = NexusTaskToken {
-            run_key: RunKey::new(),
-            operation_id: "op-1".to_string(),
-            scheduled_event_id: 1,
+            namespace_id: namespace_id_for("default").0.to_string(),
+            task_queue: "nexus-q".to_string(),
+            task_id: Uuid::new_v4().to_string(),
         }
         .encode()
         .expect("token");
@@ -6124,15 +6557,9 @@ mod tests {
     #[tokio::test]
     async fn respond_nexus_task_failed_kernel_rejection_returns_success() {
         let runtime = Arc::new(NexusRecordingRuntime::new(false));
-        let (grpc, _broker) = nexus_test_service(runtime.clone());
+        let (grpc, broker) = nexus_test_service(runtime.clone());
 
-        let token = NexusTaskToken {
-            run_key: RunKey::new(),
-            operation_id: "op-1".to_string(),
-            scheduled_event_id: 1,
-        }
-        .encode()
-        .expect("token");
+        let token = publish_test_workflow_nexus_task(&broker, RunKey::new()).await;
         grpc.respond_nexus_task_failed(Request::new(
             workflowservice::RespondNexusTaskFailedRequest {
                 namespace: "default".to_string(),
@@ -6149,5 +6576,35 @@ mod tests {
         .expect("kernel rejection should be swallowed");
 
         assert_eq!(runtime.recorded().len(), 1);
+    }
+
+    async fn publish_test_workflow_nexus_task(
+        broker: &NexusTaskBroker,
+        run_key: RunKey,
+    ) -> Vec<u8> {
+        let namespace_id = namespace_id_for("default");
+        let task_queue = TaskQueueName("nexus-q".to_string());
+        broker
+            .publish_workflow(
+                namespace_id,
+                task_queue.clone(),
+                run_key,
+                "op-1".to_string(),
+                1,
+                NexusTaskRequest::CancelOperation {
+                    service: "svc".to_string(),
+                    operation: "op".to_string(),
+                    operation_id: "op-1".to_string(),
+                    operation_token: "token-1".to_string(),
+                },
+            )
+            .await;
+        broker
+            .poll(namespace_id, task_queue, std::time::Duration::ZERO)
+            .await
+            .expect("published task")
+            .token
+            .encode()
+            .expect("token")
     }
 }

@@ -28,15 +28,16 @@ use tokio::sync::Mutex;
 
 use crate::{
     api::{
-        ActivitySweepEntry, BacklogEntry, BudgetAllocationResult, BundleLease, CommitResult,
-        CompletionCallbackSweepEntry, ConflictToken, ConnectionDirector, ControlRepository,
-        CurrentExecutionConflictPolicy, DbClass, DbPermit, DeleteRunRequest, DeleteRunResult,
-        DeploymentCasResult, DeploymentKey, DeploymentName, DispatchableActivityTask,
-        DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult, LeaseOutcome, LeaseRepository,
-        NexusSweepEntry, ProjectionBatch, ProjectionLog, ProjectionRecord, RequestRecord,
-        RunRepository, StoredWorkerDeployment, TransitionAuditRecord, WftTimeoutSweepEntry,
-        WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
-        WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
+        ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BudgetAllocationResult,
+        BundleLease, CommitResult, CompletionCallbackSweepEntry, ConflictToken, ConnectionDirector,
+        ControlRepository, CurrentExecutionConflictPolicy, DbClass, DbPermit, DeleteRunRequest,
+        DeleteRunResult, DeploymentCasResult, DeploymentKey, DeploymentName,
+        DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult,
+        LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch, ProjectionLog,
+        ProjectionRecord, RequestRecord, RunRepository, StoredWorkerDeployment,
+        TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentRepository,
+        WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
+        WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
         workflow_is_open_and_pinned_to_version, workflow_projection_context,
     },
     metrics as storage_metrics,
@@ -95,6 +96,8 @@ struct StoreState {
     deployment_token_hwm: HashMap<DeploymentKey, u64>,
     /// Authoritative event stream by run key.
     history: HashMap<RunKey, Vec<tokeira_kernel::HistoryEvent>>,
+    /// Server-computed attribution aligned with the authoritative event stream.
+    history_principals: HashMap<RunKey, Vec<Option<tokeira_types::EventPrincipal>>>,
     /// Workflow-scoped request dedupe records.
     request_dedupe: HashMap<(NamespaceId, String, String), RequestRecord>,
     /// Test/admin transition audit records.
@@ -277,6 +280,42 @@ impl RunRepository for InMemoryStore {
         result
     }
 
+    #[tracing::instrument(name = "storage.read_attributed_history", skip(self), fields(run_key = %run_key.0, after_event_id, limit))]
+    async fn read_attributed_history(
+        &self,
+        run_key: RunKey,
+        after_event_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AttributedHistoryEvent>> {
+        let store = self.inner.lock().await;
+        let Some(history) = store.history.get(&run_key) else {
+            return Ok(Vec::new());
+        };
+        let principals = store.history_principals.get(&run_key);
+        if let Some(principals) = principals
+            && principals.len() != history.len()
+        {
+            anyhow::bail!(
+                "corrupt in-memory history: {} events but {} principal entries",
+                history.len(),
+                principals.len()
+            );
+        }
+        Ok(history
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.event_id > after_event_id)
+            .take(limit)
+            .map(|(index, event)| AttributedHistoryEvent {
+                event: event.clone(),
+                principal: principals
+                    .and_then(|values| values.get(index))
+                    .cloned()
+                    .flatten(),
+            })
+            .collect())
+    }
+
     #[tracing::instrument(name = "storage.lookup_request_dedupe", skip(self), fields(namespace_id = %execution.namespace_id.0, workflow_id = %execution.workflow_id.0, request_id = %request_id.0))]
     async fn lookup_request_dedupe(
         &self,
@@ -407,6 +446,13 @@ impl RunRepository for InMemoryStore {
         epoch: ShardEpoch,
     ) -> Result<CommitResult> {
         let started = Instant::now();
+        if transition.history_events.len() != transition.event_principals.len() {
+            anyhow::bail!(
+                "history/principal sidecar length mismatch: {} events, {} principals",
+                transition.history_events.len(),
+                transition.event_principals.len()
+            );
+        }
         let state = transition.next_state.clone();
         let namespace = Some(state.namespace_id.0.to_string());
         let mut store = self.inner.lock().await;
@@ -551,6 +597,11 @@ impl RunRepository for InMemoryStore {
             .entry(run_key)
             .or_default()
             .extend(transition.history_events.iter().cloned());
+        store
+            .history_principals
+            .entry(run_key)
+            .or_default()
+            .extend(transition.event_principals.iter().cloned());
 
         store
             .transition_audit
@@ -857,6 +908,7 @@ impl RunRepository for InMemoryStore {
         ));
         store.runs.remove(&run_key);
         store.history.remove(&run_key);
+        store.history_principals.remove(&run_key);
         store.transition_audit.remove(&run_key);
         store.run_shard_map.remove(&run_key);
         store.conflict_injections.remove(&run_key);
@@ -928,6 +980,11 @@ impl RunRepository for InMemoryStore {
                 )
             })?;
         let copied_history: Vec<_> = base_history[..prefix_len].to_vec();
+        let copied_principals = store
+            .history_principals
+            .get(&base_run_key)
+            .map(|principals| principals[..prefix_len].to_vec())
+            .unwrap_or_else(|| vec![None; prefix_len]);
 
         let kernel = BasicKernel;
         let replay_ctx = ReplayContext {
@@ -961,6 +1018,9 @@ impl RunRepository for InMemoryStore {
         successor_state.first_run_started_at = Some(materialized_at);
 
         store.history.insert(successor_run_key, copied_history);
+        store
+            .history_principals
+            .insert(successor_run_key, copied_principals);
         store
             .runs
             .insert(successor_run_key, successor_state.clone());
@@ -1700,9 +1760,9 @@ mod tests {
         state::{VersioningOverride, WorkerDeploymentVersionRef, WorkflowVersioningInfo},
     };
     use tokeira_types::{
-        ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey, RequestId,
-        RunId, RunKey, SearchAttrValue, SearchAttributes, TaskKind, TaskQueueName, TransitionSeq,
-        VisibilityLifecycleState, WorkerIdentity, WorkflowId, WorkflowType,
+        EventPrincipal, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey,
+        RequestId, RunId, RunKey, SearchAttrValue, SearchAttributes, TaskKind, TaskQueueName,
+        TransitionSeq, VisibilityLifecycleState, WorkerIdentity, WorkflowId, WorkflowType,
     };
     use tracing::{
         Subscriber,
@@ -2226,12 +2286,50 @@ mod tests {
             expected_seq: TransitionSeq::ZERO,
             next_state: sample_state(run_key),
             history_events: Default::default(),
+            event_principals: Default::default(),
             request_dedupe_ops: Default::default(),
             activity_ops: Default::default(),
             timer_ops: Default::default(),
             dispatch_ops: Default::default(),
             projection_ops: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn attributed_history_commits_and_reads_as_one_aligned_batch() {
+        // Feature: authorization-foundation, Property 5: the in-memory backend
+        // mirrors DSQL's atomic event/sidecar pairing (Requirement 7.7).
+        let store = InMemoryStore::default();
+        let run_key = RunKey::new();
+        let principal = EventPrincipal {
+            principal_type: "jwt".into(),
+            name: "operator".into(),
+        };
+        let mut transition = start_transition(run_key);
+        transition.history_events.push(HistoryEvent {
+            event_id: 1,
+            happened_at: fixed_now(),
+            kind: HistoryEventKind::WorkflowTaskScheduled {
+                logical_seq: LogicalTaskSeq(1),
+                task_queue: TaskQueueName("queue".into()),
+                workflow_task_timeout: Duration::seconds(10),
+                attempt: 1,
+            },
+        });
+        transition.event_principals.push(Some(principal.clone()));
+
+        store
+            .commit_transition(run_key, transition, ShardEpoch::ZERO)
+            .await
+            .expect("commit attributed event");
+        let attributed = store
+            .read_attributed_history(run_key, 0, 10)
+            .await
+            .expect("read attributed event");
+
+        assert_eq!(attributed.len(), 1);
+        assert_eq!(attributed[0].principal, Some(principal));
+        assert_eq!(attributed[0].event.event_id, 1);
     }
 
     #[test]
@@ -2703,6 +2801,9 @@ mod tests {
     ) {
         let mut inner = store.inner.lock().await;
         inner.runs.insert(run_key, state.clone());
+        inner
+            .history_principals
+            .insert(run_key, vec![None; history.len()]);
         inner.history.insert(run_key, history);
         inner.execution_index.insert(
             (
@@ -2799,6 +2900,7 @@ mod tests {
                     expected_seq: TransitionSeq(1),
                     next_state: sample_state(run_key),
                     history_events: Default::default(),
+                    event_principals: Default::default(),
                     request_dedupe_ops: Default::default(),
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
@@ -2855,6 +2957,7 @@ mod tests {
                     expected_seq: TransitionSeq(1),
                     next_state: sample_state(run_key),
                     history_events: Default::default(),
+                    event_principals: Default::default(),
                     request_dedupe_ops: Default::default(),
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
@@ -3061,6 +3164,7 @@ mod tests {
                     expected_seq: TransitionSeq(1),
                     next_state: sample_state(run_key),
                     history_events: Default::default(),
+                    event_principals: Default::default(),
                     request_dedupe_ops: Default::default(),
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
@@ -3096,6 +3200,7 @@ mod tests {
                     expected_seq: TransitionSeq(1),
                     next_state: sample_state(run_key_1),
                     history_events: Default::default(),
+                    event_principals: Default::default(),
                     request_dedupe_ops: Default::default(),
                     activity_ops: Default::default(),
                     timer_ops: Default::default(),
@@ -3239,6 +3344,7 @@ mod tests {
             expected_seq: TransitionSeq(1),
             next_state: sample_state(run_key_1),
             history_events: Default::default(),
+            event_principals: Default::default(),
             request_dedupe_ops: Default::default(),
             activity_ops: Default::default(),
             timer_ops: Default::default(),
@@ -3452,6 +3558,7 @@ mod tests {
             expected_seq: TransitionSeq(1),
             next_state: sample_state(run_key),
             history_events: Default::default(),
+            event_principals: Default::default(),
             request_dedupe_ops: Default::default(),
             activity_ops: Default::default(),
             timer_ops: Default::default(),
@@ -3985,6 +4092,7 @@ mod tests {
                         expected_seq: TransitionSeq(1),
                         next_state: sample_state(run_key),
                         history_events: Default::default(),
+                        event_principals: Default::default(),
                         request_dedupe_ops:
                             Default::default(),
                         activity_ops: Default::default(),
@@ -4273,6 +4381,7 @@ mod tests {
             expected_seq: TransitionSeq(1),
             next_state: closed_state,
             history_events: Default::default(),
+            event_principals: Default::default(),
             request_dedupe_ops: Default::default(),
             activity_ops: Default::default(),
             timer_ops: Default::default(),
@@ -4334,6 +4443,7 @@ mod tests {
                             links: Vec::new(),
                         },
                     ));
+                    transition.event_principals.push(None);
                     transition.request_dedupe_ops.push(RequestDedupeOp {
                         request_id: RequestId(format!("request-{suffix}")),
                     });

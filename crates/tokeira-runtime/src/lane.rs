@@ -607,13 +607,21 @@ where
                         // frozen). A reset close always originates from
                         // Command::Reset, so missing bits (defensive arm)
                         // mean "exclude nothing".
-                        let (exclude_signal, exclude_update) = match &committed_command {
-                            Command::Reset(reset_request) => (
-                                reset_request.reapply_exclude_signal,
-                                reset_request.reapply_exclude_update,
-                            ),
-                            _ => (false, false),
-                        };
+                        let (exclude_signal, exclude_update, reset_request_context) =
+                            match &committed_command {
+                                Command::Reset(reset_request) => (
+                                    reset_request.reapply_exclude_signal,
+                                    reset_request.reapply_exclude_update,
+                                    reset_request.request.clone(),
+                                ),
+                                _ => (
+                                    false,
+                                    false,
+                                    tokeira_types::RequestContext::unattributed(
+                                        time::OffsetDateTime::now_utc(),
+                                    ),
+                                ),
+                            };
                         // A reset closes the predecessor and forks a successor
                         // run at `fork_event_id`. The successor is materialized
                         // here rather than through the normal start path, so
@@ -775,6 +783,7 @@ where
                                         worker_identity: tokeira_types::WorkerIdentity(
                                             "reset".into(),
                                         ),
+                                        request: reset_request_context,
                                         now: time::OffsetDateTime::now_utc(),
                                         // Guarded above: this branch is reached only
                                         // when the reapply extraction succeeded.
@@ -1173,6 +1182,7 @@ where
                                                 new_state.run_id.0, successor_run_id.0
                                             )),
                                             caller_identity: None,
+                                            principal: None,
                                             received_at: OffsetDateTime::now_utc(),
                                         },
                                         now: OffsetDateTime::now_utc(),
@@ -2050,6 +2060,7 @@ mod tests {
                     happened_at: OffsetDateTime::now_utc(),
                     kind: event_kind,
                 }],
+                event_principals: smallvec![None],
                 request_dedupe_ops: SmallVec::<[RequestDedupeOp; 1]>::new(),
                 activity_ops: SmallVec::<[tokeira_kernel::ActivityOp; 4]>::new(),
                 timer_ops: SmallVec::<[TimerOp; 4]>::new(),
@@ -2539,6 +2550,7 @@ mod tests {
                 expected_seq: current.transition_seq,
                 next_state,
                 history_events,
+                event_principals: smallvec![None],
                 request_dedupe_ops: SmallVec::new(),
                 activity_ops: SmallVec::new(),
                 timer_ops: SmallVec::new(),
@@ -2573,6 +2585,7 @@ mod tests {
                 expected_seq: current.transition_seq,
                 next_state,
                 history_events: SmallVec::new(),
+                event_principals: SmallVec::new(),
                 request_dedupe_ops: SmallVec::new(),
                 activity_ops: SmallVec::new(),
                 timer_ops: SmallVec::new(),
@@ -2670,6 +2683,7 @@ mod tests {
             request: RequestContext {
                 request_id: RequestId(format!("req-{label}")),
                 caller_identity: None,
+                principal: None,
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),

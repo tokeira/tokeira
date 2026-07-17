@@ -9,12 +9,14 @@ license.workspace = true
 anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
+base64.workspace = true
 buffa = { version = "0.6", features = ["json"] }
 connectrpc = { version = "0.6", features = ["client"] }
 http = "1"
 metrics.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+percent-encoding = "2"
 prost = "0.12"
 prost-types = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +31,7 @@ tonic.workspace = true
 tracing = "0.1"
 tracing-opentelemetry.workspace = true
 url = "2"
+tokeira-auth.workspace = true
 tokeira-build-info.workspace = true
 tokeira-compatibility.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }

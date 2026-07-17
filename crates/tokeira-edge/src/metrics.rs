@@ -14,6 +14,12 @@ pub const GRPC_REQUEST_TOTAL: &str = "tokeira_edge_grpc_request_total";
 pub const GRPC_REQUEST_DURATION_SECONDS: &str = "tokeira_edge_grpc_request_duration_seconds";
 pub const GRPC_ERROR_TOTAL: &str = "tokeira_edge_grpc_error_total";
 pub const GRPC_ACTIVE_REQUESTS: &str = "tokeira_edge_grpc_active_requests";
+/// Authorization admission latency by public API and outcome.
+pub const AUTHORIZATION_DURATION_SECONDS: &str = "tokeira_edge_authorization_duration_seconds";
+/// Intentional policy denials by public API.
+pub const AUTHORIZATION_DENIED_TOTAL: &str = "tokeira_edge_authorization_denied_total";
+/// Authentication or authorizer implementation failures by stage.
+pub const AUTHORIZATION_ERROR_TOTAL: &str = "tokeira_edge_authorization_error_total";
 const EDGE_SERVICE_LABEL: &str = "edge";
 
 // Nexus operational metrics owned by the edge. Names are tokeira-prefixed; the conformance
@@ -43,12 +49,26 @@ pub const NEXUS_COMPLETION_PREPROCESS_ERRORS_TOTAL: &str =
     "tokeira_edge_nexus_completion_request_preprocess_errors_total";
 /// Nexus task dispatch requests served to workers (maps to `nexus_task_requests`).
 pub const NEXUS_TASK_REQUESTS_TOTAL: &str = "tokeira_edge_nexus_task_requests_total";
+/// Caller-facing Nexus HTTP requests after route resolution (maps to `nexus_requests`).
+pub const NEXUS_REQUESTS_TOTAL: &str = "tokeira_edge_nexus_requests_total";
+/// Caller-facing Nexus HTTP request latency (maps to `nexus_latency`).
+pub const NEXUS_LATENCY_SECONDS: &str = "tokeira_edge_nexus_latency_seconds";
+/// Caller-facing Nexus HTTP requests rejected before dispatch (maps to
+/// `nexus_request_preprocess_errors`).
+pub const NEXUS_REQUEST_PREPROCESS_ERRORS_TOTAL: &str =
+    "tokeira_edge_nexus_request_preprocess_errors_total";
 
 pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (GRPC_REQUEST_TOTAL, MetricType::Counter),
     (GRPC_REQUEST_DURATION_SECONDS, MetricType::DurationHistogram),
     (GRPC_ERROR_TOTAL, MetricType::Counter),
     (GRPC_ACTIVE_REQUESTS, MetricType::Gauge),
+    (
+        AUTHORIZATION_DURATION_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (AUTHORIZATION_DENIED_TOTAL, MetricType::Counter),
+    (AUTHORIZATION_ERROR_TOTAL, MetricType::Counter),
     (NEXUS_COMPLETION_REQUESTS_TOTAL, MetricType::Counter),
     (
         NEXUS_COMPLETION_LATENCY_SECONDS,
@@ -59,6 +79,9 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
         MetricType::Counter,
     ),
     (NEXUS_TASK_REQUESTS_TOTAL, MetricType::Counter),
+    (NEXUS_REQUESTS_TOTAL, MetricType::Counter),
+    (NEXUS_LATENCY_SECONDS, MetricType::DurationHistogram),
+    (NEXUS_REQUEST_PREPROCESS_ERRORS_TOTAL, MetricType::Counter),
 ];
 
 static ACTIVE_REQUESTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
@@ -102,6 +125,31 @@ pub fn set_grpc_active_requests(method: &str, value: f64) {
     gauge!(GRPC_ACTIVE_REQUESTS, "method" => method.to_string()).set(value);
 }
 
+/// Record the complete authenticate-plus-authorize admission duration.
+pub fn record_authorization_duration(api_name: &str, outcome: &str, duration: std::time::Duration) {
+    histogram!(
+        AUTHORIZATION_DURATION_SECONDS,
+        "api_name" => api_name.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record one intentional policy denial.
+pub fn record_authorization_denied(api_name: &str) {
+    counter!(AUTHORIZATION_DENIED_TOTAL, "api_name" => api_name.to_owned()).increment(1);
+}
+
+/// Record an authentication or authorizer implementation failure.
+pub fn record_authorization_error(api_name: &str, stage: &str) {
+    counter!(
+        AUTHORIZATION_ERROR_TOTAL,
+        "api_name" => api_name.to_owned(),
+        "stage" => stage.to_owned(),
+    )
+    .increment(1);
+}
+
 /// Record one inbound Nexus completion request, tagged by the originator `namespace` and
 /// the handler `outcome` (`success` / `error_bad_request` / `error_not_found` /
 /// `error_internal`).
@@ -138,6 +186,46 @@ pub fn record_nexus_task_request(namespace: &str, outcome: &str) {
     .increment(1);
 }
 
+/// Record one terminal caller-facing Nexus HTTP outcome.
+///
+/// Temporal v1.31.0 attaches the resolved namespace, method and endpoint even
+/// when authorization rejects the call (`service/frontend/nexus_handler.go`).
+pub fn record_nexus_request(namespace: &str, method: &str, outcome: &str, nexus_endpoint: &str) {
+    counter!(
+        NEXUS_REQUESTS_TOTAL,
+        "namespace" => namespace.to_owned(),
+        "method" => method.to_owned(),
+        "outcome" => outcome.to_owned(),
+        "nexus_endpoint" => nexus_endpoint.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Record caller-facing Nexus HTTP latency with the same dimensions as the
+/// terminal counter so an operator can correlate rate and duration.
+pub fn record_nexus_latency(
+    namespace: &str,
+    method: &str,
+    outcome: &str,
+    nexus_endpoint: &str,
+    duration: std::time::Duration,
+) {
+    histogram!(
+        NEXUS_LATENCY_SECONDS,
+        "namespace" => namespace.to_owned(),
+        "method" => method.to_owned(),
+        "outcome" => outcome.to_owned(),
+        "nexus_endpoint" => nexus_endpoint.to_owned(),
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record a caller-facing Nexus HTTP request rejected during route or request
+/// preprocessing, before a task becomes visible to a worker.
+pub fn record_nexus_request_preprocess_error() {
+    counter!(NEXUS_REQUEST_PREPROCESS_ERRORS_TOTAL).increment(1);
+}
+
 pub struct GrpcActiveRequestGuard {
     method: String,
 }
@@ -172,6 +260,8 @@ pub fn track_grpc_active_request(method: &str) -> GrpcActiveRequestGuard {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use proptest::prelude::*;
 
     use super::*;
     use metrics::with_local_recorder;
@@ -267,6 +357,53 @@ mod tests {
     }
 
     #[test]
+    fn authorization_metrics_use_only_bounded_api_outcome_and_stage_labels() {
+        let recorder = DebuggingRecorder::new();
+
+        with_local_recorder(&recorder, || {
+            record_authorization_duration(
+                "/temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution",
+                "denied",
+                std::time::Duration::from_millis(2),
+            );
+            record_authorization_denied(
+                "/temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution",
+            );
+            record_authorization_error(
+                "/temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution",
+                "authorizer",
+            );
+        });
+
+        let snapshot = snapshot_map(&recorder);
+        let expected_api =
+            "/temporal.api.workflowservice.v1.WorkflowService/StartWorkflowExecution".to_owned();
+
+        let (labels, value) = snapshot
+            .get(AUTHORIZATION_DURATION_SECONDS)
+            .expect("authorization duration");
+        assert_eq!(labels.get("api_name"), Some(&expected_api));
+        assert_eq!(labels.get("outcome"), Some(&"denied".to_owned()));
+        assert_eq!(labels.len(), 2);
+        assert!(matches!(value, DebugValue::Histogram(values) if values.len() == 1));
+
+        let (labels, value) = snapshot
+            .get(AUTHORIZATION_DENIED_TOTAL)
+            .expect("authorization denial");
+        assert_eq!(labels.get("api_name"), Some(&expected_api));
+        assert_eq!(labels.len(), 1);
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot
+            .get(AUTHORIZATION_ERROR_TOTAL)
+            .expect("authorization error");
+        assert_eq!(labels.get("api_name"), Some(&expected_api));
+        assert_eq!(labels.get("stage"), Some(&"authorizer".to_owned()));
+        assert_eq!(labels.len(), 2);
+        assert_eq!(value, &DebugValue::Counter(1));
+    }
+
+    #[test]
     fn nexus_helpers_emit_expected_metrics_and_labels() {
         let recorder = DebuggingRecorder::new();
 
@@ -297,5 +434,54 @@ mod tests {
         assert_eq!(labels.get("namespace"), Some(&"default".to_string()));
         assert_eq!(labels.get("outcome"), Some(&"dispatched".to_string()));
         assert_eq!(value, &DebugValue::Counter(1));
+    }
+
+    // Feature: edge-nexus-http-dispatch, Property 7: one terminal caller-facing
+    // outcome produces exactly one counter sample and one latency observation
+    // with the same bounded dimensions; preprocessing remains a separate counter.
+    proptest! {
+        #[test]
+        fn property_nexus_http_metrics_are_emitted_once(
+            namespace in "[a-z0-9_-]{1,24}",
+            method in prop_oneof![Just("StartNexusOperation"), Just("CancelNexusOperation")],
+            outcome in prop_oneof![Just("success"), Just("unauthorized"), Just("internal_error")],
+            endpoint in "[a-z0-9_-]{1,24}",
+        ) {
+            let recorder = DebuggingRecorder::new();
+            with_local_recorder(&recorder, || {
+                record_nexus_request(&namespace, method, outcome, &endpoint);
+                record_nexus_latency(
+                    &namespace,
+                    method,
+                    outcome,
+                    &endpoint,
+                    std::time::Duration::from_millis(3),
+                );
+                record_nexus_request_preprocess_error();
+            });
+            let snapshot = snapshot_map(&recorder);
+
+            let (labels, value) = snapshot
+                .get(NEXUS_REQUESTS_TOTAL)
+                .expect("terminal counter");
+            prop_assert_eq!(value, &DebugValue::Counter(1));
+            prop_assert_eq!(labels.get("namespace"), Some(&namespace));
+            prop_assert_eq!(labels.get("method").map(String::as_str), Some(method));
+            prop_assert_eq!(labels.get("outcome").map(String::as_str), Some(outcome));
+            prop_assert_eq!(labels.get("nexus_endpoint"), Some(&endpoint));
+
+            let (_, value) = snapshot
+                .get(NEXUS_LATENCY_SECONDS)
+                .expect("terminal latency");
+            match value {
+                DebugValue::Histogram(values) => prop_assert_eq!(values.len(), 1),
+                other => prop_assert!(false, "expected histogram, got {other:?}"),
+            }
+            let (labels, value) = snapshot
+                .get(NEXUS_REQUEST_PREPROCESS_ERRORS_TOTAL)
+                .expect("preprocess counter");
+            prop_assert!(labels.is_empty());
+            prop_assert_eq!(value, &DebugValue::Counter(1));
+        }
     }
 }

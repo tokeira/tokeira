@@ -201,6 +201,7 @@ async fn complete_with_commands(
             commands,
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -278,6 +279,7 @@ fn start_request(
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),

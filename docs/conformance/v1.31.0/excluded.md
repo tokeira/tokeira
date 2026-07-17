@@ -6,8 +6,8 @@
 > (not part of the public SDK/operator API), or an RPC **absent from v1.31.0**. It is **definitional, not
 > a status report**.
 >
-> Surfaces that are present in v1.31.0 but still **under decision** (authentication) are not here —
-> they are in [`decisions.md`](./decisions.md).
+> Surfaces that are present in v1.31.0 but still **under decision** are not here — they are in
+> [`decisions.md`](./decisions.md) (none currently open).
 
 ## 1. Experimental / pre-release features (Temporal-designated)
 
@@ -39,6 +39,15 @@ These are Temporal-internal RPC boundaries and operational tooling, not part of 
 - **CHASM framework internals** — enabled in v1.31.0 but applications atop it are off by default;
   internal to the engine, not a public API.
 - **Persistence / test-only inspection** used by Temporal's own test base.
+- **Auth extension points** — the `ClaimMapper` / `Authorizer` / `JWTAudienceMapper` Go plugin
+  seams (`temporal.WithClaimMapper` etc. server options) are server extension points, not API
+  surface; a Rust binary cannot host them, and tokeira's extension seam is its own edge
+  `Authenticator` trait. **mTLS-derived identity at the edge** is likewise out: tokeira is
+  JWT-only at the edge with TLS terminated upstream (and even upstream, no shipped v1.31.0 claim
+  mapper consumes the TLS peer certificate — mTLS claims require a custom plugin). The
+  **configured JWT auth surface itself is in-surface** — see
+  [`supported.md`](./supported.md#authentication-and-authorization) and the decision record
+  [`authorization.md`](./authorization.md).
 
 Read-only and delivery-layer RPCs (e.g. `QueryWorkflow`, `DescribeWorkflowExecution`,
 `RecordActivityTaskStarted`) are **not** excluded by being read-only — they are part of the public
@@ -82,4 +91,5 @@ They therefore remain part of the v1.31.0 conformance surface; see [`supported.m
 ## Related pages
 
 - [`supported.md`](./supported.md) — the v1.31.0 conformance surface.
-- [`decisions.md`](./decisions.md) — surfaces present in v1.31.0 that are still under decision.
+- [`decisions.md`](./decisions.md) — surfaces present in v1.31.0 that are still under decision
+  (none currently open).

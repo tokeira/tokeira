@@ -14,7 +14,7 @@
 //! surfaced to workers as `ProtocolMessage` entries on the poll response.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -24,6 +24,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use http::HeaderMap;
 use prost::Message as _;
+use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
 use tokeira_compatibility::{FEATURE_MATRIX, FeatureState};
 use tokeira_kernel::{
@@ -37,12 +38,12 @@ use tokeira_runtime::{
     BatchOperationStore, BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry,
     CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion, DeleteWorkflowRequest,
     DeploymentPage, DeploymentView, DescribeVersion, InMemoryBroker, ListDeployments,
-    MultiOperationError, MultiOperationResult, NexusTaskBroker, NexusTaskToken, OverlapDecision,
-    OverlapPolicy, PendingUpdateTransport, QueryResult, RegisterPolledDeployment,
-    ResetWorkflowResult, ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent,
-    SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping, SetRampingOutcome,
-    SignalWithStartResult, StartWorkflowResult, StartedActivityTask, StartedWorkflowTask,
-    TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView,
+    MultiOperationError, MultiOperationResult, NexusTaskBroker, NexusTaskCorrelation,
+    NexusTaskToken, OverlapDecision, OverlapPolicy, PendingUpdateTransport, QueryResult,
+    RegisterPolledDeployment, ResetWorkflowResult, ScheduleActionResult, SchedulePatch,
+    ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping,
+    SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
+    StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView,
     UpdateActivitiesOptionsRequest, UpdateComputeConfig, UpdateLifecycleError,
     UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
     ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistry, WorkflowActivation,
@@ -51,7 +52,8 @@ use tokeira_runtime::{
     scheduled_workflow_search_attributes,
 };
 use tokeira_storage::{
-    ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType, RunRepository,
+    AttributedHistoryEvent, ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType,
+    RunRepository,
 };
 use tokeira_types::{
     ActivityTaskToken, ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus,
@@ -65,10 +67,11 @@ use crate::{
     errors::{EdgeError, EdgeResult},
     grpc::tracing_interceptor,
     history_wait::HistoryWaitRegistry,
-    interceptors::{Action, EdgeContext, EdgeInterceptors},
+    interceptors::{Action, EdgeContext, EdgeInterceptors, cross_namespace_commands_enabled},
     long_poll::LongPollGate,
     metrics as edge_metrics,
     namespace_cache::{NamespaceCache, ResolvedNamespace},
+    nexus_http::{NexusHttpWaiterRegistry, NexusHttpWorkerOutcome},
     operator_service::{ClusterInfo, OperatorApi, SearchAttributeDefinition},
     pending_queries::{LEGACY_QUERY_ID, PendingQueryStore},
     poller_registry::{ActivePoller, PollerRegistry},
@@ -177,6 +180,7 @@ fn schedule_request_context(now: OffsetDateTime) -> RequestContext {
     RequestContext {
         request_id: RequestId(Uuid::new_v4().to_string()),
         caller_identity: Some("schedule-engine".to_string()),
+        principal: None,
         received_at: now,
     }
 }
@@ -221,6 +225,7 @@ fn activity_control_request_context(
     RequestContext {
         request_id: RequestId(ctx.request_id.as_str().to_string()),
         caller_identity: (!identity.is_empty()).then(|| identity.to_string()),
+        principal: ctx.event_principal(),
         received_at: now,
     }
 }
@@ -262,6 +267,7 @@ fn build_update_activity_options_command(
             request_id: RequestId(ctx.request_id.as_str().to_string()),
             caller_identity: worker_identity_from_request(req.identity.clone())
                 .map(|identity| identity.0),
+            principal: ctx.event_principal(),
             received_at: ctx.received_at,
         },
         now: OffsetDateTime::now_utc(),
@@ -653,6 +659,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         token: ActivityTaskToken,
         result: Payloads,
         worker_identity: Option<tokeira_types::WorkerIdentity>,
+        request: RequestContext,
     ) -> Result<WorkflowMutationOutcome>;
 
     async fn fail_activity_task(
@@ -662,6 +669,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         failure_error_type: Option<String>,
         is_non_retryable: bool,
         worker_identity: Option<tokeira_types::WorkerIdentity>,
+        request: RequestContext,
     ) -> Result<()>;
 
     async fn cancel_activity_task(
@@ -669,8 +677,9 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         token: ActivityTaskToken,
         details: Option<Payloads>,
         worker_identity: Option<tokeira_types::WorkerIdentity>,
+        request: RequestContext,
     ) -> Result<WorkflowMutationOutcome> {
-        let _ = (token, details, worker_identity);
+        let _ = (token, details, worker_identity, request);
         Err(anyhow!("cancel_activity_task is not implemented"))
     }
 
@@ -698,8 +707,9 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         run_key: RunKey,
         activity_id: &str,
         identity: tokeira_types::WorkerIdentity,
+        request: RequestContext,
     ) -> Result<ActivityTaskToken> {
-        let _ = (run_key, activity_id, identity);
+        let _ = (run_key, activity_id, identity, request);
         Err(tokeira_runtime::ActivityTaskNotFound {
             reason: "force start unsupported by this runtime",
         }
@@ -1100,6 +1110,7 @@ pub struct WorkflowService {
     buffered_queries: BufferedQueryRegistry,
     broker: InMemoryBroker,
     nexus_broker: NexusTaskBroker,
+    nexus_http_waiters: NexusHttpWaiterRegistry,
     long_polls: LongPollGate,
     router: Arc<dyn EdgeRouter>,
     history_waiters: HistoryWaitRegistry,
@@ -1111,6 +1122,106 @@ pub struct WorkflowService {
     workflow_rules: WorkflowRuleStore,
     eager_dispatch_config: EagerDispatchConfig,
     task_queue_rate_limiter: TaskQueueRateLimiter,
+}
+
+const MAX_NEXUS_OPERATION_TOKEN_LENGTH: usize = 4096;
+
+fn validate_nexus_task_token(context: &EdgeContext, token: &NexusTaskToken) -> EdgeResult<()> {
+    if token.task_queue.is_empty() || token.task_id.is_empty() {
+        return Err(EdgeError::BadRequest("Invalid TaskToken.".to_string()));
+    }
+    if token.namespace_id.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "Namespace not set on request.".to_string(),
+        ));
+    }
+
+    let namespace_id = Uuid::parse_str(&token.namespace_id)
+        .map(tokeira_types::NamespaceId)
+        .map_err(|_| EdgeError::BadRequest("Invalid TaskToken.".to_owned()))?;
+    crate::interceptors::validate_task_token_namespace(context, Some(namespace_id))
+}
+
+fn decode_nexus_task_token(task_token: &[u8]) -> EdgeResult<NexusTaskToken> {
+    if task_token.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "Task token not set on request.".to_owned(),
+        ));
+    }
+    NexusTaskToken::decode(task_token)
+        .map_err(|_| EdgeError::BadRequest("Error deserializing task token.".to_owned()))
+}
+
+fn query_task_namespace_id(task_token: &[u8]) -> EdgeResult<tokeira_types::NamespaceId> {
+    let token = std::str::from_utf8(task_token)
+        .map_err(|_| EdgeError::BadRequest("invalid task token".to_owned()))?;
+    let namespace_id = token
+        .strip_prefix("query-task:")
+        .and_then(|remainder| remainder.split(':').next())
+        .ok_or_else(|| EdgeError::BadRequest("invalid task token".to_owned()))?;
+    Uuid::parse_str(namespace_id)
+        .map(tokeira_types::NamespaceId)
+        .map_err(|_| EdgeError::BadRequest("invalid task token".to_owned()))
+}
+
+fn validate_nexus_failure_details(details: &[u8]) -> EdgeResult<()> {
+    if !details.is_empty() && serde_json::from_slice::<serde_json::Value>(details).is_err() {
+        return Err(EdgeError::BadRequest(
+            "failure details must be JSON serializable".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(deprecated)]
+fn validate_nexus_completed_response_token(
+    response: &tokeira_proto::public::temporal::api::nexus::v1::Response,
+) -> EdgeResult<()> {
+    use tokeira_proto::public::temporal::api::nexus::v1::{response, start_operation_response};
+
+    let Some(variant) = response.variant.as_ref() else {
+        return Ok(());
+    };
+    let response::Variant::StartOperation(start) = variant else {
+        return Ok(());
+    };
+    if let Some(start_operation_response::Variant::AsyncSuccess(success)) = start.variant.as_ref() {
+        let operation_token = if success.operation_token.is_empty() {
+            &success.operation_id
+        } else {
+            &success.operation_token
+        };
+        if operation_token.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "missing opration token in response".to_string(),
+            ));
+        }
+        if operation_token.len() > MAX_NEXUS_OPERATION_TOKEN_LENGTH {
+            return Err(EdgeError::BadRequest(format!(
+                "operation token length exceeds allowed limit ({}/{})",
+                operation_token.len(),
+                MAX_NEXUS_OPERATION_TOKEN_LENGTH
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(deprecated)]
+fn validate_nexus_completed_response_failure_details(
+    response: &tokeira_proto::public::temporal::api::nexus::v1::Response,
+) -> EdgeResult<()> {
+    use tokeira_proto::public::temporal::api::nexus::v1::{response, start_operation_response};
+
+    let Some(response::Variant::StartOperation(start)) = response.variant.as_ref() else {
+        return Ok(());
+    };
+    if let Some(start_operation_response::Variant::OperationError(error)) = start.variant.as_ref()
+        && let Some(failure) = error.failure.as_ref()
+    {
+        validate_nexus_failure_details(&failure.details)?;
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for WorkflowService {
@@ -1221,6 +1332,24 @@ fn apply_matrix_capability_field(
 }
 
 impl WorkflowService {
+    /// Admit a transport handler that cannot yet delegate through a domain DTO.
+    ///
+    /// Standalone-activity and AdminService adapters use this narrow bridge so
+    /// they still pass through the same authn/authz ordering as every domain
+    /// method. The returned context is held for the call lifetime, preventing a
+    /// long poll from re-evaluating policy after admission.
+    pub async fn admit_request(
+        &self,
+        headers: &HeaderMap,
+        namespace: Option<&str>,
+        action: Action,
+        is_long_poll: bool,
+    ) -> EdgeResult<EdgeContext> {
+        self.interceptors
+            .begin(headers, namespace, action, is_long_poll)
+            .await
+    }
+
     async fn observe_edge_call<T, F>(
         &self,
         headers: &HeaderMap,
@@ -1409,6 +1538,7 @@ impl WorkflowService {
             buffered_queries,
             broker,
             nexus_broker,
+            nexus_http_waiters: NexusHttpWaiterRegistry::default(),
             long_polls,
             router,
             history_waiters,
@@ -1428,6 +1558,16 @@ impl WorkflowService {
         eager_dispatch_config: EagerDispatchConfig,
     ) -> Self {
         self.eager_dispatch_config = eager_dispatch_config;
+        self
+    }
+
+    /// Attach the edge-owned waiters used by caller-facing Nexus HTTP dispatch.
+    ///
+    /// The runtime broker retains only opaque waiter IDs; sharing this registry
+    /// with the HTTP handler keeps public response types and caller lifetimes in
+    /// the compatibility plane.
+    pub fn with_nexus_http_waiters(mut self, waiters: NexusHttpWaiterRegistry) -> Self {
+        self.nexus_http_waiters = waiters;
         self
     }
 
@@ -1528,6 +1668,89 @@ impl WorkflowService {
         Ok(())
     }
 
+    async fn admit_json_task_token<T: DeserializeOwned>(
+        &self,
+        headers: &HeaderMap,
+        request_namespace: &str,
+        task_token: &[u8],
+        action: Action,
+    ) -> EdgeResult<(T, Option<tokeira_types::NamespaceId>, EdgeContext, String)> {
+        if request_namespace.is_empty() {
+            // The namespace validator back-fills before authentication in
+            // v1.31.0, so malformed bytes on this branch are intentionally
+            // observable before any authorization decision.
+            let (token, token_namespace_id) = crate::task_token::decode(task_token)
+                .map_err(|error| EdgeError::BadRequest(format!("invalid task token: {error}")))?;
+            let (context, namespace) = self
+                .interceptors
+                .begin_with_task_token_backfill(headers, token_namespace_id, action)
+                .await?;
+            Ok((token, token_namespace_id, context, namespace))
+        } else {
+            // The explicit request namespace is the authorization target. Only
+            // an allowed caller may learn that its token is malformed or names
+            // a different namespace (`fx.go:256-290 @ v1.31.0`).
+            let context = self
+                .interceptors
+                .begin(headers, Some(request_namespace), action, false)
+                .await?;
+            let (token, token_namespace_id) = crate::task_token::decode(task_token)
+                .map_err(|error| EdgeError::BadRequest(format!("invalid task token: {error}")))?;
+            crate::interceptors::validate_task_token_namespace(&context, token_namespace_id)?;
+            Ok((
+                token,
+                token_namespace_id,
+                context,
+                request_namespace.to_owned(),
+            ))
+        }
+    }
+
+    async fn validate_legacy_task_namespace(
+        &self,
+        effective_namespace: &str,
+        token_namespace_id: Option<tokeira_types::NamespaceId>,
+        run_key: RunKey,
+    ) -> EdgeResult<()> {
+        if token_namespace_id.is_none()
+            && !effective_namespace.is_empty()
+            && let LoadedRun::Existing(state) =
+                self.repo.load_run(run_key).await.map_err(EdgeError::from)?
+        {
+            validate_authoritative_task_namespace(effective_namespace, state.namespace_id)?;
+        }
+        Ok(())
+    }
+
+    async fn admit_nexus_task_token(
+        &self,
+        headers: &HeaderMap,
+        request_namespace: &str,
+        task_token: &[u8],
+        action: Action,
+    ) -> EdgeResult<(NexusTaskToken, EdgeContext, String)> {
+        if request_namespace.is_empty() {
+            let token = decode_nexus_task_token(task_token)?;
+            let namespace_id = Uuid::parse_str(&token.namespace_id)
+                .map(tokeira_types::NamespaceId)
+                .map_err(|_| EdgeError::BadRequest("Invalid TaskToken.".to_owned()))?;
+            let (context, namespace) = self
+                .interceptors
+                .begin_with_task_token_backfill(headers, Some(namespace_id), action)
+                .await?;
+            validate_nexus_task_token(&context, &token)?;
+            Ok((token, context, namespace))
+        } else {
+            let context = self
+                .interceptors
+                .begin(headers, Some(request_namespace), action, false)
+                .await?;
+            let token = decode_nexus_task_token(task_token)?;
+            validate_nexus_task_token(&context, &token)?;
+            Ok((token, context, request_namespace.to_owned()))
+        }
+    }
+
     pub async fn poll_nexus_task_queue(
         &self,
         headers: &HeaderMap,
@@ -1549,7 +1772,6 @@ impl WorkflowService {
                         true,
                     )
                     .await?;
-
                 ensure_local(
                     self.router
                         .route_task_queue(&req.namespace, &req.task_queue, TaskKind::Workflow)
@@ -1596,7 +1818,7 @@ impl WorkflowService {
     pub async fn respond_nexus_task_completed(
         &self,
         headers: &HeaderMap,
-        req: crate::translate::nexus::RespondNexusTaskCompletedRequest,
+        mut req: crate::translate::nexus::RespondNexusTaskCompletedRequest,
     ) -> EdgeResult<()> {
         let namespace_label = req.namespace.clone();
         self.observe_edge_call(
@@ -1605,30 +1827,74 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
-                    .interceptors
-                    .begin(
-                        headers,
-                        Some(&req.namespace),
-                        Action::RespondNexusTaskCompleted,
-                        false,
-                    )
-                    .await?;
+                let response = req.response.unwrap_or_default();
+                let token = if req.namespace.is_empty() {
+                    // Namespace back-fill is an earlier interceptor than auth;
+                    // decoding therefore precedes handler-level operation-token
+                    // validation on the omitted-name branch.
+                    let (token, _ctx, effective_namespace) = self
+                        .admit_nexus_task_token(
+                            headers,
+                            &req.namespace,
+                            &req.task_token,
+                            Action::RespondNexusTaskCompleted,
+                        )
+                        .await?;
+                    req.namespace = effective_namespace;
+                    validate_nexus_completed_response_token(&response)?;
+                    token
+                } else {
+                    let context = self
+                        .interceptors
+                        .begin(
+                            headers,
+                            Some(&req.namespace),
+                            Action::RespondNexusTaskCompleted,
+                            false,
+                        )
+                        .await?;
+                    // v1.31.0's handler checks the async operation token before
+                    // deserializing the worker task token
+                    // (`workflow_handler.go:6035-6058 @ v1.31.0`).
+                    validate_nexus_completed_response_token(&response)?;
+                    let token = decode_nexus_task_token(&req.task_token)?;
+                    validate_nexus_task_token(&context, &token)?;
+                    token
+                };
+                // v1.31.0 validates operation-error JSON only after the task token
+                // has been decoded and namespace-fenced, but before consuming its
+                // delivery correlation (`workflow_handler.go:6058-6077 @ v1.31.0`).
+                validate_nexus_completed_response_failure_details(&response)?;
+                let correlation =
+                    self.nexus_broker
+                        .consume(&token.task_id)
+                        .await
+                        .ok_or_else(|| {
+                            EdgeError::NotFound(
+                                "Nexus task not found or already expired".to_string(),
+                            )
+                        })?;
+                let (run_key, operation_id, scheduled_event_id) = match correlation {
+                    NexusTaskCorrelation::Http { waiter_id } => {
+                        // Consuming the delivery correlation acknowledges the worker.
+                        // A concurrent caller disconnect may remove the edge waiter after
+                        // that point without turning the worker response into an RPC error,
+                        // which preserves RespondNexusTaskCompleted's v1.31.0 behavior.
+                        let _ = self
+                            .nexus_http_waiters
+                            .complete(&waiter_id, NexusHttpWorkerOutcome::Completed(response));
+                        return Ok(());
+                    }
+                    NexusTaskCorrelation::Workflow {
+                        run_key,
+                        operation_id,
+                        scheduled_event_id,
+                    } => (run_key, operation_id, scheduled_event_id),
+                };
 
-                if req.task_token.is_empty() {
-                    return Err(EdgeError::BadRequest("task_token is required".to_string()));
-                }
-                let token = NexusTaskToken::decode(&req.task_token)
-                    .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
-                let response = req
-                    .response
-                    .ok_or_else(|| EdgeError::BadRequest("response is required".to_string()))?;
-                // The worker's response is the terminal result of a caller-side outbound
-                // StartOperation/CancelOperation; record the `nexus_outbound_requests`
-                // outcome from it. Latency is not recorded at this resolution point — the
-                // dispatch wall-clock is not carried on the task token, so an honest duration
-                // is unavailable here; the External-endpoint arm records both counter and
-                // latency where it can measure the round trip directly.
+                // Workflow-originated worker tasks are outbound Nexus attempts. HTTP
+                // dispatches above are caller-facing requests and are measured by the
+                // Nexus HTTP handler instead.
                 if let Some(tags) =
                     crate::translate::nexus::nexus_completed_outbound_tags(&response)
                 {
@@ -1639,34 +1905,37 @@ impl WorkflowService {
                         &tags.outcome,
                     );
                 }
+
                 // Load the pending op so an operation-unsuccessful response can be wrapped
                 // in NexusOperationFailureInfo (endpoint/service/operation), exactly as the
                 // worker handler-error path does. A missing/raced pending op leaves them
                 // empty — the inner cause chain the SDK decodes is still intact.
-                let op_ctx = match self
-                    .repo
-                    .load_run(token.run_key)
-                    .await
-                    .map_err(EdgeError::from)?
-                {
+                let op_ctx = match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
                     LoadedRun::Existing(state) => state
                         .pending_nexus_operations
-                        .get(&token.operation_id)
+                        .get(&operation_id)
                         .map(|op| crate::translate::nexus::NexusOperationContext {
                             endpoint: op.endpoint.clone(),
                             service: op.service.clone(),
                             operation: op.operation.clone(),
-                            scheduled_event_id: token.scheduled_event_id,
+                            scheduled_event_id,
                         })
                         .unwrap_or_default(),
                     LoadedRun::Absent => Default::default(),
                 };
-                let resolution = crate::translate::nexus::proto_response_to_resolution(
-                    response,
-                    &token.operation_id,
-                    &op_ctx,
-                )
-                .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+                let resolution = match crate::translate::nexus::proto_response_to_resolution(
+                    response, &op_ctx,
+                ) {
+                    Ok(resolution) => resolution,
+                    // RespondNexusTaskCompleted in v1.31.0 accepts a response with no
+                    // variant and delegates it to the waiting consumer. Tokeira has no
+                    // separate history consumer to reject that outcome, so acknowledge
+                    // the worker while leaving the authoritative operation pending.
+                    Err(crate::translate::nexus::NexusTranslateError::MissingField(_)) => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(EdgeError::BadRequest(error.to_string())),
+                };
 
                 // A cancel-ack (None) does not resolve the operation — the operation resolves
                 // only via its completion when the backing workflow closes (v1.31.0 decouples
@@ -1677,18 +1946,13 @@ impl WorkflowService {
 
                 let applied = self
                     .runtime
-                    .resolve_nexus_operation(
-                        token.run_key,
-                        token.operation_id.clone(),
-                        token.scheduled_event_id,
-                        resolution,
-                    )
+                    .resolve_nexus_operation(run_key, operation_id, scheduled_event_id, resolution)
                     .await
                     .map_err(EdgeError::from)?;
                 if applied {
                     self.notify_history_run_key(
-                        token.run_key,
-                        read_last_event_id(self.repo.as_ref(), token.run_key).await?,
+                        run_key,
+                        read_last_event_id(self.repo.as_ref(), run_key).await?,
                     )
                     .await;
                 }
@@ -1702,7 +1966,7 @@ impl WorkflowService {
     pub async fn respond_nexus_task_failed(
         &self,
         headers: &HeaderMap,
-        req: crate::translate::nexus::RespondNexusTaskFailedRequest,
+        mut req: crate::translate::nexus::RespondNexusTaskFailedRequest,
     ) -> EdgeResult<()> {
         let namespace_label = req.namespace.clone();
         self.observe_edge_call(
@@ -1711,21 +1975,59 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
-                    .interceptors
-                    .begin(
+                let (token, _ctx, effective_namespace) = self
+                    .admit_nexus_task_token(
                         headers,
-                        Some(&req.namespace),
+                        &req.namespace,
+                        &req.task_token,
                         Action::RespondNexusTaskFailed,
-                        false,
                     )
                     .await?;
-
-                if req.task_token.is_empty() {
-                    return Err(EdgeError::BadRequest("task_token is required".to_string()));
+                req.namespace = effective_namespace;
+                if req.error.is_none() && req.failure.is_none() {
+                    return Err(EdgeError::BadRequest(
+                        "request must contain error or failure".to_string(),
+                    ));
                 }
-                let token = NexusTaskToken::decode(&req.task_token)
-                    .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+                if let Some(error) = req.error.as_ref()
+                    && let Some(failure) = error.failure.as_ref()
+                {
+                    validate_nexus_failure_details(&failure.details)?;
+                }
+                if let Some(failure) = req.failure.as_ref()
+                    && !crate::translate::nexus::failure_has_nexus_handler_info(failure)
+                {
+                    return Err(EdgeError::BadRequest(
+                        "request Failure must contain error or failure with NexusHandlerFailureInfo"
+                            .to_string(),
+                    ));
+                }
+                let correlation = self
+                    .nexus_broker
+                    .consume(&token.task_id)
+                    .await
+                    .ok_or_else(|| {
+                        EdgeError::NotFound(
+                            "Nexus task not found or already expired".to_string(),
+                        )
+                    })?;
+                let (run_key, operation_id, scheduled_event_id) = match correlation {
+                    NexusTaskCorrelation::Http { waiter_id } => {
+                        let _ = self.nexus_http_waiters.complete(
+                            &waiter_id,
+                            NexusHttpWorkerOutcome::Failed {
+                                error: req.error,
+                                failure: req.failure,
+                            },
+                        );
+                        return Ok(());
+                    }
+                    NexusTaskCorrelation::Workflow {
+                        run_key,
+                        operation_id,
+                        scheduled_event_id,
+                    } => (run_key, operation_id, scheduled_event_id),
+                };
                 // A failed worker response is the terminal result of an outbound
                 // StartOperation (a worker-reported handler error); capture its
                 // `nexus_outbound_requests` outcome before the failure is consumed into the
@@ -1739,12 +2041,6 @@ impl WorkflowService {
                 // one of them, and a `failure` must carry a NexusHandlerFailureInfo
                 // (`workflow_handler.go:6096 @ v1.31.0`).
                 let resolution = if let Some(failure) = req.failure {
-                    if !crate::translate::nexus::failure_has_nexus_handler_info(&failure) {
-                        return Err(EdgeError::BadRequest(
-                            "request Failure must contain error or failure with NexusHandlerFailureInfo"
-                                .to_string(),
-                        ));
-                    }
                     // Load the pending op once: it supplies both the NexusOperationFailureInfo
                     // wrap context (endpoint/service/operation) for a terminal failure AND the
                     // backoff inputs (attempt/scheduled_at/schedule-to-close) for a retryable
@@ -1752,12 +2048,12 @@ impl WorkflowService {
                     // resolution — there is nothing to back off.
                     let pending = match self
                         .repo
-                        .load_run(token.run_key)
+                        .load_run(run_key)
                         .await
                         .map_err(EdgeError::from)?
                     {
                         LoadedRun::Existing(state) => {
-                            state.pending_nexus_operations.get(&token.operation_id).cloned()
+                            state.pending_nexus_operations.get(&operation_id).cloned()
                         }
                         LoadedRun::Absent => None,
                     };
@@ -1797,7 +2093,7 @@ impl WorkflowService {
                                 endpoint,
                                 service,
                                 operation,
-                                token.scheduled_event_id,
+                                scheduled_event_id,
                             )
                         }
                     }
@@ -1821,17 +2117,17 @@ impl WorkflowService {
                 let applied = self
                     .runtime
                     .resolve_nexus_operation(
-                        token.run_key,
-                        token.operation_id.clone(),
-                        token.scheduled_event_id,
+                        run_key,
+                        operation_id,
+                        scheduled_event_id,
                         resolution,
                     )
                     .await
                     .map_err(EdgeError::from)?;
                 if applied {
                     self.notify_history_run_key(
-                        token.run_key,
-                        read_last_event_id(self.repo.as_ref(), token.run_key).await?,
+                        run_key,
+                        read_last_event_id(self.repo.as_ref(), run_key).await?,
                     )
                     .await;
                 }
@@ -1976,7 +2272,15 @@ impl WorkflowService {
                     .await?;
                 let namespace_id = to_internal::namespace_id_for(&req.namespace);
                 let identity = if req.operation_params.identity().trim().is_empty() {
-                    ctx.principal.subject.clone()
+                    ctx.claims
+                        .as_ref()
+                        .map(|claims| claims.subject.clone())
+                        // The permissive adapter intentionally has no claims,
+                        // but pre-auth Tokeira recorded its synthetic `root`
+                        // principal as the batch identity. Preserve that
+                        // stock-default wire behavior without manufacturing a
+                        // durable attribution principal.
+                        .unwrap_or_else(|| "root".to_owned())
                 } else {
                     req.operation_params.identity().to_string()
                 };
@@ -2903,13 +3207,18 @@ impl WorkflowService {
         // (TestQueryWorkflow_Sticky pins replayCount == 1). Partial history
         // (the old shape) matches neither mode.
         let sticky_delivery = query.sticky_preferred.as_ref() == Some(worker);
-        let history = if sticky_delivery {
-            Vec::new()
+        let (history, history_principals) = if sticky_delivery {
+            (Vec::new(), Vec::new())
         } else {
-            self.repo
-                .read_history(query.run_key, 0, usize::MAX)
+            let attributed = self
+                .repo
+                .read_attributed_history(query.run_key, 0, usize::MAX)
                 .await
-                .map_err(EdgeError::from)?
+                .map_err(EdgeError::from)?;
+            attributed
+                .into_iter()
+                .map(|attributed| (attributed.event, attributed.principal))
+                .unzip()
         };
 
         // Temporal returns direct queries as workflow-poll tasks with
@@ -2943,6 +3252,7 @@ impl WorkflowService {
                 run_id: state.run_id,
                 task_queue: state.task_queue.0,
                 history,
+                history_principals,
             },
             query: Some(WorkflowQueryDto {
                 query_type: query.query_type,
@@ -2980,7 +3290,7 @@ impl WorkflowService {
 
                 ensure_local(self.router.route_workflow(&namespace, &workflow_id).await?)?;
 
-                let internal = to_internal::start_request(req, &ctx.request_id);
+                let internal = to_internal::start_request(req, &ctx);
                 let outcome = self
                     .runtime
                     .start_workflow_with_policy(internal.clone())
@@ -3009,9 +3319,13 @@ impl WorkflowService {
                         );
                         response.eager_workflow_task = match eager_workflow_task {
                             Some(started) => Some(
-                                from_internal::poll_response(started, self.repo.as_ref())
-                                    .await
-                                    .map_err(EdgeError::from)?,
+                                from_internal::poll_response(
+                                    started,
+                                    self.repo.as_ref(),
+                                    internal.namespace_id,
+                                )
+                                .await
+                                .map_err(EdgeError::from)?,
                             ),
                             None => None,
                         };
@@ -3062,9 +3376,13 @@ impl WorkflowService {
                         // event 1 is synthesised by the proto layer from run_id.
                         let eager_workflow_task = match eager_workflow_task {
                             Some(started) => Some(
-                                from_internal::poll_response(started, self.repo.as_ref())
-                                    .await
-                                    .map_err(EdgeError::from)?,
+                                from_internal::poll_response(
+                                    started,
+                                    self.repo.as_ref(),
+                                    internal.namespace_id,
+                                )
+                                .await
+                                .map_err(EdgeError::from)?,
                             ),
                             None => None,
                         };
@@ -3179,7 +3497,7 @@ impl WorkflowService {
                     )
                     .await?;
 
-                let internal = to_internal::signal_request(req, &ctx.request_id);
+                let internal = to_internal::signal_request(req, &ctx);
                 let outcome = self
                     .runtime
                     .signal_workflow(run_key, internal)
@@ -3224,7 +3542,7 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                let ctx = self
                     .interceptors
                     .begin(
                         headers,
@@ -3233,6 +3551,7 @@ impl WorkflowService {
                         true,
                     )
                     .await?;
+                let namespace_id = resolved_namespace_id(&ctx, &req.namespace)?;
 
                 ensure_local(
                     self.router
@@ -3314,10 +3633,13 @@ impl WorkflowService {
 
                 match activation {
                     Some(WorkflowActivation::WorkflowTask(started)) => {
-                        let mut response =
-                            from_internal::poll_response(started.clone(), self.repo.as_ref())
-                                .await
-                                .map_err(EdgeError::from)?;
+                        let mut response = from_internal::poll_response(
+                            started.clone(),
+                            self.repo.as_ref(),
+                            namespace_id,
+                        )
+                        .await
+                        .map_err(EdgeError::from)?;
                         self.decorate_workflow_task_response(&started, &mut response)
                             .await?;
                         response.poller_scaling_decision = scaling_decision;
@@ -3432,22 +3754,46 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let _ctx = self
-                    .interceptors
-                    .begin(headers, None, Action::RespondWorkflowTaskCompleted, false)
+                let (task_token, token_namespace_id, context, namespace) = self
+                    .admit_json_task_token::<tokeira_types::WorkflowTaskToken>(
+                        headers,
+                        &req.namespace,
+                        &req.task_token,
+                        Action::RespondWorkflowTaskCompleted,
+                    )
                     .await?;
-
-                let task_token: tokeira_types::WorkflowTaskToken =
-                    serde_json::from_slice(&req.task_token).map_err(EdgeError::from)?;
-                let namespace_id = to_internal::namespace_id_for(&req.namespace);
-                if !req.namespace.is_empty()
+                req.namespace = namespace;
+                if token_namespace_id.is_none()
+                    && !req.namespace.is_empty()
                     && let tokeira_kernel::LoadedRun::Existing(state) = self
-                    .repo
-                    .load_run(task_token.run_key)
-                    .await
-                    .map_err(EdgeError::from)?
+                        .repo
+                        .load_run(task_token.run_key)
+                        .await
+                        .map_err(EdgeError::from)?
                 {
-                    validate_task_token_namespace(&req.namespace, state.namespace_id)?;
+                    validate_authoritative_task_namespace(&req.namespace, state.namespace_id)?;
+                }
+                let namespace_id = match context.namespace.as_ref() {
+                    Some(_) => resolved_namespace_id(&context, &req.namespace)?,
+                    None => match self
+                        .repo
+                        .load_run(task_token.run_key)
+                        .await
+                        .map_err(EdgeError::from)?
+                    {
+                        LoadedRun::Existing(state) => state.namespace_id,
+                        LoadedRun::Absent => to_internal::namespace_id_for(&req.namespace),
+                    },
+                };
+                if cross_namespace_commands_enabled() {
+                    for (target_namespace, action) in cross_namespace_authorization_targets(
+                        &req.namespace,
+                        &req.commands,
+                    ) {
+                        self.interceptors
+                            .authorize_existing_context(&context, action, &target_namespace)
+                            .await?;
+                    }
                 }
                 let query_only = task_token.logical_seq.0 == 0;
 
@@ -3551,12 +3897,35 @@ impl WorkflowService {
                     self.eager_dispatch_config
                         .max_eager_activity_tasks_per_response,
                 );
+                let eager_activity_namespace = if eager_activity_specs.is_empty() {
+                    None
+                } else if let Some(namespace) = context.namespace.as_ref() {
+                    Some(namespace.name.clone())
+                } else {
+                    // Legacy Tokeira task tokens did not carry a namespace ID.
+                    // Resolve the run's already-established stable ID before the
+                    // completion commits so eager delivery cannot fail after the
+                    // authoritative transition. v1.31.0 exposes the current name,
+                    // never the ID, on this path
+                    // (`workflow_task_completed_handler.go:613 @ v1.31.0`).
+                    let namespace_id_string = namespace_id.0.to_string();
+                    Some(
+                        self.namespaces
+                            .get_by_id(&namespace_id_string)
+                            .await
+                            .map_err(EdgeError::from)?
+                            .ok_or_else(|| {
+                                EdgeError::NamespaceNotFound(namespace_id_string.clone())
+                            })?
+                            .name,
+                    )
+                };
                 let completion_identity = req.identity.clone();
                 let saved_task_token = req.task_token.clone();
                 let wants_eager_return = req.return_new_workflow_task;
 
-                let internal =
-                    to_internal::workflow_task_completed_request(req).map_err(EdgeError::from)?;
+                let internal = to_internal::workflow_task_completed_request(req, &context)
+                    .map_err(EdgeError::from)?;
                 let run_key = internal.token.run_key;
                 let speculative_token_started_event_id = internal.token.started_event_id;
                 let outcome = self
@@ -3580,17 +3949,7 @@ impl WorkflowService {
                     resp.reset_history_event_id = state.previous_started_event_id;
                 }
 
-                if !eager_activity_specs.is_empty() {
-                    let namespace_id =
-                        match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
-                            tokeira_kernel::LoadedRun::Existing(state) => state.namespace_id,
-                            tokeira_kernel::LoadedRun::Absent => {
-                                return Err(EdgeError::Internal(format!(
-                                    "completed run {:?} not found after commit",
-                                    run_key
-                                )));
-                            }
-                        };
+                if let Some(workflow_namespace) = eager_activity_namespace.as_deref() {
                     for (activity_id, task_queue, deployment, build_id) in eager_activity_specs {
                         let queue = tokeira_types::QueueKey {
                             namespace_id,
@@ -3610,10 +3969,12 @@ impl WorkflowService {
                             .await
                             .map_err(EdgeError::from)?
                         {
-                            resp.activity_tasks.push(
-                                from_internal::poll_activity_response(started)
-                                    .map_err(EdgeError::from)?,
-                            );
+                            resp.activity_tasks
+                                .push(from_internal::poll_activity_response(
+                                    started,
+                                    namespace_id,
+                                    workflow_namespace,
+                                )?);
                         }
                     }
                 }
@@ -3621,8 +3982,10 @@ impl WorkflowService {
                 if resp.execution_status.is_open()
                     && (wants_eager_return || self.buffered_queries.has_buffered(run_key))
                 {
-                    let token: tokeira_types::WorkflowTaskToken =
-                        serde_json::from_slice(&saved_task_token).map_err(EdgeError::from)?;
+                    let (token, _) = crate::task_token::decode::<
+                        tokeira_types::WorkflowTaskToken,
+                    >(&saved_task_token)
+                    .map_err(EdgeError::from)?;
                     let loaded = self
                         .repo
                         .load_run(token.run_key)
@@ -3673,6 +4036,7 @@ impl WorkflowService {
                                 let mut workflow_task = from_internal::poll_response(
                                     started.clone(),
                                     self.repo.as_ref(),
+                                    state.namespace_id,
                                 )
                                 .await
                                 .map_err(EdgeError::from)?;
@@ -3711,6 +4075,7 @@ impl WorkflowService {
     pub async fn respond_query_task_completed(
         &self,
         headers: &HeaderMap,
+        namespace: String,
         task_token: Vec<u8>,
         result: QueryResult,
     ) -> EdgeResult<()> {
@@ -3720,10 +4085,31 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let _ctx = self
-                    .interceptors
-                    .begin(headers, None, Action::RespondQueryTaskCompleted, false)
-                    .await?;
+                let token_namespace_id = query_task_namespace_id(&task_token)?;
+                if namespace.is_empty() {
+                    let _ = self
+                        .interceptors
+                        .begin_with_task_token_backfill(
+                            headers,
+                            Some(token_namespace_id),
+                            Action::RespondQueryTaskCompleted,
+                        )
+                        .await?;
+                } else {
+                    let context = self
+                        .interceptors
+                        .begin(
+                            headers,
+                            Some(&namespace),
+                            Action::RespondQueryTaskCompleted,
+                            false,
+                        )
+                        .await?;
+                    crate::interceptors::validate_task_token_namespace(
+                        &context,
+                        Some(token_namespace_id),
+                    )?;
+                }
 
                 if let Some(sender) = self
                     .pending_queries
@@ -4065,16 +4451,24 @@ impl WorkflowService {
         namespace_id: &str,
     ) -> EdgeResult<NamespaceDescription> {
         self.observe_edge_call(headers, "describe_namespace", None, None, async move {
-            let _ctx = self
-                .interceptors
-                .begin(headers, None, Action::DescribeNamespace, false)
-                .await?;
+            // Stable-ID resolution precedes auth because the authorizer contract
+            // is name-scoped; this is the same namespace-validator ordering used
+            // for task-token back-fill in v1.31.0.
             let namespace = self
                 .namespaces
                 .get_by_id(namespace_id)
                 .await
                 .map_err(EdgeError::from)?
                 .ok_or_else(|| EdgeError::NamespaceNotFound(namespace_id.to_owned()))?;
+            let _ctx = self
+                .interceptors
+                .begin(
+                    headers,
+                    Some(&namespace.name),
+                    Action::DescribeNamespace,
+                    false,
+                )
+                .await?;
             Ok(namespace_to_description(namespace))
         })
         .await
@@ -4094,7 +4488,12 @@ impl WorkflowService {
             async move {
                 let _ctx = self
                     .interceptors
-                    .begin(headers, None, Action::RegisterNamespace, false)
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::RegisterNamespace,
+                        false,
+                    )
                     .await?;
 
                 if !is_valid_namespace_name(&req.namespace) {
@@ -4168,7 +4567,12 @@ impl WorkflowService {
                 // transition rather than fail the lookup outright.
                 let _ctx = self
                     .interceptors
-                    .begin(headers, None, Action::UpdateNamespace, false)
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::UpdateNamespace,
+                        false,
+                    )
                     .await?;
 
                 let mut namespace = self
@@ -4418,7 +4822,7 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                let ctx = self
                     .interceptors
                     .begin(
                         headers,
@@ -4445,6 +4849,7 @@ impl WorkflowService {
                 let request = RequestContext {
                     request_id: RequestId(Uuid::new_v4().to_string()),
                     caller_identity: (!req.identity.is_empty()).then(|| req.identity.clone()),
+                    principal: ctx.event_principal(),
                     received_at: OffsetDateTime::now_utc(),
                 };
 
@@ -4480,7 +4885,7 @@ impl WorkflowService {
         self.observe_edge_call(headers, "get_search_attributes", None, None, async move {
             let _ctx = self
                 .interceptors
-                .begin(headers, None, Action::OperatorRead, false)
+                .begin(headers, None, Action::GetSearchAttributes, false)
                 .await?;
 
             self.operator_api
@@ -4535,6 +4940,7 @@ impl WorkflowService {
                             request: RequestContext {
                                 request_id: RequestId(ctx.request_id.as_str().to_string()),
                                 caller_identity: None,
+                                principal: ctx.event_principal(),
                                 received_at: ctx.received_at,
                             },
                             now,
@@ -4610,7 +5016,7 @@ impl WorkflowService {
                     workflow_id: tokeira_types::WorkflowId(req.workflow_id.clone()),
                     run_id: base_run_id,
                 };
-                let internal = to_internal::reset_request(req, &ctx.request_id);
+                let internal = to_internal::reset_request(req, &ctx);
                 let outcome = self
                     .runtime
                     .reset_workflow(execution, internal)
@@ -4655,7 +5061,7 @@ impl WorkflowService {
                         .route_workflow(&req.namespace, &req.workflow_id)
                         .await?,
                 )?;
-                let internal = to_internal::signal_with_start_request(req.clone(), &ctx.request_id);
+                let internal = to_internal::signal_with_start_request(req.clone(), &ctx);
                 match self
                     .runtime
                     .signal_with_start_workflow(internal)
@@ -4734,7 +5140,7 @@ impl WorkflowService {
                 )?;
 
                 let workflow_id = req.start.workflow_id.clone();
-                let internal = to_internal::start_request(req.start, &ctx.request_id);
+                let internal = to_internal::start_request(req.start, &ctx);
 
                 // Wait-policy defaulting mirrors standalone update
                 // (`update_workflow_execution` above): Unspecified waits for
@@ -4760,6 +5166,7 @@ impl WorkflowService {
                 let update_request = RequestContext {
                     request_id: tokeira_types::RequestId(uuid::Uuid::new_v4().to_string()),
                     caller_identity: req.update_identity,
+                    principal: ctx.event_principal(),
                     received_at: time::OffsetDateTime::now_utc(),
                 };
 
@@ -4843,7 +5250,7 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                let ctx = self
                     .interceptors
                     .begin(
                         headers,
@@ -4852,6 +5259,16 @@ impl WorkflowService {
                         true,
                     )
                     .await?;
+                let namespace_id = resolved_namespace_id(&ctx, &req.namespace)?;
+                let workflow_namespace = ctx
+                    .namespace
+                    .as_ref()
+                    .map(|namespace| namespace.name.clone())
+                    .ok_or_else(|| {
+                        EdgeError::Internal(
+                            "activity poll admission returned no namespace".to_owned(),
+                        )
+                    })?;
 
                 ensure_local(
                     self.router
@@ -4945,8 +5362,12 @@ impl WorkflowService {
 
                 match started {
                     Some(started) => {
-                        let mut response = from_internal::poll_activity_response(started)
-                            .map_err(EdgeError::from)?;
+                        let mut response = from_internal::poll_activity_response(
+                            started,
+                            namespace_id,
+                            &workflow_namespace,
+                        )
+                        .map_err(EdgeError::from)?;
                         response.poller_scaling_decision = scaling_decision;
                         Ok(Some(response))
                     }
@@ -4968,18 +5389,29 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let _ctx = self
-                    .interceptors
-                    .begin(headers, None, Action::RespondActivityTaskCompleted, false)
+                let (token, token_namespace_id, ctx, effective_namespace) = self
+                    .admit_json_task_token::<ActivityTaskToken>(
+                        headers,
+                        &req.namespace,
+                        &req.task_token,
+                        Action::RespondActivityTaskCompleted,
+                    )
                     .await?;
-
-                let token = req.token;
+                self.validate_legacy_task_namespace(
+                    &effective_namespace,
+                    token_namespace_id,
+                    token.run_key,
+                )
+                .await?;
+                let request =
+                    activity_control_request_context(&ctx, &req.identity, ctx.received_at);
                 let _outcome = self
                     .runtime
                     .complete_activity_task(
                         token.clone(),
                         req.result,
                         Some(tokeira_types::WorkerIdentity(req.identity)),
+                        request,
                     )
                     .await
                     .map_err(EdgeError::from)?;
@@ -5006,12 +5438,22 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let _ctx = self
-                    .interceptors
-                    .begin(headers, None, Action::RespondActivityTaskFailed, false)
+                let (token, token_namespace_id, ctx, effective_namespace) = self
+                    .admit_json_task_token::<ActivityTaskToken>(
+                        headers,
+                        &req.namespace,
+                        &req.task_token,
+                        Action::RespondActivityTaskFailed,
+                    )
                     .await?;
-
-                let token = req.token;
+                self.validate_legacy_task_namespace(
+                    &effective_namespace,
+                    token_namespace_id,
+                    token.run_key,
+                )
+                .await?;
+                let request =
+                    activity_control_request_context(&ctx, &req.identity, ctx.received_at);
                 self.runtime
                     .fail_activity_task(
                         token.clone(),
@@ -5019,6 +5461,7 @@ impl WorkflowService {
                         req.failure_error_type,
                         req.is_non_retryable,
                         Some(tokeira_types::WorkerIdentity(req.identity)),
+                        request,
                     )
                     .await
                     .map_err(EdgeError::from)?;
@@ -5041,7 +5484,8 @@ impl WorkflowService {
     pub async fn respond_workflow_task_failed(
         &self,
         headers: &HeaderMap,
-        token: tokeira_types::WorkflowTaskToken,
+        namespace: String,
+        task_token: Vec<u8>,
         failure_cause: tokeira_kernel::WorkflowTaskFailedCause,
         failure_details: Option<tokeira_types::Payload>,
         identity: String,
@@ -5052,10 +5496,20 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let ctx = self
-                    .interceptors
-                    .begin(headers, None, Action::RespondWorkflowTaskFailed, false)
+                let (token, token_namespace_id, ctx, effective_namespace) = self
+                    .admit_json_task_token::<tokeira_types::WorkflowTaskToken>(
+                        headers,
+                        &namespace,
+                        &task_token,
+                        Action::RespondWorkflowTaskFailed,
+                    )
                     .await?;
+                self.validate_legacy_task_namespace(
+                    &effective_namespace,
+                    token_namespace_id,
+                    token.run_key,
+                )
+                .await?;
 
                 let run_key = token.run_key;
                 self.runtime
@@ -5069,6 +5523,7 @@ impl WorkflowService {
                                 ctx.request_id.as_str().to_string(),
                             ),
                             caller_identity: None,
+                            principal: ctx.event_principal(),
                             received_at: time::OffsetDateTime::now_utc(),
                         },
                         time::OffsetDateTime::now_utc(),
@@ -5098,15 +5553,25 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let _ctx = self
-                    .interceptors
-                    .begin(headers, None, Action::RecordActivityTaskHeartbeat, false)
+                let (token, token_namespace_id, _ctx, effective_namespace) = self
+                    .admit_json_task_token::<ActivityTaskToken>(
+                        headers,
+                        &req.namespace,
+                        &req.task_token,
+                        Action::RecordActivityTaskHeartbeat,
+                    )
                     .await?;
+                self.validate_legacy_task_namespace(
+                    &effective_namespace,
+                    token_namespace_id,
+                    token.run_key,
+                )
+                .await?;
 
                 let outcome = self
                     .runtime
                     .record_activity_heartbeat(
-                        req.token,
+                        token,
                         req.details,
                         worker_identity_from_request(req.identity),
                     )
@@ -5134,18 +5599,29 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let _ctx = self
-                    .interceptors
-                    .begin(headers, None, Action::RespondActivityTaskCanceled, false)
+                let (token, token_namespace_id, ctx, effective_namespace) = self
+                    .admit_json_task_token::<ActivityTaskToken>(
+                        headers,
+                        &req.namespace,
+                        &req.task_token,
+                        Action::RespondActivityTaskCanceled,
+                    )
                     .await?;
-
-                let token = req.token;
+                self.validate_legacy_task_namespace(
+                    &effective_namespace,
+                    token_namespace_id,
+                    token.run_key,
+                )
+                .await?;
+                let request =
+                    activity_control_request_context(&ctx, &req.identity, ctx.received_at);
                 let outcome = self
                     .runtime
                     .cancel_activity_task(
                         token.clone(),
                         req.details,
                         worker_identity_from_request(req.identity),
+                        request,
                     )
                     .await
                     .map_err(EdgeError::from)?;
@@ -5172,7 +5648,12 @@ impl WorkflowService {
             async move {
                 let _ctx = self
                     .interceptors
-                    .begin(headers, None, Action::RecordActivityTaskHeartbeat, false)
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::RecordActivityTaskHeartbeat,
+                        false,
+                    )
                     .await?;
                 let run_key = self
                     .resolve_execution_run_key(
@@ -5242,10 +5723,17 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                let ctx = self
                     .interceptors
-                    .begin(headers, None, Action::RespondActivityTaskCompleted, false)
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::RespondActivityTaskCompleted,
+                        false,
+                    )
                     .await?;
+                let request =
+                    activity_control_request_context(&ctx, &req.identity, ctx.received_at);
                 let run_key = self
                     .resolve_execution_run_key(
                         &req.namespace,
@@ -5272,6 +5760,7 @@ impl WorkflowService {
                             run_key,
                             &req.activity_id,
                             tokeira_types::WorkerIdentity(req.identity.clone()),
+                            request.clone(),
                         )
                         .await
                         .map_err(EdgeError::from)?,
@@ -5290,6 +5779,7 @@ impl WorkflowService {
                         token,
                         req.result,
                         worker_identity_from_request(req.identity),
+                        request,
                     )
                     .await
                     .map_err(EdgeError::from)?;
@@ -5313,10 +5803,17 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                let ctx = self
                     .interceptors
-                    .begin(headers, None, Action::RespondActivityTaskFailed, false)
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::RespondActivityTaskFailed,
+                        false,
+                    )
                     .await?;
+                let request =
+                    activity_control_request_context(&ctx, &req.identity, ctx.received_at);
                 let run_key = self
                     .resolve_execution_run_key(
                         &req.namespace,
@@ -5339,6 +5836,7 @@ impl WorkflowService {
                         req.failure_error_type,
                         req.is_non_retryable,
                         worker_identity_from_request(req.identity),
+                        request,
                     )
                     .await
                     .map_err(EdgeError::from)?;
@@ -5365,10 +5863,17 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                let ctx = self
                     .interceptors
-                    .begin(headers, None, Action::RespondActivityTaskCanceled, false)
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::RespondActivityTaskCanceled,
+                        false,
+                    )
                     .await?;
+                let request =
+                    activity_control_request_context(&ctx, &req.identity, ctx.received_at);
                 let run_key = self
                     .resolve_execution_run_key(
                         &req.namespace,
@@ -5390,6 +5895,7 @@ impl WorkflowService {
                         token,
                         req.details,
                         worker_identity_from_request(req.identity),
+                        request,
                     )
                     .await
                     .map_err(EdgeError::from)?;
@@ -5415,7 +5921,12 @@ impl WorkflowService {
             async move {
                 let ctx = self
                     .interceptors
-                    .begin(headers, None, Action::UpdateActivityOptions, false)
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::UpdateActivityOptions,
+                        false,
+                    )
                     .await?;
                 let run_key = self
                     .resolve_execution_run_key(
@@ -5462,7 +5973,7 @@ impl WorkflowService {
             async move {
                 let ctx = self
                     .interceptors
-                    .begin(headers, None, Action::PauseActivity, false)
+                    .begin(headers, Some(&req.namespace), Action::PauseActivity, false)
                     .await?;
                 let run_key = self
                     .resolve_execution_run_key(
@@ -5509,7 +6020,12 @@ impl WorkflowService {
             async move {
                 let ctx = self
                     .interceptors
-                    .begin(headers, None, Action::UnpauseActivity, false)
+                    .begin(
+                        headers,
+                        Some(&req.namespace),
+                        Action::UnpauseActivity,
+                        false,
+                    )
                     .await?;
                 validate_activity_jitter(req.jitter)?;
                 let run_key = self
@@ -5557,7 +6073,7 @@ impl WorkflowService {
             async move {
                 let ctx = self
                     .interceptors
-                    .begin(headers, None, Action::ResetActivity, false)
+                    .begin(headers, Some(&req.namespace), Action::ResetActivity, false)
                     .await?;
                 validate_activity_jitter(req.jitter)?;
                 let run_key = self
@@ -5667,7 +6183,7 @@ impl WorkflowService {
                     .resolve_run_key(&req.namespace, &req.workflow_id)
                     .await?;
 
-                let internal = to_internal::terminate_request(req, &ctx.request_id);
+                let internal = to_internal::terminate_request(req, &ctx);
                 let outcome = self
                     .runtime
                     .terminate_workflow(run_key, internal)
@@ -5720,7 +6236,7 @@ impl WorkflowService {
                     .resolve_run_key(&req.namespace, &req.workflow_id)
                     .await?;
 
-                let internal = to_internal::pause_request(req, &ctx.request_id);
+                let internal = to_internal::pause_request(req, &ctx);
                 let outcome = self
                     .runtime
                     .pause_workflow(run_key, internal)
@@ -5773,7 +6289,7 @@ impl WorkflowService {
                     .resolve_run_key(&req.namespace, &req.workflow_id)
                     .await?;
 
-                let internal = to_internal::unpause_request(req, &ctx.request_id);
+                let internal = to_internal::unpause_request(req, &ctx);
                 let outcome = self
                     .runtime
                     .unpause_workflow(run_key, internal)
@@ -5820,7 +6336,7 @@ impl WorkflowService {
                     .resolve_run_key(&req.namespace, &req.workflow_id)
                     .await?;
 
-                let internal = to_internal::cancel_request(req, &ctx.request_id);
+                let internal = to_internal::cancel_request(req, &ctx);
                 let outcome = self
                     .runtime
                     .cancel_workflow(run_key, internal)
@@ -5928,7 +6444,7 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                let ctx = self
                     .interceptors
                     .begin(
                         headers,
@@ -6008,6 +6524,7 @@ impl WorkflowService {
                 let request = RequestContext {
                     request_id: tokeira_types::RequestId(uuid::Uuid::new_v4().to_string()),
                     caller_identity: None,
+                    principal: ctx.event_principal(),
                     received_at: time::OffsetDateTime::now_utc(),
                 };
 
@@ -6056,7 +6573,7 @@ impl WorkflowService {
                     .begin(
                         headers,
                         Some(&namespace),
-                        Action::UpdateWorkflowExecution,
+                        Action::PollWorkflowExecutionUpdate,
                         false,
                     )
                     .await?;
@@ -6118,7 +6635,7 @@ impl WorkflowService {
                     .begin(
                         headers,
                         Some(&req.namespace),
-                        Action::DescribeWorkflowExecution,
+                        Action::GetWorkflowExecutionHistory,
                         false,
                     )
                     .await?;
@@ -6155,14 +6672,15 @@ impl WorkflowService {
                 loop {
                     let history = self
                         .repo
-                        .read_history(run_key, caller_last_event_id, limit)
+                        .read_attributed_history(run_key, caller_last_event_id, limit)
                         .await
                         .map_err(EdgeError::from)?;
                     let current_last_event_id = history
                         .last()
-                        .map(|event| event.event_id)
+                        .map(|attributed| attributed.event.event_id)
                         .unwrap_or(caller_last_event_id);
-                    let filtered = filter_history_events(&history, req.history_event_filter_type);
+                    let filtered =
+                        filter_attributed_history_events(&history, req.history_event_filter_type);
 
                     tracing::debug!(
                         run_key = ?run_key,
@@ -6186,14 +6704,18 @@ impl WorkflowService {
                         let more_events = history.len() >= limit;
                         let reached_close = history
                             .iter()
-                            .any(|event| is_close_history_event(&event.kind));
+                            .any(|attributed| is_close_history_event(&attributed.event.kind));
                         let next_page_token =
                             if more_events || (req.wait_new_event && !reached_close) {
                                 encode_history_page_token(current_last_event_id)
                             } else {
                                 Vec::new()
                             };
-                        let mut events: Vec<_> = filtered.into_iter().take(limit).collect();
+                        let (mut events, mut history_principals): (Vec<_>, Vec<_>) = filtered
+                            .into_iter()
+                            .take(limit)
+                            .map(|attributed| (attributed.event, attributed.principal))
+                            .unzip();
                         // Transient-suffix synthesis (spec transient-wft Req B.7): on the
                         // FINAL page of an unfiltered read, append the transient (attempt>1)
                         // pending task's unpersisted Scheduled(+Started) at their virtual
@@ -6208,6 +6730,7 @@ impl WorkflowService {
                         {
                             append_transient_suffix(
                                 &mut events,
+                                &mut history_principals,
                                 self.repo.as_ref(),
                                 run_key,
                                 current_last_event_id,
@@ -6216,6 +6739,7 @@ impl WorkflowService {
                         }
                         return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
                             history: events,
+                            history_principals,
                             next_page_token,
                         });
                     }
@@ -6225,6 +6749,7 @@ impl WorkflowService {
                     {
                         return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
                             history: Vec::new(),
+                            history_principals: Vec::new(),
                             next_page_token: encode_history_page_token(current_last_event_id),
                         });
                     }
@@ -6245,6 +6770,7 @@ impl WorkflowService {
                     {
                         return Ok(crate::translate::GetWorkflowExecutionHistoryResponse {
                             history: Vec::new(),
+                            history_principals: Vec::new(),
                             next_page_token: encode_history_page_token(current_last_event_id),
                         });
                     }
@@ -6291,7 +6817,7 @@ impl WorkflowService {
                     .await?;
                 let history = self
                     .repo
-                    .read_history(run_key, 0, usize::MAX)
+                    .read_attributed_history(run_key, 0, usize::MAX)
                     .await
                     .map_err(EdgeError::from)?;
 
@@ -6305,23 +6831,28 @@ impl WorkflowService {
 
                 let mut reversed: Vec<_> = history
                     .into_iter()
-                    .filter(|event| {
+                    .filter(|attributed| {
                         before_event_id
-                            .map(|value| event.event_id < value)
+                            .map(|value| attributed.event.event_id < value)
                             .unwrap_or(true)
                     })
                     .collect();
-                reversed.sort_by_key(|event| std::cmp::Reverse(event.event_id));
+                reversed.sort_by_key(|attributed| std::cmp::Reverse(attributed.event.event_id));
 
                 let page: Vec<_> = reversed.into_iter().take(limit).collect();
                 let next_page_token = page
                     .last()
-                    .map(|event| encode_reverse_history_page_token(event.event_id))
+                    .map(|attributed| encode_reverse_history_page_token(attributed.event.event_id))
                     .unwrap_or_default();
+                let (history, history_principals): (Vec<_>, Vec<_>) = page
+                    .into_iter()
+                    .map(|attributed| (attributed.event, attributed.principal))
+                    .unzip();
 
                 Ok(
                     crate::translate::GetWorkflowExecutionHistoryReverseResponse {
-                        history: page,
+                        history,
+                        history_principals,
                         next_page_token,
                     },
                 )
@@ -6561,6 +7092,7 @@ impl crate::operator_service::NamespaceDeletionApi for WorkflowService {
                                     namespace_id.0, run_key.0
                                 )),
                                 caller_identity: Some("tokeira-namespace-reclaimer".to_owned()),
+                                principal: None,
                                 received_at: OffsetDateTime::now_utc(),
                             },
                             now: OffsetDateTime::now_utc(),
@@ -6583,7 +7115,7 @@ impl crate::operator_service::NamespaceDeletionApi for WorkflowService {
     }
 }
 
-fn validate_task_token_namespace(
+fn validate_authoritative_task_namespace(
     request_namespace: &str,
     token_namespace_id: tokeira_types::NamespaceId,
 ) -> EdgeResult<()> {
@@ -6600,6 +7132,30 @@ fn validate_task_token_namespace(
         ));
     }
     Ok(())
+}
+
+fn resolved_namespace_id(
+    context: &EdgeContext,
+    request_namespace: &str,
+) -> EdgeResult<tokeira_types::NamespaceId> {
+    let Some(namespace) = context.namespace.as_ref() else {
+        return Err(EdgeError::Internal(
+            "namespace-scoped admission returned no namespace".to_owned(),
+        ));
+    };
+    match namespace.namespace_id.as_deref() {
+        Some(namespace_id) => Uuid::parse_str(namespace_id)
+            .map(tokeira_types::NamespaceId)
+            .map_err(|error| {
+                EdgeError::Internal(format!(
+                    "namespace registry contains invalid stable id {namespace_id}: {error}"
+                ))
+            }),
+        // Legacy/bootstrap entries predate explicit stable-ID storage. Their
+        // deterministic identity is the same value used by run construction
+        // and `NamespaceCache::get_by_id`, so issued tokens remain resolvable.
+        None => Ok(to_internal::namespace_id_for(request_namespace)),
+    }
 }
 
 /// Render v1.31.0's `WorkflowExecutionAlreadyStarted` message for a start
@@ -6642,6 +7198,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::QueryFailed { .. } => "invalid_argument",
         EdgeError::QueryTimedOut => "deadline_exceeded",
         EdgeError::Unauthorized(_) => "unauthenticated",
+        EdgeError::PermissionDenied { .. } => "permission_denied",
         EdgeError::Forbidden { .. } => "permission_denied",
         EdgeError::NamespaceNotFound(_)
         | EdgeError::WorkflowNotFound { .. }
@@ -6672,6 +7229,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
 /// Started only when the task is started, at ids last+1 / last+2.
 async fn append_transient_suffix(
     events: &mut Vec<tokeira_kernel::HistoryEvent>,
+    principals: &mut Vec<Option<tokeira_types::EventPrincipal>>,
     repo: &dyn tokeira_storage::RunRepository,
     run_key: tokeira_types::RunKey,
     read_position: i64,
@@ -6715,6 +7273,7 @@ async fn append_transient_suffix(
             attempt: pending.attempt,
         },
     });
+    principals.push(None);
     if let (Some(started_event_id), Some(started_at)) =
         (pending.started_event_id, pending.started_at)
     {
@@ -6731,6 +7290,7 @@ async fn append_transient_suffix(
                 suggest_continue_as_new: false,
             },
         });
+        principals.push(None);
     }
     Ok(())
 }
@@ -6767,13 +7327,16 @@ fn encode_reverse_history_page_token(before_event_id: i64) -> Vec<u8> {
     before_event_id.to_be_bytes().to_vec()
 }
 
-fn filter_history_events(history: &[HistoryEvent], filter_type: i32) -> Vec<HistoryEvent> {
+fn filter_attributed_history_events(
+    history: &[AttributedHistoryEvent],
+    filter_type: i32,
+) -> Vec<AttributedHistoryEvent> {
     if filter_type != 2 {
         return history.to_vec();
     }
     history
         .iter()
-        .filter(|event| is_close_history_event(&event.kind))
+        .filter(|attributed| is_close_history_event(&attributed.event.kind))
         .cloned()
         .collect()
 }
@@ -6840,6 +7403,7 @@ fn batch_request_context(ctx: &BatchDispatchContext) -> RequestContext {
     RequestContext {
         request_id: RequestId(ctx.edge_context.request_id.as_str().to_string()),
         caller_identity: Some(ctx.identity.clone()),
+        principal: ctx.edge_context.event_principal(),
         received_at: ctx.edge_context.received_at,
     }
 }
@@ -7025,6 +7589,45 @@ fn collect_eager_activity_specs(
         .collect()
 }
 
+fn cross_namespace_authorization_targets(
+    source_namespace: &str,
+    commands: &[tokeira_kernel::WorkflowCommand],
+) -> Vec<(String, Action)> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for command in commands {
+        let target = match command {
+            tokeira_kernel::WorkflowCommand::SignalExternalWorkflowExecution {
+                target_namespace,
+                ..
+            } => target_namespace
+                .as_deref()
+                .map(|namespace| (namespace, Action::SignalWorkflowExecution)),
+            tokeira_kernel::WorkflowCommand::StartChildWorkflow { namespace, .. } => namespace
+                .as_deref()
+                .map(|namespace| (namespace, Action::StartWorkflowExecution)),
+            tokeira_kernel::WorkflowCommand::RequestCancelExternalWorkflowExecution {
+                target_namespace,
+                ..
+            } => target_namespace
+                .as_deref()
+                .map(|namespace| (namespace, Action::RequestCancelWorkflowExecution)),
+            _ => None,
+        };
+        let Some((namespace, action)) = target else {
+            continue;
+        };
+        if namespace.is_empty() || namespace == source_namespace {
+            continue;
+        }
+        let key = (namespace.to_owned(), action.api_name());
+        if seen.insert(key) {
+            targets.push((namespace.to_owned(), action));
+        }
+    }
+    targets
+}
+
 fn active_poller_to_edge(poller: ActivePoller) -> crate::translate::PollerInfo {
     crate::translate::PollerInfo {
         identity: poller.identity.0,
@@ -7124,8 +7727,8 @@ mod tests {
         EmptyVisibilityApi, ExecutionResolver, WorkflowService,
         activity_offer_requires_rule_evaluation, apply_matrix_capability_field,
         build_update_activity_options_command, collect_eager_activity_specs,
-        system_capabilities_with_matrix_overlay, worker_identity_from_request,
-        workflow_rule_crud_admitted,
+        cross_namespace_authorization_targets, system_capabilities_with_matrix_overlay,
+        worker_identity_from_request, workflow_rule_crud_admitted,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -7133,7 +7736,7 @@ mod tests {
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
     use tokeira_compatibility::FeatureState;
-    use tokeira_kernel::{FieldChange, StartRequest, WorkflowCommand};
+    use tokeira_kernel::{FieldChange, ParentClosePolicy, StartRequest, WorkflowCommand};
     use tokeira_runtime::{
         BacklogConfig, InMemoryBroker, LaneConfig, TimerScannerConfig, TokeiraRuntime,
         UpdateLifecycleStage, UpdateWaitPolicy, WorkflowTimeoutScannerConfig,
@@ -7147,7 +7750,7 @@ mod tests {
     use crate::{
         errors::EdgeError,
         grpc::runtime_adapter::RuntimeAdapter,
-        interceptors::{EdgeContext, Principal},
+        interceptors::{Action, EdgeContext},
         long_poll::{LongPollConfig, LongPollGate},
         namespace_cache::{InMemoryNamespaceCache, NamespaceCache, ResolvedNamespace},
         operator_service::InMemoryOperatorApi,
@@ -7159,6 +7762,64 @@ mod tests {
             UpdateActivityOptionsRequest, UpdateWaitPolicyDto, UpdateWorkflowExecutionRequest,
         },
     };
+
+    #[test]
+    fn cross_namespace_targets_skip_local_and_deduplicate_by_api() {
+        let target_namespace_id = NamespaceId::new();
+        let external_signal = WorkflowCommand::SignalExternalWorkflowExecution {
+            target_namespace_id,
+            target_namespace: Some("target".into()),
+            target_workflow_id: WorkflowId("external".into()),
+            target_run_id: None,
+            signal_name: "signal".into(),
+            input: Payloads::default(),
+            header: None,
+            control: String::new(),
+        };
+        let child = WorkflowCommand::StartChildWorkflow {
+            child_workflow_id: WorkflowId("child".into()),
+            namespace_id: target_namespace_id,
+            namespace: Some("target".into()),
+            workflow_type: WorkflowType("child-type".into()),
+            task_queue: TaskQueueName("queue".into()),
+            input: Payloads::default(),
+            header: None,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: Duration::seconds(10),
+            retry_policy: None,
+            cron_schedule: None,
+            parent_close_policy: ParentClosePolicy::Terminate,
+            reuse_policy: Default::default(),
+        };
+        let local_cancel = WorkflowCommand::RequestCancelExternalWorkflowExecution {
+            target_namespace_id: NamespaceId::new(),
+            target_namespace: Some("source".into()),
+            target_workflow_id: WorkflowId("local".into()),
+            target_run_id: None,
+            control: String::new(),
+        };
+
+        let targets = cross_namespace_authorization_targets(
+            "source",
+            &[
+                external_signal.clone(),
+                external_signal,
+                child,
+                local_cancel,
+            ],
+        );
+
+        assert_eq!(
+            targets,
+            vec![
+                ("target".into(), Action::SignalWorkflowExecution),
+                ("target".into(), Action::StartWorkflowExecution),
+            ]
+        );
+    }
 
     fn arb_small_string() -> impl Strategy<Value = String> {
         prop::collection::vec(prop::char::range('a', 'z'), 1..8)
@@ -7203,7 +7864,7 @@ mod tests {
             token_namespace in "[a-z][a-z0-9-]{0,20}",
         ) {
             let token_namespace_id = namespace_id_for(&token_namespace);
-            let result = super::validate_task_token_namespace(
+            let result = super::validate_authoritative_task_namespace(
                 &request_namespace,
                 token_namespace_id,
             );
@@ -7261,7 +7922,8 @@ mod tests {
     fn test_edge_context() -> EdgeContext {
         EdgeContext {
             request_id: crate::request_id::RequestId::new("edge-request"),
-            principal: Principal::root(),
+            claims: None,
+            auth_principal: None,
             namespace: None,
             received_at: time::OffsetDateTime::UNIX_EPOCH,
             is_long_poll: false,
@@ -7374,6 +8036,7 @@ mod tests {
                 request: RequestContext {
                     request_id: RequestId("start-edge-update".to_string()),
                     caller_identity: None,
+                    principal: None,
                     received_at: OffsetDateTime::now_utc(),
                 },
                 now: OffsetDateTime::now_utc(),
@@ -7703,6 +8366,7 @@ mod tests {
                 RequestContext {
                     request_id: RequestId("update-1".to_string()),
                     caller_identity: None,
+                    principal: None,
                     received_at: OffsetDateTime::now_utc(),
                 },
                 Duration::milliseconds(20),

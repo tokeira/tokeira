@@ -21,10 +21,10 @@ use tokeira_kernel::{
     state::{VersioningBehavior, VersioningOverride},
 };
 use tokeira_types::{
-    ArchetypeId, ExecutionRef, ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload,
-    Payloads, ProjectionCursor, QueueKey, RequestId, RunId, RunKey, SearchAttrValue,
-    SearchAttributes, ShardEpoch, ShardId, TaskQueueName, TransitionSeq, VisibilityLifecycleState,
-    WorkerIdentity, WorkflowId, WorkflowRuleRecord, WorkflowType,
+    ArchetypeId, EventPrincipal, ExecutionRef, ExecutionStatus, GenerationCounter, Memo,
+    NamespaceId, Payload, Payloads, ProjectionCursor, QueueKey, RequestId, RunId, RunKey,
+    SearchAttrValue, SearchAttributes, ShardEpoch, ShardId, TaskQueueName, TransitionSeq,
+    VisibilityLifecycleState, WorkerIdentity, WorkflowId, WorkflowRuleRecord, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -488,6 +488,20 @@ pub struct TransitionAuditRecord {
     pub projection_ops: Vec<ProjectionOp>,
 }
 
+/// One authoritative history event paired with its server-computed attribution.
+///
+/// Attribution is physically stored as a batch-aligned sidecar so the existing
+/// positional `HistoryEvent` postcard encoding remains stable. The repository
+/// exposes the logical pair to prevent callers from accidentally losing that
+/// association while paging or reversing history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttributedHistoryEvent {
+    /// Authoritative kernel history event.
+    pub event: HistoryEvent,
+    /// Authenticated caller that authored the event, if propagation was active.
+    pub principal: Option<EventPrincipal>,
+}
+
 /// Query surface the runtime needs from storage.
 ///
 /// The interface is intentionally shaped around semantics rather than a
@@ -534,6 +548,28 @@ pub trait RunRepository: Send + Sync {
         after_event_id: i64,
         limit: usize,
     ) -> Result<Vec<HistoryEvent>>;
+
+    /// Read authoritative history with durable event attribution.
+    ///
+    /// Implementations predating attribution may rely on this default, which
+    /// treats every event as principal-absent. Durable production backends
+    /// override it to decode the batch sidecar atomically with the event blob.
+    async fn read_attributed_history(
+        &self,
+        run_key: RunKey,
+        after_event_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AttributedHistoryEvent>> {
+        Ok(self
+            .read_history(run_key, after_event_id, limit)
+            .await?
+            .into_iter()
+            .map(|event| AttributedHistoryEvent {
+                event,
+                principal: None,
+            })
+            .collect())
+    }
 
     /// Lookup request dedupe state for a workflow execution reference.
     async fn lookup_request_dedupe(
@@ -1553,6 +1589,17 @@ where
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
         (**self).read_history(run_key, after_event_id, limit).await
+    }
+
+    async fn read_attributed_history(
+        &self,
+        run_key: RunKey,
+        after_event_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AttributedHistoryEvent>> {
+        (**self)
+            .read_attributed_history(run_key, after_event_id, limit)
+            .await
     }
 
     async fn lookup_request_dedupe(

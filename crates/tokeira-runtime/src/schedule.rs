@@ -1370,6 +1370,7 @@ where
         request: RequestContext {
             request_id: RequestId(Uuid::new_v4().to_string()),
             caller_identity: Some("schedule-engine".to_string()),
+            principal: None,
             received_at: actual_time,
         },
         now: actual_time,
@@ -1516,6 +1517,7 @@ fn schedule_request_context(now: OffsetDateTime) -> RequestContext {
     RequestContext {
         request_id: RequestId(Uuid::new_v4().to_string()),
         caller_identity: Some("schedule-engine".to_string()),
+        principal: None,
         received_at: now,
     }
 }

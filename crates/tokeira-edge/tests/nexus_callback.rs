@@ -132,6 +132,7 @@ impl WorkflowRuntimeApi for FakeRuntime {
         _token: ActivityTaskToken,
         _result: Payloads,
         _worker_identity: Option<WorkerIdentity>,
+        _request: RequestContext,
     ) -> Result<WorkflowMutationOutcome> {
         unreachable!()
     }
@@ -143,6 +144,7 @@ impl WorkflowRuntimeApi for FakeRuntime {
         _failure_error_type: Option<String>,
         _is_non_retryable: bool,
         _worker_identity: Option<WorkerIdentity>,
+        _request: RequestContext,
     ) -> Result<()> {
         unreachable!()
     }

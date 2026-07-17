@@ -147,6 +147,7 @@ fn fail_request(started_event_id: i64) -> WorkflowTaskFailedRequest {
         failure_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
         failure_details: None,
         worker_identity: WorkerIdentity("worker".into()),
+        request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
         now: now(),
         reset_reapply: Vec::new(),
     }
@@ -430,6 +431,9 @@ fn completion_clears_count_and_recorded_problem() {
                 commands: vec![],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )

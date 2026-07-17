@@ -74,6 +74,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -116,6 +117,7 @@ async fn child_workflow_happy_path_delivers_start_and_completion_back_to_parent(
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -197,6 +199,7 @@ async fn parent_close_policy_terminate_closes_started_child() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -266,6 +269,7 @@ async fn parent_close_policy_request_cancel_requests_cancel_on_child() -> Result
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -353,6 +357,7 @@ async fn duplicate_child_start_delivers_failed_confirmation_to_parent() -> Resul
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -427,6 +432,7 @@ async fn start_parent_with_child(
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -542,6 +548,7 @@ fn start_request(
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),

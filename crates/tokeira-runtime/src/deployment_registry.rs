@@ -2653,6 +2653,7 @@ mod tests {
             request: RequestContext {
                 request_id: RequestId(format!("start-{build_id}-{workflow_id_value}")),
                 caller_identity: None,
+                principal: None,
                 received_at: OffsetDateTime::UNIX_EPOCH,
             },
             now: OffsetDateTime::UNIX_EPOCH,
@@ -2683,6 +2684,7 @@ mod tests {
             request: RequestContext {
                 request_id: RequestId(request_id.to_string()),
                 caller_identity: None,
+                principal: None,
                 received_at: OffsetDateTime::UNIX_EPOCH,
             },
             now: OffsetDateTime::UNIX_EPOCH,

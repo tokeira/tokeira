@@ -16,11 +16,15 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+tokeira-auth.workspace = true
+bytes = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1"
 clap.workspace = true
 http-body-util.workspace = true
+http-body-legacy = { package = "http-body", version = "0.4" }
 hyper.workspace = true
+hyper-legacy = { package = "hyper", version = "0.14" }
 hyper-util.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
@@ -30,6 +34,7 @@ opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 serde_json = "1"
 serde.workspace = true
+reqwest = { workspace = true, optional = true }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -38,6 +43,7 @@ tonic.workspace = true
 tonic-reflection.workspace = true
 tonic-web.workspace = true
 tower-http.workspace = true
+tower = "0.4"
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
@@ -56,6 +62,7 @@ tokeira-config.workspace = true
 tokeira-storage = { path = "../../crates/tokeira-storage", features = ["dsql"] }
 tokeira-types = { path = "../../crates/tokeira-types" }
 tokeira-conformance-control = { workspace = true, optional = true }
+tokeira-conformance = { workspace = true, optional = true }
 connectrpc = { version = "0.8.1", features = ["server"], optional = true }
 
 [features]
@@ -64,7 +71,9 @@ connectrpc = { version = "0.8.1", features = ["server"], optional = true }
 # a production build.
 conformance = [
     "dep:tokeira-conformance-control",
+    "dep:tokeira-conformance",
     "dep:connectrpc",
+    "dep:reqwest",
     "tokeira-edge/conformance",
     "tokeira-runtime/conformance",
 ]

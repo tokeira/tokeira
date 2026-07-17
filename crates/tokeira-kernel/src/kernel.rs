@@ -13,9 +13,9 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, Payloads, QueueKey,
-    RunId, RunKey, SearchAttributes, StickyAffinity, TaskQueueName, TransitionSeq, WorkerIdentity,
-    WorkflowId,
+    BuildId, DeploymentId, EventPrincipal, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId,
+    Payloads, QueueKey, RunId, RunKey, SearchAttributes, StickyAffinity, TaskQueueName,
+    TransitionSeq, WorkerIdentity, WorkflowId,
 };
 
 use crate::{
@@ -539,7 +539,7 @@ impl BasicKernel {
             buffered_events: Vec::new(),
         };
 
-        let mut builder = TransitionBuilder::new(initial, req.now);
+        let mut builder = TransitionBuilder::new(initial, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -705,7 +705,7 @@ impl BasicKernel {
             buffered_events: Vec::new(),
         };
 
-        let mut builder = TransitionBuilder::new(initial, req.now);
+        let mut builder = TransitionBuilder::new(initial, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -802,7 +802,7 @@ impl BasicKernel {
     /// "at most one outstanding WFT" invariant comment below.
     fn apply_signal(&self, loaded: LoadedRun, req: SignalRequest) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         // The dedupe op is emitted at *admission* even when the event is
         // buffered below: idempotency of `SignalWorkflowExecution` is anchored
         // to the request id at durable acceptance, not to the signal's
@@ -880,7 +880,7 @@ impl BasicKernel {
             return Err(Reject::DuplicateUpdateId(req.update_id));
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -925,9 +925,11 @@ impl BasicKernel {
         // what turns a cancel-external against a finished target into the
         // source's ExternalWorkflowExecutionCancelRequested SUCCESS event.
         if !state.is_open() || state.cancel_requested {
-            return Ok(TransitionBuilder::new(state, req.now).finish());
+            return Ok(
+                TransitionBuilder::new(state, req.now, req.request.principal.clone()).finish(),
+            );
         }
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -975,7 +977,7 @@ impl BasicKernel {
         req: TerminateRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -1015,7 +1017,7 @@ impl BasicKernel {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -1037,12 +1039,14 @@ impl BasicKernel {
             if let Some(info) = &state.pause_info
                 && info.request_id == req.request.request_id.0
             {
-                return Ok(TransitionBuilder::new(state, req.now).finish());
+                return Ok(
+                    TransitionBuilder::new(state, req.now, req.request.principal.clone()).finish(),
+                );
             }
             return Err(Reject::AlreadyPaused);
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -1090,7 +1094,7 @@ impl BasicKernel {
             return Err(Reject::NotPaused);
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -1148,7 +1152,7 @@ impl BasicKernel {
         req: UpdateActivityOptionsRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         let activity_ids = matching_activity_ids(&builder.state, &req.target);
         if activity_ids.is_empty() {
             return Err(Reject::UnknownActivity(req.target.label()));
@@ -1220,7 +1224,7 @@ impl BasicKernel {
         req: PauseActivityRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         let activity_ids = matching_activity_ids(&builder.state, &req.target);
         if activity_ids.is_empty() {
             return Err(Reject::UnknownActivity(req.target.label()));
@@ -1281,7 +1285,7 @@ impl BasicKernel {
         req: UnpauseActivityRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         let activity_ids = matching_activity_ids(&builder.state, &req.target);
         if activity_ids.is_empty() {
             return Err(Reject::UnknownActivity(req.target.label()));
@@ -1336,7 +1340,7 @@ impl BasicKernel {
         req: ResetActivityRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         let activity_ids = matching_activity_ids(&builder.state, &req.target);
         if activity_ids.is_empty() {
             return Err(Reject::UnknownActivity(req.target.label()));
@@ -1454,7 +1458,7 @@ impl BasicKernel {
         let logical_seq = state.next_workflow_task_seq;
         let base_run_id = state.run_id;
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         // The base run of a reset records the run it was reset INTO
         // (`ExecutionInfo.ResetRunId`, mutable_state_impl.go:1010 @ v1.31.0),
         // surfaced via DescribeMutableState. This holds whether the base is the
@@ -1519,7 +1523,7 @@ impl BasicKernel {
         }
         let mut attached_completion_callbacks = req.attached_completion_callbacks;
         stamp_callback_registration_times(&mut attached_completion_callbacks, req.now);
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
         });
@@ -1589,7 +1593,7 @@ impl BasicKernel {
         req: WorkflowExecutionTimedOutRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         // A workflow-level timeout is a forced close like terminate: a started
         // WFT is failed first (ForceCloseCommand) and buffered events flush
         // before the timed-out event (`TimeoutWorkflow`,
@@ -1645,7 +1649,7 @@ impl BasicKernel {
             });
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         let attempt = pending.attempt.max(1);
         // Transient (attempt>1) and SPECULATIVE starts persist no
         // WorkflowTaskStarted event: the started id is virtual
@@ -1777,7 +1781,7 @@ impl BasicKernel {
         req: crate::command::StartDeploymentTransitionRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         builder
             .state
             .start_version_transition(req.target, req.revision_number)
@@ -1889,7 +1893,8 @@ impl BasicKernel {
                 0
             };
             if interleaved_events <= window {
-                let mut builder = TransitionBuilder::new(state, req.now);
+                let mut builder =
+                    TransitionBuilder::new(state, req.now, req.request.principal.clone());
                 builder.request_dedupe_ops.push(RequestDedupeOp {
                     request_id: tokeira_types::RequestId(format!(
                         "wft-completed-{}-{}",
@@ -1937,7 +1942,7 @@ impl BasicKernel {
             }
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
 
         // Capture last_event_id before emitting the completion event.
         // Events between started_event_id and this value arrived while
@@ -2152,7 +2157,7 @@ impl BasicKernel {
             .cloned()
             .ok_or_else(|| Reject::UnknownActivity(activity_id.to_string()))?;
 
-        let mut builder = TransitionBuilder::new(state, now);
+        let mut builder = TransitionBuilder::new(state, now, None);
         // Buffers to `BUFFERED_EVENT_ID` when a WFT is started (the worker's
         // history view is frozen); the resolution event stores that sentinel as
         // its `started_event_id` and the flush wires the real id once this
@@ -2191,7 +2196,7 @@ impl BasicKernel {
             .cloned()
             .ok_or_else(|| Reject::UnknownActivity(req.activity_id.clone()))?;
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         match req.resolution {
             ActivityResolution::Completed { result } => {
                 builder.emit_or_buffer(HistoryEventKind::ActivityTaskCompleted {
@@ -2264,7 +2269,7 @@ impl BasicKernel {
         req: ChildStartConfirmedRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         let child = builder
             .state
             .children
@@ -2328,7 +2333,7 @@ impl BasicKernel {
         req: ChildResolvedRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         let child = builder
             .state
             .children
@@ -2417,7 +2422,7 @@ impl BasicKernel {
         req: ExternalSignalResolvedRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         let pending = builder
             .state
             .pending_external_signals
@@ -2466,7 +2471,7 @@ impl BasicKernel {
         req: ExternalCancelResolvedRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         let pending = builder
             .state
             .pending_external_cancels
@@ -2532,7 +2537,7 @@ impl BasicKernel {
             });
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         match req.resolution {
             NexusResolution::Started {
                 operation_token,
@@ -2703,7 +2708,7 @@ impl BasicKernel {
         }
 
         let run_key = state.run_key;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         // Clear the backoff state (Invariant 4: cleared on re-dispatch, so Describe
         // shows nothing while the new attempt is in flight). The attempt count is not
         // bumped here — it was already incremented by the AttemptFailed that backed
@@ -2775,7 +2780,7 @@ impl BasicKernel {
         }
 
         let reported_cause = req.failure_cause.clone();
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         // v1.31.0's sticky rule in `failWorkflowTask`: a failure while the
         // run's REAL sticky queue is set (raise S1 — the poll-side hint's
         // empty queue name does not qualify) clears the affinity and retries
@@ -3165,7 +3170,7 @@ impl BasicKernel {
         req: ResetStickyRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         builder.state.sticky = None;
         Ok(builder.finish())
     }
@@ -3196,7 +3201,7 @@ impl BasicKernel {
             if pending.started_event_id.is_some() {
                 return Err(Reject::WorkflowTaskTokenMismatch);
             }
-            let mut builder = TransitionBuilder::new(state, req.now);
+            let mut builder = TransitionBuilder::new(state, req.now, None);
             // A SPECULATIVE scheduled task persists its Scheduled event NOW,
             // immediately before the timed-out event — v1.31.0's
             // `AddWorkflowTaskScheduleToStartTimeoutEvent` creates "the
@@ -3277,7 +3282,7 @@ impl BasicKernel {
             return Err(Reject::WorkflowTaskTokenMismatch);
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         // Same sticky rule as the failure path (raise S4): a start-to-close
         // timeout while the run's REAL sticky queue is set clears the
         // affinity and retries fresh at attempt 1 without counting —
@@ -3429,7 +3434,7 @@ impl BasicKernel {
             .cloned()
             .ok_or_else(|| Reject::UnknownTimer(req.timer_id.clone()))?;
 
-        let mut builder = TransitionBuilder::new(state, req.fired_at);
+        let mut builder = TransitionBuilder::new(state, req.fired_at, None);
         let fired = HistoryEventKind::TimerFired {
             timer_id: timer.timer_id.clone(),
             started_event_id: timer.started_event_id,
@@ -3464,7 +3469,7 @@ impl BasicKernel {
         req: WorkflowStartDelayElapsedRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
-        let mut builder = TransitionBuilder::new(state, req.fired_at);
+        let mut builder = TransitionBuilder::new(state, req.fired_at, None);
         if builder
             .state
             .timers
@@ -3497,11 +3502,11 @@ impl BasicKernel {
         // If a WFT is already pending, no-op — the query will be
         // piggybacked on the existing WFT when the worker polls.
         if state.pending_workflow_task.is_some() {
-            let builder = TransitionBuilder::new(state, req.now);
+            let builder = TransitionBuilder::new(state, req.now, None);
             return Ok(builder.finish());
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         builder.schedule_workflow_task();
         Ok(builder.finish())
     }
@@ -3543,7 +3548,7 @@ impl BasicKernel {
             ));
         }
 
-        let mut builder = TransitionBuilder::new(state, req.now);
+        let mut builder = TransitionBuilder::new(state, req.now, None);
         let callback = &mut builder.state.completion_callbacks[req.callback_index];
         // Attempt counts and completion time advance for every executor result,
         // including success. Temporal's callback state machine increments the
@@ -5555,6 +5560,10 @@ struct TransitionBuilder {
     /// Wall-clock time for all events in this transition.
     now: OffsetDateTime,
     history_events: SmallVec<[HistoryEvent; 8]>,
+    /// Authenticated caller for events authored by this transaction.
+    principal: Option<EventPrincipal>,
+    /// Attribution aligned one-for-one with `history_events`.
+    event_principals: SmallVec<[Option<EventPrincipal>; 8]>,
     request_dedupe_ops: SmallVec<[RequestDedupeOp; 1]>,
     activity_ops: SmallVec<[ActivityOp; 4]>,
     timer_ops: SmallVec<[TimerOp; 4]>,
@@ -5568,12 +5577,18 @@ struct TransitionBuilder {
 impl TransitionBuilder {
     /// Create a new builder from the current state and a
     /// wall-clock timestamp.
-    fn new(state: WorkflowState, now: OffsetDateTime) -> Self {
+    fn new(state: WorkflowState, now: OffsetDateTime, principal: Option<EventPrincipal>) -> Self {
         let expected_seq = state.transition_seq;
+        // Upstream suppresses only a principal whose type AND name are empty;
+        // a half-empty authenticated identity remains attributable
+        // (`common/headers/headers.go:148-162 @ v1.31.0`).
+        let principal = principal.filter(|principal| !principal.is_empty());
         Self {
             state,
             now,
             history_events: SmallVec::new(),
+            principal,
+            event_principals: SmallVec::new(),
             request_dedupe_ops: SmallVec::new(),
             activity_ops: SmallVec::new(),
             timer_ops: SmallVec::new(),
@@ -5608,6 +5623,7 @@ impl TransitionBuilder {
         self.state.external_payload_count += count;
         self.state.external_payload_size_bytes += size;
         self.history_events.push(event);
+        self.event_principals.push(self.principal.clone());
         event_id
     }
 
@@ -5621,6 +5637,7 @@ impl TransitionBuilder {
             .push(crate::state::BufferedEvent {
                 admitted_at: self.now,
                 kind,
+                principal: self.principal.clone(),
             });
     }
 
@@ -5736,6 +5753,10 @@ impl TransitionBuilder {
                 happened_at: event.admitted_at,
                 kind,
             });
+            // The admitting transaction owns attribution. Using the flusher's
+            // principal here would let a later workflow-task completion rewrite
+            // the audit identity of an earlier signal or cancel.
+            self.event_principals.push(event.principal);
         }
         count
     }
@@ -6226,10 +6247,12 @@ impl TransitionBuilder {
     /// once.
     fn finish(mut self) -> Transition {
         self.state.transition_seq = self.state.transition_seq.next();
+        debug_assert_eq!(self.history_events.len(), self.event_principals.len());
         Transition {
             expected_seq: self.expected_seq,
             next_state: self.state,
             history_events: self.history_events,
+            event_principals: self.event_principals,
             request_dedupe_ops: self.request_dedupe_ops,
             activity_ops: self.activity_ops,
             timer_ops: self.timer_ops,

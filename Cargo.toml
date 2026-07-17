@@ -9,6 +9,7 @@ members = [
     "crates/tokeira-conformance",
     "crates/tokeira-conformance-proto",
     "crates/tokeira-conformance-control",
+    "crates/tokeira-auth",
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
@@ -87,6 +88,8 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 proptest = "1"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+jsonwebtoken = "9"
+quick-xml = { version = "0.38", features = ["serialize"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smallvec = "1.13"
@@ -105,6 +108,7 @@ tonic = { version = "0.11", features = ["transport", "gzip"] }
 tonic-reflection = "0.11"
 tonic-web = "0.11"
 tower-http = { version = "0.4", features = ["cors"] }
+url = "2"
 uuid = { version = "1.10", features = ["serde", "v4"] }
 serde_yaml = "0.9"
 tokeira-state = { path = "crates/tokeira-state" }
@@ -123,6 +127,7 @@ tokeira-compatibility-service = { path = "crates/tokeira-compatibility-service" 
 tokeira-conformance = { path = "crates/tokeira-conformance" }
 tokeira-conformance-proto = { path = "crates/tokeira-conformance-proto" }
 tokeira-conformance-control = { path = "crates/tokeira-conformance-control" }
+tokeira-auth = { path = "crates/tokeira-auth" }
 dagger-client = { path = "crates/dagger-client" }
 tokeira-build = { path = "crates/tokeira-build" }
 

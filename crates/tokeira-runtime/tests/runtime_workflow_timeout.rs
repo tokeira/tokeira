@@ -170,6 +170,7 @@ async fn manually_terminated_workflow_does_not_timeout() -> Result<()> {
                 request: RequestContext {
                     request_id: RequestId("req-term".to_string()),
                     caller_identity: None,
+                    principal: None,
                     received_at: OffsetDateTime::now_utc(),
                 },
                 now: OffsetDateTime::now_utc(),
@@ -296,6 +297,7 @@ fn start_request(
         request: RequestContext {
             request_id: RequestId("req-start".to_string()),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),

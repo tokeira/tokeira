@@ -7,9 +7,9 @@ use tokeira_edge::{
     BatchDispatchContext, EdgeContext, EdgeInterceptors, EmptyVisibilityApi,
     InMemoryExecutionResolver, InMemoryNamespaceCache, InMemoryOperatorApi,
     ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, LocalOnlyRouter, LongPollConfig,
-    LongPollGate, NamespaceCache, PendingQueryStore, PollerRegistry, Principal, RequestId,
-    ResolvedNamespace, VisibilityApi, WorkflowExecutionSummary, WorkflowMutationOutcome,
-    WorkflowRuntimeApi, WorkflowService, batch_engine,
+    LongPollGate, NamespaceCache, PendingQueryStore, PollerRegistry, RequestId, ResolvedNamespace,
+    VisibilityApi, WorkflowExecutionSummary, WorkflowMutationOutcome, WorkflowRuntimeApi,
+    WorkflowService, batch_engine,
     translate::{
         batch::{
             DescribeBatchOperationRequest, ListBatchOperationsRequest, StartBatchOperationRequest,
@@ -157,6 +157,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         _token: ActivityTaskToken,
         _result: Payloads,
         _worker_identity: Option<WorkerIdentity>,
+        _request: RequestContext,
     ) -> Result<WorkflowMutationOutcome> {
         unreachable!()
     }
@@ -168,6 +169,7 @@ impl WorkflowRuntimeApi for RecordingRuntime {
         _failure_error_type: Option<String>,
         _is_non_retryable: bool,
         _worker_identity: Option<WorkerIdentity>,
+        _request: RequestContext,
     ) -> Result<()> {
         unreachable!()
     }
@@ -424,7 +426,8 @@ fn outcome() -> WorkflowMutationOutcome {
 fn edge_context() -> EdgeContext {
     EdgeContext {
         request_id: RequestId::new("req-batch"),
-        principal: Principal::root(),
+        claims: None,
+        auth_principal: None,
         namespace: Some(ResolvedNamespace::active("default")),
         received_at: time::OffsetDateTime::UNIX_EPOCH,
         is_long_poll: false,
@@ -531,6 +534,7 @@ async fn seed_workflow(
             request: RequestContext {
                 request_id: DomainRequestId(format!("seed-{workflow_id}")),
                 caller_identity: Some("seed".to_string()),
+                principal: None,
                 received_at: now,
             },
             now,

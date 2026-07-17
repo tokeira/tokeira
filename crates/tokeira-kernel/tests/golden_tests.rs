@@ -87,6 +87,7 @@ fn request_context(id: &str) -> RequestContext {
     RequestContext {
         request_id: RequestId(id.into()),
         caller_identity: Some("tester".into()),
+        principal: None,
         received_at: now(),
     }
 }
@@ -1376,6 +1377,9 @@ fn sticky_completion_dispatches_next_wft_sticky_then_s2s_times_out() {
                 commands: vec![],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -2326,6 +2330,9 @@ fn activity_resolved_paused_workflow_no_wft() {
                     result: payloads("done"),
                 },
                 worker_identity: None,
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -2360,6 +2367,9 @@ fn wft_failed_paused_workflow_no_redispatch() {
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
                 reset_reapply: Vec::new(),
             }),
@@ -2455,6 +2465,9 @@ fn wft_completed_paused_workflow_no_force_wft() {
                 commands: vec![],
                 force_new_workflow_task: true,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -2491,6 +2504,9 @@ fn wft_completion_tracks_previous_started_event_id() {
                 commands: vec![],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -2989,6 +3005,9 @@ fn workflow_task_completed_with_activity_and_timer() {
                 ],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -3061,6 +3080,9 @@ fn workflow_task_completed_with_complete_workflow() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -3111,6 +3133,9 @@ fn workflow_task_completed_with_fail_workflow() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -3200,6 +3225,9 @@ fn continue_as_new_closes_run() {
                 commands: vec![command.clone()],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -3270,6 +3298,9 @@ fn continue_as_new_then_another_command() {
                 ],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         ),
@@ -3431,6 +3462,9 @@ fn fail_workflow_with_retry_policy() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -3475,6 +3509,9 @@ fn fail_workflow_without_retry_policy() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -3502,6 +3539,9 @@ fn activity_resolved_completed_schedules_wft() {
                     result: payloads("done"),
                 },
                 worker_identity: None,
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -3544,6 +3584,9 @@ fn activity_resolved_timed_out_schedules_wft() {
                     failure: None,
                 },
                 worker_identity: None,
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -3570,6 +3613,9 @@ fn activity_resolved_canceled_schedules_wft() {
                     details: Some(payloads("cancel")),
                 },
                 worker_identity: None,
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -3625,6 +3671,9 @@ fn wft_failed_with_started_wft() {
                 failure_cause: WorkflowTaskFailedCause::NonDeterminismError,
                 failure_details: Some(payload("details")),
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
                 reset_reapply: Vec::new(),
             }),
@@ -3753,6 +3802,9 @@ fn wft_failed_no_sticky() {
                 failure_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
                 reset_reapply: Vec::new(),
             }),
@@ -4018,6 +4070,9 @@ fn reject_wft_completed_no_pending() {
                 commands: vec![],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             })
         ),
@@ -4050,6 +4105,9 @@ fn reject_wft_completed_not_started() {
                 commands: vec![],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             })
         ),
@@ -4083,6 +4141,9 @@ fn reject_wft_completed_seq_mismatch() {
                 commands: vec![],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             })
         ),
@@ -4119,6 +4180,9 @@ fn reject_wft_completed_token_mismatch() {
                 commands: vec![],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             })
         ),
@@ -4199,6 +4263,9 @@ fn reject_duplicate_activity_id() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             })
         ),
@@ -4244,6 +4311,9 @@ fn reject_duplicate_timer_id() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             })
         ),
@@ -4262,6 +4332,9 @@ fn reject_wft_failed_absent_run() {
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
                 reset_reapply: Vec::new(),
             })
@@ -4281,6 +4354,9 @@ fn reject_wft_failed_closed_run() {
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
                 reset_reapply: Vec::new(),
             })
@@ -4300,6 +4376,9 @@ fn reject_wft_failed_no_pending() {
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
                 reset_reapply: Vec::new(),
             })
@@ -4319,6 +4398,9 @@ fn reject_wft_failed_not_started() {
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
                 reset_reapply: Vec::new(),
             })
@@ -4338,6 +4420,9 @@ fn reject_wft_failed_seq_mismatch() {
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
                 reset_reapply: Vec::new(),
             })
@@ -4360,6 +4445,9 @@ fn reject_wft_failed_started_event_mismatch() {
                 failure_cause: WorkflowTaskFailedCause::UnhandledCommand,
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
                 reset_reapply: Vec::new(),
             })
@@ -4478,6 +4566,9 @@ fn reject_unknown_activity() {
                     result: payloads("done")
                 },
                 worker_identity: None,
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             })
         ),
@@ -4530,6 +4621,9 @@ fn reject_commands_after_close() {
                 ],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             })
         ),
@@ -4563,6 +4657,9 @@ fn cancel_workflow_command() {
                 commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -4621,6 +4718,9 @@ fn cancel_workflow_then_another_command() {
                 ],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         ),
@@ -4656,6 +4756,9 @@ fn request_cancel_activity() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -4711,6 +4814,9 @@ fn request_cancel_activity_started_sets_durable_cancel_requested() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -4762,6 +4868,7 @@ fn request_cancel_activity_unknown() {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
         }),
     );
@@ -4801,6 +4908,7 @@ fn close_command_with_buffered_events_is_unhandled_command() {
                 request_id: "buffered-signal-req".into(),
                 identity: Some("worker1".into()),
             },
+            principal: None,
         });
     let transition = kernel().apply(
         LoadedRun::Existing(state.clone()),
@@ -4826,6 +4934,7 @@ fn close_command_with_buffered_events_is_unhandled_command() {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
         }),
     );
@@ -4866,6 +4975,9 @@ fn cancel_timer() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -4909,6 +5021,7 @@ fn cancel_timer_unknown() {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
         }),
     );
@@ -4964,6 +5077,7 @@ fn record_marker_missing_name_fails_wft() {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
         }),
     );
@@ -5044,6 +5158,9 @@ fn workflow_property_and_search_attribute_patches_record_merge_and_replay() {
                 ],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -5122,6 +5239,7 @@ fn invalid_search_attribute_uses_bad_search_attributes_failure_cause() {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: now(),
         }),
     );
@@ -5184,6 +5302,9 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
                 commands: vec![],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -5274,6 +5395,9 @@ fn cancel_timer_fired_and_buffered_deletes_buffered_fired_event() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -5321,6 +5445,9 @@ fn request_cancel_activity_then_resolved_canceled() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -5340,6 +5467,9 @@ fn request_cancel_activity_then_resolved_canceled() {
                     details: Some(payloads("cancel")),
                 },
                 worker_identity: None,
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -5418,6 +5548,9 @@ fn cancel_then_cancel_workflow_e2e() {
                 commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -5609,6 +5742,9 @@ fn start_child_workflow_happy_path() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -5776,6 +5912,9 @@ fn signal_external_workflow_happy_path() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -5850,6 +5989,9 @@ fn request_cancel_external_workflow_happy_path() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6068,6 +6210,9 @@ fn update_completed_happy_path() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6120,6 +6265,9 @@ fn update_rejected_happy_path() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6170,6 +6318,9 @@ fn update_completed_unknown_update() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6207,6 +6358,9 @@ fn update_rejected_unknown_update_is_tolerated() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6257,6 +6411,9 @@ fn protocol_message_accepted_body() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6308,6 +6465,9 @@ fn protocol_message_completed_body() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6362,6 +6522,9 @@ fn protocol_message_rejected_body() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6424,6 +6587,9 @@ fn complete_workflow_clears_pending_updates() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6465,6 +6631,9 @@ fn record_marker_happy_path() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6524,6 +6693,9 @@ fn record_marker_after_close_rejected() {
                 ],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -6696,6 +6868,10 @@ fn close_preserves_execution_options() {
 /// completion callback, ready to be driven to a terminal state.
 fn make_started_wft_with_standby_callback() -> WorkflowState {
     let mut state = make_open_state_with_started_wft();
+    // These callback goldens exercise terminal close outcomes. The common
+    // fixture carries a retry policy, which correctly turns a failure into an
+    // in-progress continuation and therefore must not fire WorkflowClosed.
+    state.retry_policy = None;
     state.completion_callbacks = vec![completion_callback()];
     state
 }
@@ -6731,6 +6907,9 @@ fn close_via_wft(state: WorkflowState, commands: Vec<WorkflowCommand>) -> Transi
                 commands,
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -7026,6 +7205,9 @@ fn schedule_nexus_operation_happy_path() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -7085,6 +7267,9 @@ fn schedule_nexus_operation_duplicate_rejected() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -7122,6 +7307,9 @@ fn cancel_nexus_operation_happy_path() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -7183,6 +7371,9 @@ fn cancel_nexus_operation_unknown() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -7648,6 +7839,9 @@ fn close_via_complete_clears_pending_nexus_operations() {
                 }],
                 force_new_workflow_task: false,
                 delivered_update_ids: Vec::new(),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now(),
             }),
         )
@@ -7898,6 +8092,7 @@ fn speculative_completion_request(
         commands,
         force_new_workflow_task: false,
         delivered_update_ids: Vec::new(),
+        request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
         now: now(),
     }
 }
@@ -8638,6 +8833,9 @@ fn speculative_explicit_fail_materializes_and_keeps_update_admitted() {
                 failure_cause: WorkflowTaskFailedCause::BadUpdateWorkflowExecutionMessage,
                 failure_details: None,
                 worker_identity: WorkerIdentity("worker".into()),
+                request: tokeira_types::RequestContext::unattributed(
+                    time::OffsetDateTime::UNIX_EPOCH,
+                ),
                 now: now() + Duration::seconds(1),
                 reset_reapply: Vec::new(),
             }),

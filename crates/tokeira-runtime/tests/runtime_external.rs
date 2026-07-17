@@ -64,6 +64,7 @@ async fn external_signal_delivery_signals_target_and_resolves_originator() -> Re
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -138,6 +139,7 @@ async fn external_cancel_delivery_requests_cancel_on_target_and_resolves_origina
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -218,6 +220,7 @@ async fn external_signal_cross_namespace_uses_target_namespace() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -285,6 +288,7 @@ async fn external_signal_not_found_delivers_failed_resolution() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -430,6 +434,7 @@ fn start_request(
         request: RequestContext {
             request_id: RequestId(request_id.into()),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),

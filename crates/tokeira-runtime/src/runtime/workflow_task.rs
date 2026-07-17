@@ -528,6 +528,10 @@ where
         // Anchor the cron backoff on the completion time (`req.now`), captured before
         // `req` moves into the command below.
         let completion_now = req.now;
+        // A server-decided failure of this completion is authored on behalf of
+        // the same authenticated worker call. Preserve its edge-derived
+        // principal before moving the request into the first kernel attempt.
+        let failure_request = req.request.clone();
         let command = match (retry_continuation, cron_continuation) {
             (Some(retry_continuation), _) => Command::WorkflowTaskCompletedWithRetry {
                 request: req,
@@ -584,6 +588,7 @@ where
                             failure_cause: cause,
                             failure_details: Some(server_failure_payload(&wire_message)),
                             worker_identity: completion_identity,
+                            request: failure_request.clone(),
                             now: OffsetDateTime::now_utc(),
                             reset_reapply: Vec::new(),
                         }),
@@ -664,6 +669,7 @@ where
                             failure_cause: cause,
                             failure_details: Some(server_failure_payload(&persisted_message)),
                             worker_identity: completion_identity,
+                            request: failure_request,
                             now: OffsetDateTime::now_utc(),
                             reset_reapply: Vec::new(),
                         }),
@@ -801,6 +807,7 @@ where
                 failure_cause,
                 failure_details,
                 worker_identity,
+                request,
                 now,
                 reset_reapply: Vec::new(),
             })
@@ -1438,6 +1445,7 @@ pub(crate) fn build_retry_successor_start(
                 state.run_id.0, new_run_id.0
             )),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),
@@ -1547,6 +1555,7 @@ pub(crate) fn build_cron_successor_start(
                 state.run_id.0, new_run_id.0
             )),
             caller_identity: None,
+            principal: None,
             received_at: execution_started_at,
         },
         // The successor's `WorkflowExecutionStarted` time — and thus its start-delay

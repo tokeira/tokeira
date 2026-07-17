@@ -433,6 +433,7 @@ mod tests {
             expected_seq: TransitionSeq::ZERO,
             next_state: sample_state(run_key),
             history_events: Default::default(),
+            event_principals: Default::default(),
             request_dedupe_ops: Default::default(),
             activity_ops: Default::default(),
             timer_ops: Default::default(),

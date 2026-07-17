@@ -1,4 +1,8 @@
-use tokeira_proto::conversions::ProtoConversionError;
+use prost::Message as _;
+use tokeira_proto::{
+    conversions::ProtoConversionError,
+    public::temporal::api::errordetails::v1::PermissionDeniedFailure,
+};
 use tonic::{
     Code, Status,
     metadata::{MetadataMap, MetadataValue},
@@ -26,6 +30,9 @@ impl From<EdgeError> for Status {
                 "query timed out before a worker could process it",
             )),
             EdgeError::Unauthorized(message) => Status::unauthenticated(message),
+            EdgeError::PermissionDenied { message, reason } => {
+                permission_denied_status(message, reason.unwrap_or_default())
+            }
             EdgeError::Forbidden { action, namespace } => {
                 let message = match namespace {
                     Some(namespace) => {
@@ -380,25 +387,24 @@ pub(crate) fn worker_versioning_v2_disabled_status() -> Status {
 /// clients reconstruct the typed `serviceerror.PermissionDenied` from the
 /// `grpc-status-details-bin` trailer.
 fn worker_versioning_disabled_status(message: &'static str) -> Status {
-    use prost::Message as _;
-    use tokeira_proto::public::temporal::api::errordetails::v1::PermissionDeniedFailure;
+    permission_denied_status(message.to_owned(), String::new())
+}
 
+/// Build Temporal's typed authorization denial.
+fn permission_denied_status(message: String, reason: String) -> Status {
     let detail = ProtoAny {
         type_url: "type.googleapis.com/temporal.api.errordetails.v1.PermissionDeniedFailure"
             .to_owned(),
-        value: PermissionDeniedFailure {
-            reason: String::new(),
-        }
-        .encode_to_vec(),
+        value: PermissionDeniedFailure { reason }.encode_to_vec(),
     };
     let rpc_status = RpcStatus {
         code: Code::PermissionDenied as i32,
-        message: message.to_owned(),
+        message: message.clone(),
         details: vec![detail],
     };
     Status::with_details_and_metadata(
         Code::PermissionDenied,
-        message.to_owned(),
+        message,
         rpc_status.encode_to_vec().into(),
         MetadataMap::new(),
     )
@@ -443,6 +449,8 @@ pub fn proto_conversion_status(err: ProtoConversionError) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use prost::Message as _;
+
     use super::*;
     use tonic::Code;
 
@@ -469,6 +477,13 @@ mod tests {
             (
                 EdgeError::Unauthorized("nope".to_string()),
                 Code::Unauthenticated,
+            ),
+            (
+                EdgeError::PermissionDenied {
+                    message: "Request unauthorized.".to_owned(),
+                    reason: None,
+                },
+                Code::PermissionDenied,
             ),
             (
                 EdgeError::Forbidden {
@@ -546,6 +561,25 @@ mod tests {
         for (err, code) in cases {
             let status: Status = err.into();
             assert_eq!(status.code(), code);
+        }
+    }
+
+    #[test]
+    fn authorization_denial_has_exact_message_and_typed_reason() {
+        for (reason, expected) in [
+            (None, ""),
+            (Some("namespace policy".to_owned()), "namespace policy"),
+        ] {
+            let status = Status::from(EdgeError::PermissionDenied {
+                message: "Request unauthorized.".to_owned(),
+                reason,
+            });
+            assert_eq!(status.code(), Code::PermissionDenied);
+            assert_eq!(status.message(), "Request unauthorized.");
+            let rpc = RpcStatus::decode(status.details()).expect("google.rpc.Status");
+            let detail = PermissionDeniedFailure::decode(rpc.details[0].value.as_slice())
+                .expect("PermissionDeniedFailure");
+            assert_eq!(detail.reason, expected);
         }
     }
 

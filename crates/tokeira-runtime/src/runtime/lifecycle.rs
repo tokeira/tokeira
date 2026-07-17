@@ -1382,6 +1382,7 @@ where
         );
         let reset_reason = request.reason.clone();
         let reset_now = request.now;
+        let reset_principal = request.request.principal.clone();
         let successor_run_id = request.new_run_id;
         let fork_event_id = request.fork_event_id;
         match self.submit(run_key, Command::Reset(request)).await? {
@@ -1419,6 +1420,7 @@ where
                         successor_run_id.0
                     )),
                     caller_identity: None,
+                    principal: reset_principal,
                     received_at: reset_now,
                 },
                 now: reset_now,
@@ -1674,6 +1676,7 @@ where
                             request.request_id.0, state.run_id.0
                         )),
                         caller_identity: request.caller_identity,
+                        principal: request.principal,
                         received_at: request.received_at,
                     },
                     now: OffsetDateTime::now_utc(),
@@ -1830,6 +1833,7 @@ mod tests {
             request: RequestContext {
                 request_id: RequestId("start-delete".to_string()),
                 caller_identity: Some("client".to_string()),
+                principal: None,
                 received_at: now,
             },
             now,
@@ -1855,6 +1859,7 @@ mod tests {
             request: RequestContext {
                 request_id: RequestId(request_id.to_string()),
                 caller_identity: Some("operator".to_string()),
+                principal: None,
                 received_at: OffsetDateTime::UNIX_EPOCH,
             },
             now: OffsetDateTime::UNIX_EPOCH + Duration::seconds(5),
@@ -1944,6 +1949,7 @@ mod tests {
                     request: RequestContext {
                         request_id: RequestId("terminate-before-delete".to_string()),
                         caller_identity: Some("operator".to_string()),
+                        principal: None,
                         received_at: OffsetDateTime::UNIX_EPOCH,
                     },
                     now: OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),

@@ -25,9 +25,9 @@ use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::{
-    ActivitySweepEntry, BacklogEntry, CommitResult, CompletionCallbackSweepEntry,
-    CurrentExecutionConflictPolicy, DbClass, DeleteRunRequest, DeleteRunResult,
-    DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
+    ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, CommitResult,
+    CompletionCallbackSweepEntry, CurrentExecutionConflictPolicy, DbClass, DeleteRunRequest,
+    DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
     ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
     WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
     WorkflowTimeoutSweepEntry, deleted_workflow_projection_context, metrics,
@@ -445,6 +445,16 @@ impl RunRepository for DsqlRunRepository {
         limit: usize,
     ) -> Result<Vec<HistoryEvent>> {
         self.do_read_history(run_key, after_event_id, limit).await
+    }
+
+    async fn read_attributed_history(
+        &self,
+        run_key: RunKey,
+        after_event_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AttributedHistoryEvent>> {
+        self.do_read_attributed_history(run_key, after_event_id, limit)
+            .await
     }
 
     async fn lookup_request_dedupe(
@@ -1609,6 +1619,7 @@ mod tests {
             expected_seq: TransitionSeq::ZERO,
             next_state: sample_state(run_key),
             history_events: Default::default(),
+            event_principals: Default::default(),
             request_dedupe_ops: Default::default(),
             activity_ops: Default::default(),
             timer_ops: Default::default(),

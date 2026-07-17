@@ -13,10 +13,11 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_kernel::{HistoryEvent, LoadedRun, Transition};
 use tokeira_storage::{
-    ActivitySweepEntry, BacklogEntry, BundleLease, CommitResult, DeleteRunRequest, DeleteRunResult,
-    DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, LeaseOutcome, LeaseRepository,
-    NexusSweepEntry, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-    WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
+    ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BundleLease, CommitResult,
+    DeleteRunRequest, DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask,
+    DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry, RequestRecord, RunRepository,
+    TransitionAuditRecord, WftTimeoutSweepEntry, WorkflowRuleCreateResult,
+    WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, WorkflowId,
@@ -106,6 +107,20 @@ where
     ) -> Result<Vec<HistoryEvent>> {
         self.inner
             .read_history(run_key, after_event_id, limit)
+            .await
+    }
+
+    async fn read_attributed_history(
+        &self,
+        run_key: RunKey,
+        after_event_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AttributedHistoryEvent>> {
+        // This wrapper adds wakeups only. Falling back to RunRepository's
+        // legacy default would silently erase the durable principal sidecar
+        // before public history serialization.
+        self.inner
+            .read_attributed_history(run_key, after_event_id, limit)
             .await
     }
 

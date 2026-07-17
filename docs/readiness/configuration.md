@@ -6,7 +6,7 @@
 > dynamic-config keys + static YAML). Close-to-zero configuration is a headline claim for tokeira; this
 > doc is where we make it real and releasable.
 
-**Last updated:** 2026-06-24 · status surface — see [`delivery.md`](./delivery.md) for the workstream index.
+**Last updated:** 2026-07-16 · status surface — see [`delivery.md`](./delivery.md) for the workstream index.
 
 ## The claim, and the number
 
@@ -40,6 +40,15 @@ parse time):
   - `[policy.nexus_endpoint_limits]` — the six endpoint admin limits (v1.31.0-faithful defaults).
   - `[policy.nexus_completion]` — `http_addr` (`0.0.0.0:7253`), `system_callback_url`
     (`http://127.0.0.1:7253`), retry policy (1s / 1h / 2.0 / unbounded).
+  - `[policy.authorization]` — authn/authz, **presence-enables** — the section absent is the
+    permissive default (the empty-file claim is untouched), and configuring an identity source
+    *is* the enforcement switch (no `enabled` boolean, no selector strings).
+    `principal_attribution` + `expose_authorizer_errors` (both default off), `[[…jwt.issuers]]`
+    (name/issuer/jwks_uri + optional audience/refresh_interval/permissions_claim + grants
+    rules), `[…aws_iam]` (presigned-STS bearer; grants rules). One role grammar (`ns:role`)
+    across permissions claims and grants. ~10 field definitions, all defaulted or per-issuer;
+    Temporal's `global.authorization` YAML (selectors, regex, header renames) deliberately
+    collapsed — the "before" doc's authorization surface answers to this section.
 - **`[capacity]`** — `[capacity.performance]` (`target_workflow_starts_per_second`, `target_p99_wft_latency_ms`),
   `[capacity.dsql]` (`max_connections`, `connection_rate_per_second`, `burst_capacity`).
 - **`[emergency]`** — break-glass: `disable_stickiness`, `freeze_projection`, `cap_poll_admission`
@@ -55,6 +64,26 @@ intent; compose DSQL carries `storage = "dsql"` + `[dsql]` mode/endpoint/arn/reg
 
 **Resolution:** `--config <path>` → `TOKEIRA_CONFIG` env → built-in defaults. No auto-discovery of a bare
 `tokeirad.toml`. No other env vars on invocation.
+
+### Authorization transport and issuer routing
+
+Tokeirad accepts bearer credentials at the compatibility edge and deliberately does not terminate
+TLS itself. Every deployment enabling `[policy.authorization]` **must** place the public listener
+behind an upstream TLS-terminating load balancer or service mesh. This applies equally to JWTs and
+the `tokeira-aws-v1.` presigned-STS bearer: possession of either credential is sufficient to act as
+that identity for its validity window, so plaintext transport outside a trusted local hop exposes
+the credential. JWKS endpoints should also use HTTPS.
+
+JWT issuer routing is exact and case-sensitive. Each configured `issuer` must equal the IdP token's
+signed `iss` value byte-for-byte, including scheme, path, and trailing-slash form; `name` is only an
+operator label. Missing or unmatched issuers fail closed. This is the migration detail most likely
+to surprise an operator moving from Temporal v1.31.0's merged keyring and belongs beside `issuer`
+when the canonical `config.example.toml` is created.
+
+The AWS IAM extension accepts only commercial/GovCloud `*.amazonaws.com` STS hosts; China and ISO
+partitions are outside the current surface. Tokeirad validates the presigned URL and reconstructs
+the STS request against an allow-listed host—it never follows the credential's URL as an arbitrary
+outbound destination.
 
 ## Where it is documented today (the finding)
 
@@ -79,7 +108,9 @@ surface is only fully visible by reading Rust structs. (The sibling `temporal-ds
       (`storage` + `dsql.endpoint` + `dsql.region`). Make the close-to-zero claim concrete.
 - [ ] **The genuine deployment knobs, surfaced.** Distinguish the handful that *must* be set/correct for
       a real deployment — DSQL endpoint/region/roles, `network.grpc_addr`, `nexus_completion.system_callback_url`
-      reachability (the one operational footgun), `default_retention_days` — from the rest (defaulted).
+      reachability (the one operational footgun), `default_retention_days`, and the
+      `[policy.authorization]` issuer profiles for any
+      deployment that must restrict access — from the rest (defaulted).
 - [ ] **Emergency overrides documented as break-glass** with their warning semantics.
 - [ ] **The contrast made explicit** — link the 564-key Temporal surface as the "before" so the claim is
       evidenced, not asserted.

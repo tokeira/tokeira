@@ -1207,6 +1207,8 @@ pub struct WorkflowTaskCompletedRequest {
     /// @ v1.31.0; spec speculative-wft Req 9).
     #[serde(default)]
     pub delivered_update_ids: Vec<String>,
+    /// Authenticated request context for worker-authored event attribution.
+    pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }
@@ -1225,6 +1227,8 @@ pub struct WorkflowTaskFailedRequest {
     pub failure_details: Option<Payload>,
     /// Identity of the worker that reported the failure.
     pub worker_identity: WorkerIdentity,
+    /// Authenticated request context for worker-authored event attribution.
+    pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
     /// Reset-only: the post-fork events the resetter reapplies onto the
@@ -1308,6 +1312,8 @@ pub struct ActivityResolvedRequest {
     /// Identity of the worker that resolved the activity, if
     /// applicable.
     pub worker_identity: Option<WorkerIdentity>,
+    /// Authenticated request context for worker-authored event attribution.
+    pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
 }

@@ -367,6 +367,13 @@ async fn workflow_task_token_rejects_a_different_request_namespace() {
     let store = Arc::new(InMemoryStore::default());
     let grpc = build_grpc(store).await;
 
+    grpc.register_namespace(Request::new(workflowservice::RegisterNamespaceRequest {
+        namespace: "another-namespace".to_string(),
+        ..Default::default()
+    }))
+    .await
+    .expect("register mismatch target namespace");
+
     grpc.start_workflow_execution(Request::new(
         workflowservice::StartWorkflowExecutionRequest {
             namespace: "default".to_string(),

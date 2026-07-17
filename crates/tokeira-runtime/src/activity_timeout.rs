@@ -543,6 +543,7 @@ pub(crate) async fn scan_activity_timeouts_once<R>(
                         )),
                     },
                     worker_identity: None,
+                    request: tokeira_types::RequestContext::unattributed(now),
                     now,
                 }),
             )

@@ -21,8 +21,8 @@ use tokeira_runtime::{
     InMemoryNexusEndpointStore, LaneConfig, NexusCompletion, NexusCompletionClient,
     NexusCompletionDeps, NexusCompletionRuntimeConfig, NexusCompletionToken, NexusEndpointRegistry,
     NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore, NexusHttpClient,
-    NexusStartResult, NexusTaskRequest, NexusTimeoutScannerConfig, SYSTEM_CALLBACK_URL,
-    TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    NexusStartResult, NexusTaskCorrelation, NexusTaskRequest, NexusTimeoutScannerConfig,
+    SYSTEM_CALLBACK_URL, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -199,6 +199,7 @@ async fn nexus_schedule_sync_complete_delivers_completed_resolution() -> Result<
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -270,6 +271,7 @@ async fn nexus_async_started_times_out_via_scanner() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -349,6 +351,7 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -393,6 +396,7 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
                 request: RequestContext {
                     request_id: RequestId("req-signal".to_string()),
                     caller_identity: None,
+                    principal: None,
                     received_at: OffsetDateTime::now_utc(),
                 },
                 now: OffsetDateTime::now_utc(),
@@ -416,6 +420,7 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
             commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -526,6 +531,7 @@ async fn nexus_schedule_to_start_times_out_via_scanner() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -639,6 +645,7 @@ async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -652,8 +659,17 @@ async fn worker_targeted_nexus_schedule_publishes_to_broker() -> Result<()> {
         )
         .await
         .expect("worker-targeted nexus task should publish");
-    assert_eq!(broker_task.token.run_key, run_key);
-    assert_eq!(broker_task.token.operation_id, "op-1");
+    assert_eq!(broker_task.token.namespace_id, namespace_id.0.to_string());
+    assert_eq!(broker_task.token.task_queue, "nexus-q");
+    Uuid::parse_str(&broker_task.token.task_id).expect("server-authored task UUID");
+    assert!(matches!(
+        runtime
+            .nexus_task_broker()
+            .consume(&broker_task.token.task_id)
+            .await,
+        Some(NexusTaskCorrelation::Workflow { run_key: owner, operation_id, .. })
+            if owner == run_key && operation_id == "op-1"
+    ));
     match broker_task.request {
         NexusTaskRequest::StartOperation {
             service,
@@ -733,6 +749,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -774,6 +791,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
                 request: RequestContext {
                     request_id: RequestId("req-signal".to_string()),
                     caller_identity: None,
+                    principal: None,
                     received_at: OffsetDateTime::now_utc(),
                 },
                 now: OffsetDateTime::now_utc(),
@@ -797,6 +815,7 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -810,7 +829,17 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
         )
         .await
         .expect("worker-targeted nexus cancel should publish");
-    assert_eq!(broker_task.token.run_key, run_key);
+    assert_eq!(broker_task.token.namespace_id, namespace_id.0.to_string());
+    assert_eq!(broker_task.token.task_queue, "nexus-q");
+    let correlation = runtime
+        .nexus_task_broker()
+        .consume(&broker_task.token.task_id)
+        .await;
+    assert!(matches!(
+        correlation,
+        Some(NexusTaskCorrelation::Workflow { run_key: owner, operation_id, .. })
+            if owner == run_key && operation_id == "op-1"
+    ));
     match broker_task.request {
         NexusTaskRequest::CancelOperation {
             service,
@@ -895,6 +924,9 @@ proptest! {
                     }],
                     force_new_workflow_task: false,
                     delivered_update_ids: Vec::new(),
+                    request: tokeira_types::RequestContext::unattributed(
+                        time::OffsetDateTime::UNIX_EPOCH,
+                    ),
                     now: OffsetDateTime::now_utc(),
                 })
                 .await
@@ -909,11 +941,31 @@ proptest! {
                 )
                 .await
                 .expect("start task");
-            prop_assert_eq!(start_task.token.run_key, run_key);
-            prop_assert_eq!(start_task.token.operation_id, expected_operation_id.clone());
-            // The task token's scheduled_event_id is the op's fencing key; the
-            // completion token must carry the same value (Property 1).
-            let task_scheduled_event_id = start_task.token.scheduled_event_id;
+            prop_assert_eq!(
+                start_task.token.namespace_id.as_str(),
+                namespace_id.0.to_string()
+            );
+            prop_assert_eq!(start_task.token.task_queue.as_str(), "nexus-q");
+            prop_assert!(Uuid::parse_str(&start_task.token.task_id).is_ok());
+            // The public token contains only delivery identity. The operation fence
+            // remains in Tokeira's private broker correlation and must agree with the
+            // completion callback token (Property 1).
+            let start_correlation = runtime
+                .nexus_task_broker()
+                .consume(&start_task.token.task_id)
+                .await;
+            let task_scheduled_event_id = match start_correlation {
+                Some(NexusTaskCorrelation::Workflow {
+                    run_key: owner,
+                    operation_id: correlated_operation_id,
+                    scheduled_event_id,
+                }) => {
+                    prop_assert_eq!(owner, run_key);
+                    prop_assert_eq!(correlated_operation_id, expected_operation_id.clone());
+                    scheduled_event_id
+                }
+                other => panic!("unexpected start correlation: {other:?}"),
+            };
             match start_task.request {
                 NexusTaskRequest::StartOperation {
                     service: actual_service,
@@ -982,6 +1034,7 @@ proptest! {
                         request: RequestContext {
                             request_id: RequestId("req-signal".to_string()),
                             caller_identity: None,
+                            principal: None,
                             received_at: OffsetDateTime::now_utc(),
                         },
                         now: OffsetDateTime::now_utc(),
@@ -1008,6 +1061,9 @@ proptest! {
                     commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
                     force_new_workflow_task: false,
                     delivered_update_ids: Vec::new(),
+                    request: tokeira_types::RequestContext::unattributed(
+                        time::OffsetDateTime::UNIX_EPOCH,
+                    ),
                     now: OffsetDateTime::now_utc(),
                 })
                 .await
@@ -1022,8 +1078,26 @@ proptest! {
                 )
                 .await
                 .expect("cancel task");
-            prop_assert_eq!(cancel_task.token.run_key, run_key);
-            prop_assert_eq!(cancel_task.token.operation_id, expected_operation_id.clone());
+            prop_assert_eq!(
+                cancel_task.token.namespace_id.as_str(),
+                namespace_id.0.to_string()
+            );
+            prop_assert_eq!(cancel_task.token.task_queue.as_str(), "nexus-q");
+            let cancel_correlation = runtime
+                .nexus_task_broker()
+                .consume(&cancel_task.token.task_id)
+                .await;
+            let correlation_matches = matches!(
+                cancel_correlation,
+                Some(NexusTaskCorrelation::Workflow {
+                    run_key: owner,
+                    operation_id: ref correlated_operation_id,
+                    scheduled_event_id: correlated_event_id,
+                }) if owner == run_key
+                    && correlated_operation_id == &expected_operation_id
+                    && correlated_event_id == scheduled_event_id
+            );
+            prop_assert!(correlation_matches);
             match cancel_task.request {
                 NexusTaskRequest::CancelOperation {
                     service: actual_service,
@@ -1101,6 +1175,7 @@ async fn nexus_unknown_endpoint_delivers_failed_resolution() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -1198,12 +1273,14 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
 
-    // The task is dispatched to the AGENTS-namespace broker (cross-namespace),
-    // while the token still carries the CONTROL-namespace originator run_key.
+    // The task is dispatched to the AGENTS-namespace broker (cross-namespace).
+    // Its public token identifies that delivery target; the CONTROL-namespace
+    // originator remains private broker correlation.
     let broker_task = runtime
         .nexus_task_broker()
         .poll(
@@ -1213,11 +1290,24 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
         )
         .await
         .expect("worker-targeted nexus task should publish to the agents-namespace broker");
-    assert_eq!(
-        broker_task.token.run_key, parent_run_key,
-        "the task token must carry the control-namespace originator run_key"
-    );
-    let scheduled_event_id = broker_task.token.scheduled_event_id;
+    assert_eq!(broker_task.token.namespace_id, ns_agents.0.to_string());
+    assert_eq!(broker_task.token.task_queue, "odori-agent-nexus-q");
+    let scheduled_event_id = match runtime
+        .nexus_task_broker()
+        .consume(&broker_task.token.task_id)
+        .await
+    {
+        Some(NexusTaskCorrelation::Workflow {
+            run_key,
+            operation_id,
+            scheduled_event_id,
+        }) => {
+            assert_eq!(run_key, parent_run_key);
+            assert_eq!(operation_id, "op-agent");
+            scheduled_event_id
+        }
+        other => panic!("unexpected worker correlation: {other:?}"),
+    };
     match &broker_task.request {
         NexusTaskRequest::StartOperation {
             service,
@@ -1445,6 +1535,7 @@ fn start_request(
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),
@@ -1757,6 +1848,7 @@ async fn close_workflow_with_callbacks(
             commands: vec![close],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;

@@ -6,21 +6,23 @@
 > This page exists so the open questions are visible and tracked, not silently resolved. Resolved
 > decisions move to their own record and are listed at the bottom.
 
-## 1. Authentication and authorization — TBD (before first release)
-
-**Temporal v1.31.0 states:** authentication and authorization are implemented as server **interceptors**
-(an `Authorizer` and `ClaimMapper`), gated by configuration — there is no auth gRPC service. v1.31.0
-adds **Principal Attribution**: a server-computed, immutable `Principal` (`Type`/`Name`, e.g.
-`jwt/alice@company.com`) on history events, derived from authenticated context, enabled via
-`system.enablePrincipalAttribution` (off by default). The default `Authorizer` populates `Principal` from
-the JWT `sub` claim.
-
-**Decision required:** whether and how authentication/authorization (and Principal Attribution) are part
-of the conformance surface. This must be resolved **before the first release**, because it determines
-whether a deployment can restrict access and whether history events carry trustworthy attribution.
+**No decisions are currently open.**
 
 ## Resolved decisions
 
+- **Authentication and authorization** — resolved 2026-07-16: in-surface, in two layers. The
+  stock-default layer (no-op claim mapper + no-op authorizer: every call allowed, no principal on
+  events) is conformant by construction today and is the release gate. The configured layer —
+  default JWT claim mapper + default authorizer + Principal Attribution, gated by the same knobs
+  as v1.31.0 (in tokeira: static `[policy.authorization]` TOML, presence-enables; the
+  dynamic-config key names are honoured only via the conformance-only override registry, never
+  in production) — is scoped in `.kiro/specs/authorization-foundation/`, which also adds the
+  tokeira-native AWS IAM presigned-STS bearer (product surface, not v1.31.0 surface).
+  Transport stance: bearer-only at the edge, TLS terminated upstream; mTLS-derived identity and
+  the Go plugin points are out of surface. The original TBD text's
+  `system.enablePrincipalAttribution` claim was found to be **wrong** (no such key exists in
+  v1.31.0 — the actual gate is `frontend.enablePrincipalPropagation`); the correction is part of
+  the record. Full record with the factual case: [`authorization.md`](./authorization.md).
 - **Worker Versioning V1 and V2** — resolved 2026-07-12: conformance targets the GA Worker
   Deployment APIs only; the five deprecated V1/V2 RPCs stay in-surface solely as their
   stock-default rejections (the exact `PERMISSION_DENIED` errors a default-configuration
@@ -31,4 +33,5 @@ whether a deployment can restrict access and whether history events carry trustw
 
 - [`supported.md`](./supported.md) — the decided in-surface set.
 - [`excluded.md`](./excluded.md) — the decided out-of-surface set.
+- [`authorization.md`](./authorization.md) — the resolved authentication/authorization decision record.
 - [`worker-versioning.md`](./worker-versioning.md) — the resolved worker-versioning decision record.

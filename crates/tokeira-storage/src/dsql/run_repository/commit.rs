@@ -291,6 +291,13 @@ async fn write_transition(
     transition: &Transition,
     state: &WorkflowState,
 ) -> Result<()> {
+    if transition.history_events.len() != transition.event_principals.len() {
+        bail!(
+            "history/principal sidecar length mismatch: {} events, {} principals",
+            transition.history_events.len(),
+            transition.event_principals.len()
+        );
+    }
     // The commit path intentionally writes the hot state first, then derives
     // every side table from the same transition/state pair. History remains the
     // authority; side tables are rebuildable projections that make dispatch and
@@ -302,6 +309,7 @@ async fn write_transition(
             run_key,
             state.transition_seq,
             transition.history_events.as_slice(),
+            transition.event_principals.as_slice(),
         )
         .await?;
     }
@@ -474,7 +482,15 @@ pub(super) async fn insert_history_batch(
     run_key: RunKey,
     transition_seq: TransitionSeq,
     events: &[HistoryEvent],
+    principals: &[Option<tokeira_types::EventPrincipal>],
 ) -> Result<()> {
+    if events.len() != principals.len() {
+        bail!(
+            "history/principal sidecar length mismatch: {} events, {} principals",
+            events.len(),
+            principals.len()
+        );
+    }
     let first_event_id = events
         .first()
         .ok_or_else(|| anyhow!("cannot insert empty history batch"))?
@@ -484,16 +500,22 @@ pub(super) async fn insert_history_batch(
         .ok_or_else(|| anyhow!("cannot insert empty history batch"))?
         .event_id;
     let started = Instant::now();
+    let principals_data = principals
+        .iter()
+        .any(Option::is_some)
+        .then(|| codec::encode_history_principals(principals))
+        .transpose()?;
     sqlx::query(
         "INSERT INTO history_batch
-         (run_key, first_event_id, last_event_id, transition_seq, events_data, created_at)
-         VALUES ($1, $2, $3, $4, $5, now())",
+         (run_key, first_event_id, last_event_id, transition_seq, events_data, principals_data, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now())",
     )
     .bind(run_key.0)
     .bind(first_event_id)
     .bind(last_event_id)
     .bind(convert::i64_from_u64(transition_seq.0, "transition_seq")?)
     .bind(codec::encode_history_events(events)?)
+    .bind(principals_data)
     .execute(&mut **tx)
     .await?;
     metrics::record_dsql_statement_duration(

@@ -1,0 +1,164 @@
+# Authentication and authorization — decision record
+
+> Part of [the v1.31.0 conformance definition](./README.md). This page resolves
+> [`decisions.md`](./decisions.md) item 1: whether and how **authentication, authorization, and
+> Principal Attribution** are part of the conformance surface. Decided **2026-07-16**. Every claim
+> below was verified against ground truth — the v1.31.0 server source at the pinned checkout, the
+> `v1.62.8` proto — with the citation given inline. One claim in the original TBD text was found to
+> be **factually wrong** and is corrected below.
+
+## The decision
+
+**Authentication and authorization are in the conformance surface, in two layers:**
+
+1. **Stock-default layer (the release gate — already met).** A default-configuration v1.31.0
+   server performs no authentication and no authorization: the zero-value `authorization` config
+   selects the no-op claim mapper (every caller receives `Claims{System: RoleAdmin}` —
+   `common/authorization/claim_mapper.go:52-54 @ v1.31.0`) and the no-op authorizer (every call
+   allowed, no principal produced — `common/authorization/noop_authorizer.go:12-14 @ v1.31.0`).
+   No history event carries a `principal`. Tokeira's permissive edge
+   (`AllowAllAuthenticator`, `crates/tokeira-edge/src/interceptors.rs`) is observably identical.
+   **The stock-default baseline is conformant by construction today**; it is what unblocks a first
+   release.
+
+2. **Configured layer (the `authorization-foundation` spec).** When configured like-for-like with
+   v1.31.0's `authorizer: "default"` / `claimMapper: "default"` + a JWKS key source, tokeira
+   serves the same observable behaviour: the same JWT validation pipeline and permissions-claim
+   grammar, the same role model and per-API authorization decisions, the same
+   `PERMISSION_DENIED: "Request unauthorized."` deny shape, and the same Principal Attribution
+   semantics on history events, gated by the same knobs — in tokeira, static `[policy.authorization]`
+   TOML; the v1.31.0 dynamic-config key names are honoured only through the conformance-only
+   override registry for the Temporal harness (production builds carry no dynamic config). This
+   layer is scoped and ground-truthed in
+   [`.kiro/specs/authorization-foundation/`](../../../.kiro/specs/authorization-foundation/requirements.md).
+
+**Transport stance: bearer-only at the edge; TLS terminates upstream.** Tokeira deliberately ships
+no TLS listener configuration (`configuration.md` — the `global.tls` topology is collapsed by
+construction). Authentication material reaches the edge exclusively as gRPC metadata (the
+`authorization` bearer header and its `authorization-extras` companion). mTLS-derived identity, and
+therefore any claim mapping from TLS peer certificates, is **out of surface** — a deployment that
+needs mTLS terminates it at its load balancer or mesh, upstream of tokeirad.
+
+**Tokeira-native extension: the AWS IAM bearer.** Beyond the Temporal-parity JWT path, the spec
+adds a presigned STS `GetCallerIdentity` bearer (`tokeira-aws-v1.<base64url(presigned URL)>`,
+the EKS `aws-iam-authenticator` / Vault AWS pattern) so IAM-credentialed compute with no OIDC
+issuer — ECS task roles foremost — authenticates with zero distributed secrets. This is tokeira
+product surface, **not** part of the v1.31.0 conformance surface (it appears here and in the
+spec, not in `supported.md`); the JWT path's parity is unaffected. Config for both lives in a
+tokeira-native `[policy.authorization]` shape (issuer profiles + grants rules; presence of an
+identity source is the enforcement switch), a deliberate collapse of Temporal's
+`global.authorization` YAML spelling — behavioural parity, not key-for-key parity, is the
+conformance bar (see the spec's Deviation 3).
+
+## Correction to the original TBD text
+
+The TBD (recorded before ground-truthing) stated that v1.31.0 adds Principal Attribution "enabled
+via `system.enablePrincipalAttribution` (off by default)". **No such dynamic-config key exists in
+v1.31.0.** A repo-wide search of the pinned source finds no `enablePrincipalAttribution` anywhere;
+the only principal-related key is `frontend.enablePrincipalPropagation`
+(`common/dynamicconfig/constants.go:848-853 @ v1.31.0` — namespace-scoped bool, default `false`).
+The actual v1.31.0 mechanism (feature commit `cdc4633a0`, "Propagate principal into workflow
+history", reachable from tag `v1.31.0`):
+
+- The **authorizer** computes the principal on the allow path:
+  `result.Principal = &commonpb.Principal{Type: claims.AuthType, Name: claims.Subject}`
+  (`common/authorization/default_authorizer.go:59-62 @ v1.31.0`). The no-op authorizer produces
+  none, so a stock server never attributes — there is no separate attribution gate.
+- The frontend authorization interceptor **always strips** inbound
+  `temporal-principal-type` / `temporal-principal-name` headers so external callers cannot spoof
+  identity (`common/authorization/interceptor.go:153-155`, `common/headers/headers.go:125-135
+  @ v1.31.0`), then re-sets them only when `frontend.enablePrincipalPropagation` is true for the
+  request's namespace **and** the authorizer returned a principal
+  (`interceptor.go:172-174 @ v1.31.0`).
+- History stamps the propagated principal onto **every event closed in the transaction** on the
+  active side, preserving principals already stamped on buffered events
+  (`service/history/workflow/mutable_state_impl.go:7105-7124 @ v1.31.0`); the stamping site itself
+  is ungated. Events surface it as `HistoryEvent.principal` (field 303,
+  `proto/upstream/temporal/api/history/v1/message.proto:1174`).
+
+So the correct statement is: **Principal Attribution = default authorizer +
+`frontend.enablePrincipalPropagation=true`**; both default off/absent, hence no attribution on a
+stock server.
+
+## Why: the factual case
+
+### 1. Stock v1.31.0 ships auth off, so the baseline costs nothing and means something
+
+The `Authorization` config struct's zero values select the no-op pair
+(`common/config/config.go:626-643 @ v1.31.0`; factories at
+`common/authorization/authorizer.go:64-73`, `claim_mapper.go:80-89`). "Same behaviour for the
+same configuration" — the conformance definition — is therefore already satisfied for the default
+configuration. Declaring the layer in-surface costs no engineering for the release gate while
+committing tokeira to the configured parity that makes a restricted deployment possible.
+
+### 2. The configured path is GA machinery Temporal SDKs and tooling already speak
+
+Every Temporal SDK supports a per-RPC bearer-token supplier; Temporal Cloud's API keys are JWTs in
+the same `authorization` metadata key; self-hosted deployments configure exactly the
+`jwtKeyProvider`/`permissionsClaimName` surface this decision adopts. The claim grammar
+(`namespace:role` entries in a `permissions` claim, `temporal-system` pseudo-namespace) is public,
+documented behaviour (`common/authorization/default_jwt_claim_mapper.go:112-147 @ v1.31.0`). An
+operator moving a JWT-secured Temporal deployment onto tokeira keeps their token pipeline intact.
+
+### 3. Principal Attribution is v1.31.0's one genuinely new auth surface
+
+It is the reason this decision gates the release: it changes what `GetWorkflowExecutionHistory`
+returns (field 303) and is the only place authentication becomes *durable state*. Getting the
+semantics right — server-computed, spoof-proof, buffered-event-preserving — retroactively matters
+for every history a deployment writes.
+
+### 4. What a Rust single-binary can and cannot faithfully mirror
+
+Temporal's remaining auth surface is Go **server extension points**: `WithClaimMapper` /
+`WithAuthorizer` server options accepting arbitrary Go implementations
+(`temporal/server_option.go:96,110 @ v1.31.0`), and custom `JWTAudienceMapper`s. A Rust binary
+cannot load Go plugins; tokeira's equivalent extension seam is its own `Authenticator` trait at the
+edge. Those plugin points are out of surface (see below), which is not a behavioural gap: they have
+no default behaviour to mirror.
+
+## What this decision does NOT include (out of surface)
+
+| Surface | Reason |
+|---------|--------|
+| mTLS-derived identity at the edge (TLS peer → claims) | Bearer-only-at-the-edge stance; TLS terminates upstream. Even upstream, no shipped claim mapper consumes `TLSSubject` — the `"mtls"` AuthType appears only in a doc comment (`common/authorization/roles.go:34 @ v1.31.0`); mTLS claims require a custom Go mapper. |
+| Custom `ClaimMapper` / `Authorizer` / `JWTAudienceMapper` plugins | Go server options, not API surface (`temporal/server_option.go:96,110 @ v1.31.0`). Tokeira's extension seam is the edge `Authenticator` trait. Static-`audience` validation from config **is** in surface. |
+| Nexus-dispatch principal propagation | Upstream discards the principal on the Nexus HTTP path (`service/frontend/nexus_handler.go:161 @ v1.31.0` drops the `Authorize` result); there is no behaviour to mirror. Nexus *authorization* (endpoint-name targets) follows the Nexus specs. |
+| Internal-frontend claims (`Claims{AuthType: "temporal", Subject: "internal"}`) | Multi-role topology artifact (`temporal/fx.go:553-561 @ v1.31.0`); tokeira has no internal frontend. |
+
+## Consequences in tokeira
+
+- The configured layer is specified in **`.kiro/specs/authorization-foundation/`**: a real JWT
+  authenticator (multi-issuer claim mapping + default authorizer + role model), the
+  `[policy.authorization]` static config section (presence-enables; curated to
+  `docs/readiness/configuration.md`'s close-to-zero claim), the four related dynamic-config keys
+  wired through the conformance-only override registry (`frontend.enablePrincipalPropagation`,
+  `frontend.exposeAuthorizerErrors`, `frontend.enableTokenNamespaceEnforcement`,
+  `system.enableCrossNamespaceCommands`), Principal Attribution end-to-end (edge → kernel event
+  stamp → history read-back), and the tokeira-native AWS IAM presigned-STS bearer.
+- [`decisions.md`](./decisions.md) item 1 moves to resolved; its incorrect
+  `system.enablePrincipalAttribution` claim is superseded by this record.
+- [`supported.md`](./supported.md) gains the authentication/authorization surface section;
+  [`excluded.md`](./excluded.md) records the mTLS/plugin exclusions above.
+- The permissive default (`EdgeInterceptors::permissive`, `apps/tokeirad/src/lib.rs`) remains the
+  stock-default-conformant configuration; wiring a configured authenticator replaces one
+  construction site, by design (`crates/tokeira-edge/src/interceptors.rs` chokepoint).
+
+## The counter-case, weighed
+
+The strongest argument against the configured layer: tokeira "deliberately ships close-to-zero
+configuration" ([`configuration.md`](./configuration.md)), and this decision adds a config section.
+But the alternative — auth permanently out of surface — caps tokeira at trusted-single-tenant
+deployments and makes history attribution impossible, while the surface adopted here is the
+smallest coherent unit Temporal's own ecosystem treats as one feature: issuer validation, one claim
+grammar, one authorizer, one attribution mechanism, all default-off. The bearer-only stance keeps the
+transport surface at zero. Deferring instead the *plugin* machinery (where near-zero users would
+land on a Rust binary) is the same cut Temporal Cloud itself makes: JWT bearer plus upstream TLS.
+
+## Related pages
+
+- [`supported.md`](./supported.md) — the in-surface set (this decision adds the auth section).
+- [`excluded.md`](./excluded.md) — the mTLS-at-edge / plugin-point exclusions.
+- [`decisions.md`](./decisions.md) — the decisions ledger (no decisions currently open; resolved
+  records listed there).
+- [`worker-versioning.md`](./worker-versioning.md) — the prior resolved decision, whose
+  stock-default-rejection philosophy this record extends to authentication.

@@ -3531,6 +3531,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64 0.22.1",
+ "js-sys",
+ "pem",
+ "ring",
+ "serde",
+ "serde_json",
+ "simple_asn1",
+]
+
+[[package]]
 name = "k8s-openapi"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3942,6 +3957,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+dependencies = [
+ "num-integer",
+ "num-traits",
 ]
 
 [[package]]
@@ -4783,6 +4808,16 @@ name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
+
+[[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "memchr",
+ "serde",
+]
 
 [[package]]
 name = "quinn"
@@ -5655,6 +5690,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "simple_asn1"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6404,6 +6451,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokeira-auth"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "proptest",
+ "quick-xml",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "tokeira-autoscaler"
 version = "0.1.0"
 dependencies = [
@@ -6696,6 +6765,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokeira-auth",
  "toml 0.8.23",
  "toml_edit",
  "tracing",
@@ -6839,6 +6909,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "buffa 0.6.0",
  "connectrpc 0.6.0",
  "http 1.4.0",
@@ -6846,6 +6917,7 @@ dependencies = [
  "metrics-util",
  "opentelemetry",
  "opentelemetry_sdk",
+ "percent-encoding",
  "proptest",
  "prost 0.12.6",
  "prost-types 0.12.6",
@@ -6853,6 +6925,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "time",
+ "tokeira-auth",
  "tokeira-build-info",
  "tokeira-chasm",
  "tokeira-chasm-activity",
@@ -6941,6 +7014,7 @@ dependencies = [
 name = "tokeira-kernel"
 version = "0.1.0"
 dependencies = [
+ "postcard",
  "proptest",
  "prost 0.12.6",
  "serde",
@@ -7237,9 +7311,12 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
+ "bytes",
  "clap",
  "connectrpc 0.8.1",
+ "http-body 0.4.6",
  "http-body-util",
+ "hyper 0.14.32",
  "hyper 1.10.1",
  "hyper-util",
  "metrics",
@@ -7252,14 +7329,17 @@ dependencies = [
  "proptest",
  "prost 0.12.6",
  "prost-types 0.12.6",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "time",
+ "tokeira-auth",
  "tokeira-build-info",
  "tokeira-chasm",
  "tokeira-chasm-activity",
  "tokeira-config",
+ "tokeira-conformance",
  "tokeira-conformance-control",
  "tokeira-edge",
  "tokeira-kernel",
@@ -7276,6 +7356,7 @@ dependencies = [
  "tonic 0.11.0",
  "tonic-reflection",
  "tonic-web",
+ "tower 0.4.13",
  "tower-http 0.4.4",
  "tracing",
  "tracing-opentelemetry",

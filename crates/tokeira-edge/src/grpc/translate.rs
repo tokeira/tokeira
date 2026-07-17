@@ -3156,8 +3156,10 @@ pub fn poll_response_to_proto(
         resp.payload.run_id,
     ));
 
-    let history_bytes =
-        crate::translate::history_serializer::serialize_history(&resp.payload.history);
+    let history_bytes = crate::translate::history_serializer::serialize_history_with_principals(
+        &resp.payload.history,
+        &resp.payload.history_principals,
+    );
     let history = tokeira_proto::history::History::decode(&history_bytes[..]).ok();
 
     // Extract workflow_type from the first history event (WorkflowExecutionStarted)
@@ -3950,7 +3952,10 @@ pub fn get_history_response_to_proto(
     client_follows_next_run_id: bool,
 ) -> workflowservice::GetWorkflowExecutionHistoryResponse {
     use prost::Message;
-    let history_bytes = crate::translate::history_serializer::serialize_history(&resp.history);
+    let history_bytes = crate::translate::history_serializer::serialize_history_with_principals(
+        &resp.history,
+        &resp.history_principals,
+    );
     let mut history = tokeira_proto::history::History::decode(&history_bytes[..]).ok();
 
     // HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT = 2
@@ -4047,7 +4052,10 @@ pub fn get_history_reverse_response_to_proto(
     resp: crate::translate::GetWorkflowExecutionHistoryReverseResponse,
 ) -> workflowservice::GetWorkflowExecutionHistoryReverseResponse {
     use prost::Message;
-    let history_bytes = crate::translate::history_serializer::serialize_history(&resp.history);
+    let history_bytes = crate::translate::history_serializer::serialize_history_with_principals(
+        &resp.history,
+        &resp.history_principals,
+    );
     let history = tokeira_proto::history::History::decode(&history_bytes[..]).ok();
 
     workflowservice::GetWorkflowExecutionHistoryReverseResponse {
@@ -5504,12 +5512,19 @@ pub fn serialize_activity_token(token: &ActivityTaskToken) -> Vec<u8> {
 }
 
 pub fn deserialize_activity_token(bytes: &[u8]) -> Result<ActivityTaskToken, ProtoConversionError> {
+    deserialize_activity_token_with_namespace(bytes).map(|(token, _)| token)
+}
+
+fn deserialize_activity_token_with_namespace(
+    bytes: &[u8],
+) -> Result<(ActivityTaskToken, Option<NamespaceId>), ProtoConversionError> {
     if bytes.is_empty() {
         return Err(ProtoConversionError::InvalidTaskToken(
             "task_token is empty".to_string(),
         ));
     }
-    serde_json::from_slice(bytes).map_err(|e| ProtoConversionError::InvalidTaskToken(e.to_string()))
+    crate::task_token::decode(bytes)
+        .map_err(|e| ProtoConversionError::InvalidTaskToken(e.to_string()))
 }
 
 // v1.62-sync: reads deprecated worker capabilities for SDKs predating
@@ -5618,9 +5633,9 @@ pub fn poll_activity_response_to_proto(
 pub fn respond_activity_completed_to_edge(
     req: workflowservice::RespondActivityTaskCompletedRequest,
 ) -> Result<crate::translate::RespondActivityTaskCompletedRequest, ProtoConversionError> {
-    let token = deserialize_activity_token(&req.task_token)?;
     Ok(crate::translate::RespondActivityTaskCompletedRequest {
-        token,
+        namespace: req.namespace,
+        task_token: req.task_token,
         result: req
             .result
             .as_ref()
@@ -5660,7 +5675,6 @@ pub fn respond_activity_completed_by_id_to_proto()
 pub fn respond_activity_failed_to_edge(
     req: workflowservice::RespondActivityTaskFailedRequest,
 ) -> Result<crate::translate::RespondActivityTaskFailedRequest, ProtoConversionError> {
-    let token = deserialize_activity_token(&req.task_token)?;
     let (failure, failure_error_type, is_non_retryable) = match req.failure {
         Some(f) => {
             let (error_type, non_retryable) = activity_retry_classification(&f);
@@ -5673,7 +5687,8 @@ pub fn respond_activity_failed_to_edge(
         ),
     };
     Ok(crate::translate::RespondActivityTaskFailedRequest {
-        token,
+        namespace: req.namespace,
+        task_token: req.task_token,
         failure,
         failure_error_type,
         is_non_retryable,
@@ -5723,9 +5738,9 @@ pub fn respond_activity_failed_by_id_to_proto()
 pub fn respond_activity_canceled_to_edge(
     req: workflowservice::RespondActivityTaskCanceledRequest,
 ) -> Result<crate::translate::RespondActivityTaskCanceledRequest, ProtoConversionError> {
-    let token = deserialize_activity_token(&req.task_token)?;
     Ok(crate::translate::RespondActivityTaskCanceledRequest {
-        token,
+        namespace: req.namespace,
+        task_token: req.task_token,
         details: req.details.as_ref().map(payloads_to_domain),
         identity: req.identity,
     })
@@ -5757,9 +5772,9 @@ pub fn respond_activity_canceled_by_id_to_proto()
 pub fn record_heartbeat_to_edge(
     req: workflowservice::RecordActivityTaskHeartbeatRequest,
 ) -> Result<crate::translate::RecordActivityTaskHeartbeatRequest, ProtoConversionError> {
-    let token = deserialize_activity_token(&req.task_token)?;
     Ok(crate::translate::RecordActivityTaskHeartbeatRequest {
-        token,
+        namespace: req.namespace,
+        task_token: req.task_token,
         details: req.details.as_ref().map(payloads_to_domain),
         identity: req.identity,
     })
@@ -7937,7 +7952,7 @@ mod tests {
                 .as_ref()
                 .and_then(|version| version.stamp.as_ref())
                 .map(|stamp| (stamp.build_id.as_str(), stamp.use_versioning)),
-            Some(("legacy-build", false))
+            Some(("legacy-build", true))
         );
         assert_eq!(
             edge.deployment_version
@@ -8714,6 +8729,7 @@ mod tests {
                 run_id: RunId(Uuid::from_u128(1)),
                 task_queue: "main".to_string(),
                 history: Vec::new(),
+                history_principals: Vec::new(),
             },
             query: Some(crate::translate::WorkflowQueryDto {
                 query_type: "state".to_string(),
@@ -8806,19 +8822,20 @@ mod tests {
     }
 
     #[test]
-    fn activity_token_translators_reject_malformed_tokens() {
-        let err = respond_activity_canceled_to_edge(
+    fn activity_token_translators_preserve_opaque_bytes_for_admission() {
+        let converted = respond_activity_canceled_to_edge(
             workflowservice::RespondActivityTaskCanceledRequest {
                 task_token: b"not-json".to_vec(),
                 ..Default::default()
             },
         )
-        .expect_err("malformed activity token should fail translation");
+        .expect("wire translation does not own token admission");
 
-        match err {
-            ProtoConversionError::InvalidTaskToken(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
+        // Namespace authorization must run before malformed-token disclosure
+        // when the request names a namespace. Keep the bytes opaque here so
+        // `WorkflowService::admit_json_task_token` can enforce that v1.31.0
+        // ordering (`service/frontend/fx.go:256-290 @ v1.31.0`).
+        assert_eq!(converted.task_token, b"not-json");
     }
 
     #[test]

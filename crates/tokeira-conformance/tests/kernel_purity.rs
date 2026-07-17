@@ -11,10 +11,11 @@ use std::path::Path;
 
 /// Feature: conformance-config-override, Property 5: kernel purity and replay determinism.
 ///
-/// `tokeira-kernel`'s manifest names no `tokeira-conformance` dependency under
-/// any feature — the structural proxy for "the kernel cannot read the override
-/// registry". Paired with the unchanged `Kernel::apply` signature (no config
-/// parameter), this keeps kernel transitions a pure function of their inputs.
+/// `tokeira-kernel`'s manifest names neither `tokeira-conformance` nor
+/// `tokeira-auth` under any feature. That is the structural proxy for "the
+/// kernel cannot read mutable policy or an override registry". Paired with the
+/// unchanged `Kernel::apply` signature (no config parameter), this keeps kernel
+/// transitions a pure function of their inputs.
 #[test]
 fn kernel_does_not_depend_on_conformance_registry() {
     // `CARGO_MANIFEST_DIR` is this crate (`crates/tokeira-conformance`) at
@@ -33,5 +34,10 @@ fn kernel_does_not_depend_on_conformance_registry() {
         !contents.contains("tokeira-conformance"),
         "tokeira-kernel must not depend on tokeira-conformance; a runtime-mutable \
          override read inside the pure kernel would break replay determinism (Property 5)"
+    );
+    assert!(
+        !contents.contains("tokeira-auth"),
+        "tokeira-kernel must not depend on tokeira-auth; authentication and authorization \
+         are admission concerns and cannot influence replay of an accepted command"
     );
 }

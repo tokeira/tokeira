@@ -79,6 +79,14 @@ pub enum EdgeError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// Temporal authorization denial. The transport always emits a typed
+    /// `PermissionDeniedFailure`; `reason` is the authorizer-supplied detail.
+    #[error("{message}")]
+    PermissionDenied {
+        message: String,
+        reason: Option<String>,
+    },
+
     #[error("forbidden action `{action}` for namespace {namespace:?}")]
     Forbidden {
         action: &'static str,
@@ -195,6 +203,7 @@ impl EdgeError {
             EdgeError::QueryFailed { .. } => StatusCode::BAD_REQUEST,
             EdgeError::QueryTimedOut => StatusCode::REQUEST_TIMEOUT,
             EdgeError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            EdgeError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
             EdgeError::Forbidden { .. } => StatusCode::FORBIDDEN,
             EdgeError::NamespaceNotFound(_)
             | EdgeError::WorkflowNotFound { .. }
@@ -229,6 +238,7 @@ impl EdgeError {
             EdgeError::QueryFailed { .. } => "query_failed",
             EdgeError::QueryTimedOut => "query_timed_out",
             EdgeError::Unauthorized(_) => "unauthorized",
+            EdgeError::PermissionDenied { .. } => "permission_denied",
             EdgeError::Forbidden { .. } => "forbidden",
             EdgeError::NamespaceNotFound(_) => "namespace_not_found",
             EdgeError::NamespaceDeleted(_) => "namespace_deleted",

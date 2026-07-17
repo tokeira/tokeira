@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use tokeira_types::{
-    BuildId, DeploymentId, ExecutionStatus, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
-    Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, StickyAffinity, TaskQueueName,
-    TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
+    BuildId, DeploymentId, EventPrincipal, ExecutionStatus, Headers, LogicalTaskSeq, Memo,
+    NamespaceId, Payload, Payloads, RetryPolicy, RunId, RunKey, SearchAttributes, StickyAffinity,
+    TaskQueueName, TransitionSeq, WorkerIdentity, WorkflowId, WorkflowType,
 };
 
 use crate::command::{WorkerVersionStamp, WorkflowTaskFailedCause, WorkflowTaskWorkerVersion};
@@ -245,6 +245,13 @@ pub struct BufferedEvent {
     pub admitted_at: OffsetDateTime,
     /// The event body to emit at flush.
     pub kind: crate::event::HistoryEventKind,
+    /// Authenticated caller that admitted this event.
+    ///
+    /// Buffer flush may run under a different worker request, so attribution
+    /// must be captured here rather than inherited at flush time
+    /// (`mutable_state_impl.go:7105-7124 @ v1.31.0`).
+    #[serde(default)]
+    pub principal: Option<EventPrincipal>,
 }
 
 /// `EventType` wire numbers the kernel authors into [`RequestIdInfo::event_type`].
@@ -1095,6 +1102,7 @@ pub enum LoadedRun {
 mod tests {
     use std::collections::{BTreeMap, HashSet};
 
+    use serde::Serialize;
     use serde_json::Value;
     use tokeira_types::WorkerIdentity;
 
@@ -1416,5 +1424,36 @@ mod tests {
             VersioningBehavior::Unspecified
         );
         assert_eq!(migrated.effective_deployment(), None);
+    }
+
+    #[test]
+    fn legacy_buffered_event_postcard_documents_pre_baseline_decode_failure() {
+        // Feature: authorization-foundation, Property 5: genuine bytes from
+        // the pre-attribution trailing-field shape fail positional decoding.
+        // Tokeira is pre-baseline, so this pins why a fresh database is
+        // required rather than claiming a migration guarantee that postcard
+        // does not provide (Requirement 7.7).
+        #[derive(Serialize)]
+        struct LegacyBufferedEvent {
+            admitted_at: OffsetDateTime,
+            kind: crate::event::HistoryEventKind,
+        }
+
+        let legacy = LegacyBufferedEvent {
+            admitted_at: now(),
+            kind: crate::event::HistoryEventKind::WorkflowExecutionSignaled {
+                signal_name: "legacy".into(),
+                input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
+                request_id: "legacy-request".into(),
+                identity: None,
+            },
+        };
+        let bytes = postcard::to_allocvec(&legacy).expect("encode old buffered-event shape");
+        let error = postcard::from_bytes::<BufferedEvent>(&bytes)
+            .expect_err("postcard cannot default a missing trailing sequence element");
+
+        assert!(matches!(error, postcard::Error::DeserializeUnexpectedEnd));
     }
 }

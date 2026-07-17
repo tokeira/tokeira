@@ -1521,6 +1521,7 @@ mod tests {
         RequestContext {
             request_id: RequestId(id.into()),
             caller_identity: Some("tester".into()),
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         }
     }

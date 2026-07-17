@@ -71,6 +71,7 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
             commands: Vec::new(),
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -346,6 +347,7 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time,
         })
         .await?;
@@ -500,6 +502,7 @@ async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Res
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time + Duration::seconds(31),
         })
         .await?;
@@ -559,6 +562,7 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time,
         })
         .await?;
@@ -657,6 +661,7 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
             commands: Vec::new(),
             force_new_workflow_task: true,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time,
         })
         .await?;
@@ -867,6 +872,7 @@ async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -963,6 +969,7 @@ async fn non_retryable_failure_is_terminal_without_successor() -> Result<()> {
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -1149,6 +1156,7 @@ fn start_request(
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),
@@ -1223,6 +1231,7 @@ fn signal_request(request_id: &str) -> tokeira_kernel::SignalRequest {
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),

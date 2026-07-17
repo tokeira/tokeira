@@ -46,8 +46,8 @@ use crate::{
         CompletionCallbackTrackingState, CompletionDeliveryOutcome, EndpointTarget,
         NexusCompletion, NexusCompletionClient, NexusCompletionFailureBody,
         NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusHttpClient, NexusHttpFailureBody,
-        NexusNamespaceResolver, NexusStartResult, NexusTask, NexusTaskBroker, NexusTaskRequest,
-        NexusTaskToken, NexusTimeoutEntry, NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL,
+        NexusNamespaceResolver, NexusStartResult, NexusTaskBroker, NexusTaskRequest,
+        NexusTimeoutEntry, NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL,
         TEMPORAL_CALLBACK_TOKEN_HEADER, nexus_completion_backoff,
     },
     scanner::pick_lane_for_run_key,
@@ -377,6 +377,7 @@ where
             request: RequestContext {
                 request_id: RequestId(format!("child-start-{child_run_key:?}")),
                 caller_identity: Some("runtime-child-orchestrator".to_string()),
+                principal: None,
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),
@@ -498,6 +499,7 @@ where
             request: RequestContext {
                 request_id: RequestId(format!("conflict-terminate:{run_key:?}:{new_run_id:?}")),
                 caller_identity: Some("history-service".to_string()),
+                principal: None,
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),
@@ -540,6 +542,7 @@ where
                     request: RequestContext {
                         request_id: RequestId(format!("terminate-child-{child_run_id:?}")),
                         caller_identity: Some("runtime-child-orchestrator".to_string()),
+                        principal: None,
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -605,6 +608,7 @@ where
                     request: RequestContext {
                         request_id: RequestId(format!("cancel-child-{child_run_id:?}")),
                         caller_identity: Some("runtime-child-orchestrator".to_string()),
+                        principal: None,
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -721,6 +725,7 @@ where
                             "ext-signal-{originator_run_key:?}-{initiated_event_id}"
                         )),
                         caller_identity: Some("history-service".to_string()),
+                        principal: None,
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -845,6 +850,7 @@ where
                             "ext-cancel-{originator_run_key:?}-{initiated_event_id}"
                         )),
                         caller_identity: Some("history-service".to_string()),
+                        principal: None,
                         received_at: OffsetDateTime::now_utc(),
                     },
                     now: OffsetDateTime::now_utc(),
@@ -1050,24 +1056,24 @@ where
                             (None, None)
                         }
                     };
-                    let task = NexusTask {
-                        token: NexusTaskToken {
-                            run_key: originator_run_key,
-                            operation_id: operation_id.clone(),
-                            scheduled_event_id,
-                        },
-                        request: NexusTaskRequest::StartOperation {
-                            service,
-                            operation,
-                            request_id: operation_id.clone(),
-                            payload: input.0.first().cloned(),
-                            scheduled_time: Some(scheduled_at),
-                            callback_url,
-                            callback_token,
-                        },
+                    let request = NexusTaskRequest::StartOperation {
+                        service,
+                        operation,
+                        request_id: operation_id.clone(),
+                        payload: input.0.first().cloned(),
+                        scheduled_time: Some(scheduled_at),
+                        callback_url,
+                        callback_token,
                     };
                     self.nexus_broker
-                        .publish(*namespace_id, task_queue.clone(), task)
+                        .publish_workflow(
+                            *namespace_id,
+                            task_queue.clone(),
+                            originator_run_key,
+                            operation_id,
+                            scheduled_event_id,
+                            request,
+                        )
                         .await;
                     return;
                 }
@@ -1224,21 +1230,21 @@ where
                 } else {
                     operation_token
                 };
-                let task = NexusTask {
-                    token: NexusTaskToken {
-                        run_key: originator_run_key,
-                        operation_id: operation_id.clone(),
-                        scheduled_event_id,
-                    },
-                    request: NexusTaskRequest::CancelOperation {
-                        service,
-                        operation_id,
-                        operation,
-                        operation_token: cancel_token,
-                    },
+                let request = NexusTaskRequest::CancelOperation {
+                    service,
+                    operation_id: operation_id.clone(),
+                    operation,
+                    operation_token: cancel_token,
                 };
                 self.nexus_broker
-                    .publish(*namespace_id, task_queue.clone(), task)
+                    .publish_workflow(
+                        *namespace_id,
+                        task_queue.clone(),
+                        originator_run_key,
+                        operation_id,
+                        scheduled_event_id,
+                        request,
+                    )
                     .await;
             }
         }

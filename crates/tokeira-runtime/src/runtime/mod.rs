@@ -1441,8 +1441,6 @@ pub struct StartedActivityTask {
     pub workflow_id: String,
     /// Workflow type name.
     pub workflow_type: String,
-    /// Namespace name or identifier string.
-    pub workflow_namespace: String,
     /// Transport headers carried with the activity task.
     pub header: Option<Headers>,
     /// Retry policy attached to the activity.
@@ -2196,6 +2194,7 @@ mod tests {
             commands: Vec::new(),
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         });
 
@@ -3242,6 +3241,7 @@ mod tests {
             request: RequestContext {
                 request_id: RequestId("req-timeout".to_string()),
                 caller_identity: None,
+                principal: None,
                 received_at: OffsetDateTime::now_utc(),
             },
             now: OffsetDateTime::now_utc(),

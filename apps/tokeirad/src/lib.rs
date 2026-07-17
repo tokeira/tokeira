@@ -47,13 +47,23 @@ use tonic_web::GrpcWebLayer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+#[cfg(feature = "conformance")]
+mod conformance_nexus_authorizer;
 pub mod correlation_format;
+mod nexus_http_transport;
 pub mod observability;
 
+#[cfg(feature = "conformance")]
+use conformance_nexus_authorizer::ConformanceNexusHttpAuthorizer;
+use nexus_http_transport::NexusHttpLayer;
+use tokeira_auth::{
+    Authorizer, ClaimMapper, DefaultAuthorizer, GrantRule, GrantRules, JwksKeyProvider,
+    JwtAuthenticator, JwtIssuerProfile, MultiSourceClaimMapper, StsAuthenticator,
+};
 use tokeira_chasm::Library as _;
 use tokeira_config::{Cli, ConfigStorageKind, TokeiraConfig};
 use tokeira_edge::{
-    CacheBackedRouter, CallbackResponse, EdgeInterceptors, EdgeRoutingConfig,
+    Authenticator, CacheBackedRouter, CallbackResponse, EdgeInterceptors, EdgeRoutingConfig,
     HistoryNotifyingRepository, HistoryWaitRegistry, InMemoryNamespaceCache, InMemoryOperatorApi,
     LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache, OperatorService,
     PendingQueryStore, PollerRegistry, ResolvedNamespace, RoutingCache,
@@ -69,6 +79,90 @@ use tokeira_edge::{
     translate::to_internal::namespace_id_for,
     workflow_service::{ExecutionResolver, WorkflowRuntimeApi},
 };
+
+struct AuthorizationStack {
+    grpc: Arc<dyn Authenticator>,
+    nexus: Arc<dyn tokeira_edge::nexus_http::NexusHttpAuthorizer>,
+    principal_attribution: bool,
+}
+
+async fn build_authorization_stack(config: &TokeiraConfig) -> Result<AuthorizationStack> {
+    let Some(authorization) = config
+        .policy
+        .authorization
+        .as_ref()
+        .filter(|authorization| authorization.has_identity_source())
+    else {
+        return Ok(AuthorizationStack {
+            grpc: Arc::new(tokeira_edge::AllowAllAuthenticator),
+            nexus: Arc::new(tokeira_edge::nexus_http::PermissiveNexusHttpAuthorizer),
+            principal_attribution: false,
+        });
+    };
+
+    let mut profiles = Vec::with_capacity(authorization.jwt.issuers.len());
+    for issuer in &authorization.jwt.issuers {
+        let grants = GrantRules::new(
+            issuer
+                .grants
+                .iter()
+                .map(|rule| {
+                    GrantRule::new(
+                        rule.match_sub.clone(),
+                        rule.grant.iter().map(String::as_str),
+                    )
+                    .with_context(|| format!("invalid JWT grants for issuer {}", issuer.name))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        let keys =
+            JwksKeyProvider::start(issuer.jwks_uri.clone(), issuer.refresh_interval_duration())
+                .await;
+        profiles.push(JwtIssuerProfile::new(
+            issuer.name.clone(),
+            issuer.issuer.clone(),
+            issuer.audience.clone(),
+            issuer.permissions_claim.clone(),
+            grants,
+            keys,
+        ));
+    }
+    let jwt = (!profiles.is_empty()).then(|| JwtAuthenticator::new(profiles));
+    let sts = authorization
+        .aws_iam
+        .as_ref()
+        .map(|aws_iam| {
+            aws_iam
+                .grants
+                .iter()
+                .map(|rule| {
+                    GrantRule::new(
+                        rule.match_arn.clone(),
+                        rule.grant.iter().map(String::as_str),
+                    )
+                    .context("invalid AWS IAM grants")
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(GrantRules::new)
+                .map(StsAuthenticator::new)
+        })
+        .transpose()?;
+    let mapper: Arc<dyn ClaimMapper> = Arc::new(MultiSourceClaimMapper::new(jwt, sts));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(DefaultAuthorizer);
+    Ok(AuthorizationStack {
+        grpc: Arc::new(tokeira_edge::PolicyAuthenticator::new(
+            mapper.clone(),
+            authorizer.clone(),
+            authorization.expose_authorizer_errors,
+        )),
+        nexus: Arc::new(tokeira_edge::nexus_http::PolicyNexusHttpAuthorizer::new(
+            mapper,
+            authorizer,
+            authorization.expose_authorizer_errors,
+        )),
+        principal_attribution: authorization.principal_attribution,
+    })
+}
 use tokeira_kernel::LoadedRun;
 use tokeira_projection::{
     DsqlVisibilityStore, InMemoryVisibilityStore, ProjectionSink, ProjectionWorker, SearchAttrType,
@@ -899,7 +993,12 @@ where
         background_cancel.clone(),
     );
 
-    let interceptors = Arc::new(EdgeInterceptors::permissive(namespaces.clone()));
+    let authorization = build_authorization_stack(&effective_config).await?;
+    let interceptors = Arc::new(EdgeInterceptors::configured(
+        namespaces.clone(),
+        authorization.grpc,
+        authorization.principal_attribution,
+    ));
     let router: Arc<dyn tokeira_edge::EdgeRouter> = if let Some(controller_endpoint) =
         effective_config
             .infrastructure
@@ -977,6 +1076,7 @@ where
         });
     }
 
+    let nexus_http_waiters = tokeira_edge::nexus_http::NexusHttpWaiterRegistry::default();
     let workflow_service =
         WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
             runtime_adapter.clone(),
@@ -990,7 +1090,7 @@ where
             PendingQueryStore::default(),
             buffered_queries,
             workflow_broker,
-            nexus_task_broker,
+            nexus_task_broker.clone(),
             long_polls,
             router,
             history_waits,
@@ -1000,6 +1100,7 @@ where
             task_queue_config_store,
             Arc::new(tokeira_runtime::BatchOperationStore::default()),
         )
+        .with_nexus_http_waiters(nexus_http_waiters.clone())
         .with_worker_deployment_runtime(runtime_adapter);
     // The Nexus endpoint admin shares the dispatch store, gated through the operator
     // interceptor (create/update/delete = OperatorWrite, get/list = OperatorRead).
@@ -1026,6 +1127,29 @@ where
     let operator_service = OperatorService::new(operator_api, interceptors)
         .with_nexus_endpoints(nexus_endpoint_admin)
         .with_namespace_deletion(namespaces.clone(), Arc::new(workflow_service.clone()));
+    let production_nexus_authorizer = authorization.nexus;
+    let nexus_http_authorizer: Arc<dyn tokeira_edge::nexus_http::NexusHttpAuthorizer> = {
+        #[cfg(feature = "conformance")]
+        {
+            ConformanceNexusHttpAuthorizer::from_environment(production_nexus_authorizer.clone())
+                .map(|authorizer| {
+                    Arc::new(authorizer) as Arc<dyn tokeira_edge::nexus_http::NexusHttpAuthorizer>
+                })
+                .unwrap_or(production_nexus_authorizer)
+        }
+        #[cfg(not(feature = "conformance"))]
+        {
+            production_nexus_authorizer
+        }
+    };
+    let nexus_http_layer =
+        NexusHttpLayer::new(Arc::new(tokeira_edge::nexus_http::NexusHttpHandler::new(
+            namespaces.clone(),
+            nexus_store,
+            nexus_task_broker,
+            nexus_http_waiters,
+            nexus_http_authorizer,
+        )));
 
     // Wire the standalone-activity (CHASM) bridge onto the gRPC adapter: a CHASM
     // engine over the backend's node repository, an activity-library registry, and
@@ -1160,6 +1284,7 @@ where
             Some(recorder) => {
                 Server::builder()
                     .accept_http1(true)
+                    .layer(nexus_http_layer.clone())
                     .layer(CorsLayer::permissive())
                     .layer(GrpcWebLayer::new())
                     .layer(WireCoverageLayer::new(recorder))
@@ -1173,6 +1298,7 @@ where
             None => {
                 Server::builder()
                     .accept_http1(true)
+                    .layer(nexus_http_layer)
                     .layer(CorsLayer::permissive())
                     .layer(GrpcWebLayer::new())
                     .add_service(workflow_grpc.into_service())

@@ -160,6 +160,7 @@ where
                     )),
                     caller_identity: (!rule.created_by_identity.is_empty())
                         .then(|| rule.created_by_identity.clone()),
+                    principal: None,
                     received_at: now,
                 },
                 now,
@@ -204,6 +205,7 @@ where
         token: ActivityTaskToken,
         result: Payloads,
         worker_identity: Option<WorkerIdentity>,
+        request: RequestContext,
     ) -> Result<CommitResult> {
         let activity_id = token.activity_id.clone();
         if let Err(error) = self.validate_activity_token(&token).await {
@@ -217,6 +219,7 @@ where
                     activity_id,
                     resolution: ActivityResolution::Completed { result },
                     worker_identity,
+                    request,
                     now: OffsetDateTime::now_utc(),
                 }),
             )
@@ -249,6 +252,7 @@ where
         failure_error_type: Option<String>,
         is_non_retryable: bool,
         worker_identity: Option<WorkerIdentity>,
+        request: RequestContext,
     ) -> Result<()> {
         let (activity, workflow_retry_policy) = match self.validate_activity_token(&token).await {
             Ok(validated) => validated,
@@ -323,6 +327,7 @@ where
                         retry_state,
                     },
                     worker_identity,
+                    request,
                     now: OffsetDateTime::now_utc(),
                 }),
             )
@@ -354,6 +359,7 @@ where
         token: ActivityTaskToken,
         details: Option<Payloads>,
         worker_identity: Option<WorkerIdentity>,
+        request: RequestContext,
     ) -> Result<CommitResult> {
         let activity_id = token.activity_id.clone();
         self.validate_activity_token(&token).await?;
@@ -364,6 +370,7 @@ where
                     activity_id,
                     resolution: ActivityResolution::Canceled { details },
                     worker_identity,
+                    request,
                     now: OffsetDateTime::now_utc(),
                 }),
             )
@@ -458,6 +465,7 @@ where
                 expected_seq: state.transition_seq,
                 next_state,
                 history_events: SmallVec::new(),
+                event_principals: SmallVec::new(),
                 request_dedupe_ops: SmallVec::new(),
                 activity_ops: smallvec![ActivityOp::Upsert(next_activity)],
                 timer_ops: SmallVec::new(),
@@ -585,6 +593,7 @@ where
         run_key: RunKey,
         activity_id: &str,
         identity: WorkerIdentity,
+        request: RequestContext,
     ) -> Result<ActivityTaskToken> {
         let mut attempts = 0u32;
         loop {
@@ -650,6 +659,7 @@ where
                 expected_seq: state.transition_seq,
                 next_state,
                 history_events: smallvec![started_event],
+                event_principals: smallvec![request.principal.clone()],
                 request_dedupe_ops: SmallVec::new(),
                 activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
                 timer_ops: SmallVec::new(),
@@ -904,6 +914,7 @@ where
                     .push(tokeira_kernel::BufferedEvent {
                         admitted_at: now,
                         kind: started_activity_kind,
+                        principal: None,
                     });
                 SmallVec::new()
             } else {
@@ -925,6 +936,11 @@ where
                 expected_seq: state.transition_seq,
                 next_state,
                 history_events: started_history_events,
+                event_principals: if workflow_task_started {
+                    SmallVec::new()
+                } else {
+                    smallvec![None]
+                },
                 request_dedupe_ops: SmallVec::new(),
                 activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
                 timer_ops: SmallVec::new(),
@@ -985,7 +1001,6 @@ where
                         attempt: next_activity.attempt,
                         workflow_id: state.workflow_id.0.clone(),
                         workflow_type: state.workflow_type.0.clone(),
-                        workflow_namespace: state.namespace_id.0.to_string(),
                         header: next_activity.header.clone(),
                         retry_policy: next_activity.retry_policy.clone(),
                         heartbeat_details: next_activity.heartbeat_details.clone(),
@@ -1323,6 +1338,7 @@ where
             expected_seq: state.transition_seq,
             next_state,
             history_events: SmallVec::new(),
+            event_principals: SmallVec::new(),
             request_dedupe_ops: SmallVec::new(),
             activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
             timer_ops: SmallVec::new(),
@@ -1478,6 +1494,7 @@ where
             expected_seq: state.transition_seq,
             next_state,
             history_events: SmallVec::new(),
+            event_principals: SmallVec::new(),
             request_dedupe_ops: SmallVec::new(),
             activity_ops: smallvec![ActivityOp::Upsert(next_activity)],
             timer_ops: SmallVec::new(),
@@ -1789,6 +1806,7 @@ mod tests {
             expected_seq: TransitionSeq::ZERO,
             next_state: state.clone(),
             history_events: SmallVec::new(),
+            event_principals: SmallVec::new(),
             request_dedupe_ops: SmallVec::new(),
             activity_ops: smallvec![ActivityOp::Upsert(activity.clone())],
             timer_ops: SmallVec::new(),
@@ -1886,6 +1904,7 @@ mod tests {
             expected_seq: TransitionSeq::ZERO,
             next_state: state.clone(),
             history_events: SmallVec::new(),
+            event_principals: SmallVec::new(),
             request_dedupe_ops: SmallVec::new(),
             activity_ops: smallvec![ActivityOp::Upsert(activity)],
             timer_ops: SmallVec::new(),
@@ -2064,7 +2083,14 @@ mod tests {
             .expect("store retry rule");
 
             runtime
-                .fail_activity_task(token.clone(), payload(b"failure"), None, !retryable, None)
+                .fail_activity_task(
+                    token.clone(),
+                    payload(b"failure"),
+                    None,
+                    !retryable,
+                    None,
+                    RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+                )
                 .await
                 .expect("activity failure");
             let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
@@ -2200,7 +2226,14 @@ mod tests {
         );
 
         runtime
-            .fail_activity_task(token, payload(b"retryable"), None, false, None)
+            .fail_activity_task(
+                token,
+                payload(b"retryable"),
+                None,
+                false,
+                None,
+                RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+            )
             .await
             .expect("retryable failure should re-dispatch activity");
         let LoadedRun::Existing(after_retry) =
@@ -2258,6 +2291,7 @@ mod tests {
                     request: RequestContext {
                         request_id: RequestId("pause-running".to_string()),
                         caller_identity: Some("operator".to_string()),
+                        principal: None,
                         received_at: now,
                     },
                     now,
@@ -2274,7 +2308,14 @@ mod tests {
         assert!(!outcome.activity_reset);
 
         runtime
-            .fail_activity_task(token.clone(), payload(b"retryable"), None, false, None)
+            .fail_activity_task(
+                token.clone(),
+                payload(b"retryable"),
+                None,
+                false,
+                None,
+                RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+            )
             .await
             .expect("paused retryable failure should park");
         let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {
@@ -2315,6 +2356,7 @@ mod tests {
                     request: RequestContext {
                         request_id: RequestId("reset-running".to_string()),
                         caller_identity: Some("operator".to_string()),
+                        principal: None,
                         received_at: now,
                     },
                     now,
@@ -2337,7 +2379,14 @@ mod tests {
         assert!(outcome.activity_reset);
 
         runtime
-            .fail_activity_task(token.clone(), payload(b"retryable"), None, false, None)
+            .fail_activity_task(
+                token.clone(),
+                payload(b"retryable"),
+                None,
+                false,
+                None,
+                RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+            )
             .await
             .expect("retry preparation should consume reset flags");
         let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {

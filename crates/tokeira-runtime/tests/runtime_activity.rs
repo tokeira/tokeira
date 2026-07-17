@@ -51,7 +51,12 @@ async fn schedule_poll_complete_activity_produces_completed_history() -> Result<
     assert_eq!(started.activity_id, "activity-1");
 
     let _ = runtime
-        .complete_activity_task(started.token, payloads("done"), None)
+        .complete_activity_task(
+            started.token,
+            payloads("done"),
+            None,
+            RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+        )
         .await?;
 
     let history = store.read_history(run_key, 0, 64).await?;
@@ -108,6 +113,7 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
             Some("retryable".to_string()),
             false,
             None,
+            RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         )
         .await?;
 
@@ -192,6 +198,7 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
             Some("retryable".to_string()),
             false,
             None,
+            RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         )
         .await?;
 
@@ -263,6 +270,7 @@ async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()
             Some("fatal".to_string()),
             false,
             None,
+            RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
         )
         .await?;
 
@@ -443,7 +451,12 @@ async fn cancel_activity_task_emits_canceled_history_with_worker_identity() -> R
     let details = payloads("cancel-details");
 
     runtime
-        .cancel_activity_task(started.token, Some(details.clone()), Some(identity.clone()))
+        .cancel_activity_task(
+            started.token,
+            Some(details.clone()),
+            Some(identity.clone()),
+            RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+        )
         .await?;
 
     let history = store.read_history(run_key, 0, 64).await?;
@@ -499,6 +512,7 @@ async fn update_activity_options_applies_field_changes_to_scheduled_activity() -
                 request: RequestContext {
                     request_id: RequestId("req-update-activity-options".to_string()),
                     caller_identity: Some("operator".to_string()),
+                    principal: None,
                     received_at: OffsetDateTime::now_utc(),
                 },
                 now: OffsetDateTime::now_utc(),
@@ -605,6 +619,7 @@ async fn start_and_schedule_activity_with_version(
             }],
             force_new_workflow_task: false,
             delivered_update_ids: Vec::new(),
+            request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
         })
         .await?;
@@ -664,6 +679,7 @@ fn start_request(
         request: RequestContext {
             request_id: RequestId(request_id.to_string()),
             caller_identity: None,
+            principal: None,
             received_at: OffsetDateTime::now_utc(),
         },
         now: OffsetDateTime::now_utc(),

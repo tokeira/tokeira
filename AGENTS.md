@@ -182,6 +182,33 @@ non-obvious logic as defects to fix before the change is complete — the same w
 failing lint. Comment density is not the metric; comment *quality and coverage of the
 non-obvious* is.
 
+### 10. Concurrent Agents (fleet discipline)
+
+Several agents (and one human) may work on this repository at the same time, each in its
+own git worktree. Mechanics and per-agent setup live in `docs/concurrent-agents.md`;
+these rules are the contract, and they are not optional.
+
+- **One agent, one worktree, one branch, one task.** Work only inside your own worktree.
+  Never run git or cargo commands against another checkout of this repository — including
+  the main checkout.
+- **Stay within the crate(s) your task names.** No drive-by edits to other workspace
+  crates, shared configs, CI files, or the workspace `Cargo.toml` unless the task says so.
+- **Dependencies are single-writer.** Do not add, remove, or upgrade dependencies unless
+  the task explicitly calls for it — assume another agent holds the lockfile this window.
+  When not changing dependencies, build with `--locked` so `Cargo.lock` can never be
+  rewritten by accident.
+- **Never `cargo clean`.** It defeats the shared build cache and is never the fix. If the
+  build seems inconsistent, say so and stop. Likewise never delete or move `target/`, and
+  never modify `~/.cargo/config.toml`, rustup toolchains, `RUSTC_WRAPPER`, or any
+  `KACHE_*` / `CARGO_*` environment configuration.
+- **Finish green.** Before declaring a task done: `cargo +nightly fmt --all`, `cargo lint`,
+  and the tests for the crate(s) you touched — the full Enforced Commands bar applies
+  before anything merges.
+- **Commit only your own coherent work** on your own branch (Kiro: via `-F`, §7). If you
+  cannot complete the task, leave the worktree dirty and report what remains — do not
+  half-commit. Do not push, merge, rebase, or open PRs unless the task says so:
+  integration is handled by the human, serially, one branch at a time.
+
 ---
 
 ## Architecture

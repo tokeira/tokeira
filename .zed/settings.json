@@ -1,0 +1,44 @@
+{
+  // Zed project settings for tokeira. Tracked, so every worktree opened in
+  // Zed inherits them. See docs/concurrent-agents.md ("Repo-specific notes").
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        // RA gets its own target dir (target/rust-analyzer) so save-triggered
+        // checks never serialize against terminal/agent builds in this checkout.
+        "cargo": { "targetDir": true },
+        // The repo's rustfmt.toml uses nightly-only options; stable rustfmt
+        // silently ignores them, so editor formatting must go through the
+        // rustup nightly proxy to produce what the Enforced Commands bar checks.
+        "rustfmt": { "extraArgs": ["+nightly"] },
+        // Editor diagnostics match the repo bar (`cargo lint` = clippy), not
+        // plain check. If per-save latency ever bites, drop this line to fall
+        // back to `cargo check` diagnostics.
+        "check": { "command": "clippy" }
+      }
+    }
+  },
+  "languages": {
+    // Zed's global format_on_save default is "off"; the repo convention is
+    // "just run fmt, don't check first".
+    "Rust": { "format_on_save": "on" }
+  },
+  // Replaces (not merges) Zed's defaults, so those are re-listed first. The
+  // additions keep the scanner off ~1.5M generated files under target/ and
+  // out of Claude Code's embedded worktrees (full duplicate checkouts).
+  "file_scan_exclusions": [
+    "**/.git",
+    "**/.svn",
+    "**/.hg",
+    "**/.jj",
+    "**/.sl",
+    "**/.repo",
+    "**/CVS",
+    "**/.DS_Store",
+    "**/Thumbs.db",
+    "**/.classpath",
+    "**/.settings",
+    "**/target",
+    "**/.claude/worktrees"
+  ]
+}

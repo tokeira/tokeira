@@ -1,0 +1,20 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "fmt-on-save",
+      "description": "Format the saved Rust file with the project's nightly rustfmt.",
+      "trigger": "PostFileSave",
+      "matcher": "\\.rs$",
+      "action": { "type": "command", "command": "tkw hook post-edit" },
+      "timeout": 60
+    },
+    {
+      "name": "finish-green",
+      "description": "cargo check --workspace before the session ends (advisory: Kiro does not block on Stop).",
+      "trigger": "Stop",
+      "action": { "type": "command", "command": "tkw hook stop" },
+      "timeout": 600
+    }
+  ]
+}

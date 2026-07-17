@@ -1,0 +1,7 @@
+# Gitignored files to copy into every new worktree. Gitignore glob syntax.
+# Read natively by Claude Code and the ChatGPT app (Codex); applied by `tkw`
+# for the worktrees it creates (Kiro CLI, manual).
+#
+# Add local-only config that builds/tests need as it appears.
+.env
+.env.local

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "tools/proto-sync",
+    "tools/tkw",
     "crates/tokeira-build-info",
     "crates/tokeira-compatibility",
     "crates/tokeira-compatibility-proto",

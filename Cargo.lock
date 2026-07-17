@@ -6451,6 +6451,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tkw"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "tokeira-auth"
 version = "0.1.0"
 dependencies = [

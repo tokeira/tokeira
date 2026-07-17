@@ -1,1 +1,7 @@
+# Clippy honors the workspace MSRV (no newer-than-pin API suggestions), and
+# unwrap/expect/dbg stay idiomatic in tests while the workspace lints police
+# library/binary code.
+msrv = "1.96"
 allow-dbg-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

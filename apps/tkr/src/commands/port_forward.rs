@@ -74,7 +74,11 @@ const VALID_PORT_FORWARD_SERVICES: &[&str] = &[
     "loki",
 ];
 
-pub async fn run(service: &str, local_port: Option<u16>, ctx: DeploymentContext) -> Result<()> {
+pub(crate) async fn run(
+    service: &str,
+    local_port: Option<u16>,
+    ctx: DeploymentContext,
+) -> Result<()> {
     match &ctx.platform_config {
         PlatformDeploymentConfig::Ecs(config) => run_ecs(service, local_port, config).await,
         _ => {
@@ -106,7 +110,7 @@ async fn run_compose_local(service: &str, ctx: &DeploymentContext) -> Result<()>
 }
 
 /// ECS port-forward: tunnel via SSM Session Manager.
-pub async fn run_ecs(
+pub(crate) async fn run_ecs(
     service: &str,
     local_port: Option<u16>,
     config: &tokeira_ecs_deployment::EcsConfig,

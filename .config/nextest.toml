@@ -1,0 +1,17 @@
+# cargo-nextest configuration. nextest runs each test in its own process, so a
+# single hung test can be terminated without stalling the rest of the bar —
+# `cargo test`'s in-process runner has no equivalent. Doctests still need
+# `cargo test --doc` (nextest does not run them).
+
+[profile.default]
+# Warn when a test exceeds 60s; kill it after 3 periods (180s). Unit tests here
+# are fast — anything hitting this is a hang (deadlock, missed wakeup), not work.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.ci]
+retries = 0        # a flaky test is a bug to fix, not to hide
+fail-fast = false  # report every failure in one run
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.ci.junit]
+path = "junit.xml"

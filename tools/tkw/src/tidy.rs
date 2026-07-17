@@ -8,8 +8,9 @@
 //! 2. `cargo sweep` stale artifacts out of every live checkout — including
 //!    *inside* Claude's and the ChatGPT app's managed worktrees, which is safe
 //!    because sweeping deletes artifacts, never worktrees;
-//! 3. `kache gc` the shared store (LRU to its cap, then an age pass);
-//! 4. report what came back.
+//! 3. report unused dependencies (cargo machete) — fluid codebases accrete deps;
+//! 4. `kache gc` the shared store (LRU to its cap, then an age pass);
+//! 5. report what came back.
 //!
 //! Every step is best-effort: a missing optional tool is reported and skipped,
 //! and one failure never aborts the rest. Safe to run while builds are live —
@@ -26,12 +27,12 @@ pub(crate) fn run(sweep_days: u32, kache_age: &str) -> Result<()> {
 
     println!("=== tkw tidy ===");
 
-    println!("--- 1/4: sweeping merged tkw worktrees");
+    println!("--- 1/5: sweeping merged tkw worktrees");
     if let Err(error) = worktree::clean_with(&repo, None) {
         println!("  (clean failed: {error})");
     }
 
-    println!("--- 2/4: pruning stale build artifacts (cargo sweep, >{sweep_days}d)");
+    println!("--- 2/5: pruning stale build artifacts (cargo sweep, >{sweep_days}d)");
     if installed("cargo-sweep") {
         let days = sweep_days.to_string();
         sweep(&["--time", &days], &repo.main_root);
@@ -48,7 +49,17 @@ pub(crate) fn run(sweep_days: u32, kache_age: &str) -> Result<()> {
         println!("  (cargo-sweep not installed — run: cargo install cargo-sweep)");
     }
 
-    println!("--- 3/4: kache store GC");
+    println!("--- 3/5: unused-dependency report (cargo machete)");
+    if installed("cargo-machete") {
+        // Report-only: machete exits non-zero when it finds unused deps, which
+        // run_reporting surfaces as a note — removal stays a reviewed change.
+        let main_str = repo.main_root.to_string_lossy().into_owned();
+        run_reporting("cargo", &["machete", &main_str]);
+    } else {
+        println!("  (cargo-machete not installed — run: cargo install cargo-machete)");
+    }
+
+    println!("--- 4/5: kache store GC");
     if installed("kache") {
         run_reporting("kache", &["gc"]);
         run_reporting("kache", &["gc", "--max-age", kache_age]);
@@ -56,7 +67,7 @@ pub(crate) fn run(sweep_days: u32, kache_age: &str) -> Result<()> {
         println!("  (kache not installed)");
     }
 
-    println!("--- 4/4: state");
+    println!("--- 5/5: state");
     if installed("kache") {
         run_reporting("kache", &["stats"]);
     }

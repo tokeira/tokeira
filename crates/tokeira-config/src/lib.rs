@@ -1320,6 +1320,9 @@ fn default_burst() -> u32 {
 }
 
 #[cfg(test)]
+// Edition-2024 `std::env` mutation in tests, serialized by ENV_LOCK — each site
+// carries its SAFETY comment.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use clap::Parser;
@@ -1666,6 +1669,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let cli_path = write_temp_config("cli", "cluster_name = \"cli\"");
         let env_path = write_temp_config("env", "cluster_name = \"env\"");
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
         unsafe {
             std::env::set_var("TOKEIRA_CONFIG", &env_path);
         }
@@ -1674,6 +1678,7 @@ mod tests {
         assert_eq!(source, "cli --config");
         assert_eq!(config.infrastructure.cluster_name, "cli");
 
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
         unsafe {
             std::env::remove_var("TOKEIRA_CONFIG");
         }
@@ -1685,6 +1690,7 @@ mod tests {
     fn resolve_uses_env_before_defaults() {
         let _guard = ENV_LOCK.lock().unwrap();
         let env_path = write_temp_config("env-default", "cluster_name = \"env\"");
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
         unsafe {
             std::env::set_var("TOKEIRA_CONFIG", &env_path);
         }
@@ -1693,6 +1699,7 @@ mod tests {
         assert_eq!(source, "TOKEIRA_CONFIG env");
         assert_eq!(config.infrastructure.cluster_name, "env");
 
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
         unsafe {
             std::env::remove_var("TOKEIRA_CONFIG");
         }
@@ -1702,6 +1709,7 @@ mod tests {
     #[test]
     fn resolve_applies_placement_env_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
         unsafe {
             std::env::remove_var("TOKEIRA_CONFIG");
             std::env::set_var("TOKEIRA_NODE_HOST", "10.0.4.7");
@@ -1715,12 +1723,14 @@ mod tests {
         assert_eq!(config.infrastructure.placement.node_port, Some(7233));
 
         // A malformed port fails loudly rather than advertising the wrong port.
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
         unsafe {
             std::env::set_var("TOKEIRA_NODE_PORT", "not-a-port");
         }
         let err = TokeiraConfig::resolve(None).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)), "got {err:?}");
 
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
         unsafe {
             std::env::remove_var("TOKEIRA_NODE_HOST");
             std::env::remove_var("TOKEIRA_NODE_PORT");

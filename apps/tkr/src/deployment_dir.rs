@@ -60,12 +60,12 @@ pub(crate) const PROVISIONER_BIN: &str = "tkp";
 /// platform-appropriate state directory); tests use
 /// `DeploymentResolver::with_root` (`#[cfg(test)]`) to sandbox under a
 /// `tempfile::TempDir`.
-pub struct DeploymentResolver {
+pub(crate) struct DeploymentResolver {
     root: PathBuf,
 }
 
 impl DeploymentResolver {
-    pub fn default() -> Result<Self> {
+    pub(crate) fn default() -> Result<Self> {
         // Use "tokeira" as the application to get ~/Library/Application Support/tokeira/
         // on macOS, then append "tkr" for the deployment subdirectory.
         let project_dirs = ProjectDirs::from("", "", "tokeira")
@@ -79,23 +79,23 @@ impl DeploymentResolver {
     }
 
     #[cfg(test)]
-    pub fn with_root(root: PathBuf) -> Self {
+    pub(crate) fn with_root(root: PathBuf) -> Self {
         Self { root }
     }
 
-    pub fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
-    pub fn path(&self, name: &str) -> PathBuf {
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.root.join(normalize_name(name))
     }
 
-    pub fn latest_path(&self) -> PathBuf {
+    pub(crate) fn latest_path(&self) -> PathBuf {
         self.root.join(LATEST_FILE)
     }
 
-    pub fn latest_name(&self) -> Option<String> {
+    pub(crate) fn latest_name(&self) -> Option<String> {
         fs::read_to_string(self.latest_path())
             .ok()
             .map(|name| normalize_name(name.trim()))
@@ -105,7 +105,7 @@ impl DeploymentResolver {
     /// Resolves a user-supplied name (or falls back to the `.latest`
     /// sentinel) and returns the normalised form. The returned name is the
     /// filesystem entry under [`DeploymentResolver::root`].
-    pub fn resolve_name(&self, requested: Option<&str>) -> Result<String> {
+    pub(crate) fn resolve_name(&self, requested: Option<&str>) -> Result<String> {
         if let Some(name) = requested {
             return Ok(normalize_name(name));
         }
@@ -125,7 +125,7 @@ impl DeploymentResolver {
     /// it is the entry point for **forwarded** (`.tkd`) deployments, which the
     /// bound `tkp` drives from the directory alone (the launcher needs only the
     /// path).
-    pub fn resolve_dir(&self, requested: Option<&str>) -> Result<PathBuf> {
+    pub(crate) fn resolve_dir(&self, requested: Option<&str>) -> Result<PathBuf> {
         let name = self.resolve_name(requested)?;
         let path = self.path(&name);
         if !path.join(METADATA_JSON).exists() {
@@ -137,7 +137,7 @@ impl DeploymentResolver {
     /// Whether the resolved deployment is a **`.tkd`/forwarded** deployment —
     /// provisioned by the bound `tkp`, not the legacy in-process engine. Detected
     /// by the presence of `definition.tkd`, mirroring `tkp`'s own `platform::detect`.
-    pub fn is_forwarded(&self, requested: Option<&str>) -> Result<bool> {
+    pub(crate) fn is_forwarded(&self, requested: Option<&str>) -> Result<bool> {
         Ok(self.resolve_dir(requested)?.join(DEFINITION_TKD).exists())
     }
 
@@ -151,7 +151,7 @@ impl DeploymentResolver {
     /// per-platform build/obtain + integrity stamping is the provisioner-binary
     /// work (Proposal 005). Errors clearly when no `tkp` is installed — a forwarded
     /// (`.tkd`) deployment cannot be driven without its provisioner.
-    pub fn place_provisioner(&self, name: &str) -> Result<()> {
+    pub(crate) fn place_provisioner(&self, name: &str) -> Result<()> {
         let source = which::which(PROVISIONER_BIN).map_err(|_| {
             anyhow!(
                 "cannot introduce the compose provisioner: no `{PROVISIONER_BIN}` found on PATH. \
@@ -177,7 +177,7 @@ impl DeploymentResolver {
     ///
     /// Fails fast if a directory with the same normalised name already
     /// exists so we never silently clobber operator state.
-    pub fn create(
+    pub(crate) fn create(
         &self,
         name: &str,
         platform: PlatformKind,
@@ -234,7 +234,7 @@ impl DeploymentResolver {
         Ok(metadata)
     }
 
-    pub fn list(&self) -> Result<Vec<DeploymentMetadata>> {
+    pub(crate) fn list(&self) -> Result<Vec<DeploymentMetadata>> {
         if !self.root.exists() {
             return Ok(Vec::new());
         }
@@ -253,7 +253,7 @@ impl DeploymentResolver {
         Ok(deployments)
     }
 
-    pub fn deployment_names(&self) -> Result<Vec<String>> {
+    pub(crate) fn deployment_names(&self) -> Result<Vec<String>> {
         Ok(self
             .list()?
             .into_iter()
@@ -261,7 +261,7 @@ impl DeploymentResolver {
             .collect())
     }
 
-    pub fn mark_latest(&self, name: &str) -> Result<()> {
+    pub(crate) fn mark_latest(&self, name: &str) -> Result<()> {
         let name = normalize_name(name);
         let path = self.path(&name);
         if !path.join(METADATA_JSON).exists() {
@@ -272,7 +272,7 @@ impl DeploymentResolver {
         Ok(())
     }
 
-    pub fn remove(&self, name: &str) -> Result<()> {
+    pub(crate) fn remove(&self, name: &str) -> Result<()> {
         let name = normalize_name(name);
         let path = self.path(&name);
         if !path.exists() {
@@ -288,7 +288,7 @@ impl DeploymentResolver {
         Ok(())
     }
 
-    pub fn update_status(&self, name: &str, status: DeploymentStatus) -> Result<()> {
+    pub(crate) fn update_status(&self, name: &str, status: DeploymentStatus) -> Result<()> {
         let path = self.path(name);
         let mut metadata = metadata::read(&path)?;
         metadata.status = status;
@@ -299,7 +299,7 @@ impl DeploymentResolver {
     /// Build a helpful "deployment not found" error that lists what is
     /// actually available. Extracted so every command surfaces the same
     /// guidance when a caller passes an unknown `--deployment`.
-    pub fn not_found_message(&self, name: &str) -> Result<String> {
+    pub(crate) fn not_found_message(&self, name: &str) -> Result<String> {
         let available = self.deployment_names()?;
         if available.is_empty() {
             Ok(format!(
@@ -321,7 +321,7 @@ impl DeploymentResolver {
 /// re-reading files from disk. `Compose` and `Ecs` configs are boxed
 /// because they're significantly larger than `LocalConfig` (observability
 /// stacks, ECR mirror lists, etc.).
-pub enum PlatformDeploymentConfig {
+pub(crate) enum PlatformDeploymentConfig {
     Local(LocalConfig),
     Compose(Box<ComposeConfig>),
     Ecs(Box<EcsConfig>),
@@ -333,7 +333,7 @@ pub enum PlatformDeploymentConfig {
 /// filesystem again for config — everything in [`DeploymentContext::path`]
 /// has already been parsed into [`DeploymentContext::metadata`] and
 /// [`DeploymentContext::platform_config`].
-pub struct DeploymentContext {
+pub(crate) struct DeploymentContext {
     pub name: String,
     pub path: PathBuf,
     pub metadata: DeploymentMetadata,
@@ -345,7 +345,7 @@ pub struct DeploymentContext {
 ///
 /// This is the single entry point every non-`dev` subcommand uses to turn
 /// an optional `--deployment` flag into a runnable context.
-pub fn load_context(
+pub(crate) fn load_context(
     deployments: &DeploymentResolver,
     requested_name: Option<&str>,
 ) -> Result<DeploymentContext> {
@@ -390,7 +390,7 @@ pub fn load_context(
 /// collapse to `-`; leading/trailing dashes are stripped. This means two
 /// operators typing the same deployment "My Dev" vs "my-dev" will always
 /// resolve to the same directory.
-pub fn normalize_name(name: &str) -> String {
+pub(crate) fn normalize_name(name: &str) -> String {
     name.trim()
         .chars()
         .map(|ch| {

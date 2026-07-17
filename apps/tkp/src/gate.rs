@@ -9,7 +9,7 @@ use tokeira_provisioner::{BindingVerdict, ProvenanceStamp, check_binding};
 
 /// What the gate decides for an applying verb.
 #[derive(Debug)]
-pub enum GateOutcome {
+pub(crate) enum GateOutcome {
     /// Proceed. `authoritative` is true for a versioned `Match`, false for a dev
     /// iteration (permissive bring-up; the re-stamp records the advisory dev
     /// stamp and the caller warns).
@@ -26,7 +26,10 @@ pub enum GateOutcome {
 
 /// Evaluate the binding gate for a deployment's `recorded` provenance (`None`
 /// when unstamped) against the `running` provisioner.
-pub fn evaluate_gate(recorded: Option<&ProvenanceStamp>, running: &ProvenanceStamp) -> GateOutcome {
+pub(crate) fn evaluate_gate(
+    recorded: Option<&ProvenanceStamp>,
+    running: &ProvenanceStamp,
+) -> GateOutcome {
     let verdict = check_binding(recorded, running);
     match verdict {
         BindingVerdict::Match => GateOutcome::Proceed {

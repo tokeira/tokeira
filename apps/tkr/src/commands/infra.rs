@@ -35,7 +35,7 @@ use crate::{
     tui::{ActionTuiHandle, OutputFormat},
 };
 
-pub async fn run(
+pub(crate) async fn run(
     action: InfraAction,
     deployments: &DeploymentResolver,
     ctx: DeploymentContext,
@@ -184,7 +184,7 @@ fn module_selection(module: Option<String>) -> ModuleSelection {
         .unwrap_or(ModuleSelection::All)
 }
 
-pub fn read_tokeirad_config(path: &Path) -> Result<tokeira_config::TokeiraConfig> {
+pub(crate) fn read_tokeirad_config(path: &Path) -> Result<tokeira_config::TokeiraConfig> {
     Ok(toml::from_str(&fs::read_to_string(path)?)?)
 }
 
@@ -196,7 +196,7 @@ pub fn read_tokeirad_config(path: &Path) -> Result<tokeira_config::TokeiraConfig
 /// copy-paste these by hand, we patch them into `tokeirad.toml` using the
 /// same dotted-key writer the `image push/mirror` commands use. A later
 /// `tkr deploy apply` picks them up transparently.
-pub fn write_tokeirad_writeback(
+pub(crate) fn write_tokeirad_writeback(
     deployment_path: &Path,
     values: Vec<(String, String)>,
 ) -> Result<()> {

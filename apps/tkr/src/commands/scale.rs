@@ -21,7 +21,7 @@ use crate::{
     metadata::DeploymentStatus,
 };
 
-pub async fn run(
+pub(crate) async fn run(
     action: ScaleAction,
     deployments: &DeploymentResolver,
     ctx: DeploymentContext,

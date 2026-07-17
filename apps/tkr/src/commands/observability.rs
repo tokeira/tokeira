@@ -18,24 +18,24 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckReport {
+pub(crate) struct CheckReport {
     pub checks: Vec<CheckOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckOutcome {
+pub(crate) struct CheckOutcome {
     pub name: &'static str,
     pub status: CheckStatus,
     pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckStatus {
+pub(crate) enum CheckStatus {
     Pass,
     Warn,
 }
 
-pub fn run(action: ObservabilityAction, ctx: DeploymentContext) -> Result<()> {
+pub(crate) fn run(action: ObservabilityAction, ctx: DeploymentContext) -> Result<()> {
     let ObservabilityAction::Check { timeout_seconds } = action;
     let report = check_generated_observability(&ctx, timeout_seconds)?;
 
@@ -49,7 +49,7 @@ pub fn run(action: ObservabilityAction, ctx: DeploymentContext) -> Result<()> {
     Ok(())
 }
 
-pub fn check_generated_observability(
+pub(crate) fn check_generated_observability(
     ctx: &DeploymentContext,
     timeout_seconds: u64,
 ) -> Result<CheckReport> {

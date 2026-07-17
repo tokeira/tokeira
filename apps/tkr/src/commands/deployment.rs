@@ -21,7 +21,7 @@ use crate::{
     output::OutputFormatter,
 };
 
-pub async fn run(
+pub(crate) async fn run(
     action: DeploymentAction,
     deployments: &DeploymentResolver,
     selected: Option<&str>,

@@ -4,6 +4,7 @@ publish = false
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 
 [lib]
@@ -48,3 +49,6 @@ tokeirad = { path = "../tokeirad" }
 tonic = { workspace = true }
 # URL parsing for the in-process server target.
 url = "2"
+
+[lints]
+workspace = true

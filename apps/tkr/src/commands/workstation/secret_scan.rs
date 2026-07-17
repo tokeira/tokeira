@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 #[derive(Debug, Clone)]
-pub struct SecretMatch {
+pub(super) struct SecretMatch {
     pub pattern: &'static str,
     pub start: usize,
     pub end: usize,
@@ -36,7 +36,7 @@ static SECRET_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| 
     .collect()
 });
 
-pub fn scan(command: &[String]) -> Option<SecretMatch> {
+pub(super) fn scan(command: &[String]) -> Option<SecretMatch> {
     let joined = command.join(" ");
     SECRET_PATTERNS.iter().find_map(|(pattern, regex)| {
         let found = regex.find(&joined)?;

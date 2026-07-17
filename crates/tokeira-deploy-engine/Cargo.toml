@@ -3,6 +3,7 @@ name = "tokeira-deploy-engine"
 publish = false
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -20,3 +21,6 @@ hex = "0.4"
 
 [dev-dependencies]
 proptest = "1"
+
+[lints]
+workspace = true

@@ -25,7 +25,7 @@ use crate::{
     platform,
 };
 
-pub async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()> {
+pub(crate) async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, version) = store

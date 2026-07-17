@@ -30,7 +30,7 @@ use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, Target};
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaunchClass {
+pub(crate) enum LaunchClass {
     Bound,
     CandidateUpgrade,
     DevCandidate,
@@ -42,7 +42,7 @@ pub enum LaunchClass {
 }
 
 impl LaunchClass {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             LaunchClass::Bound => "bound",
             LaunchClass::CandidateUpgrade => "candidate-upgrade",
@@ -61,7 +61,7 @@ impl LaunchClass {
 /// B-then-A. Otherwise a versioned binding is **bound** (run exactly the recorded
 /// binary) and a dev/unstamped binding is a **dev-candidate** (the current local
 /// build; a fresh deployment we are about to `init` is treated the same).
-pub fn resolve_class(verb: &str, envelope: &DeploymentStateEnvelope) -> LaunchClass {
+pub(crate) fn resolve_class(verb: &str, envelope: &DeploymentStateEnvelope) -> LaunchClass {
     match verb {
         "describe" | "plan" | "status" => LaunchClass::ReadOnly,
         "upgrade" => LaunchClass::CandidateUpgrade,
@@ -180,7 +180,7 @@ fn verify_against_manifest(path: &Path, envelope: &DeploymentStateEnvelope) -> R
 /// Forward a lifecycle `verb` to the deployment's bound `tkp`: resolve the launch
 /// class, checksum-verify (bound), then exec `tkp <verb> --deployment-dir <dir>
 /// [extra_args]`, inheriting stdio and propagating the exit status.
-pub async fn launch(deployment_dir: &Path, verb: &str, extra_args: &[String]) -> Result<()> {
+pub(crate) async fn launch(deployment_dir: &Path, verb: &str, extra_args: &[String]) -> Result<()> {
     let envelope = load_envelope(deployment_dir).await?;
     let class = resolve_class(verb, &envelope);
     let binary = TkpBinary::resolve(deployment_dir);
@@ -225,7 +225,7 @@ pub async fn launch(deployment_dir: &Path, verb: &str, extra_args: &[String]) ->
 
 /// Forward `apply`, first forwarding `init` when the deployment has never been
 /// stamped — so `tkr deployment apply` is a coherent one-command flow.
-pub async fn launch_apply(deployment_dir: &Path) -> Result<()> {
+pub(crate) async fn launch_apply(deployment_dir: &Path) -> Result<()> {
     if load_envelope(deployment_dir).await?.binding.is_none() {
         launch(deployment_dir, "init", &[]).await?;
     }

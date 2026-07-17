@@ -2041,6 +2041,8 @@ pub fn __cli_parse() -> Cli {
 }
 
 #[cfg(test)]
+// Edition-2024 `std::env` mutation in tests — each site carries its SAFETY comment.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     // Endpoint target/config types are referenced only by the Nexus endpoint store
@@ -2237,6 +2239,7 @@ mod tests {
         // splitting them risks cross-test interference under the parallel test runner.
 
         // Unset: the documented default path is used.
+        // SAFETY: all mutation of this env var is confined to this single test.
         unsafe { std::env::remove_var(WIRE_COVERAGE_OUT_ENV) };
         assert_eq!(
             wire_coverage_out_path(),
@@ -2244,16 +2247,19 @@ mod tests {
         );
 
         // A real path is honoured verbatim (after trimming).
+        // SAFETY: all mutation of this env var is confined to this single test.
         unsafe { std::env::set_var(WIRE_COVERAGE_OUT_ENV, "  /tmp/cov.json  ") };
         assert_eq!(wire_coverage_out_path(), PathBuf::from("/tmp/cov.json"));
 
         // An empty/whitespace override is treated as unset, not as a blank path.
+        // SAFETY: all mutation of this env var is confined to this single test.
         unsafe { std::env::set_var(WIRE_COVERAGE_OUT_ENV, "   ") };
         assert_eq!(
             wire_coverage_out_path(),
             PathBuf::from(WIRE_COVERAGE_DEFAULT_OUT)
         );
 
+        // SAFETY: all mutation of this env var is confined to this single test.
         unsafe { std::env::remove_var(WIRE_COVERAGE_OUT_ENV) };
     }
 

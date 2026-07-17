@@ -2,6 +2,7 @@
 name = "tokeira-compatibility-service"
 publish = false
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -11,3 +12,6 @@ connectrpc = { version = "0.6", features = ["server"] }
 tokeira-build-info.workspace = true
 tokeira-compatibility.workspace = true
 tokeira-compatibility-proto.workspace = true
+
+[lints]
+workspace = true

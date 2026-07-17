@@ -5,7 +5,12 @@ on:
   push:
     branches:
       - main
+  # Weekly re-run so advisory-only failures (a new RustSec entry against an
+  # unchanged tree) surface between pushes instead of ambushing the next PR.
+  schedule:
+    - cron: "23 5 * * 1"
 
+# Least-privilege GITHUB_TOKEN: CI only reads the checkout.
 permissions:
   contents: read
 
@@ -13,52 +18,85 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Third-party actions are pinned to a full commit SHA (supply-chain hardening);
+# the trailing comment records the human-readable release. Pins advance
+# manually and deliberately.
+
+env:
+  # rustfmt.toml uses nightly-only options, so formatting runs on nightly —
+  # pinned to a dated toolchain so a nightly rustfmt behaviour change cannot
+  # redden CI or fork dev-vs-CI formatting. Advance together with local dev.
+  NIGHTLY_FMT_TOOLCHAIN: nightly-2026-06-16
+
 jobs:
   build-and-lint:
     name: "Format, docs, and lint"
-    timeout-minutes: 15
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false # CI is read-only; don't leave the token in .git/config
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # snapshot 2026-03-27
         with:
           toolchain: "1.96"
           components: rustfmt, clippy
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - run: rustup toolchain install "$NIGHTLY_FMT_TOOLCHAIN" --profile minimal --component rustfmt
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo +nightly fmt --all --check
-      - run: cargo doc --workspace --no-deps
+      - run: cargo "+${NIGHTLY_FMT_TOOLCHAIN}" fmt --all --check
+      # `--locked` everywhere below: CI tests the committed Cargo.lock, never a
+      # fresh resolution — dependency movement is a reviewed change, not a CI
+      # side effect.
+      - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: "-D warnings"
-      - run: cargo lint
-      - run: cargo test-lint
-      - run: cargo check --workspace
+      - run: cargo lint --locked
+      - run: cargo test-lint --locked
+      - run: cargo check --workspace --locked
       - run: git diff --exit-code
 
   test:
     name: "Unit tests"
-    timeout-minutes: 15
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false # CI is read-only; don't leave the token in .git/config
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # snapshot 2026-03-27
         with:
           toolchain: "1.96"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
 
   cargo-deny:
     name: "Supply-chain & licenses"
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false # CI is read-only; don't leave the token in .git/config
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           command: check
+
+  # Internal-link integrity for the docs/spec corpus. Offline mode checks
+  # relative file links only — hermetic, no network flakes; external URLs are
+  # deliberately unchecked. `--hidden` reaches the specs under `.kiro/`.
+  links:
+    name: "Doc links"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false # CI is read-only; don't leave the token in .git/config
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --offline --no-progress --hidden --exclude-path .git --exclude-path target './**/*.md'
+          fail: true

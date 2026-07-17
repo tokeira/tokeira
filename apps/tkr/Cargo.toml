@@ -2,6 +2,7 @@
 name = "tkr"
 publish = false
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -51,3 +52,6 @@ which = "7"
 [dev-dependencies]
 proptest = "1"
 tempfile.workspace = true
+
+[lints]
+workspace = true

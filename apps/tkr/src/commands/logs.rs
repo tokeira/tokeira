@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use crate::deployment_dir::DeploymentContext;
 
-pub async fn run(
+pub(crate) async fn run(
     service: &str,
     follow: bool,
     tail: Option<u32>,

@@ -2,6 +2,7 @@
 name = "tokeira-projection"
 publish = false
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -34,3 +35,6 @@ dsql-integration = ["dsql"]
 [dev-dependencies]
 metrics-util.workspace = true
 proptest = "1"
+
+[lints]
+workspace = true

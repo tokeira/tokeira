@@ -3,6 +3,7 @@ name = "tokeira-proto"
 publish = false
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Temporal-compatible and Tokeira-internal protobuf bindings"
 license = "Apache-2.0"
 
@@ -27,3 +28,6 @@ path = "../tokeira-types"
 connectrpc-build = "0.6"
 tonic-build = "0.11"
 walkdir = "2"
+
+[lints]
+workspace = true

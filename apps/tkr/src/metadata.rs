@@ -24,7 +24,7 @@ use crate::deployment_dir::METADATA_JSON;
 /// `tokeirad.pid` file via [`crate::process::local_process_status`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum DeploymentStatus {
+pub(crate) enum DeploymentStatus {
     Created,
     Running,
     Stopped,
@@ -34,7 +34,7 @@ pub enum DeploymentStatus {
 /// set are a breaking change for existing deployments on disk; prefer
 /// additive, optional fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeploymentMetadata {
+pub(crate) struct DeploymentMetadata {
     pub name: String,
     pub id: Uuid,
     pub platform: PlatformKind,
@@ -44,14 +44,14 @@ pub struct DeploymentMetadata {
     pub updated_at: String,
 }
 
-pub fn read(path: &Path) -> Result<DeploymentMetadata> {
+pub(crate) fn read(path: &Path) -> Result<DeploymentMetadata> {
     let metadata_path = path.join(METADATA_JSON);
     let bytes = fs::read_to_string(&metadata_path)
         .with_context(|| format!("failed to read {}", metadata_path.display()))?;
     Ok(serde_json::from_str(&bytes)?)
 }
 
-pub fn write(path: &Path, metadata: &DeploymentMetadata) -> Result<()> {
+pub(crate) fn write(path: &Path, metadata: &DeploymentMetadata) -> Result<()> {
     fs::write(
         path.join(METADATA_JSON),
         serde_json::to_string_pretty(metadata)?,

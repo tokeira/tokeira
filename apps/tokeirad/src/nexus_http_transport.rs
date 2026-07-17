@@ -23,13 +23,13 @@ use tower::{Layer, Service};
 
 /// Tower layer routing caller-facing Nexus HTTP requests to the edge handler.
 #[derive(Clone, Debug)]
-pub struct NexusHttpLayer {
+pub(crate) struct NexusHttpLayer {
     handler: Arc<NexusHttpHandler>,
 }
 
 impl NexusHttpLayer {
     /// Construct the layer around a shared edge handler.
-    pub fn new(handler: Arc<NexusHttpHandler>) -> Self {
+    pub(crate) fn new(handler: Arc<NexusHttpHandler>) -> Self {
         Self { handler }
     }
 }
@@ -47,7 +47,7 @@ impl<S> Layer<S> for NexusHttpLayer {
 
 /// Service produced by [`NexusHttpLayer`].
 #[derive(Clone, Debug)]
-pub struct NexusHttpService<S> {
+pub(crate) struct NexusHttpService<S> {
     inner: S,
     handler: Arc<NexusHttpHandler>,
 }

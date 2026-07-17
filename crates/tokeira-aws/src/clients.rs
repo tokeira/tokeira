@@ -1,6 +1,6 @@
 //! AWS SDK client bundle registered as a `ProvisionContext` extension.
 
-pub mod ecr;
+pub(crate) mod ecr;
 
 /// All AWS SDK clients needed by resource implementations.
 ///

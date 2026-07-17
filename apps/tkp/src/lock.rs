@@ -31,7 +31,11 @@ fn operation_lock(deployment_dir: &Path) -> OperationLock {
 /// work, **renewed on an interval** so an operation longer than the lease cannot
 /// have its lock stolen mid-mutation, and released afterwards. Refuses if another
 /// provisioner already holds the lock.
-pub async fn with_operation_lock<F, Fut>(deployment_dir: &Path, verb: &str, body: F) -> Result<()>
+pub(crate) async fn with_operation_lock<F, Fut>(
+    deployment_dir: &Path,
+    verb: &str,
+    body: F,
+) -> Result<()>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,

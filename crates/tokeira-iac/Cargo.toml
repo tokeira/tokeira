@@ -3,6 +3,7 @@ name = "tokeira-iac"
 publish = false
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -21,3 +22,6 @@ chrono = { version = "0.4", features = ["serde"] }
 proptest = "1"
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+
+[lints]
+workspace = true

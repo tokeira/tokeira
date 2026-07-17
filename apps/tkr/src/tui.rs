@@ -45,7 +45,7 @@ use tokeira_iac::{ProvisionContext, ResourceId};
 /// progress hook so the engine layer doesn't have to know about render
 /// modes at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
+pub(crate) enum OutputFormat {
     Human,
     Json,
 }
@@ -83,7 +83,7 @@ impl std::fmt::Debug for SpinnerEntry {
 /// call [`ActionTuiHandle::print_summary`] once the operation returns to
 /// render the final `Done: x completed, y failed, z skipped` line.
 #[derive(Debug, Clone)]
-pub struct ActionTuiHandle {
+pub(crate) struct ActionTuiHandle {
     format: OutputFormat,
     multi: MultiProgress,
     start: Instant,
@@ -93,7 +93,7 @@ pub struct ActionTuiHandle {
 }
 
 impl ActionTuiHandle {
-    pub fn new(format: OutputFormat) -> Self {
+    pub(crate) fn new(format: OutputFormat) -> Self {
         Self::with_terminal_detected(format, Term::stdout().is_term())
     }
 
@@ -108,7 +108,7 @@ impl ActionTuiHandle {
         }
     }
 
-    pub fn install(&self, ctx: &mut ProvisionContext) {
+    pub(crate) fn install(&self, ctx: &mut ProvisionContext) {
         let format = self.format;
         let multi = self.multi.clone();
         let spinners = Arc::clone(&self.spinners);
@@ -269,11 +269,11 @@ impl ActionTuiHandle {
         });
     }
 
-    pub fn record_skipped(&self, n: usize) {
+    pub(crate) fn record_skipped(&self, n: usize) {
         self.counters.skipped.store(n, Ordering::Relaxed);
     }
 
-    pub fn print_summary(&self) {
+    pub(crate) fn print_summary(&self) {
         let completed = self.counters.completed.load(Ordering::Relaxed);
         let failed = self.counters.failed.load(Ordering::Relaxed);
         let skipped = self.counters.skipped.load(Ordering::Relaxed);
@@ -320,7 +320,7 @@ impl ActionTuiHandle {
 /// grows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
-pub enum ProgressEvent {
+pub(crate) enum ProgressEvent {
     OperationStart {
         action: String,
         resource_id: String,

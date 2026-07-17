@@ -23,7 +23,7 @@ use crate::{
     platform,
 };
 
-pub async fn destroy(deployment_dir: &Path, yes: bool) -> Result<()> {
+pub(crate) async fn destroy(deployment_dir: &Path, yes: bool) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, version) = store

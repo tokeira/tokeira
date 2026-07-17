@@ -2,6 +2,7 @@
 name = "tokeira-runtime"
 publish = false
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -58,3 +59,6 @@ tokeira-proto = { path = "../tokeira-proto" }
 tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[lints]
+workspace = true

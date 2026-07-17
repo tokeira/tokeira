@@ -2,6 +2,7 @@
 name = "tokeira-kernel"
 publish = false
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -20,3 +21,6 @@ prost = "0.12"
 proptest = "1.6"
 tokeira-proto = { path = "../tokeira-proto" }
 tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
+
+[lints]
+workspace = true

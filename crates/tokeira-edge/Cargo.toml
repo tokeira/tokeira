@@ -3,6 +3,7 @@ name = "tokeira-edge"
 publish = false
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -72,3 +73,6 @@ metrics-util.workspace = true
 proptest = "1"
 tokeira-types = { path = "../tokeira-types", features = ["test-support"] }
 tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

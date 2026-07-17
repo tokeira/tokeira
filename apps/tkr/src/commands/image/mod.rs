@@ -31,7 +31,7 @@
 //! subsequent `tkr infra apply` / `tkr deploy apply` sees the freshly
 //! pushed image refs without operator intervention.
 
-pub mod local_inspector;
+pub(crate) mod local_inspector;
 
 use std::{path::PathBuf, process::Stdio};
 
@@ -54,7 +54,7 @@ use crate::{
     tui::OutputFormat,
 };
 
-pub async fn run(
+pub(crate) async fn run(
     command: ImageCommand,
     deployment: Option<DeploymentContext>,
     format: OutputFormat,
@@ -117,7 +117,7 @@ pub async fn run(
     }
 }
 
-pub fn run_build(
+pub(crate) fn run_build(
     arch: tokeira_build::Arch,
     tag: Option<String>,
     format: OutputFormat,
@@ -386,7 +386,7 @@ async fn run_list(
     Ok(())
 }
 
-pub fn validate_image_filter<'a>(
+pub(crate) fn validate_image_filter<'a>(
     filter: Option<&str>,
     images: &'a [Box<dyn Image>],
     source: ImageSourceType,

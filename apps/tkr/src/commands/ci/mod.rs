@@ -15,7 +15,7 @@ use crate::cli::CiCommand;
 
 const DAGGER_COMPAT_NOT_FOUND: &str = "Dagger compatibility module not found. Run 'tkr ci' after the Dagger module is scaffolded (task 10).";
 
-pub async fn run(command: CiCommand, global_json: bool) -> Result<()> {
+pub(crate) async fn run(command: CiCommand, global_json: bool) -> Result<()> {
     if should_reexec_under_dagger() {
         return reexec_under_dagger(&command, global_json).await;
     }

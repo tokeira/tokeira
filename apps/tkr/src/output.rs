@@ -9,19 +9,19 @@ use anyhow::Result;
 use serde::Serialize;
 use std::fmt::Display;
 
-pub mod build_info;
+pub(crate) mod build_info;
 
-pub struct OutputFormatter {
+pub(crate) struct OutputFormatter {
     json: bool,
 }
 
 impl OutputFormatter {
-    pub fn new(json: bool) -> Self {
+    pub(crate) fn new(json: bool) -> Self {
         Self { json }
     }
 
     #[allow(dead_code)]
-    pub fn print<T>(&self, value: &T) -> Result<()>
+    pub(crate) fn print<T>(&self, value: &T) -> Result<()>
     where
         T: Serialize + Display,
     {
@@ -33,7 +33,7 @@ impl OutputFormatter {
         Ok(())
     }
 
-    pub fn print_json<T: Serialize>(&self, value: &T) -> Result<()> {
+    pub(crate) fn print_json<T: Serialize>(&self, value: &T) -> Result<()> {
         if self.json {
             println!("{}", serde_json::to_string_pretty(value)?);
         } else {
@@ -42,7 +42,7 @@ impl OutputFormatter {
         Ok(())
     }
 
-    pub fn print_table(&self, rows: &[Vec<String>]) {
+    pub(crate) fn print_table(&self, rows: &[Vec<String>]) {
         if self.json {
             println!(
                 "{}",
@@ -56,7 +56,7 @@ impl OutputFormatter {
     }
 
     #[allow(dead_code)]
-    pub fn print_error(&self, error: &anyhow::Error) {
+    pub(crate) fn print_error(&self, error: &anyhow::Error) {
         eprintln!("error: {error:#}");
     }
 }

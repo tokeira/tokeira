@@ -31,7 +31,7 @@ use crate::{
     process,
 };
 
-pub async fn run(
+pub(crate) async fn run(
     action: DeployAction,
     deployments: &DeploymentResolver,
     ctx: DeploymentContext,

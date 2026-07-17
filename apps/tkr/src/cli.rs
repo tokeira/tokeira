@@ -25,7 +25,7 @@ use tokeira_orchestrator::{PlatformKind, StorageKind};
 #[derive(Parser)]
 #[command(name = "tkr")]
 #[command(about = "Tokeira deployment and developer workflow CLI")]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Selects which named deployment this invocation operates on.
     /// When absent, `DeploymentResolver` falls back to the `.latest`
     /// sentinel written by `tkr deployment use`.
@@ -40,7 +40,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     Dev {
         #[command(subcommand)]
         action: DevAction,
@@ -124,7 +124,7 @@ pub enum Command {
 }
 
 #[derive(Subcommand)]
-pub enum DevAction {
+pub(crate) enum DevAction {
     Build,
     Test {
         #[arg(long = "crate")]
@@ -137,7 +137,7 @@ pub enum DevAction {
 }
 
 #[derive(Subcommand)]
-pub enum DeploymentAction {
+pub(crate) enum DeploymentAction {
     Create {
         #[arg(long)]
         name: Option<String>,
@@ -181,25 +181,25 @@ pub enum DeploymentAction {
 }
 
 #[derive(Args)]
-pub struct ImageArgs {
+pub(crate) struct ImageArgs {
     #[command(subcommand)]
     pub command: ImageCommand,
 }
 
 #[derive(Args)]
-pub struct CompatArgs {
+pub(crate) struct CompatArgs {
     #[command(subcommand)]
     pub command: CompatCommand,
 }
 
 #[derive(Args)]
-pub struct CiArgs {
+pub(crate) struct CiArgs {
     #[command(subcommand)]
     pub command: CiCommand,
 }
 
 #[derive(Subcommand)]
-pub enum CompatCommand {
+pub(crate) enum CompatCommand {
     Show {
         #[arg(long)]
         remote: Option<String>,
@@ -219,7 +219,7 @@ pub enum CompatCommand {
 }
 
 #[derive(Subcommand)]
-pub enum CiCommand {
+pub(crate) enum CiCommand {
     Check {
         #[arg(long)]
         json: bool,
@@ -239,7 +239,7 @@ pub enum CiCommand {
 }
 
 #[derive(Subcommand)]
-pub enum ImageCommand {
+pub(crate) enum ImageCommand {
     List {
         #[arg(long)]
         source_type: Option<CliImageSourceType>,
@@ -280,7 +280,7 @@ pub enum CliArch {
 }
 
 #[derive(Subcommand)]
-pub enum InfraAction {
+pub(crate) enum InfraAction {
     Plan {
         #[arg(long)]
         module: Option<String>,
@@ -301,7 +301,7 @@ pub enum InfraAction {
 }
 
 #[derive(Subcommand)]
-pub enum DeployAction {
+pub(crate) enum DeployAction {
     Plan,
     Apply {
         #[arg(long)]
@@ -315,7 +315,7 @@ pub enum DeployAction {
 }
 
 #[derive(Subcommand)]
-pub enum SchemaAction {
+pub(crate) enum SchemaAction {
     Setup {
         #[arg(long)]
         yes: bool,
@@ -325,7 +325,7 @@ pub enum SchemaAction {
 }
 
 #[derive(Subcommand)]
-pub enum ScaleAction {
+pub(crate) enum ScaleAction {
     Up {
         service: Option<String>,
         replicas: Option<u32>,
@@ -338,12 +338,12 @@ pub enum ScaleAction {
 }
 
 #[derive(Subcommand)]
-pub enum ConfigAction {
+pub(crate) enum ConfigAction {
     Show,
 }
 
 #[derive(Subcommand)]
-pub enum ObservabilityAction {
+pub(crate) enum ObservabilityAction {
     Check {
         #[arg(long, default_value = "30")]
         timeout_seconds: u64,
@@ -351,7 +351,7 @@ pub enum ObservabilityAction {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum WorkstationAction {
+pub(crate) enum WorkstationAction {
     Up {
         #[arg(long, default_value = "c8gd-rust")]
         profile: String,
@@ -421,7 +421,7 @@ pub enum WorkstationAction {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum CodeAction {
+pub(crate) enum CodeAction {
     /// Clone the repo if missing, or pull latest from origin.
     Sync {
         #[arg(long)]
@@ -441,7 +441,7 @@ pub enum CodeAction {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum GithubKeyAction {
+pub(crate) enum GithubKeyAction {
     Add {
         #[arg(long)]
         workstation: Option<String>,

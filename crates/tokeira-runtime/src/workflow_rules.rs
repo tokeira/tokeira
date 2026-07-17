@@ -480,7 +480,7 @@ mod tests {
             backoff in 0i64..10_000i64,
         ) {
             let activity = activity("demo", attempt);
-            let rules = vec![rule(
+            let rules = [rule(
                 format!("ActivityType = 'demo' AND Attempts = {attempt}"),
                 None,
             )];

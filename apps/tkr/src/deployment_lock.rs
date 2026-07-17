@@ -29,7 +29,7 @@ const LOCK_FILE: &str = "lock.toml";
 
 /// The durable lock record persisted at `{registry_root}/lock.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeploymentLock {
+pub(crate) struct DeploymentLock {
     /// The locked deployment's normalized name.
     pub name: String,
     /// A stable identity fingerprint (see [`fingerprint`]).
@@ -45,7 +45,7 @@ fn lock_path(root: &Path) -> PathBuf {
 /// (Property 13); a recreated deployment reusing the same name gets a fresh `id`
 /// and therefore a different fingerprint, so the lock fails closed rather than
 /// silently transferring.
-pub fn fingerprint(meta: &DeploymentMetadata) -> String {
+pub(crate) fn fingerprint(meta: &DeploymentMetadata) -> String {
     let canonical = format!("{}|{:?}|{:?}", meta.id, meta.platform, meta.storage);
     format!(
         "sha256:{}",
@@ -54,7 +54,7 @@ pub fn fingerprint(meta: &DeploymentMetadata) -> String {
 }
 
 /// Read the active lock, if any.
-pub fn read(resolver: &DeploymentResolver) -> Result<Option<DeploymentLock>> {
+pub(crate) fn read(resolver: &DeploymentResolver) -> Result<Option<DeploymentLock>> {
     let path = lock_path(resolver.root());
     match std::fs::read_to_string(&path) {
         Ok(text) => {
@@ -69,7 +69,7 @@ pub fn read(resolver: &DeploymentResolver) -> Result<Option<DeploymentLock>> {
 
 /// Lock the named (or currently-selected) deployment, and make it the soft
 /// selection too so the happy path (`--deployment` omitted) targets it.
-pub fn lock(resolver: &DeploymentResolver, name: Option<&str>) -> Result<DeploymentLock> {
+pub(crate) fn lock(resolver: &DeploymentResolver, name: Option<&str>) -> Result<DeploymentLock> {
     let name = resolver.resolve_name(name)?;
     let path = resolver.path(&name);
     if !path.join(METADATA_JSON).exists() {
@@ -96,7 +96,7 @@ pub fn lock(resolver: &DeploymentResolver, name: Option<&str>) -> Result<Deploym
 /// Deliberately tolerant of a corrupt `lock.toml`: `unlock --yes` is the
 /// documented recovery command, so it must clear the file even when the record
 /// no longer parses (while `enforce_mutation` keeps failing closed on it).
-pub fn unlock(resolver: &DeploymentResolver) -> Result<Option<DeploymentLock>> {
+pub(crate) fn unlock(resolver: &DeploymentResolver) -> Result<Option<DeploymentLock>> {
     let existing = read(resolver).unwrap_or(None);
     let path = lock_path(resolver.root());
     if path.exists() {
@@ -115,7 +115,7 @@ pub fn unlock(resolver: &DeploymentResolver) -> Result<Option<DeploymentLock>> {
 /// Returns the **validated target name** when a lock is active so the caller can
 /// pin dispatch to exactly the name this check approved — re-resolving the
 /// `.latest` sentinel later would race a concurrent `deployment use`.
-pub fn enforce_mutation(
+pub(crate) fn enforce_mutation(
     resolver: &DeploymentResolver,
     target_name: Option<&str>,
 ) -> Result<Option<String>> {

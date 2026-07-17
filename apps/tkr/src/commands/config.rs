@@ -11,7 +11,7 @@ use anyhow::Result;
 
 use crate::deployment_dir::{DEPLOYMENT_TOML, DeploymentContext, TOKEIRAD_TOML};
 
-pub fn run_show(ctx: DeploymentContext) -> Result<()> {
+pub(crate) fn run_show(ctx: DeploymentContext) -> Result<()> {
     println!(
         "# {}\n{}",
         ctx.path.join(DEPLOYMENT_TOML).display(),

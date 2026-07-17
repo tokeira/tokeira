@@ -9,7 +9,7 @@ use tokeira_provisioner::{ProvenanceStamp, check_binding};
 
 use crate::{envelope_store, platform};
 
-pub async fn plan(deployment_dir: &Path) -> Result<()> {
+pub(crate) async fn plan(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let (envelope, _) = envelope_store(deployment_dir)
         .load()

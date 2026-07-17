@@ -23,13 +23,13 @@ use crate::apply::load_local_config;
 const TKD_FILE: &str = "definition.tkd";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Platform {
+pub(crate) enum Platform {
     Local,
     ComposeSyn,
 }
 
 impl Platform {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Platform::Local => "local",
             Platform::ComposeSyn => "compose-syn",
@@ -38,7 +38,7 @@ impl Platform {
 }
 
 /// Resolve a deployment's platform from its directory.
-pub fn detect(deployment_dir: &Path) -> Platform {
+pub(crate) fn detect(deployment_dir: &Path) -> Platform {
     if deployment_dir.join(TKD_FILE).exists() {
         Platform::ComposeSyn
     } else {
@@ -76,7 +76,7 @@ pub(crate) fn load_tkd_config(deployment_dir: &Path) -> Result<TkdConfig> {
 }
 
 /// Plan the infrastructure for the resolved platform (read-only, no mutation).
-pub async fn infra_plan(deployment_dir: &Path) -> Result<Vec<Change>> {
+pub(crate) async fn infra_plan(deployment_dir: &Path) -> Result<Vec<Change>> {
     match detect(deployment_dir) {
         Platform::Local => {
             plan_infra(
@@ -99,7 +99,7 @@ pub async fn infra_plan(deployment_dir: &Path) -> Result<Vec<Change>> {
 }
 
 /// Apply the infrastructure for the resolved platform. Returns the change count.
-pub async fn infra_apply(deployment_dir: &Path) -> Result<usize> {
+pub(crate) async fn infra_apply(deployment_dir: &Path) -> Result<usize> {
     match detect(deployment_dir) {
         Platform::Local => {
             apply_infra(
@@ -123,7 +123,7 @@ pub async fn infra_apply(deployment_dir: &Path) -> Result<usize> {
 }
 
 /// Destroy the infrastructure for the resolved platform. Returns the change count.
-pub async fn infra_destroy(deployment_dir: &Path) -> Result<usize> {
+pub(crate) async fn infra_destroy(deployment_dir: &Path) -> Result<usize> {
     match detect(deployment_dir) {
         Platform::Local => {
             destroy_infra(

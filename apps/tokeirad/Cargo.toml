@@ -2,6 +2,7 @@
 name = "tokeirad"
 publish = false
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -83,3 +84,6 @@ metrics-util.workspace = true
 proptest = "1"
 prost = "0.12"
 prost-types = "0.12"
+
+[lints]
+workspace = true

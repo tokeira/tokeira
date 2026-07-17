@@ -3,8 +3,8 @@ name = "tokeira-remote-workstation"
 publish = false
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license.workspace = true
-rust-version = "1.95"
 description = "Remote workstation lifecycle — module composition, bootstrap, and operational methods"
 
 [dependencies]
@@ -39,3 +39,6 @@ which = "7"
 
 [dev-dependencies]
 proptest = "1"
+
+[lints]
+workspace = true

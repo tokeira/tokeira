@@ -38,7 +38,7 @@ struct PreflightConfig {
     region: String,
 }
 
-pub async fn run(action: WorkstationAction, json: bool) -> Result<()> {
+pub(crate) async fn run(action: WorkstationAction, json: bool) -> Result<()> {
     match action {
         WorkstationAction::Up {
             profile,

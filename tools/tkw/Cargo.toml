@@ -2,6 +2,7 @@
 name = "tkw"
 publish = false
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -13,3 +14,6 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

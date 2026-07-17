@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 
 #[async_trait::async_trait]
-pub trait LocalImageInspector: Send + Sync {
+pub(crate) trait LocalImageInspector: Send + Sync {
     async fn image_exists(&self, image_ref: &str) -> Result<bool>;
 }
 
@@ -23,7 +23,7 @@ pub trait LocalImageInspector: Send + Sync {
 /// failure as an error (so operators see a real diagnostic rather than a
 /// silent "image is missing" that in fact means "docker is dead").
 #[derive(Debug)]
-pub struct DockerCliInspector;
+pub(crate) struct DockerCliInspector;
 
 #[async_trait::async_trait]
 impl LocalImageInspector for DockerCliInspector {
@@ -48,21 +48,21 @@ impl LocalImageInspector for DockerCliInspector {
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct MockLocalImageInspector {
+pub(crate) struct MockLocalImageInspector {
     exists: bool,
     calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[cfg(test)]
 impl MockLocalImageInspector {
-    pub fn new(exists: bool) -> Self {
+    pub(crate) fn new(exists: bool) -> Self {
         Self {
             exists,
             calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    pub fn calls(&self) -> Vec<String> {
+    pub(crate) fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("calls lock").clone()
     }
 }

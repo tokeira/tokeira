@@ -28,7 +28,7 @@ const ADMIN_SERVICE: &str = "tokeira-admin";
 /// The short name used in the Ops layer.
 const ADMIN_SHORT_NAME: &str = "admin";
 
-pub async fn run(command: Vec<String>, ctx: DeploymentContext) -> Result<()> {
+pub(crate) async fn run(command: Vec<String>, ctx: DeploymentContext) -> Result<()> {
     let config = match &ctx.platform_config {
         PlatformDeploymentConfig::Ecs(config) => config.as_ref().clone(),
         _ => bail!("tkr admin is only supported on ECS deployments"),

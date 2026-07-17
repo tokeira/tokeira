@@ -60,7 +60,7 @@ const VALID_SERVICES: &[&str] = &[
     "grafana",
 ];
 
-pub async fn run(
+pub(crate) async fn run(
     service: &str,
     container: Option<&str>,
     cmd: &[String],
@@ -74,7 +74,7 @@ pub async fn run(
     run_ecs(service, container, cmd, &config).await
 }
 
-pub async fn run_ecs(
+pub(crate) async fn run_ecs(
     service: &str,
     container: Option<&str>,
     cmd: &[String],

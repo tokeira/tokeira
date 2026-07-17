@@ -22,7 +22,7 @@ use tokeira_provisioner::{
 
 use crate::{envelope_store, init::running_integrity_manifest, platform};
 
-pub async fn upgrade(deployment_dir: &Path) -> Result<()> {
+pub(crate) async fn upgrade(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now()); // B
     let store = envelope_store(deployment_dir);
     let (mut envelope, mut version) = store

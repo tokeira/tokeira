@@ -14,7 +14,7 @@ use crate::{
     deployment_dir::{DeploymentContext, TOKEIRAD_TOML},
 };
 
-pub async fn run(action: SchemaAction, ctx: DeploymentContext) -> Result<()> {
+pub(crate) async fn run(action: SchemaAction, ctx: DeploymentContext) -> Result<()> {
     if ctx.metadata.storage != StorageKind::Dsql {
         bail!("schema commands require dsql storage");
     }

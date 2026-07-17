@@ -61,6 +61,7 @@ exclude = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
 license = "Apache-2.0"
 authors = ["OpenAI"]
 
@@ -132,11 +133,21 @@ tokeira-auth = { path = "crates/tokeira-auth" }
 dagger-client = { path = "crates/dagger-client" }
 tokeira-build = { path = "crates/tokeira-build" }
 
+# Mechanized AGENTS.md rules (§1, §9): prose rules drift under a fluid codebase;
+# compiler-enforced ones survive refactors. Only lints measured clean (or made
+# clean) are binding here. Staged, with violation counts measured 2026-07-17 —
+# each joins this set at "warn" when its burn-down starts, "deny" at zero:
+#   clippy::unwrap_used 346 · clippy::print_stdout 402 (CLI crates need
+#   crate-root allows first) · clippy::print_stderr 47 ·
+#   missing_debug_implementations 110 · missing_docs 9017 ·
+#   clippy::expect_used 574 (not constitution-mandated; adopt-or-drop decision)
 [workspace.lints.rust]
+unsafe_code = "deny"    # §1 — the four carve-outs carry #[allow] + SAFETY at each site
 unreachable_pub = "warn"
 
 [workspace.lints.clippy]
 dbg_macro = "warn"
+undocumented_unsafe_blocks = "deny" # every retained unsafe block carries // SAFETY:
 
 [profile.release]
 lto = "fat"

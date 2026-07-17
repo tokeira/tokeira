@@ -6,14 +6,14 @@
 
 use tokeira_build_info::BuildInfo;
 
-pub fn format_version_short(info: &BuildInfo) -> String {
+pub(crate) fn format_version_short(info: &BuildInfo) -> String {
     format!(
         "tokeira {}\ngit {}\nbuild {}",
         info.tokeira_version, info.tokeira_git_sha, info.build_mode
     )
 }
 
-pub fn format_version_verbose(info: &BuildInfo) -> String {
+pub(crate) fn format_version_verbose(info: &BuildInfo) -> String {
     [
         format!("tokeira_version: {}", info.tokeira_version),
         format!("tokeira_git_sha: {}", info.tokeira_git_sha),
@@ -28,7 +28,7 @@ pub fn format_version_verbose(info: &BuildInfo) -> String {
     .join("\n")
 }
 
-pub fn format_version_json(info: &BuildInfo) -> String {
+pub(crate) fn format_version_json(info: &BuildInfo) -> String {
     let value = serde_json::json!({
         "tokeira_version": info.tokeira_version,
         "tokeira_git_sha": info.tokeira_git_sha,

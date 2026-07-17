@@ -469,6 +469,9 @@ fn patterns_to_graphql(patterns: &[&str]) -> String {
 }
 
 #[cfg(test)]
+// Edition-2024 `std::env` mutation in tests, serialized by ENV_MUTEX — each site
+// carries its SAFETY comment.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 

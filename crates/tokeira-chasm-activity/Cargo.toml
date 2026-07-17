@@ -2,6 +2,7 @@
 name = "tokeira-chasm-activity"
 publish = false
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -23,3 +24,6 @@ tokeira-proto = { path = "../tokeira-proto" }
 [dev-dependencies]
 proptest = "1.6"
 serde_json.workspace = true
+
+[lints]
+workspace = true

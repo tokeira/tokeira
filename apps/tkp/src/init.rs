@@ -30,7 +30,7 @@ use tokeira_provisioner::{
 
 use crate::{apply::load_local_config, config_history, envelope_store};
 
-pub async fn init(deployment_dir: &Path) -> Result<()> {
+pub(crate) async fn init(deployment_dir: &Path) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (existing, version) = store

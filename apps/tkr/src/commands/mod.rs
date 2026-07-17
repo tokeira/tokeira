@@ -14,23 +14,23 @@
 //! 3. Wire up the dispatch arm in `main::main`.
 //! 4. Re-use `require_confirmation` for any destructive operation.
 
-pub mod admin;
-pub mod ci;
-pub mod compat;
-pub mod config;
-pub mod deploy;
-pub mod deployment;
-pub mod dev;
-pub mod exec;
-pub mod image;
-pub mod infra;
-pub mod logs;
-pub mod observability;
-pub mod port_forward;
-pub mod scale;
-pub mod schema;
-pub mod version;
-pub mod workstation;
+pub(crate) mod admin;
+pub(crate) mod ci;
+pub(crate) mod compat;
+pub(crate) mod config;
+pub(crate) mod deploy;
+pub(crate) mod deployment;
+pub(crate) mod dev;
+pub(crate) mod exec;
+pub(crate) mod image;
+pub(crate) mod infra;
+pub(crate) mod logs;
+pub(crate) mod observability;
+pub(crate) mod port_forward;
+pub(crate) mod scale;
+pub(crate) mod schema;
+pub(crate) mod version;
+pub(crate) mod workstation;
 
 use std::path::PathBuf;
 
@@ -57,14 +57,14 @@ use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
 ///
 /// The Compose variant also carries the deployment directory because the
 /// Compose ops need it to locate the generated `docker-compose.yml`.
-pub enum PlatformOps {
+pub(crate) enum PlatformOps {
     Local(LocalDeployment, LocalConfig),
     Compose(ComposeDeployment, Box<ComposeConfig>, PathBuf),
     Ecs(EcsDeployment, Box<EcsConfig>),
 }
 
 impl PlatformOps {
-    pub fn from_context(ctx: &DeploymentContext) -> Result<Self> {
+    pub(crate) fn from_context(ctx: &DeploymentContext) -> Result<Self> {
         match &ctx.platform_config {
             PlatformDeploymentConfig::Local(config) => {
                 Ok(Self::Local(LocalDeployment, config.clone()))
@@ -80,7 +80,7 @@ impl PlatformOps {
         }
     }
 
-    pub fn desired_replicas(&self) -> Vec<tokeira_orchestrator::ServiceReplicas> {
+    pub(crate) fn desired_replicas(&self) -> Vec<tokeira_orchestrator::ServiceReplicas> {
         match self {
             Self::Local(d, c) => d.desired_replicas(c),
             Self::Compose(d, c, _) => d.desired_replicas(c),
@@ -88,7 +88,11 @@ impl PlatformOps {
         }
     }
 
-    pub async fn scale_up(&self, service: &str, replicas: u32) -> tokeira_orchestrator::Result<()> {
+    pub(crate) async fn scale_up(
+        &self,
+        service: &str,
+        replicas: u32,
+    ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_up(service, replicas, c).await,
             Self::Compose(d, c, dir) => d.scale_up_with_dir(service, replicas, c, dir).await,
@@ -96,7 +100,7 @@ impl PlatformOps {
         }
     }
 
-    pub async fn scale_down(
+    pub(crate) async fn scale_down(
         &self,
         service: &str,
         replicas: u32,
@@ -108,7 +112,7 @@ impl PlatformOps {
         }
     }
 
-    pub async fn logs(&self, service: &str) -> tokeira_orchestrator::Result<Vec<String>> {
+    pub(crate) async fn logs(&self, service: &str) -> tokeira_orchestrator::Result<Vec<String>> {
         match self {
             Self::Local(d, c) => d.logs(service, c).await,
             Self::Compose(d, c, dir) => d.logs_with_dir(service, c, dir).await,
@@ -116,7 +120,7 @@ impl PlatformOps {
         }
     }
 
-    pub async fn port_mappings(
+    pub(crate) async fn port_mappings(
         &self,
         service: &str,
     ) -> tokeira_orchestrator::Result<Vec<tokeira_orchestrator::PortMapping>> {
@@ -134,7 +138,7 @@ impl PlatformOps {
 /// so confirmation behaviour stays consistent across subcommands. The
 /// `action` argument is echoed in the error text so operators know
 /// exactly which invocation was refused.
-pub fn require_confirmation(yes: bool, action: &str) -> Result<()> {
+pub(crate) fn require_confirmation(yes: bool, action: &str) -> Result<()> {
     if yes {
         Ok(())
     } else {

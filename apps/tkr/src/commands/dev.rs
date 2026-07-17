@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 
 use crate::cli::DevAction;
 
-pub fn run(action: DevAction) -> Result<()> {
+pub(crate) fn run(action: DevAction) -> Result<()> {
     let mut command = match action {
         DevAction::Build => {
             let mut command = std::process::Command::new("cargo");

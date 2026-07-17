@@ -2,6 +2,7 @@
 name = "tokeira-types"
 publish = false
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -18,3 +19,6 @@ test-support = []
 
 [dev-dependencies]
 proptest = "1"
+
+[lints]
+workspace = true

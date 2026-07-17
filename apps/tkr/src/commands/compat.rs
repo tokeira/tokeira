@@ -15,7 +15,7 @@ use tokeira_compatibility::{FEATURE_MATRIX, SDK_MATRIX, feature_matrix_digest, s
 
 use crate::{cli::CompatCommand, output::build_info};
 
-pub fn run(command: CompatCommand, global_json: bool) -> Result<()> {
+pub(crate) fn run(command: CompatCommand, global_json: bool) -> Result<()> {
     match command {
         CompatCommand::Show {
             remote,

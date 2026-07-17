@@ -176,7 +176,7 @@ impl Default for ChasmEngineConfig {
 /// after the closure returns (so the borrow of the tree and the borrow of the
 /// component do not collide). A read path uses the same type but only as
 /// `&dyn Context`, which exposes no mutation.
-pub struct TransitionContext {
+pub(super) struct TransitionContext {
     key: ExecutionKey,
     info: ExecutionInfo,
     now: i64,

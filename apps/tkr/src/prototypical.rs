@@ -26,7 +26,7 @@ use toml_edit::{DocumentMut, value};
 /// the prototypical `tokeirad.toml` all agree. (Transitional: embedded from the
 /// compose-syn platform crate; once the per-platform compose `tkp` exists it
 /// should own and provide its own default definition — Proposal 005.)
-pub fn compose_definition(storage: StorageKind, region: Option<&str>) -> Result<String> {
+pub(crate) fn compose_definition(storage: StorageKind, region: Option<&str>) -> Result<String> {
     const DEFAULT_TKD: &str = include_str!("../../../platforms/compose-syn/definition.tkd");
     match storage {
         StorageKind::InMemory => Ok(DEFAULT_TKD.to_string()),
@@ -48,7 +48,7 @@ pub fn compose_definition(storage: StorageKind, region: Option<&str>) -> Result<
     }
 }
 
-pub fn deployment_config(
+pub(crate) fn deployment_config(
     platform: PlatformKind,
     storage: StorageKind,
     region: Option<&str>,
@@ -65,7 +65,7 @@ pub fn deployment_config(
     }
 }
 
-pub fn server_config(
+pub(crate) fn server_config(
     platform: PlatformKind,
     storage: StorageKind,
     region: Option<&str>,

@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{deployment_dir::TOKEIRAD_TOML, metadata::DeploymentStatus};
 
-pub async fn spawn_tokeirad(deployment_path: &Path) -> Result<()> {
+pub(crate) async fn spawn_tokeirad(deployment_path: &Path) -> Result<()> {
     let config_path = deployment_path.join(TOKEIRAD_TOML);
 
     // Prefer a tokeirad binary on PATH; fall back to `cargo run --bin tokeirad`
@@ -89,6 +89,8 @@ pub async fn spawn_tokeirad(deployment_path: &Path) -> Result<()> {
     Ok(())
 }
 
+// The one production `unsafe` in the workspace: libc FFI for signal forwarding.
+#[allow(unsafe_code)]
 fn forward_sigint(pid: u32) {
     #[cfg(unix)]
     unsafe {
@@ -108,7 +110,7 @@ fn forward_sigint(pid: u32) {
 /// presence of its PID sentinel. Stale PID files are theoretically possible
 /// if the supervisor was SIGKILL'd, but in practice the write/remove
 /// bracket in [`spawn_tokeirad`] keeps this trustworthy.
-pub fn local_process_status(deployment_path: &Path) -> DeploymentStatus {
+pub(crate) fn local_process_status(deployment_path: &Path) -> DeploymentStatus {
     if pid_file(deployment_path).exists() {
         DeploymentStatus::Running
     } else {

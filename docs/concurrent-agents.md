@@ -197,27 +197,46 @@ cd ../<repo>-wt/docs-pass && kiro-cli --v3
 - **Permissions:** v3 replaces Supervised mode with `permissions.yaml`, deliberately
   stored *outside* the repo (user level: `~/.kiro/settings/permissions.yaml`; workspace
   overrides under `~/.kiro/workspace-roots/<hash>/`) so repositories can't inject rules.
-  Suggested baseline — narrow allows, no bare `*`:
+  One scoping consequence of the hash keying: every fresh worktree is a different
+  workspace root, so per-workspace overrides can't serve the fleet — the **user-level
+  file is where fleet rules live**. Effects resolve `deny > ask > allow`, which lets
+  the fleet rules gate a pre-existing broad `git *` allow (applied 2026-07-17):
 
 ```yaml
-rules:
+  # ── Tokeira concurrent-agents fleet (AGENTS.md §10) ──
+  - capability: shell
+    effect: deny
+    match:
+      - cargo clean *          # §10: never the fix; defeats the shared build cache
+  - capability: shell
+    effect: ask
+    match:
+      - git push *             # §10: agents don't push unless the task says so
+      - git reset --hard *     # §5 revert safety
+      - git checkout *
+      - git restore *
+      - git clean *
   - capability: shell
     effect: allow
     match:
       - cargo check *
       - cargo test *
+      - cargo nextest *
       - cargo fmt *
       - cargo +nightly fmt *
+      - cargo lint
       - cargo lint *
+      - cargo test-lint
       - cargo test-lint *
-      - git *
+      - cargo doc *
+      - cargo metadata *
+      - cargo tree *
+      - rustfmt *
       - tkw *
-    exclude:
-      - git push *
-      - git reset --hard *
-  - capability: fs_read
-    effect: allow
 ```
+
+  Filesystem read/write capabilities are left to Kiro's per-agent defaults and
+  prompts rather than granted globally.
 
 Early-access caveat: v3 surfaces are moving; re-verify hook and permission schemas
 against kiro.dev/docs/cli/v3 when upgrading.

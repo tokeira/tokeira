@@ -53,19 +53,22 @@ impl LaunchClass {
     }
 }
 
-/// Resolve the launch class for `verb` from the deployment's recorded binding.
+/// Resolve the launch class for a (possibly namespaced) `verb` — the token
+/// sequence forwarded to `tkp` (`["describe"]`, `["infra", "plan"]`, …) — from
+/// the deployment's recorded binding.
 ///
 /// Read-only verbs are never gated (Req 6.1/8.3 — they must work precisely when
-/// the mutating classes would refuse). `upgrade` cannot run the recorded binary
-/// (A cannot know how to advance to B) → candidate-upgrade; `rollback` runs
-/// B-then-A. Otherwise a versioned binding is **bound** (run exactly the recorded
-/// binary) and a dev/unstamped binding is a **dev-candidate** (the current local
-/// build; a fresh deployment we are about to `init` is treated the same).
-pub(crate) fn resolve_class(verb: &str, envelope: &DeploymentStateEnvelope) -> LaunchClass {
+/// the mutating classes would refuse); any namespace's `plan` is read-only.
+/// `upgrade` cannot run the recorded binary (A cannot know how to advance to B)
+/// → candidate-upgrade; `rollback` runs B-then-A. Otherwise a versioned binding
+/// is **bound** (run exactly the recorded binary) and a dev/unstamped binding is
+/// a **dev-candidate** (the current local build; a fresh deployment we are about
+/// to `init` is treated the same).
+pub(crate) fn resolve_class(verb: &[&str], envelope: &DeploymentStateEnvelope) -> LaunchClass {
     match verb {
-        "describe" | "plan" | "status" => LaunchClass::ReadOnly,
-        "upgrade" => LaunchClass::CandidateUpgrade,
-        "rollback" => LaunchClass::Rollback,
+        ["describe"] | [_, "plan"] => LaunchClass::ReadOnly,
+        ["upgrade"] => LaunchClass::CandidateUpgrade,
+        ["rollback"] => LaunchClass::Rollback,
         _ => match envelope.binding.as_ref().map(|b| b.build_mode) {
             Some(BuildMode::Versioned) => LaunchClass::Bound,
             _ => LaunchClass::DevCandidate,
@@ -177,33 +180,40 @@ fn verify_against_manifest(path: &Path, envelope: &DeploymentStateEnvelope) -> R
     })
 }
 
-/// Forward a lifecycle `verb` to the deployment's bound `tkp`: resolve the launch
-/// class, checksum-verify (bound), then exec `tkp <verb> --deployment-dir <dir>
-/// [extra_args]`, inheriting stdio and propagating the exit status.
-pub(crate) async fn launch(deployment_dir: &Path, verb: &str, extra_args: &[String]) -> Result<()> {
+/// Forward a lifecycle `verb` (a token sequence — `["infra", "plan"]` mirrors
+/// `tkr infra plan`, Req 7.3) to the deployment's bound `tkp`: resolve the
+/// launch class, checksum-verify (bound), then exec
+/// `tkp <verb…> --deployment-dir <dir> [extra_args]`, inheriting stdio and
+/// propagating the exit status.
+pub(crate) async fn launch(
+    deployment_dir: &Path,
+    verb: &[&str],
+    extra_args: &[String],
+) -> Result<()> {
     let envelope = load_envelope(deployment_dir).await?;
     let class = resolve_class(verb, &envelope);
     let binary = TkpBinary::resolve(deployment_dir);
+    let verb_label = verb.join(" ");
 
     if requires_manifest_verification(class, &envelope) {
         match &binary {
             TkpBinary::Installed(path) => verify_against_manifest(path, &envelope)?,
             TkpBinary::Cargo => bail!(
                 "deployment is bound to a versioned engine but no installed `tkp` was found on \
-                 PATH; refusing to drive `{verb}` with a `cargo run` dev build — install the \
-                 recorded `tkp`"
+                 PATH; refusing to drive `{verb_label}` with a `cargo run` dev build — install \
+                 the recorded `tkp`"
             ),
         }
     }
 
     let (program, mut args) = binary.command();
-    args.push(verb.to_string());
+    args.extend(verb.iter().map(|token| token.to_string()));
     args.push("--deployment-dir".to_string());
     args.push(deployment_dir.display().to_string());
     args.extend(extra_args.iter().cloned());
 
     eprintln!(
-        "launcher: {} class → forwarding `{verb}` to tkp",
+        "launcher: {} class → forwarding `{verb_label}` to tkp",
         class.label()
     );
     let status = tokio::process::Command::new(&program)
@@ -223,13 +233,14 @@ pub(crate) async fn launch(deployment_dir: &Path, verb: &str, extra_args: &[Stri
     Ok(())
 }
 
-/// Forward `apply`, first forwarding `init` when the deployment has never been
-/// stamped — so `tkr deployment apply` is a coherent one-command flow.
+/// Forward `infra apply`, first forwarding the internal `init` when the
+/// deployment has never been stamped — so `tkr deployment apply` is a coherent
+/// one-command flow.
 pub(crate) async fn launch_apply(deployment_dir: &Path) -> Result<()> {
     if load_envelope(deployment_dir).await?.binding.is_none() {
-        launch(deployment_dir, "init", &[]).await?;
+        launch(deployment_dir, &["init"], &[]).await?;
     }
-    launch(deployment_dir, "apply", &[]).await
+    launch(deployment_dir, &["infra", "apply"], &[]).await
 }
 
 #[cfg(test)]
@@ -257,24 +268,43 @@ mod tests {
         let unstamped = envelope_with(None);
 
         assert_eq!(
-            resolve_class("upgrade", &versioned),
+            resolve_class(&["upgrade"], &versioned),
             LaunchClass::CandidateUpgrade
         );
-        assert_eq!(resolve_class("rollback", &versioned), LaunchClass::Rollback);
-        assert_eq!(resolve_class("apply", &versioned), LaunchClass::Bound);
-        assert_eq!(resolve_class("apply", &dev), LaunchClass::DevCandidate);
         assert_eq!(
-            resolve_class("apply", &unstamped),
+            resolve_class(&["rollback"], &versioned),
+            LaunchClass::Rollback
+        );
+        assert_eq!(
+            resolve_class(&["infra", "apply"], &versioned),
+            LaunchClass::Bound
+        );
+        assert_eq!(
+            resolve_class(&["infra", "apply"], &dev),
+            LaunchClass::DevCandidate
+        );
+        assert_eq!(
+            resolve_class(&["infra", "apply"], &unstamped),
             LaunchClass::DevCandidate
         );
 
         // Read-only verbs are never gated — regardless of the binding, so a
         // versioned-bound deployment with a missing/mismatched tkp can still be
-        // described (that is exactly when the operator needs diagnostics).
+        // described (that is exactly when the operator needs diagnostics). Any
+        // namespace's `plan` is read-only.
         for envelope in [&versioned, &dev, &unstamped] {
-            assert_eq!(resolve_class("describe", envelope), LaunchClass::ReadOnly);
-            assert_eq!(resolve_class("plan", envelope), LaunchClass::ReadOnly);
-            assert_eq!(resolve_class("status", envelope), LaunchClass::ReadOnly);
+            assert_eq!(
+                resolve_class(&["describe"], envelope),
+                LaunchClass::ReadOnly
+            );
+            assert_eq!(
+                resolve_class(&["infra", "plan"], envelope),
+                LaunchClass::ReadOnly
+            );
+            assert_eq!(
+                resolve_class(&["deploy", "plan"], envelope),
+                LaunchClass::ReadOnly
+            );
         }
     }
 

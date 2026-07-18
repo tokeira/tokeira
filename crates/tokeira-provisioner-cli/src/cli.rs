@@ -30,23 +30,34 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Day-0 mandatory versioning: write the first provenance stamp + integrity
-    /// manifest before any resource create.
+    /// manifest before any resource create. Internal — an inception step of
+    /// `tkr deployment create` (Req 6.5), not an operator verb, so it is hidden
+    /// from help.
+    #[command(hide = true)]
     Init(LifecycleArgs),
     /// Read-only report of identity, recorded provenance, binding verdict, and
     /// state facts. Never gates.
     Describe(DescribeArgs),
-    /// Show the binding verdict + the infrastructure plan. Read-only; never gates.
-    Plan(LifecycleArgs),
-    /// Plan and apply the deployment, gated on the binding.
-    Apply(LifecycleArgs),
-    /// Tear down the deployment's infrastructure, gated on the binding. Irreversible.
-    Destroy(DestroyArgs),
+    /// Substrate — the infrastructure the deployment stands on. Namespaced to
+    /// mirror `tkr` so forwarding is a transparent pass-through (Req 7.3).
+    #[command(subcommand)]
+    Infra(InfraCommand),
     /// Revert to a prior config revision — a same-engine apply, gated on the binding.
     Revert(RevertArgs),
     /// Upgrade to a new engine identity.
     Upgrade(LifecycleArgs),
     /// Roll back to the retained prior configuration revision.
     Rollback(LifecycleArgs),
+}
+
+#[derive(Subcommand)]
+enum InfraCommand {
+    /// Show the binding verdict + the infrastructure plan. Read-only; never gates.
+    Plan(LifecycleArgs),
+    /// Reconcile infrastructure to desired, gated on the binding.
+    Apply(LifecycleArgs),
+    /// Tear down the deployment's infrastructure, gated on the binding. Irreversible.
+    Destroy(DestroyArgs),
 }
 
 #[derive(Args)]
@@ -92,18 +103,20 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
     match Cli::parse().command {
         // Read-only: never gates, never locks.
         Command::Describe(args) => describe::describe(&args.deployment_dir, args.json).await,
-        Command::Plan(args) => plan::plan(&platform, &args.deployment_dir).await,
+        Command::Infra(InfraCommand::Plan(args)) => {
+            plan::plan(&platform, &args.deployment_dir).await
+        }
         // Mutating verbs run under the deployment's operation lock (Req 11).
         // `rollback` holds one continuous lock across its whole sequence (12.2).
         Command::Init(args) => {
             let dir = args.deployment_dir;
             lock::with_operation_lock(&dir, "init", || init::init(&platform, &dir)).await
         }
-        Command::Apply(args) => {
+        Command::Infra(InfraCommand::Apply(args)) => {
             let dir = args.deployment_dir;
             lock::with_operation_lock(&dir, "apply", || apply::apply(&platform, &dir)).await
         }
-        Command::Destroy(args) => {
+        Command::Infra(InfraCommand::Destroy(args)) => {
             let dir = args.deployment_dir;
             let yes = args.yes;
             lock::with_operation_lock(&dir, "destroy", || destroy::destroy(&platform, &dir, yes))

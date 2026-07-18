@@ -234,29 +234,34 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
 /// Map a `tkr infra` action to the `tkp` verb (+ args) the launcher forwards for a
 /// `.tkd`/forwarded deployment. `tkp`'s surface is currently flat (`tkp plan`);
 /// once it is namespaced (`tkp infra plan`) this maps to the namespaced form.
-fn forwarded_infra_verb(action: &InfraAction) -> (&'static str, Vec<String>) {
+/// Map a `tkr infra` action to the forwarded `tkp` verb tokens — the same
+/// namespaced words the operator typed (`tkr infra plan` → `tkp infra plan`),
+/// so forwarding is a transparent pass-through (Req 7.3).
+fn forwarded_infra_verb(action: &InfraAction) -> (&'static [&'static str], Vec<String>) {
     match action {
-        InfraAction::Plan { .. } => ("plan", Vec::new()),
-        InfraAction::Apply { .. } => ("apply", Vec::new()),
+        InfraAction::Plan { .. } => (&["infra", "plan"], Vec::new()),
+        InfraAction::Apply { .. } => (&["infra", "apply"], Vec::new()),
         InfraAction::Destroy { yes, .. } => (
-            "destroy",
+            &["infra", "destroy"],
             if *yes {
                 vec!["--yes".to_string()]
             } else {
                 Vec::new()
             },
         ),
-        InfraAction::Status => ("describe", Vec::new()),
+        InfraAction::Status => (&["describe"], Vec::new()),
     }
 }
 
-/// Map a `tkr deploy` action to the forwarded `tkp` verb. compose-syn models its
-/// containers as infra resources, so `deploy` maps to the same lifecycle verbs.
-fn forwarded_deploy_verb(action: &DeployAction) -> (&'static str, Vec<String>) {
+/// Map a `tkr deploy` action to the forwarded `tkp` verb tokens. compose-syn
+/// models its containers as infra resources, so `deploy` still aliases the
+/// `infra` verbs; the dedicated `tkp deploy plan|apply` surface (task 15.3)
+/// takes over once the seam realizes it.
+fn forwarded_deploy_verb(action: &DeployAction) -> (&'static [&'static str], Vec<String>) {
     match action {
-        DeployAction::Plan => ("plan", Vec::new()),
-        DeployAction::Apply { .. } => ("apply", Vec::new()),
-        DeployAction::Status => ("describe", Vec::new()),
+        DeployAction::Plan => (&["infra", "plan"], Vec::new()),
+        DeployAction::Apply { .. } => (&["infra", "apply"], Vec::new()),
+        DeployAction::Status => (&["describe"], Vec::new()),
     }
 }
 

@@ -109,7 +109,7 @@ pub(crate) async fn run(
             } else {
                 Vec::new()
             };
-            launcher::launch(&dir, "describe", &extra).await?;
+            launcher::launch(&dir, &["describe"], &extra).await?;
         }
         DeploymentAction::Apply => {
             let dir = deployments.resolve_dir(selected)?;
@@ -117,11 +117,11 @@ pub(crate) async fn run(
         }
         DeploymentAction::Upgrade => {
             let dir = deployments.resolve_dir(selected)?;
-            launcher::launch(&dir, "upgrade", &[]).await?;
+            launcher::launch(&dir, &["upgrade"], &[]).await?;
         }
         DeploymentAction::Rollback => {
             let dir = deployments.resolve_dir(selected)?;
-            launcher::launch(&dir, "rollback", &[]).await?;
+            launcher::launch(&dir, &["rollback"], &[]).await?;
         }
     }
     Ok(())

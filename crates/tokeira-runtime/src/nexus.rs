@@ -16,8 +16,8 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    Command, Link, LoadedRun, NexusOperationResolvedRequest, NexusOperationRetryRequest,
-    NexusResolution, NexusTimeoutType, PendingNexusOperation,
+    Command, Link, LoadedRun, NexusCancellationRetryRequest, NexusOperationResolvedRequest,
+    NexusOperationRetryRequest, NexusResolution, NexusTimeoutType, PendingNexusOperation,
 };
 use tokeira_storage::RunRepository;
 use tokeira_types::{NamespaceId, Payload, Payloads, RunKey, ShardId, TaskQueueName};
@@ -148,6 +148,33 @@ pub enum NexusStartResult {
     },
 }
 
+/// Classified result of one External-endpoint `CancelOperation` call.
+///
+/// Transport failures remain the trait's outer `Err` and are retryable. HTTP
+/// responses are returned here so the runtime can durably record success,
+/// retryable backoff, or terminal failure without making the kernel understand
+/// HTTP statuses or headers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NexusCancelResult {
+    /// The handler acknowledged the cancellation request with `202 Accepted`.
+    Succeeded,
+    /// A mapped Nexus handler error.
+    HandlerError {
+        /// Nexus handler-error type derived from the status.
+        error_type: String,
+        /// Decoded Nexus failure body when present.
+        failure: Option<NexusHttpFailureBody>,
+        /// Status/header-derived retry decision.
+        retryable: bool,
+    },
+    /// An HTTP status outside the Nexus handler-error mapping. v1.31.0 treats
+    /// this as a retryable unexpected-response call error.
+    UnexpectedResponse {
+        /// Diagnostic error text retained in attempt state.
+        message: String,
+    },
+}
+
 /// A Nexus failure decoded from an External handler's HTTP error response body (the JSON
 /// `nexus.Failure` shape: message + metadata + raw JSON details). Carries enough to rebuild
 /// the caller's `NexusOperationError -> HandlerError -> ApplicationError` chain faithfully,
@@ -203,10 +230,6 @@ pub trait NexusHttpClient: Send + Sync {
     /// operation **name** (not tokeira's operation id) is required — the caller
     /// resolves it from the pending operation. `operation_token` is sent as the
     /// `Nexus-Operation-Token` header (`handle.go @ v1.31.0`).
-    ///
-    /// NOTE (deferred): cancel-request *retry* and the `NexusOperationCancelRequest`
-    /// {Failed,Completed} history-event lifecycle are not modelled here yet; this
-    /// is a single best-effort attempt (Req 5.3 + the cancel-lifecycle follow-up).
     async fn cancel_operation(
         &self,
         address: &str,
@@ -214,7 +237,7 @@ pub trait NexusHttpClient: Send + Sync {
         operation: &str,
         operation_token: &str,
         trace_headers: &[KeyValue],
-    ) -> Result<()>;
+    ) -> Result<NexusCancelResult>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -648,6 +671,10 @@ pub enum NexusTaskCorrelation {
         operation_id: String,
         /// Scheduled-event fence for stale-result rejection.
         scheduled_event_id: i64,
+        /// Whether this delivery attempts to start or cancel the operation. Failed
+        /// worker responses do not echo a response variant, so the private route
+        /// retains this distinction for correct lifecycle handling.
+        task_kind: NexusWorkflowTaskKind,
     },
     /// Deliver one worker response to the caller-facing HTTP request that
     /// synchronously dispatched this task.
@@ -655,6 +682,15 @@ pub enum NexusTaskCorrelation {
         /// Opaque ID understood only by the edge-owned waiter registry.
         waiter_id: String,
     },
+}
+
+/// Kind of workflow-originated Nexus delivery retained in private correlation state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NexusWorkflowTaskKind {
+    /// `StartOperation` invocation.
+    StartOperation,
+    /// `CancelOperation` invocation.
+    CancelOperation,
 }
 
 /// Routes an async Nexus completion back to the originator's pending operation.
@@ -1022,6 +1058,18 @@ impl NexusTaskBroker {
         scheduled_event_id: i64,
         request: NexusTaskRequest,
     ) {
+        let task_kind = match &request {
+            NexusTaskRequest::StartOperation { .. } => NexusWorkflowTaskKind::StartOperation,
+            NexusTaskRequest::CancelOperation { .. } => NexusWorkflowTaskKind::CancelOperation,
+            NexusTaskRequest::Http(request) => match request.variant {
+                NexusHttpTaskRequestVariant::StartOperation { .. } => {
+                    NexusWorkflowTaskKind::StartOperation
+                }
+                NexusHttpTaskRequestVariant::CancelOperation { .. } => {
+                    NexusWorkflowTaskKind::CancelOperation
+                }
+            },
+        };
         let task_id = uuid::Uuid::new_v4().to_string();
         let token = NexusTaskToken {
             namespace_id: namespace_id.0.to_string(),
@@ -1036,6 +1084,7 @@ impl NexusTaskBroker {
                 run_key,
                 operation_id,
                 scheduled_event_id,
+                task_kind,
             },
         );
         inner
@@ -1273,7 +1322,7 @@ impl NexusHttpClient for NoopNexusHttpClient {
         _operation: &str,
         _operation_token: &str,
         _trace_headers: &[KeyValue],
-    ) -> Result<()> {
+    ) -> Result<NexusCancelResult> {
         Err(anyhow!("nexus http client not configured"))
     }
 }
@@ -1711,6 +1760,40 @@ pub(crate) async fn scan_nexus_timeouts_once<R>(
                     .await;
                 submitted += 1;
             }
+            if operation
+                .cancellation
+                .as_ref()
+                .and_then(|cancellation| {
+                    cancellation
+                        .next_attempt_at
+                        .map(|next| (cancellation.requested_event_id, next))
+                })
+                .is_some_and(|(_, next)| now >= next)
+                && submitted < config.max_timeouts_per_scan
+            {
+                let requested_event_id = operation
+                    .cancellation
+                    .as_ref()
+                    .map(|cancellation| cancellation.requested_event_id)
+                    .unwrap_or_default();
+                runtime_metrics::record_scanner_dispatched(
+                    "nexus_cancel_retry",
+                    shard_id.map(|s| s.0).unwrap_or(0),
+                );
+                let lane = pick_lane_for_run_key(lanes, lane_count, entry.run_key).clone();
+                let _ = lane
+                    .submit(
+                        entry.run_key,
+                        Command::NexusCancellationRetry(NexusCancellationRetryRequest {
+                            operation_id: entry.operation_id.clone(),
+                            scheduled_event_id: entry.scheduled_event_id,
+                            requested_event_id,
+                            now,
+                        }),
+                    )
+                    .await;
+                submitted += 1;
+            }
             continue;
         };
 
@@ -1888,6 +1971,7 @@ mod tests {
                         run_key: first_run,
                         operation_id: first_operation,
                         scheduled_event_id: 1,
+                        task_kind: NexusWorkflowTaskKind::CancelOperation,
                     })
                 );
                 prop_assert_eq!(broker.consume(&first.token.task_id).await, None);
@@ -1897,6 +1981,7 @@ mod tests {
                         run_key: second_run,
                         operation_id: second_operation,
                         scheduled_event_id: 2,
+                        task_kind: NexusWorkflowTaskKind::CancelOperation,
                     })
                 );
                 Ok(())
@@ -1963,6 +2048,7 @@ mod tests {
                         run_key,
                         operation_id,
                         scheduled_event_id: 7,
+                        task_kind: NexusWorkflowTaskKind::CancelOperation,
                     })
                 );
                 prop_assert_eq!(

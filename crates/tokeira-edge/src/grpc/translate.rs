@@ -3584,6 +3584,39 @@ fn pending_nexus_operation_to_proto(
         schedule_to_start_timeout: op.schedule_to_start_timeout.map(to_proto_duration),
         start_to_close_timeout: op.start_to_close_timeout.map(to_proto_duration),
         operation_token,
+        cancellation_info: op.cancellation.as_ref().map(|cancellation| {
+            let state = match cancellation.state {
+                tokeira_kernel::NexusOperationCancellationState::Unspecified => {
+                    enums::NexusOperationCancellationState::Unspecified
+                }
+                tokeira_kernel::NexusOperationCancellationState::Scheduled => {
+                    enums::NexusOperationCancellationState::Scheduled
+                }
+                tokeira_kernel::NexusOperationCancellationState::BackingOff => {
+                    enums::NexusOperationCancellationState::BackingOff
+                }
+                tokeira_kernel::NexusOperationCancellationState::Succeeded => {
+                    enums::NexusOperationCancellationState::Succeeded
+                }
+                tokeira_kernel::NexusOperationCancellationState::Failed => {
+                    enums::NexusOperationCancellationState::Failed
+                }
+            };
+            workflow::NexusOperationCancellationInfo {
+                requested_time: cancellation.requested_time.map(to_proto_timestamp),
+                state: state as i32,
+                attempt: cancellation.attempt as i32,
+                last_attempt_complete_time: cancellation
+                    .last_attempt_complete_time
+                    .map(to_proto_timestamp),
+                last_attempt_failure: cancellation
+                    .last_attempt_failure
+                    .as_ref()
+                    .map(payload_to_failure),
+                next_attempt_schedule_time: cancellation.next_attempt_at.map(to_proto_timestamp),
+                ..Default::default()
+            }
+        }),
         ..Default::default()
     }
 }

@@ -1261,6 +1261,7 @@ mod tests {
                     next_attempt_at: None,
                     operation_token: String::new(),
                     input: Default::default(),
+                    cancellation: None,
                 };
                 t.next_state
                     .pending_nexus_operations

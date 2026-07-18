@@ -35,6 +35,7 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use opentelemetry::KeyValue;
 use percent_encoding::percent_decode_str;
+use prost::Message as _;
 use serde::Deserialize;
 use time::Duration;
 use tokeira_kernel::{Link, LinkWorkflowEventReference};
@@ -42,7 +43,7 @@ use tokeira_types::{Payload, Payloads};
 use url::Url;
 
 use crate::nexus::{
-    CompletionDeliveryOutcome, NEXUS_OPERATION_STATE_HEADER, NexusCompletion,
+    CompletionDeliveryOutcome, NEXUS_OPERATION_STATE_HEADER, NexusCancelResult, NexusCompletion,
     NexusCompletionClient, NexusHttpClient, NexusHttpFailureBody, NexusStartResult,
     TEMPORAL_CALLBACK_TOKEN_HEADER,
 };
@@ -66,6 +67,12 @@ const NEXUS_REQUEST_TIMEOUT: Duration = Duration::seconds(10);
 /// Minimum remaining budget below which a request is not made: a non-retryable timeout is
 /// returned instead of dispatching (v1.31.0 `MinRequestTimeout`, `config.go:20-24 @ v1.31.0`).
 const NEXUS_MIN_REQUEST_TIMEOUT: Duration = Duration::milliseconds(1500);
+/// Maximum Nexus response-body and successful-result payload size. Temporal caps the raw
+/// response at `MaxNexusAPIRequestBodyBytes`, then applies the namespace blob-size error
+/// limit to the decoded public protobuf `Payload`; both defaults are 2 MiB in v1.31.0
+/// (`common/rpc/grpc.go:34-37`, `common/dynamicconfig/constants.go:316-321`, and
+/// `components/nexusoperations/executors.go:313-316 @ v1.31.0`).
+const NEXUS_RESPONSE_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 /// `nexus-operation-state` header on a completion `POST` (`headerOperationState`,
 /// `common/nexus/nexusrpc/api.go:23 @ v1.31.0`). Aliases the public protocol const so
 /// the firing client and the inbound `/nexus/callback` server share one source of truth.
@@ -208,22 +215,17 @@ impl NexusHttpClient for HttpNexusClient {
             .map(str::to_owned);
 
         if status.as_u16() == 200 {
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| anyhow!("nexus start: reading 200 body failed: {e}"))?;
-            return Ok(NexusStartResult::SyncCompleted {
-                result: body_to_payloads(&bytes, response_content_type.as_deref()),
-                links,
-            });
+            let bytes =
+                read_response_body_limited(response, "nexus start: reading 200 body").await?;
+            let result = body_to_payloads(&bytes, response_content_type.as_deref());
+            ensure_successful_payload_size(&result)?;
+            return Ok(NexusStartResult::SyncCompleted { result, links });
         }
 
         match status.as_u16() {
             201 => {
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| anyhow!("nexus start: reading 201 body failed: {e}"))?;
+                let bytes =
+                    read_response_body_limited(response, "nexus start: reading 201 body").await?;
                 let info: OperationInfo = serde_json::from_slice(&bytes).map_err(|e| {
                     anyhow!("nexus start: 201 body is not OperationInfo json: {e} (content-type {response_content_type:?})")
                 })?;
@@ -244,7 +246,9 @@ impl NexusHttpClient for HttpNexusClient {
                 })
             }
             STATUS_OPERATION_UNSUCCESSFUL => {
-                let bytes = response.bytes().await.unwrap_or_default();
+                let bytes =
+                    read_response_body_limited(response, "nexus start: reading unsuccessful body")
+                        .await?;
                 Ok(NexusStartResult::SyncFailed {
                     message: failure_message(&bytes)
                         .unwrap_or_else(|| "nexus operation failed".to_owned()),
@@ -256,7 +260,9 @@ impl NexusHttpClient for HttpNexusClient {
                 // caller's operation as failed AND tags `nexus_outbound_requests` with
                 // `handler-error:<TYPE>` (`startCallOutcomeTag @ v1.31.0`). A single
                 // attempt only — no retry classification here (Req 5.3).
-                let bytes = response.bytes().await.unwrap_or_default();
+                let bytes =
+                    read_response_body_limited(response, "nexus start: reading handler error body")
+                        .await?;
                 // The body is a JSON `nexus.Failure` ({message, metadata, details}) when the
                 // handler returned one; decode it (best-effort) so the caller's error chain
                 // can be rehydrated. A non-JSON body just yields None.
@@ -276,7 +282,7 @@ impl NexusHttpClient for HttpNexusClient {
         operation: &str,
         operation_token: &str,
         trace_headers: &[KeyValue],
-    ) -> Result<()> {
+    ) -> Result<NexusCancelResult> {
         // `serviceBaseURL.JoinPath(escape(service), escape(operation), "cancel")`
         // with the token in the `Nexus-Operation-Token` header
         // (`handle.go:25-30 @ v1.31.0`).
@@ -300,18 +306,42 @@ impl NexusHttpClient for HttpNexusClient {
             .await
             .map_err(|e| anyhow!("nexus cancel request failed: {e}"))?;
 
-        // v1.31.0 treats anything other than 202 Accepted as a handler error
-        // (`handle.go:45 @ v1.31.0`).
-        if response.status().as_u16() != 202 {
-            let status = response.status();
-            let bytes = response.bytes().await.unwrap_or_default();
-            bail!(
-                "nexus cancel: unexpected status {}: {}",
-                status,
-                String::from_utf8_lossy(&bytes)
-            );
+        let status = response.status();
+        let code = status.as_u16();
+        if code == 202 {
+            return Ok(NexusCancelResult::Succeeded);
         }
-        Ok(())
+
+        // A mapped HandlerError's default retryability may be overridden by the
+        // Nexus response header. Unmapped statuses become retryable
+        // UnexpectedResponseError values and ignore the header
+        // (`defaultErrorFromResponse` + `retryBehaviorFromHeader`,
+        // common/nexus/nexusrpc/client.go:392-468 @ v1.31.0).
+        let retry_override = response
+            .headers()
+            .get(HEADER_RETRYABLE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| match value.to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            });
+        let bytes =
+            read_response_body_limited(response, "nexus cancel: reading error body").await?;
+        let failure = serde_json::from_slice::<NexusHttpFailureBody>(&bytes).ok();
+        match mapped_handler_error_retryable(code) {
+            Some(default) => Ok(NexusCancelResult::HandlerError {
+                error_type: handler_error_type_for_status(code).to_string(),
+                failure,
+                retryable: retry_override.unwrap_or(default),
+            }),
+            None => Ok(NexusCancelResult::UnexpectedResponse {
+                message: format!(
+                    "nexus cancel: unexpected status {status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                ),
+            }),
+        }
     }
 }
 
@@ -643,7 +673,6 @@ fn payload_to_body(input: &Payloads) -> (Vec<u8>, Option<String>) {
 /// Proto-marshal a tokeira `Payload` as a `temporal.api.common.v1.Payload` — the
 /// `application/x-temporal-payload` fallback body (`xTemporalPayload @ v1.31.0`).
 fn x_temporal_payload_bytes(payload: &Payload) -> Vec<u8> {
-    use prost::Message;
     let proto = tokeira_proto::common::Payload {
         metadata: payload
             .metadata
@@ -654,6 +683,41 @@ fn x_temporal_payload_bytes(payload: &Payload) -> Vec<u8> {
         ..Default::default()
     };
     proto.encode_to_vec()
+}
+
+/// Read a Nexus response without allowing a handler to make the runtime buffer an
+/// unbounded body. The error text is part of Temporal's observable terminal failure
+/// (`components/nexusoperations/response_size_limiter.go @ v1.31.0`).
+async fn read_response_body_limited(
+    mut response: reqwest::Response,
+    context: &'static str,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| anyhow!("{context} failed: {error}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > NEXUS_RESPONSE_SIZE_LIMIT {
+            bail!("http: response body too large");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Enforce the per-event blob limit on the client-visible protobuf payload rather
+/// than its raw HTTP bytes. Content-type metadata contributes to protobuf size, which
+/// is why a response just below the raw 2 MiB cap can still fail in v1.31.0
+/// (`components/nexusoperations/executors.go:313-316 @ v1.31.0`).
+fn ensure_successful_payload_size(result: &Payloads) -> Result<()> {
+    if result.0.iter().any(|payload| {
+        tokeira_proto::conversions::common::payload_from_domain(payload).encoded_len()
+            > NEXUS_RESPONSE_SIZE_LIMIT
+    }) {
+        bail!("http: response body too large");
+    }
+    Ok(())
 }
 
 /// Decode a sync (200) result body into `Payloads`, mirroring
@@ -1075,6 +1139,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_sync_rejects_result_whose_public_payload_exceeds_blob_limit() {
+        // The raw body is deliberately below 2 MiB. Its `encoding=json/plain`
+        // metadata pushes the public protobuf Payload over the limit, matching the
+        // Tier 7.37 corpus boundary case.
+        let body = "x".repeat(NEXUS_RESPONSE_SIZE_LIMIT - 10);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let base = serve_once(Box::leak(response.into_boxed_str())).await;
+        let client = HttpNexusClient::new();
+        let error = client
+            .start_operation(
+                &base,
+                "req-oversized-payload",
+                "service",
+                "operation",
+                &empty_input(),
+                None,
+                &[],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "http: response body too large");
+    }
+
+    #[tokio::test]
+    async fn start_sync_rejects_raw_response_over_transport_limit() {
+        let body = "x".repeat(NEXUS_RESPONSE_SIZE_LIMIT + 1);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let base = serve_once(Box::leak(response.into_boxed_str())).await;
+        let client = HttpNexusClient::new();
+        let error = client
+            .start_operation(
+                &base,
+                "req-oversized-body",
+                "service",
+                "operation",
+                &empty_input(),
+                None,
+                &[],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "http: response body too large");
+    }
+
+    #[tokio::test]
     async fn start_async_201_yields_accepted_with_token() {
         let response = "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"token\":\"tok-1\",\"state\":\"running\"}";
         let base = serve_once(response).await;
@@ -1127,21 +1244,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_202_is_ok_and_non_202_errors() {
+    async fn cancel_classifies_success_and_handler_errors() {
         let base = serve_once("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").await;
         let client = HttpNexusClient::new();
-        client
+        let result = client
             .cancel_operation(&base, "service", "operation", "tok-1", &[])
             .await
             .unwrap();
+        assert_eq!(result, NexusCancelResult::Succeeded);
 
         let base =
             serve_once("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n").await;
-        assert!(
+        assert_eq!(
             client
                 .cancel_operation(&base, "service", "operation", "tok-1", &[])
                 .await
-                .is_err()
+                .unwrap(),
+            NexusCancelResult::HandlerError {
+                error_type: "INTERNAL".to_string(),
+                failure: None,
+                retryable: true,
+            }
+        );
+
+        let base = serve_once(
+            "HTTP/1.1 400 Bad Request\r\nNexus-Request-Retryable: false\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"message\":\"bad\"}",
+        )
+        .await;
+        assert_eq!(
+            client
+                .cancel_operation(&base, "service", "operation", "tok-1", &[])
+                .await
+                .unwrap(),
+            NexusCancelResult::HandlerError {
+                error_type: "BAD_REQUEST".to_string(),
+                failure: Some(NexusHttpFailureBody {
+                    message: "bad".to_string(),
+                    ..Default::default()
+                }),
+                retryable: false,
+            }
         );
     }
 

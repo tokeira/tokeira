@@ -1848,6 +1848,8 @@ where
                 let most_recent_worker_version_stamp = versioning_info
                     .as_ref()
                     .and_then(|info| info.most_recent_worker_version_stamp.clone());
+                let pending_nexus_operations =
+                    tokeira_edge::translate::describe_pending_nexus_operations(&state);
                 let mut search_attributes = state.search_attributes;
                 apply_reported_problem_search_attribute(&mut search_attributes, reported_problem);
                 if let Some(build_ids) = versioning_info
@@ -1986,29 +1988,7 @@ where
                         }
                     }),
                     callbacks: state.completion_callbacks.clone(),
-                    pending_nexus_operations: state
-                        .pending_nexus_operations
-                        .values()
-                        .map(|operation| {
-                            tokeira_edge::translate::PendingNexusOperationDescription {
-                                endpoint: operation.endpoint.clone(),
-                                service: operation.service.clone(),
-                                operation: operation.operation.clone(),
-                                scheduled_time: operation.scheduled_at,
-                                scheduled_event_id: operation.scheduled_event_id,
-                                schedule_to_close_timeout: operation.schedule_to_close_timeout,
-                                schedule_to_start_timeout: operation.schedule_to_start_timeout,
-                                start_to_close_timeout: operation.start_to_close_timeout,
-                                started: operation.started,
-                                operation_token: operation
-                                    .started
-                                    .then(|| operation.operation_id.clone()),
-                                attempt: operation.attempt,
-                                last_attempt_failure: operation.last_attempt_failure.clone(),
-                                next_attempt_at: operation.next_attempt_at,
-                            }
-                        })
-                        .collect(),
+                    pending_nexus_operations,
                     pause_info: state.pause_info.as_ref().map(|info| {
                         tokeira_edge::translate::PauseInfoDescription {
                             identity: info.identity.clone(),

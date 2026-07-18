@@ -19,8 +19,9 @@ use tokeira_kernel::{
     ChildStartConfirmedRequest, ChildStartResult, Command, CompletionCallback,
     CompletionCallbackAttemptedRequest, DispatchOp, ExternalCancelResolvedRequest,
     ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, LoadedRun, SignalRequest, StartRequest, TerminateRequest,
-    callback_completion_outcome,
+    ExternalWorkflowExecution, LoadedRun, NexusCancellationAttemptOutcome,
+    NexusCancellationAttemptedRequest, PendingNexusOperation, SignalRequest, StartRequest,
+    TerminateRequest, callback_completion_outcome,
 };
 use tokeira_proto::{
     conversions::common::{failure_to_payload, payloads_from_domain},
@@ -44,11 +45,11 @@ use crate::{
     nexus::{
         CompletionCallbackScannerConfig, CompletionCallbackTrackingEntry,
         CompletionCallbackTrackingState, CompletionDeliveryOutcome, EndpointTarget,
-        NexusCompletion, NexusCompletionClient, NexusCompletionFailureBody,
+        NexusCancelResult, NexusCompletion, NexusCompletionClient, NexusCompletionFailureBody,
         NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusHttpClient, NexusHttpFailureBody,
         NexusNamespaceResolver, NexusStartResult, NexusTaskBroker, NexusTaskRequest,
         NexusTimeoutEntry, NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL,
-        TEMPORAL_CALLBACK_TOKEN_HEADER, nexus_completion_backoff,
+        TEMPORAL_CALLBACK_TOKEN_HEADER, nexus_completion_backoff, nexus_operation_next_attempt_at,
     },
     scanner::pick_lane_for_run_key,
     shard::{ShardOwner, shard_for},
@@ -212,7 +213,7 @@ where
         injector.values
     }
 
-    /// Record the External-endpoint outbound StartOperation metric
+    /// Record an External-endpoint outbound Nexus request metric
     /// (`nexus_outbound_requests` + `_latency`), resolving the originator namespace *name*
     /// via the injected resolver (the publisher holds only the [`RunKey`]/[`NamespaceId`]).
     /// A no-op when no resolver is wired (unit harnesses) or the namespace cannot be
@@ -221,6 +222,7 @@ where
     async fn record_external_outbound_metric(
         &self,
         originator_run_key: RunKey,
+        method: &str,
         outcome: &str,
         latency: std::time::Duration,
     ) {
@@ -236,13 +238,8 @@ where
             return;
         };
         // External endpoints are not worker-via-frontend, so the failure source is unset.
-        runtime_metrics::record_nexus_outbound_request(
-            &namespace,
-            "StartOperation",
-            "_unknown_",
-            outcome,
-        );
-        runtime_metrics::record_nexus_outbound_latency(&namespace, "StartOperation", latency);
+        runtime_metrics::record_nexus_outbound_request(&namespace, method, "_unknown_", outcome);
+        runtime_metrics::record_nexus_outbound_latency(&namespace, method, latency);
     }
 
     /// Resolve a namespace id to its registered NAME for metric labelling (M.1)
@@ -966,28 +963,17 @@ where
                         }
                         Err(_) => "unknown-error".to_string(),
                     };
-                    self.record_external_outbound_metric(originator_run_key, &outcome, latency)
-                        .await;
+                    self.record_external_outbound_metric(
+                        originator_run_key,
+                        "StartOperation",
+                        &outcome,
+                        latency,
+                    )
+                    .await;
 
                     // SyncFailed (operation-unsuccessful), HandlerError, and a transport
                     // Err all resolve the caller's operation as failed; only the metric
                     // outcome distinguishes them (single attempt, no retry — Req 5.3).
-                    let failed_from_message =
-                        |message: String| tokeira_kernel::NexusResolution::Failed {
-                            failure: failure_to_payload(&failure_proto::Failure {
-                                message,
-                                failure_info: Some(
-                                    failure_proto::failure::FailureInfo::ApplicationFailureInfo(
-                                        failure_proto::ApplicationFailureInfo {
-                                            r#type: "NexusOperationFailure".to_string(),
-                                            non_retryable: false,
-                                            ..Default::default()
-                                        },
-                                    ),
-                                ),
-                                ..Default::default()
-                            }),
-                        };
                     match start_result {
                         Ok(NexusStartResult::SyncCompleted { result, links }) => {
                             tokeira_kernel::NexusResolution::Completed { result, links }
@@ -1000,7 +986,15 @@ where
                             links,
                         },
                         Ok(NexusStartResult::SyncFailed { message }) => {
-                            failed_from_message(message)
+                            terminal_nexus_call_failure_resolution(
+                                message,
+                                "NexusOperationFailure",
+                                false,
+                                &endpoint_name,
+                                &service,
+                                &operation,
+                                scheduled_event_id,
+                            )
                         }
                         Ok(NexusStartResult::HandlerError {
                             error_type,
@@ -1013,7 +1007,15 @@ where
                             &operation,
                             scheduled_event_id,
                         ),
-                        Err(error) => failed_from_message(error.to_string()),
+                        Err(error) => terminal_nexus_call_failure_resolution(
+                            error.to_string(),
+                            "CallError",
+                            true,
+                            &endpoint_name,
+                            &service,
+                            &operation,
+                            scheduled_event_id,
+                        ),
                     }
                 }
                 EndpointTarget::Worker {
@@ -1133,118 +1135,138 @@ where
         endpoint_name: String,
         service: String,
         scheduled_event_id: i64,
+        requested_event_id: i64,
     ) {
+        let pending = match self
+            .lookup_nexus_operation(originator_run_key, &operation_id)
+            .await
+        {
+            Ok(Some(pending)) => pending,
+            Ok(None) => {
+                tracing::debug!(
+                    originator_run_key = ?originator_run_key,
+                    operation_id,
+                    "cancel nexus operation became stale before dispatch"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    originator_run_key = ?originator_run_key,
+                    operation_id,
+                    "cancel nexus operation failed to load pending state"
+                );
+                return;
+            }
+        };
+        if pending.scheduled_event_id != scheduled_event_id {
+            tracing::debug!(
+                operation_id,
+                scheduled_event_id,
+                current_scheduled_event_id = pending.scheduled_event_id,
+                "cancel nexus operation dispatch was stale"
+            );
+            return;
+        }
+
         let Some(config) = self.nexus_registry.resolve(&endpoint_name) else {
             tracing::warn!(
                 endpoint = endpoint_name,
                 operation_id,
-                "cancel nexus operation skipped: endpoint not found"
+                "cancel nexus operation endpoint not found"
             );
+            let failure =
+                call_error_failure(format!("nexus endpoint not found: {endpoint_name}"), true);
+            self.submit_nexus_cancellation_outcome(
+                originator_run_key,
+                &pending,
+                requested_event_id,
+                NexusCancellationAttemptOutcome::NonRetryableFailure {
+                    failure: failure_to_payload(&failure),
+                },
+            )
+            .await;
             return;
         };
 
         match &config.target {
             EndpointTarget::External { address } => {
-                // The cancel needs the operation *name* (not tokeira's operation id) and the
-                // handler-issued async token, both resolved from the pending op. The handler
-                // unmarshals the token (e.g. a WorkflowRunOperation token); fall back to
-                // tokeira's operation id only when the op never started (no handler token).
-                let (operation, operation_token) = match self
-                    .lookup_nexus_operation_cancel_target(originator_run_key, &operation_id)
-                    .await
-                {
-                    Ok(Some((operation, token))) => (operation, token),
-                    Ok(None) => {
-                        tracing::warn!(
-                            originator_run_key = ?originator_run_key,
-                            operation_id,
-                            "cancel nexus operation skipped: pending operation not found"
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            ?error,
-                            operation_id,
-                            "cancel nexus operation skipped: failed to load run"
-                        );
-                        return;
-                    }
-                };
-                let cancel_token = if operation_token.is_empty() {
-                    operation_id.clone()
-                } else {
-                    operation_token
-                };
                 let trace_headers = self.nexus_trace_headers();
-                match self
+                let started_at = std::time::Instant::now();
+                let result = self
                     .nexus_client
-                    .cancel_operation(address, &service, &operation, &cancel_token, &trace_headers)
-                    .await
-                {
-                    Ok(()) => {
-                        // A successful cancel request is only an ack; it must NOT resolve the
-                        // operation. v1.31.0 decouples cancel-ack from resolution — the
-                        // operation resolves via its completion when the handler closes it
-                        // (EventCancelationSucceeded only advances the cancelation sub-machine,
-                        // statemachine.go:671; a completion that already resolved the op wins,
-                        // statemachine.go:424). The inbound /nexus/callback delivers that
-                        // completion.
-                        tracing::debug!(
-                            originator_run_key = ?originator_run_key,
-                            scheduled_event_id,
-                            "nexus cancel request acked; awaiting completion to resolve the operation"
-                        );
+                    .cancel_operation(
+                        address,
+                        &service,
+                        &pending.operation,
+                        &pending.operation_token,
+                        &trace_headers,
+                    )
+                    .await;
+                let latency = started_at.elapsed();
+                let metric_outcome = match &result {
+                    Ok(NexusCancelResult::Succeeded) => "successful".to_string(),
+                    Ok(NexusCancelResult::HandlerError { error_type, .. }) => {
+                        format!("handler-error:{error_type}")
                     }
-                    Err(error) => {
-                        tracing::debug!(
-                            ?error,
-                            operation_id,
-                            endpoint = endpoint_name,
-                            "cancel nexus operation failed (treating as no-op)"
-                        );
+                    Ok(NexusCancelResult::UnexpectedResponse { .. }) | Err(_) => {
+                        "unknown-error".to_string()
                     }
-                }
+                };
+                self.record_external_outbound_metric(
+                    originator_run_key,
+                    "CancelOperation",
+                    &metric_outcome,
+                    latency,
+                )
+                .await;
+
+                let now = OffsetDateTime::now_utc();
+                let outcome = match result {
+                    Ok(NexusCancelResult::Succeeded) => NexusCancellationAttemptOutcome::Succeeded,
+                    Ok(NexusCancelResult::HandlerError {
+                        error_type,
+                        failure,
+                        retryable,
+                    }) => cancellation_failure_outcome(
+                        &pending,
+                        external_handler_failure(&error_type, failure.as_ref()),
+                        retryable,
+                        now,
+                    ),
+                    Ok(NexusCancelResult::UnexpectedResponse { message }) => {
+                        cancellation_failure_outcome(
+                            &pending,
+                            call_error_failure(message, false),
+                            true,
+                            now,
+                        )
+                    }
+                    Err(error) => cancellation_failure_outcome(
+                        &pending,
+                        call_error_failure(error.to_string(), false),
+                        true,
+                        now,
+                    ),
+                };
+                self.submit_nexus_cancellation_outcome(
+                    originator_run_key,
+                    &pending,
+                    requested_event_id,
+                    outcome,
+                )
+                .await;
             }
             EndpointTarget::Worker {
                 namespace_id,
                 task_queue,
             } => {
-                let (operation, operation_token) = match self
-                    .lookup_nexus_operation_cancel_target(originator_run_key, &operation_id)
-                    .await
-                {
-                    Ok(Some((operation, token))) => (operation, token),
-                    Ok(None) => {
-                        tracing::warn!(
-                            originator_run_key = ?originator_run_key,
-                            operation_id,
-                            "cancel nexus operation skipped: pending operation not found"
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            ?error,
-                            originator_run_key = ?originator_run_key,
-                            operation_id,
-                            "cancel nexus operation skipped: failed to load pending operation"
-                        );
-                        return;
-                    }
-                };
-                // The handler unmarshals the async token (e.g. a WorkflowRunOperation
-                // token); fall back to tokeira's operation id only for a not-yet-started op.
-                let cancel_token = if operation_token.is_empty() {
-                    operation_id.clone()
-                } else {
-                    operation_token
-                };
                 let request = NexusTaskRequest::CancelOperation {
                     service,
                     operation_id: operation_id.clone(),
-                    operation,
-                    operation_token: cancel_token,
+                    operation: pending.operation.clone(),
+                    operation_token: pending.operation_token.clone(),
                 };
                 self.nexus_broker
                     .publish_workflow(
@@ -1260,20 +1282,45 @@ where
         }
     }
 
-    /// The pending op's (operation name, handler async token) for a cancel dispatch. The
-    /// token is what a WorkflowRunOperation handler unmarshals; it is empty until the op
-    /// started, so callers fall back to tokeira's operation id.
-    async fn lookup_nexus_operation_cancel_target(
+    /// Load the authoritative pending operation used by a derived cancel dispatch.
+    async fn lookup_nexus_operation(
         &self,
         run_key: RunKey,
         operation_id: &str,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<Option<PendingNexusOperation>> {
         match self.repo.load_run(run_key).await? {
-            LoadedRun::Existing(state) => Ok(state
-                .pending_nexus_operations
-                .get(operation_id)
-                .map(|pending| (pending.operation.clone(), pending.operation_token.clone()))),
+            LoadedRun::Existing(state) => {
+                Ok(state.pending_nexus_operations.get(operation_id).cloned())
+            }
             LoadedRun::Absent => Ok(None),
+        }
+    }
+
+    /// Submit one already-classified cancellation attempt to the pure kernel. A stale
+    /// outcome is harmless: the scheduled/requested event fences reject it after the
+    /// operation or cancellation has advanced.
+    async fn submit_nexus_cancellation_outcome(
+        &self,
+        run_key: RunKey,
+        pending: &PendingNexusOperation,
+        requested_event_id: i64,
+        outcome: NexusCancellationAttemptOutcome,
+    ) {
+        let command = Command::NexusCancellationAttempted(NexusCancellationAttemptedRequest {
+            operation_id: pending.operation_id.clone(),
+            scheduled_event_id: pending.scheduled_event_id,
+            requested_event_id,
+            outcome,
+            now: OffsetDateTime::now_utc(),
+        });
+        if let Err(error) = self.pick_lane(run_key).submit(run_key, command).await {
+            tracing::debug!(
+                ?error,
+                run_key = ?run_key,
+                operation_id = pending.operation_id,
+                requested_event_id,
+                "nexus cancellation attempt outcome became stale"
+            );
         }
     }
 
@@ -1441,6 +1488,165 @@ where
     }
 }
 
+/// Wrap a terminal outbound-call failure in the caller-visible Nexus operation failure.
+/// v1.31.0 records the operation identity on the outer `NexusOperationFailureInfo` and
+/// the concrete call error as its cause (`handleNonRetryableStartOperationError` and
+/// `createNexusOperationFailure`, `components/nexusoperations/executors.go:533-560,
+/// 878-899 @ v1.31.0`). Keeping that nesting matters to SDKs and to the functional
+/// corpus, which reads the cause rather than the generic outer message.
+fn terminal_nexus_call_failure_resolution(
+    message: String,
+    cause_type: &str,
+    non_retryable: bool,
+    endpoint: &str,
+    service: &str,
+    operation: &str,
+    scheduled_event_id: i64,
+) -> tokeira_kernel::NexusResolution {
+    let cause = failure_proto::Failure {
+        message,
+        failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+            failure_proto::ApplicationFailureInfo {
+                r#type: cause_type.to_string(),
+                non_retryable,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let wrapped = failure_proto::Failure {
+        message: "nexus operation completed unsuccessfully".to_string(),
+        failure_info: Some(
+            failure_proto::failure::FailureInfo::NexusOperationExecutionFailureInfo(
+                failure_proto::NexusOperationFailureInfo {
+                    scheduled_event_id,
+                    endpoint: endpoint.to_string(),
+                    service: service.to_string(),
+                    operation: operation.to_string(),
+                    ..Default::default()
+                },
+            ),
+        ),
+        cause: Some(Box::new(cause)),
+        ..Default::default()
+    };
+
+    tokeira_kernel::NexusResolution::Failed {
+        failure: failure_to_payload(&wrapped),
+    }
+}
+
+/// Convert an untyped outbound call error to the public failure shape used by
+/// v1.31.0's `callErrToFailure`. Cancellation events store this direct failure;
+/// operation-terminal events wrap it separately in `NexusOperationFailureInfo`.
+fn call_error_failure(message: String, non_retryable: bool) -> failure_proto::Failure {
+    failure_proto::Failure {
+        message,
+        failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+            failure_proto::ApplicationFailureInfo {
+                r#type: "CallError".to_string(),
+                non_retryable,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+/// Convert an external Nexus handler error without adding the parent operation
+/// wrapper. This direct failure is what cancellation attempt state and
+/// `NexusOperationCancelRequestFailed` carry in v1.31.0.
+fn external_handler_failure(
+    error_type: &str,
+    failure: Option<&NexusHttpFailureBody>,
+) -> failure_proto::Failure {
+    let app_cause = failure.map(|body| {
+        let details = if body.metadata.is_empty() && body.details.is_null() {
+            None
+        } else {
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "message".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+            if !body.metadata.is_empty() {
+                object.insert(
+                    "metadata".to_string(),
+                    serde_json::to_value(&body.metadata).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            if !body.details.is_null() {
+                object.insert("details".to_string(), body.details.clone());
+            }
+            let data = serde_json::to_vec(&serde_json::Value::Object(object)).unwrap_or_default();
+            Some(payloads_from_domain(&Payloads(vec![Payload {
+                data,
+                metadata: std::collections::BTreeMap::from([(
+                    "encoding".to_string(),
+                    "json/plain".to_string(),
+                )]),
+                external_payloads: Vec::new(),
+            }])))
+        };
+        failure_proto::Failure {
+            message: body.message.clone(),
+            failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                failure_proto::ApplicationFailureInfo {
+                    r#type: "NexusFailure".to_string(),
+                    details,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    });
+
+    failure_proto::Failure {
+        message: failure.map(|body| body.message.clone()).unwrap_or_default(),
+        failure_info: Some(
+            failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(
+                failure_proto::NexusHandlerFailureInfo {
+                    r#type: error_type.to_string(),
+                    retry_behavior: 0,
+                },
+            ),
+        ),
+        cause: app_cause.map(Box::new),
+        ..Default::default()
+    }
+}
+
+/// Apply the runtime-owned retry decision to one cancellation call failure. The
+/// parent operation's schedule-to-close deadline remains the terminal cap; the
+/// kernel receives only the resulting deadline/outcome and performs no policy math.
+fn cancellation_failure_outcome(
+    pending: &PendingNexusOperation,
+    failure: failure_proto::Failure,
+    retryable: bool,
+    now: OffsetDateTime,
+) -> NexusCancellationAttemptOutcome {
+    let failure = failure_to_payload(&failure);
+    let failed_attempts = pending
+        .cancellation
+        .as_ref()
+        .map(|cancellation| cancellation.attempt)
+        .unwrap_or_default();
+    if retryable
+        && let Some(next_attempt_at) = nexus_operation_next_attempt_at(
+            failed_attempts,
+            pending.scheduled_at,
+            pending.schedule_to_close_timeout,
+            now,
+        )
+    {
+        return NexusCancellationAttemptOutcome::RetryableFailure {
+            failure,
+            next_attempt_at,
+        };
+    }
+    NexusCancellationAttemptOutcome::NonRetryableFailure { failure }
+}
+
 /// Rehydrate an External-endpoint Nexus *handler* error (a non-2xx HTTP response) into the
 /// caller's failure chain so the SDK decodes it as `NexusOperationError -> HandlerError ->
 /// ApplicationError(+details)`.
@@ -1460,64 +1666,7 @@ fn external_handler_error_resolution(
     operation: &str,
     scheduled_event_id: i64,
 ) -> tokeira_kernel::NexusResolution {
-    let app_cause = failure.map(|body| {
-        let details = if body.metadata.is_empty() && body.details.is_null() {
-            None
-        } else {
-            // `json.Marshal(nexus.Failure{Metadata,Details})` with message/stacktrace cleared
-            // (`nexusFailureMetadataToApplicationFailureInfo @ v1.31.0`).
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "message".to_string(),
-                serde_json::Value::String(String::new()),
-            );
-            if !body.metadata.is_empty() {
-                obj.insert(
-                    "metadata".to_string(),
-                    serde_json::to_value(&body.metadata).unwrap_or(serde_json::Value::Null),
-                );
-            }
-            if !body.details.is_null() {
-                obj.insert("details".to_string(), body.details.clone());
-            }
-            let data = serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_default();
-            let payload = Payload {
-                data,
-                metadata: std::collections::BTreeMap::from([(
-                    "encoding".to_string(),
-                    "json/plain".to_string(),
-                )]),
-                external_payloads: Vec::new(),
-            };
-            Some(payloads_from_domain(&Payloads(vec![payload])))
-        };
-        failure_proto::Failure {
-            message: body.message.clone(),
-            failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
-                failure_proto::ApplicationFailureInfo {
-                    r#type: "NexusFailure".to_string(),
-                    details,
-                    ..Default::default()
-                },
-            )),
-            ..Default::default()
-        }
-    });
-
-    let handler_failure = failure_proto::Failure {
-        message: failure.map(|body| body.message.clone()).unwrap_or_default(),
-        failure_info: Some(
-            failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(
-                failure_proto::NexusHandlerFailureInfo {
-                    r#type: error_type.to_string(),
-                    // UNSPECIFIED: the per-attempt retryability is decided by status, not echoed here.
-                    retry_behavior: 0,
-                },
-            ),
-        ),
-        cause: app_cause.map(Box::new),
-        ..Default::default()
-    };
+    let handler_failure = external_handler_failure(error_type, failure);
 
     let wrapped = failure_proto::Failure {
         message: "nexus operation completed unsuccessfully".to_string(),
@@ -2006,6 +2155,7 @@ where
                 }
                 DispatchOp::CancelNexusOperation {
                     scheduled_event_id,
+                    requested_event_id,
                     originator_run_key,
                     operation_id,
                     endpoint,
@@ -2017,6 +2167,7 @@ where
                     let endpoint = endpoint.clone();
                     let service = service.clone();
                     let scheduled_event_id = *scheduled_event_id;
+                    let requested_event_id = *requested_event_id;
                     tokio::spawn(async move {
                         publisher
                             .handle_cancel_nexus_operation(
@@ -2025,6 +2176,7 @@ where
                                 endpoint,
                                 service,
                                 scheduled_event_id,
+                                requested_event_id,
                             )
                             .await;
                     });

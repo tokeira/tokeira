@@ -24,26 +24,27 @@ use crate::{
         ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult,
         Command, CompletionCallbackAttemptedRequest, ContinueAsNewInitiator, CronContinuation,
         ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
-        ExternalSignalResult, FieldChange, MemoPatch, NexusOperationResolvedRequest,
-        NexusOperationRetryRequest, NexusResolution, PauseActivityRequest, PauseWorkflowRequest,
-        ResetActivityRequest, ResetRequest, ResetStickyRequest, RetryContinuation, RetryState,
-        ScheduleQueryTaskRequest, SearchAttributesPatch, SignalRequest, SignalWithStartRequest,
-        StartAndUpdateRequest, StartRequest, StartWorkflowTaskRequest,
-        TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest,
-        UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-        UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, WorkflowCommand,
-        WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest,
-        WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-        WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+        ExternalSignalResult, FieldChange, MemoPatch, NexusCancellationAttemptOutcome,
+        NexusCancellationAttemptedRequest, NexusCancellationRetryRequest,
+        NexusOperationResolvedRequest, NexusOperationRetryRequest, NexusResolution,
+        PauseActivityRequest, PauseWorkflowRequest, ResetActivityRequest, ResetRequest,
+        ResetStickyRequest, RetryContinuation, RetryState, ScheduleQueryTaskRequest,
+        SearchAttributesPatch, SignalRequest, SignalWithStartRequest, StartAndUpdateRequest,
+        StartRequest, StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest,
+        TerminateRequest, TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
+        UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
+        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
+        WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
     },
     event::{ActivityResolution, HistoryEvent, HistoryEventKind, UpdateEventOutcome},
     state::{
         ActivityPauseInfo, ActivityState, ChildWorkflowState,
         EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, Link,
-        LoadedRun, ParentClosePolicy, PauseInfo, PendingExternalCancel, PendingExternalSignal,
-        PendingNexusOperation, PendingUpdate, PendingWorkflowTask, RequestIdInfo, TimerState,
-        VersioningOverride, WorkflowState, WorkflowTaskProblem, WorkflowTaskType,
-        WorkflowVersioningInfo,
+        LoadedRun, NexusOperationCancellation, NexusOperationCancellationState, ParentClosePolicy,
+        PauseInfo, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
+        PendingUpdate, PendingWorkflowTask, RequestIdInfo, TimerState, VersioningOverride,
+        WorkflowState, WorkflowTaskProblem, WorkflowTaskType, WorkflowVersioningInfo,
     },
     transition::{
         ActivityOp, CallbackCompletionOutcome, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp,
@@ -257,6 +258,12 @@ impl Kernel for BasicKernel {
                 self.apply_nexus_operation_resolved(loaded, req)
             }
             Command::NexusOperationRetry(req) => self.apply_nexus_operation_retry(loaded, req),
+            Command::NexusCancellationAttempted(req) => {
+                self.apply_nexus_cancellation_attempted(loaded, req)
+            }
+            Command::NexusCancellationRetry(req) => {
+                self.apply_nexus_cancellation_retry(loaded, req)
+            }
             Command::TimerDue(req) => self.apply_timer_due(loaded, req),
             Command::WorkflowStartDelayElapsed(req) => {
                 self.apply_workflow_start_delay_elapsed(loaded, req)
@@ -2568,6 +2575,36 @@ impl BasicKernel {
                     // event); the runtime cancel path reads it off this projection.
                     current.operation_token = operation_token;
                 }
+                // A cancel requested before StartOperation completed is deliberately
+                // retained in UNSPECIFIED state with no dispatch. Starting the parent
+                // operation makes it eligible atomically with recording the started
+                // event, eliminating the lost-cancel race
+                // (`Operation.Cancel` + `TransitionStarted`,
+                // components/nexusoperations/statemachine.go:360-449 @ v1.31.0).
+                let cancellation_to_dispatch = builder
+                    .state
+                    .pending_nexus_operations
+                    .get_mut(&pending.operation_id)
+                    .and_then(|current| current.cancellation.as_mut())
+                    .and_then(|cancellation| {
+                        (cancellation.state == NexusOperationCancellationState::Unspecified).then(
+                            || {
+                                cancellation.state = NexusOperationCancellationState::Scheduled;
+                                cancellation.requested_time = Some(builder.now);
+                                cancellation.requested_event_id
+                            },
+                        )
+                    });
+                if let Some(requested_event_id) = cancellation_to_dispatch {
+                    builder.dispatch_ops.push(DispatchOp::CancelNexusOperation {
+                        scheduled_event_id: pending.scheduled_event_id,
+                        requested_event_id,
+                        originator_run_key: builder.state.run_key,
+                        operation_id: pending.operation_id.clone(),
+                        endpoint: pending.endpoint.clone(),
+                        service: pending.service.clone(),
+                    });
+                }
                 // NexusOperationStarted is a workflow-task trigger
                 // (`StartedEventDefinition.IsWorkflowTaskTrigger() -> true`,
                 // components/nexusoperations/events.go @ v1.31.0): the async-started
@@ -2736,6 +2773,145 @@ impl BasicKernel {
                 scheduled_event_id: pending.scheduled_event_id,
                 scheduled_at: pending.scheduled_at,
             });
+        Ok(builder.finish())
+    }
+
+    /// Advance the durable cancellation child after one runtime-owned delivery
+    /// attempt. Retryable failures mutate only cancellation state; successful and
+    /// non-retryable outcomes additionally emit the v1.31.0 history event that
+    /// wakes workflow code. The operation itself remains pending in every case.
+    fn apply_nexus_cancellation_attempted(
+        &self,
+        loaded: LoadedRun,
+        req: NexusCancellationAttemptedRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let pending = state
+            .pending_nexus_operations
+            .get(&req.operation_id)
+            .cloned()
+            .ok_or_else(|| Reject::UnknownNexusOperation(req.operation_id.clone()))?;
+        if pending.scheduled_event_id != req.scheduled_event_id {
+            return Err(Reject::StaleNexusResolution {
+                operation_id: req.operation_id,
+                expected_scheduled_event_id: pending.scheduled_event_id,
+            });
+        }
+        let cancellation = pending
+            .cancellation
+            .as_ref()
+            .ok_or_else(|| Reject::UnknownNexusCancellation(req.operation_id.clone()))?;
+        if cancellation.requested_event_id != req.requested_event_id {
+            return Err(Reject::StaleNexusCancellation {
+                operation_id: req.operation_id,
+                expected_requested_event_id: cancellation.requested_event_id,
+            });
+        }
+        if cancellation.state != NexusOperationCancellationState::Scheduled {
+            return Err(Reject::NexusCancellationNotScheduled(req.operation_id));
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now, None);
+        let mut history_kind = None;
+        if let Some(current) = builder
+            .state
+            .pending_nexus_operations
+            .get_mut(&pending.operation_id)
+            .and_then(|operation| operation.cancellation.as_mut())
+        {
+            current.attempt = current.attempt.saturating_add(1);
+            current.last_attempt_complete_time = Some(builder.now);
+            current.last_attempt_failure = None;
+            current.next_attempt_at = None;
+            match req.outcome {
+                NexusCancellationAttemptOutcome::Succeeded => {
+                    current.state = NexusOperationCancellationState::Succeeded;
+                    history_kind = Some(HistoryEventKind::NexusOperationCancelRequestCompleted {
+                        requested_event_id: current.requested_event_id,
+                        scheduled_event_id: pending.scheduled_event_id,
+                    });
+                }
+                NexusCancellationAttemptOutcome::RetryableFailure {
+                    failure,
+                    next_attempt_at,
+                } => {
+                    current.state = NexusOperationCancellationState::BackingOff;
+                    current.last_attempt_failure = Some(failure);
+                    current.next_attempt_at = Some(next_attempt_at);
+                }
+                NexusCancellationAttemptOutcome::NonRetryableFailure { failure } => {
+                    current.state = NexusOperationCancellationState::Failed;
+                    current.last_attempt_failure = Some(failure.clone());
+                    history_kind = Some(HistoryEventKind::NexusOperationCancelRequestFailed {
+                        requested_event_id: current.requested_event_id,
+                        scheduled_event_id: pending.scheduled_event_id,
+                        failure,
+                    });
+                }
+            }
+        }
+
+        if let Some(kind) = history_kind {
+            builder.emit(kind);
+            if builder.state.pending_workflow_task.is_none() {
+                builder.schedule_workflow_task();
+            }
+        }
+        Ok(builder.finish())
+    }
+
+    /// Re-dispatch a cancellation whose retry deadline was selected by the runtime.
+    /// The scheduled/requested IDs fence concurrent scanner ticks and late outcomes;
+    /// no history event is emitted because v1.31.0's reschedule is internal HSM state.
+    fn apply_nexus_cancellation_retry(
+        &self,
+        loaded: LoadedRun,
+        req: NexusCancellationRetryRequest,
+    ) -> Result<Transition, Reject> {
+        let state = expect_open(loaded)?;
+        let pending = state
+            .pending_nexus_operations
+            .get(&req.operation_id)
+            .cloned()
+            .ok_or_else(|| Reject::UnknownNexusOperation(req.operation_id.clone()))?;
+        if pending.scheduled_event_id != req.scheduled_event_id {
+            return Err(Reject::StaleNexusResolution {
+                operation_id: req.operation_id,
+                expected_scheduled_event_id: pending.scheduled_event_id,
+            });
+        }
+        let cancellation = pending
+            .cancellation
+            .as_ref()
+            .ok_or_else(|| Reject::UnknownNexusCancellation(req.operation_id.clone()))?;
+        if cancellation.requested_event_id != req.requested_event_id {
+            return Err(Reject::StaleNexusCancellation {
+                operation_id: req.operation_id,
+                expected_requested_event_id: cancellation.requested_event_id,
+            });
+        }
+        if cancellation.state != NexusOperationCancellationState::BackingOff {
+            return Err(Reject::NexusCancellationNotBackingOff(req.operation_id));
+        }
+
+        let mut builder = TransitionBuilder::new(state, req.now, None);
+        if let Some(current) = builder
+            .state
+            .pending_nexus_operations
+            .get_mut(&pending.operation_id)
+            .and_then(|operation| operation.cancellation.as_mut())
+        {
+            current.state = NexusOperationCancellationState::Scheduled;
+            current.next_attempt_at = None;
+        }
+        builder.dispatch_ops.push(DispatchOp::CancelNexusOperation {
+            scheduled_event_id: pending.scheduled_event_id,
+            requested_event_id: cancellation.requested_event_id,
+            originator_run_key: builder.state.run_key,
+            operation_id: pending.operation_id,
+            endpoint: pending.endpoint,
+            service: pending.service,
+        });
         Ok(builder.finish())
     }
 
@@ -3995,6 +4171,7 @@ impl BasicKernel {
                         // Rebuilt from the scheduled event so a replayed op can still
                         // be re-dispatched on retry.
                         input: input.clone(),
+                        cancellation: None,
                     },
                 );
             }
@@ -4012,6 +4189,12 @@ impl BasicKernel {
                     // Rebuild the handler async token from the event so a replayed op can
                     // still round-trip it on cancel.
                     operation.operation_token = operation_token.clone();
+                    if let Some(cancellation) = operation.cancellation.as_mut()
+                        && cancellation.state == NexusOperationCancellationState::Unspecified
+                    {
+                        cancellation.state = NexusOperationCancellationState::Scheduled;
+                        cancellation.requested_time = Some(event.happened_at);
+                    }
                 }
             }
             HistoryEventKind::NexusOperationCompleted { operation_id, .. }
@@ -4020,7 +4203,67 @@ impl BasicKernel {
             | HistoryEventKind::NexusOperationTimedOut { operation_id, .. } => {
                 state.pending_nexus_operations.remove(operation_id);
             }
-            HistoryEventKind::NexusOperationCancelRequested { .. } => {}
+            HistoryEventKind::NexusOperationCancelRequested {
+                scheduled_event_id, ..
+            } => {
+                if let Some(operation) = state
+                    .pending_nexus_operations
+                    .values_mut()
+                    .find(|operation| operation.scheduled_event_id == *scheduled_event_id)
+                {
+                    let scheduled = operation.started;
+                    operation.cancellation = Some(NexusOperationCancellation {
+                        requested_event_id: event.event_id,
+                        requested_time: scheduled.then_some(event.happened_at),
+                        state: if scheduled {
+                            NexusOperationCancellationState::Scheduled
+                        } else {
+                            NexusOperationCancellationState::Unspecified
+                        },
+                        attempt: 0,
+                        last_attempt_complete_time: None,
+                        last_attempt_failure: None,
+                        next_attempt_at: None,
+                    });
+                }
+            }
+            HistoryEventKind::NexusOperationCancelRequestCompleted {
+                scheduled_event_id,
+                requested_event_id,
+            } => {
+                if let Some(cancellation) = state
+                    .pending_nexus_operations
+                    .values_mut()
+                    .find(|operation| operation.scheduled_event_id == *scheduled_event_id)
+                    .and_then(|operation| operation.cancellation.as_mut())
+                    .filter(|cancellation| cancellation.requested_event_id == *requested_event_id)
+                {
+                    cancellation.state = NexusOperationCancellationState::Succeeded;
+                    cancellation.attempt = cancellation.attempt.saturating_add(1);
+                    cancellation.last_attempt_complete_time = Some(event.happened_at);
+                    cancellation.last_attempt_failure = None;
+                    cancellation.next_attempt_at = None;
+                }
+            }
+            HistoryEventKind::NexusOperationCancelRequestFailed {
+                scheduled_event_id,
+                requested_event_id,
+                failure,
+            } => {
+                if let Some(cancellation) = state
+                    .pending_nexus_operations
+                    .values_mut()
+                    .find(|operation| operation.scheduled_event_id == *scheduled_event_id)
+                    .and_then(|operation| operation.cancellation.as_mut())
+                    .filter(|cancellation| cancellation.requested_event_id == *requested_event_id)
+                {
+                    cancellation.state = NexusOperationCancellationState::Failed;
+                    cancellation.attempt = cancellation.attempt.saturating_add(1);
+                    cancellation.last_attempt_complete_time = Some(event.happened_at);
+                    cancellation.last_attempt_failure = Some(failure.clone());
+                    cancellation.next_attempt_at = None;
+                }
+            }
             HistoryEventKind::WorkflowExecutionUpdateAccepted {
                 update_id,
                 update_name,
@@ -5152,6 +5395,7 @@ fn apply_workflow_command(
                     next_attempt_at: None,
                     operation_token: String::new(),
                     input: input.clone(),
+                    cancellation: None,
                 },
             );
             builder
@@ -5183,14 +5427,49 @@ fn apply_workflow_command(
                         "scheduled_event_id={scheduled_event_id}"
                     ))
                 })?;
-            builder.emit(HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id });
-            builder.dispatch_ops.push(DispatchOp::CancelNexusOperation {
-                scheduled_event_id,
-                originator_run_key: builder.state.run_key,
-                operation_id: pending.operation_id,
-                endpoint: pending.endpoint,
-                service: pending.service,
-            });
+            if pending.cancellation.is_some() {
+                return Err(Reject::NexusCancellationAlreadyRequested(
+                    pending.operation_id,
+                ));
+            }
+            let requested_event_id =
+                builder.emit(HistoryEventKind::NexusOperationCancelRequested {
+                    scheduled_event_id,
+                    workflow_task_completed_event_id,
+                });
+            let cancellation_state = if pending.started {
+                NexusOperationCancellationState::Scheduled
+            } else {
+                NexusOperationCancellationState::Unspecified
+            };
+            if let Some(current) = builder
+                .state
+                .pending_nexus_operations
+                .get_mut(&pending.operation_id)
+            {
+                current.cancellation = Some(NexusOperationCancellation {
+                    requested_event_id,
+                    requested_time: pending.started.then_some(builder.now),
+                    state: cancellation_state,
+                    attempt: 0,
+                    last_attempt_complete_time: None,
+                    last_attempt_failure: None,
+                    next_attempt_at: None,
+                });
+            }
+            // The handler's token does not exist before an async-start response. In
+            // that state the durable child waits; the Started transition above emits
+            // the first cancel dispatch.
+            if pending.started {
+                builder.dispatch_ops.push(DispatchOp::CancelNexusOperation {
+                    scheduled_event_id,
+                    requested_event_id,
+                    originator_run_key: builder.state.run_key,
+                    operation_id: pending.operation_id,
+                    endpoint: pending.endpoint,
+                    service: pending.service,
+                });
+            }
             Ok(false)
         }
         WorkflowCommand::UpdateCompleted { update_id, result } => {
@@ -6437,6 +6716,28 @@ pub enum Reject {
     /// fence that prevents a double re-dispatch.
     #[error("nexus operation not backing off: {0}")]
     NexusOperationNotBackingOff(String),
+    /// A workflow attempted to request cancellation more than once for the same
+    /// pending Nexus operation.
+    #[error("nexus cancellation already requested: {0}")]
+    NexusCancellationAlreadyRequested(String),
+    /// An attempt outcome or retry referenced an operation without a cancellation
+    /// child.
+    #[error("unknown nexus cancellation: {0}")]
+    UnknownNexusCancellation(String),
+    /// A cancellation attempt referenced a superseded cancel-request event.
+    #[error(
+        "stale nexus cancellation for {operation_id}: expected requested_event_id {expected_requested_event_id}"
+    )]
+    StaleNexusCancellation {
+        operation_id: String,
+        expected_requested_event_id: i64,
+    },
+    /// An attempt outcome arrived while no cancellation delivery was in flight.
+    #[error("nexus cancellation not scheduled: {0}")]
+    NexusCancellationNotScheduled(String),
+    /// A retry tick referenced cancellation state that is no longer backing off.
+    #[error("nexus cancellation not backing off: {0}")]
+    NexusCancellationNotBackingOff(String),
     /// A `CompletionCallbackAttempted` referenced a callback index that is not in
     /// the run's `completion_callbacks`.
     #[error("unknown completion callback index: {0}")]

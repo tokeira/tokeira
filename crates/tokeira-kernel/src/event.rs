@@ -586,7 +586,28 @@ pub enum HistoryEventKind {
         timeout_type: NexusTimeoutType,
     },
     /// A cancel was requested for a pending Nexus operation.
-    NexusOperationCancelRequested { scheduled_event_id: i64 },
+    NexusOperationCancelRequested {
+        /// Event ID of the corresponding `NexusOperationScheduled` event.
+        scheduled_event_id: i64,
+        /// Event ID of the workflow-task completion that carried the command.
+        workflow_task_completed_event_id: i64,
+    },
+    /// A Nexus cancellation request was acknowledged by its handler.
+    NexusOperationCancelRequestCompleted {
+        /// Event ID of the `NexusOperationCancelRequested` event.
+        requested_event_id: i64,
+        /// Event ID of the corresponding `NexusOperationScheduled` event.
+        scheduled_event_id: i64,
+    },
+    /// A Nexus cancellation request failed non-retryably.
+    NexusOperationCancelRequestFailed {
+        /// Event ID of the `NexusOperationCancelRequested` event.
+        requested_event_id: i64,
+        /// Event ID of the corresponding `NexusOperationScheduled` event.
+        scheduled_event_id: i64,
+        /// Terminal call failure returned by the handler/runtime.
+        failure: Payload,
+    },
     /// A workflow update was accepted and is awaiting
     /// completion by the worker.
     WorkflowExecutionUpdateAccepted {

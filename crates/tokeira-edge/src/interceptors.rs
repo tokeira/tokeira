@@ -662,9 +662,9 @@ impl PolicyAuthenticator {
 pub(crate) fn authorizer_errors_exposed(configured: bool) -> bool {
     #[cfg(feature = "conformance")]
     {
-        return tokeira_conformance::overrides()
+        tokeira_conformance::overrides()
             .get_bool("frontend.exposeAuthorizerErrors")
-            .unwrap_or(configured);
+            .unwrap_or(configured)
     }
     #[cfg(not(feature = "conformance"))]
     {
@@ -675,9 +675,9 @@ pub(crate) fn authorizer_errors_exposed(configured: bool) -> bool {
 fn token_namespace_enforcement_enabled() -> bool {
     #[cfg(feature = "conformance")]
     {
-        return tokeira_conformance::overrides()
+        tokeira_conformance::overrides()
             .get_bool("frontend.enableTokenNamespaceEnforcement")
-            .unwrap_or(true);
+            .unwrap_or(true)
     }
     #[cfg(not(feature = "conformance"))]
     {

@@ -13,18 +13,19 @@ use tokeira_kernel::{
     ChildWorkflowState, Command, CompletionCallback, CompletionCallbackAttemptedRequest,
     ContinueAsNewVersioningBehavior, DispatchOp, ExternalCancelResolvedRequest,
     ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, FieldChange, Link, LoadedRun, NexusOperationResolvedRequest,
-    NexusResolution, NexusTimeoutType, ParentClosePolicy, PauseActivityRequest, PauseInfo,
-    PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
-    PendingUpdate, PendingWorkflowTask, Priority, Reject, ReplayContext, RequestDedupeOp,
-    ResetActivityRequest, ResetRequest, RetryContinuation, RetryState, SignalRequest, StartRequest,
-    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState, Transition,
-    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, UserMetadata,
-    VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType, WorkflowVersioningInfo,
+    ExternalWorkflowExecution, FieldChange, Link, LoadedRun, NexusOperationCancellationState,
+    NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
+    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
+    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Priority,
+    Reject, ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryContinuation,
+    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
+    TimerDueRequest, TimerOp, TimerState, Transition, UnpauseActivityRequest,
+    UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
+    UpdateProtocolBody, UpdateRequest, UserMetadata, VersioningBehavior, VersioningOverride,
+    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    WorkflowVersioningInfo,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -388,6 +389,7 @@ fn with_pending_nexus_operation(mut state: WorkflowState, operation_id: &str) ->
             next_attempt_at: None,
             operation_token: String::new(),
             input: Default::default(),
+            cancellation: None,
         },
     );
     state
@@ -5451,9 +5453,15 @@ proptest! {
     }
 
     #[test]
-    fn property_66_cancel_nexus_operation_event_and_dispatch(operation_id in arb_small_string()) {
+    fn property_66_cancel_nexus_operation_event_and_dispatch(
+        operation_id in arb_small_string(),
+        started in any::<bool>(),
+    ) {
         let now = fixed_now();
-        let state = with_pending_nexus_operation(with_pending_wft(make_open_state(now), 86, Some(35), 1), &operation_id);
+        let mut state = with_pending_nexus_operation(with_pending_wft(make_open_state(now), 86, Some(35), 1), &operation_id);
+        let pending_operation = state.pending_nexus_operations.get_mut(&operation_id).unwrap();
+        pending_operation.started = started;
+        pending_operation.started_at = started.then_some(now);
         let transition = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
@@ -5485,14 +5493,24 @@ proptest! {
             }),
         ).unwrap();
         prop_assert_eq!(
-            matches!(transition.history_events[1].kind, HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id: 12 }),
+            matches!(transition.history_events[1].kind, HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id: 12, .. }),
             true
         );
+        let dispatched = transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::CancelNexusOperation { scheduled_event_id: 12, originator_run_key, operation_id: id, endpoint, service, .. } if originator_run_key == &state.run_key && id == &operation_id && endpoint == "endpoint" && service == "service"));
+        prop_assert_eq!(dispatched, started);
+        let cancellation = transition.next_state.pending_nexus_operations[&operation_id]
+            .cancellation
+            .as_ref()
+            .unwrap();
         prop_assert_eq!(
-            transition.dispatch_ops.iter().any(|op| matches!(op, DispatchOp::CancelNexusOperation { scheduled_event_id: 12, originator_run_key, operation_id: id, endpoint, service } if originator_run_key == &state.run_key && id == &operation_id && endpoint == "endpoint" && service == "service")),
-            true
+            cancellation.state,
+            if started {
+                NexusOperationCancellationState::Scheduled
+            } else {
+                NexusOperationCancellationState::Unspecified
+            }
         );
-        prop_assert!(transition.next_state.pending_nexus_operations.contains_key(&operation_id));
+        prop_assert_eq!(cancellation.requested_time, started.then_some(now));
     }
 
     #[test]

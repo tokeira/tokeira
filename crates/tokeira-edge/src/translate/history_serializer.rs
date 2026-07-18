@@ -179,6 +179,8 @@ fn event_worker_may_ignore(event: &HistoryEvent) -> bool {
     matches!(
         event.kind,
         HistoryEventKind::WorkflowExecutionOptionsUpdated { .. }
+            | HistoryEventKind::NexusOperationCancelRequestCompleted { .. }
+            | HistoryEventKind::NexusOperationCancelRequestFailed { .. }
     )
 }
 
@@ -435,6 +437,12 @@ fn event_type_for_kind(kind: &HistoryEventKind) -> i32 {
         HistoryEventKind::NexusOperationCanceled { .. } => E::NexusOperationCanceled,
         HistoryEventKind::NexusOperationTimedOut { .. } => E::NexusOperationTimedOut,
         HistoryEventKind::NexusOperationCancelRequested { .. } => E::NexusOperationCancelRequested,
+        HistoryEventKind::NexusOperationCancelRequestCompleted { .. } => {
+            E::NexusOperationCancelRequestCompleted
+        }
+        HistoryEventKind::NexusOperationCancelRequestFailed { .. } => {
+            E::NexusOperationCancelRequestFailed
+        }
         HistoryEventKind::WorkflowExecutionUpdateAccepted { .. } => {
             E::WorkflowExecutionUpdateAccepted
         }
@@ -1593,14 +1601,39 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 ..Default::default()
             },
         ),
-        HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id } => {
+        HistoryEventKind::NexusOperationCancelRequested {
+            scheduled_event_id,
+            workflow_task_completed_event_id,
+        } => {
             Attributes::NexusOperationCancelRequestedEventAttributes(
                 history::NexusOperationCancelRequestedEventAttributes {
                     scheduled_event_id: *scheduled_event_id,
-                    ..Default::default()
+                    workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 },
             )
         }
+        HistoryEventKind::NexusOperationCancelRequestCompleted {
+            requested_event_id,
+            scheduled_event_id,
+        } => Attributes::NexusOperationCancelRequestCompletedEventAttributes(
+            history::NexusOperationCancelRequestCompletedEventAttributes {
+                requested_event_id: *requested_event_id,
+                scheduled_event_id: *scheduled_event_id,
+                ..Default::default()
+            },
+        ),
+        HistoryEventKind::NexusOperationCancelRequestFailed {
+            requested_event_id,
+            scheduled_event_id,
+            failure,
+        } => Attributes::NexusOperationCancelRequestFailedEventAttributes(
+            history::NexusOperationCancelRequestFailedEventAttributes {
+                requested_event_id: *requested_event_id,
+                scheduled_event_id: *scheduled_event_id,
+                failure: Some(payload_to_failure(failure)),
+                ..Default::default()
+            },
+        ),
         HistoryEventKind::WorkflowExecutionUpdateAccepted {
             update_id,
             update_name,

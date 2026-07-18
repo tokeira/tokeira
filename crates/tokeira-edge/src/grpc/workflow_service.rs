@@ -3788,6 +3788,17 @@ mod tests {
         ) -> Result<bool> {
             Ok(false)
         }
+
+        async fn record_nexus_cancellation_attempt(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _operation_id: String,
+            _scheduled_event_id: i64,
+            _requested_event_id: i64,
+            _outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
+        ) -> Result<bool> {
+            Ok(false)
+        }
     }
 
     #[async_trait]
@@ -3956,6 +3967,17 @@ mod tests {
             _operation_id: String,
             _scheduled_event_id: i64,
             _resolution: NexusResolution,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn record_nexus_cancellation_attempt(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _operation_id: String,
+            _scheduled_event_id: i64,
+            _requested_event_id: i64,
+            _outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
         ) -> Result<bool> {
             Ok(false)
         }
@@ -4134,6 +4156,17 @@ mod tests {
                 resolution,
             ));
             Ok(self.applied)
+        }
+
+        async fn record_nexus_cancellation_attempt(
+            &self,
+            _run_key: tokeira_types::RunKey,
+            _operation_id: String,
+            _scheduled_event_id: i64,
+            _requested_event_id: i64,
+            _outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
+        ) -> Result<bool> {
+            Ok(false)
         }
     }
 
@@ -6473,12 +6506,9 @@ mod tests {
 
     #[tokio::test]
     async fn respond_nexus_task_completed_cancel_ack_does_not_resolve() {
-        // v1.31.0 decouples cancel-ack from operation resolution: EventCancelationSucceeded
-        // (components/nexusoperations/statemachine.go:671) only advances the cancelation
-        // sub-machine. A CancelOperation response is acked but resolves NO operation — the op
-        // resolves solely via its completion when the backing workflow closes. (The
-        // kernel-rejection-is-swallowed behaviour is covered for the failed path by
-        // respond_nexus_task_failed_kernel_rejection_returns_success.)
+        // A CancelOperation response received on a start-operation delivery does not
+        // resolve the parent operation. The workflow cancellation-delivery branch is
+        // exercised through the store-backed runtime integration tests.
         let runtime = Arc::new(NexusRecordingRuntime::new(true));
         let (grpc, broker) = nexus_test_service(runtime.clone());
 
@@ -6591,11 +6621,14 @@ mod tests {
                 run_key,
                 "op-1".to_string(),
                 1,
-                NexusTaskRequest::CancelOperation {
+                NexusTaskRequest::StartOperation {
                     service: "svc".to_string(),
                     operation: "op".to_string(),
-                    operation_id: "op-1".to_string(),
-                    operation_token: "token-1".to_string(),
+                    request_id: "op-1".to_string(),
+                    payload: None,
+                    scheduled_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    callback_url: None,
+                    callback_token: None,
                 },
             )
             .await;

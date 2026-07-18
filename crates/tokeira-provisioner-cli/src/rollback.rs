@@ -84,6 +84,7 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
     envelope
         .begin_rollback(operation_id, Utc::now())
         .map_err(|e| anyhow::anyhow!(e))?;
+    envelope.stamp_current_schema();
     version = store
         .save(&envelope, &version)
         .await
@@ -187,12 +188,12 @@ mod tests {
             IntegrityManifest {
                 provisioner_version: "1.0.0".to_string(),
                 artifacts: vec![BinaryArtifactDescriptor {
-                    version: "1.0.0".to_string(),
                     target: Target("x".to_string()),
                     sha256: sha.to_string(),
                     retrieval_ref: None,
                     size_bytes: 1,
                 }],
+                ..Default::default()
             }
         }
 

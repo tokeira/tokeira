@@ -17,7 +17,8 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::Serialize;
 use tokeira_provisioner::{
-    BindingVerdict, BuildMode, DeploymentStateEnvelope, ProvenanceStamp, check_binding,
+    BindingVerdict, BuildAuthority, BuildMode, DeploymentStateEnvelope, ProvenanceStamp,
+    check_binding,
 };
 
 use crate::{ProvisionerPlatform, config_history, envelope_store};
@@ -85,7 +86,6 @@ struct BindingView {
 
 #[derive(Serialize)]
 struct ArtifactView {
-    version: String,
     target: String,
     sha256: String,
     size_bytes: u64,
@@ -94,6 +94,12 @@ struct ArtifactView {
 #[derive(Serialize)]
 struct IntegrityView {
     provisioner_version: String,
+    /// The engine-identity digest the artifacts are keyed by (task 16.2);
+    /// `None` is a pre-identity (native dev) manifest. The full identity
+    /// fields join the verification view with tasks 17/19.1.
+    engine_identity: Option<String>,
+    /// Who built the bytes (the admission gate's input).
+    authority: BuildAuthority,
     /// The complete per-artifact record — this is what verifies a binding by
     /// hand (verification view; the operator view shows only the count).
     artifacts: Vec<ArtifactView>,
@@ -141,11 +147,12 @@ impl DescribeReport {
             },
             integrity: envelope.integrity.as_ref().map(|m| IntegrityView {
                 provisioner_version: m.provisioner_version.clone(),
+                engine_identity: m.engine_identity.as_ref().map(|id| id.digest().to_hex()),
+                authority: m.authority.clone(),
                 artifacts: m
                     .artifacts
                     .iter()
                     .map(|a| ArtifactView {
-                        version: a.version.clone(),
                         target: a.target.0.clone(),
                         sha256: a.sha256.clone(),
                         size_bytes: a.size_bytes,
@@ -282,10 +289,23 @@ impl DescribeReport {
         match &self.integrity {
             Some(i) => {
                 println!("Integrity           provisioner {}", i.provisioner_version);
+                println!(
+                    "  engine identity   {}",
+                    i.engine_identity
+                        .as_deref()
+                        .unwrap_or("none (pre-identity build)")
+                );
+                let authority = match &i.authority {
+                    BuildAuthority::LocalDeveloper => "local developer".to_string(),
+                    BuildAuthority::TrustedCi {
+                        provider, build_id, ..
+                    } => format!("trusted CI ({provider} build {build_id})"),
+                };
+                println!("  authority         {authority}");
                 for artifact in &i.artifacts {
                     println!(
-                        "  {}  {}  {} bytes\n    sha256:{}",
-                        artifact.version, artifact.target, artifact.size_bytes, artifact.sha256
+                        "  {}  {} bytes\n    sha256:{}",
+                        artifact.target, artifact.size_bytes, artifact.sha256
                     );
                 }
                 println!();
@@ -437,12 +457,12 @@ mod tests {
             integrity: Some(IntegrityManifest {
                 provisioner_version: "1.0.0".to_string(),
                 artifacts: vec![BinaryArtifactDescriptor {
-                    version: "1.0.0".to_string(),
                     target: Target("aarch64-apple-darwin".to_string()),
                     sha256: "abc123".to_string(),
                     retrieval_ref: None,
                     size_bytes: 42,
                 }],
+                ..Default::default()
             }),
             ..Default::default()
         };

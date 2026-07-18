@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::{
     DeploymentStateEnvelope, ENVELOPE_SCHEMA_VERSION, MigrationRegistry, ProvenanceStamp,
-    UpgradeDecision, evaluate_upgrade,
+    UpgradeDecision, envelope_migrations, evaluate_upgrade,
 };
 
 use crate::{ProvisionerPlatform, envelope_store, init::running_integrity_manifest};
@@ -57,7 +57,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     // Refuse an unbridged schema migration up front; run the forward migration
     // only when the schema changes (a new source_tree_hash at the same schema is
     // a re-stamp, not a migration).
-    let migrations = MigrationRegistry::new();
+    let migrations = envelope_migrations();
     let from_schema = envelope.schema_version;
     let to_schema = ENVELOPE_SCHEMA_VERSION;
     migrations
@@ -65,8 +65,15 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         .map_err(|e| anyhow::anyhow!("`upgrade` refused: {e}"))?;
     if MigrationRegistry::needs_migration(from_schema, to_schema) {
         println!("state-schema migration {from_schema} → {to_schema}");
-        // (Envelope + state-doc migrations run here when transitions are registered.)
-        envelope.schema_version = to_schema;
+        let migrated = migrations
+            .migrate(
+                serde_json::to_value(&envelope).context("failed to serialize the envelope")?,
+                from_schema,
+                to_schema,
+            )
+            .map_err(|e| anyhow::anyhow!("`upgrade` refused: {e}"))?;
+        envelope = serde_json::from_value(migrated)
+            .context("the migrated envelope does not parse as the current schema")?;
     }
 
     // ── Atomic ownership transfer — one CAS commit, BEFORE any provider mutation ──
@@ -163,12 +170,12 @@ mod tests {
         let a_manifest = IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![BinaryArtifactDescriptor {
-                version: "1.0.0".to_string(),
                 target: Target("x".to_string()),
                 sha256: "sha-of-A".to_string(),
                 retrieval_ref: None,
                 size_bytes: 1,
             }],
+            ..Default::default()
         };
         let mut env = DeploymentStateEnvelope {
             binding: Some(ProvenanceStamp::current(Utc::now())),

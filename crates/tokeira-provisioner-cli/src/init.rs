@@ -25,8 +25,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::{
-    BinaryArtifactDescriptor, DeploymentStateEnvelope, IntegrityManifest, ProvenanceStamp, Target,
-    sha256_hex,
+    BinaryArtifactDescriptor, BuildAuthority, DeploymentStateEnvelope, IntegrityManifest,
+    ProvenanceStamp, Target, sha256_hex,
 };
 
 use crate::{ProvisionerPlatform, config_history, envelope_store};
@@ -74,16 +74,23 @@ pub(crate) async fn init<P: ProvisionerPlatform>(
 }
 
 /// Build the integrity manifest for the **running** binary (task 4.1): its
-/// version, target triple, SHA-256, and size. Recorded at stamp time; the
-/// launcher verifies a retrieved binary against it before execution (task 4.2).
+/// target triple, SHA-256, and size, with the semver as a human label.
+/// Recorded at stamp time; the launcher verifies a retrieved binary against it
+/// before execution (task 4.2).
+///
+/// A self-stamped native build is a **pre-identity** manifest: it carries no
+/// [`EngineIdentity`](tokeira_provisioner::EngineIdentity) (the closure inputs
+/// exist only once the source snapshot supplies them — task 17) and attests
+/// nothing beyond `LocalDeveloper` authority. The build pipeline (task 18) is
+/// what records more.
 pub(crate) fn running_integrity_manifest() -> Result<IntegrityManifest> {
     let exe = std::env::current_exe().context("failed to locate the running binary")?;
     let bytes = std::fs::read(&exe).with_context(|| format!("failed to read {}", exe.display()))?;
-    let version = tokeira_build_info::TOKEIRA_VERSION.to_string();
     Ok(IntegrityManifest {
-        provisioner_version: version.clone(),
+        engine_identity: None,
+        authority: BuildAuthority::LocalDeveloper,
+        provisioner_version: tokeira_build_info::TOKEIRA_VERSION.to_string(),
         artifacts: vec![BinaryArtifactDescriptor {
-            version,
             target: Target(env!("TKP_TARGET").to_string()),
             sha256: sha256_hex(&bytes),
             retrieval_ref: None,

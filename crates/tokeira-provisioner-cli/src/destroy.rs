@@ -74,6 +74,7 @@ pub(crate) async fn destroy<P: ProvisionerPlatform>(
     // configuration itself did not change, only the live footprint.
     envelope.binding = Some(running);
     envelope.effective_config_ref = None;
+    envelope.stamp_current_schema();
     store
         .save(&envelope, &version)
         .await

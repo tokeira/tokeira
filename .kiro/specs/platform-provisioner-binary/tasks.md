@@ -471,15 +471,39 @@ multi-consumer decision) are out of scope.
         --bin tkp-compose`), so "`tkr` compiles `tkp` from `platforms/<platform>`" is literal (Phase 0;
         the hermetic build/obtain supersedes it in tasks 16-18). _Requirements: 14.4, 6.5_
 
-- [ ] 16. Engine identity + build authority (Requirement 15; [Proposal 005](./proposals/005-provisioner-bundles-and-binding.md))
-  - [ ] 16.1 Define `EngineIdentity` (**closure-scoped**: provisioner source-closure digest + `Cargo.lock`-
+- [x] 16. Engine identity + build authority (Requirement 15; [Proposal 005](./proposals/005-provisioner-bundles-and-binding.md))
+  - [x] 16.1 Define `EngineIdentity` (**closure-scoped**: provisioner source-closure digest + `Cargo.lock`-
         **closure** digest + toolchain + build-container digest + feature set + profile) and `BuildAuthority`
         (`LocalDeveloper` | `TrustedCi`) in `tokeira-provisioner`. This completes 14.1's narrowing (14.4):
         the digest is over the provisioner closure, not the whole workspace — else a `tkr`-only dep bump
-        re-keys every identity. _Requirements: 15.2, 13.1_
-  - [ ] 16.2 Re-key the integrity manifest / `BinaryStore` from `version+target` → `EngineIdentity+target`;
+        re-keys every identity. DONE — `identity.rs`: `EngineIdentity { source_closure, lock_closure,
+        toolchain, build_container (None = native dev build), features, profile }`; `digest()` runs over a
+        **versioned, length-prefixed canonical form** (delimiter injection cannot alias two identities;
+        a future field-set change re-keys explicitly via the canonical-version tag, never collides
+        silently). `BuildAuthority::{LocalDeveloper (default), TrustedCi{provider, build_id,
+        source_commit}}` with ordered `AuthorityTier` (`satisfies` = offered ≥ required). `Sha256Digest`
+        gained strict serde (canonical hex out, parse-validated in). `RUSTFLAGS`/link is deliberately not
+        a field — the container digest + in-closure `.cargo` config pin it for the hermetic build; the
+        module doc records the caveat (open decision 1). Identity *inputs* arrive later: the source
+        snapshot (17) and hermetic build (18) supply them; a native dev build carries **no** identity —
+        there are no partially-known identities. _Requirements: 15.2, 13.1_
+  - [x] 16.2 Re-key the integrity manifest / `BinaryStore` from `version+target` → `EngineIdentity+target`;
         record `BuildAuthority`; `create` re-verifies bytes (re-hash vs manifest) + authority-vs-policy +
-        not-revoked before binding (caching never grants admission). _Requirements: 15.3, 15.4, 4.2_
+        not-revoked before binding (caching never grants admission). DONE — `IntegrityManifest` gains
+        `engine_identity: Option<EngineIdentity>` (`None` = pre-identity native-dev manifest) +
+        `authority` (serde-defaulted, so v1 documents load compatibly); `BinaryArtifactDescriptor` drops
+        its per-artifact `version` (the manifest's identity is the key half; the semver stays as the
+        manifest's human label). `BinaryStore` addresses blobs by `identity-digest/target`, and
+        `retrieve_verified` refuses a manifest that does not describe the requested identity.
+        **Admission** (`admission.rs`): `admit_artifact` = authority-vs-policy → deny-list
+        (`RevocationList` by identity digest + artifact digest; where the list *lives* is open decision
+        4) → byte re-hash — on cache hits too; wired into `create` at 18.3. Envelope schema **v2** with
+        the canonical chain `envelope_migrations()` (the first real task-5.1 entry: v1→v2 re-keys the
+        live and checkpoint manifests), run at the upgrade boundary; every mutating verb stamps the
+        current schema before save so the claimed `schema_version` follows the serialized shape (dev
+        advances freely in `DevIterate`; versioned crosses only through `upgrade`). `describe` reports
+        the identity digest + authority in both views (the full identity field set joins with 17/19.1).
+        _Requirements: 15.3, 15.4, 4.2_
 
 - [ ] 17. Source snapshotting for build fidelity (Requirement 16)
   - [ ] 17.1 Add a Rust git SDK (`gix` pure-Rust preferred, else `git2`) — a **new** workspace dependency —

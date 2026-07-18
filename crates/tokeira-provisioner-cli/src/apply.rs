@@ -67,6 +67,7 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         deployment_dir,
         platform.config_basename(deployment_dir),
     )?;
+    envelope.stamp_current_schema();
     store
         .save(&envelope, &version)
         .await

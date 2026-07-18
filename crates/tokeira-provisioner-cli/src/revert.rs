@@ -92,6 +92,7 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
     envelope.effective_config_ref = Some(config_ref(deployment_dir, config_basename));
     config_history::snapshot(deployment_dir, config_basename, envelope.config_revision)
         .context("failed to retain the reverted config revision")?;
+    envelope.stamp_current_schema();
     store
         .save(&envelope, &version)
         .await

@@ -127,6 +127,54 @@ impl MigrationRegistry {
     }
 }
 
+// ── The canonical envelope chain ──────────────────────────────────────────
+//
+// Task 5.1's registry, first populated by the manifest re-key of task 16.2.
+// The upgrade boundary (`tkp upgrade`) refuses an unbridged transition via
+// `check_path` and runs this chain forward on a schema change.
+
+/// The canonical [`DeploymentStateEnvelope`](crate::DeploymentStateEnvelope)
+/// migration chain.
+pub fn envelope_migrations() -> MigrationRegistry {
+    MigrationRegistry::new().register(1, 2, envelope_v1_to_v2)
+}
+
+/// v1 → v2 (task 16.2): the integrity manifest is re-keyed by engine identity.
+/// Per-artifact `version` keys are dropped (the artifact's key half is the
+/// manifest's `engine_identity`); the new `engine_identity`/`authority` fields
+/// are **absent**, which the v2 shape reads as no-identity / lowest-tier —
+/// correct for every v1 document, all of which predate identity-keyed builds.
+/// Applies to the live manifest and the checkpoint's retained `[A final]` copy.
+fn envelope_v1_to_v2(mut doc: serde_json::Value) -> Result<serde_json::Value, String> {
+    fn strip_artifact_versions(manifest: &mut serde_json::Value) {
+        if let Some(artifacts) = manifest
+            .get_mut("artifacts")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for artifact in artifacts {
+                if let Some(fields) = artifact.as_object_mut() {
+                    fields.remove("version");
+                }
+            }
+        }
+    }
+
+    let root = doc
+        .as_object_mut()
+        .ok_or_else(|| "envelope document is not an object".to_string())?;
+    root.insert("schema_version".to_string(), serde_json::json!(2));
+    if let Some(manifest) = root.get_mut("integrity") {
+        strip_artifact_versions(manifest);
+    }
+    if let Some(from_integrity) = root
+        .get_mut("checkpoint")
+        .and_then(|c| c.get_mut("from_integrity"))
+    {
+        strip_artifact_versions(from_integrity);
+    }
+    Ok(doc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +247,78 @@ mod tests {
                 reason: "bad doc".to_string()
             })
         );
+    }
+
+    #[test]
+    fn envelope_v1_to_v2_rekeys_both_manifests_and_loads() {
+        let v1 = json!({
+            "schema_version": 1,
+            "deployment_id": "dep-1",
+            "binding": null,
+            "integrity": {
+                "provisioner_version": "0.1.0",
+                "artifacts": [
+                    {"version": "0.1.0", "target": "t1", "sha256": "aa", "retrieval_ref": null, "size_bytes": 1}
+                ]
+            },
+            "config_revision": 1,
+            "checkpoint": {
+                "from_provenance": {
+                    "version": "0.1.0", "git_sha": "s", "source_tree_hash": "h",
+                    "build_mode": "Dev", "recorded_at": "2026-07-01T00:00:00Z"
+                },
+                "from_integrity": {
+                    "provisioner_version": "0.0.9",
+                    "artifacts": [
+                        {"version": "0.0.9", "target": "t1", "sha256": "bb", "retrieval_ref": null, "size_bytes": 2}
+                    ]
+                },
+                "from_infra_head": null,
+                "from_runtime_head": null,
+                "from_config_ref": null,
+                "recorded_at": "2026-07-01T00:00:00Z"
+            },
+            "operation": null,
+            "lock": null,
+            "infra_head": null,
+            "runtime_head": null,
+            "effective_config_ref": null
+        });
+
+        let migrated = envelope_migrations()
+            .migrate(v1, 1, 2)
+            .expect("the canonical chain bridges 1 → 2");
+        assert_eq!(migrated["schema_version"], 2);
+        assert!(
+            migrated["integrity"]["artifacts"][0]
+                .get("version")
+                .is_none()
+        );
+        assert!(
+            migrated["checkpoint"]["from_integrity"]["artifacts"][0]
+                .get("version")
+                .is_none(),
+            "the checkpoint's retained [A final] manifest is re-keyed too"
+        );
+
+        // The migrated document is a valid current-schema envelope.
+        let env: crate::DeploymentStateEnvelope =
+            serde_json::from_value(migrated).expect("migrated document loads");
+        assert_eq!(env.schema_version, crate::ENVELOPE_SCHEMA_VERSION);
+        let manifest = env.integrity.expect("manifest kept");
+        assert!(manifest.engine_identity.is_none());
+        assert_eq!(manifest.authority, crate::BuildAuthority::LocalDeveloper);
+    }
+
+    #[test]
+    fn canonical_chain_bridges_exactly_one_to_current() {
+        let reg = envelope_migrations();
+        reg.check_path(1, crate::ENVELOPE_SCHEMA_VERSION)
+            .expect("v1 envelopes are bridged to current");
+        reg.check_path(
+            crate::ENVELOPE_SCHEMA_VERSION,
+            crate::ENVELOPE_SCHEMA_VERSION,
+        )
+        .expect("current → current is a no-op");
     }
 }

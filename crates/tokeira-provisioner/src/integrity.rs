@@ -252,7 +252,6 @@ mod tests {
 
     fn descriptor(bytes: &[u8], target: &str) -> BinaryArtifactDescriptor {
         BinaryArtifactDescriptor {
-            version: "1.0.0".to_string(),
             target: Target(target.to_string()),
             sha256: sha256_hex(bytes),
             retrieval_ref: None,
@@ -264,6 +263,7 @@ mod tests {
         IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![descriptor(bytes, target)],
+            ..Default::default()
         }
     }
 
@@ -282,12 +282,12 @@ mod tests {
         let m = IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![BinaryArtifactDescriptor {
-                version: "1.0.0".to_string(),
                 target: Target("t".to_string()),
                 sha256: sha256_hex(b"aaaa"),
                 retrieval_ref: None,
                 size_bytes: 4,
             }],
+            ..Default::default()
         };
         let err = m
             .verify_artifact(b"bbbb", &Target("t".to_string()))
@@ -313,12 +313,12 @@ mod tests {
         let m = IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![BinaryArtifactDescriptor {
-                version: "1.0.0".to_string(),
                 target: Target("t".to_string()),
                 sha256: sha256_hex(bytes),
                 retrieval_ref: None,
                 size_bytes: 0,
             }],
+            ..Default::default()
         };
         m.verify_artifact(bytes, &Target("t".to_string()))
             .expect("unrecorded size skips the size check and verifies by digest");
@@ -341,6 +341,7 @@ mod tests {
         let m = IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![descriptor(bytes, target), descriptor(bytes, target)],
+            ..Default::default()
         };
         // The verification path is self-defending — it does not rely on validate().
         let err = m
@@ -376,12 +377,12 @@ mod tests {
             let m = IntegrityManifest {
                 provisioner_version: "1.0.0".to_string(),
                 artifacts: vec![BinaryArtifactDescriptor {
-                    version: "1.0.0".to_string(),
                     target: Target("t".to_string()),
                     sha256: raw.clone(),
                     retrieval_ref: None,
                     size_bytes: 0,
                 }],
+                ..Default::default()
             };
             match m.validate() {
                 Err(IntegrityError::InvalidChecksumFormat { reason, .. }) => {

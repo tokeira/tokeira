@@ -364,12 +364,12 @@ mod tests {
         IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![BinaryArtifactDescriptor {
-                version: "1.0.0".to_string(),
                 target: Target(target.to_string()),
                 sha256: sha.to_string(),
                 retrieval_ref: None,
                 size_bytes: 0,
             }],
+            ..Default::default()
         }
     }
 

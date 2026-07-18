@@ -13,7 +13,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::{
-    ProvisionerPlatform, apply, describe, destroy, init, lock, plan, revert, rollback, upgrade,
+    ProvisionerPlatform, apply, deploy, describe, destroy, init, lock, plan, revert, rollback,
+    scale, upgrade,
 };
 
 #[derive(Parser)]
@@ -42,6 +43,14 @@ enum Command {
     /// mirror `tkr` so forwarding is a transparent pass-through (Req 7.3).
     #[command(subcommand)]
     Infra(InfraCommand),
+    /// Workload — the services that run on the substrate. Conditionally
+    /// realized: a platform whose workload rides the infra universe realizes
+    /// these as the infra verbs.
+    #[command(subcommand)]
+    Deploy(DeployCommand),
+    /// Change workload capacity (`<dim>=<n>` specs); a config revision + a
+    /// workload apply. `NotApplicable` where the platform has no scale dimension.
+    Scale(ScaleArgs),
     /// Revert to a prior config revision — a same-engine apply, gated on the binding.
     Revert(RevertArgs),
     /// Upgrade to a new engine identity.
@@ -60,14 +69,37 @@ enum InfraCommand {
     Destroy(DestroyArgs),
 }
 
+#[derive(Subcommand)]
+enum DeployCommand {
+    /// Show the binding verdict + the workload plan. Read-only; never gates.
+    Plan(LifecycleArgs),
+    /// Reconcile the workload to desired, gated on the binding.
+    Apply(LifecycleArgs),
+}
+
+#[derive(Args)]
+struct ScaleArgs {
+    /// Deployment directory holding the state envelope.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Capacity specs (`<dim>=<n>`), platform-interpreted.
+    #[arg(required = true)]
+    specs: Vec<String>,
+}
+
 #[derive(Args)]
 struct DescribeArgs {
     /// Deployment directory holding the state envelope.
     #[arg(long)]
     deployment_dir: PathBuf,
-    /// Emit JSON instead of human-readable text.
+    /// Emit the full verification record as JSON (stable, machine-parseable).
     #[arg(long)]
     json: bool,
+    /// Human-readable verification/debug view: the complete per-artifact
+    /// manifest, retained revisions, state heads. Default is the short operator
+    /// view.
+    #[arg(long, conflicts_with = "json")]
+    verbose: bool,
 }
 
 #[derive(Args)]
@@ -102,9 +134,14 @@ struct RevertArgs {
 pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
     match Cli::parse().command {
         // Read-only: never gates, never locks.
-        Command::Describe(args) => describe::describe(&args.deployment_dir, args.json).await,
+        Command::Describe(args) => {
+            describe::describe(&platform, &args.deployment_dir, args.json, args.verbose).await
+        }
         Command::Infra(InfraCommand::Plan(args)) => {
             plan::plan(&platform, &args.deployment_dir).await
+        }
+        Command::Deploy(DeployCommand::Plan(args)) => {
+            deploy::deploy_plan(&platform, &args.deployment_dir).await
         }
         // Mutating verbs run under the deployment's operation lock (Req 11).
         // `rollback` holds one continuous lock across its whole sequence (12.2).
@@ -121,6 +158,18 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
             let yes = args.yes;
             lock::with_operation_lock(&dir, "destroy", || destroy::destroy(&platform, &dir, yes))
                 .await
+        }
+        Command::Deploy(DeployCommand::Apply(args)) => {
+            let dir = args.deployment_dir;
+            lock::with_operation_lock(&dir, "deploy-apply", || {
+                deploy::deploy_apply(&platform, &dir)
+            })
+            .await
+        }
+        Command::Scale(args) => {
+            let dir = args.deployment_dir;
+            let specs = args.specs;
+            lock::with_operation_lock(&dir, "scale", || scale::scale(&platform, &dir, &specs)).await
         }
         Command::Revert(args) => {
             let dir = args.deployment_dir;

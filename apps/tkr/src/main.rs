@@ -136,8 +136,16 @@ async fn main() -> Result<()> {
             commands::schema::run(action, ctx).await
         }
         Command::Scale { action } => {
-            let ctx = load_context(&deployments, selected)?;
-            commands::scale::run(action, &deployments, ctx).await
+            if deployments.is_forwarded(selected)? {
+                let dir = deployments.resolve_dir(selected)?;
+                match forwarded_scale_verb(&action) {
+                    Some(specs) => launcher::launch(&dir, &["scale"], &specs).await,
+                    None => launcher::launch(&dir, &["describe"], &[]).await,
+                }
+            } else {
+                let ctx = load_context(&deployments, selected)?;
+                commands::scale::run(action, &deployments, ctx).await
+            }
         }
         Command::Logs {
             service,
@@ -253,15 +261,35 @@ fn forwarded_infra_verb(action: &InfraAction) -> (&'static [&'static str], Vec<S
     }
 }
 
-/// Map a `tkr deploy` action to the forwarded `tkp` verb tokens. compose-syn
-/// models its containers as infra resources, so `deploy` still aliases the
-/// `infra` verbs; the dedicated `tkp deploy plan|apply` surface (task 15.3)
-/// takes over once the seam realizes it.
+/// Map a `tkr deploy` action to the forwarded `tkp` verb tokens — the same
+/// namespaced words (`tkr deploy plan` → `tkp deploy plan`). The platform
+/// decides realization: compose-syn's workload rides its infra universe.
 fn forwarded_deploy_verb(action: &DeployAction) -> (&'static [&'static str], Vec<String>) {
     match action {
-        DeployAction::Plan => (&["infra", "plan"], Vec::new()),
-        DeployAction::Apply { .. } => (&["infra", "apply"], Vec::new()),
+        DeployAction::Plan => (&["deploy", "plan"], Vec::new()),
+        DeployAction::Apply { .. } => (&["deploy", "apply"], Vec::new()),
         DeployAction::Status => (&["describe"], Vec::new()),
+    }
+}
+
+/// Map a `tkr scale` action to the forwarded `tkp scale` specs. The spec grammar
+/// is platform-interpreted; both current platforms answer `NotApplicable`.
+fn forwarded_scale_verb(action: &ScaleAction) -> Option<Vec<String>> {
+    let spec = |direction: &str, service: &Option<String>, replicas: &Option<u32>| {
+        let mut specs = vec![direction.to_string()];
+        if let Some(service) = service {
+            specs.push(service.clone());
+        }
+        if let Some(replicas) = replicas {
+            specs.push(replicas.to_string());
+        }
+        specs
+    };
+    match action {
+        ScaleAction::Up { service, replicas } => Some(spec("up", service, replicas)),
+        ScaleAction::Down { service, replicas } => Some(spec("down", service, replicas)),
+        // `scale status` is a read; the deployment describe covers it.
+        ScaleAction::Status => None,
     }
 }
 

@@ -61,14 +61,12 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     if envelope.deployment_id.is_empty() {
         envelope.deployment_id = project_name;
     }
-    envelope.binding = Some(running);
-    envelope.config_revision += 1;
-    let config_basename = platform.config_basename(deployment_dir);
-    envelope.effective_config_ref = Some(config_ref(deployment_dir, config_basename));
-    // Retain this revision's config source so a later `revert` can re-apply it
-    // (task 14.3). Best-effort: a config-less local deployment has nothing to keep.
-    config_history::snapshot(deployment_dir, config_basename, envelope.config_revision)
-        .context("failed to retain the applied config revision")?;
+    restamp_applied_revision(
+        &mut envelope,
+        running,
+        deployment_dir,
+        platform.config_basename(deployment_dir),
+    )?;
     store
         .save(&envelope, &version)
         .await
@@ -82,6 +80,24 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
             .unwrap_or("default")
     );
     Ok(())
+}
+
+/// Advance the envelope to a new applied config revision: re-stamp the binding,
+/// bump `config_revision`, record the effective-config ref, and retain the
+/// revision's config source (task 14.2/14.3). Shared by every verb that applies
+/// configuration (`apply`, `deploy apply`, `scale`); the caller persists.
+pub(crate) fn restamp_applied_revision(
+    envelope: &mut tokeira_provisioner::DeploymentStateEnvelope,
+    running: ProvenanceStamp,
+    deployment_dir: &Path,
+    config_basename: &str,
+) -> Result<()> {
+    envelope.binding = Some(running);
+    envelope.config_revision += 1;
+    envelope.effective_config_ref = Some(config_ref(deployment_dir, config_basename));
+    // Best-effort retention: a config-less local deployment has nothing to keep.
+    config_history::snapshot(deployment_dir, config_basename, envelope.config_revision)
+        .context("failed to retain the applied config revision")
 }
 
 /// The deployment identity used to seed the platform context, defaulting when the

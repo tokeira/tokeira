@@ -17,7 +17,7 @@ use tokeira_compose_syn::{
 use tokeira_iac::{Change, ModuleSelection};
 use tokeira_local_deployment::{LocalConfig, LocalDeployment};
 use tokeira_orchestrator::{Deployment, InfraEngine};
-use tokeira_provisioner_cli::ProvisionerPlatform;
+use tokeira_provisioner_cli::{ProvisionerPlatform, Realization};
 
 const TKD_FILE: &str = "definition.tkd";
 
@@ -57,6 +57,28 @@ impl ProvisionerPlatform for BundledPlatform {
 
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
         infra_destroy(deployment_dir).await
+    }
+
+    async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<Vec<Change>>> {
+        // The workload rides the infra universe on both bundled platforms:
+        // compose-syn models its tokeirad containers as infra resources, and
+        // local has no separate workload notion.
+        Ok(Realization::Realized(infra_plan(deployment_dir).await?))
+    }
+
+    async fn deploy_apply(&self, deployment_dir: &Path) -> Result<Realization<usize>> {
+        Ok(Realization::Realized(infra_apply(deployment_dir).await?))
+    }
+
+    async fn scale(&self, deployment_dir: &Path, _specs: &[String]) -> Result<Realization<usize>> {
+        Ok(Realization::NotApplicable {
+            reason: match detect(deployment_dir) {
+                Platform::ComposeSyn => {
+                    "compose-syn has no scale dimension (scaling lands with ECS)"
+                }
+                Platform::Local => "the local platform has no scale dimension",
+            },
+        })
     }
 }
 

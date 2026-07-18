@@ -22,6 +22,7 @@ use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 mod apply;
 mod cli;
 mod config_history;
+mod deploy;
 mod describe;
 mod destroy;
 mod gate;
@@ -30,9 +31,23 @@ mod lock;
 mod plan;
 mod revert;
 mod rollback;
+mod scale;
 mod upgrade;
 
 pub use cli::run;
+
+/// The outcome of a **conditionally realized** platform verb (design §"Command
+/// behaviour and outputs"): the surface is the same for every platform, and
+/// where a platform cannot honor a verb it answers `NotApplicable` — a
+/// first-class result the shell turns into a typed non-zero refusal, never a
+/// missing subcommand and never a crash.
+#[derive(Debug)]
+pub enum Realization<T> {
+    /// The platform realized the verb.
+    Realized(T),
+    /// This platform cannot honor the verb; `reason` is operator-facing.
+    NotApplicable { reason: &'static str },
+}
 
 /// The seam a per-platform provisioner binary implements: the platform-realized
 /// verbs plus the platform properties the shell genuinely needs. Everything else
@@ -54,7 +69,9 @@ pub trait ProvisionerPlatform {
     /// The deployment identity recorded at Day-0 stamp time.
     fn deployment_id(&self, deployment_dir: &Path) -> Result<String>;
 
-    /// Preview the infrastructure Delta (read-only, no mutation).
+    /// Preview the infrastructure Delta (read-only, no mutation). The infra
+    /// verbs are universal — every provisioner provisions infrastructure — so
+    /// they are unconditional, unlike the workload verbs below.
     async fn infra_plan(&self, deployment_dir: &Path) -> Result<Vec<Change>>;
 
     /// Reconcile infrastructure to desired. Returns the change count.
@@ -62,6 +79,18 @@ pub trait ProvisionerPlatform {
 
     /// Tear down the deployment's infrastructure. Returns the removed count.
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize>;
+
+    /// Preview the workload Delta (read-only). A platform whose workload rides
+    /// the infra universe (compose-syn models its containers as infra
+    /// resources) realizes this as the infra plan.
+    async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<Vec<Change>>>;
+
+    /// Reconcile the workload to desired. Returns the change count.
+    async fn deploy_apply(&self, deployment_dir: &Path) -> Result<Realization<usize>>;
+
+    /// Change workload capacity (`<dim>=<n>` specs). `NotApplicable` where the
+    /// platform has no scale dimension. Returns the change count.
+    async fn scale(&self, deployment_dir: &Path, specs: &[String]) -> Result<Realization<usize>>;
 }
 
 /// The deployment-level envelope store.
@@ -109,5 +138,19 @@ impl ProvisionerPlatform for TestPlatform {
 
     async fn infra_destroy(&self, _deployment_dir: &Path) -> Result<usize> {
         Ok(0)
+    }
+
+    async fn deploy_plan(&self, _deployment_dir: &Path) -> Result<Realization<Vec<Change>>> {
+        Ok(Realization::Realized(Vec::new()))
+    }
+
+    async fn deploy_apply(&self, _deployment_dir: &Path) -> Result<Realization<usize>> {
+        Ok(Realization::Realized(0))
+    }
+
+    async fn scale(&self, _deployment_dir: &Path, _specs: &[String]) -> Result<Realization<usize>> {
+        Ok(Realization::NotApplicable {
+            reason: "the test platform has no scale dimension",
+        })
     }
 }

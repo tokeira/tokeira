@@ -64,6 +64,21 @@ pub(crate) fn is_retained(deployment_dir: &Path, config_basename: &str, revision
     snapshot_path(deployment_dir, config_basename, revision).exists()
 }
 
+/// Every revision retained **for the current platform** (its basename), sorted
+/// ascending — the revertable set `describe` reports.
+pub(crate) fn retained_revisions(deployment_dir: &Path, config_basename: &str) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(revisions_root(deployment_dir)) else {
+        return Vec::new();
+    };
+    let mut revisions: Vec<u64> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_str().and_then(|n| n.parse().ok()))
+        .filter(|revision| is_retained(deployment_dir, config_basename, *revision))
+        .collect();
+    revisions.sort_unstable();
+    revisions
+}
+
 /// Restore a retained revision's config source into the live config file. Errors
 /// if the revision was never snapshotted for this platform — never overwriting
 /// the live config with a foreign-format or absent snapshot.
@@ -111,6 +126,23 @@ mod tests {
         std::fs::write(tmp.path().join(TKD), b"x").unwrap();
         let err = restore(tmp.path(), TKD, 7).expect_err("no snapshot → error");
         assert!(err.to_string().contains("no retained"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn retained_revisions_lists_the_platform_keyed_set_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(TKD), b"cfg").unwrap();
+        snapshot(tmp.path(), TKD, 2).unwrap();
+        snapshot(tmp.path(), TKD, 0).unwrap();
+        // A revision retained under the OTHER platform's basename is not listed.
+        std::fs::write(tmp.path().join(TOML), b"toml").unwrap();
+        snapshot(tmp.path(), TOML, 1).unwrap();
+
+        assert_eq!(retained_revisions(tmp.path(), TKD), vec![0, 2]);
+        assert_eq!(retained_revisions(tmp.path(), TOML), vec![1]);
+        // No history at all → empty, not an error.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(retained_revisions(empty.path(), TKD).is_empty());
     }
 
     // Regression for the cross-platform clobber: a revision retained while the

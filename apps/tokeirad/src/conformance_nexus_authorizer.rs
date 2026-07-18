@@ -6,7 +6,7 @@
 //! Nexus call target. This module is absent from production builds.
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokeira_edge::nexus_http::{
     NexusAuthorizationDecision, NexusAuthorizationTarget, NexusHttpAuthorizer,
 };
@@ -54,6 +54,7 @@ impl ConformanceNexusHttpAuthorizer {
 #[serde(tag = "decision", rename_all = "snake_case")]
 enum CallbackDecision {
     Allow,
+    Unauthenticated,
     Deny {
         reason: Option<String>,
     },
@@ -63,6 +64,15 @@ enum CallbackDecision {
     },
 }
 
+#[derive(Debug, Serialize)]
+struct CallbackRequest<'a> {
+    api_name: &'a str,
+    namespace: &'a str,
+    nexus_endpoint_name: Option<&'a str>,
+    auth_token: &'a str,
+    extra_data: &'a str,
+}
+
 #[async_trait]
 impl NexusHttpAuthorizer for ConformanceNexusHttpAuthorizer {
     async fn authorize(
@@ -70,10 +80,17 @@ impl NexusHttpAuthorizer for ConformanceNexusHttpAuthorizer {
         target: &NexusAuthorizationTarget,
         headers: &[(String, String)],
     ) -> NexusAuthorizationDecision {
+        let request = CallbackRequest {
+            api_name: &target.api_name,
+            namespace: &target.namespace,
+            nexus_endpoint_name: target.nexus_endpoint_name.as_deref(),
+            auth_token: header_value(headers, "authorization").unwrap_or_default(),
+            extra_data: header_value(headers, "authorization-extras").unwrap_or_default(),
+        };
         let response = match self
             .client
             .post(&self.callback_url)
-            .json(target)
+            .json(&request)
             .send()
             .await
         {
@@ -92,6 +109,7 @@ impl NexusHttpAuthorizer for ConformanceNexusHttpAuthorizer {
         }
         match response.json::<CallbackDecision>().await {
             Ok(CallbackDecision::Allow) => NexusAuthorizationDecision::Allow,
+            Ok(CallbackDecision::Unauthenticated) => NexusAuthorizationDecision::Unauthenticated,
             Ok(CallbackDecision::Deny { reason }) => NexusAuthorizationDecision::Deny { reason },
             Ok(CallbackDecision::AuthorizerError {
                 error_type,
@@ -117,4 +135,11 @@ impl NexusHttpAuthorizer for ConformanceNexusHttpAuthorizer {
             }
         }
     }
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }

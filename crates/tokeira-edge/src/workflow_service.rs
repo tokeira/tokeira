@@ -1807,6 +1807,7 @@ impl WorkflowService {
         req: crate::translate::nexus::PollNexusTaskQueueRequest,
     ) -> EdgeResult<Option<crate::translate::nexus::PollNexusTaskQueueResponse>> {
         let namespace_label = req.namespace.clone();
+        let client_name = nexus_client_name(headers);
         self.observe_edge_call(
             headers,
             "poll_nexus_task_queue",
@@ -1822,6 +1823,12 @@ impl WorkflowService {
                         true,
                     )
                     .await?;
+                crate::metrics::record_nexus_task_request(
+                    &req.namespace,
+                    "PollNexusTaskQueue",
+                    &client_name,
+                    is_internal_nexus_task_queue(&req.task_queue),
+                );
                 ensure_local(
                     self.router
                         .route_task_queue(&req.namespace, &req.task_queue, TaskKind::Workflow)
@@ -1841,24 +1848,16 @@ impl WorkflowService {
                     .await;
 
                 match task {
-                    Some(task) => {
-                        // A Nexus task handed to a worker — the dispatch equivalent of
-                        // v1.31.0's matching `nexus_task_requests`.
-                        crate::metrics::record_nexus_task_request(&req.namespace, "dispatched");
-                        Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
-                            task_token: task.token.encode().map_err(EdgeError::from)?,
-                            request: task.request,
-                            poller_scaling_decision: self
-                                .nexus_broker
-                                .has_runnable_backlog(namespace_id, &task_queue)
-                                .await
-                                .then_some(1),
-                        }))
-                    }
-                    None => {
-                        crate::metrics::record_nexus_task_request(&req.namespace, "timeout");
-                        Ok(None)
-                    }
+                    Some(task) => Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
+                        task_token: task.token.encode().map_err(EdgeError::from)?,
+                        request: task.request,
+                        poller_scaling_decision: self
+                            .nexus_broker
+                            .has_runnable_backlog(namespace_id, &task_queue)
+                            .await
+                            .then_some(1),
+                    })),
+                    None => Ok(None),
                 }
             },
         )
@@ -1871,6 +1870,7 @@ impl WorkflowService {
         mut req: crate::translate::nexus::RespondNexusTaskCompletedRequest,
     ) -> EdgeResult<()> {
         let namespace_label = req.namespace.clone();
+        let client_name = nexus_client_name(headers);
         self.observe_edge_call(
             headers,
             "respond_nexus_task_completed",
@@ -1915,6 +1915,12 @@ impl WorkflowService {
                 // has been decoded and namespace-fenced, but before consuming its
                 // delivery correlation (`workflow_handler.go:6058-6077 @ v1.31.0`).
                 validate_nexus_completed_response_failure_details(&response)?;
+                crate::metrics::record_nexus_task_request(
+                    &req.namespace,
+                    "RespondNexusTaskCompleted",
+                    &client_name,
+                    is_internal_nexus_task_queue(&token.task_queue),
+                );
                 let correlation =
                     self.nexus_broker
                         .consume(&token.task_id)
@@ -2067,6 +2073,7 @@ impl WorkflowService {
         mut req: crate::translate::nexus::RespondNexusTaskFailedRequest,
     ) -> EdgeResult<()> {
         let namespace_label = req.namespace.clone();
+        let client_name = nexus_client_name(headers);
         self.observe_edge_call(
             headers,
             "respond_nexus_task_failed",
@@ -2097,9 +2104,15 @@ impl WorkflowService {
                 {
                     return Err(EdgeError::BadRequest(
                         "request Failure must contain error or failure with NexusHandlerFailureInfo"
-                            .to_string(),
+                        .to_string(),
                     ));
                 }
+                crate::metrics::record_nexus_task_request(
+                    &req.namespace,
+                    "RespondNexusTaskFailed",
+                    &client_name,
+                    is_internal_nexus_task_queue(&token.task_queue),
+                );
                 let correlation = self
                     .nexus_broker
                     .consume(&token.task_id)
@@ -7718,6 +7731,21 @@ fn queue_key_for_poll(
         deployment,
         build_id,
     }
+}
+
+fn nexus_client_name(headers: &HeaderMap) -> String {
+    headers
+        .get("client-name")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn is_internal_nexus_task_queue(task_queue: &str) -> bool {
+    // Temporal deliberately avoids task-queue metric breakdown for its
+    // per-worker system queues because that label would be unbounded
+    // (`service/matching/handler.go:159-176 @ v1.31.0`).
+    task_queue.starts_with("/temporal-sys/")
 }
 
 fn collect_eager_activity_specs(

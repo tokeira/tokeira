@@ -49,6 +49,8 @@ pub const NEXUS_COMPLETION_PREPROCESS_ERRORS_TOTAL: &str =
     "tokeira_edge_nexus_completion_request_preprocess_errors_total";
 /// Nexus task dispatch requests served to workers (maps to `nexus_task_requests`).
 pub const NEXUS_TASK_REQUESTS_TOTAL: &str = "tokeira_edge_nexus_task_requests_total";
+/// Normal service telemetry for caller-facing Nexus HTTP methods (maps to `service_requests`).
+pub const SERVICE_REQUESTS_TOTAL: &str = "tokeira_edge_service_requests_total";
 /// Caller-facing Nexus HTTP requests after route resolution (maps to `nexus_requests`).
 pub const NEXUS_REQUESTS_TOTAL: &str = "tokeira_edge_nexus_requests_total";
 /// Caller-facing Nexus HTTP request latency (maps to `nexus_latency`).
@@ -79,6 +81,7 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
         MetricType::Counter,
     ),
     (NEXUS_TASK_REQUESTS_TOTAL, MetricType::Counter),
+    (SERVICE_REQUESTS_TOTAL, MetricType::Counter),
     (NEXUS_REQUESTS_TOTAL, MetricType::Counter),
     (NEXUS_LATENCY_SECONDS, MetricType::DurationHistogram),
     (NEXUS_REQUEST_PREPROCESS_ERRORS_TOTAL, MetricType::Counter),
@@ -175,13 +178,35 @@ pub fn record_nexus_completion_preprocess_error(namespace: &str) {
         .increment(1);
 }
 
-/// Record one Nexus task dispatched to a worker via `PollNexusTaskQueue`, tagged by
-/// `namespace` and `outcome` (`dispatched` / `timeout`).
-pub fn record_nexus_task_request(namespace: &str, outcome: &str) {
+/// Record one Nexus worker RPC at admission.
+///
+/// Temporal v1.31.0 records this for poll and respond RPCs with the worker's
+/// client name and an internal-queue discriminator, independently of whether a
+/// long poll eventually finds work (`service/matching/handler.go:165-176,523-572
+/// @ v1.31.0`).
+pub fn record_nexus_task_request(
+    namespace: &str,
+    operation: &str,
+    client_name: &str,
+    is_internal: bool,
+) {
     counter!(
         NEXUS_TASK_REQUESTS_TOTAL,
         "namespace" => namespace.to_string(),
-        "outcome" => outcome.to_string(),
+        "operation" => operation.to_string(),
+        "client_name" => client_name.to_string(),
+        "is_internal" => is_internal.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record one caller-facing Nexus operation in the edge's normal service
+/// telemetry surface.
+pub fn record_service_request(namespace: &str, operation: &str) {
+    counter!(
+        SERVICE_REQUESTS_TOTAL,
+        "namespace" => namespace.to_owned(),
+        "operation" => operation.to_owned(),
     )
     .increment(1);
 }
@@ -416,7 +441,8 @@ mod tests {
             record_nexus_completion_request("default", "success");
             record_nexus_completion_latency("default", std::time::Duration::from_millis(7));
             record_nexus_completion_preprocess_error("default");
-            record_nexus_task_request("default", "dispatched");
+            record_nexus_task_request("default", "PollNexusTaskQueue", "temporal-go", false);
+            record_service_request("default", "StartNexusOperation");
         });
 
         let snapshot = snapshot_map(&recorder);
@@ -437,7 +463,20 @@ mod tests {
 
         let (labels, value) = snapshot.get(NEXUS_TASK_REQUESTS_TOTAL).unwrap();
         assert_eq!(labels.get("namespace"), Some(&"default".to_string()));
-        assert_eq!(labels.get("outcome"), Some(&"dispatched".to_string()));
+        assert_eq!(
+            labels.get("operation"),
+            Some(&"PollNexusTaskQueue".to_string())
+        );
+        assert_eq!(labels.get("client_name"), Some(&"temporal-go".to_string()));
+        assert_eq!(labels.get("is_internal"), Some(&"false".to_string()));
+        assert_eq!(value, &DebugValue::Counter(1));
+
+        let (labels, value) = snapshot.get(SERVICE_REQUESTS_TOTAL).unwrap();
+        assert_eq!(labels.get("namespace"), Some(&"default".to_string()));
+        assert_eq!(
+            labels.get("operation"),
+            Some(&"StartNexusOperation".to_string())
+        );
         assert_eq!(value, &DebugValue::Counter(1));
     }
 
@@ -462,6 +501,7 @@ mod tests {
                     &endpoint,
                     std::time::Duration::from_millis(3),
                 );
+                record_service_request(&namespace, method);
                 record_nexus_request_preprocess_error();
             });
             let snapshot = snapshot_map(&recorder);
@@ -482,6 +522,12 @@ mod tests {
                 DebugValue::Histogram(values) => prop_assert_eq!(values.len(), 1),
                 other => prop_assert!(false, "expected histogram, got {other:?}"),
             }
+            let (labels, value) = snapshot
+                .get(SERVICE_REQUESTS_TOTAL)
+                .expect("service request");
+            prop_assert_eq!(value, &DebugValue::Counter(1));
+            prop_assert_eq!(labels.get("namespace"), Some(&namespace));
+            prop_assert_eq!(labels.get("operation").map(String::as_str), Some(method));
             let (labels, value) = snapshot
                 .get(NEXUS_REQUEST_PREPROCESS_ERRORS_TOTAL)
                 .expect("preprocess counter");

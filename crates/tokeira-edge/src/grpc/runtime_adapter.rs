@@ -649,6 +649,25 @@ where
             .resolve_nexus_operation(run_key, operation_id, scheduled_event_id, resolution)
             .await
     }
+
+    async fn record_nexus_cancellation_attempt(
+        &self,
+        run_key: tokeira_types::RunKey,
+        operation_id: String,
+        scheduled_event_id: i64,
+        requested_event_id: i64,
+        outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
+    ) -> Result<bool> {
+        self.runtime
+            .record_nexus_cancellation_attempt(
+                run_key,
+                operation_id,
+                scheduled_event_id,
+                requested_event_id,
+                outcome,
+            )
+            .await
+    }
 }
 
 #[async_trait]

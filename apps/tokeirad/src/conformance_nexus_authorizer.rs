@@ -15,7 +15,7 @@ const CALLBACK_URL_ENV: &str = "TOKEIRA_CONFORMANCE_AUTH_CALLBACK_URL";
 
 /// Namespace-scoped callback authorizer used only by the functional harness.
 #[derive(Clone)]
-pub struct ConformanceNexusHttpAuthorizer {
+pub(crate) struct ConformanceNexusHttpAuthorizer {
     client: reqwest::Client,
     callback_url: String,
     fallback: std::sync::Arc<dyn NexusHttpAuthorizer>,
@@ -34,7 +34,9 @@ impl std::fmt::Debug for ConformanceNexusHttpAuthorizer {
 impl ConformanceNexusHttpAuthorizer {
     /// Construct from the harness-provided callback URL, or return `None` when
     /// the callback bridge is not active for this conformance process.
-    pub fn from_environment(fallback: std::sync::Arc<dyn NexusHttpAuthorizer>) -> Option<Self> {
+    pub(crate) fn from_environment(
+        fallback: std::sync::Arc<dyn NexusHttpAuthorizer>,
+    ) -> Option<Self> {
         let callback_url = std::env::var(CALLBACK_URL_ENV).ok()?;
         let callback_url = callback_url.trim();
         if callback_url.is_empty() {

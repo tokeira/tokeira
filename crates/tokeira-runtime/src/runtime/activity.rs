@@ -745,6 +745,38 @@ where
         }
     }
 
+    /// Record one worker-delivered Nexus cancellation attempt without resolving
+    /// the parent operation. The kernel fences both the scheduled operation and
+    /// cancel-request event; stale duplicate worker responses are idempotent success.
+    pub async fn record_nexus_cancellation_attempt(
+        &self,
+        run_key: RunKey,
+        operation_id: String,
+        scheduled_event_id: i64,
+        requested_event_id: i64,
+        outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
+    ) -> Result<bool> {
+        match self
+            .submit_for_owned_shard(
+                run_key,
+                Command::NexusCancellationAttempted(
+                    tokeira_kernel::NexusCancellationAttemptedRequest {
+                        operation_id,
+                        scheduled_event_id,
+                        requested_event_id,
+                        outcome,
+                        now: OffsetDateTime::now_utc(),
+                    },
+                ),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.to_string().contains("kernel rejected command") => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Atomically transition a polled activity task into the Started state,
     /// emitting `ActivityTaskStarted` and returning the dispatchable task.
     ///

@@ -81,6 +81,17 @@ impl WorkflowRuntimeApi for FakeRuntime {
         }
     }
 
+    async fn record_nexus_cancellation_attempt(
+        &self,
+        _run_key: RunKey,
+        _operation_id: String,
+        _scheduled_event_id: i64,
+        _requested_event_id: i64,
+        _outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
+    ) -> Result<bool> {
+        unreachable!("callback handler never records cancellation attempts")
+    }
+
     async fn start_workflow(&self, _req: StartRequest) -> Result<WorkflowMutationOutcome> {
         unreachable!("callback handler never starts workflows")
     }

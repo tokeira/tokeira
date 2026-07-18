@@ -781,6 +781,51 @@ pub struct PendingUpdate {
     pub name: String,
 }
 
+/// Durable delivery state for a pending Nexus operation's cancellation request.
+///
+/// This is authoritative workflow state, not an outbound queue record. The runtime
+/// performs delivery and supplies attempt outcomes/deadlines; the pure kernel only
+/// advances this state and emits derived dispatch effects. The shape mirrors
+/// `NexusOperationCancellationInfo` and the cancellation state machine in
+/// `components/nexusoperations/statemachine.go:524-681 @ v1.31.0`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NexusOperationCancellation {
+    /// Event ID of the `NexusOperationCancelRequested` history event.
+    pub requested_event_id: i64,
+    /// Time delivery first became eligible. This remains absent while cancellation
+    /// waits for an operation that has not started.
+    pub requested_time: Option<OffsetDateTime>,
+    /// Current cancellation-delivery lifecycle state.
+    pub state: NexusOperationCancellationState,
+    /// Completed delivery attempts. Incremented only when an attempt reports an
+    /// outcome, matching v1.31.0's `recordAttempt` ordering.
+    pub attempt: u32,
+    /// Completion time of the most recent delivery attempt.
+    pub last_attempt_complete_time: Option<OffsetDateTime>,
+    /// Failure from the most recent failed delivery attempt.
+    pub last_attempt_failure: Option<Payload>,
+    /// Runtime-computed deadline for retrying a retryable failure.
+    pub next_attempt_at: Option<OffsetDateTime>,
+}
+
+/// Lifecycle of a Nexus cancellation request while its parent operation remains pending.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NexusOperationCancellationState {
+    /// Cancellation was requested before the operation started, so no delivery is
+    /// eligible yet.
+    #[default]
+    Unspecified,
+    /// A delivery is queued or in flight.
+    Scheduled,
+    /// The last delivery failed retryably and awaits its runtime-supplied deadline.
+    BackingOff,
+    /// The handler acknowledged the cancellation request. This does not resolve the
+    /// parent operation; its completion callback still owns the terminal outcome.
+    Succeeded,
+    /// Delivery failed non-retryably.
+    Failed,
+}
+
 /// Tracks a Nexus operation that has been scheduled but not
 /// yet reached a terminal state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -849,6 +894,10 @@ pub struct PendingNexusOperation {
     /// at schedule and rebuilt from the `NexusOperationScheduled` event on replay.
     #[serde(default)]
     pub input: Payloads,
+    /// Cancellation-delivery lifecycle, present after the workflow requests
+    /// cancellation and retained until the parent operation resolves.
+    #[serde(default)]
+    pub cancellation: Option<NexusOperationCancellation>,
 }
 
 /// Stored form of `WorkflowExecutionVersioningInfo` for one run.

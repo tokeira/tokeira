@@ -260,6 +260,8 @@ pub enum DispatchOp {
     /// Cancel a previously scheduled Nexus operation.
     CancelNexusOperation {
         scheduled_event_id: i64,
+        /// Event ID of the cancellation request, used to fence attempt outcomes.
+        requested_event_id: i64,
         originator_run_key: RunKey,
         operation_id: String,
         endpoint: String,

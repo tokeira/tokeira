@@ -29,26 +29,33 @@ use time::OffsetDateTime;
 use tokeira_compatibility::{FEATURE_MATRIX, FeatureState};
 use tokeira_kernel::{
     ActivityRetryPolicyPatch, CancelRequest, FieldChange, HistoryEvent, HistoryEventKind,
-    LoadedRun, NexusResolution, ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest,
-    TerminateRequest, WorkflowTaskCompletedRequest,
+    LoadedRun, NexusCancellationAttemptOutcome, NexusResolution, PendingNexusOperation,
+    ResetRequest, SignalRequest, SignalWithStartRequest, StartRequest, TerminateRequest,
+    WorkflowTaskCompletedRequest,
 };
-use tokeira_proto::public::temporal::api::rules::v1::{WorkflowRule, WorkflowRuleSpec};
+use tokeira_proto::{
+    conversions::common::failure_to_payload,
+    public::temporal::api::{
+        failure::v1 as failure_proto,
+        rules::v1::{WorkflowRule, WorkflowRuleSpec},
+    },
+};
 use tokeira_runtime::{
     ActivityTokenResolutionError, BatchActivityOptionsPatch, BatchError, BatchOperationEntry,
     BatchOperationStore, BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry,
     CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion, DeleteWorkflowRequest,
     DeploymentPage, DeploymentView, DescribeVersion, InMemoryBroker, ListDeployments,
     MultiOperationError, MultiOperationResult, NexusTaskBroker, NexusTaskCorrelation,
-    NexusTaskToken, OverlapDecision, OverlapPolicy, PendingUpdateTransport, QueryResult,
-    RegisterPolledDeployment, ResetWorkflowResult, ScheduleActionResult, SchedulePatch,
-    ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome, SetRamping,
-    SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
+    NexusTaskToken, NexusWorkflowTaskKind, OverlapDecision, OverlapPolicy, PendingUpdateTransport,
+    QueryResult, RegisterPolledDeployment, ResetWorkflowResult, ScheduleActionResult,
+    SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome,
+    SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
     StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView,
     UpdateActivitiesOptionsRequest, UpdateComputeConfig, UpdateLifecycleError,
     UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
     ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistry, WorkflowActivation,
     WorkflowDeletion, WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus,
-    compute_matching_times, decide_overlap, schedule_workflow_id,
+    compute_matching_times, decide_overlap, nexus_operation_next_attempt_at, schedule_workflow_id,
     scheduled_workflow_search_attributes,
 };
 use tokeira_storage::{
@@ -456,6 +463,38 @@ fn option_field_selected(update_mask: &[String], field: &str) -> bool {
             || path.starts_with(&format!("activity_options.{field}."))
             || path.starts_with(&format!("activityOptions.{camel}."))
     })
+}
+
+/// Classify a worker-reported Nexus cancellation failure using the same runtime
+/// policy and schedule-to-close cap as External-endpoint delivery. The edge sees
+/// the worker's public `Failure`; the kernel receives only the durable outcome and
+/// a precomputed deadline.
+fn worker_cancellation_failure_outcome(
+    pending: &PendingNexusOperation,
+    failure: failure_proto::Failure,
+    retryable: bool,
+    now: OffsetDateTime,
+) -> NexusCancellationAttemptOutcome {
+    let failure = failure_to_payload(&failure);
+    let failed_attempts = pending
+        .cancellation
+        .as_ref()
+        .map(|cancellation| cancellation.attempt)
+        .unwrap_or_default();
+    if retryable
+        && let Some(next_attempt_at) = nexus_operation_next_attempt_at(
+            failed_attempts,
+            pending.scheduled_at,
+            pending.schedule_to_close_timeout,
+            now,
+        )
+    {
+        return NexusCancellationAttemptOutcome::RetryableFailure {
+            failure,
+            next_attempt_at,
+        };
+    }
+    NexusCancellationAttemptOutcome::NonRetryableFailure { failure }
 }
 
 #[async_trait]
@@ -898,6 +937,17 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         operation_id: String,
         scheduled_event_id: i64,
         resolution: NexusResolution,
+    ) -> Result<bool>;
+
+    /// Record a worker-owned cancellation delivery outcome without resolving the
+    /// parent Nexus operation.
+    async fn record_nexus_cancellation_attempt(
+        &self,
+        run_key: RunKey,
+        operation_id: String,
+        scheduled_event_id: i64,
+        requested_event_id: i64,
+        outcome: tokeira_kernel::NexusCancellationAttemptOutcome,
     ) -> Result<bool>;
 }
 
@@ -1874,7 +1924,7 @@ impl WorkflowService {
                                 "Nexus task not found or already expired".to_string(),
                             )
                         })?;
-                let (run_key, operation_id, scheduled_event_id) = match correlation {
+                let (run_key, operation_id, scheduled_event_id, task_kind) = match correlation {
                     NexusTaskCorrelation::Http { waiter_id } => {
                         // Consuming the delivery correlation acknowledges the worker.
                         // A concurrent caller disconnect may remove the edge waiter after
@@ -1889,7 +1939,8 @@ impl WorkflowService {
                         run_key,
                         operation_id,
                         scheduled_event_id,
-                    } => (run_key, operation_id, scheduled_event_id),
+                        task_kind,
+                    } => (run_key, operation_id, scheduled_event_id, task_kind),
                 };
 
                 // Workflow-originated worker tasks are outbound Nexus attempts. HTTP
@@ -1904,6 +1955,53 @@ impl WorkflowService {
                         tags.failure_source,
                         &tags.outcome,
                     );
+                }
+
+                if task_kind == NexusWorkflowTaskKind::CancelOperation {
+                    if !matches!(
+                        response.variant.as_ref(),
+                        Some(tokeira_proto::public::temporal::api::nexus::v1::response::Variant::CancelOperation(_))
+                    ) {
+                        return Err(EdgeError::BadRequest(
+                            "cancel operation task requires a cancel operation response".to_string(),
+                        ));
+                    }
+                    let pending = match self
+                        .repo
+                        .load_run(run_key)
+                        .await
+                        .map_err(EdgeError::from)?
+                    {
+                        LoadedRun::Existing(state) => {
+                            state.pending_nexus_operations.get(&operation_id).cloned()
+                        }
+                        LoadedRun::Absent => None,
+                    };
+                    let Some(pending) = pending else {
+                        return Ok(());
+                    };
+                    let Some(cancellation) = pending.cancellation.as_ref() else {
+                        return Ok(());
+                    };
+                    let applied = self
+                        .runtime
+                        .record_nexus_cancellation_attempt(
+                            run_key,
+                            operation_id,
+                            scheduled_event_id,
+                            cancellation.requested_event_id,
+                            NexusCancellationAttemptOutcome::Succeeded,
+                        )
+                        .await
+                        .map_err(EdgeError::from)?;
+                    if applied {
+                        self.notify_history_run_key(
+                            run_key,
+                            read_last_event_id(self.repo.as_ref(), run_key).await?,
+                        )
+                        .await;
+                    }
+                    return Ok(());
                 }
 
                 // Load the pending op so an operation-unsuccessful response can be wrapped
@@ -2011,7 +2109,7 @@ impl WorkflowService {
                             "Nexus task not found or already expired".to_string(),
                         )
                     })?;
-                let (run_key, operation_id, scheduled_event_id) = match correlation {
+                let (run_key, operation_id, scheduled_event_id, task_kind) = match correlation {
                     NexusTaskCorrelation::Http { waiter_id } => {
                         let _ = self.nexus_http_waiters.complete(
                             &waiter_id,
@@ -2026,7 +2124,8 @@ impl WorkflowService {
                         run_key,
                         operation_id,
                         scheduled_event_id,
-                    } => (run_key, operation_id, scheduled_event_id),
+                        task_kind,
+                    } => (run_key, operation_id, scheduled_event_id, task_kind),
                 };
                 // A failed worker response is the terminal result of an outbound
                 // StartOperation (a worker-reported handler error); capture its
@@ -2036,6 +2135,69 @@ impl WorkflowService {
                     req.failure.as_ref(),
                     req.error.as_ref(),
                 );
+                if task_kind == NexusWorkflowTaskKind::CancelOperation {
+                    let pending = match self
+                        .repo
+                        .load_run(run_key)
+                        .await
+                        .map_err(EdgeError::from)?
+                    {
+                        LoadedRun::Existing(state) => {
+                            state.pending_nexus_operations.get(&operation_id).cloned()
+                        }
+                        LoadedRun::Absent => None,
+                    };
+                    let Some(pending) = pending else {
+                        return Ok(());
+                    };
+                    let Some(cancellation) = pending.cancellation.as_ref() else {
+                        return Ok(());
+                    };
+                    let failure = if let Some(failure) = req.failure {
+                        failure
+                    } else {
+                        crate::translate::nexus::legacy_handler_error_to_failure(
+                            req.error.ok_or_else(|| {
+                                EdgeError::BadRequest(
+                                    "request must contain error or failure".to_string(),
+                                )
+                            })?,
+                        )
+                    };
+                    let retryable =
+                        crate::translate::nexus::nexus_handler_failure_retryable(&failure);
+                    let outcome = worker_cancellation_failure_outcome(
+                        &pending,
+                        failure,
+                        retryable,
+                        OffsetDateTime::now_utc(),
+                    );
+                    tokeira_runtime::metrics::record_nexus_outbound_request(
+                        &req.namespace,
+                        "CancelOperation",
+                        outbound_tags.failure_source,
+                        &outbound_tags.outcome,
+                    );
+                    let applied = self
+                        .runtime
+                        .record_nexus_cancellation_attempt(
+                            run_key,
+                            operation_id,
+                            scheduled_event_id,
+                            cancellation.requested_event_id,
+                            outcome,
+                        )
+                        .await
+                        .map_err(EdgeError::from)?;
+                    if applied {
+                        self.notify_history_run_key(
+                            run_key,
+                            read_last_event_id(self.repo.as_ref(), run_key).await?,
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
                 // Prefer the v1.62 structured `failure` (field 5) modern SDKs send;
                 // fall back to the deprecated `error` (field 4). v1.31.0 requires
                 // one of them, and a `failure` must carry a NexusHandlerFailureInfo

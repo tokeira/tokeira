@@ -1614,6 +1614,8 @@ fn command_type_name(command: &Command) -> &'static str {
         Command::ExternalCancelResolved(_) => "ExternalCancelResolved",
         Command::NexusOperationResolved(_) => "NexusOperationResolved",
         Command::NexusOperationRetry(_) => "NexusOperationRetry",
+        Command::NexusCancellationAttempted(_) => "NexusCancellationAttempted",
+        Command::NexusCancellationRetry(_) => "NexusCancellationRetry",
         Command::TimerDue(_) => "TimerDue",
         Command::WorkflowStartDelayElapsed(_) => "WorkflowStartDelayElapsed",
         Command::ScheduleQueryTask(_) => "ScheduleQueryTask",
@@ -1709,6 +1711,12 @@ fn history_event_type_name(event: &HistoryEvent) -> &'static str {
         HistoryEventKind::NexusOperationCanceled { .. } => "NexusOperationCanceled",
         HistoryEventKind::NexusOperationTimedOut { .. } => "NexusOperationTimedOut",
         HistoryEventKind::NexusOperationCancelRequested { .. } => "NexusOperationCancelRequested",
+        HistoryEventKind::NexusOperationCancelRequestCompleted { .. } => {
+            "NexusOperationCancelRequestCompleted"
+        }
+        HistoryEventKind::NexusOperationCancelRequestFailed { .. } => {
+            "NexusOperationCancelRequestFailed"
+        }
         HistoryEventKind::WorkflowExecutionUpdateAccepted { .. } => {
             "WorkflowExecutionUpdateAccepted"
         }

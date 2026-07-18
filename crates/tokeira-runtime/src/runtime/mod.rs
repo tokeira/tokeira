@@ -2561,6 +2561,7 @@ mod tests {
             next_attempt_at: None,
             operation_token: String::new(),
             input: Default::default(),
+            cancellation: None,
         };
 
         // Schedule-to-close fires once scheduled_at + timeout has passed.

@@ -507,6 +507,69 @@ pub struct PendingNexusOperationDescription {
     /// (`PendingNexusOperationInfo.next_attempt_schedule_time`); drives the
     /// `BACKING_OFF` state. `None` unless backing off.
     pub next_attempt_at: Option<OffsetDateTime>,
+    /// Cancellation delivery state, present after the workflow requests it.
+    pub cancellation: Option<NexusOperationCancellationDescription>,
+}
+
+/// Describe projection for one pending Nexus operation's cancellation request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NexusOperationCancellationDescription {
+    /// Time the first cancellation delivery became eligible.
+    pub requested_time: Option<OffsetDateTime>,
+    /// Durable cancellation lifecycle state.
+    pub state: tokeira_kernel::NexusOperationCancellationState,
+    /// Completed delivery attempts.
+    pub attempt: u32,
+    /// Completion time of the latest attempt.
+    pub last_attempt_complete_time: Option<OffsetDateTime>,
+    /// Failure from the latest failed attempt.
+    pub last_attempt_failure: Option<tokeira_types::Payload>,
+    /// Next runtime-computed retry deadline.
+    pub next_attempt_at: Option<OffsetDateTime>,
+}
+
+/// Project pending Nexus operations from authoritative run state in chronological
+/// schedule order.
+///
+/// Temporal v1.31.0 obtains this list by iterating the HSM collection's Go map and
+/// promises no order (`service/history/hsm/tree.go:643-657` and
+/// `service/history/api/describeworkflow/api.go:289-320 @ v1.31.0`). Tokeira uses
+/// the immutable scheduled-event ID as a stable order so repeated Describe calls
+/// and corpus assertions cannot inherit `HashMap` iteration randomness.
+pub fn describe_pending_nexus_operations(
+    state: &tokeira_kernel::WorkflowState,
+) -> Vec<PendingNexusOperationDescription> {
+    let mut operations = state
+        .pending_nexus_operations
+        .values()
+        .map(|operation| PendingNexusOperationDescription {
+            endpoint: operation.endpoint.clone(),
+            service: operation.service.clone(),
+            operation: operation.operation.clone(),
+            scheduled_time: operation.scheduled_at,
+            scheduled_event_id: operation.scheduled_event_id,
+            schedule_to_close_timeout: operation.schedule_to_close_timeout,
+            schedule_to_start_timeout: operation.schedule_to_start_timeout,
+            start_to_close_timeout: operation.start_to_close_timeout,
+            started: operation.started,
+            operation_token: operation.started.then(|| operation.operation_token.clone()),
+            attempt: operation.attempt,
+            last_attempt_failure: operation.last_attempt_failure.clone(),
+            next_attempt_at: operation.next_attempt_at,
+            cancellation: operation.cancellation.as_ref().map(|cancellation| {
+                NexusOperationCancellationDescription {
+                    requested_time: cancellation.requested_time,
+                    state: cancellation.state,
+                    attempt: cancellation.attempt,
+                    last_attempt_complete_time: cancellation.last_attempt_complete_time,
+                    last_attempt_failure: cancellation.last_attempt_failure.clone(),
+                    next_attempt_at: cancellation.next_attempt_at,
+                }
+            }),
+        })
+        .collect::<Vec<_>>();
+    operations.sort_by_key(|operation| operation.scheduled_event_id);
+    operations
 }
 
 // Visibility types re-exported from tokeira-projection (the authoritative owner).

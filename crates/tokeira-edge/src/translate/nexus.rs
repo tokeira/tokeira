@@ -425,6 +425,43 @@ pub fn proto_handler_error_to_resolution(
     })
 }
 
+/// Convert the deprecated Nexus `HandlerError` response into the modern public
+/// Temporal failure shape used by cancellation attempt state. v1.31.0 accepts
+/// both the deprecated error and structured failure fields; retaining the
+/// `NexusHandlerFailureInfo` makes retry classification identical for either wire
+/// form (`workflow_handler.go:6081-6104 @ v1.31.0`).
+pub fn legacy_handler_error_to_failure(error: nexus_v1::HandlerError) -> failure_proto::Failure {
+    let cause = error.failure.map(|failure| {
+        Box::new(failure_proto::Failure {
+            message: failure.message,
+            stack_trace: failure.stack_trace,
+            failure_info: Some(failure_proto::failure::FailureInfo::ApplicationFailureInfo(
+                failure_proto::ApplicationFailureInfo {
+                    r#type: "NexusFailure".to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        })
+    });
+    failure_proto::Failure {
+        message: cause
+            .as_ref()
+            .map(|failure| failure.message.clone())
+            .unwrap_or_default(),
+        failure_info: Some(
+            failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(
+                failure_proto::NexusHandlerFailureInfo {
+                    r#type: error.error_type,
+                    retry_behavior: error.retry_behavior,
+                },
+            ),
+        ),
+        cause,
+        ..Default::default()
+    }
+}
+
 /// `failure_source` metric-tag values for an outbound Nexus request. `worker` marks a
 /// failure the handler/worker reported; otherwise the tag defaults to `_unknown_`
 /// (`common/nexus/failure.go:25-26`, `common/metrics/tags.go:66,264-268 @ v1.31.0`).

@@ -20,11 +20,12 @@ use tokeira_kernel::{
 use tokeira_runtime::{
     ActivityTimeoutScannerConfig, BacklogConfig, COMPLETION_TOKEN_VERSION,
     CompletionCallbackScannerConfig, CompletionDeliveryOutcome, EndpointTarget,
-    InMemoryNexusEndpointStore, LaneConfig, NexusCompletion, NexusCompletionClient,
-    NexusCompletionDeps, NexusCompletionRuntimeConfig, NexusCompletionToken, NexusEndpointRegistry,
-    NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore, NexusHttpClient,
-    NexusStartResult, NexusTaskCorrelation, NexusTaskRequest, NexusTimeoutScannerConfig,
-    SYSTEM_CALLBACK_URL, TimerScannerConfig, TokeiraRuntime, WorkflowTimeoutScannerConfig,
+    InMemoryNexusEndpointStore, LaneConfig, NexusCancelResult, NexusCompletion,
+    NexusCompletionClient, NexusCompletionDeps, NexusCompletionRuntimeConfig, NexusCompletionToken,
+    NexusEndpointRegistry, NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore,
+    NexusHttpClient, NexusStartResult, NexusTaskCorrelation, NexusTaskRequest,
+    NexusTimeoutScannerConfig, SYSTEM_CALLBACK_URL, TimerScannerConfig, TokeiraRuntime,
+    WorkflowTimeoutScannerConfig,
 };
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
@@ -136,7 +137,7 @@ impl NexusHttpClient for MockNexusClient {
         operation: &str,
         operation_token: &str,
         _trace_headers: &[KeyValue],
-    ) -> Result<()> {
+    ) -> Result<NexusCancelResult> {
         let mut state = self.state.lock().unwrap();
         let _ = service;
         state.cancel_calls.push((
@@ -145,7 +146,7 @@ impl NexusHttpClient for MockNexusClient {
             operation_token.to_string(),
         ));
         if state.cancel_ok {
-            Ok(())
+            Ok(NexusCancelResult::Succeeded)
         } else {
             Err(anyhow!("cancel failed"))
         }
@@ -427,18 +428,18 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
         })
         .await?;
 
-    // v1.31.0 decouples cancel-ack from operation resolution: CancelNexusOperation
-    // records a NexusOperationCancelRequested event and dispatches the cancel to the
-    // handler, but does NOT resolve the operation. The operation resolves solely from
-    // its completion when the backing workflow closes
-    // (components/nexusoperations/statemachine.go:424,668 @ v1.31.0; Gap C of commit
-    // 31b50953 "decouple cancel from resolution"). So we assert the cancel-request is
-    // recorded and the cancel is dispatched exactly once — never a Canceled resolution.
+    // v1.31.0 decouples cancellation-delivery acknowledgement from operation
+    // resolution. The acknowledgement completes the cancellation child and emits
+    // NexusOperationCancelRequestCompleted; it does not resolve the parent operation
+    // (`components/nexusoperations/statemachine.go:424,668 @ v1.31.0`).
     wait_for_history(&store, run_key, |history| {
         history.iter().any(|event| {
             matches!(
                 &event.kind,
-                HistoryEventKind::NexusOperationCancelRequested { scheduled_event_id: id }
+                HistoryEventKind::NexusOperationCancelRequested {
+                    scheduled_event_id: id,
+                    ..
+                }
                 if *id == scheduled_event_id
             )
         })
@@ -448,6 +449,18 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
     // The cancel is delivered to the handler exactly once (1 start, 1 cancel). Dispatch
     // runs after the WFT commit, so wait for it rather than assume synchronous delivery.
     wait_for_client(&client, (1, 1)).await?;
+    wait_for_history(&store, run_key, |history| {
+        history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                HistoryEventKind::NexusOperationCancelRequestCompleted {
+                    scheduled_event_id: id,
+                    ..
+                } if *id == scheduled_event_id
+            )
+        })
+    })
+    .await?;
 
     // The cancel-ack must not resolve the operation: no NexusOperationCanceled is
     // emitted, and the operation stays pending awaiting its completion.
@@ -469,6 +482,15 @@ async fn nexus_cancel_requests_without_resolving() -> Result<()> {
             .any(|pending| pending.scheduled_event_id == scheduled_event_id),
         "operation stays pending after cancel-ack"
     );
+    let cancellation = state.pending_nexus_operations["op-1"]
+        .cancellation
+        .as_ref()
+        .expect("cancel child remains visible on the pending operation");
+    assert_eq!(
+        cancellation.state,
+        tokeira_kernel::NexusOperationCancellationState::Succeeded
+    );
+    assert_eq!(cancellation.attempt, 1);
 
     runtime.shutdown_timer_scanner().await?;
     runtime.shutdown_workflow_timeout_scanner().await?;
@@ -755,14 +777,24 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             now: OffsetDateTime::now_utc(),
         })
         .await?;
-    let _ = runtime
+    let start_task = runtime
         .nexus_task_broker()
         .poll(
             namespace_id,
             TaskQueueName("nexus-q".to_string()),
             tokio::time::Duration::from_millis(50),
         )
+        .await
+        .expect("worker-targeted nexus start should publish");
+    let start_correlation = runtime
+        .nexus_task_broker()
+        .consume(&start_task.token.task_id)
         .await;
+    assert!(matches!(
+        start_correlation,
+        Some(NexusTaskCorrelation::Workflow { run_key: owner, operation_id, .. })
+            if owner == run_key && operation_id == "op-1"
+    ));
 
     let scheduled_event_id = store
         .read_history(run_key, 0, 64)
@@ -777,6 +809,20 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             _ => None,
         })
         .expect("scheduled event should exist");
+
+    assert!(
+        runtime
+            .resolve_nexus_operation(
+                run_key,
+                "op-1".to_string(),
+                scheduled_event_id,
+                tokeira_kernel::NexusResolution::Started {
+                    operation_token: "handler-token".to_string(),
+                    links: Vec::new(),
+                },
+            )
+            .await?
+    );
 
     runtime
         .signal_workflow(
@@ -847,15 +893,206 @@ async fn worker_targeted_nexus_cancel_publishes_to_broker() -> Result<()> {
             service,
             operation,
             operation_id,
-            ..
+            operation_token,
         } => {
             assert_eq!(service, "charge");
             assert_eq!(operation, "authorize");
             assert_eq!(operation_id, "op-1");
+            assert_eq!(operation_token, "handler-token");
         }
         other => panic!("expected cancel operation task, got {other:?}"),
     }
     assert_eq!(client.snapshot(), (0, 0));
+    runtime.shutdown_timer_scanner().await?;
+    runtime.shutdown_workflow_timeout_scanner().await?;
+    runtime.shutdown_nexus_timeout_scanner().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn worker_targeted_cancel_before_start_is_delivered_after_started_resolution() -> Result<()> {
+    let store = Arc::new(InMemoryStore::default());
+    let client = Arc::new(MockNexusClient::new(
+        NexusStartResult::AsyncAccepted {
+            operation_token: "unused-external-token".to_string(),
+            links: Vec::new(),
+        },
+        true,
+    ));
+    let namespace_id = NamespaceId::new();
+    let registry = seed_registry(vec![(
+        "payments",
+        EndpointTarget::Worker {
+            namespace_id,
+            task_queue: TaskQueueName("nexus-q".to_string()),
+        },
+    )]);
+    let mut runtime = runtime_with_registry(store.clone(), client, registry);
+    let workflow_id = WorkflowId("nexus-worker-cancel-before-start".to_string());
+    let run_key = applied_state(
+        &runtime
+            .start_workflow(start_request(
+                namespace_id,
+                workflow_id.clone(),
+                "req-start",
+            ))
+            .await?,
+    )
+    .run_key;
+
+    let task = poll_wft(&runtime, namespace_id, "workflow-q").await?;
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
+            token: task.token,
+            identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![WorkflowCommand::ScheduleNexusOperation {
+                operation_id: "op-1".to_string(),
+                endpoint: "payments".to_string(),
+                service: "charge".to_string(),
+                operation: "authorize".to_string(),
+                input: payloads("input"),
+                schedule_to_close_timeout: Some(time::Duration::seconds(30)),
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+            }],
+            force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
+            request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    let start_task = runtime
+        .nexus_task_broker()
+        .poll(
+            namespace_id,
+            TaskQueueName("nexus-q".to_string()),
+            tokio::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("start task should be published");
+    let scheduled_event_id = match runtime
+        .nexus_task_broker()
+        .consume(&start_task.token.task_id)
+        .await
+    {
+        Some(NexusTaskCorrelation::Workflow {
+            run_key: owner,
+            operation_id,
+            scheduled_event_id,
+            ..
+        }) => {
+            assert_eq!(owner, run_key);
+            assert_eq!(operation_id, "op-1");
+            scheduled_event_id
+        }
+        other => panic!("unexpected start correlation: {other:?}"),
+    };
+
+    runtime
+        .signal_workflow(
+            ExecutionRef {
+                namespace_id,
+                workflow_id,
+                run_id: None,
+            },
+            SignalRequest {
+                signal_name: "cancel-before-start".to_string(),
+                input: Payloads::default(),
+                header: None,
+                links: Vec::new(),
+                request: RequestContext {
+                    request_id: RequestId("req-signal".to_string()),
+                    caller_identity: None,
+                    principal: None,
+                    received_at: OffsetDateTime::now_utc(),
+                },
+                now: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+    let cancel_wft = poll_wft(&runtime, namespace_id, "workflow-q").await?;
+    runtime
+        .complete_workflow_task(WorkflowTaskCompletedRequest {
+            client_discards_speculative_with_events: false,
+            token: cancel_wft.token,
+            identity: WorkerIdentity("worker".to_string()),
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            commands: vec![WorkflowCommand::CancelNexusOperation { scheduled_event_id }],
+            force_new_workflow_task: false,
+            delivered_update_ids: Vec::new(),
+            request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+            now: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    assert!(
+        runtime
+            .nexus_task_broker()
+            .poll(
+                namespace_id,
+                TaskQueueName("nexus-q".to_string()),
+                tokio::time::Duration::ZERO,
+            )
+            .await
+            .is_none(),
+        "cancel must wait until the handler token exists"
+    );
+    let state = match store.load_run(run_key).await? {
+        tokeira_kernel::LoadedRun::Existing(state) => state,
+        tokeira_kernel::LoadedRun::Absent => panic!("run should exist"),
+    };
+    assert_eq!(
+        state.pending_nexus_operations["op-1"]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .state,
+        tokeira_kernel::NexusOperationCancellationState::Unspecified
+    );
+
+    assert!(
+        runtime
+            .resolve_nexus_operation(
+                run_key,
+                "op-1".to_string(),
+                scheduled_event_id,
+                tokeira_kernel::NexusResolution::Started {
+                    operation_token: "handler-token".to_string(),
+                    links: Vec::new(),
+                },
+            )
+            .await?
+    );
+    let cancel_task = runtime
+        .nexus_task_broker()
+        .poll(
+            namespace_id,
+            TaskQueueName("nexus-q".to_string()),
+            tokio::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("started resolution should release the pending cancel");
+    assert!(matches!(
+        cancel_task.request,
+        NexusTaskRequest::CancelOperation { operation_token, .. }
+            if operation_token == "handler-token"
+    ));
+
     runtime.shutdown_timer_scanner().await?;
     runtime.shutdown_workflow_timeout_scanner().await?;
     runtime.shutdown_nexus_timeout_scanner().await?;
@@ -961,6 +1198,7 @@ proptest! {
                     run_key: owner,
                     operation_id: correlated_operation_id,
                     scheduled_event_id,
+                    ..
                 }) => {
                     prop_assert_eq!(owner, run_key);
                     prop_assert_eq!(correlated_operation_id, expected_operation_id.clone());
@@ -1020,6 +1258,21 @@ proptest! {
                     _ => None,
                 })
                 .expect("scheduled event");
+            prop_assert_eq!(scheduled_event_id, task_scheduled_event_id);
+            let handler_token = format!("handler-{expected_operation_id}");
+            let started = runtime
+                .resolve_nexus_operation(
+                    run_key,
+                    expected_operation_id.clone(),
+                    scheduled_event_id,
+                    tokeira_kernel::NexusResolution::Started {
+                        operation_token: handler_token.clone(),
+                        links: Vec::new(),
+                    },
+                )
+                .await
+                .expect("started resolution");
+            prop_assert!(started);
 
             runtime
                 .signal_workflow(
@@ -1095,6 +1348,7 @@ proptest! {
                     run_key: owner,
                     operation_id: ref correlated_operation_id,
                     scheduled_event_id: correlated_event_id,
+                    ..
                 }) if owner == run_key
                     && correlated_operation_id == &expected_operation_id
                     && correlated_event_id == scheduled_event_id
@@ -1105,11 +1359,12 @@ proptest! {
                     service: actual_service,
                     operation: actual_operation,
                     operation_id: actual_operation_id,
-                    ..
+                    operation_token,
                 } => {
                     prop_assert_eq!(actual_service, expected_service);
                     prop_assert_eq!(actual_operation, expected_operation);
                     prop_assert_eq!(actual_operation_id, expected_operation_id);
+                    prop_assert_eq!(operation_token, handler_token);
                 }
                 other => panic!("unexpected cancel request: {other:?}"),
             }
@@ -1303,6 +1558,7 @@ async fn cross_namespace_async_nexus_completes_back_to_originator() -> Result<()
             run_key,
             operation_id,
             scheduled_event_id,
+            ..
         }) => {
             assert_eq!(run_key, parent_run_key);
             assert_eq!(operation_id, "op-agent");

@@ -108,6 +108,10 @@ pub enum Command {
     NexusOperationResolved(NexusOperationResolvedRequest),
     /// A backing-off Nexus operation's next-attempt time arrived; re-dispatch it.
     NexusOperationRetry(NexusOperationRetryRequest),
+    /// A Nexus cancellation delivery attempt completed.
+    NexusCancellationAttempted(NexusCancellationAttemptedRequest),
+    /// A backing-off Nexus cancellation's next-attempt time arrived.
+    NexusCancellationRetry(NexusCancellationRetryRequest),
     /// A timer's deadline was reached.
     TimerDue(TimerDueRequest),
     /// The internal first-workflow-task delay elapsed.
@@ -1492,6 +1496,57 @@ pub struct NexusOperationRetryRequest {
     /// stale re-dispatch from a superseded attempt is rejected).
     pub scheduled_event_id: i64,
     /// Wall-clock time the command was accepted.
+    pub now: OffsetDateTime,
+}
+
+/// Outcome of one Nexus cancellation-delivery attempt.
+///
+/// The runtime owns transport, retry classification, and backoff calculation. The
+/// kernel receives the already-decided outcome and records it deterministically.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum NexusCancellationAttemptOutcome {
+    /// The handler acknowledged the cancellation request.
+    Succeeded,
+    /// Delivery failed retryably and should wait until `next_attempt_at`.
+    RetryableFailure {
+        /// Public failure surfaced by Describe while backing off.
+        failure: Payload,
+        /// Runtime-computed next-attempt deadline.
+        next_attempt_at: OffsetDateTime,
+    },
+    /// Delivery failed non-retryably.
+    NonRetryableFailure {
+        /// Public failure recorded on the cancel-request-failed event and Describe.
+        failure: Payload,
+    },
+}
+
+/// Record the outcome of one Nexus cancellation-delivery attempt.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NexusCancellationAttemptedRequest {
+    /// Pending operation identifier.
+    pub operation_id: String,
+    /// Scheduled-event fence for the parent operation.
+    pub scheduled_event_id: i64,
+    /// Cancel-request event fence, preventing an old attempt from advancing a newer
+    /// cancellation lifecycle.
+    pub requested_event_id: i64,
+    /// Runtime-classified attempt outcome.
+    pub outcome: NexusCancellationAttemptOutcome,
+    /// Wall-clock completion time supplied by the runtime.
+    pub now: OffsetDateTime,
+}
+
+/// Request from the runtime scanner when a cancellation retry deadline has arrived.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NexusCancellationRetryRequest {
+    /// Pending operation identifier.
+    pub operation_id: String,
+    /// Scheduled-event fence for the parent operation.
+    pub scheduled_event_id: i64,
+    /// Cancel-request event fence.
+    pub requested_event_id: i64,
+    /// Wall-clock acceptance time supplied by the runtime.
     pub now: OffsetDateTime,
 }
 

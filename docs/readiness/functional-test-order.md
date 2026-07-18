@@ -89,12 +89,12 @@ dependency then cost.
 | 38 | Nexus operation execution (`tests/nexus_api_test.go`) | Task transport + async completion (C4b). | `nexus-async-completion` |
 
 > The Nexus suites assert server metrics (`nexus_requests`, `nexus_latency`, `nexus_completion_requests`,
-> `nexus_task_requests`, `nexus_outbound_requests`, `nexus_request_preprocess_errors`). **Not all are
-> bridge work.** A 2026-06-24 audit of the `TestNexusWorkflowTestSuite` metric-gated tests split them:
-> *Group A* (the 4 `nexus_outbound_requests` tests — driven by a real caller `StartOperation`) are flipped
-> by the shim, honestly; *Group B* (the 3 async-completion tests) assert `HandlerErrorType` behaviour and
-> require Temporal's internal callback-token wire format + `StateMachineRef` staleness, which tokeira
-> deliberately does not adopt — they stay **skipped, reclassified deliberate-deviation**, not bridge work.
+> `nexus_task_requests`, `nexus_outbound_requests`, `nexus_request_preprocess_errors`). The historical
+> Group-A/Group-B audit identified which failures were observation gaps and which required product
+> behaviour. Tier 7.36 supplied the scoped metrics/authorization harness bridges; Tier 7.37 completed
+> the product callback, cancellation, timeout, payload-limit, and failure-rehydration behaviour using
+> Tokeira's own authoritative run state and callback-token routing rather than Temporal's internal
+> service topology. `TestNexusWorkflowTestSuite` now runs with **zero skips** and is clean twice.
 > See [In-process metrics capture](#in-process-metrics-capture-for-the-functional-tests).
 
 ### Tier 8 — Worker Deployments (GA)

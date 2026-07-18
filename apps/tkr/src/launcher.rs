@@ -87,30 +87,44 @@ enum TkpBinary {
 
 impl TkpBinary {
     /// Resolve the `tkp` to run, **preferring the deployment's own bound binary**
-    /// (`<dir>/tkp`, placed at `tkr deployment create`) over any `tkp` on `PATH`.
-    /// A never-inceptioned deployment falls back to an installed `tkp`, then a
-    /// `cargo run` dev build.
+    /// (`<dir>/tkp`, placed at `tkr deployment create`) over anything else. A
+    /// never-inceptioned deployment falls back to the per-platform source
+    /// binary (`tkp-compose` — all forwarded deployments are compose today): on
+    /// PATH, beside the running `tkr`, then a `cargo run` dev build of the
+    /// platform's bin target.
     fn resolve(deployment_dir: &Path) -> Self {
-        let bound = deployment_dir.join("tkp");
+        let bound = deployment_dir.join(crate::deployment_dir::PROVISIONER_BIN);
         if bound.is_file() {
             return TkpBinary::Installed(bound);
         }
-        match which::which("tkp") {
-            Ok(path) => TkpBinary::Installed(path),
-            Err(_) => TkpBinary::Cargo,
+        let source = crate::deployment_dir::PROVISIONER_SOURCE_BIN;
+        if let Ok(path) = which::which(source) {
+            return TkpBinary::Installed(path);
         }
+        if let Some(sibling) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.join(source)))
+            .filter(|sibling| sibling.is_file())
+        {
+            return TkpBinary::Installed(sibling);
+        }
+        TkpBinary::Cargo
     }
 
     fn command(&self) -> (String, Vec<String>) {
         match self {
             TkpBinary::Installed(path) => (path.display().to_string(), Vec::new()),
+            // The platform ships its own provisioner: build/run the compose
+            // platform's bin target from source (dev fallback).
             TkpBinary::Cargo => (
                 "cargo".to_string(),
                 vec![
                     "run".to_string(),
                     "--quiet".to_string(),
+                    "-p".to_string(),
+                    "tokeira-compose-syn".to_string(),
                     "--bin".to_string(),
-                    "tkp".to_string(),
+                    crate::deployment_dir::PROVISIONER_SOURCE_BIN.to_string(),
                     "--".to_string(),
                 ],
             ),

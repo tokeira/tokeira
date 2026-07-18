@@ -20,9 +20,12 @@ use tokeira_provisioner::{
     UpgradeDecision, evaluate_upgrade,
 };
 
-use crate::{envelope_store, init::running_integrity_manifest, platform};
+use crate::{ProvisionerPlatform, envelope_store, init::running_integrity_manifest};
 
-pub(crate) async fn upgrade(deployment_dir: &Path) -> Result<()> {
+pub(crate) async fn upgrade<P: ProvisionerPlatform>(
+    platform: &P,
+    deployment_dir: &Path,
+) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now()); // B
     let store = envelope_store(deployment_dir);
     let (mut envelope, mut version) = store
@@ -74,8 +77,8 @@ pub(crate) async fn upgrade(deployment_dir: &Path) -> Result<()> {
         .context("failed to commit the atomic ownership transfer")?;
     println!("ownership transferred — [A final] checkpoint captured, operation marker open");
 
-    // ── Apply B's plan (dispatched by platform). Migrations would run here on a schema change. ──
-    let change_count = platform::infra_apply(deployment_dir).await?;
+    // ── Apply B's plan (realized by the injected platform). Migrations would run here on a schema change. ──
+    let change_count = platform.infra_apply(deployment_dir).await?;
     println!("infra apply under the new engine: {change_count} change(s)");
 
     // ── Close the operation marker ──
@@ -111,12 +114,13 @@ fn transfer_ownership(envelope: &mut DeploymentStateEnvelope, to: ProvenanceStam
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestPlatform;
     use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope};
 
     #[tokio::test]
     async fn upgrade_refuses_an_unstamped_deployment() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = upgrade(tmp.path())
+        let err = upgrade(&TestPlatform, tmp.path())
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(err.to_string().contains("unstamped"), "unexpected: {err}");
@@ -142,7 +146,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = upgrade(tmp.path())
+        let err = upgrade(&TestPlatform, tmp.path())
             .await
             .expect_err("versioned → dev refuses");
         assert!(err.to_string().contains("refused"), "unexpected: {err}");

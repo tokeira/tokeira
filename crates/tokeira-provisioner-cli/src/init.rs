@@ -1,5 +1,6 @@
-//! `tkp init` — Day-0 mandatory versioning (task 2.2), recording the integrity
-//! manifest at stamp time (task 4.1).
+//! Day-0 mandatory versioning (task 2.2), recording the integrity manifest at
+//! stamp time (task 4.1). Not an operator verb: `tkr deployment create` runs
+//! this as an internal inception step (Req 6.5).
 //!
 //! Versioning is mandatory from Day 0: initialization writes the deployment
 //! envelope's first provenance stamp **before any resource create**, so there is
@@ -28,9 +29,12 @@ use tokeira_provisioner::{
     sha256_hex,
 };
 
-use crate::{apply::load_local_config, config_history, envelope_store};
+use crate::{ProvisionerPlatform, config_history, envelope_store};
 
-pub(crate) async fn init(deployment_dir: &Path) -> Result<()> {
+pub(crate) async fn init<P: ProvisionerPlatform>(
+    platform: &P,
+    deployment_dir: &Path,
+) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (existing, version) = store
@@ -44,11 +48,11 @@ pub(crate) async fn init(deployment_dir: &Path) -> Result<()> {
         );
     }
 
-    let config = load_local_config(deployment_dir)?;
+    let deployment_id = platform.deployment_id(deployment_dir)?;
     let integrity = running_integrity_manifest()?;
 
     let envelope = DeploymentStateEnvelope {
-        deployment_id: config.project_name.clone(),
+        deployment_id: deployment_id.clone(),
         binding: Some(running.clone()),
         integrity: Some(integrity),
         config_revision: 0,
@@ -59,12 +63,12 @@ pub(crate) async fn init(deployment_dir: &Path) -> Result<()> {
         .await
         .context("failed to write the Day-0 stamp")?;
     // Retain the Day-0 config source as revision 0 so it is revertable (task 14.3).
-    config_history::snapshot(deployment_dir, 0)
+    config_history::snapshot(deployment_dir, platform.config_basename(deployment_dir), 0)
         .context("failed to retain the Day-0 config revision")?;
 
     println!(
         "initialized deployment '{}' — stamped with provisioner {} ({:?}), source_tree_hash {}",
-        config.project_name, running.version, running.build_mode, running.source_tree_hash
+        deployment_id, running.version, running.build_mode, running.source_tree_hash
     );
     Ok(())
 }
@@ -91,11 +95,14 @@ pub(crate) fn running_integrity_manifest() -> Result<IntegrityManifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestPlatform;
 
     #[tokio::test]
     async fn init_stamps_the_envelope_with_binding_and_integrity() {
         let tmp = tempfile::tempdir().unwrap();
-        init(tmp.path()).await.expect("init succeeds");
+        init(&TestPlatform, tmp.path())
+            .await
+            .expect("init succeeds");
 
         let (env, _) = envelope_store(tmp.path()).load().await.unwrap();
         assert!(env.binding.is_some(), "Day-0 binding recorded");
@@ -108,8 +115,12 @@ mod tests {
     #[tokio::test]
     async fn init_refuses_an_already_initialized_deployment() {
         let tmp = tempfile::tempdir().unwrap();
-        init(tmp.path()).await.expect("first init succeeds");
-        let err = init(tmp.path()).await.expect_err("second init refuses");
+        init(&TestPlatform, tmp.path())
+            .await
+            .expect("first init succeeds");
+        let err = init(&TestPlatform, tmp.path())
+            .await
+            .expect_err("second init refuses");
         assert!(
             err.to_string().contains("already initialized"),
             "unexpected: {err}"
@@ -122,7 +133,7 @@ mod tests {
     #[tokio::test]
     async fn config_refinement_keeps_the_engine_binding_and_advances_revision() {
         let tmp = tempfile::tempdir().unwrap();
-        init(tmp.path()).await.expect("init");
+        init(&TestPlatform, tmp.path()).await.expect("init");
         let (after_init, _) = envelope_store(tmp.path()).load().await.unwrap();
         let engine_hash = after_init
             .binding
@@ -132,8 +143,12 @@ mod tests {
             .clone();
 
         // Two successive config applies (same binary → same engine).
-        crate::apply::apply(tmp.path()).await.expect("apply 1");
-        crate::apply::apply(tmp.path()).await.expect("apply 2");
+        crate::apply::apply(&TestPlatform, tmp.path())
+            .await
+            .expect("apply 1");
+        crate::apply::apply(&TestPlatform, tmp.path())
+            .await
+            .expect("apply 2");
 
         let (after, _) = envelope_store(tmp.path()).load().await.unwrap();
         assert_eq!(

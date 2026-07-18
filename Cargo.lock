@@ -6387,21 +6387,14 @@ name = "tkp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
- "clap",
- "serde",
- "serde_json",
  "tempfile",
- "tokeira-build-info",
  "tokeira-compose",
  "tokeira-compose-syn",
  "tokeira-config",
- "tokeira-deploy-engine",
  "tokeira-iac",
  "tokeira-local-deployment",
  "tokeira-orchestrator",
- "tokeira-provisioner",
- "tokeira-state",
+ "tokeira-provisioner-cli",
  "tokio",
 ]
 
@@ -7159,6 +7152,23 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokeira-build-info",
+ "tokeira-state",
+ "tokio",
+]
+
+[[package]]
+name = "tokeira-provisioner-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokeira-build-info",
+ "tokeira-iac",
+ "tokeira-provisioner",
  "tokeira-state",
  "tokio",
 ]

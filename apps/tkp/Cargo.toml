@@ -9,18 +9,11 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
-chrono.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-tokeira-provisioner = { workspace = true }
-tokeira-state = { workspace = true }
-tokeira-build-info = { workspace = true }
+tokeira-provisioner-cli = { workspace = true }
 tokeira-config = { workspace = true }
-tokeira-iac = { path = "../../crates/tokeira-iac" }
+tokeira-iac = { workspace = true }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
-tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-local-deployment = { path = "../../platforms/local" }
 tokeira-compose-syn = { path = "../../platforms/compose-syn" }
 tokeira-compose = { path = "../../crates/tokeira-compose" }

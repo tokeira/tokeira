@@ -19,6 +19,7 @@ members = [
     "crates/tokeira-chasm-activity",
     "crates/tokeira-state",
     "crates/tokeira-provisioner",
+    "crates/tokeira-provisioner-cli",
     "crates/tokeira-iac",
     "crates/tokeira-deploy-engine",
     "crates/tokeira-config",
@@ -115,6 +116,7 @@ uuid = { version = "1.10", features = ["serde", "v4"] }
 serde_yaml = "0.9"
 tokeira-state = { path = "crates/tokeira-state" }
 tokeira-provisioner = { path = "crates/tokeira-provisioner" }
+tokeira-provisioner-cli = { path = "crates/tokeira-provisioner-cli" }
 tokeira-iac = { path = "crates/tokeira-iac" }
 tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
 tokeira-config = { path = "crates/tokeira-config" }

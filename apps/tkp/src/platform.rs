@@ -15,12 +15,62 @@ use tokeira_compose_syn::{
     context::Cx,
 };
 use tokeira_iac::{Change, ModuleSelection};
-use tokeira_local_deployment::LocalDeployment;
+use tokeira_local_deployment::{LocalConfig, LocalDeployment};
 use tokeira_orchestrator::{Deployment, InfraEngine};
-
-use crate::apply::load_local_config;
+use tokeira_provisioner_cli::ProvisionerPlatform;
 
 const TKD_FILE: &str = "definition.tkd";
+
+/// The transitional bundled realization: BOTH `local` and `compose-syn`, resolved
+/// per-deployment by directory content ([`detect`]). A per-platform binary
+/// (task 15.4) implements the same seam with exactly one platform and no
+/// detection.
+pub(crate) struct BundledPlatform;
+
+impl ProvisionerPlatform for BundledPlatform {
+    fn label(&self, deployment_dir: &Path) -> &'static str {
+        detect(deployment_dir).label()
+    }
+
+    fn config_basename(&self, deployment_dir: &Path) -> &'static str {
+        match detect(deployment_dir) {
+            Platform::ComposeSyn => TKD_FILE,
+            Platform::Local => "deployment.toml",
+        }
+    }
+
+    fn deployment_id(&self, deployment_dir: &Path) -> Result<String> {
+        // Historical bundled behavior: the Day-0 identity comes from the local
+        // config (defaulted when absent) regardless of platform. The compose
+        // per-platform binary derives it from the deployment dir name instead
+        // (aligning with `Cx.project_name`) — that lands with the split (15.4).
+        Ok(load_local_config(deployment_dir)?.project_name)
+    }
+
+    async fn infra_plan(&self, deployment_dir: &Path) -> Result<Vec<Change>> {
+        infra_plan(deployment_dir).await
+    }
+
+    async fn infra_apply(&self, deployment_dir: &Path) -> Result<usize> {
+        infra_apply(deployment_dir).await
+    }
+
+    async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
+        infra_destroy(deployment_dir).await
+    }
+}
+
+pub(crate) fn load_local_config(deployment_dir: &Path) -> Result<LocalConfig> {
+    let path = deployment_dir.join("deployment.toml");
+    if path.exists() {
+        tokeira_config::load_config(&path, None)
+            .with_context(|| format!("failed to load {}", path.display()))
+    } else {
+        // A missing config falls back to defaults so the flow is exercisable; a
+        // real deployment carries a `deployment.toml`.
+        Ok(LocalConfig::default())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Platform {

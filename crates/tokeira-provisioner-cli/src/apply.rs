@@ -4,26 +4,22 @@
 //! refuses on any non-`Match` verdict; a dev deployment takes the permissive
 //! `DevIterate` path with a warning. On success the deployment envelope is
 //! re-stamped with the running binding and its `config_revision` advances.
-//!
-//! This first increment wires the **local** platform (no infra modules → an
-//! empty, no-op plan that still exercises the real `InfraEngine` and the
-//! `DeploymentStore` state seam). The full multi-platform dispatch and the
-//! service/runtime apply land next.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tokeira_local_deployment::LocalConfig;
 use tokeira_provisioner::ProvenanceStamp;
 
 use crate::{
-    config_history, envelope_store,
+    ProvisionerPlatform, config_history, envelope_store,
     gate::{GateOutcome, evaluate_gate},
-    platform,
 };
 
-pub(crate) async fn apply(deployment_dir: &Path) -> Result<()> {
+pub(crate) async fn apply<P: ProvisionerPlatform>(
+    platform: &P,
+    deployment_dir: &Path,
+) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, version) = store
@@ -50,14 +46,13 @@ pub(crate) async fn apply(deployment_dir: &Path) -> Result<()> {
         }
     }
 
-    // ── Engine apply (dispatched by platform: local | compose-syn) ──
-    let resolved = platform::detect(deployment_dir);
-    // The deployment identity seeds the compose-syn `Cx`; it was set at `init`.
+    // ── Engine apply (realized by the injected platform) ──
+    // The deployment identity seeds the platform context; it was set at `init`.
     let project_name = deployment_identity(&envelope.deployment_id);
-    let change_count = platform::infra_apply(deployment_dir).await?;
+    let change_count = platform.infra_apply(deployment_dir).await?;
     println!(
         "[{}] infra apply: {change_count} change(s)",
-        resolved.label()
+        platform.label(deployment_dir)
     );
 
     // ── Re-stamp the envelope ──
@@ -68,10 +63,11 @@ pub(crate) async fn apply(deployment_dir: &Path) -> Result<()> {
     }
     envelope.binding = Some(running);
     envelope.config_revision += 1;
-    envelope.effective_config_ref = Some(config_ref(deployment_dir));
+    let config_basename = platform.config_basename(deployment_dir);
+    envelope.effective_config_ref = Some(config_ref(deployment_dir, config_basename));
     // Retain this revision's config source so a later `revert` can re-apply it
     // (task 14.3). Best-effort: a config-less local deployment has nothing to keep.
-    config_history::snapshot(deployment_dir, envelope.config_revision)
+    config_history::snapshot(deployment_dir, config_basename, envelope.config_revision)
         .context("failed to retain the applied config revision")?;
     store
         .save(&envelope, &version)
@@ -88,7 +84,7 @@ pub(crate) async fn apply(deployment_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The deployment identity used to seed the compose-syn `Cx`, defaulting when the
+/// The deployment identity used to seed the platform context, defaulting when the
 /// envelope has not recorded one yet.
 pub(crate) fn deployment_identity(recorded: &str) -> String {
     if recorded.is_empty() {
@@ -99,35 +95,21 @@ pub(crate) fn deployment_identity(recorded: &str) -> String {
 }
 
 /// A content ref for the effective configuration — a SHA-256 of the deployment's
-/// config source (the `.tkd` for compose-syn, `deployment.toml` for local), so a
-/// given config revision is identifiable (and revertable to; task 14.3). Absent
-/// config falls back to `"default"`.
-pub(crate) fn config_ref(deployment_dir: &Path) -> String {
-    let config_file = match platform::detect(deployment_dir) {
-        platform::Platform::ComposeSyn => deployment_dir.join("definition.tkd"),
-        platform::Platform::Local => deployment_dir.join("deployment.toml"),
-    };
+/// config source (the platform's `config_basename`), so a given config revision
+/// is identifiable (and revertable to; task 14.3). Absent config falls back to
+/// `"default"`.
+pub(crate) fn config_ref(deployment_dir: &Path, config_basename: &str) -> String {
+    let config_file = deployment_dir.join(config_basename);
     match std::fs::read(&config_file) {
         Ok(bytes) => format!("sha256:{}", tokeira_provisioner::sha256_hex(&bytes)),
         Err(_) => "default".to_string(),
     }
 }
 
-pub(crate) fn load_local_config(deployment_dir: &Path) -> Result<LocalConfig> {
-    let path = deployment_dir.join("deployment.toml");
-    if path.exists() {
-        tokeira_config::load_config(&path, None)
-            .with_context(|| format!("failed to load {}", path.display()))
-    } else {
-        // First increment: a missing config falls back to defaults so the flow
-        // is exercisable; a real deployment carries a `deployment.toml`.
-        Ok(LocalConfig::default())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestPlatform;
     use tokeira_provisioner::DeploymentStateEnvelope;
 
     #[tokio::test]
@@ -136,7 +118,7 @@ mod tests {
         // stamping happens at `create`, so an unstamped deployment at apply time
         // is unverifiable).
         let tmp = tempfile::tempdir().unwrap();
-        let err = apply(tmp.path())
+        let err = apply(&TestPlatform, tmp.path())
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(
@@ -161,7 +143,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        apply(tmp.path())
+        apply(&TestPlatform, tmp.path())
             .await
             .expect("apply proceeds under DevIterate");
 

@@ -1,0 +1,283 @@
+//! `tkp describe` — read-only report of identity, recorded provenance, binding
+//! verdict, and state facts. Never gates: it must work precisely when the
+//! applying verbs would refuse, so diagnosis works on a drifted or mismatched
+//! deployment.
+
+use std::path::Path;
+
+use anyhow::Result;
+use chrono::Utc;
+use serde::Serialize;
+use tokeira_provisioner::{
+    BindingVerdict, BuildMode, DeploymentStateEnvelope, ProvenanceStamp, check_binding,
+};
+
+use crate::envelope_store;
+
+pub(crate) async fn describe(deployment_dir: &Path, json: bool) -> Result<()> {
+    let running = ProvenanceStamp::current(Utc::now());
+    let (envelope, _version) = envelope_store(deployment_dir).load().await?;
+    let report = DescribeReport::build(&running, &envelope);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        report.print_human(deployment_dir);
+    }
+    Ok(())
+}
+
+// ── Report model (also the `--json` shape) ────────────────────────────────
+
+#[derive(Serialize)]
+struct StampView {
+    version: String,
+    git_sha: String,
+    source_tree_hash: String,
+    build_mode: BuildMode,
+}
+
+impl StampView {
+    fn of(stamp: &ProvenanceStamp) -> Self {
+        Self {
+            version: stamp.version.clone(),
+            git_sha: stamp.git_sha.clone(),
+            source_tree_hash: stamp.source_tree_hash.clone(),
+            build_mode: stamp.build_mode,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BindingView {
+    /// The deployment's recorded stamp, or `None` when unstamped (Unknown).
+    recorded: Option<StampView>,
+    verdict: &'static str,
+    proceeds: bool,
+    authoritative: bool,
+}
+
+#[derive(Serialize)]
+struct IntegrityView {
+    provisioner_version: String,
+    artifact_count: usize,
+}
+
+#[derive(Serialize)]
+struct DescribeReport {
+    running: StampView,
+    deployment_id: String,
+    schema_version: u32,
+    config_revision: u64,
+    effective_config_ref: Option<String>,
+    binding: BindingView,
+    integrity: Option<IntegrityView>,
+    infra_head_present: bool,
+    runtime_head_present: bool,
+    operation: Option<String>,
+    lock_holder: Option<String>,
+}
+
+impl DescribeReport {
+    fn build(running: &ProvenanceStamp, envelope: &DeploymentStateEnvelope) -> Self {
+        let verdict = check_binding(envelope.binding.as_ref(), running);
+        Self {
+            running: StampView::of(running),
+            deployment_id: envelope.deployment_id.clone(),
+            schema_version: envelope.schema_version,
+            config_revision: envelope.config_revision,
+            effective_config_ref: envelope.effective_config_ref.clone(),
+            binding: BindingView {
+                recorded: envelope.binding.as_ref().map(StampView::of),
+                verdict: verdict_label(verdict),
+                proceeds: verdict.proceeds(),
+                authoritative: verdict.is_authoritative(),
+            },
+            integrity: envelope.integrity.as_ref().map(|m| IntegrityView {
+                provisioner_version: m.provisioner_version.clone(),
+                artifact_count: m.artifacts.len(),
+            }),
+            infra_head_present: envelope.infra_head.is_some(),
+            runtime_head_present: envelope.runtime_head.is_some(),
+            operation: envelope
+                .operation
+                .as_ref()
+                .map(|op| format!("{:?} (phase: {})", op.kind, op.phase)),
+            lock_holder: envelope.lock.as_ref().map(|l| l.holder.clone()),
+        }
+    }
+
+    fn print_human(&self, deployment_dir: &Path) {
+        println!(
+            "tkp describe — deployment at {}\n",
+            deployment_dir.display()
+        );
+
+        println!("Running provisioner");
+        println!("  version           {}", self.running.version);
+        println!("  git_sha           {}", self.running.git_sha);
+        println!(
+            "  source_tree_hash  {}  (authoritative drift key)",
+            self.running.source_tree_hash
+        );
+        println!("  build_mode        {:?}\n", self.running.build_mode);
+
+        println!("Deployment envelope");
+        let id = if self.deployment_id.is_empty() {
+            "(uninitialized)"
+        } else {
+            &self.deployment_id
+        };
+        println!("  deployment_id     {id}");
+        println!("  schema_version    {}", self.schema_version);
+        println!("  config_revision   {}", self.config_revision);
+        println!(
+            "  effective_config  {}\n",
+            self.effective_config_ref.as_deref().unwrap_or("(none)")
+        );
+
+        println!("Binding");
+        match &self.binding.recorded {
+            Some(s) => println!(
+                "  recorded          {} / {} ({:?})",
+                s.version, s.source_tree_hash, s.build_mode
+            ),
+            None => println!("  recorded          unstamped (Unknown)"),
+        }
+        let mark = if self.binding.proceeds {
+            "proceeds"
+        } else {
+            "REFUSES"
+        };
+        let auth = if self.binding.authoritative {
+            " (authoritative)"
+        } else {
+            ""
+        };
+        println!(
+            "  verdict           {} — {mark}{auth}\n",
+            self.binding.verdict
+        );
+
+        match &self.integrity {
+            Some(i) => println!(
+                "Integrity           provisioner {}, {} artifact(s)\n",
+                i.provisioner_version, i.artifact_count
+            ),
+            None => println!("Integrity           none recorded\n"),
+        }
+
+        println!("State heads");
+        println!(
+            "  infra             {}",
+            if self.infra_head_present {
+                "present"
+            } else {
+                "none"
+            }
+        );
+        println!(
+            "  runtime           {}\n",
+            if self.runtime_head_present {
+                "present"
+            } else {
+                "none"
+            }
+        );
+
+        println!(
+            "Operation           {}",
+            self.operation.as_deref().unwrap_or("none")
+        );
+        println!(
+            "Lock                {}",
+            match &self.lock_holder {
+                Some(h) => format!("held by {h}"),
+                None => "free".to_string(),
+            }
+        );
+    }
+}
+
+fn verdict_label(verdict: BindingVerdict) -> &'static str {
+    match verdict {
+        BindingVerdict::Match => "Match",
+        BindingVerdict::DevIterate => "DevIterate",
+        BindingVerdict::Mismatch => "Mismatch",
+        BindingVerdict::Downgrade => "Downgrade",
+        BindingVerdict::ModeRegression => "ModeRegression",
+        BindingVerdict::Unknown => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn describe_uninitialized_deployment_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (envelope, _) = envelope_store(tmp.path()).load().await.unwrap();
+        // No envelope written yet → default, unbound.
+        assert!(envelope.binding.is_none());
+
+        let running = ProvenanceStamp::current(Utc::now());
+        let report = DescribeReport::build(&running, &envelope);
+        assert_eq!(report.binding.verdict, "Unknown");
+        assert!(!report.binding.proceeds, "an unstamped deployment refuses");
+        assert!(report.integrity.is_none());
+    }
+
+    fn versioned_stamp(hash: &str) -> ProvenanceStamp {
+        ProvenanceStamp {
+            version: "1.0.0".to_string(),
+            git_sha: "sha".to_string(),
+            source_tree_hash: hash.to_string(),
+            build_mode: BuildMode::Versioned,
+            recorded_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_reports_a_recorded_matching_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+
+        // Explicit Versioned stamps so the Match path is deterministic regardless
+        // of how this test binary itself was built (a cargo build is Dev mode).
+        let running = versioned_stamp("hashA");
+        let envelope = DeploymentStateEnvelope {
+            deployment_id: "dep-1".to_string(),
+            binding: Some(running.clone()),
+            config_revision: 3,
+            ..Default::default()
+        };
+        let (_, version) = store.load().await.unwrap();
+        store.save(&envelope, &version).await.unwrap();
+
+        // Re-load and describe — round-trips through the envelope store.
+        let (loaded, _) = store.load().await.unwrap();
+        let report = DescribeReport::build(&running, &loaded);
+        assert_eq!(report.deployment_id, "dep-1");
+        assert_eq!(report.config_revision, 3);
+        assert_eq!(report.binding.verdict, "Match");
+        assert!(report.binding.proceeds && report.binding.authoritative);
+    }
+
+    #[tokio::test]
+    async fn describe_reports_mode_regression_for_dev_binary_on_versioned_deployment() {
+        // A versioned deployment described by a dev binary refuses (ModeRegression).
+        let recorded = versioned_stamp("hashA");
+        let envelope = DeploymentStateEnvelope {
+            binding: Some(recorded),
+            ..Default::default()
+        };
+        let dev_running = ProvenanceStamp {
+            build_mode: BuildMode::Dev,
+            ..versioned_stamp("hashA")
+        };
+        let report = DescribeReport::build(&dev_running, &envelope);
+        assert_eq!(report.binding.verdict, "ModeRegression");
+        assert!(!report.binding.proceeds);
+    }
+}

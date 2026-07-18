@@ -71,13 +71,19 @@ pub struct WorkflowTimeoutTrackingState {
 impl WorkflowTimeoutTrackingState {
     /// Begin tracking a run, replacing any existing entry for the same key.
     pub fn insert(&self, entry: WorkflowTimeoutEntry) {
-        self.inner.lock().unwrap().insert(entry.run_key, entry);
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .insert(entry.run_key, entry);
     }
 
     /// Stop tracking a run. Called when the run closes or its timeout fires, so a
     /// closed run is never repeatedly evaluated.
     pub fn remove(&self, run_key: RunKey) {
-        self.inner.lock().unwrap().remove(&run_key);
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .remove(&run_key);
     }
 
     /// Drop every entry for a shard. Invoked on shard handoff so this node stops
@@ -86,7 +92,7 @@ impl WorkflowTimeoutTrackingState {
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .retain(|_, entry| entry.shard_id != shard_id);
     }
 
@@ -94,14 +100,19 @@ impl WorkflowTimeoutTrackingState {
     /// evaluates without holding it, so lane inserts/removes are never blocked on
     /// timeout evaluation.
     pub fn snapshot(&self) -> Vec<WorkflowTimeoutEntry> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Snapshot only the entries owned by `shard_id`, used by the per-shard scan.
     pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<WorkflowTimeoutEntry> {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .values()
             .filter(|entry| entry.shard_id == shard_id)
             .cloned()
@@ -256,7 +267,11 @@ pub(crate) async fn run_workflow_timeout_scanner<R: tokeira_storage::RunReposito
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        let active_shards: Vec<_> = shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .active_shards()
+            .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("workflow_timeout", shard_id.0);
             scan_workflow_timeouts_once(
@@ -452,7 +467,7 @@ async fn start_timeout_retry_successor<R: tokeira_storage::RunRepository + 'stat
                 || new_state.workflow_run_timeout.is_some()
             {
                 let shard_id = {
-                    let owner = shard_owner.read().unwrap();
+                    let owner = shard_owner.read().expect("shard_owner lock poisoned");
                     crate::shard::shard_for(successor_run_key, owner.shard_count())
                 };
                 tracking.insert(WorkflowTimeoutEntry {
@@ -528,7 +543,7 @@ async fn start_timeout_cron_successor(
                 || new_state.workflow_run_timeout.is_some()
             {
                 let shard_id = {
-                    let owner = shard_owner.read().unwrap();
+                    let owner = shard_owner.read().expect("shard_owner lock poisoned");
                     crate::shard::shard_for(successor_run_key, owner.shard_count())
                 };
                 tracking.insert(WorkflowTimeoutEntry {

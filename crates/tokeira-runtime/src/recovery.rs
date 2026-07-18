@@ -445,7 +445,7 @@ mod tests {
     fn make_lanes(store: &InMemoryStore) -> (Vec<LaneHandle>, usize) {
         let shard_owner = Arc::new(RwLock::new(ShardOwner::new(1)));
         {
-            let mut owner = shard_owner.write().unwrap();
+            let mut owner = shard_owner.write().expect("shard_owner lock poisoned");
             let _ = owner.record_acquired(ShardId(0), ShardEpoch::ZERO);
             owner.mark_active(ShardId(0));
         }
@@ -1416,7 +1416,7 @@ mod tests {
                         async move {
                             submitted
                                 .lock()
-                                .unwrap()
+                                .expect("submitted lock poisoned")
                                 .push(due.run_key);
                             Ok(())
                         }
@@ -1425,7 +1425,7 @@ mod tests {
                 .await;
 
                 let submitted =
-                    submitted.lock().unwrap();
+                    submitted.lock().expect("submitted lock poisoned");
                 prop_assert_eq!(
                     submitted.len(),
                     expected_count,

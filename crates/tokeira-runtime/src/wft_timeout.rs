@@ -78,13 +78,19 @@ impl WftTimeoutTrackingState {
     /// Begin tracking a started workflow task, replacing any prior entry for the
     /// run.
     pub fn insert(&self, entry: WftTimeoutEntry) {
-        self.inner.lock().unwrap().insert(entry.run_key, entry);
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .insert(entry.run_key, entry);
     }
 
     /// Stop tracking a run's workflow task, called when it completes or times out
     /// so a finished task is never scanned again.
     pub fn remove(&self, run_key: RunKey) {
-        self.inner.lock().unwrap().remove(&run_key);
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .remove(&run_key);
     }
 
     /// Install the precise speculative-timer set once the runtime's lanes exist
@@ -130,7 +136,7 @@ impl WftTimeoutTrackingState {
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .retain(|_, entry| entry.shard_id != shard_id);
         if let Some(timers) = self.speculative.get() {
             timers.remove_all_for_shard(shard_id);
@@ -140,14 +146,19 @@ impl WftTimeoutTrackingState {
     /// Snapshot all tracked entries; the scanner evaluates the copy without
     /// holding the lock.
     pub fn snapshot(&self) -> Vec<WftTimeoutEntry> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Snapshot only the entries owned by `shard_id`, used by the per-shard scan.
     pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<WftTimeoutEntry> {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .values()
             .filter(|entry| entry.shard_id == shard_id)
             .cloned()
@@ -270,7 +281,11 @@ pub(crate) async fn run_wft_timeout_scanner(
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        let active_shards: Vec<_> = shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .active_shards()
+            .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("wft_timeout", shard_id.0);
             scan_wft_timeouts_once(&tracking, Some(shard_id), &config, |entry, now| {
@@ -352,7 +367,10 @@ mod tests {
                 move |entry, _| {
                     let submitted = submitted.clone();
                     async move {
-                        submitted.lock().unwrap().push(entry.run_key);
+                        submitted
+                            .lock()
+                            .expect("submitted lock poisoned")
+                            .push(entry.run_key);
                         Ok(())
                     }
                 }
@@ -360,7 +378,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(*submitted.lock().unwrap(), vec![expired.run_key]);
+        assert_eq!(
+            *submitted.lock().expect("submitted lock poisoned"),
+            vec![expired.run_key]
+        );
         let remaining = tracking.snapshot();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].run_key, fresh.run_key);

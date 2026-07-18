@@ -237,7 +237,7 @@ impl UpdateRegistry {
         wait_policy: UpdateWaitPolicy,
         tx: oneshot::Sender<UpdateResolution>,
     ) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
         match inner.entry((run_key, update_id)) {
             std::collections::hash_map::Entry::Occupied(mut occupied) => {
                 occupied
@@ -271,7 +271,7 @@ impl UpdateRegistry {
         if let Some(entry) = self
             .inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .get_mut(&(run_key, update_id.to_string()))
         {
             entry.waiters.retain(|waiter| !waiter.tx.is_closed());
@@ -288,7 +288,7 @@ impl UpdateRegistry {
         if let Some(entry) = self
             .inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .get_mut(&(run_key, update_id.to_string()))
         {
             entry.waiters.push(UpdateWaiter { wait_policy, tx });
@@ -310,7 +310,7 @@ impl UpdateRegistry {
         let mut deliverable: Vec<(u64, String, String, Payloads, String)> = self
             .inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .iter_mut()
             .filter(|((entry_run_key, _), entry)| {
                 *entry_run_key == run_key && !entry.accepted && (include_sent || !entry.sent)
@@ -341,7 +341,9 @@ impl UpdateRegistry {
     /// Re-arm delivery after an attempt-1 workflow task failed or timed out:
     /// the replacement task must carry the still-unaccepted updates again.
     pub(crate) fn reset_sent_for_run(&self, run_key: RunKey) {
-        for ((entry_run_key, _), entry) in self.inner.lock().unwrap().iter_mut() {
+        for ((entry_run_key, _), entry) in
+            self.inner.lock().expect("inner lock poisoned").iter_mut()
+        {
             if *entry_run_key == run_key && !entry.accepted {
                 entry.sent = false;
             }
@@ -357,7 +359,7 @@ impl UpdateRegistry {
     pub(crate) fn sent_update_ids(&self, run_key: RunKey) -> Vec<String> {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .iter()
             .filter(|((entry_run_key, _), entry)| {
                 *entry_run_key == run_key && entry.sent && !entry.accepted
@@ -387,7 +389,7 @@ impl UpdateRegistry {
     pub(crate) fn abort_sent_for_wft_failure(&self, run_key: RunKey) -> usize {
         let mut aborted_waiters = Vec::new();
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().expect("inner lock poisoned");
             for ((entry_run_key, _), entry) in inner.iter_mut() {
                 if *entry_run_key == run_key && entry.sent && !entry.accepted {
                     aborted_waiters.append(&mut entry.waiters);
@@ -416,7 +418,7 @@ impl UpdateRegistry {
     pub(crate) fn reject_unprocessed(&self, run_key: RunKey) -> Vec<String> {
         let mut rejected = Vec::new();
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().expect("inner lock poisoned");
             let keys: Vec<(RunKey, String)> = inner
                 .iter()
                 .filter(|((entry_run_key, _), entry)| {
@@ -450,7 +452,7 @@ impl UpdateRegistry {
         let entry = self
             .inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .remove(&(run_key, update_id.to_string()));
         match entry {
             Some(entry) => {
@@ -472,7 +474,7 @@ impl UpdateRegistry {
     ) -> bool {
         let mut waiters_to_notify = Vec::new();
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().expect("inner lock poisoned");
             if let Some(entry) = inner.get_mut(&(run_key, update_id.to_string())) {
                 // The worker has accepted the update; it leaves the sendable set so
                 // a subsequent workflow task does not re-offer it (which would make
@@ -510,7 +512,7 @@ impl UpdateRegistry {
     pub(crate) fn remove(&self, run_key: RunKey, update_id: &str) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .remove(&(run_key, update_id.to_string()));
     }
 
@@ -525,7 +527,7 @@ impl UpdateRegistry {
     pub(crate) fn take_entry_waiters(&self, run_key: RunKey, update_id: &str) -> Vec<UpdateWaiter> {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .remove(&(run_key, update_id.to_string()))
             .map(|entry| entry.waiters)
             .unwrap_or_default()
@@ -555,7 +557,7 @@ impl UpdateRegistry {
     pub(crate) fn drain_for_run(&self, run_key: RunKey, continuing: bool) -> usize {
         let mut drained = Vec::new();
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().expect("inner lock poisoned");
             let keys: Vec<_> = inner
                 .keys()
                 .filter(|(key_run, _)| *key_run == run_key)
@@ -587,7 +589,7 @@ impl UpdateRegistry {
     pub fn peek_update_info(&self, run_key: RunKey, update_id: &str) -> Option<(String, Payloads)> {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .get(&(run_key, update_id.to_string()))
             .map(|entry| (entry.update_name.clone(), entry.input.clone()))
     }
@@ -595,7 +597,7 @@ impl UpdateRegistry {
     pub fn contains_registered_update(&self, run_key: RunKey, update_id: &str) -> bool {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .contains_key(&(run_key, update_id.to_string()))
     }
 
@@ -603,7 +605,7 @@ impl UpdateRegistry {
     pub(crate) fn contains(&self, run_key: RunKey, update_id: &str) -> bool {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .contains_key(&(run_key, update_id.to_string()))
     }
 }

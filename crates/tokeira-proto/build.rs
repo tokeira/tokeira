@@ -52,10 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .files(
                 &controller_protos
                     .iter()
-                    .map(|p| p.to_str().unwrap())
+                    .map(|p| p.to_str().expect("proto path is valid UTF-8"))
                     .collect::<Vec<_>>(),
             )
-            .includes(&[proto_root.to_str().unwrap()])
+            .includes(&[proto_root.to_str().expect("proto root is valid UTF-8")])
             .include_file("_connectrpc_controller.rs")
             .compile()?;
     }

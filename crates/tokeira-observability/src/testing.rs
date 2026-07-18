@@ -325,7 +325,8 @@ impl AlertRuleValidator {
                 ));
             }
         }
-        let runbook_url = yaml_string(annotations, "runbook_url").unwrap();
+        let runbook_url = yaml_string(annotations, "runbook_url")
+            .expect("runbook_url presence validated with the required annotations above");
         if is_stable_url(runbook_url) || repo_root.join(runbook_url).exists() {
             Ok(())
         } else {

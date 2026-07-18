@@ -1,3 +1,5 @@
+// Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
+#![allow(clippy::unwrap_used)]
 // Property tests construct prost messages with `..Default::default()` for
 // forward-compat against upstream proto field additions.
 #![allow(clippy::needless_update)]

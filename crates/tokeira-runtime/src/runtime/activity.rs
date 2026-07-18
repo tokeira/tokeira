@@ -474,7 +474,7 @@ where
             };
 
             let (bundle, commit_epoch) = {
-                let owner = self.shard_owner.read().unwrap();
+                let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
                 let bundle_id = execution_home_bundle(
                     state.namespace_id.0.as_bytes(),
                     state.workflow_id.0.as_bytes(),
@@ -671,7 +671,7 @@ where
             // placement controller (no lease to fence), real local epoch under
             // one so storage lease-fences a superseded owner's write.
             let (bundle, commit_epoch) = {
-                let owner = self.shard_owner.read().unwrap();
+                let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
                 let bundle_id = execution_home_bundle(
                     state.namespace_id.0.as_bytes(),
                     state.workflow_id.0.as_bytes(),
@@ -955,7 +955,7 @@ where
             // write is rejected by lease fencing — the authoritative ownership
             // check.
             let (bundle, commit_epoch) = {
-                let owner = self.shard_owner.read().unwrap();
+                let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
                 let bundle_id = execution_home_bundle(
                     state.namespace_id.0.as_bytes(),
                     state.workflow_id.0.as_bytes(),
@@ -1350,7 +1350,7 @@ where
         // placement controller (no lease to fence), real local epoch under
         // one so storage lease-fences a superseded owner's write.
         let (bundle, commit_epoch) = {
-            let owner = deps.shard_owner.read().unwrap();
+            let owner = deps.shard_owner.read().expect("shard_owner lock poisoned");
             let bundle_id = execution_home_bundle(
                 state.namespace_id.0.as_bytes(),
                 state.workflow_id.0.as_bytes(),
@@ -1502,7 +1502,7 @@ where
             projection_ops: SmallVec::new(),
         };
         let (bundle, commit_epoch) = {
-            let owner = deps.shard_owner.read().unwrap();
+            let owner = deps.shard_owner.read().expect("shard_owner lock poisoned");
             let bundle_id = execution_home_bundle(
                 state.namespace_id.0.as_bytes(),
                 state.workflow_id.0.as_bytes(),

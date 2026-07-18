@@ -1010,7 +1010,10 @@ impl DeploymentRegistry {
 
             let mut next = record.clone();
             {
-                let version_record = next.versions.get_mut(&version.build_id).unwrap();
+                let version_record = next
+                    .versions
+                    .get_mut(&version.build_id)
+                    .expect("version present: resolved on the record this was cloned from");
                 apply_compute_config_change(
                     &mut version_record.compute_config,
                     &cmd.updates,
@@ -1068,7 +1071,10 @@ impl DeploymentRegistry {
 
                 let mut next = record.clone();
                 let view = {
-                    let version_record = next.versions.get_mut(&version.build_id).unwrap();
+                    let version_record = next
+                        .versions
+                        .get_mut(&version.build_id)
+                        .expect("version present: resolved on the record this was cloned from");
                     for (key, value) in &cmd.upsert_entries {
                         version_record
                             .metadata
@@ -2016,7 +2022,10 @@ fn apply_compute_config_change(
             continue;
         }
 
-        let existing = compute_config.scaling_groups.get_mut(name).unwrap();
+        let existing = compute_config
+            .scaling_groups
+            .get_mut(name)
+            .expect("scaling group present: validated by validate_compute_config_change");
         for path in &update.update_mask {
             match path.as_str() {
                 "task_queue_types" => {

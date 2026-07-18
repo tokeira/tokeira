@@ -97,7 +97,7 @@ impl SpeculativeTimerSet {
                 WftTimeoutKind::ScheduleToStart => WorkflowTaskTimeoutType::ScheduleToStart,
             };
             let lane = {
-                let lanes = lanes.lock().unwrap();
+                let lanes = lanes.lock().expect("lanes lock poisoned");
                 if lanes.is_empty() {
                     return;
                 }
@@ -126,7 +126,7 @@ impl SpeculativeTimerSet {
         if let Some(prev) = self
             .inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .insert(run_key, SpeculativeTimer { shard_id, cancel })
         {
             prev.cancel.cancel();
@@ -136,7 +136,12 @@ impl SpeculativeTimerSet {
     /// Disarm the run's speculative timer, if any (completion / failure /
     /// conversion-to-normal / a non-speculative pending task).
     pub fn disarm(&self, run_key: RunKey) {
-        if let Some(timer) = self.inner.lock().unwrap().remove(&run_key) {
+        if let Some(timer) = self
+            .inner
+            .lock()
+            .expect("inner lock poisoned")
+            .remove(&run_key)
+        {
             timer.cancel.cancel();
         }
     }
@@ -144,7 +149,7 @@ impl SpeculativeTimerSet {
     /// Drop every timer for a shard on handoff; the new owner re-derives them
     /// from persisted pending speculative state during its sweep (F2).
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().expect("inner lock poisoned");
         map.retain(|_, timer| {
             if timer.shard_id == shard_id {
                 timer.cancel.cancel();

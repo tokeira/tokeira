@@ -3,6 +3,8 @@
 //! `ComposeDeployment`. The three-way lock proves the `syn` interpreter realizes
 //! the operator definition with full fidelity (Proposal 004 Phase 5).
 
+// Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
+#![allow(clippy::unwrap_used)]
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,

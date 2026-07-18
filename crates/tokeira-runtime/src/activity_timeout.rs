@@ -90,7 +90,7 @@ impl ActivityTrackingState {
     pub fn insert(&self, entry: ActivityTrackingEntry) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .insert((entry.run_key, entry.activity_id.clone()), entry);
     }
 
@@ -112,7 +112,7 @@ impl ActivityTrackingState {
         now: OffsetDateTime,
     ) {
         let activity_id = activity_id.into();
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().expect("inner lock poisoned");
         match guard.get_mut(&(run_key, activity_id.clone())) {
             Some(entry) => {
                 entry.last_dispatched_at = now;
@@ -145,7 +145,7 @@ impl ActivityTrackingState {
         if let Some(entry) = self
             .inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .get_mut(&(run_key, activity_id.to_string()))
         {
             entry.last_dispatched_at = now;
@@ -161,7 +161,7 @@ impl ActivityTrackingState {
         if let Some(entry) = self
             .inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .get_mut(&(run_key, activity_id.to_string()))
         {
             entry.started_at = Some(now);
@@ -178,7 +178,7 @@ impl ActivityTrackingState {
         activity_id: &str,
         now: OffsetDateTime,
     ) -> Option<bool> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().expect("inner lock poisoned");
         let entry = guard.get_mut(&(run_key, activity_id.to_string()))?;
         entry.last_heartbeat_at = Some(now);
         Some(entry.cancel_requested)
@@ -190,7 +190,7 @@ impl ActivityTrackingState {
         if let Some(entry) = self
             .inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .get_mut(&(run_key, activity_id.to_string()))
         {
             entry.cancel_requested = true;
@@ -201,7 +201,7 @@ impl ActivityTrackingState {
     pub fn is_cancel_requested(&self, run_key: RunKey, activity_id: &str) -> Option<bool> {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .get(&(run_key, activity_id.to_string()))
             .map(|entry| entry.cancel_requested)
     }
@@ -211,7 +211,7 @@ impl ActivityTrackingState {
     pub fn remove(&self, run_key: RunKey, activity_id: &str) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .remove(&(run_key, activity_id.to_string()));
     }
 
@@ -219,7 +219,7 @@ impl ActivityTrackingState {
     pub fn remove_all_for_run(&self, run_key: RunKey) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .retain(|(candidate, _), _| *candidate != run_key);
     }
 
@@ -228,21 +228,26 @@ impl ActivityTrackingState {
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .retain(|_, entry| entry.shard_id != shard_id);
     }
 
     /// Snapshot all tracked entries; the scanner evaluates the copy without
     /// holding the lock.
     pub fn snapshot(&self) -> Vec<ActivityTrackingEntry> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Snapshot only the entries owned by `shard_id`, used by the per-shard scan.
     pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<ActivityTrackingEntry> {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .values()
             .filter(|entry| entry.shard_id == shard_id)
             .cloned()
@@ -686,7 +691,12 @@ pub(crate) async fn run_activity_timeout_scanner<R>(
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        let active_shards: Vec<_> = deps.shard_owner.read().unwrap().active_shards().collect();
+        let active_shards: Vec<_> = deps
+            .shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .active_shards()
+            .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("activity_timeout", shard_id.0);
             scan_activity_timeouts_once(&deps, Some(shard_id), &lanes, lane_count, &config).await;

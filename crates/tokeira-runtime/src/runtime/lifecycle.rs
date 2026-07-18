@@ -939,7 +939,7 @@ where
             }
 
             let (bundle, epoch) = {
-                let owner = self.shard_owner.read().unwrap();
+                let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
                 let bundle = execution_home_bundle(
                     state.namespace_id.0.as_bytes(),
                     state.workflow_id.0.as_bytes(),

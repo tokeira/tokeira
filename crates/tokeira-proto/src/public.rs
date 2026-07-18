@@ -4,6 +4,8 @@
 //! it completely. That makes it easier to compare generated code with the upstream proto files and
 //! with Temporal-compatible API documentation.
 
+// Generated code: the codegen's unwraps are its own.
+#![allow(clippy::unwrap_used)]
 pub mod temporal {
     pub mod api {
         pub mod activity {

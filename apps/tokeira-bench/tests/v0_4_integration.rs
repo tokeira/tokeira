@@ -22,6 +22,8 @@
 //! Synchronisation uses `tokio::sync::Notify` and `tokio::time::timeout` —
 //! never `tokio::time::sleep` — per `tokeira/AGENTS.md` Rule 1.
 
+// Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
+#![allow(clippy::unwrap_used)]
 use std::{sync::Arc, time::Duration};
 
 use temporalio_client::{

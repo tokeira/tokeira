@@ -8,6 +8,8 @@
 //! - projection mutations and checkpoints
 //! - operator/admin control plane APIs
 
+// Generated code: the codegen's unwraps are its own.
+#![allow(clippy::unwrap_used)]
 pub use crate::public::temporal;
 
 pub mod tokeira {

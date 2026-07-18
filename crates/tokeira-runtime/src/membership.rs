@@ -254,7 +254,7 @@ where
     /// that snapshots inputs from the live [`ShardOwner`] and [`RuntimeDrain`].
     pub fn heartbeat_message(&self) -> RuntimeHeartbeat {
         self.heartbeat_message_with_inputs(HeartbeatInputs::from_shard_owner(
-            &self.shard_owner.read().unwrap(),
+            &self.shard_owner.read().expect("shard_owner lock poisoned"),
             self.drain.state(),
         ))
     }
@@ -423,7 +423,7 @@ where
                     if let LeaseOutcome::Acquired { epoch } = outcome {
                         self.shard_owner
                             .write()
-                            .unwrap()
+                            .expect("shard_owner lock poisoned")
                             .record_acquired(bundle, epoch);
                     }
                 }
@@ -439,7 +439,10 @@ where
                 } else {
                     None
                 };
-                *self.last_budget_valid_until.lock().unwrap() = valid_until;
+                *self
+                    .last_budget_valid_until
+                    .lock()
+                    .expect("last_budget_valid_until lock poisoned") = valid_until;
                 self.budget_applier.apply_budget(
                     budget.rate_per_second,
                     budget.capacity,
@@ -451,13 +454,18 @@ where
                 let bundles = self
                     .shard_owner
                     .read()
-                    .unwrap()
+                    .expect("shard_owner lock poisoned")
                     .owned_shards()
                     .collect::<Vec<_>>();
                 for bundle in bundles {
                     self.relinquish_owned_bundle(bundle).await?;
                 }
-                let owned_bundle_count = self.shard_owner.read().unwrap().owned_shards().count();
+                let owned_bundle_count = self
+                    .shard_owner
+                    .read()
+                    .expect("shard_owner lock poisoned")
+                    .owned_shards()
+                    .count();
                 self.drain.record_progress(owned_bundle_count, 0, 0);
             }
             Some(Directive::RoutingUpdate(_)) | None => {}
@@ -483,7 +491,7 @@ where
                     if let LeaseOutcome::Acquired { epoch } = outcome {
                         self.shard_owner
                             .write()
-                            .unwrap()
+                            .expect("shard_owner lock poisoned")
                             .record_acquired(bundle, epoch);
                     }
                 }
@@ -499,13 +507,18 @@ where
                 let bundles = self
                     .shard_owner
                     .read()
-                    .unwrap()
+                    .expect("shard_owner lock poisoned")
                     .owned_shards()
                     .collect::<Vec<_>>();
                 for bundle in bundles {
                     self.relinquish_owned_bundle(bundle).await?;
                 }
-                let owned_bundle_count = self.shard_owner.read().unwrap().owned_shards().count();
+                let owned_bundle_count = self
+                    .shard_owner
+                    .read()
+                    .expect("shard_owner lock poisoned")
+                    .owned_shards()
+                    .count();
                 self.drain.record_progress(owned_bundle_count, 0, 0);
             }
             Some(controller_directive::Directive::RoutingUpdate(_)) | None => {}
@@ -521,7 +534,10 @@ where
         } else {
             None
         };
-        *self.last_budget_valid_until.lock().unwrap() = valid_until;
+        *self
+            .last_budget_valid_until
+            .lock()
+            .expect("last_budget_valid_until lock poisoned") = valid_until;
         self.budget_applier.apply_budget(
             budget.rate_per_second,
             budget.capacity,
@@ -536,7 +552,10 @@ where
     /// An unparseable deadline is treated as expired (`true`) — failing safe by
     /// re-requesting a budget rather than honouring an unreadable one.
     pub fn last_budget_expired(&self) -> bool {
-        let guard = self.last_budget_valid_until.lock().unwrap();
+        let guard = self
+            .last_budget_valid_until
+            .lock()
+            .expect("last_budget_valid_until lock poisoned");
         match &*guard {
             None => false,
             Some(expiry) => {
@@ -550,7 +569,7 @@ where
 
     async fn relinquish_owned_bundle(&self, bundle: ShardId) -> Result<()> {
         let epoch = {
-            let owner = self.shard_owner.read().unwrap();
+            let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
             owner.epoch_of(bundle).unwrap_or(ShardEpoch::ZERO)
         };
         if epoch == ShardEpoch::ZERO {
@@ -561,7 +580,7 @@ where
             .relinquish_bundle(bundle, self.config.owner_identity(), epoch)
             .await?;
         if matches!(outcome, LeaseOutcome::Acquired { .. }) {
-            let mut owner = self.shard_owner.write().unwrap();
+            let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
             owner.mark_draining(bundle);
             owner.remove(bundle);
         }
@@ -621,10 +640,11 @@ mod tests {
             capacity: u64,
             max_reservoir_size: u32,
         ) -> Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((rate_per_second, capacity, max_reservoir_size));
+            self.calls.lock().expect("calls lock poisoned").push((
+                rate_per_second,
+                capacity,
+                max_reservoir_size,
+            ));
             Ok(())
         }
     }
@@ -750,7 +770,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(budget.calls.lock().unwrap().as_slice(), &[(10.0, 20, 3)]);
+        assert_eq!(
+            budget.calls.lock().expect("calls lock poisoned").as_slice(),
+            &[(10.0, 20, 3)]
+        );
         assert!(!client.last_budget_expired());
 
         client
@@ -802,7 +825,15 @@ mod tests {
                 .filter(|lease| lease.bundle_id == ShardId(1) || lease.bundle_id == ShardId(2))
                 .all(|lease| lease.owner_node_id.is_none())
         );
-        assert_eq!(client.shard_owner.read().unwrap().owned_shards().count(), 0);
+        assert_eq!(
+            client
+                .shard_owner
+                .read()
+                .expect("shard_owner lock poisoned")
+                .owned_shards()
+                .count(),
+            0
+        );
         assert_eq!(client.drain.state(), RuntimeDrainState::SafeToTerminate);
     }
 
@@ -814,7 +845,7 @@ mod tests {
         client
             .shard_owner
             .write()
-            .unwrap()
+            .expect("shard_owner lock poisoned")
             .record_acquired(ShardId(2), ShardEpoch(7));
         client.drain.mark_safe_to_terminate();
 

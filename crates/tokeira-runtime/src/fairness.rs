@@ -344,7 +344,7 @@ impl FairnessState {
     pub fn remaining_budget(&self, queue: &QueueKey) -> u32 {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .queues
             .get(queue)
             .map(|entry| entry.remaining_budget)
@@ -354,7 +354,7 @@ impl FairnessState {
     }
 
     pub fn consume_budget(&self, queue: &QueueKey, count: u32) -> u32 {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
         let entry = inner
             .queues
             .entry(queue.clone())
@@ -381,7 +381,7 @@ impl FairnessState {
         recent_poll_counts: &HashMap<QueueKey, u64>,
         now: OffsetDateTime,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("inner lock poisoned");
         for (queue, share) in adjustments {
             let polls = recent_poll_counts.get(&queue).copied().unwrap_or(0);
             let budget = (share * polls as f64).floor() as u32;
@@ -397,7 +397,11 @@ impl FairnessState {
     }
 
     pub fn snapshot(&self) -> HashMap<QueueKey, QueueFairnessState> {
-        self.inner.lock().unwrap().queues.clone()
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .queues
+            .clone()
     }
 }
 

@@ -134,11 +134,11 @@ dagger-client = { path = "crates/dagger-client" }
 tokeira-build = { path = "crates/tokeira-build" }
 
 # Mechanized AGENTS.md rules (§1, §9): prose rules drift under a fluid codebase;
-# compiler-enforced ones survive refactors. Remaining staged burn-down
-# (counts measured 2026-07-17): clippy::unwrap_used 165 unique sites (123 in
-# tokeira-runtime) — active at "warn", "deny" at zero · missing_docs 9017 —
-# a campaign, not yet enabled · clippy::expect_used 574 — not
-# constitution-mandated; adopt-or-drop decision pending.
+# compiler-enforced ones survive refactors. Everything here is binding. The one
+# staged remainder is missing_docs (9,017 sites measured 2026-07-17 — a
+# documentation campaign, not a lint flip). clippy::expect_used (measured 574)
+# is deliberately NOT adopted: expect-with-invariant-message is this
+# workspace's sanctioned unwrap remedy.
 [workspace.lints.rust]
 unsafe_code = "deny"    # §1 — the four carve-outs carry #[allow] + SAFETY at each site
 unreachable_pub = "warn"
@@ -147,7 +147,7 @@ missing_debug_implementations = "deny" # §1 — burned down 2026-07-17 (derives
 [workspace.lints.clippy]
 dbg_macro = "warn"
 undocumented_unsafe_blocks = "deny" # every retained unsafe block carries // SAFETY:
-unwrap_used = "warn"    # §1 "No .unwrap() outside tests" — burn-down active
+unwrap_used = "deny"    # §1 — burned down 2026-07-18; tests and generated code carry allows
 print_stdout = "deny"   # §1 tracing-not-println — CLI/bench/probe crates carry documented allows
 print_stderr = "deny"
 

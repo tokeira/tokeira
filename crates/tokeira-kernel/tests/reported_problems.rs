@@ -8,6 +8,8 @@
 //! set counts nothing, clears the affinity, and retries fresh at attempt 1;
 //! schedule-to-start timeouts never count; completion clears both fields.
 
+// Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
+#![allow(clippy::unwrap_used)]
 use std::collections::BTreeMap;
 
 use time::{Duration, OffsetDateTime};

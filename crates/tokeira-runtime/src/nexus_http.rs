@@ -623,14 +623,14 @@ fn payload_to_body(input: &Payloads) -> (Vec<u8>, Option<String>) {
             payload.data.clone(),
             Some(format!(
                 "application/json; format=protobuf; message-type=\"{}\"",
-                message_type.unwrap()
+                message_type.expect("guarded by is_some in this match arm")
             )),
         ),
         Some("binary/protobuf") if payload.metadata.len() == 2 && message_type.is_some() => (
             payload.data.clone(),
             Some(format!(
                 "application/x-protobuf; message-type=\"{}\"",
-                message_type.unwrap()
+                message_type.expect("guarded by is_some in this match arm")
             )),
         ),
         _ => (

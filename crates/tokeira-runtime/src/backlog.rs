@@ -461,16 +461,26 @@ mod tests {
             Ok(Vec::new())
         }
         async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
-            if *self.fail_persist.lock().unwrap() {
+            if *self
+                .fail_persist
+                .lock()
+                .expect("fail_persist lock poisoned")
+            {
                 return Err(anyhow!("persist failed"));
             }
-            self.persisted.lock().unwrap().extend(entries);
+            self.persisted
+                .lock()
+                .expect("persisted lock poisoned")
+                .extend(entries);
             Ok(())
         }
         async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
-            self.drain_calls.lock().unwrap().push(queue.clone());
+            self.drain_calls
+                .lock()
+                .expect("drain_calls lock poisoned")
+                .push(queue.clone());
             let mut drained = Vec::new();
-            let mut guard = self.drained.lock().unwrap();
+            let mut guard = self.drained.lock().expect("drained lock poisoned");
             let backlog = guard.entry(queue.clone()).or_default();
             while drained.len() < limit {
                 let Some(entry) = backlog.pop_front() else {
@@ -592,7 +602,11 @@ mod tests {
         };
         scan_grace_once(&broker, &activity_broker, &repo, &config).await;
 
-        let persisted = repo.persisted.lock().unwrap().clone();
+        let persisted = repo
+            .persisted
+            .lock()
+            .expect("persisted lock poisoned")
+            .clone();
         assert_eq!(persisted.len(), 1);
         assert!(matches!(
             persisted[0].payload,
@@ -610,7 +624,7 @@ mod tests {
         let fairness = FairnessState::new();
         let metrics = DeliveryMetrics::new();
         let queue = workflow_queue();
-        repo.drained.lock().unwrap().insert(
+        repo.drained.lock().expect("drained lock poisoned").insert(
             queue.clone(),
             VecDeque::from(vec![BacklogEntry {
                 run_key: RunKey::new(),
@@ -647,7 +661,11 @@ mod tests {
         )
         .await;
 
-        let calls = repo.drain_calls.lock().unwrap().clone();
+        let calls = repo
+            .drain_calls
+            .lock()
+            .expect("drain_calls lock poisoned")
+            .clone();
         assert_eq!(calls, vec![queue.clone()]);
         let delivered = waiter.await.unwrap();
         assert!(delivered.is_some());
@@ -674,7 +692,7 @@ mod tests {
             OffsetDateTime::now_utc(),
         );
         assert_eq!(fairness.remaining_budget(&queue), 0);
-        repo.drained.lock().unwrap().insert(
+        repo.drained.lock().expect("drained lock poisoned").insert(
             queue.clone(),
             VecDeque::from(vec![BacklogEntry {
                 run_key: RunKey::new(),
@@ -770,7 +788,7 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let repo = MockBacklogRepo::default();
-                *repo.fail_persist.lock().unwrap() = true;
+                *repo.fail_persist.lock().expect("fail_persist lock poisoned") = true;
                 let broker = InMemoryBroker::default();
                 let activity_broker = InMemoryActivityBroker::default();
                 let queue = workflow_queue();
@@ -805,7 +823,7 @@ mod tests {
                     .unwrap();
 
                 prop_assert_eq!(delivered.and_then(|entry| entry.into_queued().map(|queued| queued.0)), Some(task));
-                prop_assert!(repo.persisted.lock().unwrap().is_empty());
+                prop_assert!(repo.persisted.lock().expect("persisted lock poisoned").is_empty());
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
@@ -824,7 +842,7 @@ mod tests {
                 let workflow_queue = workflow_queue();
                 let activity_queue = activity_queue();
 
-                repo.drained.lock().unwrap().insert(
+                repo.drained.lock().expect("drained lock poisoned").insert(
                     workflow_queue.clone(),
                     VecDeque::from(vec![BacklogEntry {
                         run_key: RunKey::new(),
@@ -836,7 +854,7 @@ mod tests {
                         insertion_seq: 0,
                     }]),
                 );
-                repo.drained.lock().unwrap().insert(
+                repo.drained.lock().expect("drained lock poisoned").insert(
                     activity_queue.clone(),
                     VecDeque::from(vec![BacklogEntry {
                         run_key: RunKey::new(),
@@ -947,7 +965,7 @@ mod tests {
                     .collect();
                 repo.drained
                     .lock()
-                    .unwrap()
+                    .expect("drained lock poisoned")
                     .insert(queue.clone(), VecDeque::from(entries));
 
                 let broker_clone = broker.clone();
@@ -1063,7 +1081,11 @@ mod tests {
         };
         scan_grace_once(&broker, &activity_broker, &repo, &config).await;
 
-        let persisted = repo.persisted.lock().unwrap().clone();
+        let persisted = repo
+            .persisted
+            .lock()
+            .expect("persisted lock poisoned")
+            .clone();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].run_key, task_a.run_key);
 

@@ -108,14 +108,14 @@ impl ReadinessCheck for MutableReadinessCheck {
     }
 
     async fn check(&self) -> Result<ReadinessCheckResult, ObservabilityError> {
-        Ok(self.state.lock().unwrap().clone())
+        Ok(self.state.lock().expect("state lock poisoned").clone())
     }
 }
 
 impl ReadinessHandle {
     /// Update the check state with an optional sanitized message.
     pub fn update(&self, status: ReadinessStatus, message: Option<String>) {
-        *self.check.state.lock().unwrap() = ReadinessCheckResult {
+        *self.check.state.lock().expect("state lock poisoned") = ReadinessCheckResult {
             status,
             message: message.map(sanitize_readiness_message),
         };

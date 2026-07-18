@@ -199,7 +199,11 @@ pub(crate) async fn run_timer_scanner<R>(
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        let active_shards: Vec<_> = shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .active_shards()
+            .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("timer", shard_id.0);
             scan_due_timers_once_for_shard(&*repo, shard_id, &config, |due, fired_at| {

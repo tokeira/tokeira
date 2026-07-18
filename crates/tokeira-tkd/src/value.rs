@@ -304,8 +304,14 @@ impl<H: std::fmt::Debug> FieldMapExt<H> for FieldMap<H> {
                 .map(|v| match v {
                     Value::Tuple(t) if t.len() == 2 => {
                         let mut it = t.into_iter();
-                        let k = expect_str(it.next().unwrap(), key)?;
-                        let val = expect_str(it.next().unwrap(), key)?;
+                        let k = expect_str(
+                            it.next().expect("tuple length 2 checked in this arm"),
+                            key,
+                        )?;
+                        let val = expect_str(
+                            it.next().expect("tuple length 2 checked in this arm"),
+                            key,
+                        )?;
                         Ok((k, val))
                     }
                     other => Err(EvalError::new(format!(

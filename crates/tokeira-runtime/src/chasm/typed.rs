@@ -402,7 +402,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let dispatched = fx.dispatch.dispatched.lock().unwrap();
+        let dispatched = fx
+            .dispatch
+            .dispatched
+            .lock()
+            .expect("dispatched lock poisoned");
         assert_eq!(dispatched.len(), 1);
         assert_eq!(dispatched[0].1.task.task_type_id, 11);
     }
@@ -537,7 +541,13 @@ mod tests {
             .await
             .unwrap();
         // The visibility hook recorded the contributing component's search attrs.
-        assert!(!fx.visibility.recorded.lock().unwrap().is_empty());
+        assert!(
+            !fx.visibility
+                .recorded
+                .lock()
+                .expect("recorded lock poisoned")
+                .is_empty()
+        );
 
         fx.engine.delete_execution(&key()).await.unwrap();
         let err = fx.engine.read_component(&key()).await.unwrap_err();

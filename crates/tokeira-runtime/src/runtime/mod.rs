@@ -737,13 +737,13 @@ where
                 )
             })
             .collect();
-        *shared_lanes.lock().unwrap() = lanes.clone();
+        *shared_lanes.lock().expect("shared_lanes lock poisoned") = lanes.clone();
         if seed_default_shard {
             // Single-node / no-controller deployments have no placement
             // controller to grant shard ownership, so seed shard 0 as locally
             // owned at the zero epoch. Controller-managed deployments pass
             // `false` and acquire ownership through durable leases instead.
-            let mut owner = shard_owner.write().unwrap();
+            let mut owner = shard_owner.write().expect("shard_owner lock poisoned");
             let shard_id = ShardId(0);
             let _ = owner.record_acquired(shard_id, ShardEpoch::ZERO);
             owner.mark_active(shard_id);
@@ -1109,7 +1109,7 @@ where
         connection_rate_headroom: f32,
     ) -> HeartbeatInputs {
         HeartbeatInputs::from_runtime_components(
-            &self.shard_owner.read().unwrap(),
+            &self.shard_owner.read().expect("shard_owner lock poisoned"),
             self.runtime_drain.state(),
             &self.lanes,
             available_connections,
@@ -2770,7 +2770,7 @@ mod tests {
                 scan_due_timers_once(&repo, &config, move |due, fired_at| {
                     let captured = captured_clone.clone();
                     async move {
-                        captured.lock().unwrap().push((
+                        captured.lock().expect("captured lock poisoned").push((
                             due.run_key,
                             due.timer_id,
                             lane_index_for_run_key(due.run_key, lane_count),
@@ -2780,7 +2780,7 @@ mod tests {
                     }
                 }).await;
 
-                let captured = captured.lock().unwrap();
+                let captured = captured.lock().expect("captured lock poisoned");
                 prop_assert_eq!(captured.len(), due_timers.len());
                 for (index, due) in due_timers.iter().enumerate() {
                     let (run_key, timer_id, lane_index, _) = &captured[index];
@@ -2835,12 +2835,12 @@ mod tests {
                 scan_due_timers_once(&repo, &TimerScannerConfig::default(), move |_due, fired_at| {
                     let fired_ats = fired_ats_clone.clone();
                     async move {
-                        fired_ats.lock().unwrap().push(fired_at);
+                        fired_ats.lock().expect("fired_ats lock poisoned").push(fired_at);
                         Ok(())
                     }
                 }).await;
 
-                let fired_ats = fired_ats.lock().unwrap();
+                let fired_ats = fired_ats.lock().expect("fired_ats lock poisoned");
                 prop_assert!(!fired_ats.is_empty());
                 let first = fired_ats[0];
                 prop_assert!(fired_ats.iter().all(|value| *value == first));
@@ -2879,7 +2879,7 @@ mod tests {
                         if should_fail {
                             Err(anyhow!("lane channel closed"))
                         } else {
-                            successes.lock().unwrap().push(due.timer_id);
+                            successes.lock().expect("successes lock poisoned").push(due.timer_id);
                             Ok(())
                         }
                     }
@@ -2894,7 +2894,7 @@ mod tests {
                             .unwrap_or(false)
                     })
                     .count();
-                prop_assert_eq!(successes.lock().unwrap().len(), expected_successes);
+                prop_assert_eq!(successes.lock().expect("successes lock poisoned").len(), expected_successes);
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
@@ -2927,12 +2927,12 @@ mod tests {
                 scan_due_timers_once(&repo, &config, move |due, _fired_at| {
                     let captured = captured_clone.clone();
                     async move {
-                        captured.lock().unwrap().push(due.timer_id);
+                        captured.lock().expect("captured lock poisoned").push(due.timer_id);
                         Ok(())
                     }
                 }).await;
 
-                prop_assert_eq!(captured.lock().unwrap().len(), due_timers.len());
+                prop_assert_eq!(captured.lock().expect("captured lock poisoned").len(), due_timers.len());
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
@@ -3121,12 +3121,12 @@ mod tests {
                     move |entry, violation, now| {
                         let seen = seen_clone.clone();
                         async move {
-                            seen.lock().unwrap().push((entry.run_key, violation, now));
+                            seen.lock().expect("seen lock poisoned").push((entry.run_key, violation, now));
                             Ok(())
                         }
                     }
                 ).await;
-                let seen = seen.lock().unwrap();
+                let seen = seen.lock().expect("seen lock poisoned");
                 prop_assert!(seen.len() <= max_batch);
                 if !seen.is_empty() {
                     let now = seen[0].2;
@@ -3278,7 +3278,7 @@ mod tests {
         }
 
         fn recorded_limits(&self) -> Vec<usize> {
-            self.limits.lock().unwrap().clone()
+            self.limits.lock().expect("limits lock poisoned").clone()
         }
     }
 
@@ -3409,8 +3409,16 @@ mod tests {
             _now: OffsetDateTime,
             limit: usize,
         ) -> Result<Vec<DueTimer>> {
-            self.limits.lock().unwrap().push(limit);
-            match self.responses.lock().unwrap().pop_front() {
+            self.limits
+                .lock()
+                .expect("limits lock poisoned")
+                .push(limit);
+            match self
+                .responses
+                .lock()
+                .expect("responses lock poisoned")
+                .pop_front()
+            {
                 Some(TimerListResponse::Ok(due_timers)) => Ok(due_timers),
                 Some(TimerListResponse::Err(message)) => Err(anyhow!(message)),
                 None => Ok(Vec::new()),

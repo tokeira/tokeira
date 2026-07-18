@@ -413,7 +413,7 @@ impl NexusEndpointStore for InMemoryNexusEndpointStore {
         spec: NexusEndpointSpec,
         now_unix_nanos: i64,
     ) -> Result<NexusEndpointRecord, NexusEndpointStoreError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("state lock poisoned");
         if state.by_name.contains_key(&spec.name) {
             return Err(NexusEndpointStoreError::DuplicateName(spec.name));
         }
@@ -436,7 +436,7 @@ impl NexusEndpointStore for InMemoryNexusEndpointStore {
     fn get(&self, id: &str) -> Result<NexusEndpointRecord, NexusEndpointStoreError> {
         self.state
             .lock()
-            .unwrap()
+            .expect("state lock poisoned")
             .by_id
             .get(id)
             .cloned()
@@ -450,7 +450,7 @@ impl NexusEndpointStore for InMemoryNexusEndpointStore {
         spec: NexusEndpointSpec,
         now_unix_nanos: i64,
     ) -> Result<NexusEndpointRecord, NexusEndpointStoreError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("state lock poisoned");
         let previous = state
             .by_id
             .get(id)
@@ -488,7 +488,7 @@ impl NexusEndpointStore for InMemoryNexusEndpointStore {
     }
 
     fn delete(&self, id: &str) -> Result<(), NexusEndpointStoreError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().expect("state lock poisoned");
         let record = state
             .by_id
             .remove(id)
@@ -502,7 +502,7 @@ impl NexusEndpointStore for InMemoryNexusEndpointStore {
         start_after_id: Option<&str>,
         page_size: usize,
     ) -> Result<NexusEndpointPage, NexusEndpointStoreError> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().expect("state lock poisoned");
         // Id byte-order, mirroring the table owner's `endpointEntries` sorted by id.
         let mut ids: Vec<&String> = state.by_id.keys().collect();
         ids.sort();
@@ -531,7 +531,7 @@ impl NexusEndpointStore for InMemoryNexusEndpointStore {
     }
 
     fn find_by_name(&self, name: &str) -> Option<NexusEndpointRecord> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().expect("state lock poisoned");
         state
             .by_name
             .get(name)
@@ -1329,39 +1329,44 @@ impl NexusTimeoutTrackingState {
     pub fn insert(&self, entry: NexusTimeoutEntry) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .insert((entry.run_key, entry.operation_id.clone()), entry);
     }
 
     pub fn remove(&self, run_key: RunKey, operation_id: &str) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .remove(&(run_key, operation_id.to_string()));
     }
 
     pub fn remove_all_for_run(&self, run_key: RunKey) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .retain(|(candidate, _), _| *candidate != run_key);
     }
 
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .retain(|_, entry| entry.shard_id != shard_id);
     }
 
     pub fn snapshot(&self) -> Vec<NexusTimeoutEntry> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<NexusTimeoutEntry> {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .values()
             .filter(|entry| entry.shard_id == shard_id)
             .cloned()
@@ -1394,39 +1399,44 @@ impl CompletionCallbackTrackingState {
     pub fn insert(&self, entry: CompletionCallbackTrackingEntry) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .insert((entry.run_key, entry.callback_index), entry);
     }
 
     pub fn remove(&self, run_key: RunKey, callback_index: usize) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .remove(&(run_key, callback_index));
     }
 
     pub fn remove_all_for_run(&self, run_key: RunKey) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .retain(|(candidate, _), _| *candidate != run_key);
     }
 
     pub fn remove_all_for_shard(&self, shard_id: ShardId) {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .retain(|_, entry| entry.shard_id != shard_id);
     }
 
     pub fn snapshot(&self) -> Vec<CompletionCallbackTrackingEntry> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn snapshot_for_shard(&self, shard_id: ShardId) -> Vec<CompletionCallbackTrackingEntry> {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .values()
             .filter(|entry| entry.shard_id == shard_id)
             .cloned()
@@ -1768,7 +1778,11 @@ pub(crate) async fn run_nexus_timeout_scanner<R>(
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        let active_shards: Vec<_> = shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .active_shards()
+            .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("nexus_timeout", shard_id.0);
             scan_nexus_timeouts_once(

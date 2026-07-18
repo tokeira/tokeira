@@ -410,7 +410,7 @@ where
         runtime_metrics::record_lane_queue_wait(message.enqueued_at.elapsed());
         let processing_start = std::time::Instant::now();
         let shard_id = {
-            let owner = shard_owner.read().unwrap();
+            let owner = shard_owner.read().expect("shard_owner lock poisoned");
             shard_for(message.run_key, owner.shard_count())
         };
         let processing_span = lane_processing_span(&message, command_type, shard_id);
@@ -707,7 +707,7 @@ where
                             repo.load_run(successor_run_key).await
                         {
                             let shard_id = {
-                                let owner = shard_owner.read().unwrap();
+                                let owner = shard_owner.read().expect("shard_owner lock poisoned");
                                 shard_for(successor_run_key, owner.shard_count())
                             };
                             if successor_state.workflow_execution_timeout.is_some()
@@ -1195,7 +1195,10 @@ where
                                     let workflow_timeout_tracking =
                                         workflow_timeout_tracking.clone();
                                     let predecessor_run_key = message.run_key;
-                                    let shard_count = shard_owner.read().unwrap().shard_count();
+                                    let shard_count = shard_owner
+                                        .read()
+                                        .expect("shard_owner lock poisoned")
+                                        .shard_count();
                                     // Start the successor off-lane for the same
                                     // reason as child delivery: it may route to
                                     // this lane, and an inline submit would
@@ -1435,7 +1438,7 @@ where
             transition.next_state.transition_seq.0 as i64,
         );
         let (execution_home_bundle, epoch) = {
-            let owner = shard_owner.read().unwrap();
+            let owner = shard_owner.read().expect("shard_owner lock poisoned");
             let bundle_id = execution_home_bundle(
                 transition.next_state.namespace_id.0.as_bytes(),
                 transition.next_state.workflow_id.0.as_bytes(),
@@ -1960,7 +1963,7 @@ mod tests {
             if let Some(span) = ctx.span(id) {
                 self.0
                     .lock()
-                    .unwrap()
+                    .expect("0 lock poisoned")
                     .push((span.metadata().name().to_string(), recorder.values));
             }
         }
@@ -1972,7 +1975,7 @@ mod tests {
             values.record(&mut recorder);
             if let Some(span) = ctx.span(id) {
                 let span_name = span.metadata().name();
-                let mut captured = self.0.lock().unwrap();
+                let mut captured = self.0.lock().expect("0 lock poisoned");
                 if let Some((_, fields)) = captured
                     .iter_mut()
                     .rev()
@@ -2004,19 +2007,19 @@ mod tests {
         }
 
         fn with_reject(self) -> Self {
-            self.state.lock().unwrap().reject = true;
+            self.state.lock().expect("state lock poisoned").reject = true;
             self
         }
 
         fn snapshot(&self) -> (Vec<Command>, Vec<LoadedRun>) {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().expect("state lock poisoned");
             (state.applied_commands.clone(), state.loaded_runs.clone())
         }
     }
 
     impl Kernel for MockKernel {
         fn apply(&self, loaded: LoadedRun, command: Command) -> Result<Transition, Reject> {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().expect("state lock poisoned");
             state.applied_commands.push(command);
             state.loaded_runs.push(loaded.clone());
             if state.reject {
@@ -2570,7 +2573,7 @@ mod tests {
             if let Some(metadata) = tracing::Span::current().metadata() {
                 self.observed
                     .lock()
-                    .unwrap()
+                    .expect("observed lock poisoned")
                     .push(metadata.name().to_string());
             }
             let LoadedRun::Existing(current) = loaded else {
@@ -2720,7 +2723,7 @@ mod tests {
     fn test_shard_owner() -> Arc<RwLock<ShardOwner>> {
         let owner = Arc::new(RwLock::new(ShardOwner::new(1)));
         {
-            let mut guard = owner.write().unwrap();
+            let mut guard = owner.write().expect("owner lock poisoned");
             let _ = guard.record_acquired(ShardId(0), ShardEpoch::ZERO);
             guard.mark_active(ShardId(0));
         }
@@ -2910,7 +2913,7 @@ mod tests {
             });
 
         assert!(message.trace_context.is_some());
-        let spans = capture.0.lock().unwrap();
+        let spans = capture.0.lock().expect("0 lock poisoned");
         let (_, fields) = spans
             .iter()
             .find(|(name, _)| name == "lane.process")
@@ -2954,7 +2957,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(result.0, CommitResult::Applied { .. }));
-        let captured = capture.0.lock().unwrap();
+        let captured = capture.0.lock().expect("0 lock poisoned");
         let kernel_span = captured
             .iter()
             .find(|(name, _)| name == "kernel.transition")
@@ -3781,7 +3784,7 @@ mod tests {
         .await
         .unwrap();
 
-        let observed = observed.lock().unwrap();
+        let observed = observed.lock().expect("observed lock poisoned");
         assert!(observed.iter().any(|name| name == "kernel.transition"));
     }
 }

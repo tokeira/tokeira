@@ -51,7 +51,7 @@ where
             let current_epoch = self
                 .shard_owner
                 .read()
-                .unwrap()
+                .expect("shard_owner lock poisoned")
                 .epoch_of(shard_id)
                 .unwrap_or(ShardEpoch::ZERO);
             runtime_metrics::record_not_shard_owner(NotShardOwnerOperationLabel::SubmitDrain);
@@ -59,7 +59,7 @@ where
             return Err(NotShardOwner::local(shard_id, current_epoch).into());
         }
         {
-            let owner = self.shard_owner.read().unwrap();
+            let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
             if !owner.is_active(shard_id) {
                 let current_epoch = owner.epoch_of(shard_id).unwrap_or(ShardEpoch::ZERO);
                 runtime_metrics::record_not_shard_owner(
@@ -93,7 +93,7 @@ where
     ) -> Result<CommitResult> {
         let shard_id = self.shard_id_for(run_key).await;
         {
-            let owner = self.shard_owner.read().unwrap();
+            let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
             if owner.epoch_of(shard_id).is_none() {
                 runtime_metrics::record_not_shard_owner(
                     NotShardOwnerOperationLabel::SubmitForOwnedShard,
@@ -191,7 +191,7 @@ where
     /// is laxer because it validates *already-issued* tokens.
     pub(super) async fn current_shard_epoch(&self, run_key: RunKey) -> Result<ShardEpoch> {
         let shard_id = self.shard_id_for(run_key).await;
-        let owner = self.shard_owner.read().unwrap();
+        let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
         owner.owns(shard_id).ok_or_else(|| {
             runtime_metrics::record_not_shard_owner(NotShardOwnerOperationLabel::CurrentShardEpoch);
             mark_error_biased_sample(ErrorBiasedSamplingReason::NotShardOwner);
@@ -213,7 +213,7 @@ where
     /// [`NotShardOwner`] only when the shard is not owned at all.
     pub(super) async fn shard_epoch_for_completion(&self, run_key: RunKey) -> Result<ShardEpoch> {
         let shard_id = self.shard_id_for(run_key).await;
-        let owner = self.shard_owner.read().unwrap();
+        let owner = self.shard_owner.read().expect("shard_owner lock poisoned");
         owner.epoch_of(shard_id).ok_or_else(|| {
             runtime_metrics::record_not_shard_owner(
                 NotShardOwnerOperationLabel::ShardEpochForCompletion,
@@ -230,7 +230,11 @@ where
     /// route a run to the wrong shard. The mapping itself is the pure
     /// [`shard_for`] function.
     pub(super) async fn shard_id_for(&self, run_key: RunKey) -> ShardId {
-        let shard_count = self.shard_owner.read().unwrap().shard_count();
+        let shard_count = self
+            .shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .shard_count();
         shard_for(run_key, shard_count)
     }
 }

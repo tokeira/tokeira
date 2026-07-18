@@ -34,13 +34,16 @@ pub struct WorkerRegistry {
 
 impl WorkerRegistry {
     pub fn register(&self, key: WorkerRegistrationKey, metadata: WorkerVersionMetadata) {
-        self.inner.lock().unwrap().insert(key, metadata);
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .insert(key, metadata);
     }
 
     pub fn lookup(&self, key: &WorkerRegistrationKey) -> WorkerVersionMetadata {
         self.inner
             .lock()
-            .unwrap()
+            .expect("inner lock poisoned")
             .get(key)
             .cloned()
             .unwrap_or_default()
@@ -54,14 +57,18 @@ impl WorkerRegistry {
         now: OffsetDateTime,
         recent_window: time::Duration,
     ) -> bool {
-        self.inner.lock().unwrap().iter().any(|(key, metadata)| {
-            key.namespace_id == namespace_id
-                && metadata.deployment.as_ref() == Some(deployment)
-                && metadata.build_id.as_ref() == Some(build_id)
-                && metadata
-                    .last_seen_at
-                    .is_some_and(|last_seen| now - last_seen <= recent_window)
-        })
+        self.inner
+            .lock()
+            .expect("inner lock poisoned")
+            .iter()
+            .any(|(key, metadata)| {
+                key.namespace_id == namespace_id
+                    && metadata.deployment.as_ref() == Some(deployment)
+                    && metadata.build_id.as_ref() == Some(build_id)
+                    && metadata
+                        .last_seen_at
+                        .is_some_and(|last_seen| now - last_seen <= recent_window)
+            })
     }
 }
 

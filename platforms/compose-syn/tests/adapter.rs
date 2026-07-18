@@ -4,6 +4,8 @@
 //! `ComposeDeployment` — proven through the engine TRAIT surface (the methods the
 //! bound `tkp` would call), not just the raw builder artifacts.
 
+// Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
+#![allow(clippy::unwrap_used)]
 use std::{
     any::{Any, TypeId},
     collections::{BTreeMap, BTreeSet, HashMap},

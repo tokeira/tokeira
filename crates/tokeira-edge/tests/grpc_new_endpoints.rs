@@ -1,3 +1,5 @@
+// Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
+#![allow(clippy::unwrap_used)]
 // Wire-roundtrip tests construct prost messages with `..Default::default()`
 // (forward-compat) and exercise deprecated-but-still-on-wire fields for v1.31.0.
 #![allow(clippy::needless_update, deprecated)]

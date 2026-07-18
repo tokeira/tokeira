@@ -191,7 +191,7 @@ where
     }
 
     fn pick_lane(&self, run_key: RunKey) -> LaneHandle {
-        let lanes = self.lanes.lock().unwrap();
+        let lanes = self.lanes.lock().expect("lanes lock poisoned");
         pick_lane_for_run_key(&lanes, self.lane_count, run_key).clone()
     }
 
@@ -2203,7 +2203,11 @@ pub async fn run_completion_callback_scanner<R>(
             _ = tokio::time::sleep(config.scan_interval) => {}
         }
 
-        let active_shards: Vec<_> = shard_owner.read().unwrap().active_shards().collect();
+        let active_shards: Vec<_> = shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .active_shards()
+            .collect();
         for shard_id in active_shards {
             runtime_metrics::record_scanner_tick("completion_callback", shard_id.0);
             scan_completion_callbacks_once(

@@ -9,5 +9,7 @@
 #![allow(missing_debug_implementations)]
 
 pub mod connect {
+    // Generated code: the codegen's unwraps are its own.
+    #![allow(clippy::unwrap_used)]
     connectrpc::include_generated!("_connectrpc_compatibility.rs");
 }

@@ -27,7 +27,7 @@ where
     /// performs is unnecessary. Controller-managed deployments must use
     /// `acquire_shard` instead so the sweep runs before admission.
     pub fn record_self_assigned_shard(&self, shard_id: ShardId, epoch: ShardEpoch) {
-        let mut owner = self.shard_owner.write().unwrap();
+        let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
         let _ = owner.record_acquired(shard_id, epoch);
         owner.mark_active(shard_id);
     }
@@ -68,7 +68,7 @@ where
         };
 
         let cancel = {
-            let mut owner = self.shard_owner.write().unwrap();
+            let mut owner = self.shard_owner.write().expect("shard_owner lock poisoned");
             owner.record_acquired(shard_id, epoch)
         };
 
@@ -103,7 +103,10 @@ where
         // Sweep must complete before the shard goes Active: only now is the
         // in-memory delivery/timeout state a faithful rebuild of durable
         // history, so it is safe to start admitting commands against it.
-        self.shard_owner.write().unwrap().mark_active(shard_id);
+        self.shard_owner
+            .write()
+            .expect("shard_owner lock poisoned")
+            .mark_active(shard_id);
 
         let shard_owner = self.shard_owner.clone();
         let workflow_timeout_tracking = self.workflow_timeout_tracking.clone();
@@ -116,7 +119,7 @@ where
         // timeouts for runs whose ownership has moved elsewhere.
         tokio::spawn(async move {
             if lost_rx.await.is_ok() {
-                let mut owner = shard_owner.write().unwrap();
+                let mut owner = shard_owner.write().expect("shard_owner lock poisoned");
                 owner.mark_draining(shard_id);
                 drop(owner);
                 workflow_timeout_tracking.remove_all_for_shard(shard_id);
@@ -139,7 +142,10 @@ where
     /// lease-loss handling in [`acquire_shard`](Self::acquire_shard); the
     /// durable lease is expected to be released by the caller / controller flow.
     pub async fn relinquish_shard(&self, shard_id: ShardId) {
-        self.shard_owner.write().unwrap().mark_draining(shard_id);
+        self.shard_owner
+            .write()
+            .expect("shard_owner lock poisoned")
+            .mark_draining(shard_id);
         self.workflow_timeout_tracking
             .remove_all_for_shard(shard_id);
         self.wft_timeout_tracking.remove_all_for_shard(shard_id);
@@ -147,7 +153,10 @@ where
         self.nexus_timeout_tracking.remove_all_for_shard(shard_id);
         self.completion_callback_tracking
             .remove_all_for_shard(shard_id);
-        self.shard_owner.write().unwrap().remove(shard_id);
+        self.shard_owner
+            .write()
+            .expect("shard_owner lock poisoned")
+            .remove(shard_id);
     }
 }
 

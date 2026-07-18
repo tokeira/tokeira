@@ -1,3 +1,5 @@
+// Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
+#![allow(clippy::unwrap_used)]
 use std::{
     sync::{
         Arc, Mutex,

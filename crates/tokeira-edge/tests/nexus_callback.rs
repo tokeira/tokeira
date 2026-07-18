@@ -5,6 +5,8 @@
 //! server: token decode / state selection / content-type + body validation → status, and
 //! the `resolve_nexus_operation` result → status mapping (200 / 404 / 503).
 
+// Integration test: unwrap is idiomatic in test code (root AGENTS.md §1).
+#![allow(clippy::unwrap_used)]
 use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};

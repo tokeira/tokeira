@@ -233,7 +233,9 @@ pub struct GrpcActiveRequestGuard {
 
 impl Drop for GrpcActiveRequestGuard {
     fn drop(&mut self) {
-        let mut active = active_requests().lock().unwrap();
+        let mut active = active_requests()
+            .lock()
+            .expect("active_requests lock poisoned");
         let next = active
             .get(&self.method)
             .copied()
@@ -249,7 +251,9 @@ impl Drop for GrpcActiveRequestGuard {
 }
 
 pub fn track_grpc_active_request(method: &str) -> GrpcActiveRequestGuard {
-    let mut active = active_requests().lock().unwrap();
+    let mut active = active_requests()
+        .lock()
+        .expect("active_requests lock poisoned");
     let next = active.get(method).copied().unwrap_or(0) + 1;
     active.insert(method.to_string(), next);
     set_grpc_active_requests(method, next as f64);

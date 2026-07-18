@@ -114,7 +114,10 @@ mod tests {
             key: &ExecutionKey,
             _now: i64,
         ) -> anyhow::Result<Option<i64>> {
-            self.seen.lock().unwrap().push(key.clone());
+            self.seen
+                .lock()
+                .expect("seen lock poisoned")
+                .push(key.clone());
             Ok(self.next)
         }
     }
@@ -148,7 +151,7 @@ mod tests {
         let sweeper = ChasmTimerSweeper::new(engine.clone(), evaluator.clone());
 
         assert_eq!(sweeper.sweep_once().await, 1);
-        let seen = evaluator.seen.lock().unwrap().clone();
+        let seen = evaluator.seen.lock().expect("seen lock poisoned").clone();
         assert_eq!(seen, vec![due.clone()], "only the due timer fires");
         // The due timer is re-armed to the evaluator's next deadline; the future one
         // is untouched.

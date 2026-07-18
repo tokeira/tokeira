@@ -46,6 +46,16 @@ pub enum HostKindVal {
     Service(Service),
 }
 
+// Manual impl: `dyn Kind` carries no `Debug`; the variant is the signal.
+impl std::fmt::Debug for HostKindVal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HostKindVal::Boxed(_) => f.write_str("HostKindVal::Boxed(..)"),
+            HostKindVal::Service(svc) => f.debug_tuple("HostKindVal::Service").field(svc).finish(),
+        }
+    }
+}
+
 /// The dispatch tag for a [`HostObj`] — the method-table key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HostKind {
@@ -269,7 +279,7 @@ fn cx_field(cx: &Cx, field: &str) -> Result<Value, EvalError> {
 
 /// The compose platform's host bridge. Dispatch is direct `match` (the kind set
 /// is small and fixed), replacing the compiled-era function-pointer registry.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct ComposeBridge;
 
 impl HostBridge for ComposeBridge {

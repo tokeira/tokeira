@@ -17,7 +17,7 @@ use crate::{
     operator_service::{DeleteNamespaceRequest, OperatorService, SearchAttributeDefinition},
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OperatorServiceGrpc {
     inner: OperatorService,
 }

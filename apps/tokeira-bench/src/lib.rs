@@ -5,6 +5,8 @@
 //! register the same type with the same name — a mismatch there shows up as
 //! workflow-task failures and skews throughput numbers.
 
+// Bench harness: printed results are the product.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 pub mod workflows;
 
 pub use workflows::EchoWorkflow;

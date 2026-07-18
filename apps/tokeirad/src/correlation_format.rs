@@ -11,6 +11,7 @@ use tracing_subscriber::{
 
 /// Formatter wrapper that augments emitted log records with the active
 /// OpenTelemetry trace/span identifiers when a traced span is in scope.
+#[derive(Debug)]
 pub struct CorrelationFormat<E> {
     inner: E,
     json: bool,

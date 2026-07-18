@@ -63,7 +63,7 @@ pub struct WorkflowTimeoutEntry {
 ///
 /// Cloning shares the underlying map (it is `Arc`-backed), so the scanner, the
 /// lanes that insert/remove entries, and shard recovery all observe one set.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct WorkflowTimeoutTrackingState {
     inner: Arc<Mutex<HashMap<RunKey, WorkflowTimeoutEntry>>>,
 }

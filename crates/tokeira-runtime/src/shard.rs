@@ -40,6 +40,7 @@ pub enum ShardState {
 }
 
 /// Per-shard ownership record held by the runtime node.
+#[derive(Debug)]
 pub struct OwnedShard {
     /// Epoch obtained when the lease was acquired.
     pub epoch: ShardEpoch,
@@ -55,6 +56,7 @@ pub struct OwnedShard {
 /// Each shard transitions through `Sweeping → Active →
 /// Draining` during its lifecycle on this node. Only shards
 /// in the `Active` state accept new commands.
+#[derive(Debug)]
 pub struct ShardOwner {
     shards: HashMap<ShardId, OwnedShard>,
     shard_count: u32,

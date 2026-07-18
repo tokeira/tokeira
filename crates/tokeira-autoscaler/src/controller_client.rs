@@ -17,6 +17,13 @@ pub struct ControllerClient {
     client: PlacementControllerClient<HttpClient>,
 }
 
+// Manual impl: the generated RPC client carries no `Debug`.
+impl std::fmt::Debug for ControllerClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControllerClient").finish_non_exhaustive()
+    }
+}
+
 /// Response from the controller's scale-in nomination RPC.
 #[derive(Debug, Clone)]
 pub struct NominationResult {

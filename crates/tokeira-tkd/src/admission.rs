@@ -10,12 +10,14 @@ use crate::{
 };
 
 /// A `#[require(expr)]` clause attached to a config type.
+#[derive(Debug)]
 pub struct RequireClause {
     pub scope: String,
     pub expr: syn::Expr,
 }
 
 /// The admission schema extracted from the `.tkd`'s attributes.
+#[derive(Debug)]
 pub struct Admission {
     /// `(type, field)` pairs marked `#[create]` (create-time-immutable).
     pub creates: Vec<(String, String)>,

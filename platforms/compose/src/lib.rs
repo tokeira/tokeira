@@ -36,7 +36,7 @@ use config::ComposeDsqlConfig;
 use modules::{ComposeModule, DsqlModule, LocalStateModule, dsql_resource_id};
 use services::ComposeWorkload;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct ComposeDeployment;
 
 impl ComposeDeployment {

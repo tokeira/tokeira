@@ -48,6 +48,7 @@ impl<H: Clone> Env<H> {
 }
 
 /// The evaluator — borrows the bridge, the type/fn tables, and the context.
+#[derive(Debug)]
 pub struct Interp<'a, B: HostBridge> {
     pub bridge: &'a B,
     pub types: &'a TypeTable,

@@ -27,7 +27,7 @@ pub struct WorkerVersionMetadata {
     pub last_seen_at: Option<OffsetDateTime>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct WorkerRegistry {
     inner: Arc<Mutex<HashMap<WorkerRegistrationKey, WorkerVersionMetadata>>>,
 }

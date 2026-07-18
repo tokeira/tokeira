@@ -27,6 +27,7 @@ use crate::{
 /// Insight: we model one substream per worker because it makes replay and
 /// checkpoint semantics obvious. A richer implementation may multiplex many
 /// substreams through one task later, but the semantics should stay the same.
+#[derive(Debug)]
 pub struct ProjectionWorker<L, S> {
     pub log: L,
     pub sink: S,

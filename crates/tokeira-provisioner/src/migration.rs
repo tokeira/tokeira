@@ -32,9 +32,18 @@ struct Migration {
     apply: MigrationFn,
 }
 
+// Manual impl: `apply` is a function value with no `Debug`.
+impl std::fmt::Debug for Migration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Migration")
+            .field("to_schema", &self.to_schema)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Forward-only migrations keyed by their starting schema (at most one per
 /// `from_schema` — a linear chain).
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct MigrationRegistry {
     by_from: BTreeMap<u32, Migration>,
 }

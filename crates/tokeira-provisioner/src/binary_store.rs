@@ -26,6 +26,15 @@ pub struct BinaryStore {
     prefix: String,
 }
 
+// Manual impl: `backend` is a trait object without a `Debug` bound.
+impl std::fmt::Debug for BinaryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinaryStore")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BinaryStore {
     /// Construct a store rooted at `prefix` (e.g. `"binaries"`), alongside the
     /// deployment's state documents.

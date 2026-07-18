@@ -14,6 +14,7 @@ use crate::{StateError, backend::StateBackend};
 /// This backend stores each logical state document at
 /// `{prefix}/{key}/manifest.json` and uses S3 conditional writes for CAS:
 /// `If-None-Match: *` for first write and `If-Match: <etag>` for updates.
+#[derive(Debug)]
 pub struct S3Backend {
     client: aws_sdk_s3::Client,
     bucket: String,

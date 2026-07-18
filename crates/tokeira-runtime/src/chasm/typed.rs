@@ -30,6 +30,7 @@ use super::{
 /// `C` is the concrete root component the caller operates on. The wrapper resolves
 /// `C`'s archetype id from the engine registry, (de)serializes `C::Data` at the
 /// node boundary, and runs the caller's typed closures inside a transition.
+#[derive(Debug)]
 pub struct TypedEngine<'e, C> {
     engine: &'e ChasmEngine,
     _marker: PhantomData<fn() -> C>,

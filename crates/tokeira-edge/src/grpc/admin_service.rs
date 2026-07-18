@@ -21,7 +21,7 @@ use crate::{
     workflow_service::WorkflowService,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AdminServiceGrpc {
     inner: WorkflowService,
 }

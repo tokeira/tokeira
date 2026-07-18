@@ -19,13 +19,13 @@ pub trait Kind {
 }
 
 /// A handle to a declared module (carries only its name).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ModuleRef {
     name: String,
 }
 
 /// A handle to a declared resource, used to reference its outputs (writeback).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ResourceRef {
     module: String,
     resource: String,
@@ -113,6 +113,17 @@ pub struct Deployment {
     modules: Vec<Module>,
     services: Vec<ServiceEntry>,
     writeback: Vec<(String, WbValue)>,
+}
+
+// Manual impl: modules hold `Box<dyn Kind>` resources with no `Debug`.
+impl std::fmt::Debug for Deployment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deployment")
+            .field("namespaces", &self.namespaces)
+            .field("modules", &self.modules.len())
+            .field("services", &self.services.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Deployment {

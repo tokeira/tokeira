@@ -22,6 +22,7 @@ use crate::{Resource, error::IacError};
 ///
 /// Extensions provide access to configuration and other context without
 /// coupling this crate to specific config types.
+#[derive(Debug)]
 pub struct ModuleContext<'a> {
     pub state: &'a crate::document::InfraState,
     extensions: &'a HashMap<TypeId, Box<dyn Any + Send + Sync>>,

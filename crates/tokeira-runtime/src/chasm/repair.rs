@@ -48,6 +48,15 @@ pub struct VisibilityRepairScanner {
     partition_count: u32,
 }
 
+// Manual impl: composed of trait objects with no `Debug` bound.
+impl std::fmt::Debug for VisibilityRepairScanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VisibilityRepairScanner")
+            .field("partition_count", &self.partition_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl VisibilityRepairScanner {
     pub fn new(
         nodes: Arc<dyn ChasmNodeRepository>,

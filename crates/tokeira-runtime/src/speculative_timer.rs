@@ -36,6 +36,7 @@ use crate::{lane::LaneHandle, scanner::pick_lane_for_run_key, wft_timeout::WftTi
 
 /// A live speculative timer: the deadline task plus the identity it targets so a
 /// re-arm for a superseding task cancels the old one.
+#[derive(Debug)]
 struct SpeculativeTimer {
     shard_id: ShardId,
     cancel: CancellationToken,
@@ -44,7 +45,7 @@ struct SpeculativeTimer {
 /// Set of precise in-memory speculative-task timers, keyed by run (one
 /// speculative task per run at a time). Cloning shares the underlying map and
 /// lane handles.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SpeculativeTimerSet {
     inner: Arc<Mutex<HashMap<RunKey, SpeculativeTimer>>>,
     /// Lane handles used to submit the timeout when a timer fires. Shares the

@@ -25,7 +25,7 @@ impl Default for LocalConfig {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct LocalDeployment;
 
 impl PlatformConfig for LocalDeployment {

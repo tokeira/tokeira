@@ -6,6 +6,8 @@
 //! number of in-flight workflows at `--concurrency` so we can dial load up or
 //! down without overwhelming a single-node tokeirad.
 
+// Bench harness: printed results are the product.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 use std::{
     sync::Arc,
     time::{Duration, Instant},

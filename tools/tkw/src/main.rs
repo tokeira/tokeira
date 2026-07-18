@@ -16,6 +16,8 @@
 //! lifecycles; tkw reports them and may sweep stale artifacts inside them, but
 //! never removes them.
 
+// CLI: stdout/stderr are the user interface.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 mod hook;
 mod includes;
 mod repo;

@@ -17,6 +17,15 @@ pub struct CasStore<T> {
     _phantom: PhantomData<T>,
 }
 
+// Manual impl: `backend` is a trait object without a `Debug` bound.
+impl<T> std::fmt::Debug for CasStore<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CasStore")
+            .field("key_prefix", &self.key_prefix)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> CasStore<T>
 where
     T: Serialize + DeserializeOwned + Default + Validate,

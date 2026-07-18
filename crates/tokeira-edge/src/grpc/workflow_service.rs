@@ -99,7 +99,7 @@ fn indexed_value_type_from_edge(value: &str) -> Result<IndexedValueType, Status>
 /// Each handler follows the same pattern: extract headers, translate the
 /// request, delegate to `WorkflowService`, translate the response. Keeping
 /// this layer mechanical makes it easy to audit proto field coverage.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WorkflowServiceGrpc {
     inner: WorkflowService,
     /// Optional standalone-activity bridge. Present only once `tokeirad` has

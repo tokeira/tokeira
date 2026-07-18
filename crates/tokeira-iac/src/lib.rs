@@ -203,6 +203,18 @@ pub struct ProvisionContext {
     extensions: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
+// Manual impl: the progress reporters are bare `dyn Fn` values and the
+// extension bag is type-erased; neither can carry `Debug`.
+impl std::fmt::Debug for ProvisionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisionContext")
+            .field("project_name", &self.project_name)
+            .field("tags", &self.tags)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
 type ApplyProgressReporter = dyn Fn(&str, &ResourceId, &ResourceType, usize, usize) + Send + Sync;
 type CompleteProgressReporter = dyn Fn(&str, &ResourceId, &ResourceType, Duration) + Send + Sync;
 type FailedProgressReporter =

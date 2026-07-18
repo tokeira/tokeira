@@ -22,6 +22,7 @@ use crate::RuntimeError;
 /// ```ignore
 /// ctx.set_extension(K8sPlatform::new().await?);
 /// ```
+#[derive(Debug)]
 pub struct ServiceContext {
     pub state: tokeira_iac::RuntimeState,
     pub infra_state: tokeira_iac::InfraState,

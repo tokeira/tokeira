@@ -29,6 +29,7 @@ use crate::{
 #[error("{0}")]
 pub struct InvalidVisibilityQuery(pub String);
 
+#[derive(Debug)]
 pub struct VisibilityQueryService<S> {
     store: S,
 }

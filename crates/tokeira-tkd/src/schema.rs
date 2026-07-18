@@ -11,6 +11,7 @@ use crate::value::EvalError;
 /// The `struct`/`enum` types the `.tkd` defines (the config schema). Used to
 /// decide whether a named type is a config type (generic `Value`) or an author
 /// type (routed to the bridge).
+#[derive(Debug)]
 pub struct TypeTable {
     structs: HashMap<String, ItemStruct>,
     enums: HashMap<String, ItemEnum>,
@@ -56,6 +57,7 @@ impl TypeTable {
 }
 
 /// The `.tkd`'s functions (`config`, `deployment`, and any pure helpers).
+#[derive(Debug)]
 pub struct FnTable {
     fns: HashMap<String, ItemFn>,
 }

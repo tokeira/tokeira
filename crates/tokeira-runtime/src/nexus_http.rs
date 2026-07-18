@@ -99,6 +99,7 @@ const REQUEST_ID_REFERENCE_TYPE: &str = "RequestIdReference";
 
 /// reqwest-backed [`NexusHttpClient`]. The inner client is cheaply cloneable and
 /// connection-pools, so a single instance is shared across all dispatches.
+#[derive(Debug)]
 pub struct HttpNexusClient {
     http: reqwest::Client,
 }
@@ -317,6 +318,7 @@ impl NexusHttpClient for HttpNexusClient {
 /// reqwest-backed [`NexusCompletionClient`]. Like [`HttpNexusClient`] the inner
 /// client connection-pools, so one instance is shared across all completion
 /// deliveries.
+#[derive(Debug)]
 pub struct HttpNexusCompletionClient {
     http: reqwest::Client,
 }

@@ -58,6 +58,14 @@ pub struct InMemoryStore {
     inner: Arc<Mutex<StoreState>>,
 }
 
+// Manual impl: summarizes without taking the interior lock — a `Debug` that
+// must lock the store invites deadlock from inside failure paths.
+impl std::fmt::Debug for InMemoryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryStore").finish_non_exhaustive()
+    }
+}
+
 #[derive(Default)]
 struct StoreState {
     /// Current open run per workflow.

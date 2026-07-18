@@ -5,6 +5,8 @@
 //! (`TEMPORAL_SERVICE_ADDRESS` env var, `~/.config/temporalio/temporal.toml`,
 //! or defaults to `http://localhost:7233`).
 
+// Bench harness: printed results are the product.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 use clap::Parser;
 use temporalio_client::{
     Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions,

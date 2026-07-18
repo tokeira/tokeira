@@ -438,7 +438,7 @@ fn cx_field(cx: &Cx, field: &str) -> Result<Value, EvalError> {
 
 /// The EKS platform's host bridge. Dispatch is direct `match` (the kind set is
 /// fixed), matching compose-syn's post-refactor shape.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct EksBridge;
 
 impl HostBridge for EksBridge {

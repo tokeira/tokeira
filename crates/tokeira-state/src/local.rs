@@ -29,6 +29,7 @@ use crate::{StateError, backend::StateBackend};
 ///
 /// This is a single-host backend. It does not provide distributed locking.
 /// Cloud deployments should use the S3 state path.
+#[derive(Debug)]
 pub struct LocalBackend {
     root: PathBuf,
 }

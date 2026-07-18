@@ -41,6 +41,7 @@ use crate::{
 /// Layout:
 /// - `{key_prefix}/manifest.json` — mutable compare-and-swap object
 /// - `{key_prefix}/snapshots/<timestamp>-<uuid>.json` — immutable snapshots
+#[derive(Debug)]
 pub struct S3StateStore<T> {
     client: aws_sdk_s3::Client,
     bucket: String,

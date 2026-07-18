@@ -68,7 +68,7 @@ pub struct WftTimeoutEntry {
 /// `OnceLock` backfilled once the lanes exist) so the lane's post-commit hook
 /// can arm/disarm the precise speculative timers through the same handle it
 /// already holds for the coarse sweep.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct WftTimeoutTrackingState {
     inner: Arc<Mutex<HashMap<RunKey, WftTimeoutEntry>>>,
     speculative: Arc<std::sync::OnceLock<crate::speculative_timer::SpeculativeTimerSet>>,

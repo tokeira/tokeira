@@ -12,6 +12,8 @@
 //! The `internal` module retains the tonic/prost output for code that hasn't migrated.
 
 #![allow(refining_impl_trait_internal, refining_impl_trait_reachable)]
+// Generated connect-rpc service markers/servers carry no Debug derive.
+#![allow(missing_debug_implementations)]
 // The tonic/prost-generated bindings (compiled from the upstream Temporal `.proto`s)
 // trip style lints that are not actionable on generated code: large message/oneof
 // enums, and doc-list formatting carried verbatim from the upstream proto comments.

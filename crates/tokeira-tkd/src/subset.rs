@@ -14,12 +14,14 @@ use syn::{Expr, File, Item, Pat, Stmt, punctuated::Punctuated, spanned::Spanned,
 use crate::{bridge::HostBridge, schema::TypeTable};
 
 /// One subset violation.
+#[derive(Debug)]
 pub struct Diagnostic {
     pub msg: String,
     pub span: Span,
 }
 
 /// All violations found in a `.tkd` (non-empty ⇒ rejected).
+#[derive(Debug)]
 pub struct Diagnostics(pub Vec<Diagnostic>);
 
 impl Diagnostics {

@@ -21,6 +21,7 @@ use crate::{
 
 /// DSQL cluster lifecycle. Flat (003 §6): `Storage::Dsql` carries `endpoint`/`arn`
 /// directly, so `Preexisting` is a plain marker.
+#[derive(Debug)]
 pub enum DsqlMode {
     Managed,
     Preexisting,
@@ -28,6 +29,7 @@ pub enum DsqlMode {
 
 /// Storage backend — a create-time choice. `Dsql` carries the cluster identity
 /// (region) and, for an adopted cluster, the `endpoint`/`arn` directly.
+#[derive(Debug)]
 pub enum Storage {
     InMemory,
     Dsql {
@@ -38,6 +40,7 @@ pub enum Storage {
     },
 }
 
+#[derive(Debug)]
 pub struct Tokeirad {
     pub image: String,
     pub replicas: u32,
@@ -45,11 +48,13 @@ pub struct Tokeirad {
     pub metrics_port: u16,
 }
 
+#[derive(Debug)]
 pub struct Backend {
     pub image: String,
     pub replicas: u32,
 }
 
+#[derive(Debug)]
 pub struct Grafana {
     pub image: String,
     pub replicas: u32,
@@ -57,6 +62,7 @@ pub struct Grafana {
     pub admin_password: String,
 }
 
+#[derive(Debug)]
 pub struct Observability {
     pub mimir: Backend,
     pub loki: Backend,
@@ -65,6 +71,7 @@ pub struct Observability {
 }
 
 /// The operator surface — what an operator edits.
+#[derive(Debug)]
 pub struct Compose {
     pub storage: Storage,
     pub tokeirad: Tokeirad,

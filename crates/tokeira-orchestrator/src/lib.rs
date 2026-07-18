@@ -235,6 +235,16 @@ pub struct InfraEngine<D: Deployment> {
     state_store: Arc<dyn DeploymentStore<iac::InfraState>>,
 }
 
+// Manual impl: the store is a trait object and `D`/`D::Config` carry no
+// `Debug` bound; the deployment dir is the useful identifier.
+impl<D: Deployment> std::fmt::Debug for InfraEngine<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InfraEngine")
+            .field("deployment_dir", &self.deployment_dir)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<D: Deployment> InfraEngine<D> {
     /// Create an infrastructure facade for one deployment config.
     ///
@@ -437,6 +447,14 @@ pub struct DeployEngine<D: Deployment> {
     image_ctx: deploy_engine::ImageContext,
     config: D::Config,
     state_store: Box<dyn DeploymentStore<iac::RuntimeState>>,
+}
+
+// Manual impl: the store is a trait object and `D`/`D::Config` carry no
+// `Debug` bound.
+impl<D: Deployment> std::fmt::Debug for DeployEngine<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeployEngine").finish_non_exhaustive()
+    }
 }
 
 impl<D: Deployment> DeployEngine<D> {

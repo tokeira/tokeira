@@ -60,6 +60,7 @@ pub type StateSaver = Box<
 /// and applies changes using the `known` vs `desired` resource model to
 /// ensure removed resources are properly deleted through their `Resource`
 /// implementation rather than silently dropped from state.
+#[derive(Debug)]
 pub struct Engine;
 
 impl Default for Engine {

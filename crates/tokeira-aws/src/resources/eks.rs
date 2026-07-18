@@ -8,6 +8,7 @@ use tokeira_iac::{
 
 /// EKS cluster with Auto Mode.
 /// Depends on VPC, EKS node security group, and cluster/node IAM roles.
+#[derive(Debug)]
 pub struct EksClusterResource {
     project: String,
     version: String,

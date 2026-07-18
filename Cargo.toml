@@ -134,20 +134,22 @@ dagger-client = { path = "crates/dagger-client" }
 tokeira-build = { path = "crates/tokeira-build" }
 
 # Mechanized AGENTS.md rules (§1, §9): prose rules drift under a fluid codebase;
-# compiler-enforced ones survive refactors. Only lints measured clean (or made
-# clean) are binding here. Staged, with violation counts measured 2026-07-17 —
-# each joins this set at "warn" when its burn-down starts, "deny" at zero:
-#   clippy::unwrap_used 346 · clippy::print_stdout 402 (CLI crates need
-#   crate-root allows first) · clippy::print_stderr 47 ·
-#   missing_debug_implementations 110 · missing_docs 9017 ·
-#   clippy::expect_used 574 (not constitution-mandated; adopt-or-drop decision)
+# compiler-enforced ones survive refactors. Remaining staged burn-down
+# (counts measured 2026-07-17): clippy::unwrap_used 165 unique sites (123 in
+# tokeira-runtime) — active at "warn", "deny" at zero · missing_docs 9017 —
+# a campaign, not yet enabled · clippy::expect_used 574 — not
+# constitution-mandated; adopt-or-drop decision pending.
 [workspace.lints.rust]
 unsafe_code = "deny"    # §1 — the four carve-outs carry #[allow] + SAFETY at each site
 unreachable_pub = "warn"
+missing_debug_implementations = "deny" # §1 — burned down 2026-07-17 (derives + manual impls)
 
 [workspace.lints.clippy]
 dbg_macro = "warn"
 undocumented_unsafe_blocks = "deny" # every retained unsafe block carries // SAFETY:
+unwrap_used = "warn"    # §1 "No .unwrap() outside tests" — burn-down active
+print_stdout = "deny"   # §1 tracing-not-println — CLI/bench/probe crates carry documented allows
+print_stderr = "deny"
 
 # The daily release profile favours *diagnosability*: tokeirad runs with
 # `panic = "abort"` (a violated fencing or history invariant must die, not limp

@@ -24,6 +24,8 @@
 //! Env: `TOKEIRAD_URL` (default `http://localhost:7233`),
 //! `TOKEIRAD_NAMESPACE` (default `default`).
 
+// Diagnostic probe CLI: stdout is the report.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 // Requests use `..Default::default()` for forward-compat against upstream proto
 // field additions (TEMPORAL_PROTO_VERSION bumps), matching the grpc roundtrip tests.
 #![allow(clippy::needless_update)]

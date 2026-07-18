@@ -267,6 +267,15 @@ pub struct ChasmEngine {
     timers: Mutex<HashMap<ExecutionKey, Option<i64>>>,
 }
 
+// Manual impl: composed of trait objects with no `Debug` bound.
+impl std::fmt::Debug for ChasmEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChasmEngine")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ChasmEngine {
     /// Construct an engine with default tuning and a system-time logical clock.
     pub fn new(

@@ -12,6 +12,8 @@
 //! `upgrade`/`rollback` recovers by re-running that verb (idempotent, marker-driven);
 //! there is no separate `resume` verb.
 
+// CLI: stdout/stderr are the user interface.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;

@@ -392,6 +392,15 @@ pub struct InMemoryNexusEndpointStore {
     state: Mutex<NexusEndpointStoreState>,
 }
 
+// Manual impl: summarizes without taking the interior lock — a `Debug` that
+// must lock the state invites deadlock from inside failure paths.
+impl std::fmt::Debug for InMemoryNexusEndpointStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryNexusEndpointStore")
+            .finish_non_exhaustive()
+    }
+}
+
 impl InMemoryNexusEndpointStore {
     pub fn new() -> Self {
         Self::default()
@@ -556,6 +565,14 @@ impl NexusEndpointStore for InMemoryNexusEndpointStore {
 #[derive(Clone)]
 pub struct NexusEndpointRegistry {
     store: Arc<dyn NexusEndpointStore>,
+}
+
+// Manual impl: composed of trait objects with no `Debug` bound.
+impl std::fmt::Debug for NexusEndpointRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NexusEndpointRegistry")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for NexusEndpointRegistry {
@@ -1231,6 +1248,7 @@ impl Drop for NexusHttpDispatchLease {
     }
 }
 
+#[derive(Debug)]
 pub struct NoopNexusHttpClient;
 
 #[async_trait]
@@ -1269,6 +1287,7 @@ impl NexusHttpClient for NoopNexusHttpClient {
 /// as an explicit **test** double — the production runtime must wire the real
 /// `HttpNexusCompletionClient`. The runtime-constructor default (loud-vs-silent) is
 /// decided when delivery is wired (Wave 4).
+#[derive(Debug)]
 pub struct NoopNexusCompletionClient;
 
 #[async_trait]
@@ -1301,7 +1320,7 @@ pub struct NexusTimeoutEntry {
     pub scheduled_at: OffsetDateTime,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct NexusTimeoutTrackingState {
     inner: Arc<Mutex<HashMap<(RunKey, String), NexusTimeoutEntry>>>,
 }
@@ -1366,7 +1385,7 @@ pub struct CompletionCallbackTrackingEntry {
     pub callback_index: usize,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct CompletionCallbackTrackingState {
     inner: Arc<Mutex<HashMap<(RunKey, usize), CompletionCallbackTrackingEntry>>>,
 }
@@ -1491,6 +1510,14 @@ pub struct NexusCompletionDeps {
     pub client: Arc<dyn NexusCompletionClient>,
     pub config: NexusCompletionRuntimeConfig,
     pub scanner: CompletionCallbackScannerConfig,
+}
+
+// Manual impl: composed of trait objects with no `Debug` bound.
+impl std::fmt::Debug for NexusCompletionDeps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NexusCompletionDeps")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for NexusCompletionDeps {

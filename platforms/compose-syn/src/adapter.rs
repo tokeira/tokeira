@@ -45,7 +45,7 @@ pub struct TkdConfig {
 }
 
 /// Adapts an interpreted `.tkd` to [`tokeira_orchestrator::Deployment`].
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct TkdDeployment;
 
 impl TkdDeployment {

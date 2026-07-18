@@ -9,6 +9,7 @@ use tokeira_iac::{
 /// Private-only design — no NAT Gateway, no IGW, no public subnets.
 /// All AWS service traffic routes through VPC endpoints.
 /// Root resource with no dependencies.
+#[derive(Debug)]
 pub struct VpcResource {
     project: String,
     cidr: String,

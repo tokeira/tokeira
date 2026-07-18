@@ -26,6 +26,7 @@ use crate::{
     },
 };
 
+#[derive(Debug)]
 pub struct VisibilitySink<S> {
     store: S,
 }

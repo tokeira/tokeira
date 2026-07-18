@@ -42,6 +42,13 @@ pub struct ChasmTimerSweeper {
     evaluator: Arc<dyn TimeoutEvaluator>,
 }
 
+// Manual impl: composed of trait objects with no `Debug` bound.
+impl std::fmt::Debug for ChasmTimerSweeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChasmTimerSweeper").finish_non_exhaustive()
+    }
+}
+
 impl ChasmTimerSweeper {
     /// Build a sweeper over `engine`, delegating timeout application to `evaluator`.
     pub fn new(engine: Arc<ChasmEngine>, evaluator: Arc<dyn TimeoutEvaluator>) -> Self {

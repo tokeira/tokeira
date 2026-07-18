@@ -32,6 +32,7 @@ use tokio::time::Instant;
 
 // ── Poll helper ──────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct PollTarget<'a> {
     pub resource_desc: &'a str,
     pub resource_id: &'a ResourceId,

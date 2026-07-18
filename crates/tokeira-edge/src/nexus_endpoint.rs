@@ -107,6 +107,14 @@ pub struct CacheNamespaceResolver {
     cache: Arc<dyn NamespaceCache>,
 }
 
+// Manual impl: composed of trait objects with no `Debug` bound.
+impl std::fmt::Debug for CacheNamespaceResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheNamespaceResolver")
+            .finish_non_exhaustive()
+    }
+}
+
 impl CacheNamespaceResolver {
     pub fn new(cache: Arc<dyn NamespaceCache>) -> Self {
         Self { cache }
@@ -128,6 +136,13 @@ pub struct NexusEndpointAdmin {
     store: Arc<dyn NexusEndpointStore>,
     namespaces: Arc<dyn NexusNamespaceResolver>,
     limits: NexusEndpointLimits,
+}
+
+// Manual impl: composed of trait objects with no `Debug` bound.
+impl std::fmt::Debug for NexusEndpointAdmin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NexusEndpointAdmin").finish_non_exhaustive()
+    }
 }
 
 impl NexusEndpointAdmin {

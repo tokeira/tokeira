@@ -62,12 +62,12 @@ pub struct DeliveryMetricsSnapshot {
 /// Recording is lock-free per queue (`DashMap`) because it sits on the hot
 /// delivery path; the controller periodically snapshots and resets these into
 /// a [`DeliveryMetricsSnapshot`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DeliveryMetrics {
     queues: Arc<DashMap<QueueKey, QueueCounters>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct QueueCounters {
     latency: LatencyHistogram,
     sync_match: SlidingWindowCounter,
@@ -92,6 +92,14 @@ pub struct FairnessState {
     inner: Arc<Mutex<FairnessStateInner>>,
 }
 
+// Manual impl: summarizes without taking the interior lock — a `Debug` that
+// must lock the state invites deadlock from inside failure paths.
+impl std::fmt::Debug for FairnessState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FairnessState").finish_non_exhaustive()
+    }
+}
+
 struct FairnessStateInner {
     queues: HashMap<QueueKey, QueueFairnessState>,
 }
@@ -102,7 +110,7 @@ struct FairnessStateInner {
 /// across an `advance()` boundary so it does not snap to zero the instant a new
 /// window opens. A window with no events reports `1.0` (healthy) so that a quiet
 /// queue is never penalised for lack of data — see [`Self::rate`].
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(crate) struct SlidingWindowCounter {
     current_success: u64,
     current_total: u64,
@@ -155,6 +163,7 @@ impl SlidingWindowCounter {
 /// top bucket. The flat per-ms layout trades memory for branch-free recording
 /// and exact percentile reads at the millisecond granularity the controller
 /// cares about.
+#[derive(Debug)]
 pub(crate) struct LatencyHistogram {
     buckets: Vec<u64>,
     count: u64,

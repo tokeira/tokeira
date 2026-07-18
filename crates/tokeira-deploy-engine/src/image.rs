@@ -46,6 +46,7 @@ pub struct WritebackTarget {
 ///
 /// Extensions provide access to configuration and platform handles without
 /// coupling this crate to specific implementations.
+#[derive(Debug)]
 pub struct ImageContext {
     pub state: tokeira_iac::RuntimeState,
     extensions: HashMap<TypeId, Box<dyn Any + Send + Sync>>,

@@ -260,7 +260,7 @@ pub enum ScheduleError {
 /// [`Self::update`]) rather than locks held across awaits: a caller presents the
 /// token it last read, and the update is rejected if the stored token has since
 /// moved on.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ScheduleStore {
     schedules: DashMap<(NamespaceId, ScheduleId), ScheduleEntry>,
     next_start: tokio::sync::Mutex<HashMap<NamespaceId, Instant>>,

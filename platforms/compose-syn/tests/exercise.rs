@@ -9,6 +9,8 @@
 //! observability artifact rendering (dashboards + alerts), local state, and the
 //! deploy-engine service manifests — runs here.
 
+// Live-exercise test narration prints progress deliberately.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 use std::{fs, path::PathBuf};
 
 use tokeira_compose_syn::{

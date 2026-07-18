@@ -669,7 +669,7 @@ impl Workstation {
         match state.as_str() {
             "running" => Ok(()),
             "stopped" => {
-                println!("starting instance...");
+                tracing::info!("starting instance...");
                 self.ec2
                     .start_instances()
                     .instance_ids(&handle.instance_id)

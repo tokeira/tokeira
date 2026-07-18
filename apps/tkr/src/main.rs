@@ -39,6 +39,8 @@
 //!   operators can omit `--deployment` for the happy path.
 //! - Destructive operations require `--yes` (see [`commands::require_confirmation`]).
 
+// CLI: stdout/stderr are the user interface.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 use anyhow::Result;
 use clap::Parser;
 

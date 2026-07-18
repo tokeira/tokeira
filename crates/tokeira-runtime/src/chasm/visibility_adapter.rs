@@ -46,6 +46,15 @@ pub struct ProjectionVisibilitySink {
     partition_count: u32,
 }
 
+// Manual impl: composed of trait objects with no `Debug` bound.
+impl std::fmt::Debug for ProjectionVisibilitySink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectionVisibilitySink")
+            .field("partition_count", &self.partition_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ProjectionVisibilitySink {
     /// Build an adapter over a projection sink. `partition_count` matches the
     /// deployment's projection partitioning; for a direct store write it only keeps

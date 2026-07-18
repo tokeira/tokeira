@@ -52,6 +52,7 @@ pub struct PlannedServiceManifest {
 /// The caller manages state persistence. This engine sorts services
 /// by declared dependencies, computes plans, and delegates manifest
 /// application to the supplied [`Platform`].
+#[derive(Debug)]
 pub struct ServiceEngine;
 
 impl Default for ServiceEngine {

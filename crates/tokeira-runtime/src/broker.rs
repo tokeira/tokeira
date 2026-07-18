@@ -76,6 +76,14 @@ pub struct InMemoryBroker {
     inner: Arc<Mutex<BrokerState>>,
 }
 
+// Manual impl: summarizes without taking the interior lock — a `Debug` that
+// must lock the state invites deadlock from inside failure paths.
+impl std::fmt::Debug for InMemoryBroker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryBroker").finish_non_exhaustive()
+    }
+}
+
 /// In-memory activity-task broker.
 ///
 /// Mirrors [`InMemoryBroker`] but for activity tasks.
@@ -83,6 +91,15 @@ pub struct InMemoryBroker {
 #[derive(Default, Clone)]
 pub struct InMemoryActivityBroker {
     inner: Arc<Mutex<ActivityBrokerState>>,
+}
+
+// Manual impl: summarizes without taking the interior lock — a `Debug` that
+// must lock the state invites deadlock from inside failure paths.
+impl std::fmt::Debug for InMemoryActivityBroker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryActivityBroker")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Live backlog shape used by matching diagnostics and poller scaling.

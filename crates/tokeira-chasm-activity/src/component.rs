@@ -30,6 +30,7 @@ use crate::{
 /// request-scoped context provenance and is explicitly transient (not persisted).
 #[derive(Component)]
 #[chasm(fqn = "activity.activity")]
+#[derive(Debug)]
 pub struct ActivityExecution {
     /// The activity's persisted state (status, attempt, stamp, timeouts, payloads).
     #[chasm(data)]
@@ -221,6 +222,7 @@ fn api_status_name(status: ActivityStatus) -> &'static str {
 
 /// The `activity` library: registers [`ActivityExecution`] as archetype
 /// `"activity.activity"` (Requirement 11.1).
+#[derive(Debug)]
 pub struct ActivityLibrary;
 
 impl Library for ActivityLibrary {

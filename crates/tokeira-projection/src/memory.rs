@@ -34,6 +34,15 @@ pub struct InMemoryVisibilityStore {
     inner: Arc<Mutex<VisibilityState>>,
 }
 
+// Manual impl: summarizes without taking the interior lock — a `Debug` that
+// must lock the store invites deadlock from inside failure paths.
+impl std::fmt::Debug for InMemoryVisibilityStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryVisibilityStore")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Default)]
 struct VisibilityState {
     rows: HashMap<RunKey, ExecutionRow>,

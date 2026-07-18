@@ -5,12 +5,14 @@
 //! round-trip that gRPC edge, runtime, and storage have to sustain.
 
 #![allow(unreachable_pub)]
+// The SDK's workflow macros generate public types we cannot add derives to.
+#![allow(missing_debug_implementations)]
 
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
 
 #[workflow]
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct EchoWorkflow;
 
 #[workflow_methods]

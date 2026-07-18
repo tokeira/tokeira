@@ -196,7 +196,7 @@ pub enum BatchError {
     InvalidArgument(String),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct BatchOperationStore {
     entries: DashMap<(NamespaceId, JobId), BatchOperationEntry>,
 }

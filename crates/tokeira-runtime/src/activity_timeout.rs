@@ -79,7 +79,7 @@ pub struct ActivityTrackingEntry {
 /// Cloning shares the underlying map; lanes, the scanner, and shard recovery all
 /// see one set. Keyed by `(RunKey, activity_id)` since a run may have many
 /// activities open at once.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct ActivityTrackingState {
     inner: Arc<Mutex<HashMap<(RunKey, String), ActivityTrackingEntry>>>,
 }

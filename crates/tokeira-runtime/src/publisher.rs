@@ -105,6 +105,16 @@ pub struct RuntimeDispatchPublisher<R> {
     namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
 }
 
+// Manual impl: composed of trait objects with no `Debug` bound.
+impl<R> std::fmt::Debug for RuntimeDispatchPublisher<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeDispatchPublisher")
+            .field("lane_count", &self.lane_count)
+            .field("shard_count", &self.shard_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<R> Clone for RuntimeDispatchPublisher<R> {
     fn clone(&self) -> Self {
         Self {

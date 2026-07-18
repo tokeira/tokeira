@@ -34,7 +34,7 @@ use crate::{
     },
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RuntimeAdapter<R> {
     runtime: Arc<TokeiraRuntime<R>>,
 }

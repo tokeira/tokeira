@@ -177,7 +177,7 @@ pub trait Kernel {
 /// all outputs leave via the returned `Transition`. This
 /// makes the kernel trivially testable with golden-file and
 /// property-based tests.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct BasicKernel;
 
 /// Additional durable identity/config needed to replay a history prefix.

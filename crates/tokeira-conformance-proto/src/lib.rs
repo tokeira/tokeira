@@ -8,6 +8,8 @@
 //! `conformance` Cargo feature.
 
 #![allow(refining_impl_trait_internal, refining_impl_trait_reachable)]
+// Generated connect-rpc service markers/servers carry no Debug derive.
+#![allow(missing_debug_implementations)]
 
 pub mod connect {
     connectrpc::include_generated!("_connectrpc_conformance.rs");

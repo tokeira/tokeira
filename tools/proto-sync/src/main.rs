@@ -1,3 +1,5 @@
+// CLI: stdout/stderr are the user interface.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 use std::{
     env, fs,
     path::{Path, PathBuf},

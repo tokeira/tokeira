@@ -30,6 +30,7 @@ impl ModuleSelection {
 ///   resources in state that need deletion. Must be a superset of desired.
 /// - `active_modules`: which module names are in scope for this operation.
 ///   Used for module-scoped `--module` filtering.
+#[derive(Debug)]
 pub struct InfraComposition {
     pub desired_modules: Vec<Box<dyn Module>>,
     pub known_modules: Vec<Box<dyn Module>>,

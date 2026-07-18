@@ -99,7 +99,7 @@ pub trait DispatchPublisher: Send + Sync {
 /// and make it obvious which piece of code serializes commands for a run, but
 /// they do not define correctness. If a run moves between lanes later, the run's
 /// durable state remains the source of truth.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LaneHandle {
     lane_id: usize,
     tx: mpsc::Sender<LaneMessage>,

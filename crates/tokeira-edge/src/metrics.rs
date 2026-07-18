@@ -226,6 +226,7 @@ pub fn record_nexus_request_preprocess_error() {
     counter!(NEXUS_REQUEST_PREPROCESS_ERRORS_TOTAL).increment(1);
 }
 
+#[derive(Debug)]
 pub struct GrpcActiveRequestGuard {
     method: String,
 }

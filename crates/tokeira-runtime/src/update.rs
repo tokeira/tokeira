@@ -206,7 +206,7 @@ pub(crate) struct UpdateRegistryEntry {
 }
 
 /// In-memory registry of waiting update callers.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct UpdateRegistry {
     inner: Arc<Mutex<HashMap<(RunKey, String), UpdateRegistryEntry>>>,
     /// Monotonic counter stamped onto each entry at admission so the worker

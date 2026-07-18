@@ -124,6 +124,16 @@ pub struct Deployment {
     writeback: Vec<(String, WbValue)>,
 }
 
+// Manual impl: modules hold `Box<dyn Kind>` resources with no `Debug`.
+impl std::fmt::Debug for Deployment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deployment")
+            .field("namespaces", &self.namespaces)
+            .field("modules", &self.modules.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Deployment {
     /// Start a deployment with the given required Kubernetes namespaces.
     pub fn new(namespaces: &[&str]) -> Self {

@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, oneshot};
 
 pub const LEGACY_QUERY_ID: &str = "__legacy__";
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct PendingQueryStore {
     inner: Arc<Mutex<HashMap<Vec<u8>, HashMap<String, oneshot::Sender<QueryResult>>>>>,
 }

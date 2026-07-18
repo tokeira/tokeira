@@ -327,6 +327,7 @@ pub struct BootstrapNexusEndpointConfig {
 /// `tracing::debug!` line that `record_worker_heartbeat` emits). The stream is
 /// a broadcast receiver over structured tracing events captured inside the
 /// facade; consumers not subscribed to it see no behaviour change.
+#[derive(Debug)]
 pub struct TokeiradHandle {
     bound_addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -486,6 +487,9 @@ fn dsql_coordination_table_names(config: &TokeiraConfig) -> (String, String) {
 /// Parses `TokeiraConfig` from the CLI arguments, handles `--dump-config`, and
 /// serves the gRPC stack on `infrastructure.network.grpc_addr` until
 /// Ctrl-C.
+// `--version` / `--dump-config` are CLI outputs to stdout by contract; daemon
+// logging elsewhere speaks `tracing` only.
+#[allow(clippy::print_stdout)]
 pub async fn run_from_cli(cli: Cli) -> Result<()> {
     if cli.version {
         println!("{}", render_build_info(cli.verbose, cli.json));
@@ -2180,7 +2184,7 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "missing namespace should fail");
-        let error = result.err().expect("error");
+        let error = result.expect_err("error");
 
         assert!(error.to_string().contains("namespace `missing` not found"));
     }

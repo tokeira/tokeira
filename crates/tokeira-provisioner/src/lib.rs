@@ -25,12 +25,14 @@ use tokeira_state::{SnapshotRef, StateError, Validate};
 
 pub mod binary_store;
 pub mod binding;
+pub mod identity;
 pub mod integrity;
 pub mod migration;
 pub mod upgrade;
 mod version;
 pub use binary_store::{BinaryError, BinaryStore};
 pub use binding::{BindingVerdict, check_binding};
+pub use identity::{AuthorityTier, BuildAuthority, BuildProfile, EngineIdentity};
 pub use integrity::{ChecksumFormatError, IntegrityError, Sha256Digest, sha256_hex};
 pub use migration::{MigrationError, MigrationRegistry};
 pub use upgrade::{UpgradeDecision, evaluate_upgrade};

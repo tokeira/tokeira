@@ -6,7 +6,16 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# The platform ships its own provisioner (Req 14): the shared shell composed
+# with this crate's `provisioner` realization. The source binary is
+# `tkp-compose`; `tkr deployment create` places it in the deployment as `tkp`.
+[[bin]]
+name = "tkp-compose"
+path = "src/bin/tkp.rs"
+
 [dependencies]
+tokeira-provisioner-cli = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokeira-compose = { path = "../../crates/tokeira-compose" }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokeira-iac = { workspace = true }
@@ -30,7 +39,6 @@ tokeira-tkd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # The engine compose platform — the fidelity oracle the tests compare against.
 tokeira-compose-deployment = { path = "../compose" }
 

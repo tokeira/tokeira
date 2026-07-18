@@ -432,32 +432,44 @@ multi-consumer decision) are out of scope.
         as runtime config/data wherever possible so refinement is a plan, not a rebuild; reserve `tkp`
         rebuilds for behavioral engine/resource-impl changes (Req 13.4).
 
-- [ ] 15. Per-platform provisioner — the `tkp` shell + clean split (Requirement 14)
-  - [ ] 15.1 Extract `crates/tokeira-provisioner-cli` (lib): move the platform-agnostic shell out of
+- [x] 15. Per-platform provisioner — the `tkp` shell + clean split (Requirement 14)
+  - [x] 15.1 Extract `crates/tokeira-provisioner-cli` (lib): move the platform-agnostic shell out of
         `apps/tkp` — the mutating-verb contract, binding-gate orchestration, operation-lock wrapper, state
         envelope, `describe`, Day-0 stamp, `config_history`, and the clap dispatch — generic over a
         `ProvisionerPlatform` seam whose methods are the **platform-realized** verbs
         (`infra_plan|apply|destroy`, `deploy_plan|apply`, `scale`),
-        each able to return a first-class `NotApplicable` (+ `label`). Depends on `tokeira-provisioner`
-        (domain); NOT folded into it. Refit the current `apps/tkp` as the first consumer (Local + ComposeSyn
-        impls) with **no behavior change** — workspace green. _Requirements: 14.2_
-  - [ ] 15.2 The shell's clap surface is **namespaced to mirror `tkr`** (`tkp infra plan|apply|destroy`,
+        each able to return a first-class `NotApplicable` (+ `label`, `config_basename`, `deployment_id`).
+        Depends on `tokeira-provisioner` (domain); NOT folded into it. DONE: the shell's tests moved with
+        it (run against a no-op `TestPlatform`); `apps/tkp` was refit as the transitional bundled consumer
+        with no behavior change, then retired at 15.4. _Requirements: 14.2_
+  - [x] 15.2 The shell's clap surface is **namespaced to mirror `tkr`** (`tkp infra plan|apply|destroy`,
         etc. — Req 7.3, transparent forwarding), with Day-0 stamping an **internal** create step, not an
-        operator `tkp init` verb. _Requirements: 7.3, 6.5_
-  - [ ] 15.3 Implement the **full** lifecycle surface — no verb is "planned" (design §Command behaviour and
+        operator `tkp init` verb. DONE: `init` is a hidden subcommand invoked by inception; `tkr`'s
+        launcher forwards token sequences and classifies read-only on any namespace's `plan`.
+        _Requirements: 7.3, 6.5_
+  - [x] 15.3 Implement the **full** lifecycle surface — no verb is "planned" (design §Command behaviour and
         outputs): the mutating-verb contract (gate → lock → plan → confirm → apply → revision/envelope →
         report) for `infra apply|destroy`, `deploy apply`, `scale`, `revert`,
         `upgrade`, `rollback`; the read-only verbs (`describe`, `infra/deploy plan`); and
         `describe`'s **two views** — operator (default, short) and verification/debug (`--json`;
         `--verbose` human). Conditional verbs return `NotApplicable` cleanly (e.g. `scale` where the
         platform has no scale dimension). Database schema is **out of scope** (`tokeira-storage`-owned,
-        applied by `tokeirad`) — no `schema` verb, no `tokeira-storage` link. _Requirements: 13.2, 14.1_
-  - [ ] 15.4 Split into per-platform binaries: `apps/tkp-compose` (`tokeira-provisioner-cli` + a
-        `ComposePlatform` seam impl + `tokeira-compose-syn`/`-compose`/`-iac`/`-orchestrator`, **no `local`**)
-        and `apps/tkp-local`; retire the bundled `apps/tkp`. _Requirements: 14.1_
-  - [ ] 15.5 Repoint `tkr`: `create` resolves the per-platform source (`tkp-compose`) and copies it to
-        `<deployment>/tkp`; the launcher runs `<deployment>/tkp`; `deployment_dir::place_provisioner`
-        resolves the platform-specific binary (currently `which("tkp")`). _Requirements: 14.4, 6.5_
+        applied by `tokeirad`) — no `schema` verb, no `tokeira-storage` link. DONE: `Realization`
+        (Realized | NotApplicable) on the workload verbs; both platforms realize `deploy` as the infra
+        universe and answer `NotApplicable` for `scale`; describe's verification view carries the full
+        per-artifact manifest + retained-revision set. _Requirements: 13.2, 14.1_
+  - [x] 15.4 **The platform ships its own provisioner** (shape decided in review — no dedicated
+        `apps/tkp-<platform>` crates): each platform crate carries a provisioner bin target composed from
+        the shell. DONE: `platforms/compose-syn` gained `provisioner.rs` (the seam impl — `.tkd`
+        load/validate, Bollard wiring, engine plan/apply/destroy; `deployment_id` = the deployment dir
+        basename, aligning the Day-0 stamp with `Cx.project_name`) + `[[bin]] tkp-compose`;
+        `platforms/local` mirrors with `provisioner.rs` + `[[bin]] tkp-local` (the Docker-free end-to-end
+        shell binary). The bundled `apps/tkp` is retired. _Requirements: 14.1, 14.2_
+  - [x] 15.5 Repoint `tkr`: `create` resolves the per-platform source and copies it to `<deployment>/tkp`;
+        the launcher runs `<deployment>/tkp`. DONE: `place_provisioner` and the launcher fallback resolve
+        `tkp-compose` (PATH → the running `tkr`'s sibling artifact → `cargo run -p tokeira-compose-syn
+        --bin tkp-compose`), so "`tkr` compiles `tkp` from `platforms/<platform>`" is literal (Phase 0;
+        the hermetic build/obtain supersedes it in tasks 16-18). _Requirements: 14.4, 6.5_
 
 - [ ] 16. Engine identity + build authority (Requirement 15; [Proposal 005](./proposals/005-provisioner-bundles-and-binding.md))
   - [ ] 16.1 Define `EngineIdentity` (**closure-scoped**: provisioner source-closure digest + `Cargo.lock`-
@@ -599,10 +611,11 @@ multi-consumer decision) are out of scope.
   **versioned deployment** is strict (apply requires source-tree `Match`; drift → `upgrade`). The first
   real exercise of this is the ECS platform bring-up, which runs entirely in the dev regime; its expected
   fix-and-reapply churn is absorbed by `DevIterate` without versioning friction.
-- The provisioner is a **new, deployment-married binary** (`apps/tkp`, binary `tkp` — small-form sibling
-  of `tkr`) with a specialized lifecycle CLI — `describe`, `plan`, `apply`, `destroy`, `scale`, and the
-  version-transition verbs `upgrade`/`rollback` (DSQL `schema` and all image ops are `tkr`-owned, not `tkp`
-  verbs).
+- The provisioner is a **deployment-married binary** (`tokeira-provisioner-cli` composed with one
+  platform's realization — a bin target of the platform crate, e.g. `tkp-compose`; placed as `tkp`) with a
+  specialized lifecycle CLI — `describe`, `infra plan|apply|destroy`, `deploy plan|apply`, `scale`,
+  `revert`, and the version-transition verbs `upgrade`/`rollback` (DSQL `schema` and all image ops are
+  `tkr`-owned, not `tkp` verbs).
   It
   is **not** `tkr` with fewer flags presented to operators; operators drive `tkr`'s existing command
   structure and `tkr` forwards lifecycle verbs to the checksum-verified `tkp`. `tkr` never mutates a

@@ -4,7 +4,7 @@
 - **Refines:** Req 1 (provenance from Day 0), Req 4 (integrity verification), Req 5 (binary retention), Req 6.5 (the commands that write the stamp), Req 7 (surface separation); tasks 6 (`BinaryStore`) and 7 (binary size).
 - **Builds on:** platform-config-dsl [Proposal 004 — `.tkd` syn interpreter](../../platform-config-dsl/proposals/004-tkd-syn-interpreter.md). The interpreted-definition work is the *enabler*: because a `.tkd` is data the bound `tkp` reads at runtime, `tkp` is no longer source-specialised per deployment, so two deployments on the same engine can share the exact same `tkp` bytes.
 - **Requires requirements changes (proposed, not yet adopted):** Req 1.2, Req 4.x, Req 5.x, Req 6.5 wording (§Requirements changes).
-- **Owner area:** `apps/tkr` (deployment-create orchestration), `apps/tkp` (independent identity + provenance `build.rs`), a new Dagger **provisioner-build** module (sibling of `tokeira-build`'s image pipeline), `crates/tokeira-provisioner` (`EngineIdentity`, `BuildAuthority`, manifest re-key), `tokeira-state` (`BinaryStore` re-key + per-deployment retention).
+- **Owner area:** `apps/tkr` (deployment-create orchestration), `crates/tokeira-provisioner-cli` + the platform crates' provisioner bin targets (`platforms/<p>` → `tkp-<p>`; identity + provenance `build.rs`), a new Dagger **provisioner-build** module (sibling of `tokeira-build`'s image pipeline), `crates/tokeira-provisioner` (`EngineIdentity`, `BuildAuthority`, manifest re-key), `tokeira-state` (`BinaryStore` re-key + per-deployment retention).
 
 ## Thesis
 

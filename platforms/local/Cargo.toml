@@ -7,11 +7,20 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# The platform ships its own provisioner (Req 14): the shared shell composed
+# with this crate's `provisioner` realization. Local runs in-process in `tkr`;
+# this binary exercises the real shell end to end without Docker.
+[[bin]]
+name = "tkp-local"
+path = "src/bin/tkp.rs"
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokeira-provisioner-cli.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokeira-config.workspace = true
 tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
@@ -20,7 +29,6 @@ tokeira-state = { path = "../../crates/tokeira-state" }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

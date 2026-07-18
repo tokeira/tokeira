@@ -18,6 +18,7 @@ pub mod definition;
 pub mod interp;
 pub mod kinds;
 pub mod observability_config;
+pub mod provisioner;
 
 /// The default `.tkd` deployment definition this platform ships. `tkr deployment
 /// create` writes it into the deployment directory as the config revision the

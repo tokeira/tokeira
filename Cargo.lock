@@ -6383,22 +6383,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
-name = "tkp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "tempfile",
- "tokeira-compose",
- "tokeira-compose-syn",
- "tokeira-config",
- "tokeira-iac",
- "tokeira-local-deployment",
- "tokeira-orchestrator",
- "tokeira-provisioner-cli",
- "tokio",
-]
-
-[[package]]
 name = "tkr"
 version = "0.1.0"
 dependencies = [
@@ -6753,6 +6737,7 @@ dependencies = [
  "tokeira-deploy-engine",
  "tokeira-iac",
  "tokeira-orchestrator",
+ "tokeira-provisioner-cli",
  "tokeira-state",
  "tokeira-tkd",
  "tokio",
@@ -7043,6 +7028,7 @@ dependencies = [
  "tokeira-deploy-engine",
  "tokeira-iac",
  "tokeira-orchestrator",
+ "tokeira-provisioner-cli",
  "tokeira-state",
  "tokio",
 ]

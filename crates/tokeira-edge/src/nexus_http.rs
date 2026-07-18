@@ -43,7 +43,10 @@ use url::form_urlencoded;
 
 use crate::{
     interceptors::authorizer_errors_exposed,
-    metrics::{record_nexus_latency, record_nexus_request, record_nexus_request_preprocess_error},
+    metrics::{
+        record_nexus_latency, record_nexus_request, record_nexus_request_preprocess_error,
+        record_service_request,
+    },
     namespace_cache::{NamespaceCache, ResolvedNamespace},
 };
 
@@ -210,6 +213,8 @@ pub enum NexusAuthorizationDecision {
     Allow,
     /// Reject with Temporal's optional denial reason.
     Deny { reason: Option<String> },
+    /// Reject authentication before the Nexus operation handler is admitted.
+    Unauthenticated,
     /// Surface an authorizer failure when the expose-errors gate permits it.
     ExposedError {
         /// Nexus HandlerError type, for example `UNAVAILABLE`.
@@ -289,10 +294,12 @@ impl NexusHttpAuthorizer for PolicyNexusHttpAuthorizer {
         let claims = match self.claim_mapper.get_claims(token, extras).await {
             Ok(claims) => claims,
             Err(error) => {
-                // Claim-mapper diagnostics are never exposed, including through
-                // Nexus (`interceptor.go @ v1.31.0`).
+                // Nexus adapts a claim-mapper failure before operation admission,
+                // unlike the gRPC interceptor's permission-denied envelope
+                // (`service/frontend/nexus_http_handler.go:128-134,179-185 @
+                // v1.31.0`). The diagnostic itself remains private.
                 tracing::warn!(%error, api = %target.api_name, "Nexus authentication failed");
-                return NexusAuthorizationDecision::Deny { reason: None };
+                return NexusAuthorizationDecision::Unauthenticated;
             }
         };
         let call_target = CallTarget {
@@ -517,6 +524,14 @@ impl NexusHttpHandler {
             .await
         {
             NexusAuthorizationDecision::Allow => {}
+            NexusAuthorizationDecision::Unauthenticated => {
+                // Claim mapping happens in the outer Nexus HTTP handler in
+                // v1.31.0, so its failure increments only the preprocess counter
+                // and returns the protocol's fixed unauthenticated error.
+                record_nexus_request_preprocess_error();
+                return HandlerError::unauthenticated("unauthorized")
+                    .into_response(caller_failure_support);
+            }
             NexusAuthorizationDecision::Deny { reason } => {
                 let message = reason.filter(|reason| !reason.is_empty()).map_or_else(
                     || "permission denied".to_owned(),
@@ -861,7 +876,11 @@ fn general_headers(
     let mut result = BTreeMap::new();
     for (name, value) in headers {
         let name = name.to_ascii_lowercase();
-        if excluded_header.is_some_and(|excluded| name == excluded)
+        // This Temporal-private capability controls the response envelope and
+        // is represented in Request.capabilities instead. It is never worker
+        // input (`tests/nexus_api_test.go @ v1.31.0`).
+        if name == FAILURE_SUPPORT_HEADER
+            || excluded_header.is_some_and(|excluded| name == excluded)
             || excluded_prefixes
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
@@ -1837,6 +1856,7 @@ fn record_terminal(
 ) {
     record_nexus_request(&target.namespace, method, outcome, endpoint);
     record_nexus_latency(&target.namespace, method, outcome, endpoint, duration);
+    record_service_request(&target.namespace, method);
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1875,6 +1895,10 @@ impl HandlerError {
 
     fn unauthorized(message: impl Into<String>) -> Self {
         Self::new("UNAUTHORIZED", message)
+    }
+
+    fn unauthenticated(message: impl Into<String>) -> Self {
+        Self::new("UNAUTHENTICATED", message)
     }
 
     fn not_found(message: impl Into<String>) -> Self {
@@ -2120,6 +2144,10 @@ mod tests {
                     ("Content-Type".to_owned(), "application/json".to_owned()),
                     ("Nexus-Request-Id".to_owned(), request_id.clone()),
                     ("Nexus-Callback-Token".to_owned(), "callback-secret".to_owned()),
+                    (
+                        "Temporal-Nexus-Failure-Support".to_owned(),
+                        "true".to_owned(),
+                    ),
                     ("X-General".to_owned(), "general-value".to_owned()),
                 ],
                 body: body.clone(),
@@ -2160,6 +2188,8 @@ mod tests {
             prop_assert_eq!(translated.header.get("x-general"), Some(&"general-value".to_owned()));
             prop_assert!(!translated.header.contains_key("content-type"));
             prop_assert!(!translated.header.contains_key("nexus-callback-token"));
+            prop_assert!(!translated.header.contains_key(FAILURE_SUPPORT_HEADER));
+            prop_assert!(translated.temporal_failure_responses);
             match translated.variant {
                 NexusHttpTaskRequestVariant::StartOperation {
                     service: actual_service,
@@ -2181,6 +2211,37 @@ mod tests {
                 other => panic!("unexpected request variant: {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_uses_nexus_unauthenticated_shape() {
+        let namespaces = Arc::new(InMemoryNamespaceCache::new());
+        namespaces
+            .insert(ResolvedNamespace::active("default"))
+            .await
+            .expect("namespace");
+        let handler = NexusHttpHandler::new(
+            namespaces,
+            Arc::new(InMemoryNexusEndpointStore::new()),
+            NexusTaskBroker::default(),
+            NexusHttpWaiterRegistry::default(),
+            Arc::new(RecordingAuthorizer {
+                decision: NexusAuthorizationDecision::Unauthenticated,
+                targets: Mutex::new(Vec::new()),
+            }),
+        );
+        let response = handler
+            .handle(start_request(
+                "/namespaces/default/task-queues/queue/nexus-services/service/operation".to_owned(),
+                b"\"input\"".to_vec(),
+            ))
+            .await;
+
+        assert_eq!(response.status, 401);
+        let failure: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("failure JSON");
+        assert_eq!(failure["message"], "unauthorized");
+        assert_eq!(failure["details"]["type"], "UNAUTHENTICATED");
     }
 
     #[test]

@@ -8,7 +8,7 @@ durable storage first (`WorkerDeploymentRepository`), then pure per-run kernel s
 runtime registry state machine and dispatch routing, then the edge handlers/adapter and the
 describe projection, finishing with the cleanup, compatibility-matrix, and integration work.
 Every mutation path follows load → validate (pure) → CAS-commit; the kernel stays pure; the edge
-talks to the runtime only through the new `WorkerDeploymentRuntimeApi` adapter. All 18 correctness
+talks to the runtime only through the new `WorkerDeploymentRuntimeApi` adapter. All 19 correctness
 properties from the design are implemented as required `proptest` tasks (minimum 100 iterations),
 each placed in the crate the design specifies.
 
@@ -228,7 +228,7 @@ each placed in the crate the design specifies.
     - Make `describe_deployment`, `list_deployments`, `get_deployment_reachability`, `get_current_deployment`, `set_current_deployment` each return `Status::unimplemented("Deployments are deprecated and no longer supported, use Worker Deployments instead")` (the exact v1.31.0 message) before any state access; they do not route through the adapter.
     - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7_
   - [x] 7.7 Unit tests for edge validation and deprecated-companion messages in `crates/tokeira-edge/src/grpc/workflow_service.rs`
-    - Cover: each deprecated companion returns the exact `UNIMPLEMENTED` message and touches no registry state; empty `deployment_name` / unset oneof / empty identity / unresolvable version → `INVALID_ARGUMENT`; namespace-not-found → `NOT_FOUND`; exceeding max-versions → `RESOURCE_EXHAUSTED`; overlapping upsert/remove and update/remove → `INVALID_ARGUMENT`; `eager_worker_deployment_options` applied iff `request_eager_execution`; all 13 v2 RPCs accept valid input without `UNIMPLEMENTED`.
+    - Cover: each deprecated companion returns the exact `UNIMPLEMENTED` message and touches no registry state; empty `deployment_name` / unset oneof / empty identity / unresolvable version → `INVALID_ARGUMENT`; namespace-not-found → `NOT_FOUND`; max-version admission evicts the oldest eligible Version before returning `RESOURCE_EXHAUSTED` when none qualifies; overlapping upsert/remove and update/remove → `INVALID_ARGUMENT`; `eager_worker_deployment_options` applied iff `request_eager_execution`; all 13 v2 RPCs accept valid input without `UNIMPLEMENTED`.
     - _Requirements: 1.8, 2.5, 2.14, 5.3, 6.3, 7.4, 7.8, 9.7, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 12.2, 12.5_
 
 - [x] 8. Edge: describe versioning-info projection
@@ -272,10 +272,31 @@ each placed in the crate the design specifies.
   - Run `cargo doc --workspace --no-deps` (`RUSTDOCFLAGS="-D warnings"`).
   - Ensure all tests pass, ask the user if questions arise.
 
+- [x] 13. Tier 8.39 corrective conformance: poll limits, eviction, and drainage timing
+  - [x] 13.1 Correct the runtime registry's configurable admission limits
+    - Add live runtime accessors for v1.31.0's `MatchingMaxVersionsInDeployment`, `MatchingMaxTaskQueuesInDeploymentVersion`, and `PollerHistoryTTL` defaults; classify the corresponding conformance-only keys as wired without exposing production configuration or involving the kernel.
+    - Make poll registration count distinct task-queue family names, reject a new family at the configured limit with the v1.31.0 message, and return the reason through `RegistryError::ResourceExhausted(reason)`.
+    - _Requirements: 2.16, 2.17_
+  - [x] 13.2 Implement atomic oldest-eligible Version eviction at the configured limit
+    - Apply the v1.31.0 `tryDeleteVersion` behavior to explicit create, poll auto-create, and `allow_no_pollers` auto-create: deterministic oldest-first selection, normal routing/poller/drainage gates, manager bypass, and one CAS mutation covering delete + insert.
+    - Add Property 19 (at least 100 cases) plus focused examples for exact exhaustion messages and unchanged state on rejection.
+    - _Requirements: 2.5, 2.18, 12.4; Property 19_
+  - [x] 13.3 Implement due drainage recomputation in the Tokeira runtime shape
+    - Add live runtime accessors for the v1.31.0 visibility-grace and refresh-interval defaults and their conformance-only overrides.
+    - Before returning a public registry observation, lazily recompute only due `DRAINING` Versions through `RunRepository` and CAS-commit the result; preserve the stale-result reactivation guard and start a fresh grace cycle after rollback/re-demotion.
+    - Extend Property 11 and focused tests for before-due no-op, due transition, repeated refresh, and rollback/re-demotion.
+    - _Requirements: 8.7, 8.8, 8.9; Property 11_
+  - [x] 13.4 Make poll admission authoritative and prove Tier 8.39 clean
+    - Propagate Worker Deployment registration errors from workflow/activity poll admission instead of logging them as best-effort bookkeeping; successful registration remains before the long poll.
+    - Track each admitted poll with a cancellation-aware runtime liveness guard: client cancellation removes the exact live registration, normal completion retains the recent observation, and the edge's bounded diagnostic history remains a separate concern. Aggregate physical Deployment-Version pollers into the public `DescribeTaskQueue` family view.
+    - Remove the four obsolete override-class skips for `TestDeploymentVersionLimits`, `TestDeleteVersion_ServerDeleteMaxVersionsReached`, `TestSetRampingVersion_AfterDrained`, and `TestDrainRollbackedVersion`; retain the internal Force-CAN override-state skip.
+    - Run focused runtime/edge/conformance tests, then two consecutive clean `TestWorkerDeploymentSuite` runs and update the functional-conformance ledger.
+    - _Requirements: 2.16, 2.17, 2.18, 2.19, 8.7, 8.8, 8.9_
+
 ## Notes
 
 - Tasks follow the design's strict dependency order: storage → kernel → runtime registry → runtime dispatch → edge → describe projection → cleanup/matrix → integration. No new architecture is introduced beyond `design.md`.
-- Property tests are REQUIRED, not optional (no `*` markers). All 18 design properties are covered exactly once, each placed in the crate the design's Testing Strategy specifies: Properties 1–13 and 16 in `tokeira-runtime` (registry/routing), Property 17 in `tokeira-storage`, Property 18 in `tokeira-kernel`, Property 14 in `tokeira-edge`, and Property 15 in `tokeira-runtime`. Each uses the workspace-standard `proptest` with ≥100 iterations and reference models/generators per the design; no hand-rolled property infrastructure.
+- Property tests are REQUIRED, not optional (no `*` markers). All 19 design properties are covered exactly once, each placed in the crate the design's Testing Strategy specifies: Properties 1–13, 16, and 19 in `tokeira-runtime` (registry/routing), Property 17 in `tokeira-storage`, Property 18 in `tokeira-kernel`, Property 14 in `tokeira-edge`, and Property 15 in `tokeira-runtime`. Each uses the workspace-standard `proptest` with ≥100 iterations and reference models/generators per the design; no hand-rolled property infrastructure.
 - The kernel stays pure: tasks under section 2 add only serializable per-run state and pure transition methods — no I/O, async, metrics, or storage.
 - The edge talks to the runtime only through the new `WorkerDeploymentRuntimeApi` adapter; `DeploymentMutationOutcome` (edge adapter) is kept distinct from the concrete runtime `CommitResult`. Translation uses free functions, not `TryFrom`.
 - Every mutating registry method follows load → validate (pure) → CAS-commit so a rejected request never partially mutates state (Property 16).
@@ -298,7 +319,8 @@ each placed in the crate the design specifies.
     { "id": 7, "tasks": ["7.3", "7.4"] },
     { "id": 8, "tasks": ["7.5", "7.6", "8.1"] },
     { "id": 9, "tasks": ["7.7", "8.2", "9.1", "10.1", "10.2"] },
-    { "id": 10, "tasks": ["11.1", "11.2", "11.3"] }
+    { "id": 10, "tasks": ["11.1", "11.2", "11.3"] },
+    { "id": 11, "tasks": ["13.1", "13.2", "13.3", "13.4"] }
   ]
 }
 ```

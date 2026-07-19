@@ -480,8 +480,15 @@ deployment.
    already exists (and is not an idempotent `request_id` retry), THEN THE Edge SHALL
    return `ALREADY_EXISTS` (Temporal `ErrWorkerDeploymentVersionAlreadyExists`,
    `client.go:1296 @ v1.31.0`).
-5. IF `CreateWorkerDeploymentVersion` would exceed the deployment's maximum number of
-   Versions, THEN THE Edge SHALL return `RESOURCE_EXHAUSTED`.
+5. IF adding a Version would exceed the deployment's configured maximum number of
+   Versions, THEN THE runtime SHALL first try to delete the oldest eligible Version,
+   ordered by `create_time`; eligibility SHALL use the normal delete-version routing,
+   active-poller, and drainage preconditions while bypassing manager-identity checks for
+   this server-initiated maintenance. WHEN an eligible Version is deleted, THE runtime
+   SHALL admit the new Version atomically in the same CAS mutation; IF no Version is
+   eligible, THEN THE Edge SHALL return `RESOURCE_EXHAUSTED` with the configured limit in
+   the message (`service/worker/workerdeployment/workflow.go:541-556, 1485-1504 @
+   v1.31.0`).
 6. IF `CreateWorkerDeploymentVersion` supplies a malformed `compute_config`, THEN THE
    Edge SHALL return `INVALID_ARGUMENT`.
 7. WHEN `DescribeWorkerDeploymentVersion` is called for an existing Version, THE Edge
@@ -518,6 +525,30 @@ deployment.
     `DeleteWorkerDeploymentVersion` targets a Version that does not exist, THE Edge
     SHALL return an empty success response (no-op), matching v1.31.0
     (`client.go:1037 @ v1.31.0`).
+16. WHEN a versioned worker first polls a task queue, THE runtime SHALL durably register
+    its Deployment, Version, and task-queue family before admitting the poll; THE Edge
+    SHALL propagate a registration rejection to the poller rather than treating registry
+    failure as best-effort bookkeeping (`physical_task_queue_manager.go:768-786` and
+    `service/worker/workerdeployment/client.go:320-355 @ v1.31.0`).
+17. IF poll registration would add a new task-queue family after the configured
+    `MatchingMaxTaskQueuesInDeploymentVersion` limit is reached, THEN THE Edge SHALL
+    return `RESOURCE_EXHAUSTED` naming the task queue and configured limit and SHALL NOT
+    mutate the Version. A second task-queue type under an already-registered family SHALL
+    remain idempotently admissible because v1.31.0 counts distinct family names, not
+    `(name,type)` pairs (`version_workflow.go:625-642 @ v1.31.0`).
+18. WHEN poll registration would add a new Version at the configured maximum, THE runtime
+    SHALL apply criterion 2.5's oldest-eligible deletion before admitting it; IF no
+    Version is eligible, THEN THE Edge SHALL return `RESOURCE_EXHAUSTED` naming the
+    requested Version and configured limit and SHALL leave durable state unchanged.
+19. WHILE a versioned worker poll RPC is outstanding, THE runtime SHALL treat its exact
+    Deployment-Version task-queue registration as live for delete and server-eviction
+    preconditions. WHEN that poll is cancelled by the client, THE runtime SHALL remove
+    that live registration before a later delete decision; WHEN it completes normally,
+    THE runtime SHALL retain its most-recent observation for the configured poller-history
+    window. This liveness lifecycle is distinct from `DescribeTaskQueue`'s diagnostic
+    poller history, which MAY retain a cancelled worker until its bounded history expires
+    (`matching_engine.go:1194-1206` and `task_queue_partition_manager.go:601, 617-621 @
+    v1.31.0`).
 
 ### Requirement 3: Current Version Selection
 
@@ -692,6 +723,20 @@ decommission, so that I can retire old worker builds without breaking open workf
    standalone `GetDeploymentReachability` RPC is `UNIMPLEMENTED` in v1.31.0 (see
    Requirement 11); reachability is therefore exposed only through the v2 Version's
    drainage info, not via a separate reachability RPC.
+7. WHEN a Version first enters `DRAINING`, THE runtime SHALL defer its first reachability
+   recomputation until the configured
+   `VersionDrainageStatusVisibilityGracePeriod`; WHILE it remains `DRAINING`, THE runtime
+   SHALL defer subsequent recomputations until the configured
+   `VersionDrainageStatusRefreshInterval` (`version_workflow.go:1020-1052 @ v1.31.0`).
+8. WHEN a public registry operation observes that a draining Version's recomputation is
+   due, THE runtime MAY perform the due recomputation lazily instead of running
+   Temporal's internal Version workflow, provided the response and all following
+   operations observe the same durably CAS-committed drainage state. This is Tokeira's
+   architecture-preserving equivalent; it SHALL NOT create a synthetic history or put
+   drainage correctness in the edge.
+9. WHEN a previously drained Version becomes Current or Ramping and is later demoted
+   again, THE runtime SHALL clear the old drainage timestamps on reactivation and start a
+   fresh grace-period cycle on the later demotion.
 
 ### Requirement 9: Workflow Versioning Routing Application
 

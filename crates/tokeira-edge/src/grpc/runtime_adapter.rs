@@ -924,9 +924,7 @@ fn registry_error_to_edge(error: RegistryError) -> EdgeError {
         RegistryError::NotFound => EdgeError::NotFound("worker deployment not found".to_string()),
         RegistryError::NotFoundMessage(message) => EdgeError::NotFound(message),
         RegistryError::FailedPrecondition(message) => EdgeError::FailedPrecondition(message),
-        RegistryError::ResourceExhausted => EdgeError::ResourceExhausted(
-            "worker deployment registry resource exhausted".to_string(),
-        ),
+        RegistryError::ResourceExhausted(message) => EdgeError::ResourceExhausted(message),
         RegistryError::InvalidArgument(message) => EdgeError::BadRequest(message),
     }
 }

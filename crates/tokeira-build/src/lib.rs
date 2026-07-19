@@ -4,9 +4,11 @@
 //! which images exist and what remote references they should use.
 
 mod arch;
+mod closure;
 mod dagger;
 mod dagger_default;
 mod error;
+mod snapshot;
 mod toolchain;
 
 pub mod pipelines;
@@ -15,6 +17,7 @@ pub mod pipelines;
 pub(crate) mod testing;
 
 pub use arch::Arch;
+pub use closure::{ClosureError, LockedDependency, ProvisionerClosure, resolve_source_closure};
 pub use dagger::{ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
 pub use dagger_default::DefaultDaggerClient;
 pub use error::BuildError;
@@ -23,4 +26,5 @@ pub use pipelines::{
     mirror::{MirrorRequest, MirroredReference, mirror_image},
     publish::{PublishRequest, PublishResult, PublishedReference, RegistryPassword, publish_image},
 };
+pub use snapshot::{SnapshotError, SnapshotRequest, SourceSnapshot, snapshot_source_closure};
 pub use toolchain::rust_toolchain_version;

@@ -505,23 +505,42 @@ multi-consumer decision) are out of scope.
         the identity digest + authority in both views (the full identity field set joins with 17/19.1).
         _Requirements: 15.3, 15.4, 4.2_
 
-- [ ] 17. Source snapshotting for build fidelity (Requirement 16)
-  - [ ] 17.1 Add a Rust git SDK (`gix` pure-Rust preferred, else `git2`) — a **new** workspace dependency —
+- [x] 17. Source snapshotting for build fidelity (Requirement 16)
+  - [x] 17.1 Add a Rust git SDK (`gix` pure-Rust preferred, else `git2`) — a **new** workspace dependency —
         and a snapshot module: freeze the provisioner source closure into an immutable, content-addressed
         ref via a **temporary-index `write-tree`** (or the in-process `gix` equivalent) — seed a throwaway
         index from the current one, stage the closure into it (tracked staged + unstaged changes; **untracked
         `.rs` refuse-by-default, listed — `--include-untracked` to opt in**, decision 9), and write a `tree`,
         leaving the working tree, real index, and all refs untouched. NOT the porcelain `git stash` (reverts
         the tree, writes `refs/stash`); `git stash create` is the nearest intuition but omits untracked
-        files. `TrustedCi` → a pinned, reachable, protected commit. _Requirements: 16.1, 16.2, 16.3_
-  - [ ] 17.2 Key `EngineIdentity`'s source digest on the snapshot **`tree` oid** (pure content), never a
+        files. `TrustedCi` → a pinned, reachable, protected commit. DONE — `gix 0.85` (`tree-editor`
+        feature) in `tokeira-build`: `snapshot.rs::snapshot_source_closure` takes the in-process route
+        (no throwaway index file): tracked paths under the closure come from the real index, **worktree
+        bytes** (staged+unstaged — what a build compiles) are written as blobs, the tree is built via
+        gix's editor, and nothing touches the working tree, real index, or any ref (test asserts
+        `status`/`HEAD`/`for-each-ref` byte-identical). Untracked-`.rs` refusal lists repo-relative paths;
+        `include_untracked` stages them; other untracked kinds are outside the contract. **The closure
+        itself** is resolved from cargo metadata (`closure.rs::resolve_source_closure`, new
+        `cargo_metadata` dep): workspace crates reachable from the platform seed (all-features —
+        over-approximation is the safe direction for an identity key) + `Cargo.toml`/`Cargo.lock`/
+        `rust-toolchain.toml`/`.cargo/config.toml`, plus the **locked third-party set** (name, version,
+        source, `Cargo.lock` checksum) with a canonical serialization — the `lock_closure` digest input
+        (16.1); test pins that `apps/tkr` is NOT reachable. _Requirements: 16.1, 16.2, 16.3_
+  - [x] 17.2 Key `EngineIdentity`'s source digest on the snapshot **`tree` oid** (pure content), never a
         `commit` oid. Wrap the tree with `commit-tree` for a reachable audit handle — **fixed** synthetic
         identity + **fixed** timestamps (deterministic: same `(tree, parent)` → same commit; committer
         supplied, not read from git config), with a **parentless** fallback on an unborn/detached `HEAD`.
         Record the ref + tree digest in the build request and the bound deployment's provenance; feed the
         snapshot to the build, never the live tree — atomic (snapshot → derive → build). Retention: **record
         the oid only by default; pin `refs/tokeira/snapshots/<engine-identity>` only under `TrustedCi`**
-        (decision 10). _Requirements: 16.1, 16.4, 16.5_
+        (decision 10). DONE — `EngineIdentity::source_closure_digest_for_tree` domain-tags the tree oid
+        (never the commit; hash-algorithm-agnostic, so a SHA-256 object-format repo needs no change);
+        `write_audit_commit` uses the fixed synthetic signature at epoch 0 with a tree-derived message
+        (tests: same `(tree, parent)` → same commit oid; parent = `HEAD` when born, parentless when
+        unborn; no ref written — record-oid-only). *Recording the ref + tree digest into the build
+        request / envelope provenance, feeding the snapshot to the hermetic build, and the `TrustedCi`
+        ref-pin land with task 18 (the build request and create wiring are 18.x shapes).*
+        _Requirements: 16.1, 16.4, 16.5_
 
 - [ ] 18. Reproducible Dagger build + bundle, wired into create (Requirements 15, 14)
   - [ ] 18.1 A Dagger `build_provisioner(source_snapshot, request) -> ProvisionerBundle` function

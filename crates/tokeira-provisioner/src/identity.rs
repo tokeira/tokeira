@@ -136,6 +136,23 @@ impl EngineIdentity {
     pub fn digest(&self) -> Sha256Digest {
         Sha256Digest::from_bytes(&self.canonical_bytes())
     }
+
+    /// Derive the [`source_closure`](Self::source_closure) key from a source
+    /// snapshot's **tree** oid (task 17.2).
+    ///
+    /// Identity keys on the tree — pure content — never on the audit commit
+    /// wrapping it: the commit's parent changes with `HEAD`, and a re-snapshot
+    /// of identical source under a different parent must not re-key the
+    /// engine. The oid is domain-tagged before hashing so a git object id can
+    /// never collide with a digest derived from any other Tokeira input, and
+    /// the derivation works for any hash the repository uses (SHA-1 today,
+    /// SHA-256 object-format repos unchanged).
+    pub fn source_closure_digest_for_tree(tree_oid_hex: &str) -> Sha256Digest {
+        let mut tagged = Vec::with_capacity(32 + tree_oid_hex.len());
+        tagged.extend_from_slice(b"tokeira-source-closure/v1\n");
+        tagged.extend_from_slice(tree_oid_hex.as_bytes());
+        Sha256Digest::from_bytes(&tagged)
+    }
 }
 
 /// Who built a provisioner artifact, and under what controls (Proposal 005).
@@ -310,6 +327,26 @@ mod tests {
         assert!(!local.satisfies(AuthorityTier::TrustedCi));
         assert!(ci.satisfies(AuthorityTier::LocalDeveloper));
         assert!(ci.satisfies(AuthorityTier::TrustedCi));
+    }
+
+    #[test]
+    fn source_closure_key_derives_from_the_tree_oid_alone() {
+        let tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let a = EngineIdentity::source_closure_digest_for_tree(tree);
+        let b = EngineIdentity::source_closure_digest_for_tree(tree);
+        assert_eq!(a, b, "same tree, same key");
+        assert_ne!(
+            a,
+            Sha256Digest::from_bytes(tree.as_bytes()),
+            "the key is domain-tagged, not a bare hash of the oid"
+        );
+        assert_ne!(
+            a,
+            EngineIdentity::source_closure_digest_for_tree(
+                "0000000000000000000000000000000000000000"
+            ),
+            "different trees, different keys"
+        );
     }
 
     #[test]

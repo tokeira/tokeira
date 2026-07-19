@@ -122,9 +122,24 @@ pub(crate) fn new(name: &str, base: Option<&str>) -> Result<()> {
     })?;
 
     let branch = format!("agent/{name}");
-    let base = base.unwrap_or("HEAD");
+    // PR-flow default: base on the remote default branch so unpushed local work
+    // never leaks into agent branches (docs/concurrent-agents.md, preflight).
+    // `--base` declares a dependent task's parent; HEAD is the remote-less fallback.
+    let base = match base {
+        Some(b) => b.to_string(),
+        None => {
+            if repo
+                .git(&["rev-parse", "--verify", "--quiet", "origin/main"])
+                .is_ok()
+            {
+                "origin/main".to_string()
+            } else {
+                "HEAD".to_string()
+            }
+        }
+    };
     let path_str = path.to_string_lossy().into_owned();
-    repo.git_passthrough(&["worktree", "add", "-b", &branch, &path_str, base])?;
+    repo.git_passthrough(&["worktree", "add", "-b", &branch, &path_str, &base])?;
 
     let copied = includes::copy_into(&repo, &path)?;
 

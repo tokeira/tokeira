@@ -44,7 +44,8 @@ enum Command {
     New {
         /// Worktree name (also names the branch: `agent/<name>`).
         name: String,
-        /// Base ref for the new branch. Defaults to the main checkout's HEAD.
+        /// Base ref for the new branch. Defaults to origin/main (HEAD when no
+        /// remote exists); pass explicitly to declare a dependent task's parent.
         #[arg(long)]
         base: Option<String>,
     },

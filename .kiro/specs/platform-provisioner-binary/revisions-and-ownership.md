@@ -11,8 +11,9 @@ A full, code-accurate reference for the four `tkp` lifecycle verbs that move a d
 
 > **Status in one line.** All four verbs are wired and their **envelope state-machines are implemented and
 > unit-tested**, but every mutating path is exercised only against the `local` platform's *empty* apply.
-> The real cross-engine and multi-binary work (upgrade re-provisioning, rollback's two-binary orchestration,
-> `describe`'s two views) is unbuilt — [§6](#6-what-is-missing).
+> The real cross-engine and multi-binary work (upgrade re-provisioning, rollback's two-binary
+> orchestration) is unbuilt — [§6](#6-what-is-missing). Since the task-15 split, `describe`'s two views
+> are built and every verb runs through the per-platform `ProvisionerPlatform` seam.
 
 ---
 
@@ -91,7 +92,7 @@ deployment directory. Understanding these is prerequisite to reading the per-ver
 ### The `DeploymentStateEnvelope` — the authoritative document
 `crates/tokeira-provisioner/src/lib.rs:214`. Stored via a `tokeira_state` CAS store
 (`CasStore` over `LocalBackend` at `state/envelope`, constructed in `envelope_store`,
-`apps/tkp/src/main.rs:150`). Every mutating verb ends in a `store.save(&envelope, &version)` — a
+`crates/tokeira-provisioner-cli/src/lib.rs:101`). Every mutating verb ends in a `store.save(&envelope, &version)` — a
 **compare-and-swap** commit against the loaded `version` (optimistic concurrency).
 
 | Field | Meaning | Advanced by |
@@ -112,42 +113,45 @@ The `RollbackCheckpoint` (`lib.rs:155`) holds `from_provenance` (A's stamp), `fr
 ### Two distinct locks
 - **Operator lock** (`lock.toml`, `tkr`-side) — confines mutation to one selected deployment (Req 8).
 - **Operation lock** (`OperationLock` in the envelope + the process-level `with_operation_lock` wrapper,
-  `apps/tkp/src/lock.rs`) — remote mutual exclusion so two mutations can't run at once. Every mutating verb
-  in `main.rs` is wrapped: `lock::with_operation_lock(&dir, "<verb>", || …)` (`apps/tkp/src/main.rs:118‑140`).
+  `crates/tokeira-provisioner-cli/src/lock.rs`) — remote mutual exclusion so two mutations can't run at
+  once. Every mutating verb is wrapped by the shell's dispatch:
+  `lock::with_operation_lock(&dir, "<verb>", || …)` (`crates/tokeira-provisioner-cli/src/cli.rs:150‑186`).
 
 ---
 
 ## 4. Per-command mechanics
 
 Every mutating verb follows the same shell contract (design §Command behaviour): **resolve → gate → lock →
-plan → apply → record → report**. The gate (`apps/tkp/src/gate.rs`, `evaluate_gate`) refuses a non-`Match`
+plan → apply → record → report**. The gate (`crates/tokeira-provisioner-cli/src/gate.rs`, `evaluate_gate`) refuses a non-`Match`
 binding before any mutation, except the `DevIterate` dev path.
 
 ### 4a. `describe`
 
 - **Class:** read-only. **Gate:** evaluated for *report* only — never blocks. **Lock:** none.
-- **Dispatch:** `apps/tkp/src/main.rs:112` → `describe()` (`main.rs:157`).
-- **Mechanics:** loads the envelope, builds a `DescribeReport` (`main.rs:207`, `::build` at `:222`) pairing
-  the *running* `ProvenanceStamp::current` against the *recorded* binding, and prints either a human view
-  (`print_human`, `main.rs:250`) or the full record as `--json`.
+- **Dispatch:** `crates/tokeira-provisioner-cli/src/cli.rs:137` → `describe()` (`describe.rs:25`).
+- **Mechanics:** loads the envelope, builds a `DescribeReport` (`describe.rs:103`; `::build`/the print
+  views in the same file) pairing the *running* `ProvenanceStamp::current` against the *recorded* binding.
+  **Two views** since task 15.3: the short operator view (default), the verification view (`--verbose`
+  human; `--json` always the full record incl. the per-artifact manifest and retained revisions).
 - **Mutates in the deployment dir:** **nothing.** Pure read of `state/envelope`.
 - **Reports:** running stamp (version/git_sha/`source_tree_hash`/build_mode); envelope (id, `schema_version`,
   `config_revision`, `effective_config_ref`); binding verdict (+ proceeds/authoritative); integrity summary;
   infra/runtime head presence; the operation marker; the lock holder.
-- **Status:** **complete for today's envelope**, as a *single consolidated view* + `--json`. The design's
-  **two views** (short operator vs `--verbose` verification/debug with the full per-artifact manifest,
-  `EngineIdentity`, snapshot ref, retained-revision list) is **not built** — task 19.1.
+- **Status:** **two views built** (task 15.3): the short operator view (default) and the
+  verification/debug view (`--verbose` human; `--json` always the full record) with the complete
+  per-artifact manifest and the retained-revision set. Remaining for 19.1: the `EngineIdentity` fields and
+  source-snapshot ref, which join the verification view when tasks 16/17 create them.
 
 ### 4b. `revert`
 
 - **Class:** mutating (config axis). **Gate:** blocks on non-`Match`. **Lock:** `"revert"`.
-- **Dispatch:** `apps/tkp/src/main.rs:129` → `revert::revert(&dir, to)` (`apps/tkp/src/revert.rs:28`).
+- **Dispatch:** `crates/tokeira-provisioner-cli/src/cli.rs:176` → `revert::revert` (`revert.rs:28`).
 - **Mechanics** (002 configuration-rollback, Req 13.3):
   1. Load envelope; **gate** (`revert.rs:37`).
   2. Refuse a non-prior target (`to_revision >= config_revision`) or an **unretained** one
      (`config_history::is_retained`, `revert.rs:56‑68`).
   3. **Restore** the target revision's retained config source into the live config file
-     (`config_history::restore`, `apps/tkp/src/config_history.rs:79`).
+     (`config_history::restore`, `crates/tokeira-provisioner-cli/src/config_history.rs:85`).
   4. **Reconcile:** `platform::infra_apply` drives the live footprint toward the restored config.
   5. **Re-stamp:** `binding = running`; `config_revision += 1`; `effective_config_ref = config_ref(dir)`;
      snapshot the *new* revision; CAS-save (`revert.rs:86‑94`).
@@ -164,7 +168,7 @@ binding before any mutation, except the `DevIterate` dev path.
 ### 4c. `upgrade`
 
 - **Class:** mutating (identity axis). **Gate:** permits the `Candidate` (running B ≠ recorded A). **Lock:** `"upgrade"`.
-- **Dispatch:** `apps/tkp/src/main.rs:134` → `upgrade::upgrade(&dir)` (`apps/tkp/src/upgrade.rs:25`).
+- **Dispatch:** `crates/tokeira-provisioner-cli/src/cli.rs:181` → `upgrade::upgrade` (`upgrade.rs:25`).
 - **Mechanics** (task 5.3 / 8.4; the only verb that authoritatively advances the engine identity):
   1. Load envelope; require a recorded `A` (**refuse unstamped**, `upgrade.rs:34`).
   2. `evaluate_upgrade(A, B)` → `Refuse` | `VersionedAdvance` | `Promotion`
@@ -172,7 +176,7 @@ binding before any mutation, except the `DevIterate` dev path.
   3. **State-schema migration boundary** (before any mutation): `MigrationRegistry::check_path` refuses an
      unbridged transition; `needs_migration` runs the forward migration and advances `schema_version`
      (`upgrade.rs:57‑67`). *The registry is currently empty, so this is a same-schema no-op.*
-  4. **Atomic ownership transfer** (`transfer_ownership`, `upgrade.rs:101`): `envelope.begin_upgrade(B, …)`
+  4. **Atomic ownership transfer** (`transfer_ownership`, `upgrade.rs:104`): `envelope.begin_upgrade(B, …)`
      (`lib.rs:279`) captures `[A final]` as the `RollbackCheckpoint` (incl. A's integrity, state heads, and
      `from_config_ref`), flips `binding → B`, opens the `UpgradeInFlight` marker (`phase = "ownership-
      transferred"`); then **re-records `integrity` for B** (`running_integrity_manifest`). Persisted in
@@ -195,8 +199,8 @@ binding before any mutation, except the `DevIterate` dev path.
 ### 4d. `rollback`
 
 - **Class:** mutating (identity axis, two-binary). **Gate:** permits the `Rollback` class. **Lock:** `"rollback"`,
-  held **continuously** across the whole sequence (Req 12.2, via the `main.rs:138` wrapper).
-- **Dispatch:** `apps/tkp/src/main.rs:138` → `rollback::rollback(&dir)` (`apps/tkp/src/rollback.rs:27`).
+  held **continuously** across the whole sequence (Req 12.2, via the shell dispatch's wrapper).
+- **Dispatch:** `crates/tokeira-provisioner-cli/src/cli.rs:184` → `rollback::rollback` (`rollback.rs:26`).
 - **Mechanics** (002 upgrade-case algorithm):
   1. Load envelope; **binding gate** — the running binary must be the current engine `B` (`rollback.rs:43`).
   2. **Precondition:** a `[A final]` checkpoint must exist, else fail-closed (`rollback.rs:62`).
@@ -221,15 +225,20 @@ binding before any mutation, except the `DevIterate` dev path.
 
 ## 5. Cross-cutting: crate and function map
 
+Since the task-15 split, the shell lives in `crates/tokeira-provisioner-cli` and each platform ships its
+own provisioner bin target (`platforms/compose-syn` → `tkp-compose`, `platforms/local` → `tkp-local`;
+placed in the deployment as `tkp`).
+
 | Concern | Crate | Symbol (file:line) |
 |---------|-------|--------------------|
-| CLI dispatch, `describe` | `tkp` (`apps/tkp`) | `main.rs:110` (match), `describe` `main.rs:157`, `DescribeReport` `main.rs:207` |
-| Verb bodies | `tkp` | `apply.rs:26`, `revert.rs:28`, `upgrade.rs:25` (`transfer_ownership:101`), `rollback.rs:27` |
-| Config-revision retention | `tkp` | `config_history.rs`: `snapshot:54`, `restore:79`, `is_retained:72`, `config_file:39` |
-| Config content ref | `tkp` | `apply.rs:105` (`config_ref` → `sha256:…`) |
-| Binding gate | `tkp` | `gate.rs` (`evaluate_gate`) |
-| Operation lock wrapper | `tkp` | `lock.rs` (`with_operation_lock`) |
-| Platform dispatch | `tkp` | `platform.rs` (`detect`, `infra_apply`, `Platform`) |
+| CLI dispatch (namespaced verbs) | `tokeira-provisioner-cli` | `cli.rs:135` (match), `run` (the whole per-platform `main`) |
+| `describe` (two views) | `tokeira-provisioner-cli` | `describe.rs:25` (`describe`), `describe.rs:103` (`DescribeReport`) |
+| Verb bodies | `tokeira-provisioner-cli` | `apply.rs:19`, `revert.rs:28`, `upgrade.rs:25` (`transfer_ownership:104`), `rollback.rs:26`, `deploy.rs`, `scale.rs` |
+| Config-revision retention | `tokeira-provisioner-cli` | `config_history.rs`: `config_file:30`, `snapshot:45`, `is_retained:63`, `retained_revisions:69`, `restore:85` |
+| Config content ref / revision restamp | `tokeira-provisioner-cli` | `apply.rs:117` (`config_ref` → `sha256:…`), `apply.rs:89` (`restamp_applied_revision`) |
+| Binding gate | `tokeira-provisioner-cli` | `gate.rs` (`evaluate_gate`) |
+| Operation lock wrapper | `tokeira-provisioner-cli` | `lock.rs` (`with_operation_lock`) |
+| Platform seam + realizations | `tokeira-provisioner-cli`; `platforms/*` | `lib.rs` (`ProvisionerPlatform`, `Realization`); `platforms/compose-syn/src/provisioner.rs` (`ComposeSynPlatform`), `platforms/local/src/provisioner.rs` (`LocalPlatform`) |
 | **Envelope + state-machine** | `tokeira-provisioner` | `lib.rs`: `DeploymentStateEnvelope:214`, `RollbackCheckpoint:155`, `Operation:181`, `begin_upgrade:279`, `begin_rollback:320`, `complete_rollback:345`, `close_operation:351`, `ProvenanceStamp::current:91` |
 | Upgrade decision | `tokeira-provisioner` | `upgrade.rs:16` (`UpgradeDecision`), `:26` (`evaluate_upgrade`) |
 | State-schema migration | `tokeira-provisioner` | `MigrationRegistry` (`check_path`, `needs_migration`) |
@@ -245,7 +254,7 @@ The concrete gaps, mapped to [tasks.md](./tasks.md) task 19:
 
 | # | Verb | Missing | Task |
 |---|------|---------|------|
-| 1 | `describe` | The **two views** — split the single view into short *operator* (default) and *verification/debug* (`--verbose`) with the full per-artifact manifest, `EngineIdentity` (task 16), snapshot ref (task 17), retained-revision list. | 19.1 |
+| 1 | `describe` | Two views **built** (task 15.3); remaining: the `EngineIdentity` fields (task 16) and source-snapshot ref (task 17) joining the verification view. | 19.1 |
 | 2 | `upgrade` | **Real cross-engine re-provisioning** through the platform seam (vs local's empty apply); a **populated `MigrationRegistry`**; the ids-only **audit change log**; the **advisory baseline drift gate** (Req 4.7). | 19.2 |
 | 3 | `rollback` | The **two-binary orchestration** — `tkr` relaunches A for the reconcile after B's re-pin (today B does it all in-process); the real **`destroy_selected`** delete-only over live resources; **both-binary checksum** verification; lock held across the relaunch boundary. | 19.3 |
 | 4 | `rollback` | **Restore of R_a's config *source*.** `begin_rollback` restores the `effective_config_ref` *pointer* from the checkpoint, but the live config **source file** is not restored before A reconciles — so A's forward-apply toward R_a is not yet driven by R_a's source (moot for local's empty apply; required for a real platform). Part of the two-binary work. | 19.3 |

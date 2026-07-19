@@ -420,12 +420,15 @@ identity names precisely what it provisions, and "what produced this deployment"
 #### Acceptance Criteria
 
 1. A `tkp` SHALL be composed of **the IaC engine + resource providers + exactly one deployment platform**
-   (that platform's kind library, builder vocabulary, and `.tkd` interpreter). The target SHALL NOT be a
-   single multi-platform provisioner; `apps/tkp`'s current `local`+`compose-syn` bundling is transitional.
+   (that platform's kind library, builder vocabulary, and `.tkd` interpreter). It SHALL NOT be a
+   single multi-platform provisioner (the once-bundled `apps/tkp` is retired).
 2. THE platform-agnostic provisioner surface — lifecycle verbs, binding gate, operation lock, state
    envelope, `describe`, config-revision machinery — SHALL live in a shared library
-   (`tokeira-provisioner-cli`), and each per-platform binary SHALL inject its platform through a narrow
-   seam (`ProvisionerPlatform`: `infra_plan|apply|destroy`) and link **only** that platform's crates.
+   (`tokeira-provisioner-cli`), and **the platform SHALL ship its own provisioner**: the per-platform
+   binary is a bin target of the platform crate (`platforms/compose-syn` → `tkp-compose`,
+   `platforms/local` → `tkp-local`) that injects its realization through the `ProvisionerPlatform` seam
+   (`infra_plan|apply|destroy`, `deploy_plan|apply`, `scale`) and links **only** that platform's crates —
+   no dedicated `apps/tkp-<platform>` crates.
 3. A deployment's recorded provenance SHALL be exactly three parts: **(a) engine identity** (the IaC engine
    + resource providers, as a source closure), **(b) platform** (kind library + builder vocabulary +
    interpreter), **(c) deployment definition** (the `.tkd`, digested). (a)+(b) are compiled into `tkp` and

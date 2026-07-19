@@ -23,20 +23,30 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokeira_state::{SnapshotRef, StateError, Validate};
 
+pub mod admission;
 pub mod binary_store;
 pub mod binding;
+pub mod identity;
 pub mod integrity;
 pub mod migration;
 pub mod upgrade;
 mod version;
+pub use admission::{AdmissionError, RevocationList, admit_artifact};
 pub use binary_store::{BinaryError, BinaryStore};
 pub use binding::{BindingVerdict, check_binding};
+pub use identity::{AuthorityTier, BuildAuthority, BuildProfile, EngineIdentity};
 pub use integrity::{ChecksumFormatError, IntegrityError, Sha256Digest, sha256_hex};
-pub use migration::{MigrationError, MigrationRegistry};
+pub use migration::{MigrationError, MigrationRegistry, envelope_migrations};
 pub use upgrade::{UpgradeDecision, evaluate_upgrade};
 
 /// Current `DeploymentStateEnvelope` schema version.
-pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (task 16.2): the integrity manifest is keyed by [`EngineIdentity`] —
+/// it gains `engine_identity` + `authority`, and per-artifact `version` is
+/// gone. v1 documents deserialize compatibly (the new fields default; the
+/// stale key is ignored); the canonical registry
+/// ([`migration::envelope_migrations`]) bridges 1 → 2 at the upgrade boundary.
+pub const ENVELOPE_SCHEMA_VERSION: u32 = 2;
 
 /// How a provisioner binary was built. Only [`Versioned`](Self::Versioned) is
 /// authoritative; a `Dev` build is an advisory local iteration.
@@ -99,10 +109,11 @@ impl ProvenanceStamp {
     }
 }
 
-/// One binary artifact for one target, addressed by content hash.
+/// One binary artifact for one target, addressed by content hash. Its key half
+/// is the enclosing manifest's [`engine_identity`](IntegrityManifest::engine_identity)
+/// — the artifact carries no version of its own (task 16.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryArtifactDescriptor {
-    pub version: String,
     pub target: Target,
     pub sha256: String,
     /// Optional retrieval pointer (e.g. an S3 key) when the blob is stored.
@@ -110,13 +121,25 @@ pub struct BinaryArtifactDescriptor {
     pub size_bytes: u64,
 }
 
-/// The set of binary artifacts a provisioner version publishes, across targets.
+/// The set of binary artifacts one engine publishes, across targets — keyed by
+/// `EngineIdentity × target` (task 16.2), with the semver kept as a
+/// human-facing label only.
 ///
 /// CAS-guarded in the envelope; cannot be silently rewritten. Carries **all**
 /// targets because a rollback may run from a different operator platform than the
 /// one that performed the upgrade.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct IntegrityManifest {
+    /// The closure-scoped engine identity of these artifacts (task 16.1).
+    /// `None` is a pre-identity manifest — a native dev build, whose closure
+    /// inputs exist only once the source snapshot (task 17) supplies them.
+    /// There are no partially-known identities.
+    #[serde(default)]
+    pub engine_identity: Option<EngineIdentity>,
+    /// Who built the bytes. Defaults to the lowest tier — trust is recorded
+    /// explicitly by the build pipeline, never assumed (Proposal 005).
+    #[serde(default)]
+    pub authority: BuildAuthority,
     pub provisioner_version: String,
     pub artifacts: Vec<BinaryArtifactDescriptor>,
 }
@@ -351,6 +374,19 @@ impl DeploymentStateEnvelope {
     pub fn close_operation(&mut self) {
         self.operation = None;
     }
+
+    /// Stamp the current schema version before a mutating save.
+    ///
+    /// Serde reads older envelope shapes compatibly, but re-serializing always
+    /// emits the **current** shape — so the claimed `schema_version` must
+    /// follow the bytes or the document lies to older readers. Every mutating
+    /// verb calls this before its save: a dev deployment thereby advances
+    /// shape freely inside the `DevIterate` loop, while a versioned deployment
+    /// only reaches a mutating save through `upgrade`, where the migration
+    /// registry gates the schema transition first.
+    pub fn stamp_current_schema(&mut self) {
+        self.schema_version = ENVELOPE_SCHEMA_VERSION;
+    }
 }
 
 #[cfg(test)]
@@ -409,9 +445,21 @@ mod tests {
                     .with_timezone(&Utc),
             }),
             integrity: Some(IntegrityManifest {
+                engine_identity: Some(EngineIdentity {
+                    source_closure: Sha256Digest::from_bytes(b"src"),
+                    lock_closure: Sha256Digest::from_bytes(b"lock"),
+                    toolchain: "rustc 1.88.0".into(),
+                    build_container: None,
+                    features: ["provisioner".to_string()].into(),
+                    profile: identity::BuildProfile::Dist,
+                }),
+                authority: BuildAuthority::TrustedCi {
+                    provider: "buildkite".into(),
+                    build_id: "b-42".into(),
+                    source_commit: "abc123".into(),
+                },
                 provisioner_version: "1.2.3".into(),
                 artifacts: vec![BinaryArtifactDescriptor {
-                    version: "1.2.3".into(),
                     target: Target("aarch64-unknown-linux-musl".into()),
                     sha256: "cafe".into(),
                     retrieval_ref: Some("s3://bin/1.2.3".into()),
@@ -494,11 +542,11 @@ mod tests {
         };
         let manifest_a = IntegrityManifest {
             provisioner_version: "1.0.0".into(),
-            artifacts: vec![],
+            ..Default::default()
         };
         let manifest_b = IntegrityManifest {
             provisioner_version: "2.0.0".into(),
-            artifacts: vec![],
+            ..Default::default()
         };
         // Post-upgrade envelope: bound to B (with B's re-recorded integrity
         // manifest), checkpoint holds [A final].
@@ -545,6 +593,53 @@ mod tests {
     fn begin_rollback_without_checkpoint_errors() {
         let mut env = DeploymentStateEnvelope::default();
         assert!(env.begin_rollback("op", Utc::now()).is_err());
+    }
+
+    // A v1 envelope document (per-artifact `version`, no `engine_identity` /
+    // `authority`) must keep loading under the v2 shape: the stale key is
+    // ignored and the new fields take their safe defaults (no identity;
+    // lowest-tier authority).
+    #[test]
+    fn v1_envelope_documents_deserialize_compatibly() {
+        let v1 = serde_json::json!({
+            "schema_version": 1,
+            "deployment_id": "dep-legacy",
+            "binding": null,
+            "integrity": {
+                "provisioner_version": "0.1.0",
+                "artifacts": [{
+                    "version": "0.1.0",
+                    "target": "aarch64-apple-darwin",
+                    "sha256": "cafe",
+                    "retrieval_ref": null,
+                    "size_bytes": 7
+                }]
+            },
+            "config_revision": 3,
+            "checkpoint": null,
+            "operation": null,
+            "lock": null,
+            "infra_head": null,
+            "runtime_head": null,
+            "effective_config_ref": null
+        });
+        let env: DeploymentStateEnvelope =
+            serde_json::from_value(v1).expect("v1 document loads under the v2 shape");
+        env.validate().expect("older schema versions stay readable");
+        let manifest = env.integrity.expect("manifest kept");
+        assert!(manifest.engine_identity.is_none(), "no identity is Unknown");
+        assert_eq!(manifest.authority, BuildAuthority::LocalDeveloper);
+        assert_eq!(manifest.artifacts[0].sha256, "cafe");
+    }
+
+    #[test]
+    fn stamp_current_schema_advances_a_loaded_v1_envelope() {
+        let mut env = DeploymentStateEnvelope {
+            schema_version: 1,
+            ..Default::default()
+        };
+        env.stamp_current_schema();
+        assert_eq!(env.schema_version, ENVELOPE_SCHEMA_VERSION);
     }
 
     #[test]

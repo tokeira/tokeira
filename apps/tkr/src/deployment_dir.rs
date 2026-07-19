@@ -51,7 +51,13 @@ pub(crate) const METADATA_JSON: &str = "metadata.json";
 pub(crate) const LATEST_FILE: &str = ".latest";
 /// The deployment-local provisioner binary — the `tkp` married to this
 /// deployment, placed at create and preferred by the launcher over any on `PATH`.
+/// The provisioner's name **inside a deployment dir** — always `tkp`,
+/// regardless of which platform's binary it is (Req 14.4).
 pub(crate) const PROVISIONER_BIN: &str = "tkp";
+/// The per-platform **source** binary `create` resolves and copies in: the
+/// `tkp-compose` bin target of `platforms/compose-syn` (all forwarded
+/// deployments are compose today).
+pub(crate) const PROVISIONER_SOURCE_BIN: &str = "tkp-compose";
 
 /// Resolves deployment names to on-disk paths and mediates the `.latest`
 /// selection sentinel.
@@ -147,17 +153,29 @@ impl DeploymentResolver {
     /// `tkp` on `PATH`, so the binary that mutates the deployment is exactly the
     /// one married to it at create.
     ///
-    /// Transitional: resolves the installed `tkp` and copies its bytes; the
-    /// per-platform build/obtain + integrity stamping is the provisioner-binary
-    /// work (Proposal 005). Errors clearly when no `tkp` is installed — a forwarded
-    /// (`.tkd`) deployment cannot be driven without its provisioner.
+    /// Phase 0 (native-cargo dev binding, Proposal 005): resolves the
+    /// **per-platform source binary** (`tkp-compose`, a bin target of
+    /// `platforms/compose-syn` — the platform ships its own provisioner) and
+    /// copies its bytes in as `tkp`. Resolution order: installed on PATH, then
+    /// the running `tkr`'s own directory (a dev `tkr` in `target/debug` finds
+    /// its sibling `tkp-compose` from the same build). The hermetic
+    /// build/obtain + bundle verification supersede this (tasks 16-18).
     pub(crate) fn place_provisioner(&self, name: &str) -> Result<()> {
-        let source = which::which(PROVISIONER_BIN).map_err(|_| {
-            anyhow!(
-                "cannot introduce the compose provisioner: no `{PROVISIONER_BIN}` found on PATH. \
-                 Install it (e.g. `cargo install --path apps/tkp`) and re-run `tkr deployment create`."
-            )
-        })?;
+        let source = which::which(PROVISIONER_SOURCE_BIN)
+            .ok()
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| Some(exe.parent()?.join(PROVISIONER_SOURCE_BIN)))
+                    .filter(|sibling| sibling.is_file())
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot introduce the compose provisioner: no `{PROVISIONER_SOURCE_BIN}` on \
+                     PATH or beside this `tkr`. Build it (`cargo build -p tokeira-compose-syn \
+                     --bin {PROVISIONER_SOURCE_BIN}`) and re-run `tkr deployment create`."
+                )
+            })?;
         let dest = self.path(name).join(PROVISIONER_BIN);
         fs::copy(&source, &dest).with_context(|| {
             format!("failed to copy {} -> {}", source.display(), dest.display())

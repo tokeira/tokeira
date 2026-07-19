@@ -19,12 +19,14 @@ use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
 use crate::{
-    envelope_store,
+    ProvisionerPlatform, envelope_store,
     gate::{GateOutcome, evaluate_gate},
-    platform,
 };
 
-pub(crate) async fn rollback(deployment_dir: &Path) -> Result<()> {
+pub(crate) async fn rollback<P: ProvisionerPlatform>(
+    platform: &P,
+    deployment_dir: &Path,
+) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, mut version) = store
@@ -71,9 +73,9 @@ pub(crate) async fn rollback(deployment_dir: &Path) -> Result<()> {
     );
 
     // ── B deletes what it created (keys(S_B) − keys(S_A)) ──
-    // The local platform has no infra resources, so the delete-only pass is
-    // empty; `Engine::destroy_selected` wires here for real platforms.
-    println!("B delete-only: 0 resource(s) (local platform has no infra resources)");
+    // The real delete-only pass (`Engine::destroy_selected` over live resources)
+    // lands with the two-binary orchestration (task 19.3); today it is empty.
+    println!("B delete-only: 0 resource(s) (delete-only pass lands with task 19.3)");
 
     // ── Re-pin to A — one CAS commit ──
     // `begin_rollback` restores A's binding, integrity manifest (it must always
@@ -82,6 +84,7 @@ pub(crate) async fn rollback(deployment_dir: &Path) -> Result<()> {
     envelope
         .begin_rollback(operation_id, Utc::now())
         .map_err(|e| anyhow::anyhow!(e))?;
+    envelope.stamp_current_schema();
     version = store
         .save(&envelope, &version)
         .await
@@ -92,7 +95,7 @@ pub(crate) async fn rollback(deployment_dir: &Path) -> Result<()> {
     );
 
     // ── A forward-reconciles toward its retained prior configuration revision ──
-    let change_count = platform::infra_apply(deployment_dir).await?;
+    let change_count = platform.infra_apply(deployment_dir).await?;
     println!("A reconcile (re-apply retained revision): {change_count} change(s)");
 
     // ── Complete: clear the marker and consume the checkpoint ──
@@ -108,6 +111,7 @@ pub(crate) async fn rollback(deployment_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestPlatform;
     use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, ProvenanceStamp};
 
     #[tokio::test]
@@ -138,7 +142,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = rollback(tmp.path())
+        let err = rollback(&TestPlatform, tmp.path())
             .await
             .expect_err("a mismatched running binary is refused");
         assert!(
@@ -167,7 +171,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = rollback(tmp.path())
+        let err = rollback(&TestPlatform, tmp.path())
             .await
             .expect_err("no checkpoint refuses");
         assert!(
@@ -184,12 +188,12 @@ mod tests {
             IntegrityManifest {
                 provisioner_version: "1.0.0".to_string(),
                 artifacts: vec![BinaryArtifactDescriptor {
-                    version: "1.0.0".to_string(),
                     target: Target("x".to_string()),
                     sha256: sha.to_string(),
                     retrieval_ref: None,
                     size_bytes: 1,
                 }],
+                ..Default::default()
             }
         }
 
@@ -215,7 +219,9 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        rollback(tmp.path()).await.expect("rollback succeeds");
+        rollback(&TestPlatform, tmp.path())
+            .await
+            .expect("rollback succeeds");
 
         let (after, _) = store.load().await.unwrap();
         assert_eq!(

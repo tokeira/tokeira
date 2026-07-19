@@ -19,13 +19,17 @@ use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
 use crate::{
+    ProvisionerPlatform,
     apply::config_ref,
     config_history, envelope_store,
     gate::{GateOutcome, evaluate_gate},
-    platform,
 };
 
-pub(crate) async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()> {
+pub(crate) async fn revert<P: ProvisionerPlatform>(
+    platform: &P,
+    deployment_dir: &Path,
+    to_revision: u64,
+) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, version) = store
@@ -53,6 +57,7 @@ pub(crate) async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()
     }
 
     // ── Target must be a prior, retained revision ──
+    let config_basename = platform.config_basename(deployment_dir);
     if to_revision >= envelope.config_revision {
         anyhow::bail!(
             "cannot revert to config revision {to_revision}: the current revision is {} \
@@ -60,7 +65,7 @@ pub(crate) async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()
             envelope.config_revision
         );
     }
-    if !config_history::is_retained(deployment_dir, to_revision) {
+    if !config_history::is_retained(deployment_dir, config_basename, to_revision) {
         anyhow::bail!(
             "config revision {to_revision} was not retained; only revisions produced by a prior \
              `init`/`apply` can be reverted to"
@@ -68,26 +73,26 @@ pub(crate) async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()
     }
 
     // ── Restore the retained revision's config source, then reconcile ──
-    config_history::restore(deployment_dir, to_revision)
+    config_history::restore(deployment_dir, config_basename, to_revision)
         .context("failed to restore the target config revision")?;
-    let resolved = platform::detect(deployment_dir);
     println!(
         "restored config revision {to_revision} → {}",
-        config_history::config_file(deployment_dir).display()
+        config_history::config_file(deployment_dir, config_basename).display()
     );
 
-    let change_count = platform::infra_apply(deployment_dir).await?;
+    let change_count = platform.infra_apply(deployment_dir).await?;
     println!(
         "[{}] revert reconcile: {change_count} change(s)",
-        resolved.label()
+        platform.label(deployment_dir)
     );
 
     // ── Re-stamp: a forward config revision whose content equals `to_revision` ──
     envelope.binding = Some(running);
     envelope.config_revision += 1;
-    envelope.effective_config_ref = Some(config_ref(deployment_dir));
-    config_history::snapshot(deployment_dir, envelope.config_revision)
+    envelope.effective_config_ref = Some(config_ref(deployment_dir, config_basename));
+    config_history::snapshot(deployment_dir, config_basename, envelope.config_revision)
         .context("failed to retain the reverted config revision")?;
+    envelope.stamp_current_schema();
     store
         .save(&envelope, &version)
         .await
@@ -102,6 +107,7 @@ pub(crate) async fn revert(deployment_dir: &Path, to_revision: u64) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestPlatform;
     use tokeira_provisioner::DeploymentStateEnvelope;
 
     #[tokio::test]
@@ -117,7 +123,7 @@ mod tests {
         store.save(&env, &v).await.unwrap();
 
         // Reverting to the current (or a future) revision is rejected.
-        let err = revert(tmp.path(), 2)
+        let err = revert(&TestPlatform, tmp.path(), 2)
             .await
             .expect_err("revert to current revision refuses");
         assert!(err.to_string().contains("prior"), "unexpected: {err}");
@@ -135,7 +141,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = revert(tmp.path(), 1)
+        let err = revert(&TestPlatform, tmp.path(), 1)
             .await
             .expect_err("no snapshot for revision 1 → refuse");
         assert!(
@@ -146,11 +152,13 @@ mod tests {
 
     #[tokio::test]
     async fn revert_restores_a_prior_local_revision_and_advances_forward() {
-        // Full flow on the local platform (empty infra apply): init → apply → apply
-        // builds two retained revisions with distinct config, then revert to the
-        // first restores its config and advances the counter forward.
+        // Full flow through the shell (empty test-platform apply): init → apply →
+        // apply builds two retained revisions with distinct config, then revert to
+        // the first restores its config and advances the counter forward.
         let tmp = tempfile::tempdir().unwrap();
-        crate::init::init(tmp.path()).await.expect("init");
+        crate::init::init(&TestPlatform, tmp.path())
+            .await
+            .expect("init");
 
         // Revision 1: a deployment.toml with project "one".
         std::fs::write(
@@ -158,7 +166,9 @@ mod tests {
             "project_name = \"one\"\n",
         )
         .unwrap();
-        crate::apply::apply(tmp.path()).await.expect("apply rev 1");
+        crate::apply::apply(&TestPlatform, tmp.path())
+            .await
+            .expect("apply rev 1");
 
         // Revision 2: change the config source.
         std::fs::write(
@@ -166,12 +176,16 @@ mod tests {
             "project_name = \"two\"\n",
         )
         .unwrap();
-        crate::apply::apply(tmp.path()).await.expect("apply rev 2");
+        crate::apply::apply(&TestPlatform, tmp.path())
+            .await
+            .expect("apply rev 2");
 
         let (before, _) = envelope_store(tmp.path()).load().await.unwrap();
         assert_eq!(before.config_revision, 2);
 
-        revert(tmp.path(), 1).await.expect("revert to revision 1");
+        revert(&TestPlatform, tmp.path(), 1)
+            .await
+            .expect("revert to revision 1");
 
         // The live config source now holds revision 1's content...
         let restored = std::fs::read_to_string(tmp.path().join("deployment.toml")).unwrap();

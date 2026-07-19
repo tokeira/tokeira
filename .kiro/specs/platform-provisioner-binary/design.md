@@ -94,14 +94,12 @@ that dir, the same bytes always operate the same deployment. Which binary actual
 bound, candidate-upgrade, dev-candidate, or rollback — is decided by **launch class**
 (§Command surfaces and launch classes).
 
-> The current `apps/tkp` surface is transitional: a **flat** verb list (`tkp plan`, `tkp apply`,
-> `tkp destroy`, …) that still carries an `init` verb. Task 15.2 reshapes it into the namespaced tree above
-> and folds `init` into inception, as part of extracting `tokeira-provisioner-cli`.
-
 ## Architecture
 
-`tkp` is a new binary crate (`apps/tkp`) spanning the engine-decoupled crates: `tokeira-iac` (engine),
-`tokeira-deploy-engine`, `tokeira-orchestrator`, `tokeira-aws`, the platform crates, and `tokeira-state`.
+`tkp` is `tokeira-provisioner-cli` (the platform-agnostic shell) composed with one platform's
+realization — **a bin target of the platform crate** (`platforms/compose-syn` → `tkp-compose`), spanning
+the engine-decoupled crates: `tokeira-iac` (engine), `tokeira-deploy-engine`, `tokeira-orchestrator`,
+`tokeira-aws`, the platform crates, and `tokeira-state`.
 The work sits at three seams and touches no durable-execution engine crate (kernel/runtime/storage):
 
 - **State (`tokeira-state`).** A deployment-level state envelope binds provenance, integrity, the rollback
@@ -602,11 +600,19 @@ platform-realized surface. So:
   `infra_plan|apply|destroy`, `deploy_plan|apply`, `scale` (each able to return `NotApplicable`) — plus
   `label`. It depends on `tokeira-provisioner` (the domain library: stamps,
   binding, integrity, migration) — the shell is a distinct layer, not folded in.
-- **`apps/tkp-compose`** (bin, `tkp-compose`) = `tokeira-provisioner-cli` + a `ComposePlatform` impl of the
-  seam + `tokeira-compose-syn`/`-compose`/`-iac`/`-orchestrator`. **No `local`.** `apps/tkp-local` mirrors
-  it for the `local` exception. The current bundled `apps/tkp` retires.
+- **The platform ships its own provisioner** — no dedicated `apps/tkp-<platform>` crates. Each platform
+  crate carries a provisioner **bin target** composed from the shell: `platforms/compose-syn` has
+  `[[bin]] tkp-compose` (`src/bin/tkp.rs` + a `provisioner` module implementing the seam — the `.tkd`
+  load/validate, the Bollard handle registration, the engine wiring). `platforms/local` mirrors it with
+  `tkp-local` (the in-process exception platform; its binary exercises the real shell end to end without
+  Docker). The seam impl lives *with the platform it realizes*, and "`tkr` compiles `tkp` from
+  `platforms/<platform>`" is literal: Phase-0 inception resolves an installed `tkp-compose`, the running
+  `tkr`'s sibling artifact, or `cargo build -p tokeira-compose-syn --bin tkp-compose`. The once-bundled
+  `apps/tkp` is retired.
 
-**Naming and placement.** The source binaries are per-platform (`tkp-compose`, `tkp-local`).
+**Naming and placement.** Bin-target names are per-platform and workspace-unique (`tkp-compose`,
+`tkp-local`) because sibling artifacts share one `target/` dir; the **placed** binary is always
+`<deployment>/tkp` (Req 14.4), and each binary's own CLI reports itself as `tkp`.
 `tkr deployment create --platform compose` resolves `tkp-compose`, copies it to `<deployment>/tkp`, and the
 launcher runs `<deployment>/tkp` (Req 6.5; the deployment-married provisioner).
 

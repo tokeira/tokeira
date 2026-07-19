@@ -87,8 +87,26 @@ pub enum ChecksumFormatError {
 /// A parsed SHA-256 digest — a fixed 32 bytes, so comparison is over the decoded
 /// value rather than a hex string (which could differ by case/padding while
 /// naming the same digest).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Serializes as the canonical lowercase hex form; deserialization is strict
+/// ([`parse_manifest_hex`](Self::parse_manifest_hex)), so a malformed digest is
+/// rejected at the serde boundary rather than surviving as an unparseable
+/// string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sha256Digest([u8; 32]);
+
+impl serde::Serialize for Sha256Digest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Sha256Digest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse_manifest_hex(&raw).map_err(serde::de::Error::custom)
+    }
+}
 
 impl Sha256Digest {
     /// Parse a manifest checksum string. The manifest format is a canonical
@@ -234,7 +252,6 @@ mod tests {
 
     fn descriptor(bytes: &[u8], target: &str) -> BinaryArtifactDescriptor {
         BinaryArtifactDescriptor {
-            version: "1.0.0".to_string(),
             target: Target(target.to_string()),
             sha256: sha256_hex(bytes),
             retrieval_ref: None,
@@ -246,6 +263,7 @@ mod tests {
         IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![descriptor(bytes, target)],
+            ..Default::default()
         }
     }
 
@@ -264,12 +282,12 @@ mod tests {
         let m = IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![BinaryArtifactDescriptor {
-                version: "1.0.0".to_string(),
                 target: Target("t".to_string()),
                 sha256: sha256_hex(b"aaaa"),
                 retrieval_ref: None,
                 size_bytes: 4,
             }],
+            ..Default::default()
         };
         let err = m
             .verify_artifact(b"bbbb", &Target("t".to_string()))
@@ -295,12 +313,12 @@ mod tests {
         let m = IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![BinaryArtifactDescriptor {
-                version: "1.0.0".to_string(),
                 target: Target("t".to_string()),
                 sha256: sha256_hex(bytes),
                 retrieval_ref: None,
                 size_bytes: 0,
             }],
+            ..Default::default()
         };
         m.verify_artifact(bytes, &Target("t".to_string()))
             .expect("unrecorded size skips the size check and verifies by digest");
@@ -323,6 +341,7 @@ mod tests {
         let m = IntegrityManifest {
             provisioner_version: "1.0.0".to_string(),
             artifacts: vec![descriptor(bytes, target), descriptor(bytes, target)],
+            ..Default::default()
         };
         // The verification path is self-defending — it does not rely on validate().
         let err = m
@@ -358,12 +377,12 @@ mod tests {
             let m = IntegrityManifest {
                 provisioner_version: "1.0.0".to_string(),
                 artifacts: vec![BinaryArtifactDescriptor {
-                    version: "1.0.0".to_string(),
                     target: Target("t".to_string()),
                     sha256: raw.clone(),
                     retrieval_ref: None,
                     size_bytes: 0,
                 }],
+                ..Default::default()
             };
             match m.validate() {
                 Err(IntegrityError::InvalidChecksumFormat { reason, .. }) => {

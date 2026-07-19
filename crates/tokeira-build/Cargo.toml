@@ -9,8 +9,10 @@ authors.workspace = true
 description = "Image build, publish, and mirror pipelines for Tokeira"
 
 [dependencies]
+cargo_metadata.workspace = true
 dagger-client.workspace = true
 eyre.workspace = true
+gix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

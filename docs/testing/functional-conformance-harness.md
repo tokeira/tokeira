@@ -61,9 +61,11 @@ this repository; `<temporal-fork>` is the pinned Temporal fork checkout.
 runner pins it explicitly (`GOTOOLCHAIN=go1.26.2`) for every `go test` it spawns; set the same env for
 any manual command below.
 
-**Out-of-scope skips.** A small, curated set of corpus tests cannot run against an out-of-process
-`tokeirad` (they depend on `OverrideDynamicConfig`, which the harness cannot deliver to it) or touch an
-internal surface the Shape-2 onebox does not front. These are registered by name in
+**Out-of-scope skips.** A small, curated set of corpus tests touches an internal surface the Shape-2
+onebox does not front or depends on an override key that is deliberately unwired, kernel-excluded,
+or not enforced. Supported `OverrideDynamicConfig` values are delivered to a conformance-enabled
+out-of-process `tokeirad`; this includes static suite-level overrides applied while the Shape-2
+cluster is constructed as well as test-scoped changes. Remaining exclusions are registered by name in
 `tests/testcore/tokeira_conformance_skip.go` with a cited reason — **never** by editing a corpus test
 body. The registry is applied two ways: the shared `SetupTest`/`SetupSubTest` hooks skip whole methods
 and `s.Run` sub-tests, and the run-all runner additionally derives a `go test -skip` regexp from the
@@ -133,9 +135,10 @@ Fixes derived from a conformance run are bound by these rules:
   default is represented as the pinned-release default as a hardcoded constant. It becomes real
   Tokeira config only when it is a genuine deployment policy *and* the fixed default would be
   operationally wrong — and then it is raised as a deliberate decision, not added silently.
-- **Feature modes are independent runs.** A non-default behavioural mode Tokeira claims is exercised
-  by booting `tokeirad` in that mode and running the corpus (or its subset) as a separate, tagged
-  run — not by injecting per-test dynamic-config overrides.
+- **Feature modes are independent runs.** A non-default behavioural mode that cannot be represented
+  by a supported live conformance override is exercised by booting `tokeirad` in that mode and
+  running the corpus (or its subset) as a separate, tagged run. Wired runtime policy values continue
+  to use the scoped override bridge so the corpus can exercise their boundaries and transitions.
 - **Raise ambiguity; do not guess.** A wrong guess behind a green check bakes in non-conformance.
 
 ## Compatibility pin

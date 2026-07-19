@@ -222,6 +222,35 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
+    // Worker Deployment admission and drainage are runtime-registry policy. The
+    // v1.31.0 corpus overrides these limits/intervals to exercise boundary and
+    // lifecycle behavior without changing the production defaults
+    // (`common/dynamicconfig/constants.go:492-503,1380-1396 @ v1.31.0`).
+    KeySpec {
+        key: "matching.maxVersionsInDeployment",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "matching.maxTaskQueuesInDeploymentVersion",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "matching.PollerHistoryTTL",
+        value_type: ValueType::Duration,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "matching.wv.VersionDrainageStatusVisibilityGracePeriod",
+        value_type: ValueType::Duration,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "matching.wv.VersionDrainageStatusRefreshInterval",
+        value_type: ValueType::Duration,
+        disposition: Disposition::Wired,
+    },
     // Callback limits are frontend admission policy, read live before a start is
     // translated into runtime state (`validateWorkflowCompletionCallbacks`,
     // service/frontend/workflow_handler.go:6300-6350 @ v1.31.0).
@@ -487,6 +516,19 @@ mod tests {
         "frontend.enableTokenNamespaceEnforcement",
         "system.enableCrossNamespaceCommands",
     ];
+    const WORKER_DEPLOYMENT_KEYS: &[(&str, ValueType)] = &[
+        ("matching.maxVersionsInDeployment", ValueType::Int),
+        ("matching.maxTaskQueuesInDeploymentVersion", ValueType::Int),
+        ("matching.PollerHistoryTTL", ValueType::Duration),
+        (
+            "matching.wv.VersionDrainageStatusVisibilityGracePeriod",
+            ValueType::Duration,
+        ),
+        (
+            "matching.wv.VersionDrainageStatusRefreshInterval",
+            ValueType::Duration,
+        ),
+    ];
 
     /// The classification table is internally consistent: keys are unique, and
     /// the reported-problems threshold — the proving wired consumer — is present
@@ -512,6 +554,11 @@ mod tests {
             let auth = classification(key).expect("authorization key classified");
             assert_eq!(auth.disposition, Disposition::Wired);
             assert_eq!(auth.value_type, ValueType::Bool);
+        }
+        for (key, value_type) in WORKER_DEPLOYMENT_KEYS {
+            let deployment = classification(key).expect("worker deployment key classified");
+            assert_eq!(deployment.disposition, Disposition::Wired);
+            assert_eq!(deployment.value_type, *value_type);
         }
     }
 

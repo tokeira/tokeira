@@ -45,7 +45,10 @@ use crate::WorkerRegistry;
 const MAX_CAS_ATTEMPTS: usize = 32;
 const MAX_DEPLOYMENT_PAGE_SIZE: usize = 100;
 const MAX_VERSIONS_PER_DEPLOYMENT: usize = 100;
+const MAX_TASK_QUEUE_FAMILIES_PER_VERSION: usize = 100;
 const ACTIVE_POLLER_WINDOW: Duration = Duration::minutes(5);
+const DRAINAGE_VISIBILITY_GRACE_PERIOD: Duration = Duration::minutes(3);
+const DRAINAGE_REFRESH_INTERVAL: Duration = Duration::minutes(3);
 /// Reserved version string for unversioned workers; a `version` field carrying this
 /// (or empty) resolves to a nil Version rather than a real `(deployment, build_id)`
 /// pair (`common/worker_versioning/worker_versioning.go:1103 @ v1.31.0`).
@@ -59,6 +62,71 @@ const UNVERSIONED_VERSION_SENTINEL: &str = "__unversioned__";
 /// provenance (`service/worker/workerdeployment/util.go:108` +
 /// `client.go:1230 @ v1.31.0`).
 const AUTO_CREATE_REQUEST_ID_PREFIX: &str = "_auto_create_";
+
+#[cfg(not(feature = "conformance"))]
+fn max_versions_per_deployment() -> usize {
+    MAX_VERSIONS_PER_DEPLOYMENT
+}
+
+#[cfg(feature = "conformance")]
+fn max_versions_per_deployment() -> usize {
+    tokeira_conformance::overrides()
+        .get_i64("matching.maxVersionsInDeployment")
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(MAX_VERSIONS_PER_DEPLOYMENT)
+}
+
+#[cfg(not(feature = "conformance"))]
+fn max_task_queue_families_per_version() -> usize {
+    MAX_TASK_QUEUE_FAMILIES_PER_VERSION
+}
+
+#[cfg(feature = "conformance")]
+fn max_task_queue_families_per_version() -> usize {
+    tokeira_conformance::overrides()
+        .get_i64("matching.maxTaskQueuesInDeploymentVersion")
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(MAX_TASK_QUEUE_FAMILIES_PER_VERSION)
+}
+
+#[cfg(not(feature = "conformance"))]
+fn active_poller_window() -> Duration {
+    ACTIVE_POLLER_WINDOW
+}
+
+#[cfg(feature = "conformance")]
+fn active_poller_window() -> Duration {
+    tokeira_conformance::overrides()
+        .get_duration("matching.PollerHistoryTTL")
+        .and_then(|value| Duration::try_from(value).ok())
+        .unwrap_or(ACTIVE_POLLER_WINDOW)
+}
+
+#[cfg(not(feature = "conformance"))]
+fn drainage_visibility_grace_period() -> Duration {
+    DRAINAGE_VISIBILITY_GRACE_PERIOD
+}
+
+#[cfg(feature = "conformance")]
+fn drainage_visibility_grace_period() -> Duration {
+    tokeira_conformance::overrides()
+        .get_duration("matching.wv.VersionDrainageStatusVisibilityGracePeriod")
+        .and_then(|value| Duration::try_from(value).ok())
+        .unwrap_or(DRAINAGE_VISIBILITY_GRACE_PERIOD)
+}
+
+#[cfg(not(feature = "conformance"))]
+fn drainage_refresh_interval() -> Duration {
+    DRAINAGE_REFRESH_INTERVAL
+}
+
+#[cfg(feature = "conformance")]
+fn drainage_refresh_interval() -> Duration {
+    tokeira_conformance::overrides()
+        .get_duration("matching.wv.VersionDrainageStatusRefreshInterval")
+        .and_then(|value| Duration::try_from(value).ok())
+        .unwrap_or(DRAINAGE_REFRESH_INTERVAL)
+}
 
 /// Clock used by the registry to stamp caller-visible state transitions.
 pub trait RegistryClock: Send + Sync {
@@ -208,6 +276,9 @@ impl DeploymentRegistry {
         }
         let key = cmd.key();
         let auto_request_id = format!("{AUTO_CREATE_REQUEST_ID_PREFIX}{}", cmd.deployment_name.0);
+        let max_versions = max_versions_per_deployment();
+        let max_task_queue_families = max_task_queue_families_per_version();
+        let poller_window = active_poller_window();
         self.mutate_deployment(&key, |loaded, now| {
             let task_queue = VersionTaskQueue {
                 name: cmd.task_queue.clone(),
@@ -215,6 +286,19 @@ impl DeploymentRegistry {
             };
             match loaded {
                 None => {
+                    if max_versions == 0 {
+                        return Err(version_limit_error(
+                            &cmd.deployment_name,
+                            &cmd.build_id,
+                            max_versions,
+                        ));
+                    }
+                    if max_task_queue_families == 0 {
+                        return Err(task_queue_limit_error(
+                            &cmd.task_queue,
+                            max_task_queue_families,
+                        ));
+                    }
                     let mut versions = BTreeMap::new();
                     versions.insert(
                         cmd.build_id.clone(),
@@ -245,6 +329,18 @@ impl DeploymentRegistry {
                             // the freshly-polled task queue. Everything else already
                             // present is a no-op.
                             let mut changed = false;
+                            let family_exists = version
+                                .polled_task_queues
+                                .iter()
+                                .any(|registered| registered.name == task_queue.name);
+                            if !family_exists
+                                && task_queue_family_count(version) >= max_task_queue_families
+                            {
+                                return Err(task_queue_limit_error(
+                                    &cmd.task_queue,
+                                    max_task_queue_families,
+                                ));
+                            }
                             if version.status == WorkerDeploymentVersionStatus::Created {
                                 version.status = WorkerDeploymentVersionStatus::Inactive;
                                 changed = true;
@@ -259,8 +355,25 @@ impl DeploymentRegistry {
                             }
                         }
                         None => {
-                            if next.versions.len() >= MAX_VERSIONS_PER_DEPLOYMENT {
-                                return Err(RegistryError::ResourceExhausted);
+                            if next.versions.len() >= max_versions
+                                && !try_delete_oldest_eligible_version(
+                                    &mut next,
+                                    self.worker_registry(),
+                                    now,
+                                    poller_window,
+                                )
+                            {
+                                return Err(version_limit_error(
+                                    &cmd.deployment_name,
+                                    &cmd.build_id,
+                                    max_versions,
+                                ));
+                            }
+                            if max_task_queue_families == 0 {
+                                return Err(task_queue_limit_error(
+                                    &cmd.task_queue,
+                                    max_task_queue_families,
+                                ));
                             }
                             next.versions.insert(
                                 cmd.build_id.clone(),
@@ -447,6 +560,7 @@ impl DeploymentRegistry {
         &self,
         key: DeploymentKey,
     ) -> Result<DeploymentView, RegistryError> {
+        self.refresh_due_deployment_drainage(&key).await?;
         self.repository
             .load_deployment(&key)
             .await
@@ -497,7 +611,9 @@ impl DeploymentRegistry {
             }
         }
 
-        Err(RegistryError::ResourceExhausted)
+        Err(RegistryError::ResourceExhausted(
+            "worker deployment registry resource exhausted".to_string(),
+        ))
     }
 
     pub async fn list_deployments(
@@ -509,11 +625,26 @@ impl DeploymentRegistry {
         // Over-fetch by one: the extra record (if present) signals there is another page
         // without a second round trip, and its presence is what produces a non-empty
         // continuation token below.
-        let records = self
+        let mut records = self
             .repository
             .list_deployments(cmd.namespace_id, after.as_ref(), page_size + 1)
             .await
             .map_err(RegistryError::from_storage_error)?;
+        for record in &mut records {
+            let key = DeploymentKey {
+                namespace_id: record.namespace_id,
+                deployment_name: record.name.clone(),
+            };
+            self.refresh_due_deployment_drainage(&key).await?;
+            if let Some(refreshed) = self
+                .repository
+                .load_deployment(&key)
+                .await
+                .map_err(RegistryError::from_storage_error)?
+            {
+                *record = refreshed;
+            }
+        }
         let mut deployments: Vec<_> = records
             .iter()
             .take(page_size)
@@ -547,6 +678,8 @@ impl DeploymentRegistry {
         // stable key, matching the server-side defaulting in `workflow_handler.go:185 @
         // v1.31.0`.
         let effective_request_id = effective_request_id(&cmd.request_id);
+        let max_versions = max_versions_per_deployment();
+        let poller_window = active_poller_window();
         self.mutate_deployment(&key, |loaded, now| {
             // Versions are only created under an existing parent deployment — Temporal
             // uses plain update (not update-with-start) here, so a missing parent is
@@ -563,11 +696,21 @@ impl DeploymentRegistry {
                 return Err(RegistryError::AlreadyExists);
             }
 
-            if record.versions.len() >= MAX_VERSIONS_PER_DEPLOYMENT {
-                return Err(RegistryError::ResourceExhausted);
-            }
-
             let mut next = record.clone();
+            if next.versions.len() >= max_versions
+                && !try_delete_oldest_eligible_version(
+                    &mut next,
+                    self.worker_registry(),
+                    now,
+                    poller_window,
+                )
+            {
+                return Err(version_limit_error(
+                    &cmd.deployment_name,
+                    &cmd.build_id,
+                    max_versions,
+                ));
+            }
             record_deployment_modifier(&mut next, &cmd.identity);
             next.versions.insert(
                 cmd.build_id.clone(),
@@ -611,6 +754,7 @@ impl DeploymentRegistry {
             namespace_id: cmd.namespace_id,
             deployment_name: version.deployment_name.clone(),
         };
+        self.refresh_due_deployment_drainage(&key).await?;
         let record = self
             .repository
             .load_deployment(&key)
@@ -639,6 +783,7 @@ impl DeploymentRegistry {
             namespace_id: cmd.namespace_id,
             deployment_name: version.deployment_name.clone(),
         };
+        let poller_window = active_poller_window();
         self.mutate_deployment(&key, |loaded, now| {
             // Deleting an absent deployment or version is a success no-op, not NOT_FOUND
             // (`client.go:1037 @ v1.31.0`). The conflict-token check still runs first so a
@@ -659,6 +804,7 @@ impl DeploymentRegistry {
                 cmd.skip_drainage,
                 self.worker_registry(),
                 now,
+                poller_window,
             )?;
 
             let mut next = record.clone();
@@ -678,6 +824,8 @@ impl DeploymentRegistry {
             namespace_id: cmd.namespace_id,
             deployment_name: cmd.deployment_name.clone(),
         };
+        let max_versions = max_versions_per_deployment();
+        let poller_window = active_poller_window();
         let commit = self
             .mutate_deployment(&key, |loaded, now| {
                 let synthesized;
@@ -727,6 +875,9 @@ impl DeploymentRegistry {
                         cmd.allow_no_pollers,
                         &cmd.identity,
                         now,
+                        max_versions,
+                        self.worker_registry(),
+                        poller_window,
                     )?;
                     if !cmd.ignore_missing_task_queues {
                         validate_missing_task_queues(&next, previous_current.as_ref(), target)?;
@@ -788,6 +939,8 @@ impl DeploymentRegistry {
             namespace_id: cmd.namespace_id,
             deployment_name: cmd.deployment_name.clone(),
         };
+        let max_versions = max_versions_per_deployment();
+        let poller_window = active_poller_window();
         let commit = self
             .mutate_deployment(&key, |loaded, now| {
                 let synthesized;
@@ -861,6 +1014,9 @@ impl DeploymentRegistry {
                         cmd.allow_no_pollers,
                         &cmd.identity,
                         now,
+                        max_versions,
+                        self.worker_registry(),
+                        poller_window,
                     )?;
                     // The missing-task-queue guard runs only when the ramping version
                     // actually changes (a percentage-only adjustment keeps the same
@@ -1161,6 +1317,28 @@ impl DeploymentRegistry {
         .map(|_| ())
     }
 
+    async fn refresh_due_deployment_drainage(
+        &self,
+        key: &DeploymentKey,
+    ) -> Result<(), RegistryError> {
+        let Some(record) = self
+            .repository
+            .load_deployment(key)
+            .await
+            .map_err(RegistryError::from_storage_error)?
+        else {
+            return Ok(());
+        };
+        let due = due_drainage_build_ids(
+            &record,
+            self.now(),
+            drainage_visibility_grace_period(),
+            drainage_refresh_interval(),
+        );
+        self.refresh_deployment_drainage_for_versions(key, due)
+            .await
+    }
+
     /// Core load → validate → CAS-commit loop shared by every mutating method.
     ///
     /// `validate` is a pure closure run against the freshly loaded snapshot (and the
@@ -1229,7 +1407,9 @@ impl DeploymentRegistry {
             }
         }
 
-        Err(RegistryError::ResourceExhausted)
+        Err(RegistryError::ResourceExhausted(
+            "worker deployment registry resource exhausted".to_string(),
+        ))
     }
 }
 
@@ -1563,8 +1743,8 @@ pub enum RegistryError {
     NotFoundMessage(String),
     #[error("worker deployment precondition failed: {0}")]
     FailedPrecondition(String),
-    #[error("worker deployment resource exhausted")]
-    ResourceExhausted,
+    #[error("{0}")]
+    ResourceExhausted(String),
     #[error("invalid worker deployment argument: {0}")]
     InvalidArgument(String),
 }
@@ -1698,12 +1878,86 @@ fn routing_version_key(
     }))
 }
 
+fn task_queue_family_count(version: &StoredVersion) -> usize {
+    version
+        .polled_task_queues
+        .iter()
+        .map(|task_queue| task_queue.name.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn version_limit_error(
+    deployment_name: &DeploymentName,
+    build_id: &BuildId,
+    max_versions: usize,
+) -> RegistryError {
+    RegistryError::ResourceExhausted(format!(
+        "cannot add version {} since maximum number of versions ({max_versions}) have been registered in the deployment",
+        format_legacy_version_string(deployment_name, build_id)
+    ))
+}
+
+fn task_queue_limit_error(task_queue: &str, max_task_queues: usize) -> RegistryError {
+    RegistryError::ResourceExhausted(format!(
+        "cannot add task queue {task_queue} since maximum number of task queues ({max_task_queues}) have been registered in deployment"
+    ))
+}
+
+/// Remove the oldest Version eligible for server-initiated maintenance.
+///
+/// Temporal tries Versions in ascending creation order when an add reaches the
+/// configured cap. The internal deletion bypasses manager identity but retains
+/// routing, active-poller, and drainage gates (`workflow.go:1485-1504 @ v1.31.0`).
+/// Selection and removal happen inside the caller's CAS closure so a racing write
+/// causes the entire delete-plus-insert decision to be re-evaluated.
+fn try_delete_oldest_eligible_version(
+    deployment: &mut StoredWorkerDeployment,
+    worker_registry: &WorkerRegistry,
+    now: OffsetDateTime,
+    poller_window: Duration,
+) -> bool {
+    let candidate = deployment
+        .versions
+        .iter()
+        .filter_map(|(build_id, version_record)| {
+            let version = WorkerDeploymentVersionKey {
+                deployment_name: deployment.name.clone(),
+                build_id: build_id.clone(),
+            };
+            validate_version_delete_preconditions(
+                deployment,
+                version_record,
+                &version,
+                false,
+                worker_registry,
+                now,
+                poller_window,
+            )
+            .is_ok()
+            .then_some((build_id.clone(), version_record.create_time))
+        })
+        .min_by(|(left_id, left_time), (right_id, right_time)| {
+            left_time
+                .cmp(right_time)
+                .then_with(|| left_id.cmp(right_id))
+        })
+        .map(|(build_id, _)| build_id);
+
+    candidate
+        .and_then(|build_id| deployment.versions.remove(&build_id))
+        .is_some()
+}
+
 fn ensure_version_available(
     deployment: &mut StoredWorkerDeployment,
     version: &WorkerDeploymentVersionKey,
     allow_no_pollers: bool,
     identity: &str,
     now: OffsetDateTime,
+    max_versions: usize,
+    worker_registry: &WorkerRegistry,
+    poller_window: Duration,
 ) -> Result<(), RegistryError> {
     if deployment.name != version.deployment_name {
         return Err(RegistryError::NotFound);
@@ -1717,8 +1971,14 @@ fn ensure_version_available(
     if !allow_no_pollers {
         return Err(RegistryError::NotFound);
     }
-    if deployment.versions.len() >= MAX_VERSIONS_PER_DEPLOYMENT {
-        return Err(RegistryError::ResourceExhausted);
+    if deployment.versions.len() >= max_versions
+        && !try_delete_oldest_eligible_version(deployment, worker_registry, now, poller_window)
+    {
+        return Err(version_limit_error(
+            &version.deployment_name,
+            &version.build_id,
+            max_versions,
+        ));
     }
 
     deployment.versions.insert(
@@ -1857,6 +2117,35 @@ fn version_is_accepting_new_workflows(version: &StoredVersion) -> bool {
     )
 }
 
+fn due_drainage_build_ids(
+    deployment: &StoredWorkerDeployment,
+    now: OffsetDateTime,
+    visibility_grace_period: Duration,
+    refresh_interval: Duration,
+) -> BTreeSet<BuildId> {
+    deployment
+        .versions
+        .iter()
+        .filter_map(|(build_id, version)| {
+            let info = version.drainage_info.as_ref()?;
+            if version.status != WorkerDeploymentVersionStatus::Draining
+                || info.status != VersionDrainageStatus::Draining
+            {
+                return None;
+            }
+            // v1.31.0 distinguishes the first check by equal changed/checked
+            // timestamps: visibility gets one grace period to catch up; later checks
+            // use the regular refresh interval (`version_workflow.go:1020-1052`).
+            let interval = if info.last_checked_time == info.last_changed_time {
+                visibility_grace_period
+            } else {
+                refresh_interval
+            };
+            (now - info.last_checked_time >= interval).then_some(build_id.clone())
+        })
+        .collect()
+}
+
 fn recompute_version_drainage(
     version: &mut StoredVersion,
     has_open_pinned_workflows: bool,
@@ -1908,7 +2197,7 @@ fn recompute_version_drainage(
 
 /// Enforces the three v1.31.0 delete-version gates, all `FAILED_PRECONDITION`: a
 /// version may not be deleted while it is Current/Ramping, while it has a poller seen
-/// within `ACTIVE_POLLER_WINDOW`, or while it is still draining (unless `skip_drainage`
+/// within the configured active-poller window, or while it is still draining (unless `skip_drainage`
 /// bypasses the last gate). Poller presence is read from the live `WorkerRegistry`, so
 /// this is the one delete check that depends on transient runtime state rather than the
 /// durable record.
@@ -1919,6 +2208,7 @@ fn validate_version_delete_preconditions(
     skip_drainage: bool,
     worker_registry: &WorkerRegistry,
     now: OffsetDateTime,
+    poller_window: Duration,
 ) -> Result<(), RegistryError> {
     if deployment.routing_config.current_version.as_ref() == Some(version)
         || deployment.routing_config.ramping_version.as_ref() == Some(version)
@@ -1933,7 +2223,7 @@ fn validate_version_delete_preconditions(
         &DeploymentId(version.deployment_name.0.clone()),
         &RuntimeBuildId(version.build_id.0.clone()),
         now,
-        ACTIVE_POLLER_WINDOW,
+        poller_window,
     ) {
         return Err(RegistryError::FailedPrecondition(
             "worker deployment version has active pollers".to_string(),
@@ -2309,6 +2599,9 @@ fn decode_page_token(token: &str) -> Option<DeploymentName> {
 mod tests {
     use std::sync::Arc;
 
+    #[cfg(feature = "conformance")]
+    use std::time::Duration as StdDuration;
+
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_kernel::{
@@ -2326,6 +2619,9 @@ mod tests {
         ShardEpoch, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
     };
 
+    #[cfg(feature = "conformance")]
+    use tokeira_conformance::OverrideValue;
+
     use crate::{WorkerRegistrationKey, WorkerVersionMetadata};
 
     use super::*;
@@ -2340,17 +2636,23 @@ mod tests {
     }
 
     fn registry_with_store() -> (DeploymentRegistry, Arc<InMemoryStore>) {
+        registry_with_store_at(OffsetDateTime::UNIX_EPOCH)
+    }
+
+    fn registry_with_store_at(now: OffsetDateTime) -> (DeploymentRegistry, Arc<InMemoryStore>) {
         let store = Arc::new(InMemoryStore::default());
+        let registry = registry_for_store_at(store.clone(), now);
+        (registry, store)
+    }
+
+    fn registry_for_store_at(store: Arc<InMemoryStore>, now: OffsetDateTime) -> DeploymentRegistry {
         let repository: Arc<dyn WorkerDeploymentRepository> = store.clone();
         let run_repository: Arc<dyn RunRepository> = store.clone();
-        (
-            DeploymentRegistry::with_clock_and_repositories(
-                repository,
-                run_repository,
-                WorkerRegistry::default(),
-                Arc::new(FixedClock(OffsetDateTime::UNIX_EPOCH)),
-            ),
-            store,
+        DeploymentRegistry::with_clock_and_repositories(
+            repository,
+            run_repository,
+            WorkerRegistry::default(),
+            Arc::new(FixedClock(now)),
         )
     }
 
@@ -2400,6 +2702,23 @@ mod tests {
             compute_config: ComputeConfig::default(),
             request_id: request_id.to_string(),
             identity: "operator-a".to_string(),
+        }
+    }
+
+    fn register_polled_cmd(
+        namespace_id: NamespaceId,
+        deployment_name: &str,
+        build_id: &str,
+        task_queue: &str,
+        task_queue_type: DeploymentTaskQueueType,
+    ) -> RegisterPolledDeployment {
+        RegisterPolledDeployment {
+            namespace_id,
+            deployment_name: DeploymentName(deployment_name.to_string()),
+            build_id: BuildId(build_id.to_string()),
+            task_queue: task_queue.to_string(),
+            task_queue_type,
+            identity: "worker-a".to_string(),
         }
     }
 
@@ -3056,7 +3375,7 @@ mod tests {
             RegistryError::NotFound => RegistryErrorKind::NotFound,
             RegistryError::NotFoundMessage(_) => RegistryErrorKind::NotFound,
             RegistryError::FailedPrecondition(_) => RegistryErrorKind::FailedPrecondition,
-            RegistryError::ResourceExhausted => RegistryErrorKind::ResourceExhausted,
+            RegistryError::ResourceExhausted(_) => RegistryErrorKind::ResourceExhausted,
             RegistryError::InvalidArgument(_) => RegistryErrorKind::InvalidArgument,
         }
     }
@@ -3131,6 +3450,78 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: worker-deployments, Property 19: task-queue admission counts queue
+        // families independent of type, and cap recovery evicts the oldest Version that
+        // satisfies every ordinary deletion precondition.
+        #[test]
+        fn property_poll_admission_limits_and_oldest_eligible_eviction(
+            queue_observations in proptest::collection::vec((0u8..12, any::<bool>()), 0..50),
+            eligibility in proptest::collection::vec(any::<bool>(), 1..24)
+                .prop_filter("at least one Version must be eligible", |values| values.iter().any(|value| *value)),
+        ) {
+            let mut queue_version = stored_version("queue-build");
+            for (family, workflow) in &queue_observations {
+                queue_version.polled_task_queues.insert(VersionTaskQueue {
+                    name: format!("queue-{family}"),
+                    task_queue_type: if *workflow {
+                        DeploymentTaskQueueType::Workflow
+                    } else {
+                        DeploymentTaskQueueType::Activity
+                    },
+                });
+            }
+            let expected_families = queue_observations
+                .iter()
+                .map(|(family, _)| family)
+                .collect::<BTreeSet<_>>()
+                .len();
+            prop_assert_eq!(task_queue_family_count(&queue_version), expected_families);
+
+            let namespace_id = NamespaceId::new();
+            let deployment_name = DeploymentName("deployment-a".to_string());
+            let mut deployment = StoredWorkerDeployment {
+                namespace_id,
+                name: deployment_name.clone(),
+                create_time: OffsetDateTime::UNIX_EPOCH,
+                routing_config: StoredRoutingConfig::default(),
+                last_modifier_identity: "operator-a".to_string(),
+                manager_identity: None,
+                routing_config_update_state: RoutingConfigUpdateState::Completed,
+                versions: BTreeMap::new(),
+                conflict_token: ConflictToken::default(),
+                create_request_ids: BTreeSet::new(),
+            };
+            let expected_eviction_index = eligibility
+                .iter()
+                .position(|eligible| *eligible)
+                .expect("strategy guarantees an eligible Version");
+            for (index, eligible) in eligibility.iter().enumerate() {
+                let build_id = format!("build-{index}");
+                let mut version = stored_version(&build_id);
+                version.create_time = OffsetDateTime::UNIX_EPOCH + Duration::seconds(index as i64);
+                if !eligible {
+                    version.status = WorkerDeploymentVersionStatus::Draining;
+                    version.drainage_info = Some(DrainageInfo {
+                        status: VersionDrainageStatus::Draining,
+                        last_changed_time: OffsetDateTime::UNIX_EPOCH,
+                        last_checked_time: OffsetDateTime::UNIX_EPOCH,
+                    });
+                }
+                deployment.versions.insert(BuildId(build_id), version);
+            }
+
+            let removed = try_delete_oldest_eligible_version(
+                &mut deployment,
+                &WorkerRegistry::default(),
+                OffsetDateTime::UNIX_EPOCH,
+                ACTIVE_POLLER_WINDOW,
+            );
+            prop_assert!(removed);
+            prop_assert_eq!(deployment.versions.len(), eligibility.len() - 1);
+            let expected_eviction = BuildId(format!("build-{expected_eviction_index}"));
+            prop_assert!(!deployment.versions.contains_key(&expected_eviction));
+        }
 
         // Feature: worker-deployments, Property 15: a write carrying a non-empty identity
         // records it as the affected record's last_modifier_identity.
@@ -3346,11 +3737,24 @@ mod tests {
                 if rejection_index == 6 {
                     let mut record = store.load_deployment(&key).await.unwrap().unwrap();
                     let expected = record.conflict_token;
+                    if let Some(version) = record.versions.get_mut(&BuildId("build-a".to_string())) {
+                        version.status = WorkerDeploymentVersionStatus::Draining;
+                        version.drainage_info = Some(DrainageInfo {
+                            status: VersionDrainageStatus::Draining,
+                            last_changed_time: OffsetDateTime::UNIX_EPOCH,
+                            last_checked_time: OffsetDateTime::UNIX_EPOCH,
+                        });
+                    }
                     for index in 1..MAX_VERSIONS_PER_DEPLOYMENT {
                         let build_id = format!("build-extra-{index}");
-                        record
-                            .versions
-                            .insert(BuildId(build_id.clone()), stored_version(&build_id));
+                        let mut version = stored_version(&build_id);
+                        version.status = WorkerDeploymentVersionStatus::Draining;
+                        version.drainage_info = Some(DrainageInfo {
+                            status: VersionDrainageStatus::Draining,
+                            last_changed_time: OffsetDateTime::UNIX_EPOCH,
+                            last_checked_time: OffsetDateTime::UNIX_EPOCH,
+                        });
+                        record.versions.insert(BuildId(build_id), version);
                     }
                     store.put_deployment(record, Some(expected)).await.unwrap();
                 }
@@ -4899,6 +5303,47 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "conformance")]
+    #[test]
+    fn conformance_worker_deployment_policy_reads_live_overrides() {
+        let overrides = tokeira_conformance::overrides();
+        overrides.reset();
+        overrides
+            .set("matching.maxVersionsInDeployment", OverrideValue::Int(1))
+            .unwrap();
+        overrides
+            .set(
+                "matching.maxTaskQueuesInDeploymentVersion",
+                OverrideValue::Int(2),
+            )
+            .unwrap();
+        overrides
+            .set(
+                "matching.PollerHistoryTTL",
+                OverrideValue::Duration(StdDuration::from_millis(500)),
+            )
+            .unwrap();
+        overrides
+            .set(
+                "matching.wv.VersionDrainageStatusVisibilityGracePeriod",
+                OverrideValue::Duration(StdDuration::from_secs(3)),
+            )
+            .unwrap();
+        overrides
+            .set(
+                "matching.wv.VersionDrainageStatusRefreshInterval",
+                OverrideValue::Duration(StdDuration::from_secs(4)),
+            )
+            .unwrap();
+
+        assert_eq!(max_versions_per_deployment(), 1);
+        assert_eq!(max_task_queue_families_per_version(), 2);
+        assert_eq!(active_poller_window(), Duration::milliseconds(500));
+        assert_eq!(drainage_visibility_grace_period(), Duration::seconds(3));
+        assert_eq!(drainage_refresh_interval(), Duration::seconds(4));
+        overrides.reset();
+    }
+
     #[tokio::test]
     async fn create_describe_and_idempotent_retry_project_stored_deployment() {
         let (registry, _) = registry_with_store();
@@ -5162,9 +5607,14 @@ mod tests {
         let expected = record.conflict_token;
         for idx in 0..MAX_VERSIONS_PER_DEPLOYMENT {
             let build_id = format!("build-{idx}");
-            record
-                .versions
-                .insert(BuildId(build_id.clone()), stored_version(&build_id));
+            let mut version = stored_version(&build_id);
+            version.status = WorkerDeploymentVersionStatus::Draining;
+            version.drainage_info = Some(DrainageInfo {
+                status: VersionDrainageStatus::Draining,
+                last_changed_time: OffsetDateTime::UNIX_EPOCH,
+                last_checked_time: OffsetDateTime::UNIX_EPOCH,
+            });
+            record.versions.insert(BuildId(build_id), version);
         }
         store.put_deployment(record, Some(expected)).await.unwrap();
 
@@ -5177,7 +5627,111 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(exhausted, RegistryError::ResourceExhausted);
+        assert_eq!(
+            exhausted,
+            RegistryError::ResourceExhausted(
+                "cannot add version deployment-a.build-extra since maximum number of versions (100) have been registered in the deployment".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_registration_enforces_task_queue_family_limit_without_double_counting_types() {
+        let (registry, store) = registry_with_store();
+        let namespace_id = NamespaceId::new();
+        registry
+            .register_polled_deployment(register_polled_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "queue-0",
+                DeploymentTaskQueueType::Workflow,
+            ))
+            .await
+            .unwrap();
+
+        let key = deployment_key(namespace_id, "deployment-a");
+        let mut record = store.load_deployment(&key).await.unwrap().unwrap();
+        let expected = record.conflict_token;
+        let version = record
+            .versions
+            .get_mut(&BuildId("build-a".to_string()))
+            .unwrap();
+        for index in 1..MAX_TASK_QUEUE_FAMILIES_PER_VERSION {
+            version.polled_task_queues.insert(VersionTaskQueue {
+                name: format!("queue-{index}"),
+                task_queue_type: DeploymentTaskQueueType::Workflow,
+            });
+        }
+        store.put_deployment(record, Some(expected)).await.unwrap();
+
+        registry
+            .register_polled_deployment(register_polled_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "queue-0",
+                DeploymentTaskQueueType::Activity,
+            ))
+            .await
+            .unwrap();
+        let exhausted = registry
+            .register_polled_deployment(register_polled_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "queue-over-limit",
+                DeploymentTaskQueueType::Workflow,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            exhausted,
+            RegistryError::ResourceExhausted(
+                "cannot add task queue queue-over-limit since maximum number of task queues (100) have been registered in deployment".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn version_limit_recovery_atomically_replaces_the_oldest_eligible_version() {
+        let (registry, store) = registry_with_store();
+        let namespace_id = NamespaceId::new();
+        registry
+            .create_deployment(create_cmd(namespace_id, "deployment-a", "request-a"))
+            .await
+            .unwrap();
+        let key = deployment_key(namespace_id, "deployment-a");
+        let mut record = store.load_deployment(&key).await.unwrap().unwrap();
+        let expected = record.conflict_token;
+        for index in 0..MAX_VERSIONS_PER_DEPLOYMENT {
+            let build_id = format!("build-{index}");
+            let mut version = stored_version(&build_id);
+            version.create_time =
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(i64::try_from(index).unwrap());
+            record.versions.insert(BuildId(build_id), version);
+        }
+        store.put_deployment(record, Some(expected)).await.unwrap();
+
+        registry
+            .register_polled_deployment(register_polled_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-new",
+                "queue-a",
+                DeploymentTaskQueueType::Workflow,
+            ))
+            .await
+            .unwrap();
+        let after = store.load_deployment(&key).await.unwrap().unwrap();
+        assert_eq!(after.versions.len(), MAX_VERSIONS_PER_DEPLOYMENT);
+        assert!(!after.versions.contains_key(&BuildId("build-0".to_string())));
+        assert!(
+            after
+                .versions
+                .contains_key(&BuildId("build-new".to_string()))
+        );
+        assert_eq!(after.last_modifier_identity, "operator-a");
     }
 
     #[tokio::test]
@@ -6027,6 +6581,152 @@ mod tests {
             Some("manager-a")
         );
         assert_eq!(manager.deployment.last_modifier_identity, "manager-a");
+    }
+
+    #[tokio::test]
+    async fn drainage_due_times_use_initial_visibility_grace_then_refresh_interval() {
+        let (registry, store) = registry_with_store();
+        let namespace_id = NamespaceId::new();
+        registry
+            .create_deployment(create_cmd(namespace_id, "deployment-a", "request-a"))
+            .await
+            .unwrap();
+        registry
+            .create_version(create_version_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "version-request-a",
+            ))
+            .await
+            .unwrap();
+        let key = deployment_key(namespace_id, "deployment-a");
+        let mut record = store.load_deployment(&key).await.unwrap().unwrap();
+        let version = record
+            .versions
+            .get_mut(&BuildId("build-a".to_string()))
+            .unwrap();
+        version.status = WorkerDeploymentVersionStatus::Draining;
+        version.drainage_info = Some(DrainageInfo {
+            status: VersionDrainageStatus::Draining,
+            last_changed_time: OffsetDateTime::UNIX_EPOCH,
+            last_checked_time: OffsetDateTime::UNIX_EPOCH,
+        });
+
+        assert!(
+            due_drainage_build_ids(
+                &record,
+                OffsetDateTime::UNIX_EPOCH + DRAINAGE_VISIBILITY_GRACE_PERIOD
+                    - Duration::nanoseconds(1),
+                DRAINAGE_VISIBILITY_GRACE_PERIOD,
+                DRAINAGE_REFRESH_INTERVAL,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            due_drainage_build_ids(
+                &record,
+                OffsetDateTime::UNIX_EPOCH + DRAINAGE_VISIBILITY_GRACE_PERIOD,
+                DRAINAGE_VISIBILITY_GRACE_PERIOD,
+                DRAINAGE_REFRESH_INTERVAL,
+            ),
+            BTreeSet::from([BuildId("build-a".to_string())])
+        );
+
+        let later_check_time = OffsetDateTime::UNIX_EPOCH + Duration::minutes(1);
+        record
+            .versions
+            .get_mut(&BuildId("build-a".to_string()))
+            .unwrap()
+            .drainage_info
+            .as_mut()
+            .unwrap()
+            .last_checked_time = later_check_time;
+        assert!(
+            due_drainage_build_ids(
+                &record,
+                later_check_time + DRAINAGE_REFRESH_INTERVAL - Duration::nanoseconds(1),
+                DRAINAGE_VISIBILITY_GRACE_PERIOD,
+                DRAINAGE_REFRESH_INTERVAL,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            due_drainage_build_ids(
+                &record,
+                later_check_time + DRAINAGE_REFRESH_INTERVAL,
+                DRAINAGE_VISIBILITY_GRACE_PERIOD,
+                DRAINAGE_REFRESH_INTERVAL,
+            ),
+            BTreeSet::from([BuildId("build-a".to_string())])
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_lazily_refreshes_drainage_once_visibility_grace_is_due() {
+        let (registry, store) = registry_with_store();
+        let namespace_id = NamespaceId::new();
+        registry
+            .create_deployment(create_cmd(namespace_id, "deployment-a", "request-a"))
+            .await
+            .unwrap();
+        registry
+            .create_version(create_version_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "version-request-a",
+            ))
+            .await
+            .unwrap();
+        let key = deployment_key(namespace_id, "deployment-a");
+        let mut record = store.load_deployment(&key).await.unwrap().unwrap();
+        let expected = record.conflict_token;
+        let version = record
+            .versions
+            .get_mut(&BuildId("build-a".to_string()))
+            .unwrap();
+        version.status = WorkerDeploymentVersionStatus::Draining;
+        version.drainage_info = Some(DrainageInfo {
+            status: VersionDrainageStatus::Draining,
+            last_changed_time: OffsetDateTime::UNIX_EPOCH,
+            last_checked_time: OffsetDateTime::UNIX_EPOCH,
+        });
+        store.put_deployment(record, Some(expected)).await.unwrap();
+
+        let before_due = registry_for_store_at(
+            store.clone(),
+            OffsetDateTime::UNIX_EPOCH + DRAINAGE_VISIBILITY_GRACE_PERIOD
+                - Duration::nanoseconds(1),
+        )
+        .describe_deployment(key.clone())
+        .await
+        .unwrap();
+        assert_eq!(
+            before_due.versions[0].record.status,
+            WorkerDeploymentVersionStatus::Draining
+        );
+
+        let due = registry_for_store_at(
+            store,
+            OffsetDateTime::UNIX_EPOCH + DRAINAGE_VISIBILITY_GRACE_PERIOD,
+        )
+        .describe_deployment(key)
+        .await
+        .unwrap();
+        assert_eq!(
+            due.versions[0].record.status,
+            WorkerDeploymentVersionStatus::Drained
+        );
+        assert_eq!(
+            due.versions[0]
+                .record
+                .drainage_info
+                .as_ref()
+                .unwrap()
+                .last_checked_time,
+            OffsetDateTime::UNIX_EPOCH + DRAINAGE_VISIBILITY_GRACE_PERIOD
+        );
     }
 
     #[tokio::test]

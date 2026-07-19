@@ -222,6 +222,7 @@ impl<R: WorkerDeploymentRepository> DeploymentRegistry<R> {
     async fn list_deployments(&self, page: ListPage) -> Result<DeploymentPage, RegistryError>;
     // Version CRUD
     async fn create_version(&self, cmd: CreateVersion) -> Result<(), RegistryError>;
+    async fn register_polled_deployment(&self, cmd: RegisterPolledDeployment) -> Result<(), RegistryError>;
     async fn describe_version(&self, cmd: DescribeVersion) -> Result<VersionView, RegistryError>;
     async fn delete_version(&self, cmd: DeleteVersion) -> Result<(), RegistryError>;
     // Routing config
@@ -244,7 +245,7 @@ request never partially mutates state. This matches the OCC model already used b
 
 `RegistryError` is `thiserror`-based with variants mapping to the v1.31.0 error
 contract: `AlreadyExists`, `NotFound`, `FailedPrecondition(reason)`,
-`ResourceExhausted`, `InvalidArgument(reason)`. The edge maps these to `EdgeError`
+`ResourceExhausted(reason)`, `InvalidArgument(reason)`. The edge maps these to `EdgeError`
 (see Error Handling).
 
 #### Poller-presence semantics (resolved against v1.31.0)
@@ -265,6 +266,55 @@ contract: `AlreadyExists`, `NotFound`, `FailedPrecondition(reason)`,
   Tokeira derives "task queues polled by a version" from the durable
   `polled_task_queues` set on the Version record (updated when a poller registers,
   via the existing `WorkerRegistry` registration hook).
+
+#### Poll-registration limits and server-initiated eviction
+
+Versioned poll admission is a correctness-bearing registry mutation, not best-effort
+observability. The edge invokes `register_polled_deployment` before entering the long
+poll and propagates a rejected registration. The registry reads the v1.31.0 defaults
+(`MatchingMaxVersionsInDeployment=100`,
+`MatchingMaxTaskQueuesInDeploymentVersion=100`, `PollerHistoryTTL=5m`) through live
+runtime accessors. Production builds return those constants; conformance builds may
+read a delivered override at the same consult site. No mutable configuration reaches
+the kernel.
+
+At the Version limit, every add path (explicit create, poll auto-create, and
+`allow_no_pollers` auto-create) sorts Versions by `(create_time, build_id)` and removes
+the first candidate satisfying the normal current/ramping, recent-poller, and drainage
+delete preconditions. The server-initiated path bypasses manager identity and does not
+replace `last_modifier_identity` with an internal identity, matching
+`tryDeleteVersion` (`workflow.go:1485-1504 @ v1.31.0`). Deletion and insertion occur in
+one loaded-record CAS mutation, so a conflict reloads and re-evaluates both decisions.
+If no candidate qualifies, the mutation rejects without a write and carries the exact
+configured-limit message through `RegistryError::ResourceExhausted(reason)`.
+
+Task-queue capacity counts distinct task-queue family names. Adding a second type for
+an existing family is allowed at the limit; adding a new family rejects before status,
+task-queue, or conflict-token mutation (`version_workflow.go:625-642 @ v1.31.0`).
+
+The runtime keeps deletion liveness separate from the edge's diagnostic poller history.
+Poll admission creates an exact `WorkerRegistry` registration guard. Normal completion
+disarms the guard and leaves the latest observation eligible for the configured history
+window; cancellation drops the guard and removes that exact live observation, so a
+stopped worker cannot fence version deletion. `DescribeTaskQueue` continues to retain
+bounded diagnostic history and aggregates identities from Tokeira's physical
+Deployment-Version queues into the public task-queue-family view. This preserves the
+observable v1.31.0 distinction between shutdown removal and recent poller history
+without importing a matching-service architecture (`matching_engine.go:1194-1206` and
+`task_queue_partition_manager.go:601, 617-621 @ v1.31.0`).
+
+#### Due drainage recomputation
+
+Tokeira does not create Temporal's internal Version entity workflow. Instead, the
+runtime registry treats a `DRAINING` record as due when `now - last_checked_time`
+reaches the visibility grace period for the first check
+(`last_checked_time == last_changed_time`) or the refresh interval for later checks.
+A public registry operation that loads the record runs this due check, reads open
+pinned-workflow presence from `RunRepository`, and CAS-commits the resulting
+`DRAINING`/`DRAINED` state before returning its view. This makes the observable state
+identical without tainting the edge or manufacturing history. A racing reactivation is
+safe: the CAS closure rechecks Current/Ramping state and clears rather than applying a
+stale drainage result.
 
 ### Storage: `WorkerDeploymentRepository` (`crates/tokeira-storage/src/api.rs`, new trait; `memory.rs` + `dsql/` impls)
 
@@ -686,9 +736,12 @@ stops being Current or Ramping while open pinned workflows target it is set to
 `DRAINING` with `last_changed_time`; once no open pinned workflows remain it becomes
 `DRAINED` with `last_changed_time`; a version that becomes Current or Ramping again has
 its drainage info cleared; a recompute records `last_checked_time`; and while a version
-is Current or Ramping its `drainage_info` is never populated.
+is Current or Ramping its `drainage_info` is never populated. A recomputation before
+the configured first-check grace period or later refresh interval is a no-op; once due,
+the first observing registry operation commits the recomputed state. Reactivation and a
+later demotion start a fresh grace-period cycle.
 
-**Validates: Requirements 8.1, 8.2, 8.3, 8.4, 8.5, 8.6**
+**Validates: Requirements 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 8.8, 8.9**
 
 ### Property 12: Routing determinism and effective-version precedence
 
@@ -771,6 +824,19 @@ an equal `WorkflowVersioningInfo`, so post-restart routing decisions
 
 **Validates: Requirements 13.5**
 
+### Property 19: Poll-registration limits and atomic oldest-eligible eviction
+
+*For any* deployment with generated Versions, create times, routing roles, drainage
+states, recent-poller observations, task-queue family/type memberships, and configured
+limits, a poll registration below both limits succeeds; a new family at the family
+limit rejects without mutation while a new type for an existing family succeeds; and a
+new Version at the Version limit atomically removes exactly the oldest eligible Version
+before insertion, or rejects without mutation when none is eligible. The manager
+identity does not block server-initiated eviction and the deployment's
+`last_modifier_identity` is not replaced by an internal maintenance identity.
+
+**Validates: Requirements 2.5, 2.16, 2.17, 2.18, 2.19, 12.4**
+
 ## Error Handling
 
 The runtime registry returns `RegistryError`; the edge maps it to `EdgeError`, which
@@ -790,7 +856,7 @@ action_name) and `grpc/errors.rs` (tonic mapping) get entries for the new varian
 | Set current/ramping to unknown build_id with `allow_no_pollers` false | `NotFound` (v1.31.0 `errVersionNotFound`) | not-found | `NOT_FOUND` |
 | Create deployment name exists | `AlreadyExists` | `AlreadyExists` (new) | `ALREADY_EXISTS` |
 | Create version (name,build_id) exists | `AlreadyExists` (v1.31.0 `ErrWorkerDeploymentVersionAlreadyExists`) | `AlreadyExists` | `ALREADY_EXISTS` |
-| Create version exceeds max-versions limit | `ResourceExhausted` (v1.31.0 `errTooManyVersions`) | `ResourceExhausted` (new) | `RESOURCE_EXHAUSTED` |
+| Add version at max with no eligible eviction candidate; add task-queue family at max | `ResourceExhausted(reason)` (v1.31.0 `errTooManyVersions` / `errMaxTaskQueuesInVersionType`) | `ResourceExhausted(reason)` | `RESOURCE_EXHAUSTED` |
 | Delete deployment with versions; delete current/ramping/pollered/draining version | `FailedPrecondition` | `FailedPrecondition` | `FAILED_PRECONDITION` |
 | Conflict-token mismatch | `FailedPrecondition` (v1.31.0 `errFailedPrecondition`) | `FailedPrecondition` | `FAILED_PRECONDITION` |
 | Manager-identity mismatch | `FailedPrecondition` (v1.31.0 `ErrManagerIdentityMismatch`) | `FailedPrecondition` | `FAILED_PRECONDITION` |
@@ -806,7 +872,7 @@ is not used for any of these user-facing conditions.
 
 ### Dual testing approach
 
-- **Property tests (proptest, required)** implement Properties 1–18, each tagged
+- **Property tests (proptest, required)** implement Properties 1–19, each tagged
   `// Feature: worker-deployments, Property N: <text>` and configured for a minimum of
   100 iterations. They use a reference model for the CRUD/state-machine properties
   (Properties 1, 3, 5, 8, 9), deterministic generators for routing and ids
@@ -819,8 +885,9 @@ is not used for any of these user-facing conditions.
   not input-varying: the exact `UNIMPLEMENTED` message for each of the 5 deprecated
   companions and that they touch no registry state (Requirement 11.1–11.6); empty
   `deployment_name` / unset oneof / empty identity → `INVALID_ARGUMENT` (1.8, 7.4, 7.8,
-  2.14); namespace-not-found (1.11, 12.2); exceeding max-versions → `RESOURCE_EXHAUSTED`
-  (2.5); overlapping upsert/remove and update/remove → `INVALID_ARGUMENT` (6.3, 5.3);
+  2.14); namespace-not-found (1.11, 12.2); max-version eviction/exhaustion and
+  task-queue-family exhaustion with exact messages (2.5, 2.17, 2.18); overlapping
+  upsert/remove and update/remove → `INVALID_ARGUMENT` (6.3, 5.3);
   `eager_worker_deployment_options` applied iff `request_eager_execution` (9.7); and
   that all 13 v2 RPCs accept valid input without `UNIMPLEMENTED` (12.5).
 - **Integration tests** exercise the full edge → runtime adapter → registry → storage
@@ -852,8 +919,10 @@ document so reviewers can confirm against the same ground truth: create-version 
 no-ops use `client.go:1037` and `client.go:1089`; duplicate version mapping uses
 `client.go:1296`; routing-config and scoped manager/conflict-token checks use
 `service/worker/workerdeployment/workflow.go:1177`, `:775`, `:1244`, `:1109`, plus
-`client.go:384`; routing update state derives from `client.go:1759`; drainage is in
-`version_workflow.go`; request-id defaulting and compute validation use
+`client.go:384`; routing update state derives from `client.go:1759`; max-version
+oldest-eligible eviction is in `workflow.go:541-556,1485-1504`; task-queue-family
+limits are in `version_workflow.go:625-642`; drainage grace/refresh timing is in
+`version_workflow.go:1020-1052`; request-id defaulting and compute validation use
 `service/frontend/workflow_handler.go:185/:258/:4078` and
 `service/worker/workerdeployment/client.go:2037`; legacy version parsing uses
 `common/worker_versioning/worker_versioning.go:1103`; effective-version precedence is

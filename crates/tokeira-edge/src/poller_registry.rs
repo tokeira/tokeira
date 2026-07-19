@@ -29,6 +29,19 @@ use tokeira_types::{QueueKey, WorkerIdentity};
 
 const POLLER_HISTORY_TTL: Duration = Duration::minutes(5);
 
+#[cfg(not(feature = "conformance"))]
+fn poller_history_ttl() -> Duration {
+    POLLER_HISTORY_TTL
+}
+
+#[cfg(feature = "conformance")]
+fn poller_history_ttl() -> Duration {
+    tokeira_conformance::overrides()
+        .get_duration("matching.PollerHistoryTTL")
+        .and_then(|value| Duration::try_from(value).ok())
+        .unwrap_or(POLLER_HISTORY_TTL)
+}
+
 /// One worker identity recently observed polling a task queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivePoller {
@@ -59,26 +72,38 @@ impl PollerRegistryState {
             );
     }
 
-    fn pollers_at(&self, queue: &QueueKey, now: OffsetDateTime) -> Vec<ActivePoller> {
-        let cutoff = now - POLLER_HISTORY_TTL;
+    fn pollers_at(
+        &self,
+        queue: &QueueKey,
+        now: OffsetDateTime,
+        history_ttl: Duration,
+    ) -> Vec<ActivePoller> {
+        let cutoff = now - history_ttl;
         let mut pollers = self.pollers.write().expect("poller registry poisoned");
-        let remove_queue = match pollers.get_mut(queue) {
-            Some(entries) => {
-                entries.retain(|_, poller| poller.last_accessed_at > cutoff);
-                entries.is_empty()
+        let mut by_identity = HashMap::<WorkerIdentity, ActivePoller>::new();
+        pollers.retain(|registered_queue, entries| {
+            entries.retain(|_, poller| poller.last_accessed_at > cutoff);
+            // DescribeTaskQueue addresses a task-queue family, while versioned
+            // pollers are registered against physical deployment/build queues.
+            // v1.31.0's enhanced Describe aggregates those physical queues before
+            // reporting pollers (`physical_task_queue_manager.go @ v1.31.0`).
+            if registered_queue.namespace_id == queue.namespace_id
+                && registered_queue.task_queue == queue.task_queue
+                && registered_queue.task_kind == queue.task_kind
+            {
+                for poller in entries.values() {
+                    let observed = by_identity
+                        .entry(poller.identity.clone())
+                        .or_insert_with(|| poller.clone());
+                    if poller.last_accessed_at > observed.last_accessed_at {
+                        *observed = poller.clone();
+                    }
+                }
             }
-            None => return Vec::new(),
-        };
-        if remove_queue {
-            pollers.remove(queue);
-            return Vec::new();
-        }
+            !entries.is_empty()
+        });
 
-        let mut recent = pollers
-            .get(queue)
-            .into_iter()
-            .flat_map(|entries| entries.values().cloned())
-            .collect::<Vec<_>>();
+        let mut recent = by_identity.into_values().collect::<Vec<_>>();
         // Hash iteration must not leak into public response ordering. Temporal
         // does not promise an order, but stable output keeps tests and operator
         // diffs deterministic.
@@ -148,7 +173,8 @@ impl PollerRegistry {
     /// Return identities observed on `queue` during the five-minute history
     /// window, deduplicated by worker identity.
     pub fn pollers(&self, queue: &QueueKey) -> Vec<ActivePoller> {
-        self.state.pollers_at(queue, OffsetDateTime::now_utc())
+        self.state
+            .pollers_at(queue, OffsetDateTime::now_utc(), poller_history_ttl())
     }
 
     /// Eagerly remove one worker identity from every physical version and task
@@ -169,7 +195,7 @@ impl PollerRegistry {
 
     #[cfg(test)]
     fn pollers_at(&self, queue: &QueueKey, now: OffsetDateTime) -> Vec<ActivePoller> {
-        self.state.pollers_at(queue, now)
+        self.state.pollers_at(queue, now, POLLER_HISTORY_TTL)
     }
 }
 
@@ -218,7 +244,9 @@ mod tests {
 
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
-    use tokeira_types::{NamespaceId, QueueKey, TaskKind, TaskQueueName, WorkerIdentity};
+    use tokeira_types::{
+        BuildId, DeploymentId, NamespaceId, QueueKey, TaskKind, TaskQueueName, WorkerIdentity,
+    };
     use uuid::Uuid;
 
     use super::{POLLER_HISTORY_TTL, PollerRegistry};
@@ -305,6 +333,28 @@ mod tests {
 
         let pollers = registry.pollers_at(&queue, latest + Duration::seconds(1));
         assert_eq!(pollers.len(), 1);
+        assert_eq!(pollers[0].last_accessed_at, latest);
+    }
+
+    #[test]
+    fn task_queue_family_view_aggregates_physical_deployment_versions() {
+        let registry = PollerRegistry::default();
+        let root_queue = queue();
+        let first = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
+        let latest = first + Duration::seconds(30);
+        let identity = WorkerIdentity("worker".to_string());
+        let mut physical_queue = root_queue.clone();
+        physical_queue.deployment = Some(DeploymentId("deployment-a".to_string()));
+        physical_queue.build_id = Some(BuildId("build-a".to_string()));
+        registry.record_at(physical_queue, identity.clone(), first);
+        let mut newer_physical_queue = root_queue.clone();
+        newer_physical_queue.deployment = Some(DeploymentId("deployment-a".to_string()));
+        newer_physical_queue.build_id = Some(BuildId("build-b".to_string()));
+        registry.record_at(newer_physical_queue, identity, latest);
+
+        let pollers = registry.pollers_at(&root_queue, latest + Duration::seconds(1));
+        assert_eq!(pollers.len(), 1);
+        assert_eq!(pollers[0].identity.0, "worker");
         assert_eq!(pollers[0].last_accessed_at, latest);
     }
 

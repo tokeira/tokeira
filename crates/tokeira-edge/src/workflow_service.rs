@@ -53,7 +53,8 @@ use tokeira_runtime::{
     StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView,
     UpdateActivitiesOptionsRequest, UpdateComputeConfig, UpdateLifecycleError,
     UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
-    ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistry, WorkflowActivation,
+    ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistrationGuard,
+    WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata, WorkflowActivation,
     WorkflowDeletion, WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus,
     compute_matching_times, decide_overlap, nexus_operation_next_attempt_at, schedule_workflow_id,
     scheduled_workflow_search_attributes,
@@ -1644,6 +1645,32 @@ impl WorkflowService {
 
     pub fn worker_registry(&self) -> WorkerRegistry {
         self.worker_registry.clone()
+    }
+
+    fn record_worker_poll(
+        &self,
+        namespace: &str,
+        task_queue: &str,
+        worker_identity: &str,
+        deployment: Option<&DeploymentId>,
+        build_id: Option<&BuildId>,
+    ) -> WorkerRegistrationGuard {
+        // Record liveness only after deployment admission has succeeded. The
+        // max-version recovery path retains Temporal's ordinary active-poller delete
+        // gate (`service/worker/workerdeployment/workflow.go:1485-1504 @ v1.31.0`),
+        // while a rejected poll must not make its unregistered Version look active.
+        self.worker_registry.register_poll(
+            WorkerRegistrationKey {
+                worker_identity: WorkerIdentity(worker_identity.to_string()),
+                namespace_id: to_internal::namespace_id_for(namespace),
+                task_queue: TaskQueueName(task_queue.to_string()),
+            },
+            WorkerVersionMetadata {
+                deployment: deployment.cloned(),
+                build_id: build_id.cloned(),
+                last_seen_at: Some(OffsetDateTime::now_utc()),
+            },
+        )
     }
 
     pub fn heartbeat_store(&self) -> Arc<dyn HeartbeatStore> {
@@ -3745,34 +3772,34 @@ impl WorkflowService {
                     ),
                     WorkerIdentity(req.worker_identity.clone()),
                 );
-                // A versioned worker poll lazily registers its deployment and version,
-                // matching v1.31.0's matching-driven auto-create
-                // (`service/worker/workerdeployment/client.go:1230 @ v1.31.0`). This is
-                // best-effort bookkeeping on the control plane: a registry hiccup must
-                // not fail the poll itself, so failures are logged rather than
-                // propagated. Unversioned polls carry no deployment/build id and skip it.
+                // A versioned poll is admitted only after its deployment/version/task
+                // queue registration commits. v1.31.0 returns the registration limit
+                // failure to the poller (`physical_task_queue_manager.go:768-786`), so
+                // treating this as best-effort would silently violate the public limit.
+                // Unversioned polls carry no deployment/build id and skip registration.
                 if let (Some(worker_deployments), Some(deployment), Some(build_id)) = (
                     self.worker_deployments.as_ref(),
                     req.deployment.as_ref(),
                     req.build_id.as_ref(),
-                ) && let Err(error) = worker_deployments
-                    .register_polled_deployment(RegisterPolledDeployment {
-                        namespace_id: to_internal::namespace_id_for(&req.namespace),
-                        deployment_name: DeploymentName(deployment.0.clone()),
-                        build_id: tokeira_storage::BuildId(build_id.0.clone()),
-                        task_queue: req.task_queue.clone(),
-                        task_queue_type: DeploymentTaskQueueType::Workflow,
-                        identity: req.worker_identity.clone(),
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        %error,
-                        deployment = %deployment.0,
-                        build_id = %build_id.0,
-                        "failed to auto-register polled worker deployment"
-                    );
+                ) {
+                    worker_deployments
+                        .register_polled_deployment(RegisterPolledDeployment {
+                            namespace_id: to_internal::namespace_id_for(&req.namespace),
+                            deployment_name: DeploymentName(deployment.0.clone()),
+                            build_id: tokeira_storage::BuildId(build_id.0.clone()),
+                            task_queue: req.task_queue.clone(),
+                            task_queue_type: DeploymentTaskQueueType::Workflow,
+                            identity: req.worker_identity.clone(),
+                        })
+                        .await?;
                 }
+                let worker_poll = self.record_worker_poll(
+                    &req.namespace,
+                    &req.task_queue,
+                    &req.worker_identity,
+                    req.deployment.as_ref(),
+                    req.build_id.as_ref(),
+                );
                 let internal = to_internal::poll_request(req);
                 let scaling_queue = internal.queue.clone();
                 let activation = self
@@ -3795,8 +3822,10 @@ impl WorkflowService {
                         .await
                 {
                     poller.cancelled();
+                    drop(worker_poll);
                 } else {
                     poller.completed();
+                    worker_poll.completed();
                 }
                 let scaling_decision = if activation.is_some() {
                     self.runtime
@@ -5462,32 +5491,33 @@ impl WorkflowService {
                     ),
                     WorkerIdentity(req.worker_identity.clone()),
                 );
-                // Activity polls participate in the same matching-driven Worker
-                // Deployment auto-registration as workflow polls. v1.31.0 reports
-                // both queue types in DescribeWorkerDeploymentVersion once each has
-                // polled (`service/worker/workerdeployment/client.go:1230 @ v1.31.0`).
+                // Activity polls use the same authoritative admission as workflow
+                // polls. Both task types are recorded, while the configured capacity
+                // counts distinct task-queue family names (`version_workflow.go:625-642
+                // @ v1.31.0`).
                 if let (Some(worker_deployments), Some(deployment), Some(build_id)) = (
                     self.worker_deployments.as_ref(),
                     req.deployment.as_ref(),
                     req.build_id.as_ref(),
-                ) && let Err(error) = worker_deployments
-                    .register_polled_deployment(RegisterPolledDeployment {
-                        namespace_id: to_internal::namespace_id_for(&req.namespace),
-                        deployment_name: DeploymentName(deployment.0.clone()),
-                        build_id: tokeira_storage::BuildId(build_id.0.clone()),
-                        task_queue: req.task_queue.clone(),
-                        task_queue_type: DeploymentTaskQueueType::Activity,
-                        identity: req.worker_identity.clone(),
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        %error,
-                        deployment = %deployment.0,
-                        build_id = %build_id.0,
-                        "failed to auto-register activity worker deployment"
-                    );
+                ) {
+                    worker_deployments
+                        .register_polled_deployment(RegisterPolledDeployment {
+                            namespace_id: to_internal::namespace_id_for(&req.namespace),
+                            deployment_name: DeploymentName(deployment.0.clone()),
+                            build_id: tokeira_storage::BuildId(build_id.0.clone()),
+                            task_queue: req.task_queue.clone(),
+                            task_queue_type: DeploymentTaskQueueType::Activity,
+                            identity: req.worker_identity.clone(),
+                        })
+                        .await?;
                 }
+                let worker_poll = self.record_worker_poll(
+                    &req.namespace,
+                    &req.task_queue,
+                    &req.worker_identity,
+                    req.deployment.as_ref(),
+                    req.build_id.as_ref(),
+                );
                 let internal = to_internal::poll_activity_request(req);
                 let scaling_queue = internal.queue.clone();
                 if internal.queue.deployment.is_some() {
@@ -5513,6 +5543,7 @@ impl WorkflowService {
                         .await
                 {
                     poller.completed();
+                    worker_poll.completed();
                     return Ok(None);
                 }
                 // The runtime evaluates durable rules when the broker offer is about to become a
@@ -5527,6 +5558,7 @@ impl WorkflowService {
                 // 617-621 @ v1.31.0`).
                 poller.completed();
                 let started = started.map_err(EdgeError::from)?;
+                worker_poll.completed();
                 let scaling_decision = if started.is_some() {
                     self.runtime
                         .activity_poller_scaling_decision(&scaling_queue)
@@ -7929,12 +7961,14 @@ mod tests {
     use tokeira_kernel::{FieldChange, ParentClosePolicy, StartRequest, WorkflowCommand};
     use tokeira_runtime::{
         BacklogConfig, InMemoryBroker, LaneConfig, TimerScannerConfig, TokeiraRuntime,
-        UpdateLifecycleStage, UpdateWaitPolicy, WorkflowTimeoutScannerConfig,
+        UpdateLifecycleStage, UpdateWaitPolicy, WorkerRegistrationKey,
+        WorkflowTimeoutScannerConfig,
     };
     use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
     use tokeira_types::{
-        ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext, RequestId, RunId,
-        RunKey, SearchAttributes, TaskQueueName, WorkflowId, WorkflowType,
+        BuildId, DeploymentId, ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext,
+        RequestId, RunId, RunKey, SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId,
+        WorkflowType,
     };
 
     use crate::{
@@ -8238,6 +8272,40 @@ mod tests {
         assert!(matches!(result, CommitResult::Applied { .. }));
 
         Ok((service, runtime, namespace_id, workflow_id, run_id))
+    }
+
+    #[tokio::test]
+    async fn admitted_worker_poll_records_deployment_liveness_in_the_shared_registry() -> Result<()>
+    {
+        let (service, _runtime, namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        let deployment = DeploymentId("deployment-a".to_string());
+        let build_id = BuildId("build-a".to_string());
+        let observed_after = OffsetDateTime::now_utc();
+
+        service
+            .record_worker_poll(
+                "default",
+                "queue-a",
+                "worker-a",
+                Some(&deployment),
+                Some(&build_id),
+            )
+            .completed();
+
+        let metadata = service.worker_registry().lookup(&WorkerRegistrationKey {
+            worker_identity: WorkerIdentity("worker-a".to_string()),
+            namespace_id,
+            task_queue: TaskQueueName("queue-a".to_string()),
+        });
+        assert_eq!(metadata.deployment, Some(deployment));
+        assert_eq!(metadata.build_id, Some(build_id));
+        assert!(
+            metadata
+                .last_seen_at
+                .is_some_and(|seen| seen >= observed_after)
+        );
+        Ok(())
     }
 
     fn update_request(

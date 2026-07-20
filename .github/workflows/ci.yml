@@ -42,6 +42,9 @@ jobs:
           toolchain: "1.96"
           components: rustfmt, clippy
       - run: rustup toolchain install "$NIGHTLY_FMT_TOOLCHAIN" --profile minimal --component rustfmt
+      # prost-build compiles the vendored Temporal protos and sources `protoc`
+      # from PATH; the runner image does not ship it.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -68,6 +71,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # snapshot 2026-03-27
         with:
           toolchain: "1.96"
+      # prost-build compiles the vendored Temporal protos and sources `protoc`
+      # from PATH; the runner image does not ship it.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}

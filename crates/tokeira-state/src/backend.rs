@@ -37,9 +37,10 @@ pub trait StateBackend: Send + Sync {
 
     /// Read an immutable snapshot payload.
     ///
-    /// The generic facade does not currently use snapshots, but this method is
-    /// part of the backend contract so adapters can expose the same storage
-    /// primitives as the S3 source store.
+    /// An absent key is [`StateError::NotFound`] — content-addressed
+    /// consumers (the binary/bundle stores) rely on discriminating an honest
+    /// miss from a backend failure; any other error means the read itself
+    /// failed.
     async fn read_snapshot(&self, key: &str) -> Result<Vec<u8>, StateError>;
 
     /// Write an immutable snapshot payload.

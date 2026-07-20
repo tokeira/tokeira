@@ -254,3 +254,60 @@ fn an_empty_closure_is_refused() {
     .expect_err("nothing to snapshot");
     assert!(matches!(err, SnapshotError::EmptyClosure));
 }
+
+// The freeze → materialize round trip (task 18.1's build input): the
+// materialized tree carries the frozen worktree bytes — including an
+// unstaged edit — and the executable bit, and reads only the object
+// database (a post-snapshot worktree edit must not leak in).
+#[test]
+fn materialized_snapshot_reproduces_the_frozen_closure() {
+    use tokeira_build::materialize_snapshot;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    seed_repo(tmp.path());
+    // An executable script, committed with its mode.
+    let script = tmp.path().join("crates/alpha/build.sh");
+    std::fs::write(&script, "#!/bin/sh\n").expect("write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    git(tmp.path(), &["add", "."]);
+    git(tmp.path(), &["commit", "-q", "-m", "script"]);
+    // An unstaged edit — the frozen truth.
+    std::fs::write(
+        tmp.path().join("crates/alpha/src/lib.rs"),
+        "pub fn frozen() {}\n",
+    )
+    .expect("edit");
+
+    let snapshot = snapshot_source_closure(&request(tmp.path())).expect("snapshot");
+    // Mutate the worktree AFTER the freeze: materialization must not see it.
+    std::fs::write(
+        tmp.path().join("crates/alpha/src/lib.rs"),
+        "pub fn after_the_freeze() {}\n",
+    )
+    .expect("post-freeze edit");
+
+    let dest = tempfile::tempdir().expect("tempdir");
+    let count =
+        materialize_snapshot(tmp.path(), &snapshot.tree_oid, dest.path()).expect("materialize");
+    assert_eq!(count, snapshot.file_count, "every frozen file materializes");
+
+    let lib = std::fs::read_to_string(dest.path().join("crates/alpha/src/lib.rs"))
+        .expect("materialized file");
+    assert_eq!(
+        lib, "pub fn frozen() {}\n",
+        "the frozen bytes, not the post-freeze worktree"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dest.path().join("crates/alpha/build.sh"))
+            .expect("script metadata")
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "the executable bit survives");
+    }
+}

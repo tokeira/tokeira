@@ -542,15 +542,46 @@ multi-consumer decision) are out of scope.
         ref-pin land with task 18 (the build request and create wiring are 18.x shapes).*
         _Requirements: 16.1, 16.4, 16.5_
 
-- [ ] 18. Reproducible Dagger build + bundle, wired into create (Requirements 15, 14)
-  - [ ] 18.1 A Dagger `build_provisioner(source_snapshot, request) -> ProvisionerBundle` function
+- [~] 18. Reproducible Dagger build + bundle, wired into create (Requirements 15, 14)
+  - [x] 18.1 A Dagger `build_provisioner(source_snapshot, request) -> ProvisionerBundle` function
         (validate closure → compute `EngineIdentity` → build `tkp` per target → run tests → checksum +
         measure artifacts → package), runnable locally (local Dagger Engine) and on Buildkite (the **same**
-        function). Reuses the `dagger-client` boundary (`tokeira-build`). _Requirements: 15.1_
-  - [ ] 18.2 A Tokeira-controlled content-addressed bundle store (S3 CAS keyed by `EngineIdentity ×
+        function). Reuses the `dagger-client` boundary (`tokeira-build`). DONE —
+        `pipelines/provisioner.rs::build_provisioner`: hermetic **cold** build (guardrail 3 — no
+        incremental `target/` mount; the dev loop stays native cargo and never comes through here) of the
+        **materialized snapshot** (new `snapshot::materialize_snapshot` reads the frozen tree from the
+        odb — a post-freeze worktree edit cannot leak in; round-trip test proves bytes + exec bit),
+        inside a build container that must be **digest-pinned** (`…@sha256:…` — a floating tag is
+        refused before any engine call, guardrail 2), `--locked` everywhere. `EngineIdentity` is
+        computed request-side (tree-oid keying 17.2 + `canonical_lock_bytes` 16.1 + toolchain +
+        container digest + features + profile). Tests (`cargo test --locked -p <closure crates>`, via
+        the new `ProvisionerClosure::crate_names`) run on the frozen source; reaching packaging means
+        they passed (`TestEvidence`). Artifacts are exported then hashed/measured **host-side** — the
+        manifest attests the bytes that left the engine (new `FileRef::export` on the dagger boundary;
+        the mock writes deterministic bytes so pipeline tests exercise real checksumming). Returns
+        `ProvisionerBundle { identity, authority, artifacts, tests, build }` (new domain model,
+        `bundle.rs`), whose `integrity_manifest()` is what the envelope records at bind. *The known
+        Dagger export-path timeout risk (Proposal 005) now sits on `File::export` — much smaller than
+        the image-tarball path, unresolved until exercised live.* _Requirements: 15.1_
+  - [x] 18.2 A Tokeira-controlled content-addressed bundle store (S3 CAS keyed by `EngineIdentity ×
         BuildAuthority × target`, + a per-deployment copy for self-contained rollback): resolve-or-build;
         cache-hit re-verification; authority-partitioned/write-gated; a revocation deny-list honoured at
-        bind. Not GitHub Actions artifacts. _Requirements: 15.3, 15.4, 5_
+        bind. Not GitHub Actions artifacts. DONE (store; the per-deployment retained copy is the 18.3
+        create wiring, via the existing identity-keyed `BinaryStore`) — `bundle_store.rs::BundleStore`
+        over any `StateBackend` (one implementation serves the S3 CAS and local dev), keys
+        `bundles/{tier}/{identity-digest}/{target}` + `manifest.json` written **last** (a torn publish
+        resolves as a miss, never a half-trusted hit). `publish` verifies bytes against the bundle's own
+        descriptors **before** writing and refuses failing-tests bundles. `resolve` searches qualifying
+        tier partitions highest-trust first — a `TrustedCi` floor never reads the `local_developer`
+        partition (guardrail 1) — and re-runs the **full admission gate** on every hit (re-hash +
+        authority + deny-list; a cache hit is a performance event, never a trust decision). A present-
+        but-inadmissible bundle is a surfaced `Admission` error, never silently degraded to a miss. The
+        deny-list got its v1 home (decision 4): `{prefix}/revocations.json` in the store itself —
+        revocation is one CAS write, honoured by every subsequent bind. Enabler: `StateBackend::
+        read_snapshot` now discriminates an absent key as `StateError::NotFound` (contract documented;
+        Local + S3 backends fixed; regression test) so an honest miss is distinguishable from a backend
+        failure. *Write-gating trusted partitions to CI credentials is Phase-3 policy (18.3/18.4).*
+        _Requirements: 15.3, 15.4, 5_
   - [ ] 18.3 Wire `tkr deployment create` inception to **request a bundle**: resolve `EngineIdentity` →
         resolve an existing verified bundle (build via Dagger on a miss) → verify → retain in the deployment
         → Day-0 stamp. Phasing: Phase 0 native-cargo dev binding (the current `place_provisioner` copy) →

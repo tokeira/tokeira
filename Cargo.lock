@@ -7757,6 +7757,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokeira-provisioner",
  "toml 0.8.23",
  "tracing",
 ]

@@ -14,6 +14,12 @@ use crate::{
     BinaryArtifactDescriptor, BuildAuthority, EngineIdentity, IntegrityManifest, Sha256Digest,
 };
 
+/// Basename of the bundle-manifest sidecar `tkr deployment create` places
+/// next to the deployment's `tkp` (task 18.3). `tkp init` records it as the
+/// Day-0 integrity manifest — after verifying its own bytes are one of the
+/// manifest's artifacts — instead of the pre-identity self-stamp.
+pub const BUNDLE_MANIFEST_BASENAME: &str = "tkp.manifest.json";
+
 /// Evidence that the bundle's bytes passed their tests. Bound to the bundle —
 /// the evidence travels with the exact artifact set it vouches for, never
 /// cached by identity alone (Proposal 005, guardrail 5).

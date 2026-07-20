@@ -582,13 +582,31 @@ multi-consumer decision) are out of scope.
         Local + S3 backends fixed; regression test) so an honest miss is distinguishable from a backend
         failure. *Write-gating trusted partitions to CI credentials is Phase-3 policy (18.3/18.4).*
         _Requirements: 15.3, 15.4, 5_
-  - [ ] 18.3 Wire `tkr deployment create` inception to **request a bundle**: resolve `EngineIdentity` →
+  - [x] 18.3 Wire `tkr deployment create` inception to **request a bundle**: resolve `EngineIdentity` →
         resolve an existing verified bundle (build via Dagger on a miss) → verify → retain in the deployment
         → Day-0 stamp. Phasing: Phase 0 native-cargo dev binding (the current `place_provisioner` copy) →
         Phase 1 the split (task 15) → Phase 2 hermetic Dagger + CAS → Phase 3 Buildkite + the admission gate.
-        _Requirements: 6.5, 14.4_
-  - [ ] 18.4 Thin GitHub Action → Buildkite trigger (optional dispatch/approval front-end only, never the
-        build implementation or artifact channel). _Requirements: 15.1_
+        DONE (Phase 2, opt-in `--bundle`; native Phase-0 stays the default — the dev loop never pays a
+        hermetic build). `obtain_provisioner` (`pipelines/obtain.rs`) is the canonical resolve-or-build:
+        identity computed **without building** (`engine_identity_for`), CAS consulted first (a hit is
+        re-verified by the store's admission gate and builds nothing — test pins zero engine calls), a
+        miss runs one hermetic build and **publishes before use** so the next create of the identity —
+        any deployment, any agent — hits; a request whose own authority cannot satisfy the deployment's
+        floor is refused before any work, and a tampered CAS entry surfaces instead of quietly
+        rebuilding. `tkr deployment create --bundle --build-image <ref@sha256:…>`
+        (`bundle_create.rs`): snapshot the closure → obtain → retain the bytes in the deployment's
+        identity-keyed `BinaryStore` (`retrieval_ref` recorded) → place `tkp` + the
+        `tkp.manifest.json` sidecar. `tkp init` records a placed sidecar as the Day-0 manifest —
+        identity-keyed — **after verifying its own bytes are one of the sidecar's artifacts** (the
+        manifest the envelope records always describes the engine that stamped it); a corrupt or
+        disagreeing sidecar refuses init, never silently downgrades to the pre-identity self-stamp.
+        The LocalDeveloper CAS lives at `<deployments-root>/.bundle-cas`; trusted tiers ride the same
+        store over S3 when CI flows land (Phase 3). _Requirements: 6.5, 14.4_
+  - [SKIPPED] 18.4 Thin GitHub Action → Buildkite trigger (optional dispatch/approval front-end only, never the
+        build implementation or artifact channel). SKIPPED — owner decision (2026-07-20): no CI-trigger
+        front-end; the Buildkite/TrustedCi flow (Phase 3) will be specced when needed, and nothing in
+        18.1–18.3 depends on it (the same `build_provisioner` runs under any invoker).
+        _Requirements: 15.1_
 
 - [ ] 19. Complete the revisions & ownership verbs (Requirements 4, 9, 13; Proposal 002)
       The verbs are wired and their envelope state-machines are tested, but exercised only against the

@@ -33,15 +33,39 @@ pub(crate) async fn run(
             platform,
             storage,
             region,
+            bundle,
+            build_image,
         } => {
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let metadata =
                 deployments.create(&resolved_name, platform.into(), storage.into(), region)?;
             // Forwarded (`.tkd`) platforms carry their own bound provisioner —
-            // introduce `tkp` into the deployment at create.
+            // introduce `tkp` into the deployment at create: the verified
+            // hermetic bundle when `--bundle` opts in (task 18.3), else the
+            // Phase-0 native dev copy.
             if deployments.is_forwarded(Some(&metadata.name))? {
-                deployments.place_provisioner(&metadata.name)?;
-                println!("provisioner: placed `tkp` in the deployment");
+                if bundle {
+                    let image = build_image.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`--bundle` requires `--build-image <image>@sha256:<digest>` (the \
+                             digest-pinned build container is an engine-identity input)"
+                        )
+                    })?;
+                    crate::bundle_create::place_bundle_provisioner(
+                        deployments,
+                        &metadata.name,
+                        image,
+                    )
+                    .await?;
+                } else {
+                    deployments.place_provisioner(&metadata.name)?;
+                    println!("provisioner: placed `tkp` in the deployment");
+                }
+            } else if bundle {
+                anyhow::bail!(
+                    "`--bundle` applies only to forwarded (`.tkd`) platforms — this deployment \
+                     is driven in-process"
+                );
             }
             print_metadata(&metadata, json)?;
         }

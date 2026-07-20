@@ -24,7 +24,8 @@ pub use error::BuildError;
 pub use pipelines::{
     build::{TokeiradBuildRequest, TokeiradBuildResult, build_tokeirad_image},
     mirror::{MirrorRequest, MirroredReference, mirror_image},
-    provisioner::{ProvisionerBuildRequest, build_provisioner},
+    obtain::{ObtainedProvisioner, obtain_provisioner},
+    provisioner::{ProvisionerBuildRequest, build_provisioner, engine_identity_for},
     publish::{PublishRequest, PublishResult, PublishedReference, RegistryPassword, publish_image},
 };
 pub use snapshot::{

@@ -42,6 +42,9 @@ jobs:
           toolchain: "1.96"
           components: rustfmt, clippy
       - run: rustup toolchain install "$NIGHTLY_FMT_TOOLCHAIN" --profile minimal --component rustfmt
+      # prost-build compiles the vendored Temporal protos and sources `protoc`
+      # from PATH; the runner image does not ship it.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -59,20 +62,34 @@ jobs:
 
   test:
     name: "Unit tests"
-    timeout-minutes: 20
+    # Cache-cold runs build the entire workspace and link every test binary;
+    # the ceiling exists to bound hangs, not honest cold builds.
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false # CI is read-only; don't leave the token in .git/config
+      # The hosted runner leaves ~14 GB free — not enough for the workspace's
+      # debug rlibs plus every linked test binary (this job died on ENOSPC).
+      # Drop preinstalled toolchains this job never touches (~30 GB back).
+      - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # snapshot 2026-03-27
         with:
           toolchain: "1.96"
+      # prost-build compiles the vendored Temporal protos and sources `protoc`
+      # from PATH; the runner image does not ship it.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
 
+  # cargo-deny is split in two so the deterministic half can gate merges:
+  # bans/licenses/sources are a pure function of the committed tree and can be
+  # a required status check, while advisories fail on external events (a new
+  # RustSec entry against an unchanged tree) — that job is deliberately never
+  # required, and the weekly cron above re-runs it between pushes.
   cargo-deny:
     name: "Supply-chain & licenses"
     timeout-minutes: 15
@@ -83,7 +100,19 @@ jobs:
           persist-credentials: false # CI is read-only; don't leave the token in .git/config
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
-          command: check
+          command: check bans licenses sources
+
+  cargo-deny-advisories:
+    name: "Security advisories"
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false # CI is read-only; don't leave the token in .git/config
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          command: check advisories
 
   # Internal-link integrity for the docs/spec corpus. Offline mode checks
   # relative file links only — hermetic, no network flakes; external URLs are

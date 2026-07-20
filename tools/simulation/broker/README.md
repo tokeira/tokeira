@@ -2,9 +2,9 @@
 
 Discrete-event simulator that falsifies the safety and liveness invariants of
 Tokeira's delivery broker design
-([040-delivery-broker](../../docs/architecture/040-delivery-broker.md), implemented
-in [`crates/tokeira-runtime/src/broker.rs`](../../crates/tokeira-runtime/src/broker.rs))
-and the [delivery-broker-simulator spec](../../.kiro/specs/delivery-broker-simulator/).
+([040-delivery-broker](../../../docs/architecture/040-delivery-broker.md), implemented
+in [`crates/tokeira-runtime/src/broker.rs`](../../../crates/tokeira-runtime/src/broker.rs))
+and the [delivery-broker-simulator spec](../../../.kiro/specs/delivery-broker-simulator/).
 
 Like [`tools/simulation/placement`](../placement/), this is not a proof. It is a
 deterministic, adversarial simulator that repeatedly tries to break the broker's

@@ -5793,7 +5793,7 @@ fn apply_workflow_command(
 /// Sentinel event id stamped on a bufferable event that has not yet been
 /// flushed — mirrors v1.31.0's `common.BufferedEventID` (`-123`). A resolution
 /// event whose matching `*Started` also buffered carries this in its
-/// `started_event_id` until [`TransitionBuilder::flush_buffered`] back-patches
+/// `started_event_id` until `TransitionBuilder::flush_buffered` back-patches
 /// the real id (`wireEventIDs`, event_store.go:339-406 @ v1.31.0). Public so
 /// the runtime's direct-construct activity-start path can buffer with the same
 /// sentinel when a WFT is started.

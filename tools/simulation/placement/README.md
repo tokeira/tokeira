@@ -2,8 +2,8 @@
 
 Discrete-event simulator that falsifies the safety invariants of Tokeira's
 placement and membership design
-([035-placement-and-membership](../../docs/architecture/035-placement-and-membership.md),
-with the [shard-placement-membership spec](../../.kiro/specs/shard-placement-membership/)).
+([035-placement-and-membership](../../../docs/architecture/035-placement-and-membership.md),
+with the [shard-placement-membership spec](../../../.kiro/specs/shard-placement-membership/)).
 
 Like [`tools/simulation/broker`](../broker/), this is not a proof. It is a
 deterministic, adversarial simulator that repeatedly tries to break the

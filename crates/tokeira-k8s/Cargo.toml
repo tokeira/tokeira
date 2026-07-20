@@ -1,5 +1,6 @@
 [package]
 name = "tokeira-k8s"
+publish = false
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true

@@ -385,10 +385,14 @@ fn apply_permissions(permissions: &[JsonValue], claims: &mut Claims) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::OnceLock};
 
     use jsonwebtoken::{EncodingKey, Header, encode};
     use proptest::prelude::*;
+    use ring::{
+        rand::SystemRandom,
+        signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair},
+    };
     use time::OffsetDateTime;
 
     use super::*;
@@ -410,11 +414,42 @@ mod tests {
         format!("{header}.{payload}.signature")
     }
 
-    const EC_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgWTFfCGljY6aw3Hrt\n\
-kHmPRiazukxPLb6ilpRAewjW8nihRANCAATDskChT+Altkm9X7MI69T3IUmrQU0L\n\
-950IxEzvw/x5BMEINRMrXLBJhqzO9Bm+d6JbqA21YQmd1Kt4RzLJR1W+\n\
------END PRIVATE KEY-----";
+    /// Process-wide ES256 fixture keypair, generated fresh on every test run
+    /// so no private-key bytes live in the source tree (a committed key,
+    /// however inert, trips secret scanners forever).
+    ///
+    /// One shared keypair rather than one per call: `signed_token*` (the
+    /// signing side) and `signed_profile` (the JWKS verification side) must
+    /// agree on the key for cross-helper token flows to verify.
+    struct EcKeyMaterial {
+        /// PKCS#8 v1 DER document holding the P-256 signing key.
+        pkcs8: Vec<u8>,
+        /// Base64url (unpadded) JWK coordinates of the public point.
+        x: String,
+        y: String,
+    }
+
+    fn ec_key() -> &'static EcKeyMaterial {
+        static KEY: OnceLock<EcKeyMaterial> = OnceLock::new();
+        KEY.get_or_init(|| {
+            let rng = SystemRandom::new();
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                .expect("generate P-256 keypair");
+            let pair =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                    .expect("round-trip freshly generated keypair");
+            // Uncompressed SEC1 point: an 0x04 tag, then X and Y as 32-byte
+            // big-endian coordinates — exactly the JWK `x`/`y` payload.
+            let point = pair.public_key().as_ref();
+            let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&point[1..33]);
+            let y = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&point[33..65]);
+            EcKeyMaterial {
+                pkcs8: pkcs8.as_ref().to_vec(),
+                x,
+                y,
+            }
+        })
+    }
 
     fn signed_token(claims: JsonValue) -> String {
         let mut header = Header::new(Algorithm::ES256);
@@ -423,24 +458,21 @@ kHmPRiazukxPLb6ilpRAewjW8nihRANCAATDskChT+Altkm9X7MI69T3IUmrQU0L\n\
     }
 
     fn signed_token_with_header(header: Header, claims: JsonValue) -> String {
-        encode(
-            &header,
-            &claims,
-            &EncodingKey::from_ec_pem(EC_PRIVATE_KEY.as_bytes()).expect("EC key"),
-        )
-        .expect("signed JWT")
+        encode(&header, &claims, &EncodingKey::from_ec_der(&ec_key().pkcs8)).expect("signed JWT")
     }
 
     fn signed_profile(audience: &str) -> JwtIssuerProfile {
+        let key = ec_key();
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-256", "alg": "ES256", "kid": "ec01",
+                "x": key.x.as_str(),
+                "y": key.y.as_str()
+            }]
+        });
         let keys = JwksKeyProvider::from_jwks(
             "https://issuer.example/keys".to_owned(),
-            br#"{
-                "keys": [{
-                    "kty":"EC", "crv":"P-256", "alg":"ES256", "kid":"ec01",
-                    "x":"w7JAoU_gJbZJvV-zCOvU9yFJq0FNC_edCMRM78P8eQQ",
-                    "y":"wQg1EytcsEmGrM70Gb53oluoDbVhCZ3Uq3hHMslHVb4"
-                }]
-            }"#,
+            jwks.to_string().as_bytes(),
         )
         .expect("JWKS");
         JwtIssuerProfile::new(

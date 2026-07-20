@@ -586,7 +586,7 @@ where
     /// If a worker races us and starts the activity first, the freshly loaded
     /// `started_event_id` is honoured and a token for the real start is
     /// returned instead. The started event fabricated here is identical in
-    /// shape to [`Self::start_activity_task`]'s; a stale broker offer for
+    /// shape to `Self::start_activity_task`'s; a stale broker offer for
     /// this activity dies at claim time against `started_event_id`.
     pub async fn force_start_activity_for_completion(
         &self,

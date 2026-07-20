@@ -1,5 +1,6 @@
 [package]
 name = "tokeira-tkd"
+publish = false
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true

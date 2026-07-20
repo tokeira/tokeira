@@ -250,8 +250,9 @@ impl Engine {
     /// shared fail-closed, reverse-dependency-ordered delete path — an id in
     /// `ids` but absent from `known` errors ([`IacError::UnknownResourceDelete`],
     /// Property 10) rather than orphaning the live resource, and an id absent
-    /// from state is skipped (idempotent). Unlike [`destroy_known`], it does
-    /// **not** refresh or reconcile the full known set — only the named ids.
+    /// from state is skipped (idempotent). Unlike
+    /// [`destroy_known`](Self::destroy_known), it does **not** refresh or
+    /// reconcile the full known set — only the named ids.
     pub async fn destroy_selected(
         &self,
         known: &[&dyn Resource],

@@ -209,6 +209,42 @@ these rules are the contract, and they are not optional.
   half-commit. Do not push, merge, rebase, or open PRs unless the task says so:
   integration is handled by the human, serially, one branch at a time.
 
+### 11. Commit attribution — recognise agent work (required)
+
+Kiro, Claude Code, and Codex do a large share of the daily work in this repo, and that contribution
+is recognised **in the history** — never flattened into a lone human author. The human operator stays
+the git `author`; the agents are credited with **required** commit trailers:
+
+- **`Co-authored-by: <Agent> <email>`** — one line for **every agent that authored** part of the
+  change (wrote code, docs, tests, or specs). GitHub renders these as co-authors on the commit and PR.
+- **`Assisted-by: <Agent> <email>`** — one line for **every agent that assisted** without primary
+  authorship: review, verification, ground-truthing, or pairing.
+
+Both trailers are required whenever their role applies: **no agent-produced commit ships without a
+`Co-authored-by:` for its authoring agent(s)**, and any agent that reviewed or verified the change
+**must** be credited with `Assisted-by:`. Credit every agent that took part — generously, not
+grudgingly. A commit with genuine agent involvement and no attribution trailer is an incomplete
+change, the same as a missing test or a failing lint.
+
+Canonical identities (use exactly these; if an agent's address changes, update it here so all three
+agents stay consistent):
+
+- `Kiro <kiro@kiro.dev>`
+- `Claude <noreply@anthropic.com>`
+- `Codex <codex@openai.com>`
+
+Trailers go at the end of the message, after a blank line — which is why the `-F` message file is
+authored to end with them. Example message file:
+
+```text
+feat(placement): fence slot leases on the monotonic token
+
+<why-this-is-correct body>
+
+Co-authored-by: Kiro <kiro@kiro.dev>
+Assisted-by: Claude <noreply@anthropic.com>
+```
+
 ---
 
 ## Architecture

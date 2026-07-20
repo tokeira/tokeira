@@ -25,6 +25,9 @@ url.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 regex = "1"
+# Runtime generation of the ES256 test keypair (no committed key material).
+# ring is already in the tree as jsonwebtoken's backend — no new supply chain.
+ring = "0.17"
 
 [lints]
 workspace = true

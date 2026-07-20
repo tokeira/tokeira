@@ -107,6 +107,15 @@ pub enum SnapshotError {
     },
     #[error("failed to write a git object: {0}")]
     WriteObject(String),
+    #[error("invalid snapshot oid '{0}'")]
+    InvalidOid(String),
+    #[error("failed to read a snapshot object: {0}")]
+    ReadObject(String),
+    #[error("failed to materialize {path}: {source}")]
+    WriteFile {
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 /// Freeze the worktree content of the closure into a content-addressed tree +
@@ -258,6 +267,106 @@ fn write_audit_commit(
         .write_object(&commit)
         .map_err(|e| SnapshotError::WriteObject(e.to_string()))?
         .detach())
+}
+
+/// Materialize a snapshot **tree** into `dest` — the file set a hermetic
+/// build consumes (task 18.1's "feed the snapshot to the build, never the
+/// live tree"). Reads only the object database; the working tree and index
+/// play no part, so a worktree edit after the snapshot cannot leak into the
+/// build. Returns the number of files written.
+///
+/// Submodule (commit) entries are impossible here — the snapshot writer only
+/// freezes blobs and links — and are refused as corruption if encountered.
+pub fn materialize_snapshot(
+    repo_root: &Path,
+    tree_oid_hex: &str,
+    dest: &Path,
+) -> Result<usize, SnapshotError> {
+    let repo = gix::discover(repo_root).map_err(Box::new)?;
+    let tree = gix::ObjectId::from_hex(tree_oid_hex.as_bytes())
+        .map_err(|e| SnapshotError::InvalidOid(format!("{tree_oid_hex}: {e}")))?;
+    std::fs::create_dir_all(dest).map_err(|source| SnapshotError::WriteFile {
+        path: dest.display().to_string(),
+        source,
+    })?;
+    let mut file_count = 0usize;
+    materialize_tree(&repo, tree, dest, &mut file_count)?;
+    Ok(file_count)
+}
+
+fn materialize_tree(
+    repo: &gix::Repository,
+    tree: gix::ObjectId,
+    dest: &Path,
+    file_count: &mut usize,
+) -> Result<(), SnapshotError> {
+    let read = |oid: gix::ObjectId| -> Result<Vec<u8>, SnapshotError> {
+        Ok(repo
+            .find_object(oid)
+            .map_err(|e| SnapshotError::ReadObject(e.to_string()))?
+            .detach()
+            .data)
+    };
+    let tree = repo
+        .find_object(tree)
+        .map_err(|e| SnapshotError::ReadObject(e.to_string()))?
+        .try_into_tree()
+        .map_err(|e| SnapshotError::ReadObject(e.to_string()))?;
+    // Decode the tree before iterating: entries borrow the tree's data.
+    let entries: Vec<(gix::object::tree::EntryKind, String, gix::ObjectId)> = tree
+        .iter()
+        .map(|entry| {
+            let entry = entry.map_err(|e| SnapshotError::ReadObject(e.to_string()))?;
+            Ok((
+                entry.mode().kind(),
+                entry.filename().to_str_lossy().into_owned(),
+                entry.oid().to_owned(),
+            ))
+        })
+        .collect::<Result<_, SnapshotError>>()?;
+    for (kind, name, oid) in entries {
+        let path = dest.join(&name);
+        let write_err = |source: std::io::Error| SnapshotError::WriteFile {
+            path: path.display().to_string(),
+            source,
+        };
+        match kind {
+            gix::object::tree::EntryKind::Tree => {
+                std::fs::create_dir_all(&path).map_err(write_err)?;
+                materialize_tree(repo, oid, &path, file_count)?;
+            }
+            gix::object::tree::EntryKind::Blob | gix::object::tree::EntryKind::BlobExecutable => {
+                std::fs::write(&path, read(oid)?).map_err(write_err)?;
+                #[cfg(unix)]
+                if kind == gix::object::tree::EntryKind::BlobExecutable {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .map_err(write_err)?;
+                }
+                *file_count += 1;
+            }
+            gix::object::tree::EntryKind::Link => {
+                let target = read(oid)?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(
+                    std::path::Path::new(std::str::from_utf8(&target).map_err(|e| {
+                        SnapshotError::ReadObject(format!("non-utf8 symlink target: {e}"))
+                    })?),
+                    &path,
+                )
+                .map_err(write_err)?;
+                #[cfg(not(unix))]
+                std::fs::write(&path, target).map_err(write_err)?;
+                *file_count += 1;
+            }
+            gix::object::tree::EntryKind::Commit => {
+                return Err(SnapshotError::ReadObject(format!(
+                    "unexpected submodule entry '{name}' — snapshots freeze only blobs and links"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether repo-relative `path` falls under any closure path (a file match or

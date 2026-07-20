@@ -40,6 +40,9 @@ pub struct ProvisionerClosure {
     /// These (plus [`workspace_files`](Self::workspace_files)) are the
     /// snapshot's closure paths.
     pub crate_dirs: Vec<PathBuf>,
+    /// Package names of the reachable workspace members, sorted — the `-p`
+    /// set a hermetic build tests (task 18.1).
+    pub crate_names: Vec<String>,
     /// Workspace-relative build-shaping files that exist in this workspace.
     pub workspace_files: Vec<PathBuf>,
     /// The locked third-party dependencies reachable from the seed, sorted by
@@ -151,6 +154,7 @@ pub fn resolve_source_closure(
     let members: BTreeSet<&cargo_metadata::PackageId> = metadata.workspace_members.iter().collect();
     let checksums = lock_checksums(workspace_root)?;
     let mut crate_dirs = Vec::new();
+    let mut crate_names = Vec::new();
     let mut locked = Vec::new();
     for package in &metadata.packages {
         if !reachable.contains(&package.id) {
@@ -165,6 +169,7 @@ pub fn resolve_source_closure(
                 .strip_prefix(workspace_root.to_string_lossy().as_ref())
                 .unwrap_or(dir);
             crate_dirs.push(PathBuf::from(relative.as_str().trim_start_matches('/')));
+            crate_names.push(package.name.as_str().to_owned());
         } else {
             let version = package.version.to_string();
             let checksum = checksums
@@ -179,6 +184,7 @@ pub fn resolve_source_closure(
         }
     }
     crate_dirs.sort();
+    crate_names.sort();
     locked.sort();
 
     let workspace_files = WORKSPACE_BUILD_FILES
@@ -189,6 +195,7 @@ pub fn resolve_source_closure(
 
     Ok(ProvisionerClosure {
         crate_dirs,
+        crate_names,
         workspace_files,
         locked,
     })

@@ -143,14 +143,26 @@ impl StateBackend for S3Backend {
 
     async fn read_snapshot(&self, key: &str) -> Result<Vec<u8>, StateError> {
         let object_key = self.snapshot_key(key);
-        let output = self
+        let output = match self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(&object_key)
             .send()
             .await
-            .map_err(|err| Self::s3_error("s3:GetObject", &err))?;
+        {
+            Ok(output) => output,
+            // An absent key is `NotFound` — content-addressed consumers (the
+            // binary/bundle stores) discriminate an honest miss from a
+            // backend failure.
+            Err(err) if Self::is_code::<GetObjectError>(&err, "NoSuchKey") => {
+                return Err(StateError::NotFound(format!("snapshot {key}")));
+            }
+            Err(err) if Self::is_code::<GetObjectError>(&err, "NotFound") => {
+                return Err(StateError::NotFound(format!("snapshot {key}")));
+            }
+            Err(err) => return Err(Self::s3_error("s3:GetObject", &err)),
+        };
         Self::collect_body("s3:GetObject", output.body).await
     }
 

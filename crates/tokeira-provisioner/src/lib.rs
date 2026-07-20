@@ -26,6 +26,8 @@ use tokeira_state::{SnapshotRef, StateError, Validate};
 pub mod admission;
 pub mod binary_store;
 pub mod binding;
+pub mod bundle;
+pub mod bundle_store;
 pub mod identity;
 pub mod integrity;
 pub mod migration;
@@ -34,6 +36,8 @@ mod version;
 pub use admission::{AdmissionError, RevocationList, admit_artifact};
 pub use binary_store::{BinaryError, BinaryStore};
 pub use binding::{BindingVerdict, check_binding};
+pub use bundle::{BuildManifest, ProvisionerBundle, TestEvidence};
+pub use bundle_store::{BundleStore, BundleStoreError, ResolvedBundle};
 pub use identity::{AuthorityTier, BuildAuthority, BuildProfile, EngineIdentity};
 pub use integrity::{ChecksumFormatError, IntegrityError, Sha256Digest, sha256_hex};
 pub use migration::{MigrationError, MigrationRegistry, envelope_migrations};
@@ -74,7 +78,7 @@ impl BuildMode {
 /// A Rust target triple (`aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, …).
 ///
 /// `os`/`arch` alone is not precise enough for an executable artifact.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Target(pub String);
 
 /// Recorded identity of the binary bound to a deployment.

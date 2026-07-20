@@ -137,9 +137,16 @@ impl StateBackend for LocalBackend {
 
     async fn read_snapshot(&self, key: &str) -> Result<Vec<u8>, StateError> {
         let path = self.root.join(key);
-        tokio::fs::read(&path)
-            .await
-            .map_err(|e| StateError::Backend(format!("read snapshot {}: {e}", path.display())))
+        tokio::fs::read(&path).await.map_err(|e| {
+            // An absent key is `NotFound` — content-addressed consumers (the
+            // binary/bundle stores) discriminate an honest miss from a
+            // backend failure.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StateError::NotFound(format!("snapshot {key}"))
+            } else {
+                StateError::Backend(format!("read snapshot {}: {e}", path.display()))
+            }
+        })
     }
 
     async fn write_snapshot(&self, key: &str, data: &[u8]) -> Result<(), StateError> {
@@ -182,6 +189,17 @@ impl StateBackend for LocalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The read_snapshot contract: an absent key is NotFound (an honest miss),
+    // never a generic Backend failure — the content-addressed stores
+    // discriminate on it.
+    #[tokio::test]
+    async fn missing_snapshot_reads_as_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(tmp.path());
+        let err = backend.read_snapshot("absent/key").await.unwrap_err();
+        assert!(matches!(err, StateError::NotFound(_)), "got {err:?}");
+    }
 
     #[tokio::test]
     async fn empty_version_creates_new_manifest() {

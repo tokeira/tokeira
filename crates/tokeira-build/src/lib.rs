@@ -24,7 +24,10 @@ pub use error::BuildError;
 pub use pipelines::{
     build::{TokeiradBuildRequest, TokeiradBuildResult, build_tokeirad_image},
     mirror::{MirrorRequest, MirroredReference, mirror_image},
+    provisioner::{ProvisionerBuildRequest, build_provisioner},
     publish::{PublishRequest, PublishResult, PublishedReference, RegistryPassword, publish_image},
 };
-pub use snapshot::{SnapshotError, SnapshotRequest, SourceSnapshot, snapshot_source_closure};
+pub use snapshot::{
+    SnapshotError, SnapshotRequest, SourceSnapshot, materialize_snapshot, snapshot_source_closure,
+};
 pub use toolchain::rust_toolchain_version;

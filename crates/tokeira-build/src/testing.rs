@@ -31,6 +31,10 @@ pub(crate) enum MockCall {
     },
     File(String),
     ExportImage(String),
+    ExportFile {
+        source: String,
+        host_path: String,
+    },
     Publish(String),
 }
 
@@ -200,7 +204,10 @@ impl<'client> ContainerRef<'client> for MockContainer {
 
     fn file(&self, path: &str) -> Result<Box<dyn FileRef<'client> + 'client>, BuildError> {
         self.record(MockCall::File(path.to_owned()));
-        Ok(Box::new(MockFile))
+        Ok(Box::new(MockFile {
+            state: Arc::clone(&self.state),
+            source: path.to_owned(),
+        }))
     }
 
     fn export_image(&self, tag: &str) -> Result<(), BuildError> {
@@ -231,14 +238,51 @@ impl<'client> DirectoryRef<'client> for MockDirectory {
             .expect("mock state lock")
             .calls
             .push(MockCall::File(name.to_owned()));
-        Ok(Box::new(MockFile))
+        Ok(Box::new(MockFile {
+            state: Arc::clone(&self.state),
+            source: name.to_owned(),
+        }))
     }
 }
 
+/// A mock file that knows the container path it came from; `export` writes
+/// deterministic bytes derived from that path, so pipelines that hash their
+/// exported artifacts (the provisioner build) exercise real host-side
+/// checksumming under the mock.
 #[derive(Debug, Clone)]
-struct MockFile;
+struct MockFile {
+    state: Arc<Mutex<MockState>>,
+    source: String,
+}
 
-impl<'client> FileRef<'client> for MockFile {}
+impl<'client> FileRef<'client> for MockFile {
+    fn export(&self, host_path: &Path) -> Result<(), BuildError> {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .calls
+            .push(MockCall::ExportFile {
+                source: self.source.clone(),
+                host_path: host_path.display().to_string(),
+            });
+        if let Some(parent) = host_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| BuildError::Validation {
+                reason: format!("mock export mkdir: {e}"),
+            })?;
+        }
+        std::fs::write(host_path, mock_artifact_bytes(&self.source)).map_err(|e| {
+            BuildError::Validation {
+                reason: format!("mock export write: {e}"),
+            }
+        })
+    }
+}
+
+/// The deterministic bytes [`MockFile::export`] writes for a container path —
+/// tests derive expected checksums from this.
+pub(crate) fn mock_artifact_bytes(source: &str) -> Vec<u8> {
+    format!("mock-artifact:{source}").into_bytes()
+}
 
 #[derive(Debug, Clone)]
 struct MockSecret;

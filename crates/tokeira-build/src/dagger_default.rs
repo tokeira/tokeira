@@ -196,6 +196,13 @@ impl<'client> DirectoryRef<'client> for dagger_client::Directory<'client> {
 }
 
 impl<'client> FileRef<'client> for dagger_client::File<'client> {
+    fn export(&self, host_path: &Path) -> Result<(), BuildError> {
+        let path = host_path.to_str().ok_or_else(|| {
+            validation_error(format!("path is not valid UTF-8: {}", host_path.display()))
+        })?;
+        dagger_client::File::export(self, path).map_err(dagger_error)
+    }
+
     fn as_dagger_file(&self) -> Option<&dagger_client::File<'client>> {
         Some(self)
     }

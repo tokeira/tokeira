@@ -25,7 +25,7 @@ use std::{
 };
 
 use time::{Duration, OffsetDateTime};
-use tokeira_types::{QueueKey, WorkerIdentity};
+use tokeira_types::{BuildId, DeploymentId, QueueKey, WorkerIdentity};
 
 const POLLER_HISTORY_TTL: Duration = Duration::minutes(5);
 
@@ -49,6 +49,10 @@ pub struct ActivePoller {
     pub identity: WorkerIdentity,
     /// Latest poll-admission or non-cancelled poll-end observation.
     pub last_accessed_at: OffsetDateTime,
+    /// Deployment reported with this physical poll, when the worker is versioned.
+    pub deployment: Option<DeploymentId>,
+    /// Build ID reported with this physical poll, when the worker is versioned.
+    pub build_id: Option<BuildId>,
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +62,8 @@ struct PollerRegistryState {
 
 impl PollerRegistryState {
     fn record(&self, queue: QueueKey, identity: WorkerIdentity, observed_at: OffsetDateTime) {
+        let deployment = queue.deployment.clone();
+        let build_id = queue.build_id.clone();
         self.pollers
             .write()
             .expect("poller registry poisoned")
@@ -68,6 +74,8 @@ impl PollerRegistryState {
                 ActivePoller {
                     identity,
                     last_accessed_at: observed_at,
+                    deployment,
+                    build_id,
                 },
             );
     }
@@ -80,7 +88,8 @@ impl PollerRegistryState {
     ) -> Vec<ActivePoller> {
         let cutoff = now - history_ttl;
         let mut pollers = self.pollers.write().expect("poller registry poisoned");
-        let mut by_identity = HashMap::<WorkerIdentity, ActivePoller>::new();
+        let mut by_identity_and_version =
+            HashMap::<(WorkerIdentity, Option<DeploymentId>, Option<BuildId>), ActivePoller>::new();
         pollers.retain(|registered_queue, entries| {
             entries.retain(|_, poller| poller.last_accessed_at > cutoff);
             // DescribeTaskQueue addresses a task-queue family, while versioned
@@ -92,8 +101,16 @@ impl PollerRegistryState {
                 && registered_queue.task_kind == queue.task_kind
             {
                 for poller in entries.values() {
-                    let observed = by_identity
-                        .entry(poller.identity.clone())
+                    // Temporal keeps poller history on each physical queue, then
+                    // aggregates those queues for DescribeTaskQueue. The same SDK
+                    // identity may therefore legitimately appear once per Deployment
+                    // Version (`physical_task_queue_manager.go @ v1.31.0`).
+                    let observed = by_identity_and_version
+                        .entry((
+                            poller.identity.clone(),
+                            poller.deployment.clone(),
+                            poller.build_id.clone(),
+                        ))
                         .or_insert_with(|| poller.clone());
                     if poller.last_accessed_at > observed.last_accessed_at {
                         *observed = poller.clone();
@@ -103,11 +120,32 @@ impl PollerRegistryState {
             !entries.is_empty()
         });
 
-        let mut recent = by_identity.into_values().collect::<Vec<_>>();
+        let mut recent = by_identity_and_version.into_values().collect::<Vec<_>>();
         // Hash iteration must not leak into public response ordering. Temporal
         // does not promise an order, but stable output keeps tests and operator
         // diffs deterministic.
-        recent.sort_by(|left, right| left.identity.0.cmp(&right.identity.0));
+        recent.sort_by(|left, right| {
+            left.identity
+                .0
+                .cmp(&right.identity.0)
+                .then_with(|| {
+                    left.deployment
+                        .as_ref()
+                        .map(|deployment| deployment.0.as_str())
+                        .cmp(
+                            &right
+                                .deployment
+                                .as_ref()
+                                .map(|deployment| deployment.0.as_str()),
+                        )
+                })
+                .then_with(|| {
+                    left.build_id
+                        .as_ref()
+                        .map(|build_id| build_id.0.as_str())
+                        .cmp(&right.build_id.as_ref().map(|build_id| build_id.0.as_str()))
+                })
+        });
         recent
     }
 
@@ -353,9 +391,12 @@ mod tests {
         registry.record_at(newer_physical_queue, identity, latest);
 
         let pollers = registry.pollers_at(&root_queue, latest + Duration::seconds(1));
-        assert_eq!(pollers.len(), 1);
-        assert_eq!(pollers[0].identity.0, "worker");
-        assert_eq!(pollers[0].last_accessed_at, latest);
+        assert_eq!(pollers.len(), 2);
+        assert!(pollers.iter().all(|poller| poller.identity.0 == "worker"));
+        assert_eq!(pollers[0].build_id.as_ref().unwrap().0, "build-a");
+        assert_eq!(pollers[0].last_accessed_at, first);
+        assert_eq!(pollers[1].build_id.as_ref().unwrap().0, "build-b");
+        assert_eq!(pollers[1].last_accessed_at, latest);
     }
 
     #[test]

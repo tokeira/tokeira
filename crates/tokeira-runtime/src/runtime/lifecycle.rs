@@ -405,7 +405,7 @@ where
         // execution instead of rewriting the original start. Keeping that as a
         // kernel command preserves Tokeira's "history is authority" rule.
         let update = UpdateExecutionOptionsRequest {
-            versioning_override: FieldChange::Unchanged,
+            versioning_override: VersioningOverrideChange::Unchanged,
             completion_callbacks: FieldChange::Unchanged,
             attached_completion_callbacks,
             attached_links,
@@ -1019,7 +1019,7 @@ where
     pub async fn update_workflow_execution_options(
         &self,
         execution: ExecutionRef,
-        versioning_override: FieldChange<tokeira_kernel::VersioningOverride>,
+        versioning_override: VersioningOverrideChange,
         request: RequestContext,
     ) -> Result<CommitResult> {
         let run_key = self

@@ -300,6 +300,16 @@ impl From<anyhow::Error> for EdgeError {
         {
             return Self::BadRequest(reason.clone());
         }
+        // Implied pinned overrides are structurally valid; availability is a
+        // state-dependent precondition resolved inside the serialized kernel
+        // transition (`updateworkflowoptions/api.go @ v1.31.0`). Preserve that
+        // distinction instead of collapsing the typed reject into INTERNAL.
+        if let Some(tokeira_runtime::KernelRejected(
+            tokeira_kernel::Reject::InvalidVersioningOverride(reason),
+        )) = value.downcast_ref::<tokeira_runtime::KernelRejected>()
+        {
+            return Self::FailedPrecondition(reason.clone());
+        }
         // An invalid workflow command fails the WFT server-side and errors the
         // completion with INVALID_ARGUMENT carrying the cause message — the
         // corpus asserts err.Error() == "UnhandledCommand" exactly

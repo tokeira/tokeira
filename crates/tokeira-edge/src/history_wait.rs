@@ -16,8 +16,8 @@ use tokeira_storage::{
     ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BundleLease, CommitResult,
     DeleteRunRequest, DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask,
     DueTimer, LeaseOutcome, LeaseRepository, NexusSweepEntry, RequestRecord, RunRepository,
-    TransitionAuditRecord, WftTimeoutSweepEntry, WorkflowRuleCreateResult,
-    WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
+    TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
+    WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
 };
 use tokeira_types::{
     ExecutionRef, NamespaceId, QueueKey, RequestId, RunId, RunKey, ShardEpoch, ShardId, WorkflowId,
@@ -136,6 +136,20 @@ where
 
     async fn read_transition_audit(&self, run_key: RunKey) -> Result<Vec<TransitionAuditRecord>> {
         self.inner.read_transition_audit(run_key).await
+    }
+
+    async fn has_open_pinned_workflows(
+        &self,
+        namespace_id: NamespaceId,
+        version: &WorkerDeploymentVersionKey,
+    ) -> Result<bool> {
+        // This adapter adds long-poll wakeups only. Delegating every authoritative read
+        // is essential: falling back to RunRepository's compatibility default would
+        // make Worker Deployment drainage report DRAINED while an open pinned run still
+        // exists (`GetVersionDrainageStatus`, client.go @ v1.31.0).
+        self.inner
+            .has_open_pinned_workflows(namespace_id, version)
+            .await
     }
 
     async fn create_workflow_rule(
@@ -411,8 +425,115 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokeira_storage::InMemoryStore;
-    use tokeira_types::{WorkflowRuleAction, WorkflowRuleTrigger};
+    use time::Duration;
+    use tokeira_kernel::{
+        BasicKernel, Command, Kernel, StartRequest, WorkflowIdConflictPolicy,
+        WorkflowIdReusePolicy,
+        state::{VersioningOverride, WorkerDeploymentVersionRef},
+    };
+    use tokeira_storage::{BuildId, DeploymentName, InMemoryStore};
+    use tokeira_types::{
+        Memo, Payloads, RequestContext, RunId, SearchAttributes, TaskQueueName, WorkflowRuleAction,
+        WorkflowRuleTrigger, WorkflowType,
+    };
+
+    async fn seed_open_pinned_run(
+        repo: &HistoryNotifyingRepository<InMemoryStore>,
+        namespace_id: NamespaceId,
+        version: &WorkerDeploymentVersionKey,
+    ) {
+        let workflow_id = WorkflowId("pinned-workflow".to_string());
+        let run_id = RunId::new();
+        let run_key = RunKey::derive(namespace_id, &workflow_id, run_id);
+        let transition = BasicKernel
+            .apply(
+                LoadedRun::Absent,
+                Command::Start(StartRequest {
+                    initiator: None,
+                    run_key,
+                    namespace_id,
+                    workflow_id,
+                    run_id,
+                    workflow_type: WorkflowType("workflow-type".to_string()),
+                    task_queue: TaskQueueName("queue".to_string()),
+                    deployment: None,
+                    build_id: None,
+                    versioning_override: Some(VersioningOverride::Pinned {
+                        version: WorkerDeploymentVersionRef {
+                            deployment_name: version.deployment_name.0.clone(),
+                            build_id: version.build_id.0.clone(),
+                        },
+                    }),
+                    workflow_start_delay: None,
+                    client_cron_schedule: None,
+                    completion_callbacks: Vec::new(),
+                    user_metadata: None,
+                    links: Vec::new(),
+                    on_conflict_options: None,
+                    priority: None,
+                    input: Payloads::default(),
+                    header: None,
+                    memo: Memo::default(),
+                    search_attributes: SearchAttributes::default(),
+                    workflow_execution_timeout: None,
+                    workflow_run_timeout: None,
+                    workflow_task_timeout: Duration::seconds(10),
+                    retry_policy: None,
+                    conflict_policy: WorkflowIdConflictPolicy::Fail,
+                    reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                    attempt: 1,
+                    continued_execution_run_id: None,
+                    first_execution_run_id: Some(run_id),
+                    parent_run_key: None,
+                    parent_workflow_id: None,
+                    parent_run_id: None,
+                    parent_namespace_id: None,
+                    parent_namespace_name: None,
+                    parent_initiated_event_id: 0,
+                    root_workflow_id: None,
+                    root_run_id: None,
+                    original_execution_run_id: Some(run_id),
+                    continued_failure: None,
+                    last_completion_result: None,
+                    first_run_started_at: None,
+                    request: RequestContext {
+                        request_id: RequestId("pinned-start".to_string()),
+                        caller_identity: None,
+                        principal: None,
+                        received_at: OffsetDateTime::UNIX_EPOCH,
+                    },
+                    now: OffsetDateTime::UNIX_EPOCH,
+                    cron_schedule: None,
+                    reserved_poller_identity: None,
+                    eager_execution_accepted: false,
+                }),
+            )
+            .expect("pinned start transition");
+        assert!(matches!(
+            repo.commit_transition(run_key, transition, ShardEpoch::ZERO)
+                .await
+                .expect("commit pinned start"),
+            CommitResult::Applied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_pinned_workflow_read_delegates_through_history_notifier() {
+        let inner = Arc::new(InMemoryStore::default());
+        let repo = HistoryNotifyingRepository::new(inner, HistoryWaitRegistry::default());
+        let namespace_id = NamespaceId::new();
+        let version = WorkerDeploymentVersionKey {
+            deployment_name: DeploymentName("deployment".to_string()),
+            build_id: BuildId("build".to_string()),
+        };
+        seed_open_pinned_run(&repo, namespace_id, &version).await;
+
+        assert!(
+            repo.has_open_pinned_workflows(namespace_id, &version)
+                .await
+                .expect("read through wrapper")
+        );
+    }
 
     #[tokio::test]
     async fn workflow_rule_storage_delegates_through_history_notifier() {

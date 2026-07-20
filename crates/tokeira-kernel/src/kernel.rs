@@ -33,7 +33,7 @@ use crate::{
         StartRequest, StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest,
         TerminateRequest, TimerDueRequest, UnpauseActivityRequest, UnpauseWorkflowRequest,
         UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody,
-        UpdateRequest, WorkflowCommand, WorkflowExecutionTimedOutRequest,
+        UpdateRequest, VersioningOverrideChange, WorkflowCommand, WorkflowExecutionTimedOutRequest,
         WorkflowStartDelayElapsedRequest, WorkflowTaskCompletedRequest, WorkflowTaskFailedCause,
         WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
     },
@@ -43,8 +43,9 @@ use crate::{
         EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED, EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, Link,
         LoadedRun, NexusOperationCancellation, NexusOperationCancellationState, ParentClosePolicy,
         PauseInfo, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
-        PendingUpdate, PendingWorkflowTask, RequestIdInfo, TimerState, VersioningOverride,
-        WorkflowState, WorkflowTaskProblem, WorkflowTaskType, WorkflowVersioningInfo,
+        PendingUpdate, PendingWorkflowTask, RequestIdInfo, TimerState, VersioningBehavior,
+        VersioningOverride, WorkflowState, WorkflowTaskProblem, WorkflowTaskType,
+        WorkflowVersioningInfo,
     },
     transition::{
         ActivityOp, CallbackCompletionOutcome, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp,
@@ -477,6 +478,8 @@ impl BasicKernel {
         let event_root_workflow_id = req.root_workflow_id.clone();
         let event_root_run_id = req.root_run_id;
         let initial_versioning_info = initial_versioning_info(req.versioning_override.clone());
+        let initial_worker_deployment_name =
+            initial_worker_deployment_name(req.versioning_override.as_ref());
         let mut completion_callbacks = req.completion_callbacks.clone();
         stamp_callback_registration_times(&mut completion_callbacks, req.now);
         let initial = WorkflowState {
@@ -489,7 +492,7 @@ impl BasicKernel {
             deployment: req.deployment.clone(),
             build_id: req.build_id.clone(),
             versioning_info: initial_versioning_info.clone(),
-            worker_deployment_name: None,
+            worker_deployment_name: initial_worker_deployment_name.clone(),
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq::ZERO,
             last_event_id: 0,
@@ -584,7 +587,7 @@ impl BasicKernel {
             links: req.links,
             priority: req.priority,
             versioning_info: initial_versioning_info,
-            worker_deployment_name: None,
+            worker_deployment_name: initial_worker_deployment_name,
             eager_execution_accepted,
         });
         // The starting request id authors the WorkflowExecutionStarted event
@@ -645,6 +648,8 @@ impl BasicKernel {
         let event_root_workflow_id = req.root_workflow_id.clone();
         let event_root_run_id = req.root_run_id;
         let initial_versioning_info = initial_versioning_info(req.versioning_override.clone());
+        let initial_worker_deployment_name =
+            initial_worker_deployment_name(req.versioning_override.as_ref());
         let initial = WorkflowState {
             run_key: req.run_key,
             namespace_id: req.namespace_id,
@@ -655,7 +660,7 @@ impl BasicKernel {
             deployment: req.deployment,
             build_id: req.build_id,
             versioning_info: initial_versioning_info.clone(),
-            worker_deployment_name: None,
+            worker_deployment_name: initial_worker_deployment_name.clone(),
             status: ExecutionStatus::Running,
             transition_seq: TransitionSeq::ZERO,
             last_event_id: 0,
@@ -750,7 +755,7 @@ impl BasicKernel {
             links: req.links.clone(),
             priority: req.priority,
             versioning_info: initial_versioning_info,
-            worker_deployment_name: None,
+            worker_deployment_name: initial_worker_deployment_name,
             // Signal-with-start has no eager-execution request field and does
             // not reserve an inline first-WFT worker.
             eager_execution_accepted: false,
@@ -1524,12 +1529,27 @@ impl BasicKernel {
         req: UpdateExecutionOptionsRequest,
     ) -> Result<Transition, Reject> {
         let state = expect_open(loaded)?;
+        let versioning_override =
+            resolve_versioning_override_change(&state, req.versioning_override)?;
         let mut completion_callbacks = req.completion_callbacks;
         if let FieldChange::Set(callbacks) = &mut completion_callbacks {
             stamp_callback_registration_times(callbacks, req.now);
         }
         let mut attached_completion_callbacks = req.attached_completion_callbacks;
         stamp_callback_registration_times(&mut attached_completion_callbacks, req.now);
+
+        // `MergeAndApply` returns Noop and authors no event when the merged
+        // options equal current state (`updateworkflowoptions/api.go @
+        // v1.31.0`). Attached conflict-policy data shares this command, so the
+        // fast path is valid only when every other mutation channel is empty.
+        if matches!(versioning_override, FieldChange::Unchanged)
+            && matches!(completion_callbacks, FieldChange::Unchanged)
+            && attached_completion_callbacks.is_empty()
+            && req.attached_links.is_empty()
+            && req.attached_request_id.is_none()
+        {
+            return Ok(TransitionBuilder::new(state, req.now, None).finish_noop());
+        }
         let mut builder = TransitionBuilder::new(state, req.now, req.request.principal.clone());
         builder.request_dedupe_ops.push(RequestDedupeOp {
             request_id: req.request.request_id.clone(),
@@ -1544,7 +1564,8 @@ impl BasicKernel {
         // {Buffered:true, EventId:0} → {Buffered:false, EventId:14}).
         let options_event_id =
             builder.emit_or_buffer(HistoryEventKind::WorkflowExecutionOptionsUpdated {
-                versioning_override: req.versioning_override.clone(),
+                identity: req.request.caller_identity.clone().unwrap_or_default(),
+                versioning_override: versioning_override.clone(),
                 completion_callbacks: completion_callbacks.clone(),
                 attached_completion_callbacks: attached_completion_callbacks.clone(),
                 attached_links: req.attached_links.clone(),
@@ -1562,7 +1583,7 @@ impl BasicKernel {
             );
         }
 
-        match req.versioning_override {
+        match versioning_override {
             FieldChange::Set(versioning_override) => {
                 builder
                     .state
@@ -3158,6 +3179,7 @@ impl BasicKernel {
                         builder.state.admitted_updates.insert(update_id.clone());
                     }
                     HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                        identity: _,
                         versioning_override,
                         completion_callbacks,
                         attached_completion_callbacks,
@@ -4304,6 +4326,7 @@ impl BasicKernel {
                 state.admitted_updates.remove(update_id);
             }
             HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                identity: _,
                 versioning_override,
                 completion_callbacks,
                 attached_completion_callbacks,
@@ -4392,6 +4415,15 @@ fn initial_versioning_info(
         versioning_override: Some(versioning_override),
         ..WorkflowVersioningInfo::default()
     })
+}
+
+fn initial_worker_deployment_name(
+    versioning_override: Option<&VersioningOverride>,
+) -> Option<String> {
+    match versioning_override {
+        Some(VersioningOverride::Pinned { version }) => Some(version.deployment_name.clone()),
+        Some(VersioningOverride::AutoUpgrade) | None => None,
+    }
 }
 
 fn expect_open(loaded: LoadedRun) -> Result<WorkflowState, Reject> {
@@ -6539,6 +6571,80 @@ impl TransitionBuilder {
             projection_ops: self.projection_ops,
         }
     }
+
+    /// Produce an explicit no-op transition without advancing the OCC fence.
+    ///
+    /// The runtime recognizes this fully empty write set and bypasses storage.
+    /// Keeping the marker in the normal transition type avoids introducing a
+    /// second kernel result channel while making accidental effect loss
+    /// impossible through [`Transition::is_noop`].
+    fn finish_noop(self) -> Transition {
+        debug_assert!(self.history_events.is_empty());
+        debug_assert!(self.event_principals.is_empty());
+        debug_assert!(self.request_dedupe_ops.is_empty());
+        debug_assert!(self.activity_ops.is_empty());
+        debug_assert!(self.timer_ops.is_empty());
+        debug_assert!(self.dispatch_ops.is_empty());
+        debug_assert!(self.projection_ops.is_empty());
+        Transition {
+            expected_seq: self.expected_seq,
+            next_state: self.state,
+            history_events: self.history_events,
+            event_principals: self.event_principals,
+            request_dedupe_ops: self.request_dedupe_ops,
+            activity_ops: self.activity_ops,
+            timer_ops: self.timer_ops,
+            dispatch_ops: self.dispatch_ops,
+            projection_ops: self.projection_ops,
+        }
+    }
+}
+
+/// Resolve a versioning change against the authoritative state loaded for this
+/// transition and reduce value-equivalent changes to an event-free no-op.
+fn resolve_versioning_override_change(
+    state: &WorkflowState,
+    change: VersioningOverrideChange,
+) -> Result<FieldChange<VersioningOverride>, Reject> {
+    let requested = match change {
+        VersioningOverrideChange::Unchanged => return Ok(FieldChange::Unchanged),
+        VersioningOverrideChange::Set(value) => Some(value),
+        VersioningOverrideChange::Clear => None,
+        VersioningOverrideChange::SetImpliedPinned => {
+            let behavior = state.effective_behavior();
+            if behavior != VersioningBehavior::Pinned {
+                return Err(implied_pinned_reject(state, behavior));
+            }
+            let version = state
+                .effective_deployment()
+                .cloned()
+                .ok_or_else(|| implied_pinned_reject(state, behavior))?;
+            Some(VersioningOverride::Pinned { version })
+        }
+    };
+
+    if state.versioning_override() == requested.as_ref() {
+        return Ok(FieldChange::Unchanged);
+    }
+    Ok(match requested {
+        Some(value) => FieldChange::Set(value),
+        None => FieldChange::Clear,
+    })
+}
+
+fn implied_pinned_reject(state: &WorkflowState, behavior: VersioningBehavior) -> Reject {
+    // v1.31.0 interpolates the public enum's generated String value, whose
+    // user-facing spelling is CamelCase rather than its protobuf constant name
+    // (`service/history/api/updateworkflowoptions/api.go @ v1.31.0`).
+    let behavior = match behavior {
+        VersioningBehavior::Unspecified => "Unspecified",
+        VersioningBehavior::Pinned => "Pinned",
+        VersioningBehavior::AutoUpgrade => "AutoUpgrade",
+    };
+    Reject::InvalidVersioningOverride(format!(
+        "must specify a specific pinned override version because workflow with id {} has behavior {behavior} and is not yet pinned to any version",
+        state.workflow_id.0
+    ))
 }
 
 /// The `ActivityTaskScheduled` event id a buffered terminal activity event
@@ -6624,6 +6730,11 @@ pub enum Reject {
     /// A `WorkflowTaskStarted` transition attempted to move a pinned workflow.
     #[error("pinned workflow cannot start a deployment-version transition")]
     PinnedWorkflowCannotTransition,
+    /// An execution-options mutation is structurally valid but incompatible
+    /// with authoritative run state. The edge maps this state-dependent reject
+    /// to `FAILED_PRECONDITION`, matching updateworkflowoptions at v1.31.0.
+    #[error("{0}")]
+    InvalidVersioningOverride(String),
     /// A `WorkflowTaskStarted` was issued but the pending WFT
     /// has already been started.
     #[error("workflow task already started: logical_seq={logical_seq}")]

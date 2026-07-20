@@ -119,7 +119,7 @@ pub(crate) fn resolve_workflow_task_target_version(
 /// percentage P is scaled to `P * 100` buckets — e.g. P=50 sends ids with
 /// bucket `< 5000` (half) to the ramping version. This gives 1/100-percent
 /// resolution matching the `float` percentage field.
-fn routing_config_target(
+pub(crate) fn routing_config_target(
     routing_config: &StoredRoutingConfig,
     workflow_id: &WorkflowId,
 ) -> Option<WorkerDeploymentVersionRef> {

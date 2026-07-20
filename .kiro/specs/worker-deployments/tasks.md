@@ -293,6 +293,51 @@ each placed in the crate the design specifies.
     - Run focused runtime/edge/conformance tests, then two consecutive clean `TestWorkerDeploymentSuite` runs and update the functional-conformance ledger.
     - _Requirements: 2.16, 2.17, 2.18, 2.19, 8.7, 8.8, 8.9_
 
+- [x] 14. Tier 8.40 pinned routing, membership, and reactivation
+  - [x] 14.1 Add runtime-scoped membership and reactivation caches
+    - Construct one shared `DeploymentRegistry` per runtime and reuse it from adapters,
+      poll admission, and the dispatch publisher.
+    - Cache positive and negative workflow-task membership results by namespace, task
+      queue family, deployment, and build id using the v1.31.0 one-second default; cache
+      reactivation deduplication by target Version using the ten-second default. Deliver
+      the three conformance-only dynamic-config keys at their consult sites without
+      exposing production configuration or involving the kernel.
+    - _Requirements: 9.11, 14.1, 14.2, 14.4_
+  - [x] 14.2 Validate explicit pinned targets across public write paths
+    - Apply the shared membership check to start, signal-with-start, direct update,
+      batch update, and post-reset option updates before their run mutation commits.
+      Preserve negative answers until TTL expiry and return `FAILED_PRECONDITION` with
+      no mutation when membership is absent.
+    - _Requirements: 14.1, 14.2_
+  - [x] 14.3 Apply best-effort reactivation only after successful persistence
+    - After a successful concrete pinned operation, use the shared TTL gate and a durable
+      registry CAS to change `INACTIVE`/`DRAINED` to `DRAINING`. Disabled, duplicate,
+      failed, cleared, auto-upgrade, and already-active paths are no-ops; reactivation
+      errors never roll back the committed workflow operation.
+    - _Requirements: 14.3, 14.4, 14.5, 14.6_
+  - [x] 14.4 Author pinned start routing state and derive broker publication
+    - Put the pinned deployment name in live start state and
+      `WorkflowExecutionStarted` so replay agrees. Resolve every workflow-task physical
+      queue from authoritative run state plus durable registry immediately before broker
+      publication; keep the broker disposable.
+    - Add focused kernel replay and end-to-end pinned-start routing coverage.
+    - On versioned workflow/activity poll admission, re-key any disposable unversioned
+      backlog when the newly registered Version is selected by durable Current/Ramping
+      routing, so registration racing start publication cannot strand the first task.
+    - _Requirements: 9.9, 9.10, 9.12, 13.5, 13.6_
+  - [x] 14.5 Complete Tier 8.40 validation and fidelity follow-ups
+    - Add/retain deterministic tests for positive and negative cache TTL behavior,
+      enable gating, concurrent deduplication, post-commit ordering, and all public
+      operation paths (Properties 20 and 21; at least 100 cases for each property).
+    - Resolve any remaining drainage/open-pinned count discrepancy against v1.31.0,
+      classify only genuinely undeliverable private-harness leaves, and run the relevant
+      `TestDeploymentVersionSuite` leaves twice consecutively before updating the ledger.
+    - Correct missing-task-queue admission to combine durable historical membership with
+      live runtime pressure: idle missing queues pass; a still-owned missing queue with
+      backlog/add-rate rejects atomically with the exact current/ramping v1.31.0 message.
+      Cover both outcomes and ensure the check is re-evaluated after a CAS conflict.
+    - _Requirements: 8.1-8.9, 9.9-9.11, 14.1-14.6; Properties 20 and 21_
+
 ## Notes
 
 - Tasks follow the design's strict dependency order: storage → kernel → runtime registry → runtime dispatch → edge → describe projection → cleanup/matrix → integration. No new architecture is introduced beyond `design.md`.
@@ -320,7 +365,9 @@ each placed in the crate the design specifies.
     { "id": 8, "tasks": ["7.5", "7.6", "8.1"] },
     { "id": 9, "tasks": ["7.7", "8.2", "9.1", "10.1", "10.2"] },
     { "id": 10, "tasks": ["11.1", "11.2", "11.3"] },
-    { "id": 11, "tasks": ["13.1", "13.2", "13.3", "13.4"] }
+    { "id": 11, "tasks": ["13.1", "13.2", "13.3", "13.4"] },
+    { "id": 12, "tasks": ["14.1", "14.2", "14.3", "14.4"] },
+    { "id": 13, "tasks": ["14.5"] }
   ]
 }
 ```

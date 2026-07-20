@@ -251,6 +251,26 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Duration,
         disposition: Disposition::Wired,
     },
+    // Pinned-override admission caches both membership outcomes, and successful
+    // pinned operations deduplicate version reactivation. These are runtime
+    // registry policies in Tokeira rather than Temporal history/matching service
+    // objects (`version_membership_cache.go` and
+    // `version_reactivation_signal_cache.go @ v1.31.0`).
+    KeySpec {
+        key: "history.versionMembershipCacheTTL",
+        value_type: ValueType::Duration,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "history.versionReactivationSignalCacheTTL",
+        value_type: ValueType::Duration,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "history.enableVersionReactivationSignals",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
     // Callback limits are frontend admission policy, read live before a start is
     // translated into runtime state (`validateWorkflowCompletionCallbacks`,
     // service/frontend/workflow_handler.go:6300-6350 @ v1.31.0).
@@ -528,6 +548,12 @@ mod tests {
             "matching.wv.VersionDrainageStatusRefreshInterval",
             ValueType::Duration,
         ),
+        ("history.versionMembershipCacheTTL", ValueType::Duration),
+        (
+            "history.versionReactivationSignalCacheTTL",
+            ValueType::Duration,
+        ),
+        ("history.enableVersionReactivationSignals", ValueType::Bool),
     ];
 
     /// The classification table is internally consistent: keys are unique, and

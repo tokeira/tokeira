@@ -4,7 +4,7 @@
 
 This design implements the **Worker Deployment v2 surface** (P10 in the
 api-conformance tracker) and makes Tokeira the owner of **worker-versioning routing
-application**. It does three things:
+application**. It does four things:
 
 1. **Implements the 13 v2 worker-deployment RPCs** — deployment CRUD, version CRUD,
    current/ramping selection, compute-config update/validate, version metadata,
@@ -19,6 +19,9 @@ application**. It does three things:
    (`service/frontend/workflow_handler.go` returns `UNIMPLEMENTED` with the message
    "Deployments are deprecated and no longer supported, use Worker Deployments
    instead"; verified at [`github.com/temporalio/temporal` tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0)).
+4. **Validates and reactivates pinned targets** through runtime-scoped TTL caches shared
+   by every public path, while keeping queue publication a derived effect of durable
+   registry and per-run state.
 
 The wire shapes are derived from the vendored API `v1.62.11`
 (`proto/upstream/temporal/api/deployment/v1/message.proto`,
@@ -257,15 +260,16 @@ contract: `AlreadyExists`, `NotFound`, `FailedPrecondition(reason)`,
   `client.go:384 @ v1.31.0`). When `true`, an unknown build_id is auto-created as a
   Version by the set-current/set-ramping update path.
 - `ignore_missing_task_queues` (set-current): when `false` and both the previous and
-  new current versions are versioned (not unversioned), the new version must poll
-  every task queue the previous current version polled; otherwise `FAILED_PRECONDITION`
-  (`isVersionMissingTaskQueues` → `ErrCurrentVersionDoesNotHaveAllTaskQueues`). For
-  set-ramping the same check runs **only when the ramping version changes** and is
-  evaluated against the deployment's **current** version (per the
-  `SetWorkerDeploymentRampingVersionRequest.ignore_missing_task_queues` proto comment).
-  Tokeira derives "task queues polled by a version" from the durable
-  `polled_task_queues` set on the Version record (updated when a poller registers,
-  via the existing `WorkerRegistry` registration hook).
+  new current versions are versioned (not unversioned), first compare the durable
+  historical `polled_task_queues` memberships. A queue missing from the target is a
+  rejection only when it has not moved to another deployment and its current physical
+  queue has backlog or non-zero add-rate. Empty historical memberships therefore do not
+  block promotion (`IsVersionMissingTaskQueues` / `isTaskQueueExpectedInNewVersion`,
+  `service/worker/workerdeployment/client.go:1822-1926 @ v1.31.0`). For set-ramping the
+  same check runs **only when the ramping version changes** and is evaluated against the
+  deployment's **current** version. Tokeira keeps historical membership durable on the
+  Version record and resolves live pressure from its disposable runtime task brokers;
+  neither source enters per-run kernel state.
 
 #### Poll-registration limits and server-initiated eviction
 
@@ -460,6 +464,56 @@ queue from the deployment registry's routing config:
 
 Routing decisions are derived effects of durable registry + per-run state; no
 correctness weight rests on transient queues (Requirement 13.6).
+
+### Pinned membership and reactivation (`deployment_registry.rs`, edge/runtime adapters)
+
+Temporal validates explicit pinned overrides through a cache of task-queue Version
+membership and, after successful persistence, asynchronously signals a potentially
+inactive Version workflow (`common/worker_versioning/worker_versioning.go` and
+`service/history/api/worker_versioning_util.go @ v1.31.0`). Tokeira preserves the
+observable ordering without importing that internal workflow architecture:
+
+1. The runtime-scoped `DeploymentRegistry` owns both caches. Every adapter and the
+   dispatch publisher shares this single instance; constructing one per request would
+   discard the contractually observable negative-cache and dedup windows.
+2. Explicit pinned inputs are checked against the durable Version's workflow
+   task-queue-family membership before the run command is submitted. Both positive and
+   negative results are cached by `(namespace, task queue family, deployment, build id)`
+   for the delivered TTL (default one second, minimum one second).
+3. Only after the workflow mutation commits, the caller asks the registry to reactivate
+   the concrete pinned target. When enabled, one caller per
+   `(namespace, deployment, build id)` TTL window may CAS `INACTIVE`/`DRAINED` to
+   `DRAINING`; other states are no-ops. Errors are deliberately best-effort and cannot
+   invalidate the already committed run transition.
+4. Start, signal-with-start, update-options, batch updates, and post-reset updates all
+   use this shared ordering. The reactivation TTL defaults to ten seconds and is clamped
+   to at least one second (`common/dynamicconfig/constants.go` and
+   `service/history/fx.go @ v1.31.0`).
+
+The caches are derived runtime accelerators, not correctness state. Expiry causes a
+fresh durable membership read or permits another idempotent CAS reactivation. Kernel
+commands carry only deterministic per-run intent and never consult either cache.
+
+### Start-history and derived publication fidelity
+
+A concrete pinned start initializes `worker_deployment_name` in live state and authors
+the same name in `WorkflowExecutionStarted`. Replay therefore reconstructs the routing
+operand before any later WFT completion. Before broker publication, the runtime loads
+the authoritative run, reads the shared registry's durable routing config, resolves the
+target with the pure routing function, and selects the physical Deployment-Version
+queue. Publication does not become an authority: loss or duplication of that queue
+effect is repaired from committed run history and registry state.
+
+Poll admission closes the inverse ordering race. A start may publish while the task
+queue has no registered Deployment-Version membership and therefore initially place
+the derived offer on the unversioned queue. Once a versioned poll commits membership,
+the runtime checks the durable routing config and, when that poller's Version is Current
+or an active Ramping target, re-keys any disposable unversioned workflow/activity offer
+onto the physical queue before blocking the poll. This is the architecture-appropriate
+equivalent of v1.31.0 interrupting and re-resolving spooled work when task-queue user data
+changes (`ProcessSpooledTask`, `service/matching/task_queue_partition_manager.go @
+v1.31.0`): Tokeira keeps the authoritative pending task in run history and repairs only
+its delivery index.
 
 ### Compatibility matrix (`crates/tokeira-compatibility/src/matrix.rs`)
 
@@ -689,10 +743,12 @@ token.
 *For any* set-current or set-ramping request, the poller-presence guards hold per
 v1.31.0: with `allow_no_pollers` false a target build_id that is not a tracked version
 is rejected with `NOT_FOUND`, while with it true the version is auto-created; with
-`ignore_missing_task_queues` false a versioned target that does not poll every task
-queue the comparison version polled is rejected with `FAILED_PRECONDITION`, while with
-it true the check is bypassed (for ramping, the check runs only when the ramping version
-changes and compares against the Current version).
+`ignore_missing_task_queues` false, each historical comparison-version queue missing
+from the target is rejected only if it has not moved to another deployment and has
+current backlog/add-rate pressure. Missing but idle queues do not reject. With the flag
+true the check is bypassed (for ramping, the check runs only when the ramping version
+changes and compares against the Current version). Rejections use the exact
+current-versus-ramping v1.31.0 message and leave registry state unchanged.
 
 **Validates: Requirements 3.5, 3.6, 4.6, 4.7**
 
@@ -837,6 +893,24 @@ identity does not block server-initiated eviction and the deployment's
 
 **Validates: Requirements 2.5, 2.16, 2.17, 2.18, 2.19, 12.4**
 
+### Property 20: Pinned membership cache fidelity
+
+*For any* sequence of Version/task-queue membership changes and validation times,
+positive and negative answers remain stable until the configured TTL expires and are
+refreshed afterward. A missing membership rejects without changing the run, and all
+public callers observe the same cache instance.
+
+**Validates: Requirements 14.1, 14.2, 9.11**
+
+### Property 21: Post-commit reactivation deduplication
+
+*For any* sequence of pinned operation outcomes, target statuses, enable values, and
+times, only successful concrete pinned commits may change `INACTIVE`/`DRAINED` to
+`DRAINING`; at most one logical change occurs per target inside the TTL; and expiry
+permits a later reactivation. Failures and non-pinned/no-change inputs never reactivate.
+
+**Validates: Requirements 14.3, 14.4, 14.5, 14.6**
+
 ## Error Handling
 
 The runtime registry returns `RegistryError`; the edge maps it to `EdgeError`, which
@@ -861,7 +935,7 @@ action_name) and `grpc/errors.rs` (tonic mapping) get entries for the new varian
 | Conflict-token mismatch | `FailedPrecondition` (v1.31.0 `errFailedPrecondition`) | `FailedPrecondition` | `FAILED_PRECONDITION` |
 | Manager-identity mismatch | `FailedPrecondition` (v1.31.0 `ErrManagerIdentityMismatch`) | `FailedPrecondition` | `FAILED_PRECONDITION` |
 | Ramping version equals non-nil Current | `FailedPrecondition` | `FailedPrecondition` | `FAILED_PRECONDITION` |
-| Missing pollers / missing task queues with guard flags false | `FailedPrecondition` (v1.31.0 `ErrCurrentVersionDoesNotHaveAllTaskQueues`) | `FailedPrecondition` | `FAILED_PRECONDITION` |
+| Missing target membership for a still-owned queue with backlog/add-rate, guard flag false | `FailedPrecondition` (v1.31.0 `ErrCurrentVersionDoesNotHaveAllTaskQueues` / `ErrRampingVersionDoesNotHaveAllTaskQueues`) | `FailedPrecondition` | `FAILED_PRECONDITION` |
 | Pinned run cannot transition (dispatch path) | kernel `ErrPinnedWorkflowCannotTransition` → drop stale task | n/a (matching drops) | n/a |
 | 5 deprecated `Deployment` companions | n/a (no state access) | `Unimplemented` (exact v1.31.0 message) | `UNIMPLEMENTED` |
 

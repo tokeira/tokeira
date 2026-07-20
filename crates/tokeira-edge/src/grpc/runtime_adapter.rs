@@ -479,7 +479,7 @@ where
     async fn update_workflow_execution_options(
         &self,
         run_key: tokeira_types::RunKey,
-        versioning_override: tokeira_kernel::FieldChange<tokeira_kernel::VersioningOverride>,
+        versioning_override: tokeira_kernel::VersioningOverrideChange,
         request: tokeira_types::RequestContext,
     ) -> Result<WorkflowMutationOutcome> {
         let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
@@ -898,6 +898,36 @@ where
     ) -> EdgeResult<Option<TaskQueueVersioningView>> {
         self.worker_deployment_registry()?
             .task_queue_versioning(namespace_id, &task_queue)
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn validate_pinned_workflow_version(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        task_queue: String,
+        deployment_name: String,
+        build_id: String,
+    ) -> EdgeResult<()> {
+        self.worker_deployment_registry()?
+            .validate_pinned_workflow_version(
+                namespace_id,
+                &task_queue,
+                &deployment_name,
+                &build_id,
+            )
+            .await
+            .map_err(registry_error_to_edge)
+    }
+
+    async fn reactivate_pinned_version(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        deployment_name: String,
+        build_id: String,
+    ) -> EdgeResult<()> {
+        self.worker_deployment_registry()?
+            .reactivate_pinned_version(namespace_id, &deployment_name, &build_id)
             .await
             .map_err(registry_error_to_edge)
     }

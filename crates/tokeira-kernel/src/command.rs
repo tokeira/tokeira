@@ -171,6 +171,26 @@ pub enum FieldChange<T> {
     Clear,
 }
 
+/// Versioning-override mutation carried into the serialized run transition.
+///
+/// Unlike a generic optional-field patch, the v0.32 pinned form may omit its
+/// version. Temporal resolves that form while holding the workflow lease
+/// (`service/history/api/updateworkflowoptions/api.go @ v1.31.0`). Tokeira
+/// carries the unresolved intent to the pure kernel so resolution observes
+/// authoritative lane order without adding I/O to the state machine.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum VersioningOverrideChange {
+    /// Keep the current override.
+    #[default]
+    Unchanged,
+    /// Replace the current override with a concrete value.
+    Set(VersioningOverride),
+    /// Pin to the run's effective pinned deployment at transition time.
+    SetImpliedPinned,
+    /// Remove the current override.
+    Clear,
+}
+
 /// Per-key patch applied to a workflow memo by a completed workflow task.
 ///
 /// Temporal treats a JSON-null payload as deletion and otherwise merges each
@@ -726,6 +746,9 @@ pub struct ResetRequest {
     /// Exclude updates from the post-fork event reapply.
     #[serde(default)]
     pub reapply_exclude_update: bool,
+    /// Ordered versioning changes applied to the successor before its fresh WFT.
+    #[serde(default)]
+    pub post_reset_versioning_overrides: Vec<VersioningOverrideChange>,
     /// Human-readable reason for the reset.
     pub reason: String,
     /// Caller-supplied request context for dedupe and tracing.
@@ -995,7 +1018,7 @@ pub struct ResetActivityRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpdateExecutionOptionsRequest {
     /// Versioning override change.
-    pub versioning_override: FieldChange<VersioningOverride>,
+    pub versioning_override: VersioningOverrideChange,
     /// Completion callbacks change.
     pub completion_callbacks: FieldChange<Vec<CompletionCallback>>,
     /// Completion callbacks to append without replacing existing registrations.

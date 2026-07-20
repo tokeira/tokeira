@@ -24,9 +24,10 @@
 //! the optimistic-concurrency model used by `RunRepository::commit_transition`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
-    sync::Arc,
+    future::Future,
+    sync::{Arc, Mutex},
 };
 
 use thiserror::Error;
@@ -49,6 +50,9 @@ const MAX_TASK_QUEUE_FAMILIES_PER_VERSION: usize = 100;
 const ACTIVE_POLLER_WINDOW: Duration = Duration::minutes(5);
 const DRAINAGE_VISIBILITY_GRACE_PERIOD: Duration = Duration::minutes(3);
 const DRAINAGE_REFRESH_INTERVAL: Duration = Duration::minutes(3);
+const VERSION_MEMBERSHIP_CACHE_TTL: Duration = Duration::seconds(1);
+const VERSION_REACTIVATION_CACHE_TTL: Duration = Duration::seconds(10);
+const TASK_ADD_RATE_WINDOW: Duration = Duration::seconds(30);
 /// Reserved version string for unversioned workers; a `version` field carrying this
 /// (or empty) resolves to a nil Version rather than a real `(deployment, build_id)`
 /// pair (`common/worker_versioning/worker_versioning.go:1103 @ v1.31.0`).
@@ -120,6 +124,73 @@ fn drainage_refresh_interval() -> Duration {
     DRAINAGE_REFRESH_INTERVAL
 }
 
+#[cfg(not(feature = "conformance"))]
+fn version_membership_cache_ttl() -> Duration {
+    VERSION_MEMBERSHIP_CACHE_TTL
+}
+
+#[cfg(feature = "conformance")]
+fn version_membership_cache_ttl() -> Duration {
+    tokeira_conformance::overrides()
+        .get_duration("history.versionMembershipCacheTTL")
+        .and_then(|value| Duration::try_from(value).ok())
+        .unwrap_or(VERSION_MEMBERSHIP_CACHE_TTL)
+        .max(Duration::seconds(1))
+}
+
+#[cfg(not(feature = "conformance"))]
+fn version_reactivation_cache_ttl() -> Duration {
+    VERSION_REACTIVATION_CACHE_TTL
+}
+
+#[cfg(feature = "conformance")]
+fn version_reactivation_cache_ttl() -> Duration {
+    tokeira_conformance::overrides()
+        .get_duration("history.versionReactivationSignalCacheTTL")
+        .and_then(|value| Duration::try_from(value).ok())
+        .unwrap_or(VERSION_REACTIVATION_CACHE_TTL)
+        .max(Duration::seconds(1))
+}
+
+#[cfg(not(feature = "conformance"))]
+fn version_reactivation_enabled() -> bool {
+    false
+}
+
+#[cfg(feature = "conformance")]
+fn version_reactivation_enabled() -> bool {
+    tokeira_conformance::overrides()
+        .get_bool("history.enableVersionReactivationSignals")
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct VersionMembershipCacheKey {
+    namespace_id: NamespaceId,
+    task_queue: String,
+    deployment_name: String,
+    build_id: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CachedMembership {
+    present: bool,
+    expires_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct VersionReactivationCacheKey {
+    namespace_id: NamespaceId,
+    deployment_name: String,
+    build_id: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MissingTaskQueueGuard {
+    Current,
+    Ramping,
+}
+
 #[cfg(feature = "conformance")]
 fn drainage_refresh_interval() -> Duration {
     tokeira_conformance::overrides()
@@ -150,6 +221,8 @@ pub struct DeploymentRegistry {
     run_repository: Option<Arc<dyn RunRepository>>,
     worker_registry: WorkerRegistry,
     clock: Arc<dyn RegistryClock>,
+    membership_cache: Arc<Mutex<HashMap<VersionMembershipCacheKey, CachedMembership>>>,
+    reactivation_cache: Arc<Mutex<HashMap<VersionReactivationCacheKey, OffsetDateTime>>>,
 }
 
 impl DeploymentRegistry {
@@ -170,6 +243,8 @@ impl DeploymentRegistry {
             run_repository: None,
             worker_registry,
             clock,
+            membership_cache: Arc::new(Mutex::new(HashMap::new())),
+            reactivation_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -197,6 +272,8 @@ impl DeploymentRegistry {
             run_repository: Some(run_repository),
             worker_registry,
             clock,
+            membership_cache: Arc::new(Mutex::new(HashMap::new())),
+            reactivation_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -206,6 +283,178 @@ impl DeploymentRegistry {
 
     pub fn now(&self) -> OffsetDateTime {
         self.clock.now()
+    }
+
+    /// Validate that a pinned version has polled the workflow task-queue family.
+    ///
+    /// Both positive and negative results are cached. That staleness is part of
+    /// the v1.31.0 public behavior: a poll that creates a missing version does
+    /// not invalidate an earlier negative membership result
+    /// (`common/worker_versioning/version_membership_cache.go @ v1.31.0`).
+    pub async fn validate_pinned_workflow_version(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &str,
+        deployment_name: &str,
+        build_id: &str,
+    ) -> Result<(), RegistryError> {
+        self.validate_pinned_workflow_version_with_ttl(
+            namespace_id,
+            task_queue,
+            deployment_name,
+            build_id,
+            version_membership_cache_ttl(),
+        )
+        .await
+    }
+
+    async fn validate_pinned_workflow_version_with_ttl(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &str,
+        deployment_name: &str,
+        build_id: &str,
+        cache_ttl: Duration,
+    ) -> Result<(), RegistryError> {
+        let task_queue = task_queue_family_name(task_queue).to_string();
+        let key = VersionMembershipCacheKey {
+            namespace_id,
+            task_queue: task_queue.clone(),
+            deployment_name: deployment_name.to_string(),
+            build_id: build_id.to_string(),
+        };
+        let now = self.clock.now();
+        if let Some(cached) = self
+            .membership_cache
+            .lock()
+            .expect("membership cache lock poisoned")
+            .get(&key)
+            .copied()
+            .filter(|cached| cached.expires_at > now)
+        {
+            return membership_result(cached.present, deployment_name, build_id, &task_queue);
+        }
+
+        let deployment_key = DeploymentKey {
+            namespace_id,
+            deployment_name: DeploymentName(deployment_name.to_string()),
+        };
+        let present = self
+            .repository
+            .load_deployment(&deployment_key)
+            .await
+            .map_err(RegistryError::from_storage_error)?
+            .and_then(|deployment| {
+                deployment
+                    .versions
+                    .get(&BuildId(build_id.to_string()))
+                    .cloned()
+            })
+            .is_some_and(|version| {
+                version.polled_task_queues.iter().any(|polled| {
+                    polled.name == task_queue
+                        && polled.task_queue_type == DeploymentTaskQueueType::Workflow
+                })
+            });
+        self.membership_cache
+            .lock()
+            .expect("membership cache lock poisoned")
+            .insert(
+                key,
+                CachedMembership {
+                    present,
+                    expires_at: now + cache_ttl,
+                },
+            );
+        membership_result(present, deployment_name, build_id, &task_queue)
+    }
+
+    /// Best-effort reactivation of a version targeted by a successful pinned operation.
+    ///
+    /// The cache check and insertion are atomic, so concurrent starts emit one
+    /// logical reactivation within the configured TTL. Tokeira applies that
+    /// signal's observable state change directly to its durable deployment
+    /// registry rather than introducing Temporal's entity-workflow mechanism.
+    pub async fn reactivate_pinned_version(
+        &self,
+        namespace_id: NamespaceId,
+        deployment_name: &str,
+        build_id: &str,
+    ) -> Result<(), RegistryError> {
+        self.reactivate_pinned_version_with_policy(
+            namespace_id,
+            deployment_name,
+            build_id,
+            version_reactivation_enabled(),
+            version_reactivation_cache_ttl(),
+        )
+        .await
+    }
+
+    async fn reactivate_pinned_version_with_policy(
+        &self,
+        namespace_id: NamespaceId,
+        deployment_name: &str,
+        build_id: &str,
+        enabled: bool,
+        cache_ttl: Duration,
+    ) -> Result<(), RegistryError> {
+        if !enabled {
+            return Ok(());
+        }
+        let now = self.clock.now();
+        let cache_key = VersionReactivationCacheKey {
+            namespace_id,
+            deployment_name: deployment_name.to_string(),
+            build_id: build_id.to_string(),
+        };
+        {
+            let mut cache = self
+                .reactivation_cache
+                .lock()
+                .expect("reactivation cache lock poisoned");
+            if cache
+                .get(&cache_key)
+                .is_some_and(|expires_at| *expires_at > now)
+            {
+                return Ok(());
+            }
+            cache.insert(cache_key, now + cache_ttl);
+        }
+
+        let deployment_key = DeploymentKey {
+            namespace_id,
+            deployment_name: DeploymentName(deployment_name.to_string()),
+        };
+        let build_id = BuildId(build_id.to_string());
+        self.mutate_deployment(&deployment_key, |loaded, changed_at| {
+            let Some(record) = loaded else {
+                return Ok(RegistryMutation::Unchanged(()));
+            };
+            let Some(version) = record.versions.get(&build_id) else {
+                return Ok(RegistryMutation::Unchanged(()));
+            };
+            if !matches!(
+                version.status,
+                WorkerDeploymentVersionStatus::Drained | WorkerDeploymentVersionStatus::Inactive
+            ) {
+                return Ok(RegistryMutation::Unchanged(()));
+            }
+            let mut next = record.clone();
+            let version = next
+                .versions
+                .get_mut(&build_id)
+                .expect("version presence checked above");
+            version.status = WorkerDeploymentVersionStatus::Draining;
+            version.drainage_info = Some(DrainageInfo {
+                status: VersionDrainageStatus::Draining,
+                last_changed_time: changed_at,
+                last_checked_time: changed_at,
+            });
+            Ok(RegistryMutation::Put(next, ()))
+        })
+        .await
+        .map(|_| ())
     }
 
     pub async fn create_deployment(
@@ -269,11 +518,17 @@ impl DeploymentRegistry {
     /// An unversioned poll (empty deployment name or build id) registers nothing.
     pub async fn register_polled_deployment(
         &self,
-        cmd: RegisterPolledDeployment,
+        mut cmd: RegisterPolledDeployment,
     ) -> Result<(), RegistryError> {
         if cmd.deployment_name.0.is_empty() || cmd.build_id.0.is_empty() {
             return Ok(());
         }
+        // Partition RPC names identify physical queues, but Deployment Version
+        // membership is recorded at task-queue-family granularity. Concurrent
+        // polls of `/_sys/<family>/<partition>` must therefore collapse onto the
+        // root name (`tqid.PartitionFromProto` and `RegisterTaskQueueWorker @
+        // v1.31.0`).
+        cmd.task_queue = task_queue_family_name(&cmd.task_queue).to_string();
         let key = cmd.key();
         let auto_request_id = format!("{AUTO_CREATE_REQUEST_ID_PREFIX}{}", cmd.deployment_name.0);
         let max_versions = max_versions_per_deployment();
@@ -556,6 +811,57 @@ impl DeploymentRegistry {
         Ok(None)
     }
 
+    /// Resolve the durable routing config governing a workflow task queue.
+    ///
+    /// A workflow that already names a deployment takes that deployment's
+    /// routing config. Before the first versioned task starts, the run has no
+    /// deployment name, so Tokeira discovers the deployment through the
+    /// version/task-queue membership written by worker polls. This keeps queue
+    /// selection a derived runtime effect of durable registry state rather than
+    /// an edge decision.
+    pub(crate) async fn workflow_task_routing_config(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &str,
+        preferred_deployment: Option<&str>,
+    ) -> Result<StoredRoutingConfig, RegistryError> {
+        if let Some(deployment_name) = preferred_deployment {
+            let key = DeploymentKey {
+                namespace_id,
+                deployment_name: DeploymentName(deployment_name.to_string()),
+            };
+            return self
+                .repository
+                .load_deployment(&key)
+                .await
+                .map_err(RegistryError::from_storage_error)
+                .map(|record| {
+                    record
+                        .map(|record| record.routing_config)
+                        .unwrap_or_default()
+                });
+        }
+
+        let mut deployments = self
+            .repository
+            .list_all_for_namespace(namespace_id)
+            .await
+            .map_err(RegistryError::from_storage_error)?;
+        deployments.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(deployments
+            .into_iter()
+            .find(|deployment| {
+                deployment.versions.values().any(|version| {
+                    version.polled_task_queues.iter().any(|polled| {
+                        polled.name == task_queue
+                            && polled.task_queue_type == DeploymentTaskQueueType::Workflow
+                    })
+                })
+            })
+            .map(|deployment| deployment.routing_config)
+            .unwrap_or_default())
+    }
+
     pub async fn describe_deployment(
         &self,
         key: DeploymentKey,
@@ -667,11 +973,17 @@ impl DeploymentRegistry {
     }
 
     pub async fn create_version(&self, cmd: CreateVersion) -> Result<(), RegistryError> {
-        if cmd.build_id.0.is_empty() || cmd.deployment_name.0.is_empty() {
+        if cmd.deployment_name.0.is_empty() {
             return Err(RegistryError::InvalidArgument(
-                "deployment_name and build_id are required".to_string(),
+                "deployment name cannot be empty".to_string(),
             ));
         }
+        if cmd.build_id.0.is_empty() {
+            return Err(RegistryError::InvalidArgument(
+                "deployment build ID cannot be empty".to_string(),
+            ));
+        }
+        validate_compute_config_shape(&cmd.compute_config)?;
 
         let key = cmd.key();
         // Default an empty request_id to a generated UUID so the dedupe set always has a
@@ -826,10 +1138,12 @@ impl DeploymentRegistry {
         };
         let max_versions = max_versions_per_deployment();
         let poller_window = active_poller_window();
+        let registry = self;
+        let cmd = &cmd;
         let commit = self
-            .mutate_deployment(&key, |loaded, now| {
+            .mutate_deployment_async(&key, move |loaded, now| async move {
                 let synthesized;
-                let record = match loaded {
+                let record = match loaded.as_ref() {
                     Some(record) => {
                         validate_supplied_conflict_token(
                             cmd.conflict_token,
@@ -880,7 +1194,15 @@ impl DeploymentRegistry {
                         poller_window,
                     )?;
                     if !cmd.ignore_missing_task_queues {
-                        validate_missing_task_queues(&next, previous_current.as_ref(), target)?;
+                        registry
+                            .validate_missing_task_queues(
+                                &next,
+                                previous_current.as_ref(),
+                                target,
+                                MissingTaskQueueGuard::Current,
+                                now,
+                            )
+                            .await?;
                     }
                 }
                 record_deployment_modifier(&mut next, &cmd.identity);
@@ -941,10 +1263,12 @@ impl DeploymentRegistry {
         };
         let max_versions = max_versions_per_deployment();
         let poller_window = active_poller_window();
+        let registry = self;
+        let cmd = &cmd;
         let commit = self
-            .mutate_deployment(&key, |loaded, now| {
+            .mutate_deployment_async(&key, move |loaded, now| async move {
                 let synthesized;
-                let record = match loaded {
+                let record = match loaded.as_ref() {
                     Some(record) => {
                         validate_supplied_conflict_token(
                             cmd.conflict_token,
@@ -1023,11 +1347,15 @@ impl DeploymentRegistry {
                     // version) and compares against Current, per the
                     // `ignore_missing_task_queues` proto comment and v1.31.0.
                     if ramping_changed && !cmd.ignore_missing_task_queues {
-                        validate_missing_task_queues(
-                            &next,
-                            next.routing_config.current_version.as_ref(),
-                            target,
-                        )?;
+                        registry
+                            .validate_missing_task_queues(
+                                &next,
+                                next.routing_config.current_version.as_ref(),
+                                target,
+                                MissingTaskQueueGuard::Ramping,
+                                now,
+                            )
+                            .await?;
                     }
                 }
                 record_deployment_modifier(&mut next, &cmd.identity);
@@ -1175,6 +1503,7 @@ impl DeploymentRegistry {
                     &cmd.updates,
                     &cmd.removals,
                 )?;
+                validate_compute_config_shape(&version_record.compute_config)?;
                 if !cmd.request_id.is_empty() {
                     version_record
                         .compute_config_request_ids
@@ -1197,7 +1526,10 @@ impl DeploymentRegistry {
         // deployment, so an unknown Version is not NOT_FOUND and stored state is never
         // touched (`workflow_handler.go:258`, `client.go:2037 @ v1.31.0`).
         required_version_selector(&cmd.deployment_name, cmd.build_id.as_ref())?;
-        validate_compute_config_change(&cmd.updates, &cmd.removals)
+        validate_compute_config_change(&cmd.updates, &cmd.removals)?;
+        let mut proposed = ComputeConfig::default();
+        apply_compute_config_change(&mut proposed, &cmd.updates, &cmd.removals)?;
+        validate_compute_config_shape(&proposed)
     }
 
     pub async fn update_version_metadata(
@@ -1339,6 +1671,93 @@ impl DeploymentRegistry {
             .await
     }
 
+    /// Reject a routing change only when a target-missing historical task queue still
+    /// carries live work for the comparison version.
+    ///
+    /// Historical membership alone is insufficient: v1.31.0 permits the change when
+    /// the queue is idle or has moved to another deployment's current version, and
+    /// rejects only backlog/non-zero-add-rate queues that would become unversioned
+    /// (`service/worker/workerdeployment/client.go:1822-1926 @ v1.31.0`).
+    async fn validate_missing_task_queues(
+        &self,
+        deployment: &StoredWorkerDeployment,
+        comparison_version: Option<&WorkerDeploymentVersionKey>,
+        target: &WorkerDeploymentVersionKey,
+        guard: MissingTaskQueueGuard,
+        now: OffsetDateTime,
+    ) -> Result<(), RegistryError> {
+        let Some(comparison_version) = comparison_version else {
+            return Ok(());
+        };
+        let Some(comparison) = deployment.versions.get(&comparison_version.build_id) else {
+            return Ok(());
+        };
+        let Some(candidate) = deployment.versions.get(&target.build_id) else {
+            return Err(RegistryError::NotFound);
+        };
+        let missing: Vec<_> = comparison
+            .polled_task_queues
+            .difference(&candidate.polled_task_queues)
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let namespace_deployments = self
+            .repository
+            .list_all_for_namespace(deployment.namespace_id)
+            .await
+            .map_err(RegistryError::from_storage_error)?;
+        for task_queue in missing {
+            // Assignment to another deployment's Current version means this queue is
+            // intentionally moving, rather than being orphaned by the proposed change.
+            let moved = namespace_deployments.iter().any(|other| {
+                other.name != deployment.name
+                    && other
+                        .routing_config
+                        .current_version
+                        .as_ref()
+                        .and_then(|current| other.versions.get(&current.build_id))
+                        .is_some_and(|current| current.polled_task_queues.contains(&task_queue))
+            });
+            if moved {
+                continue;
+            }
+
+            // Production always supplies the run repository. A registry constructed
+            // without one (legacy isolated tests) cannot prove a queue idle, so retain
+            // the conservative pre-existing behavior and treat it as pressured.
+            let has_pressure = match &self.run_repository {
+                Some(repository) => repository
+                    .has_deployment_task_queue_pressure(
+                        deployment.namespace_id,
+                        comparison_version,
+                        &task_queue,
+                        now - TASK_ADD_RATE_WINDOW,
+                    )
+                    .await
+                    .map_err(RegistryError::from_storage_error)?,
+                None => true,
+            };
+            if has_pressure {
+                let version =
+                    format_external_version_string(&target.deployment_name, &target.build_id);
+                let message = match guard {
+                    MissingTaskQueueGuard::Current => format!(
+                        "proposed current version '{version}' is missing active task queues from the current version; these would become unversioned if it is set as the current version"
+                    ),
+                    MissingTaskQueueGuard::Ramping => format!(
+                        "proposed ramping version '{version}' is missing active task queues from the current version; these would become unversioned if it is set as the ramping version"
+                    ),
+                };
+                return Err(RegistryError::FailedPrecondition(message));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Core load → validate → CAS-commit loop shared by every mutating method.
     ///
     /// `validate` is a pure closure run against the freshly loaded snapshot (and the
@@ -1399,6 +1818,66 @@ impl DeploymentRegistry {
                         }
                         // Lost the CAS race: reload and re-validate against the snapshot
                         // the winning writer left behind.
+                        DeploymentCasResult::Conflict
+                        | DeploymentCasResult::NotFound
+                        | DeploymentCasResult::AlreadyExists => continue,
+                    }
+                }
+            }
+        }
+
+        Err(RegistryError::ResourceExhausted(
+            "worker deployment registry resource exhausted".to_string(),
+        ))
+    }
+
+    /// Async counterpart to [`Self::mutate_deployment`] for preconditions derived
+    /// from other durable repository state.
+    ///
+    /// The validator receives an owned snapshot so it may await without borrowing a
+    /// stack-local load. A lost deployment CAS still reloads and reruns the complete
+    /// validator, including its durable-state reads, before attempting another write.
+    async fn mutate_deployment_async<T, F, Fut>(
+        &self,
+        key: &DeploymentKey,
+        mut validate: F,
+    ) -> Result<RegistryCommit<T>, RegistryError>
+    where
+        F: FnMut(Option<StoredWorkerDeployment>, OffsetDateTime) -> Fut,
+        Fut: Future<Output = Result<RegistryMutation<T>, RegistryError>>,
+    {
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let loaded = self
+                .repository
+                .load_deployment(key)
+                .await
+                .map_err(RegistryError::from_storage_error)?;
+            let expected = loaded.as_ref().map(|record| record.conflict_token);
+            let now = self.now();
+
+            match validate(loaded, now).await? {
+                RegistryMutation::Unchanged(value) => {
+                    return Ok(RegistryCommit {
+                        conflict_token: expected,
+                        value,
+                    });
+                }
+                RegistryMutation::Put(record, value) => {
+                    match self
+                        .repository
+                        .put_deployment(record, expected)
+                        .await
+                        .map_err(RegistryError::from_storage_error)?
+                    {
+                        DeploymentCasResult::Applied { token } => {
+                            return Ok(RegistryCommit {
+                                conflict_token: Some(token),
+                                value,
+                            });
+                        }
+                        // The deployment snapshot and every external precondition are
+                        // one validation unit. Re-read both after a lost CAS rather than
+                        // applying a decision made against stale routing state.
                         DeploymentCasResult::Conflict
                         | DeploymentCasResult::NotFound
                         | DeploymentCasResult::AlreadyExists => continue,
@@ -1806,6 +2285,20 @@ pub fn format_legacy_version_string(
     format!("{}.{}", deployment_name.0, build_id.0)
 }
 
+/// Format the structured v0.32 deployment-version identity used by current APIs.
+///
+/// v1.31.0 retains the dot-separated deprecated string field, but public errors
+/// from the v0.32 version-management RPCs render `<deployment>:<build>` via
+/// `WorkerDeploymentVersionToStringV32` (`service/worker/workerdeployment/util.go
+/// @ v1.31.0`). Keeping the formatter separate prevents legacy wire fields from
+/// silently changing representation.
+pub fn format_external_version_string(
+    deployment_name: &DeploymentName,
+    build_id: &BuildId,
+) -> String {
+    format!("{}:{}", deployment_name.0, build_id.0)
+}
+
 pub fn resolve_version_selector(
     deployment_name: &DeploymentName,
     build_id: Option<&BuildId>,
@@ -1896,6 +2389,20 @@ fn version_limit_error(
         "cannot add version {} since maximum number of versions ({max_versions}) have been registered in the deployment",
         format_legacy_version_string(deployment_name, build_id)
     ))
+}
+
+fn membership_result(
+    present: bool,
+    deployment_name: &str,
+    build_id: &str,
+    task_queue: &str,
+) -> Result<(), RegistryError> {
+    if present {
+        return Ok(());
+    }
+    Err(RegistryError::FailedPrecondition(format!(
+        "Pinned version '{deployment_name}:{build_id}' is not present in task queue '{task_queue}' of type 'Workflow'"
+    )))
 }
 
 fn task_queue_limit_error(task_queue: &str, max_task_queues: usize) -> RegistryError {
@@ -2004,38 +2511,6 @@ fn ensure_version_available(
         },
     );
     Ok(())
-}
-
-fn validate_missing_task_queues(
-    deployment: &StoredWorkerDeployment,
-    comparison_version: Option<&WorkerDeploymentVersionKey>,
-    target: &WorkerDeploymentVersionKey,
-) -> Result<(), RegistryError> {
-    // No comparison version (e.g. previous Current was unversioned) means there is
-    // nothing the target is required to cover, so the guard passes.
-    let Some(comparison_version) = comparison_version else {
-        return Ok(());
-    };
-    let Some(comparison) = deployment.versions.get(&comparison_version.build_id) else {
-        return Ok(());
-    };
-    let Some(candidate) = deployment.versions.get(&target.build_id) else {
-        return Err(RegistryError::NotFound);
-    };
-
-    // The promotion is safe only if the target already polls every task queue the
-    // comparison version polls; otherwise some queues would be left without a current
-    // worker. Subset, not equality — the target may poll additional queues.
-    if comparison
-        .polled_task_queues
-        .is_subset(&candidate.polled_task_queues)
-    {
-        Ok(())
-    } else {
-        Err(RegistryError::FailedPrecondition(
-            "target version is missing task queues polled by the comparison version".to_string(),
-        ))
-    }
 }
 
 /// Reconciles each version's status/timestamps with the routing config after a
@@ -2196,9 +2671,9 @@ fn recompute_version_drainage(
 }
 
 /// Enforces the three v1.31.0 delete-version gates, all `FAILED_PRECONDITION`: a
-/// version may not be deleted while it is Current/Ramping, while it has a poller seen
-/// within the configured active-poller window, or while it is still draining (unless `skip_drainage`
-/// bypasses the last gate). Poller presence is read from the live `WorkerRegistry`, so
+/// version may not be deleted while it is Current/Ramping, while it is still draining
+/// (unless `skip_drainage` bypasses that gate), or while it has a poller seen within the
+/// configured active-poller window. Poller presence is read from the live `WorkerRegistry`, so
 /// this is the one delete check that depends on transient runtime state rather than the
 /// durable record.
 fn validate_version_delete_preconditions(
@@ -2213,9 +2688,24 @@ fn validate_version_delete_preconditions(
     if deployment.routing_config.current_version.as_ref() == Some(version)
         || deployment.routing_config.ramping_version.as_ref() == Some(version)
     {
-        return Err(RegistryError::FailedPrecondition(
-            "worker deployment version is current or ramping".to_string(),
-        ));
+        return Err(RegistryError::FailedPrecondition(format!(
+            "version '{}' cannot be deleted since it is current or ramping",
+            format_external_version_string(&version.deployment_name, &version.build_id)
+        )));
+    }
+
+    // v1.31.0 checks drainage before poller presence. The ordering is observable
+    // when both gates fail, so preserve it (`version_workflow.go @ v1.31.0`).
+    if !skip_drainage
+        && version_record
+            .drainage_info
+            .as_ref()
+            .is_some_and(|info| info.status != VersionDrainageStatus::Drained)
+    {
+        return Err(RegistryError::FailedPrecondition(format!(
+            "version '{}' cannot be deleted since it is draining",
+            format_external_version_string(&version.deployment_name, &version.build_id)
+        )));
     }
 
     if worker_registry.has_recent_poller_for_deployment_version(
@@ -2225,20 +2715,10 @@ fn validate_version_delete_preconditions(
         now,
         poller_window,
     ) {
-        return Err(RegistryError::FailedPrecondition(
-            "worker deployment version has active pollers".to_string(),
-        ));
-    }
-
-    if !skip_drainage
-        && version_record
-            .drainage_info
-            .as_ref()
-            .is_some_and(|info| info.status != VersionDrainageStatus::Drained)
-    {
-        return Err(RegistryError::FailedPrecondition(
-            "worker deployment version is still draining".to_string(),
-        ));
+        return Err(RegistryError::FailedPrecondition(format!(
+            "version '{}' cannot be deleted since it has active pollers",
+            format_external_version_string(&version.deployment_name, &version.build_id)
+        )));
     }
 
     Ok(())
@@ -2253,9 +2733,14 @@ fn required_version_selector(
             "deployment_version is required".to_string(),
         ));
     };
-    if deployment_name.0.is_empty() || build_id.0.is_empty() {
+    if deployment_name.0.is_empty() {
         return Err(RegistryError::InvalidArgument(
-            "deployment_name and build_id are required".to_string(),
+            "deployment name cannot be empty".to_string(),
+        ));
+    }
+    if build_id.0.is_empty() {
+        return Err(RegistryError::InvalidArgument(
+            "deployment build ID cannot be empty".to_string(),
         ));
     }
     Ok(WorkerDeploymentVersionKey {
@@ -2289,6 +2774,107 @@ fn validate_compute_config_change(
         }
     }
     Ok(())
+}
+
+fn validate_compute_config_shape(compute_config: &ComputeConfig) -> Result<(), RegistryError> {
+    let mut catch_all_seen = false;
+    let mut task_types = BTreeSet::new();
+    for (name, group) in &compute_config.scaling_groups {
+        validate_non_empty_key(name, "compute config scaling group")?;
+        if group.task_queue_types.is_empty() {
+            if catch_all_seen {
+                return Err(RegistryError::InvalidArgument(format!(
+                    "entry {name}: only one scaling group can have no task types defined"
+                )));
+            }
+            catch_all_seen = true;
+        }
+        for task_type in &group.task_queue_types {
+            if *task_type == DeploymentTaskQueueType::Unspecified {
+                return Err(RegistryError::InvalidArgument(format!(
+                    "entry {name}: task type undefined not allowed in compute spec"
+                )));
+            }
+            if !task_types.insert(*task_type) {
+                return Err(RegistryError::InvalidArgument(format!(
+                    "entry {name}: task type {} appears in more than one entry",
+                    deployment_task_queue_type_name(*task_type)
+                )));
+            }
+        }
+
+        let provider_type = group
+            .provider
+            .as_ref()
+            .map(|provider| provider.provider_type.as_str())
+            .unwrap_or_default();
+        if !matches!(
+            provider_type,
+            "aws-lambda"
+                | "aws-ecs"
+                | "subprocess"
+                | "k8s"
+                | "gcp-cloud-run"
+                | "test-invoke"
+                | "test-worker-set"
+        ) {
+            return Err(RegistryError::InvalidArgument(format!(
+                "entry {name}: invalid compute provider type '{provider_type}'"
+            )));
+        }
+        if matches!(provider_type, "test-invoke" | "test-worker-set")
+            && group
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.details.as_ref())
+                .is_some_and(|details| {
+                    serde_json::from_slice::<serde_json::Value>(&details.data)
+                        .ok()
+                        .and_then(|value| value.as_object().cloned())
+                        .is_some_and(|object| object.contains_key("illegal_field"))
+                })
+        {
+            // The v1.31.0 server delegates provider validation to the WCI package
+            // pinned in its go.mod. Its two test providers deliberately reject this
+            // field; the functional corpus exercises that public rejection.
+            return Err(RegistryError::InvalidArgument(
+                "illegal_field found in config".to_string(),
+            ));
+        }
+
+        if let Some(scaler) = &group.scaler
+            && !matches!(scaler.scaler_type.as_str(), "no-sync" | "rate-based")
+        {
+            return Err(RegistryError::InvalidArgument(format!(
+                "entry {name}: invalid scaling algorithm type '{}'",
+                scaler.scaler_type
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn deployment_task_queue_type_name(task_type: DeploymentTaskQueueType) -> &'static str {
+    match task_type {
+        DeploymentTaskQueueType::Workflow => "Workflow",
+        DeploymentTaskQueueType::Activity => "Activity",
+        DeploymentTaskQueueType::Nexus => "Nexus",
+        DeploymentTaskQueueType::Unspecified => "Unspecified",
+    }
+}
+
+fn task_queue_family_name(task_queue: &str) -> &str {
+    let Some(physical) = task_queue.strip_prefix("/_sys/") else {
+        return task_queue;
+    };
+    let Some((family, partition)) = physical.rsplit_once('/') else {
+        return task_queue;
+    };
+    if family.is_empty() || partition.parse::<u32>().is_err() {
+        task_queue
+    } else {
+        family
+    }
 }
 
 fn apply_compute_config_change(
@@ -2618,6 +3204,7 @@ mod tests {
         Memo, NamespaceId, Payloads, RequestContext, RequestId, RunId, RunKey, SearchAttributes,
         ShardEpoch, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
     };
+    use tokio::task::JoinSet;
 
     #[cfg(feature = "conformance")]
     use tokeira_conformance::OverrideValue;
@@ -2632,6 +3219,22 @@ mod tests {
     impl RegistryClock for FixedClock {
         fn now(&self) -> OffsetDateTime {
             self.0
+        }
+    }
+
+    #[derive(Debug)]
+    struct AdjustableClock(Mutex<OffsetDateTime>);
+
+    impl AdjustableClock {
+        fn advance(&self, duration: Duration) {
+            let mut now = self.0.lock().expect("test clock lock poisoned");
+            *now += duration;
+        }
+    }
+
+    impl RegistryClock for AdjustableClock {
+        fn now(&self) -> OffsetDateTime {
+            *self.0.lock().expect("test clock lock poisoned")
         }
     }
 
@@ -2924,6 +3527,7 @@ mod tests {
         namespace_id: NamespaceId,
         deployment_name: &str,
         build_id: &str,
+        task_queue: &str,
         workflow_id: &str,
     ) -> RunKey {
         let run_id = RunId::new();
@@ -2937,9 +3541,9 @@ mod tests {
             workflow_id,
             run_id,
             workflow_type: WorkflowType("wf-type".to_string()),
-            task_queue: TaskQueueName("workflow-tq".to_string()),
-            deployment: None,
-            build_id: None,
+            task_queue: TaskQueueName(task_queue.to_string()),
+            deployment: Some(DeploymentId(deployment_name.to_string())),
+            build_id: Some(RuntimeBuildId(build_id.to_string())),
             versioning_override: Some(VersioningOverride::Pinned {
                 version: WorkerDeploymentVersionRef {
                     deployment_name: deployment_name.to_string(),
@@ -3641,7 +4245,7 @@ mod tests {
                         cmd.identity = identity.clone();
                         cmd.updates.insert(
                             "primary".to_string(),
-                            compute_update(scaling_group("provider", "scaler"), 1),
+                            compute_update(scaling_group("test-invoke", "no-sync"), 1),
                         );
                         registry.update_compute_config(cmd).await.map_err(|error| {
                             TestCaseError::fail(format!("update compute failed: {error:?}"))
@@ -3886,6 +4490,7 @@ mod tests {
                             namespace_id,
                             deployment_name,
                             "build-a",
+                            "workflow-tq",
                             "workflow-a",
                         )
                         .await,
@@ -4272,13 +4877,27 @@ mod tests {
                             mask_index,
                         } => {
                             let name = compute_group_name(group_index);
-                            let update = compute_update(
-                                scaling_group(
-                                    &format!("provider-{request_index}"),
-                                    &format!("scaler-{request_index}"),
-                                ),
-                                mask_index,
-                            );
+                            let providers = [
+                                "aws-lambda",
+                                "aws-ecs",
+                                "subprocess",
+                                "k8s",
+                                "gcp-cloud-run",
+                                "test-invoke",
+                                "test-worker-set",
+                            ];
+                            let scalers = ["no-sync", "rate-based"];
+                            let mut group = scaling_group(
+                                    providers[request_index % providers.len()],
+                                    scalers[request_index % scalers.len()],
+                                );
+                            group.task_queue_types = match group_index {
+                                0 => vec![DeploymentTaskQueueType::Workflow],
+                                1 => vec![DeploymentTaskQueueType::Activity],
+                                2 => vec![DeploymentTaskQueueType::Nexus],
+                                _ => Vec::new(),
+                            };
+                            let update = compute_update(group, mask_index);
                             let mut updates = BTreeMap::new();
                             updates.insert(name.clone(), update.clone());
                             let removals = BTreeSet::new();
@@ -4361,7 +4980,7 @@ mod tests {
                             cmd.updates.insert(
                                 name,
                                 ComputeConfigScalingGroupUpdate {
-                                    scaling_group: scaling_group("validate", "validate"),
+                                    scaling_group: scaling_group("test-invoke", "no-sync"),
                                     update_mask: if invalid_mask {
                                         vec!["provider.unknown".to_string()]
                                     } else {
@@ -4408,6 +5027,235 @@ mod tests {
             })?;
         }
 
+        // Feature: worker-deployments, Property 20
+        #[test]
+        fn property_pinned_membership_cache_fidelity(
+            initially_present in any::<bool>(),
+            present_after_mutation in any::<bool>(),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async move {
+                let store = Arc::new(InMemoryStore::default());
+                let clock = Arc::new(AdjustableClock(Mutex::new(OffsetDateTime::UNIX_EPOCH)));
+                let repository: Arc<dyn WorkerDeploymentRepository> = store.clone();
+                let run_repository: Arc<dyn RunRepository> = store.clone();
+                let registry = DeploymentRegistry::with_clock_and_repositories(
+                    repository,
+                    run_repository,
+                    WorkerRegistry::default(),
+                    clock.clone(),
+                );
+                let namespace_id = NamespaceId::new();
+                let ttl = Duration::seconds(1);
+                if initially_present {
+                    registry
+                        .register_polled_deployment(register_polled_cmd(
+                            namespace_id,
+                            "deployment-a",
+                            "build-a",
+                            "queue-a",
+                            DeploymentTaskQueueType::Workflow,
+                        ))
+                        .await
+                        .unwrap();
+                }
+
+                let first = registry
+                    .validate_pinned_workflow_version_with_ttl(
+                        namespace_id,
+                        "queue-a",
+                        "deployment-a",
+                        "build-a",
+                        ttl,
+                    )
+                    .await;
+                prop_assert_eq!(first.is_ok(), initially_present);
+
+                match (initially_present, present_after_mutation) {
+                    (false, true) => {
+                        registry
+                            .register_polled_deployment(register_polled_cmd(
+                                namespace_id,
+                                "deployment-a",
+                                "build-a",
+                                "queue-a",
+                                DeploymentTaskQueueType::Workflow,
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    (true, false) => {
+                        let key = deployment_key(namespace_id, "deployment-a");
+                        let mut record = store.load_deployment(&key).await.unwrap().unwrap();
+                        let expected = record.conflict_token;
+                        record
+                            .versions
+                            .get_mut(&BuildId("build-a".to_string()))
+                            .unwrap()
+                            .polled_task_queues
+                            .clear();
+                        store.put_deployment(record, Some(expected)).await.unwrap();
+                    }
+                    (false, false) | (true, true) => {}
+                }
+
+                // Clones are public callers sharing the same runtime-scoped cache. A
+                // membership mutation must remain invisible until the TTL boundary.
+                let second = registry
+                    .clone()
+                    .validate_pinned_workflow_version_with_ttl(
+                        namespace_id,
+                        "queue-a",
+                        "deployment-a",
+                        "build-a",
+                        ttl,
+                    )
+                    .await;
+                prop_assert_eq!(second.is_ok(), initially_present);
+
+                clock.advance(ttl);
+                let refreshed = registry
+                    .validate_pinned_workflow_version_with_ttl(
+                        namespace_id,
+                        "queue-a",
+                        "deployment-a",
+                        "build-a",
+                        ttl,
+                    )
+                    .await;
+                prop_assert_eq!(refreshed.is_ok(), present_after_mutation);
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+
+        // Feature: worker-deployments, Property 21
+        #[test]
+        fn property_post_commit_reactivation_deduplication(
+            operation_committed in any::<bool>(),
+            concrete_pin in any::<bool>(),
+            enabled in any::<bool>(),
+            status_index in 0u8..6,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async move {
+                let store = Arc::new(InMemoryStore::default());
+                let clock = Arc::new(AdjustableClock(Mutex::new(OffsetDateTime::UNIX_EPOCH)));
+                let repository: Arc<dyn WorkerDeploymentRepository> = store.clone();
+                let run_repository: Arc<dyn RunRepository> = store.clone();
+                let registry = DeploymentRegistry::with_clock_and_repositories(
+                    repository,
+                    run_repository,
+                    WorkerRegistry::default(),
+                    clock.clone(),
+                );
+                let namespace_id = NamespaceId::new();
+                let key = deployment_key(namespace_id, "deployment-a");
+                let build_id = BuildId("build-a".to_string());
+                let ttl = Duration::seconds(1);
+                registry
+                    .register_polled_deployment(register_polled_cmd(
+                        namespace_id,
+                        "deployment-a",
+                        "build-a",
+                        "queue-a",
+                        DeploymentTaskQueueType::Workflow,
+                    ))
+                    .await
+                    .unwrap();
+
+                let initial_status = match status_index {
+                    0 => WorkerDeploymentVersionStatus::Inactive,
+                    1 => WorkerDeploymentVersionStatus::Drained,
+                    2 => WorkerDeploymentVersionStatus::Current,
+                    3 => WorkerDeploymentVersionStatus::Ramping,
+                    4 => WorkerDeploymentVersionStatus::Draining,
+                    _ => WorkerDeploymentVersionStatus::Created,
+                };
+                let mut record = store.load_deployment(&key).await.unwrap().unwrap();
+                let expected = record.conflict_token;
+                record.versions.get_mut(&build_id).unwrap().status = initial_status;
+                store.put_deployment(record, Some(expected)).await.unwrap();
+
+                let reactivation_requested = operation_committed && concrete_pin;
+                if reactivation_requested {
+                    registry
+                        .reactivate_pinned_version_with_policy(
+                            namespace_id,
+                            "deployment-a",
+                            "build-a",
+                            enabled,
+                            ttl,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let after = store.load_deployment(&key).await.unwrap().unwrap();
+                let expected_status = if reactivation_requested
+                    && enabled
+                    && matches!(
+                        initial_status,
+                        WorkerDeploymentVersionStatus::Inactive
+                            | WorkerDeploymentVersionStatus::Drained
+                    )
+                {
+                    WorkerDeploymentVersionStatus::Draining
+                } else {
+                    initial_status
+                };
+                prop_assert_eq!(after.versions.get(&build_id).unwrap().status, expected_status);
+
+                if reactivation_requested && enabled {
+                    let mut reset = after;
+                    let expected = reset.conflict_token;
+                    reset.versions.get_mut(&build_id).unwrap().status =
+                        WorkerDeploymentVersionStatus::Drained;
+                    store.put_deployment(reset, Some(expected)).await.unwrap();
+
+                    registry
+                        .reactivate_pinned_version_with_policy(
+                            namespace_id,
+                            "deployment-a",
+                            "build-a",
+                            true,
+                            ttl,
+                        )
+                        .await
+                        .unwrap();
+                    let deduplicated = store.load_deployment(&key).await.unwrap().unwrap();
+                    prop_assert_eq!(
+                        deduplicated.versions.get(&build_id).unwrap().status,
+                        WorkerDeploymentVersionStatus::Drained
+                    );
+
+                    clock.advance(ttl);
+                    registry
+                        .reactivate_pinned_version_with_policy(
+                            namespace_id,
+                            "deployment-a",
+                            "build-a",
+                            true,
+                            ttl,
+                        )
+                        .await
+                        .unwrap();
+                    let expired = store.load_deployment(&key).await.unwrap().unwrap();
+                    prop_assert_eq!(
+                        expired.versions.get(&build_id).unwrap().status,
+                        WorkerDeploymentVersionStatus::Draining
+                    );
+                }
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+
         // Feature: worker-deployments, Property 7: allow_no_pollers and
         // ignore_missing_task_queues gate set-current/set-ramping (NOT_FOUND vs auto-create,
         // and the missing-task-queue precondition).
@@ -4417,6 +5265,7 @@ mod tests {
             target_exists in any::<bool>(),
             current_has_queue in any::<bool>(),
             target_has_queue in any::<bool>(),
+            queue_has_pressure in any::<bool>(),
             allow_no_pollers in any::<bool>(),
             ignore_missing_task_queues in any::<bool>(),
         ) {
@@ -4482,6 +5331,17 @@ mod tests {
                     ))
                     .await
                     .map_err(|error| TestCaseError::fail(format!("initial set-current failed: {error:?}")))?;
+                if current_has_queue && queue_has_pressure {
+                    seed_open_pinned_workflow(
+                        &store,
+                        namespace_id,
+                        deployment_name,
+                        "build-current",
+                        "workflow-tq",
+                        "pressure-workflow",
+                    )
+                    .await;
+                }
 
                 let result = if use_ramping {
                     let mut cmd = set_ramping_cmd(
@@ -4510,6 +5370,7 @@ mod tests {
                 let target_covers_queue = target_exists && target_has_queue;
                 let missing_task_queue = current_has_queue
                     && !target_covers_queue
+                    && queue_has_pressure
                     && !ignore_missing_task_queues;
                 match (missing_target, missing_task_queue) {
                     (true, _) => {
@@ -4518,10 +5379,12 @@ mod tests {
                     }
                     (false, true) => {
                         let error = result.unwrap_err();
-                        prop_assert_eq!(
-                            registry_error_kind(&error),
-                            RegistryErrorKind::FailedPrecondition
-                        );
+                        let expected = if use_ramping {
+                            "proposed ramping version 'deployment-a:build-target' is missing active task queues from the current version; these would become unversioned if it is set as the ramping version"
+                        } else {
+                            "proposed current version 'deployment-a:build-target' is missing active task queues from the current version; these would become unversioned if it is set as the current version"
+                        };
+                        prop_assert_eq!(error, RegistryError::FailedPrecondition(expected.to_string()));
                     }
                     (false, false) => {
                         result.map_err(|error| {
@@ -5335,12 +6198,33 @@ mod tests {
                 OverrideValue::Duration(StdDuration::from_secs(4)),
             )
             .unwrap();
+        overrides
+            .set(
+                "history.versionMembershipCacheTTL",
+                OverrideValue::Duration(StdDuration::from_secs(5)),
+            )
+            .unwrap();
+        overrides
+            .set(
+                "history.versionReactivationSignalCacheTTL",
+                OverrideValue::Duration(StdDuration::from_secs(6)),
+            )
+            .unwrap();
+        overrides
+            .set(
+                "history.enableVersionReactivationSignals",
+                OverrideValue::Bool(true),
+            )
+            .unwrap();
 
         assert_eq!(max_versions_per_deployment(), 1);
         assert_eq!(max_task_queue_families_per_version(), 2);
         assert_eq!(active_poller_window(), Duration::milliseconds(500));
         assert_eq!(drainage_visibility_grace_period(), Duration::seconds(3));
         assert_eq!(drainage_refresh_interval(), Duration::seconds(4));
+        assert_eq!(version_membership_cache_ttl(), Duration::seconds(5));
+        assert_eq!(version_reactivation_cache_ttl(), Duration::seconds(6));
+        assert!(version_reactivation_enabled());
         overrides.reset();
     }
 
@@ -5690,6 +6574,263 @@ mod tests {
             RegistryError::ResourceExhausted(
                 "cannot add task queue queue-over-limit since maximum number of task queues (100) have been registered in deployment".to_string()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_membership_caches_negative_results_until_ttl_expiry() {
+        let store = Arc::new(InMemoryStore::default());
+        let clock = Arc::new(AdjustableClock(Mutex::new(OffsetDateTime::UNIX_EPOCH)));
+        let repository: Arc<dyn WorkerDeploymentRepository> = store.clone();
+        let run_repository: Arc<dyn RunRepository> = store;
+        let registry = DeploymentRegistry::with_clock_and_repositories(
+            repository,
+            run_repository,
+            WorkerRegistry::default(),
+            clock.clone(),
+        );
+        let namespace_id = NamespaceId::new();
+
+        let missing = registry
+            .validate_pinned_workflow_version_with_ttl(
+                namespace_id,
+                "queue-a",
+                "deployment-a",
+                "build-a",
+                Duration::seconds(1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            missing,
+            RegistryError::FailedPrecondition(
+                "Pinned version 'deployment-a:build-a' is not present in task queue 'queue-a' of type 'Workflow'"
+                    .to_string()
+            )
+        );
+
+        registry
+            .register_polled_deployment(register_polled_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "/_sys/queue-a/3",
+                DeploymentTaskQueueType::Workflow,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .validate_pinned_workflow_version_with_ttl(
+                    namespace_id,
+                    "queue-a",
+                    "deployment-a",
+                    "build-a",
+                    Duration::seconds(1),
+                )
+                .await
+                .is_err(),
+            "a worker poll does not invalidate v1.31.0's negative membership cache"
+        );
+
+        clock.advance(Duration::seconds(1));
+        registry
+            .validate_pinned_workflow_version_with_ttl(
+                namespace_id,
+                "queue-a",
+                "deployment-a",
+                "build-a",
+                Duration::seconds(1),
+            )
+            .await
+            .expect("the durable membership is observed at the TTL boundary");
+    }
+
+    #[tokio::test]
+    async fn pinned_reactivation_is_gated_deduplicated_and_ttl_bounded() {
+        let store = Arc::new(InMemoryStore::default());
+        let clock = Arc::new(AdjustableClock(Mutex::new(OffsetDateTime::UNIX_EPOCH)));
+        let repository: Arc<dyn WorkerDeploymentRepository> = store.clone();
+        let run_repository: Arc<dyn RunRepository> = store.clone();
+        let registry = DeploymentRegistry::with_clock_and_repositories(
+            repository,
+            run_repository,
+            WorkerRegistry::default(),
+            clock.clone(),
+        );
+        let namespace_id = NamespaceId::new();
+        registry
+            .register_polled_deployment(register_polled_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "queue-a",
+                DeploymentTaskQueueType::Workflow,
+            ))
+            .await
+            .unwrap();
+        let key = deployment_key(namespace_id, "deployment-a");
+
+        registry
+            .reactivate_pinned_version_with_policy(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                false,
+                Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let inactive = store.load_deployment(&key).await.unwrap().unwrap();
+        assert_eq!(
+            inactive
+                .versions
+                .get(&BuildId("build-a".to_string()))
+                .unwrap()
+                .status,
+            WorkerDeploymentVersionStatus::Inactive
+        );
+
+        registry
+            .reactivate_pinned_version_with_policy(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                true,
+                Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let draining = store.load_deployment(&key).await.unwrap().unwrap();
+        assert_eq!(
+            draining
+                .versions
+                .get(&BuildId("build-a".to_string()))
+                .unwrap()
+                .status,
+            WorkerDeploymentVersionStatus::Draining
+        );
+
+        let mut reset_to_drained = draining;
+        let expected = reset_to_drained.conflict_token;
+        reset_to_drained
+            .versions
+            .get_mut(&BuildId("build-a".to_string()))
+            .unwrap()
+            .status = WorkerDeploymentVersionStatus::Drained;
+        store
+            .put_deployment(reset_to_drained, Some(expected))
+            .await
+            .unwrap();
+        registry
+            .reactivate_pinned_version_with_policy(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                true,
+                Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_deployment(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .versions
+                .get(&BuildId("build-a".to_string()))
+                .unwrap()
+                .status,
+            WorkerDeploymentVersionStatus::Drained,
+            "a duplicate signal inside the cache TTL has no observable effect"
+        );
+
+        clock.advance(Duration::seconds(10));
+        registry
+            .reactivate_pinned_version_with_policy(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                true,
+                Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_deployment(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .versions
+                .get(&BuildId("build-a".to_string()))
+                .unwrap()
+                .status,
+            WorkerDeploymentVersionStatus::Draining
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_pinned_reactivation_commits_once_per_cache_window() {
+        let store = Arc::new(InMemoryStore::default());
+        let clock = Arc::new(AdjustableClock(Mutex::new(OffsetDateTime::UNIX_EPOCH)));
+        let repository: Arc<dyn WorkerDeploymentRepository> = store.clone();
+        let run_repository: Arc<dyn RunRepository> = store.clone();
+        let registry = DeploymentRegistry::with_clock_and_repositories(
+            repository,
+            run_repository,
+            WorkerRegistry::default(),
+            clock,
+        );
+        let namespace_id = NamespaceId::new();
+        let key = deployment_key(namespace_id, "deployment-a");
+        registry
+            .register_polled_deployment(register_polled_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "queue-a",
+                DeploymentTaskQueueType::Workflow,
+            ))
+            .await
+            .unwrap();
+        let before = store
+            .load_deployment(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .conflict_token
+            .generation();
+
+        let mut calls = JoinSet::new();
+        for _ in 0..16 {
+            let registry = registry.clone();
+            calls.spawn(async move {
+                registry
+                    .reactivate_pinned_version_with_policy(
+                        namespace_id,
+                        "deployment-a",
+                        "build-a",
+                        true,
+                        Duration::seconds(10),
+                    )
+                    .await
+            });
+        }
+        while let Some(result) = calls.join_next().await {
+            result.unwrap().unwrap();
+        }
+
+        let after = store.load_deployment(&key).await.unwrap().unwrap();
+        assert_eq!(after.conflict_token.generation(), before + 1);
+        assert_eq!(
+            after
+                .versions
+                .get(&BuildId("build-a".to_string()))
+                .unwrap()
+                .status,
+            WorkerDeploymentVersionStatus::Draining
         );
     }
 
@@ -6206,7 +7347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_task_queue_guard_uses_durable_polled_task_queue_sets() {
+    async fn missing_task_queue_guard_uses_durable_task_queue_pressure() {
         let (registry, store) = registry_with_store();
         let namespace_id = NamespaceId::new();
         registry
@@ -6239,6 +7380,15 @@ mod tests {
             ))
             .await
             .unwrap();
+        seed_open_pinned_workflow(
+            &store,
+            namespace_id,
+            "deployment-a",
+            "build-a",
+            "queue-b",
+            "pressure-workflow",
+        )
+        .await;
 
         let mut guarded_current = set_current_cmd(
             namespace_id,
@@ -6251,10 +7401,12 @@ mod tests {
             .set_current_version(guarded_current)
             .await
             .unwrap_err();
-        assert!(matches!(
+        assert_eq!(
             missing_current,
-            RegistryError::FailedPrecondition(_)
-        ));
+            RegistryError::FailedPrecondition(
+                "proposed current version 'deployment-a:build-b' is missing active task queues from the current version; these would become unversioned if it is set as the current version".to_string()
+            )
+        );
 
         let mut bypass_current = set_current_cmd(
             namespace_id,
@@ -6762,6 +7914,7 @@ mod tests {
             namespace_id,
             "deployment-a",
             "build-a",
+            "workflow-tq",
             "workflow-a",
         )
         .await;
@@ -6842,6 +7995,7 @@ mod tests {
             namespace_id,
             "deployment-a",
             "build-a",
+            "workflow-tq",
             "workflow-a",
         )
         .await;
@@ -6901,7 +8055,7 @@ mod tests {
         add.updates.insert(
             "primary".to_string(),
             ComputeConfigScalingGroupUpdate {
-                scaling_group: scaling_group("lambda", "target-tracking"),
+                scaling_group: scaling_group("aws-lambda", "rate-based"),
                 update_mask: vec!["ignored_for_new_group".to_string()],
             },
         );
@@ -6915,7 +8069,7 @@ mod tests {
         add.updates.insert(
             "primary".to_string(),
             ComputeConfigScalingGroupUpdate {
-                scaling_group: scaling_group("lambda", "target-tracking"),
+                scaling_group: scaling_group("aws-lambda", "rate-based"),
                 update_mask: vec!["provider.type".to_string()],
             },
         );
@@ -6926,7 +8080,7 @@ mod tests {
         no_op.updates.insert(
             "primary".to_string(),
             ComputeConfigScalingGroupUpdate {
-                scaling_group: scaling_group("ecs", "step"),
+                scaling_group: scaling_group("aws-ecs", "no-sync"),
                 update_mask: Vec::new(),
             },
         );
@@ -6952,7 +8106,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .provider_type,
-            "lambda"
+            "aws-lambda"
         );
 
         let mut masked =
@@ -6960,7 +8114,7 @@ mod tests {
         masked.updates.insert(
             "primary".to_string(),
             ComputeConfigScalingGroupUpdate {
-                scaling_group: scaling_group("ecs", "step"),
+                scaling_group: scaling_group("aws-ecs", "no-sync"),
                 update_mask: vec![
                     "provider.type".to_string(),
                     "scaler".to_string(),
@@ -6985,12 +8139,12 @@ mod tests {
             .scaling_groups
             .get("primary")
             .unwrap();
-        assert_eq!(group.provider.as_ref().unwrap().provider_type, "ecs");
+        assert_eq!(group.provider.as_ref().unwrap().provider_type, "aws-ecs");
         assert_eq!(
             group.provider.as_ref().unwrap().nexus_endpoint,
-            "https://lambda.example.com"
+            "https://aws-lambda.example.com"
         );
-        assert_eq!(group.scaler.as_ref().unwrap().scaler_type, "step");
+        assert_eq!(group.scaler.as_ref().unwrap().scaler_type, "no-sync");
         assert_eq!(
             group.task_queue_types,
             vec![DeploymentTaskQueueType::Workflow]
@@ -7071,7 +8225,7 @@ mod tests {
         valid.updates.insert(
             "primary".to_string(),
             ComputeConfigScalingGroupUpdate {
-                scaling_group: scaling_group("lambda", "target-tracking"),
+                scaling_group: scaling_group("aws-lambda", "rate-based"),
                 update_mask: vec!["provider.type".to_string()],
             },
         );
@@ -7096,7 +8250,7 @@ mod tests {
         invalid_mask.updates.insert(
             "primary".to_string(),
             ComputeConfigScalingGroupUpdate {
-                scaling_group: scaling_group("lambda", "target-tracking"),
+                scaling_group: scaling_group("aws-lambda", "rate-based"),
                 update_mask: vec!["provider.unknown".to_string()],
             },
         );

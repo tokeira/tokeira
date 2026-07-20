@@ -1775,6 +1775,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             )
         }
         HistoryEventKind::WorkflowExecutionOptionsUpdated {
+            identity,
             versioning_override,
             completion_callbacks,
             attached_completion_callbacks,
@@ -1802,6 +1803,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             let _ = attached_links;
             Attributes::WorkflowExecutionOptionsUpdatedEventAttributes(
                 history::WorkflowExecutionOptionsUpdatedEventAttributes {
+                    identity: identity.clone(),
                     versioning_override,
                     unset_versioning_override,
                     attached_request_id: attached_request_id.clone().unwrap_or_default(),
@@ -2547,6 +2549,7 @@ mod tests {
             event_id: 4,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                identity: "operator".to_string(),
                 versioning_override: tokeira_kernel::command::FieldChange::Unchanged,
                 completion_callbacks: tokeira_kernel::command::FieldChange::Unchanged,
                 attached_completion_callbacks: Vec::new(),
@@ -2591,6 +2594,7 @@ mod tests {
             event_id: 3,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                identity: "operator".to_string(),
                 versioning_override: tokeira_kernel::command::FieldChange::Unchanged,
                 completion_callbacks: tokeira_kernel::command::FieldChange::Unchanged,
                 attached_completion_callbacks: vec![callback],
@@ -2620,6 +2624,7 @@ mod tests {
             event_id: 3,
             happened_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
             kind: HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                identity: String::new(),
                 versioning_override: tokeira_kernel::command::FieldChange::Unchanged,
                 completion_callbacks: tokeira_kernel::command::FieldChange::Unchanged,
                 attached_completion_callbacks: Vec::new(),

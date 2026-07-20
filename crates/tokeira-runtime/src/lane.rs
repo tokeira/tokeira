@@ -607,21 +607,27 @@ where
                         // frozen). A reset close always originates from
                         // Command::Reset, so missing bits (defensive arm)
                         // mean "exclude nothing".
-                        let (exclude_signal, exclude_update, reset_request_context) =
-                            match &committed_command {
-                                Command::Reset(reset_request) => (
-                                    reset_request.reapply_exclude_signal,
-                                    reset_request.reapply_exclude_update,
-                                    reset_request.request.clone(),
+                        let (
+                            exclude_signal,
+                            exclude_update,
+                            reset_request_context,
+                            post_reset_versioning_overrides,
+                        ) = match &committed_command {
+                            Command::Reset(reset_request) => (
+                                reset_request.reapply_exclude_signal,
+                                reset_request.reapply_exclude_update,
+                                reset_request.request.clone(),
+                                reset_request.post_reset_versioning_overrides.clone(),
+                            ),
+                            _ => (
+                                false,
+                                false,
+                                tokeira_types::RequestContext::unattributed(
+                                    time::OffsetDateTime::now_utc(),
                                 ),
-                                _ => (
-                                    false,
-                                    false,
-                                    tokeira_types::RequestContext::unattributed(
-                                        time::OffsetDateTime::now_utc(),
-                                    ),
-                                ),
-                            };
+                                Vec::new(),
+                            ),
+                        };
                         // A reset closes the predecessor and forks a successor
                         // run at `fork_event_id`. The successor is materialized
                         // here rather than through the normal start path, so
@@ -783,7 +789,7 @@ where
                                         worker_identity: tokeira_types::WorkerIdentity(
                                             "reset".into(),
                                         ),
-                                        request: reset_request_context,
+                                        request: reset_request_context.clone(),
                                         now: time::OffsetDateTime::now_utc(),
                                         // Guarded above: this branch is reached only
                                         // when the reapply extraction succeeded.
@@ -792,6 +798,50 @@ where
                                 );
                                 let publisher = publisher.clone();
                                 tokio::spawn(async move {
+                                    // Post-reset options are committed on the
+                                    // successor before the reset-boundary failure
+                                    // schedules its first fresh WFT. This preserves
+                                    // v1.31.0's `performPostResetOperations` ordering
+                                    // without coupling storage materialization to
+                                    // public option semantics
+                                    // (`service/history/ndc/workflow_resetter.go @
+                                    // v1.31.0`).
+                                    for (index, versioning_override) in
+                                        post_reset_versioning_overrides.into_iter().enumerate()
+                                    {
+                                        let mut request = reset_request_context.clone();
+                                        request.request_id = tokeira_types::RequestId(format!(
+                                            "post-reset-options:{}:{index}",
+                                            request.request_id.0
+                                        ));
+                                        // v1.31.0 supplies an empty identity to
+                                        // MergeAndApply for post-reset operations.
+                                        request.caller_identity = None;
+                                        let command =
+                                            tokeira_kernel::Command::UpdateExecutionOptions(
+                                                tokeira_kernel::UpdateExecutionOptionsRequest {
+                                                    versioning_override,
+                                                    completion_callbacks:
+                                                        tokeira_kernel::FieldChange::Unchanged,
+                                                    attached_completion_callbacks: Vec::new(),
+                                                    attached_links: Vec::new(),
+                                                    attached_request_id: None,
+                                                    request,
+                                                    now: time::OffsetDateTime::now_utc(),
+                                                },
+                                            );
+                                        if let Err(error) = publisher
+                                            .submit_to_run(successor_run_key, command)
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                ?error,
+                                                successor_run_key = ?successor_run_key,
+                                                "failed to apply post-reset workflow options"
+                                            );
+                                            return;
+                                        }
+                                    }
                                     if let Err(error) =
                                         publisher.submit_to_run(successor_run_key, command).await
                                     {
@@ -1472,6 +1522,21 @@ where
             "transition_seq",
             transition.next_state.transition_seq.0 as i64,
         );
+        if transition.is_noop() {
+            // A state-equivalent options update is linearized by this lane
+            // load/apply turn but has no durable write set. Temporal returns
+            // `Noop=true` without persisting mutable state in the equivalent
+            // lease-protected path (`updateworkflowoptions/api.go @ v1.31.0`).
+            // Ownership was checked above, so returning the authoritative
+            // loaded state cannot bypass shard routing or a fencing decision.
+            return Ok((
+                CommitResult::Applied {
+                    new_state: transition.next_state,
+                },
+                SmallVec::new(),
+                SmallVec::new(),
+            ));
+        }
         let dispatch_ops = transition.dispatch_ops.clone();
         let history_events = transition.history_events.clone();
 
@@ -2000,6 +2065,7 @@ mod tests {
         loaded_runs: Vec<LoadedRun>,
         dispatch_ops: SmallVec<[DispatchOp; 4]>,
         reject: bool,
+        noop: bool,
     }
 
     impl MockKernel {
@@ -2010,12 +2076,18 @@ mod tests {
                     loaded_runs: Vec::new(),
                     dispatch_ops,
                     reject: false,
+                    noop: false,
                 })),
             }
         }
 
         fn with_reject(self) -> Self {
             self.state.lock().expect("state lock poisoned").reject = true;
+            self
+        }
+
+        fn with_noop(self) -> Self {
+            self.state.lock().expect("state lock poisoned").noop = true;
             self
         }
 
@@ -2037,6 +2109,20 @@ mod tests {
             let LoadedRun::Existing(current) = loaded else {
                 panic!("tests expect an existing run");
             };
+
+            if state.noop {
+                return Ok(Transition {
+                    expected_seq: current.transition_seq,
+                    next_state: current,
+                    history_events: SmallVec::new(),
+                    event_principals: SmallVec::new(),
+                    request_dedupe_ops: SmallVec::new(),
+                    activity_ops: SmallVec::new(),
+                    timer_ops: SmallVec::new(),
+                    dispatch_ops: SmallVec::new(),
+                    projection_ops: SmallVec::new(),
+                });
+            }
 
             let mut next_state = current.clone();
             next_state.transition_seq = current.transition_seq.next();
@@ -2805,6 +2891,36 @@ mod tests {
         let (load_calls, commit_calls, _) = repo.snapshot().await;
         assert_eq!(load_calls, 1);
         assert_eq!(commit_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn explicit_kernel_noop_bypasses_durable_commit() {
+        let run_key = RunKey::new();
+        let state = sample_state(run_key);
+        let repo = MockRepo::new(
+            LoadedRun::Existing(state.clone()),
+            vec![CommitBehavior::Error],
+        );
+        let kernel = MockKernel::new(SmallVec::new()).with_noop();
+
+        let result = handle_message(
+            &kernel,
+            &repo,
+            &test_shard_owner(),
+            run_key,
+            sample_command("noop"),
+            &LaneConfig::default(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.1, SmallVec::<[DispatchOp; 4]>::new());
+        assert_eq!(result.2, SmallVec::<[HistoryEvent; 8]>::new());
+        assert_eq!(result.0, CommitResult::Applied { new_state: state });
+        let (load_calls, commit_calls, _) = repo.snapshot().await;
+        assert_eq!(load_calls, 1);
+        assert_eq!(commit_calls, 0);
     }
 
     #[tokio::test]

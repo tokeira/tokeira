@@ -62,12 +62,18 @@ jobs:
 
   test:
     name: "Unit tests"
-    timeout-minutes: 20
+    # Cache-cold runs build the entire workspace and link every test binary;
+    # the ceiling exists to bound hangs, not honest cold builds.
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false # CI is read-only; don't leave the token in .git/config
+      # The hosted runner leaves ~14 GB free — not enough for the workspace's
+      # debug rlibs plus every linked test binary (this job died on ENOSPC).
+      # Drop preinstalled toolchains this job never touches (~30 GB back).
+      - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # snapshot 2026-03-27
         with:
           toolchain: "1.96"

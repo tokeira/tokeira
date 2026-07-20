@@ -147,6 +147,17 @@ pub(crate) enum DeploymentAction {
         storage: CliStorageKind,
         #[arg(long)]
         region: Option<String>,
+        /// Obtain the provisioner as a verified hermetic bundle (CAS hit or
+        /// one Dagger build) instead of the native dev copy — Phase 2 of
+        /// Proposal 005. Requires a running Dagger engine and the tokeira
+        /// workspace.
+        #[arg(long)]
+        bundle: bool,
+        /// The digest-pinned build container for `--bundle`
+        /// (`<image>@sha256:<digest>` — a floating tag is refused; the
+        /// container is an engine-identity input).
+        #[arg(long, requires = "bundle")]
+        build_image: Option<String>,
     },
     List,
     Use {

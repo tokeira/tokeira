@@ -84,17 +84,8 @@ pub fn build_provisioner(
     request: &ProvisionerBuildRequest,
     dagger: &dyn DaggerClient,
 ) -> Result<ProvisionerBundle, BuildError> {
-    let build_container = validate(request)?;
-    let toolchain = rust_toolchain_version(&request.workspace_root)?;
-
-    let identity = EngineIdentity {
-        source_closure: EngineIdentity::source_closure_digest_for_tree(&request.snapshot.tree_oid),
-        lock_closure: Sha256Digest::from_bytes(&request.closure.canonical_lock_bytes()),
-        toolchain: toolchain.clone(),
-        build_container: Some(build_container),
-        features: request.features.iter().cloned().collect(),
-        profile: request.profile,
-    };
+    let identity = engine_identity_for(request)?;
+    let toolchain = identity.toolchain.clone();
 
     // Feed the snapshot to the build — materialize the frozen tree and upload
     // that, never the live worktree.
@@ -198,6 +189,24 @@ pub fn build_provisioner(
             toolchain,
             builder: builder_label(&request.authority),
         },
+    })
+}
+
+/// The engine identity a request resolves to — computable **without
+/// building** (task 18.3): the CAS is consulted by identity before any build
+/// starts. Validates the request (including the digest-pin) on the way.
+pub fn engine_identity_for(
+    request: &ProvisionerBuildRequest,
+) -> Result<EngineIdentity, BuildError> {
+    let build_container = validate(request)?;
+    let toolchain = rust_toolchain_version(&request.workspace_root)?;
+    Ok(EngineIdentity {
+        source_closure: EngineIdentity::source_closure_digest_for_tree(&request.snapshot.tree_oid),
+        lock_closure: Sha256Digest::from_bytes(&request.closure.canonical_lock_bytes()),
+        toolchain,
+        build_container: Some(build_container),
+        features: request.features.iter().cloned().collect(),
+        profile: request.profile,
     })
 }
 

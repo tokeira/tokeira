@@ -49,7 +49,7 @@ pub(crate) async fn init<P: ProvisionerPlatform>(
     }
 
     let deployment_id = platform.deployment_id(deployment_dir)?;
-    let integrity = running_integrity_manifest()?;
+    let integrity = day_zero_manifest(deployment_dir)?;
 
     let envelope = DeploymentStateEnvelope {
         deployment_id: deployment_id.clone(),
@@ -71,6 +71,47 @@ pub(crate) async fn init<P: ProvisionerPlatform>(
         deployment_id, running.version, running.build_mode, running.source_tree_hash
     );
     Ok(())
+}
+
+/// The manifest the Day-0 stamp records (task 18.3): the **bundle-manifest
+/// sidecar** when `tkr deployment create` placed one next to the deployment's
+/// `tkp`, else the pre-identity self-stamp.
+///
+/// A placed sidecar is a create-time contract, so a corrupt one **refuses
+/// init** — it is never silently downgraded to a self-stamp. And it is only
+/// recorded after the running binary proves it *is* one of the sidecar's
+/// artifacts (its own bytes verify against the manifest for its own target):
+/// the manifest the envelope records always describes the engine that
+/// stamped it.
+fn day_zero_manifest(deployment_dir: &Path) -> Result<IntegrityManifest> {
+    let sidecar = deployment_dir.join(tokeira_provisioner::BUNDLE_MANIFEST_BASENAME);
+    if !sidecar.exists() {
+        return running_integrity_manifest();
+    }
+    let raw = std::fs::read(&sidecar)
+        .with_context(|| format!("failed to read the bundle manifest {}", sidecar.display()))?;
+    let manifest: IntegrityManifest = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "the placed bundle manifest {} does not parse — refusing to stamp from it",
+            sidecar.display()
+        )
+    })?;
+    manifest
+        .validate()
+        .map_err(|e| anyhow::anyhow!("the placed bundle manifest is malformed: {e}"))?;
+
+    let exe = std::env::current_exe().context("failed to locate the running binary")?;
+    let bytes = std::fs::read(&exe).with_context(|| format!("failed to read {}", exe.display()))?;
+    manifest
+        .verify_artifact(&bytes, &Target(env!("TKP_TARGET").to_string()))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "the running provisioner is not an artifact of the placed bundle manifest \
+                 ({e}) — the deployment's tkp and its manifest disagree; re-run \
+                 `tkr deployment create`"
+            )
+        })?;
+    Ok(manifest)
 }
 
 /// Build the integrity manifest for the **running** binary (task 4.1): its
@@ -117,6 +158,87 @@ mod tests {
         assert_eq!(integrity.artifacts.len(), 1);
         assert!(!integrity.artifacts[0].sha256.is_empty());
         assert_eq!(env.config_revision, 0);
+    }
+
+    // Task 18.3: a placed bundle-manifest sidecar is recorded as the Day-0
+    // manifest — identity-keyed, unlike the pre-identity self-stamp — after
+    // the running binary proves it is one of its artifacts.
+    #[tokio::test]
+    async fn init_records_a_placed_bundle_manifest_that_describes_the_running_binary() {
+        use tokeira_provisioner::{BuildProfile, EngineIdentity, Sha256Digest};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A sidecar whose artifact IS the running (test) binary.
+        let exe = std::env::current_exe().unwrap();
+        let bytes = std::fs::read(&exe).unwrap();
+        let sidecar = IntegrityManifest {
+            engine_identity: Some(EngineIdentity {
+                source_closure: Sha256Digest::from_bytes(b"src"),
+                lock_closure: Sha256Digest::from_bytes(b"lock"),
+                toolchain: "rustc 1.88.0".into(),
+                build_container: Some(Sha256Digest::from_bytes(b"img")),
+                features: ["provisioner".to_string()].into(),
+                profile: BuildProfile::Dist,
+            }),
+            authority: BuildAuthority::LocalDeveloper,
+            provisioner_version: "0.1.0".into(),
+            artifacts: vec![BinaryArtifactDescriptor {
+                target: Target(env!("TKP_TARGET").to_string()),
+                sha256: sha256_hex(&bytes),
+                retrieval_ref: None,
+                size_bytes: bytes.len() as u64,
+            }],
+        };
+        std::fs::write(
+            tmp.path()
+                .join(tokeira_provisioner::BUNDLE_MANIFEST_BASENAME),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+
+        init(&TestPlatform, tmp.path())
+            .await
+            .expect("init succeeds");
+
+        let (env, _) = envelope_store(tmp.path()).load().await.unwrap();
+        let recorded = env.integrity.expect("integrity recorded");
+        assert_eq!(recorded, sidecar, "the sidecar manifest is the record");
+        assert!(
+            recorded.engine_identity.is_some(),
+            "the Day-0 stamp is identity-keyed"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_refuses_a_sidecar_that_does_not_describe_the_running_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sidecar = IntegrityManifest {
+            provisioner_version: "0.1.0".into(),
+            artifacts: vec![BinaryArtifactDescriptor {
+                target: Target(env!("TKP_TARGET").to_string()),
+                sha256: sha256_hex(b"some other binary entirely"),
+                retrieval_ref: None,
+                size_bytes: 26,
+            }],
+            ..Default::default()
+        };
+        std::fs::write(
+            tmp.path()
+                .join(tokeira_provisioner::BUNDLE_MANIFEST_BASENAME),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+
+        let err = init(&TestPlatform, tmp.path())
+            .await
+            .expect_err("a disagreeing sidecar refuses init");
+        assert!(
+            err.to_string().contains("not an artifact"),
+            "unexpected: {err}"
+        );
+        // Nothing was stamped.
+        let (env, _) = envelope_store(tmp.path()).load().await.unwrap();
+        assert!(env.binding.is_none());
     }
 
     #[tokio::test]

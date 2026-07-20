@@ -7758,6 +7758,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokeira-provisioner",
+ "tokeira-state",
+ "tokio",
  "toml 0.8.23",
  "tracing",
 ]

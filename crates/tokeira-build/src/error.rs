@@ -38,4 +38,7 @@ pub enum BuildError {
 
     #[error("request validation failed: {reason}")]
     Validation { reason: String },
+
+    #[error("bundle store: {0}")]
+    BundleStore(#[from] tokeira_provisioner::BundleStoreError),
 }

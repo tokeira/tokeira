@@ -2525,10 +2525,19 @@ mod tests {
 
         async fn wait_for_submits(&self, expected: usize) {
             loop {
+                // Register before the re-check (broker.rs module-doc TOCTOU
+                // invariant): `notify_waiters` stores no permit and signals
+                // only already-enabled waiters, so a check-first loop can lose
+                // the sole wakeup from the spawned successor submit and park
+                // forever — which is exactly how this helper once wedged a
+                // full-suite run for 2h21m.
+                let notified = self.wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.state.lock().await.submits.len() >= expected {
                     return;
                 }
-                self.wake.notified().await;
+                notified.await;
             }
         }
     }

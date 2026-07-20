@@ -64,10 +64,11 @@ pub struct WftTimeoutEntry {
 /// Shared in-memory tracking state for started workflow tasks.
 ///
 /// Cloning shares the underlying map; lanes, the scanner, and shard recovery all
-/// see one set. It also carries the [`SpeculativeTimerSet`] (behind a shared
-/// `OnceLock` backfilled once the lanes exist) so the lane's post-commit hook
-/// can arm/disarm the precise speculative timers through the same handle it
-/// already holds for the coarse sweep.
+/// see one set. It also carries the
+/// [`SpeculativeTimerSet`](crate::speculative_timer::SpeculativeTimerSet)
+/// (behind a shared `OnceLock` backfilled once the lanes exist) so the lane's
+/// post-commit hook can arm/disarm the precise speculative timers through the
+/// same handle it already holds for the coarse sweep.
 #[derive(Clone, Default, Debug)]
 pub struct WftTimeoutTrackingState {
     inner: Arc<Mutex<HashMap<RunKey, WftTimeoutEntry>>>,

@@ -97,7 +97,7 @@ impl EngineIdentity {
     /// prefix, so a crafted value containing delimiters (a `\n` in a toolchain
     /// string, a `,` ambiguity in features) cannot make two distinct identities
     /// serialize identically. The form opens with
-    /// [`IDENTITY_CANONICAL_VERSION`], so evolving the field set re-keys
+    /// `IDENTITY_CANONICAL_VERSION`, so evolving the field set re-keys
     /// explicitly rather than colliding silently.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         fn field(buf: &mut Vec<u8>, tag: &str, value: &str) {

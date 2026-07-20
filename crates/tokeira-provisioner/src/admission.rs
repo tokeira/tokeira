@@ -1,17 +1,19 @@
 //! Bind-time admission (task 16.2; Proposal 005 §The two gates).
 //!
 //! Whether obtained provisioner bytes may be **bound** to a deployment. This is
-//! the second gate, distinct from the binding gate: [`check_binding`]
-//! (crate::check_binding) compares the *running* engine against the *recorded*
-//! one; admission decides whether candidate bytes are trustworthy to record at
+//! the second gate, distinct from the binding gate:
+//! [`check_binding`](crate::check_binding) compares the *running* engine
+//! against the *recorded* one; admission decides whether candidate bytes are
+//! trustworthy to record at
 //! all. `create` (and every later identity-advancing operation) runs it before
 //! binding — **on a cache hit too**: caching accelerates production, it never
 //! grants admission.
 //!
 //! Three checks, all mandatory:
 //!
-//! 1. **authority-vs-policy** — the bundle's [`BuildAuthority`] must satisfy
-//!    the deployment's required [`AuthorityTier`]. Same-identity bytes from a
+//! 1. **authority-vs-policy** — the bundle's
+//!    [`BuildAuthority`](crate::BuildAuthority) must satisfy the deployment's
+//!    required [`AuthorityTier`]. Same-identity bytes from a
 //!    lower tier are inadmissible (builds are not bit-reproducible, so a
 //!    laptop build must never satisfy a production create — guardrail 1).
 //! 2. **not revoked** — neither the engine identity nor the actual artifact

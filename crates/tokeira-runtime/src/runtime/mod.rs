@@ -166,7 +166,7 @@ pub struct WorkflowTaskReportedProblem {
 /// (`workflow_task_state_machine.go:1050-1054`,
 /// `mutable_state_impl.go:6478-6491 @ v1.31.0`).
 ///
-/// The threshold is read *live* via [`reported_problems_threshold`], so a
+/// The threshold is read *live* via `reported_problems_threshold`, so a
 /// mid-run override takes effect on the next call (Tier 3.22
 /// `DynamicConfigChanges`). A zero threshold disables publication, matching
 /// v1.31.0's dynamic-config semantics.

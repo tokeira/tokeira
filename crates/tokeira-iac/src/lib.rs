@@ -112,11 +112,12 @@ pub struct ResourceState {
 ///   than skipping it. A resource whose `describe` cannot confirm absence is
 ///   therefore never silently orphaned.
 ///
-/// Return [`Unsupported`] from any path that yields "not found" without a real
-/// provider query confirming absence — an unimplemented/stub `describe`, or an
-/// early return because a prerequisite (physical id, dependency) is missing
-/// from local state. Reserve [`Absent`] for a provider query that positively
-/// reported the resource does not exist.
+/// Return [`Unsupported`](Self::Unsupported) from any path that yields "not
+/// found" without a real provider query confirming absence — an
+/// unimplemented/stub `describe`, or an early return because a prerequisite
+/// (physical id, dependency) is missing from local state. Reserve
+/// [`Absent`](Self::Absent) for a provider query that positively reported the
+/// resource does not exist.
 #[derive(Debug, Clone)]
 pub enum DescribeResult {
     /// The provider returned live state for the resource.

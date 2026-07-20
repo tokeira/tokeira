@@ -545,6 +545,24 @@ pub fn reset_request(req: ResetWorkflowExecutionRequest, context: &EdgeContext) 
         new_run_id: RunId::new(),
         reapply_exclude_signal: req.reapply_exclude_signal,
         reapply_exclude_update: req.reapply_exclude_update,
+        post_reset_versioning_overrides: req
+            .post_reset_versioning_overrides
+            .into_iter()
+            .filter_map(|change| match change {
+                crate::translate::VersioningOverrideChange::Unchanged => None,
+                crate::translate::VersioningOverrideChange::Set(override_) => {
+                    Some(tokeira_kernel::VersioningOverrideChange::Set(
+                        versioning_override_to_kernel(&override_),
+                    ))
+                }
+                crate::translate::VersioningOverrideChange::SetImpliedPinned => {
+                    Some(tokeira_kernel::VersioningOverrideChange::SetImpliedPinned)
+                }
+                crate::translate::VersioningOverrideChange::Clear => {
+                    Some(tokeira_kernel::VersioningOverrideChange::Clear)
+                }
+            })
+            .collect(),
         reason: req.reason,
         request: RequestContext {
             request_id: CoreRequestId(

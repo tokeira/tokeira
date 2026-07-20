@@ -4294,8 +4294,9 @@ mod tests {
     }
 
     /// api-conformance-workflow-options Property 3 (Expected Error Mapping): a malformed
-    /// run id is `INVALID_ARGUMENT`, a missing execution is `NOT_FOUND`, and an empty
-    /// `update_mask` is `INVALID_ARGUMENT` — all before any mutation.
+    /// run id is `INVALID_ARGUMENT` and a missing execution is `NOT_FOUND`. An empty
+    /// `update_mask` is a no-op only after the target execution has resolved, so an empty
+    /// store still returns `NOT_FOUND` (`updateworkflowoptions/api.go @ v1.31.0`).
     #[tokio::test]
     async fn update_workflow_execution_options_maps_expected_errors() {
         use tokeira_proto::public::temporal::api::{
@@ -4331,7 +4332,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(bad_run.code(), tonic::Code::InvalidArgument);
 
-        // Empty mask → INVALID_ARGUMENT (rejected at the translation boundary).
+        // Empty mask still resolves the execution before returning the unchanged options.
         let empty_mask = grpc
             .update_workflow_execution_options(Request::new(
                 workflowservice::UpdateWorkflowExecutionOptionsRequest {
@@ -4347,7 +4348,7 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(empty_mask.code(), tonic::Code::InvalidArgument);
+        assert_eq!(empty_mask.code(), tonic::Code::NotFound);
     }
 
     #[test]

@@ -985,9 +985,9 @@ fn versioning_override_to_edge(
 /// `update_mask` selects which options to apply (`mergeWorkflowExecutionOptions`,
 /// `service/history/api/updateworkflowoptions/api.go @ v1.31.0`); we recognize
 /// `versioning_override` and its deprecated `versioning_override.{behavior,deployment}`
-/// sub-paths (which v1.31.0 requires be masked together). An empty mask, or a mask naming
-/// any other option (e.g. `priority`, `time_skipping_config` — valid v1.31.0 fields tokeira
-/// does not yet model), is rejected with `INVALID_ARGUMENT` rather than silently dropped.
+/// sub-paths (which v1.31.0 requires be masked together). An empty mask is a
+/// successful no-op; unsupported named options are rejected rather than silently
+/// dropped (`mergeWorkflowExecutionOptions`, updateworkflowoptions/api.go @ v1.31.0).
 pub fn update_workflow_execution_options_request_to_edge(
     req: workflowservice::UpdateWorkflowExecutionOptionsRequest,
 ) -> Result<EdgeUpdateWorkflowExecutionOptionsRequest, ProtoConversionError> {
@@ -1004,9 +1004,13 @@ pub fn update_workflow_execution_options_request_to_edge(
 
     let paths = req.update_mask.map(|mask| mask.paths).unwrap_or_default();
     if paths.is_empty() {
-        return Err(ProtoConversionError::InvalidArgument(
-            "update_mask must name at least one option to update".to_string(),
-        ));
+        return Ok(EdgeUpdateWorkflowExecutionOptionsRequest {
+            namespace: req.namespace,
+            workflow_id: execution.workflow_id,
+            run_id: (!execution.run_id.is_empty()).then_some(execution.run_id),
+            versioning_override: VersioningOverrideChange::Unchanged,
+            identity: req.identity,
+        });
     }
     let (mut behavior_masked, mut deployment_masked) = (false, false);
     for path in &paths {
@@ -1033,6 +1037,27 @@ pub fn update_workflow_execution_options_request_to_edge(
     // a recognized override present in the options is Set; an absent (or unrepresentable)
     // override clears it (`mergedOpts.GetVersioningOverride() == nil → unset` @ v1.31.0).
     let options = req.workflow_execution_options.unwrap_or_default();
+    if options
+        .versioning_override
+        .as_ref()
+        .is_some_and(|override_| {
+            matches!(
+                override_.r#override.as_ref(),
+                Some(workflow::versioning_override::Override::Pinned(pinned))
+                    if pinned.behavior
+                        == workflow::versioning_override::PinnedOverrideBehavior::Pinned as i32
+                        && pinned.version.is_none()
+            )
+        })
+    {
+        return Ok(EdgeUpdateWorkflowExecutionOptionsRequest {
+            namespace: req.namespace,
+            workflow_id: execution.workflow_id,
+            run_id: (!execution.run_id.is_empty()).then_some(execution.run_id),
+            versioning_override: VersioningOverrideChange::SetImpliedPinned,
+            identity: req.identity,
+        });
+    }
     let versioning_override = match versioning_override_to_edge(options.versioning_override)? {
         Some(override_) => VersioningOverrideChange::Set(override_),
         None => VersioningOverrideChange::Clear,
@@ -1456,11 +1481,20 @@ pub fn list_worker_deployments_to_edge(
 pub fn create_worker_deployment_version_to_edge(
     req: workflowservice::CreateWorkerDeploymentVersionRequest,
 ) -> Result<CreateVersion, ProtoConversionError> {
-    let version = worker_deployment_version_to_domain(req.deployment_version.as_ref())?;
+    // Create exposes separate v1.31.0 validation errors for an empty deployment
+    // name and build ID. Preserve the empty fields here so the registry can
+    // produce those public messages; the shared selector translator remains
+    // strict for RPCs whose contract treats an incomplete pair as one field.
+    let version = req
+        .deployment_version
+        .as_ref()
+        .ok_or(ProtoConversionError::MissingField(
+            "WorkerDeploymentVersion",
+        ))?;
     Ok(CreateVersion {
         namespace_id: namespace_id_for(&req.namespace),
-        deployment_name: version.deployment_name,
-        build_id: version.build_id,
+        deployment_name: DeploymentName(version.deployment_name.clone()),
+        build_id: DeploymentBuildId(version.build_id.clone()),
         compute_config: compute_config_to_domain(req.compute_config.as_ref()),
         request_id: req.request_id,
         identity: req.identity,
@@ -1844,7 +1878,8 @@ pub fn worker_deployment_version_info_from_edge(
         first_activation_time: record.first_activation_time.map(to_proto_timestamp),
         last_deactivation_time: record.last_deactivation_time.map(to_proto_timestamp),
         last_current_time: record.last_current_time.map(to_proto_timestamp),
-        compute_config: Some(compute_config_from_edge(&record.compute_config)),
+        compute_config: (!record.compute_config.scaling_groups.is_empty())
+            .then(|| compute_config_from_edge(&record.compute_config)),
         last_modifier_identity: record.last_modifier_identity.clone(),
     }
 }
@@ -4241,7 +4276,13 @@ pub fn describe_task_queue_response_to_proto(
                     identity: poller.identity,
                     rate_per_second: poller.rate_per_second,
                     worker_version_capabilities: None,
-                    deployment_options: None,
+                    deployment_options: poller.deployment.zip(poller.build_id).map(
+                        |(deployment_name, build_id)| deployment_proto::WorkerDeploymentOptions {
+                            deployment_name,
+                            build_id,
+                            worker_versioning_mode: enums::WorkerVersioningMode::Versioned as i32,
+                        },
+                    ),
                 },
             )
             .collect(),
@@ -4441,6 +4482,36 @@ pub fn reset_request_to_edge(
         }
     }
 
+    let mut post_reset_versioning_overrides = Vec::new();
+    for operation in req.post_reset_operations {
+        let Some(variant) = operation.variant else {
+            return Err(ProtoConversionError::InvalidArgument(
+                "unsupported post reset operation: unspecified".to_string(),
+            ));
+        };
+        match variant {
+            workflow::post_reset_operation::Variant::UpdateWorkflowOptions(update) => {
+                let translated = update_workflow_execution_options_request_to_edge(
+                    workflowservice::UpdateWorkflowExecutionOptionsRequest {
+                        namespace: req.namespace.clone(),
+                        workflow_execution: Some(execution.clone()),
+                        workflow_execution_options: update.workflow_execution_options,
+                        update_mask: update.update_mask,
+                        // v1.31.0's resetter invokes MergeAndApply with an empty
+                        // identity (`workflow_resetter.go:1181-1190 @ v1.31.0`).
+                        identity: String::new(),
+                    },
+                )?;
+                post_reset_versioning_overrides.push(translated.versioning_override);
+            }
+            _ => {
+                return Err(ProtoConversionError::InvalidArgument(
+                    "unsupported post reset operation".to_string(),
+                ));
+            }
+        }
+    }
+
     Ok(EdgeResetWorkflowExecutionRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id.clone(),
@@ -4450,6 +4521,7 @@ pub fn reset_request_to_edge(
         request_id: non_empty(req.request_id),
         reapply_exclude_signal,
         reapply_exclude_update,
+        post_reset_versioning_overrides,
     })
 }
 
@@ -6914,9 +6986,10 @@ mod tests {
     }
 
     /// api-conformance-workflow-options: the `update_mask` is validated + reduced to the
-    /// supported `versioning_override` change (Property 1 / 3). Empty mask, unsupported
-    /// option (`priority`), a half-masked deprecated sub-field, and a missing execution all
-    /// reject; a masked Pinned override is `Set`, a masked-but-absent override is `Clear`.
+    /// supported `versioning_override` change (Property 1 / 3). An empty mask is a no-op;
+    /// an unsupported option (`priority`), a half-masked deprecated sub-field, and a missing
+    /// execution reject; a masked Pinned override is `Set`, and a masked-but-absent override
+    /// is `Clear`.
     #[test]
     fn update_workflow_execution_options_request_validation() {
         use tokeira_proto::public::temporal::api::{
@@ -6941,7 +7014,7 @@ mod tests {
             }
         }
 
-        // Missing execution, empty mask, unsupported option, half-masked sub-field → reject.
+        // Missing execution, unsupported option, and half-masked sub-field → reject.
         assert!(
             update_workflow_execution_options_request_to_edge(req(
                 None,
@@ -6950,22 +7023,23 @@ mod tests {
             ))
             .is_err()
         );
-        assert!(
-            update_workflow_execution_options_request_to_edge(
-                workflowservice::UpdateWorkflowExecutionOptionsRequest {
-                    namespace: "ns".to_string(),
-                    workflow_execution: Some(common::WorkflowExecution {
-                        workflow_id: "w".to_string(),
-                        run_id: String::new(),
-                    }),
-                    workflow_execution_options: None,
-                    update_mask: None,
-                    identity: String::new(),
-                }
-            )
-            .is_err(),
-            "empty mask is rejected"
-        );
+        let no_op = update_workflow_execution_options_request_to_edge(
+            workflowservice::UpdateWorkflowExecutionOptionsRequest {
+                namespace: "ns".to_string(),
+                workflow_execution: Some(common::WorkflowExecution {
+                    workflow_id: "w".to_string(),
+                    run_id: String::new(),
+                }),
+                workflow_execution_options: None,
+                update_mask: None,
+                identity: String::new(),
+            },
+        )
+        .expect("v1.31.0 treats an empty mask as a successful no-op");
+        assert!(matches!(
+            no_op.versioning_override,
+            VersioningOverrideChange::Unchanged
+        ));
         assert!(
             update_workflow_execution_options_request_to_edge(req(None, &["priority"], "w"))
                 .is_err(),

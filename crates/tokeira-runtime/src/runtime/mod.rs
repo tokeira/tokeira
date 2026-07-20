@@ -20,8 +20,8 @@ use tokeira_kernel::{
     HistoryEvent, HistoryEventKind, LoadedRun, PauseActivityRequest, PauseWorkflowRequest,
     RetryState, SignalRequest, SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest,
     TerminateRequest, Transition, UnpauseWorkflowRequest, UpdateExecutionOptionsRequest,
-    UpdateRequest, WorkflowCommand, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowState,
-    WorkflowTaskCompletedRequest,
+    UpdateRequest, VersioningOverrideChange, WorkflowCommand, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest,
 };
 use tokeira_storage::{
     CommitResult, DeleteRunRequest, DeleteRunResult, DispatchableActivityTask,
@@ -253,6 +253,14 @@ pub struct TokeiraRuntime<R> {
     fairness_state: FairnessState,
     /// Optional durable Worker Deployment registry used for v2 routing decisions.
     worker_deployment_repository: Option<Arc<dyn WorkerDeploymentRepository>>,
+    /// Runtime-scoped Worker Deployment registry, including its membership and
+    /// reactivation caches.
+    ///
+    /// This must be constructed once rather than per adapter call: both caches
+    /// deliberately retain positive and negative observations across public RPCs
+    /// (`version_membership_cache.go` and `version_reactivation_signal_cache.go @
+    /// v1.31.0`).
+    worker_deployment_registry: Arc<RwLock<Option<DeploymentRegistry>>>,
     /// Background Nexus-timeout scanner task.
     nexus_timeout_scanner_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token for the Nexus-timeout scanner.
@@ -681,6 +689,7 @@ where
         let update_registry = UpdateRegistry::new();
         let buffered_queries = BufferedQueryRegistry::default();
         let worker_registry = WorkerRegistry::default();
+        let worker_deployment_registry = Arc::new(RwLock::new(None));
         let heartbeat_store: Arc<dyn HeartbeatStore> = Arc::new(InMemoryHeartbeatStore::new());
         let delivery_metrics = DeliveryMetrics::new();
         let fairness_state = FairnessState::new();
@@ -721,7 +730,8 @@ where
                     activity_tracking.clone(),
                     delivery_metrics.clone(),
                 )
-                .with_namespace_resolver(namespace_resolver.clone());
+                .with_namespace_resolver(namespace_resolver.clone())
+                .with_worker_deployment_registry(worker_deployment_registry.clone());
                 spawn_lane_with_id(
                     lane_id,
                     BasicKernel,
@@ -851,7 +861,8 @@ where
             activity_tracking.clone(),
             delivery_metrics.clone(),
         )
-        .with_namespace_resolver(namespace_resolver.clone());
+        .with_namespace_resolver(namespace_resolver.clone())
+        .with_worker_deployment_registry(worker_deployment_registry.clone());
         let completion_callback_scanner_cancel = CancellationToken::new();
         let completion_callback_scanner_handle =
             Some(tokio::spawn(run_completion_callback_scanner(
@@ -908,6 +919,7 @@ where
             owner_identity,
             node_endpoint,
             worker_deployment_repository: None,
+            worker_deployment_registry,
         }
     }
 
@@ -918,6 +930,15 @@ where
         mut self,
         repository: Arc<dyn WorkerDeploymentRepository>,
     ) -> Self {
+        *self
+            .worker_deployment_registry
+            .write()
+            .expect("worker deployment registry lock poisoned") =
+            Some(DeploymentRegistry::with_repositories(
+                repository.clone(),
+                self.repo.clone(),
+                self.worker_registry.clone(),
+            ));
         self.worker_deployment_repository = Some(repository);
         self
     }
@@ -1023,24 +1044,18 @@ where
         self.worker_registry.clone()
     }
 
-    /// Build the Worker Deployment registry view used by transport adapters.
+    /// Return the runtime-scoped Worker Deployment registry used by transport adapters.
     ///
-    /// The registry object is cheap to assemble because it only clones repository
-    /// handles. Keeping construction here ensures edge code never reaches directly
-    /// into runtime-owned storage fields.
+    /// Keeping the registry behind the runtime boundary ensures edge code never
+    /// reaches directly into runtime-owned storage or cache state.
     pub fn deployment_registry(&self) -> Option<DeploymentRegistry>
     where
         R: 'static,
     {
-        self.worker_deployment_repository
-            .as_ref()
-            .map(|repository| {
-                DeploymentRegistry::with_repositories(
-                    repository.clone(),
-                    self.repo.clone(),
-                    self.worker_registry.clone(),
-                )
-            })
+        self.worker_deployment_registry
+            .read()
+            .expect("worker deployment registry lock poisoned")
+            .clone()
     }
 
     pub fn heartbeat_store(&self) -> Arc<dyn HeartbeatStore> {

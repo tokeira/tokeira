@@ -51,11 +51,14 @@ pub enum VersioningOverride {
 
 /// The `versioning_override` change an `UpdateWorkflowExecutionOptions` request applies,
 /// derived from the request's `update_mask` + `workflow_execution_options`. The mask must
-/// always touch `versioning_override` (it is tokeira's only supported mutable option), so
-/// the change is exactly Set-a-value or Clear — never "leave unchanged".
+/// may leave all fields unchanged when the mask is empty, set/clear the concrete
+/// override, or request the v0.32 implied-pinned form that resolves from the
+/// workflow's existing effective deployment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VersioningOverrideChange {
+    Unchanged,
     Set(VersioningOverride),
+    SetImpliedPinned,
     Clear,
 }
 
@@ -1016,6 +1019,8 @@ pub struct ResetWorkflowExecutionRequest {
     /// + `reset_reapply_exclude_types` (resetworkflow/api.go:199-219).
     pub reapply_exclude_signal: bool,
     pub reapply_exclude_update: bool,
+    /// Ordered options updates applied to the forked run before its first new WFT.
+    pub post_reset_versioning_overrides: Vec<VersioningOverrideChange>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1173,6 +1178,10 @@ pub struct PollerInfo {
     pub identity: String,
     pub last_access_time: Option<OffsetDateTime>,
     pub rate_per_second: f64,
+    /// Deployment name reported by a versioned worker poll.
+    pub deployment: Option<String>,
+    /// Build ID reported by a versioned worker poll.
+    pub build_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

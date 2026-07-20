@@ -95,6 +95,10 @@ are durable and must survive process restart.
   (Current/Ramping version, per-workflow behavior, overrides) to decide which
   Deployment Version a workflow task or activity task is dispatched to. Owned by this
   spec.
+- **Version membership cache:** A runtime-scoped TTL cache of both positive and negative
+  answers to whether a Deployment Version has polled a workflow task queue.
+- **Version reactivation:** A best-effort, post-commit transition of a pinned target
+  Version from `INACTIVE`/`DRAINED` back to `DRAINING`, gated and TTL-deduplicated.
 
 ## Target State
 
@@ -120,6 +124,11 @@ are durable and must survive process restart.
 - The deprecated **build-id-based v1** RPCs (`UpdateWorkerBuildIdCompatibility`,
   `GetWorkerBuildIdCompatibility`, assignment/redirect rule RPCs) are explicitly
   **out of scope**; they remain under their existing handlers per the tracker.
+- Pinned start, signal-with-start, update-options, batch update, and post-reset paths
+  validate explicit Version membership through one runtime-scoped cache. Successful
+  pinned operations may reactivate their target through one runtime-scoped,
+  TTL-deduplicated cache. Dispatch derives physical Deployment-Version routing from the
+  durable registry and authoritative run state before broker publication.
 
 Behaviour is verified against Temporal server
 [tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0)
@@ -163,38 +172,12 @@ vendored API `v1.62.11`.
   `common/worker_versioning/worker_versioning.go`, and `service/history/api/` task-start
   handlers. These are the source of truth for defaulting, lifecycle ordering, error
   mapping, and reachability calculation.
-- **Current handlers (`crates/tokeira-edge/src/grpc/workflow_service.rs`, verified):**
-  - The 13 v2 worker-deployment RPCs are wired via the `deferred_unary!` macro pointing
-    at `"worker-deployments"` in the block beginning at line 1323. NOTE: that same
-    `deferred_unary!` block also contains `describe_worker` (1401) and `list_workers`
-    (1407), which are worker-observability RPCs, NOT deployment-management RPCs and are
-    NOT in scope for this spec — they belong to `worker-config-management`/observability.
-    This spec owns only the 13 deployment RPCs in that block.
-  - The 5 deprecated `Deployment` companions are explicit `Status::unimplemented`
-    handlers at lines 1069–1109, with three distinct current messages — `describe_deployment`
-    / `list_deployments`: "Deployment management is not yet supported. Worker versioning
-    via assignment and redirect rules is available."; `get_deployment_reachability`:
-    "...Use GetWorkerTaskReachability for build ID reachability."; `get_current_deployment`
-    / `set_current_deployment`: "Deployment management is not yet supported." NONE of these
-    match the v1.31.0 message. To conform to the targeted release (§8), this spec replaces
-    all five with the v1.31.0 message "Deployments are deprecated and no longer supported,
-    use Worker Deployments instead" (Requirement 11). `DescribeDeployment` is one of these
-    explicit handlers (line 1069) — it is NOT in the deferred v2 block, confirming it is a
-    deprecated companion, not part of the 13-RPC v2 set.
-- **Compatibility matrix:** `crates/tokeira-compatibility/src/matrix.rs` — the
-  `worker-deployments` `FeatureEntry` (id `"worker-deployments"`, line 514) is
-  `FeatureState::Unsupported`; `WORKER_DEPLOYMENT_RPCS` (line 203) lists 18 RPC
-  identifiers = the 13 v2 deployment RPCs + the 5 deprecated `Deployment` companions
-  (it does NOT include `DescribeWorker`/`ListWorkers`, which belong to the `worker-config`
-  feature). This spec moves that entry to its supported state with evidence; the 5
-  deprecated companions are counted as conformant via their v1.31.0 `UNIMPLEMENTED`
-  behavior.
-- **Existing deferred-RPC test (verified):** `deferred_handler_blocks_return_tracked_unimplemented_messages`
-  (line 2372, using the `assert_deferred_rpc!` macro at line 2353) asserts the deferred
-  placeholder behavior for all 13 deployment RPCs — and currently also for
-  `describe_worker`/`list_workers` under `"worker-deployments"`. Implementing this spec
-  requires updating that test for the 13 RPCs and re-pointing the two worker RPCs to
-  their correct owning spec.
+- **Current implementation:** the 13 v2 RPCs are real edge handlers backed by the
+  durable runtime registry; the five deprecated companions return the exact v1.31.0
+  `UNIMPLEMENTED` response; `DescribeWorker`/`ListWorkers` are owned by worker
+  observability; and the compatibility matrix records the v2 surface as implemented.
+  The runtime owns one shared `DeploymentRegistry` instance used by adapters, caches,
+  poll admission, and dispatch publication.
 - **Sibling specs that defer to this one:**
   - `api-conformance-start-fields/requirements.md` — `versioning_override` "persist
     routing override and apply to WFT dispatch" and `eager_worker_deployment_options`
@@ -208,8 +191,9 @@ vendored API `v1.62.11`.
   and redirect-rule RPCs (`UpdateWorkerVersioningRules`, `GetWorkerVersioningRules`,
   `GetWorkerTaskReachability`, `UpdateWorkerBuildIdCompatibility`,
   `GetWorkerBuildIdCompatibility`) remain under their current handlers.
-- **No existing durable registry:** there is currently no kernel/runtime/storage
-  representation of Worker Deployments or Deployment Versions; this spec introduces it.
+- **Durable registry and per-run state:** Worker Deployment records live in
+  `WorkerDeploymentRepository`; authoritative per-run versioning state is event-sourced
+  in the pure kernel. Runtime caches and broker queues are derived and disposable.
 
 ## Field Policy
 
@@ -570,9 +554,12 @@ build.
 4. IF `SetWorkerDeploymentCurrentVersion` supplies a non-nil `conflict_token` that does
    not match the deployment's current token, THEN THE Edge SHALL return
    `FAILED_PRECONDITION` and SHALL NOT mutate routing state.
-5. IF `ignore_missing_task_queues` is false AND not all expected task queues are polled
-   by the proposed Current Version, THEN THE Edge SHALL return `FAILED_PRECONDITION`;
-   WHEN `ignore_missing_task_queues` is true, THE Edge SHALL bypass this check.
+5. IF `ignore_missing_task_queues` is false AND a task queue historically polled by the
+   previous Current Version is absent from the proposed Current Version, remains assigned
+   to that deployment, AND has backlog or non-zero add-rate, THEN THE Edge SHALL return
+   `FAILED_PRECONDITION` with v1.31.0's exact proposed-current-version message; an idle
+   missing queue SHALL NOT block the change. WHEN `ignore_missing_task_queues` is true,
+   THE Edge SHALL bypass this check.
 6. IF `allow_no_pollers` is false AND the proposed Current Version is unknown, THEN THE
    Edge SHALL return `NOT_FOUND` (`workflow.go:1230/1244` + `client.go:384 @ v1.31.0`);
    WHEN `allow_no_pollers` is true, THE Edge SHALL bypass this check.
@@ -605,9 +592,11 @@ promoting it.
    not match the deployment's current token, THEN THE Edge SHALL return
    `FAILED_PRECONDITION` and SHALL NOT mutate routing state.
 6. WHILE the ramping version is changing, IF `ignore_missing_task_queues` is false AND
-   expected task queue pollers are missing, THEN THE Edge SHALL return
-   `FAILED_PRECONDITION`; WHEN `ignore_missing_task_queues` is true, THE Edge SHALL
-   bypass this check.
+   a task queue historically polled by Current is absent from the proposed Ramping
+   Version, remains assigned to that deployment, AND has backlog or non-zero add-rate,
+   THEN THE Edge SHALL return `FAILED_PRECONDITION` with v1.31.0's exact
+   proposed-ramping-version message; an idle missing queue SHALL NOT block the change.
+   WHEN `ignore_missing_task_queues` is true, THE Edge SHALL bypass this check.
 7. IF `allow_no_pollers` is false AND the proposed Ramping Version is unknown, THEN THE
    Edge SHALL return `NOT_FOUND` (`workflow.go:1230/1244` + `client.go:384 @ v1.31.0`);
    WHEN `allow_no_pollers` is true, THE Edge SHALL bypass this check.
@@ -788,6 +777,24 @@ their version and AutoUpgrade workflows follow the Current Version.
    those deployment options; otherwise THE field SHALL have no routing effect.
 8. WHERE a deployment has no Current Version, THE runtime SHALL route AUTO_UPGRADE and
    unversioned traffic (after any ramp) to unversioned workers.
+9. WHEN a workflow starts with a concrete PINNED override, THE kernel SHALL author the
+   pinned deployment name into both live state and `WorkflowExecutionStarted` history,
+   so replay restores identical first-task routing.
+10. BEFORE a workflow task is published to the broker, THE runtime SHALL derive its
+    physical Deployment-Version queue from the authoritative run state and durable
+    routing config. The broker queue SHALL remain a disposable derived effect.
+11. THE runtime SHALL use one shared `DeploymentRegistry` instance for edge adapters,
+    poll admission, membership/reactivation caches, and dispatch publication; it SHALL
+    NOT construct a fresh cache-bearing registry per request.
+12. WHEN a workflow task is published before the first versioned poll has registered
+    the task queue's Deployment-Version membership, THEN admission of a versioned poll
+    that is selected by the durable routing config SHALL re-derive the disposable
+    unversioned backlog onto that poller's physical Deployment-Version queue. The
+    authoritative pending workflow task SHALL remain in run state throughout, and a
+    registration/start race SHALL NOT strand the task on the unversioned queue. This is
+    Tokeira's derived-broker equivalent of v1.31.0 re-resolving spooled work after task
+    queue user data changes (`service/matching/task_queue_partition_manager.go @
+    v1.31.0`).
 
 ### Requirement 10: Describe Versioning Field Projection
 
@@ -886,6 +893,41 @@ restarts.
 6. THE runtime SHALL NOT store deployment registry or routing-config correctness state
    solely in transient queues or projection-only state.
 
+### Requirement 14: Pinned Membership Validation and Version Reactivation
+
+**User Story:** As an operator pinning workflows to Deployment Versions, I want invalid
+targets rejected consistently and drained targets reactivated after successful writes,
+so that pinned routing is safe without adding latency or partial side effects.
+
+#### Acceptance Criteria
+
+1. WHEN an explicit pinned override targets a Deployment Version, THE runtime SHALL
+   validate that the Version has polled the run's workflow task-queue family before the
+   per-run mutation commits. A missing membership SHALL return `FAILED_PRECONDITION`
+   with no run mutation.
+2. THE runtime SHALL cache both positive and negative membership answers by namespace,
+   workflow task-queue family, deployment name, and build id. Entries SHALL expire after
+   `history.versionMembershipCacheTTL` (v1.31.0 default one second, clamped to at least
+   one second), so creating a Version does not invalidate an earlier negative answer
+   before its TTL (`common/worker_versioning/worker_versioning.go` and
+   `service/history/fx.go @ v1.31.0`).
+3. WHEN `history.enableVersionReactivationSignals` is true AND a successful start,
+   signal-with-start, update-options, batch update, or post-reset operation concretely
+   pins a workflow, THE runtime SHALL best-effort reactivate an `INACTIVE` or `DRAINED`
+   target Version to `DRAINING` after the run mutation commits. Reactivation failure
+   SHALL NOT fail or roll back the already committed workflow operation.
+4. THE runtime SHALL TTL-deduplicate reactivation by namespace, deployment name, and
+   build id using `history.versionReactivationSignalCacheTTL` (v1.31.0 default ten
+   seconds, clamped to at least one second). Concurrent or repeated operations inside
+   the TTL SHALL cause at most one logical reactivation.
+5. IF reactivation is disabled, the operation is unsuccessful, the override is absent,
+   auto-upgrade, or cleared, or the target Version is already Current/Ramping/Draining,
+   THEN the runtime SHALL make no reactivation state change.
+6. Tokeira SHALL apply the observable reactivation directly to its durable Deployment
+   registry rather than creating Temporal's internal Version workflow; this is an
+   architecture-preserving implementation of
+   `service/history/api/worker_versioning_util.go @ v1.31.0`.
+
 ## Iteration and Feedback Notes
 
 - 13 v2 worker-deployment RPCs are implemented; the 5 deprecated `Deployment` companion
@@ -912,13 +954,17 @@ restarts.
   the 5 deprecated companions are `UNIMPLEMENTED`. Also CONFIRMED during design (against
   v1.31.0, now captured in `design.md`): poller-presence validation semantics —
   `allow_no_pollers` false → unknown build_id rejected with `NOT_FOUND`, true →
-  auto-create (`client.go:384`); `ignore_missing_task_queues` false → new versioned
-  current/ramping version must poll every task queue the comparison version polled,
-  else `FAILED_PRECONDITION` (ramping checks against the current version, only when the
-  ramping version changes); version task-queue stats sourced from the durable
+  auto-create (`client.go:384`); `ignore_missing_task_queues` false → a historical queue
+  missing from the target rejects only while it remains assigned to the deployment and
+  has backlog/non-zero add-rate (`client.go:1822-1926`), with ramping checked against
+  Current only when the ramping version changes; version task-queue stats sourced from the durable
   `polled_task_queues` set on each Version (`report_task_queue_stats` gates
   `stats`/`stats_by_priority_key`); and effective-deployment recomputation via the pure
   `effective_deployment()` / `effective_behavior()` precedence functions
   (transition > override > behavior+deployment_version), the analog of
   `GetEffectiveDeployment` / `GetEffectiveVersioningBehavior`. No open design-phase
   confirmations remain.
+- Tier 8.40 adds Requirement 14 and routing criteria 9.9–9.11. They preserve Tokeira's
+  planes: task-queue membership and reactivation live in the runtime registry, dispatch
+  remains derived before broker publication, and only durable per-run versioning state
+  enters the pure kernel.

@@ -151,11 +151,48 @@ pub fn start_batch_request_to_edge(
             )
         }
         workflowservice::start_batch_operation_request::Operation::UpdateWorkflowOptionsOperation(
-            _,
+            op,
         ) => {
-            return Err(BatchTranslateError::Unsupported(
-                "BatchOperationUpdateWorkflowExecutionOptions",
-            ));
+            // Reuse the single-workflow reducer so batch and direct requests
+            // accept exactly the same masks and override forms. The synthetic
+            // execution is translation-only; each real target is resolved by
+            // the batch engine before mutation.
+            let update = crate::grpc::translate::update_workflow_execution_options_request_to_edge(
+                workflowservice::UpdateWorkflowExecutionOptionsRequest {
+                    namespace: req.namespace.clone(),
+                    workflow_execution: Some(proto_common::WorkflowExecution {
+                        workflow_id: "batch-target".to_string(),
+                        ..Default::default()
+                    }),
+                    workflow_execution_options: op.workflow_execution_options,
+                    update_mask: op.update_mask,
+                    identity: op.identity.clone(),
+                },
+            )
+            .map_err(|error| BatchTranslateError::InvalidArgument(error.to_string()))?;
+            let versioning_override = match update.versioning_override {
+                crate::translate::VersioningOverrideChange::Unchanged => {
+                    tokeira_kernel::VersioningOverrideChange::Unchanged
+                }
+                crate::translate::VersioningOverrideChange::Set(override_) => {
+                    tokeira_kernel::VersioningOverrideChange::Set(
+                        crate::translate::to_internal::versioning_override_to_kernel(&override_),
+                    )
+                }
+                crate::translate::VersioningOverrideChange::Clear => {
+                    tokeira_kernel::VersioningOverrideChange::Clear
+                }
+                crate::translate::VersioningOverrideChange::SetImpliedPinned => {
+                    tokeira_kernel::VersioningOverrideChange::SetImpliedPinned
+                }
+            };
+            (
+                BatchOperationType::UpdateWorkflowExecutionOptions,
+                BatchOperationParams::UpdateWorkflowExecutionOptions {
+                    identity: op.identity,
+                    versioning_override,
+                },
+            )
         }
         workflowservice::start_batch_operation_request::Operation::UnpauseActivitiesOperation(
             op,
@@ -335,6 +372,9 @@ pub fn batch_operation_type_to_proto(value: BatchOperationType) -> enums::BatchO
         BatchOperationType::Signal => enums::BatchOperationType::Signal,
         BatchOperationType::Delete => enums::BatchOperationType::Delete,
         BatchOperationType::Reset => enums::BatchOperationType::Reset,
+        BatchOperationType::UpdateWorkflowExecutionOptions => {
+            enums::BatchOperationType::UpdateExecutionOptions
+        }
         BatchOperationType::UnpauseActivity => enums::BatchOperationType::UnpauseActivity,
         BatchOperationType::UpdateActivityOptions => {
             enums::BatchOperationType::UpdateActivityOptions
@@ -435,6 +475,7 @@ mod tests {
             Just(BatchOperationType::Signal),
             Just(BatchOperationType::Delete),
             Just(BatchOperationType::Reset),
+            Just(BatchOperationType::UpdateWorkflowExecutionOptions),
             Just(BatchOperationType::UnpauseActivity),
             Just(BatchOperationType::UpdateActivityOptions),
         ]

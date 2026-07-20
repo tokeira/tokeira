@@ -179,6 +179,18 @@ async fn apply_operation(
                 .reset_workflow_batch_internal(ctx, workflow_ref, fork_event_id, reason.clone())
                 .await
         }
+        BatchOperationParams::UpdateWorkflowExecutionOptions {
+            versioning_override,
+            ..
+        } => {
+            service
+                .update_workflow_execution_options_batch_internal(
+                    ctx,
+                    workflow_ref,
+                    versioning_override.clone(),
+                )
+                .await
+        }
         BatchOperationParams::UnpauseActivity {
             target,
             reset_attempts,

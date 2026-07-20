@@ -53,11 +53,10 @@ use tokeira_runtime::{
     StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView,
     UpdateActivitiesOptionsRequest, UpdateComputeConfig, UpdateLifecycleError,
     UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
-    ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistrationGuard,
-    WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata, WorkflowActivation,
-    WorkflowDeletion, WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus,
-    compute_matching_times, decide_overlap, nexus_operation_next_attempt_at, schedule_workflow_id,
-    scheduled_workflow_search_attributes,
+    ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistrationKey, WorkerRegistry,
+    WorkerVersionMetadata, WorkflowActivation, WorkflowDeletion, WorkflowDeletionNotFound,
+    WorkflowExecution, WorkflowExecutionStatus, compute_matching_times, decide_overlap,
+    nexus_operation_next_attempt_at, schedule_workflow_id, scheduled_workflow_search_attributes,
 };
 use tokeira_storage::{
     AttributedHistoryEvent, ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType,
@@ -118,8 +117,9 @@ use crate::{
         UnpauseWorkflowExecutionResponse, UpdateActivityOptionsRequest,
         UpdateActivityOptionsResponse, UpdateNamespaceRequest,
         UpdateWorkflowExecutionOptionsRequest, UpdateWorkflowExecutionOptionsResponse,
-        UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse, VersioningOverrideChange,
-        WorkflowExecutionDescription, WorkflowQueryDto, from_internal, to_internal,
+        UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse, VersioningOverride,
+        VersioningOverrideChange, WorkflowExecutionDescription, WorkflowQueryDto, from_internal,
+        to_internal,
     },
     workflow_rules::{WorkflowRuleError, WorkflowRuleStore},
 };
@@ -817,7 +817,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     async fn update_workflow_execution_options(
         &self,
         run_key: RunKey,
-        versioning_override: FieldChange<tokeira_kernel::VersioningOverride>,
+        versioning_override: tokeira_kernel::VersioningOverrideChange,
         request: RequestContext,
     ) -> Result<WorkflowMutationOutcome> {
         let _ = (run_key, versioning_override, request);
@@ -1031,6 +1031,31 @@ pub trait WorkerDeploymentRuntimeApi: Send + Sync + 'static {
         namespace_id: tokeira_types::NamespaceId,
         task_queue: String,
     ) -> EdgeResult<Option<TaskQueueVersioningView>>;
+
+    /// Validate one pinned version against workflow-task-queue membership.
+    async fn validate_pinned_workflow_version(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        task_queue: String,
+        deployment_name: String,
+        build_id: String,
+    ) -> EdgeResult<()> {
+        let _ = (namespace_id, task_queue, deployment_name, build_id);
+        Err(EdgeError::Unimplemented(
+            "pinned version membership validation is not configured".to_string(),
+        ))
+    }
+
+    /// Best-effort reactivation after a successful operation pins a workflow.
+    async fn reactivate_pinned_version(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        deployment_name: String,
+        build_id: String,
+    ) -> EdgeResult<()> {
+        let _ = (namespace_id, deployment_name, build_id);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1643,6 +1668,51 @@ impl WorkflowService {
         })
     }
 
+    async fn validate_pinned_override(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        task_queue: &str,
+        override_: Option<&tokeira_kernel::VersioningOverride>,
+    ) -> EdgeResult<Option<(String, String)>> {
+        let Some(tokeira_kernel::VersioningOverride::Pinned { version }) = override_ else {
+            return Ok(None);
+        };
+        if let Some(worker_deployments) = self.worker_deployments.as_ref() {
+            worker_deployments
+                .validate_pinned_workflow_version(
+                    namespace_id,
+                    task_queue.to_string(),
+                    version.deployment_name.clone(),
+                    version.build_id.clone(),
+                )
+                .await?;
+        }
+        Ok(Some((
+            version.deployment_name.clone(),
+            version.build_id.clone(),
+        )))
+    }
+
+    async fn reactivate_pinned_override(
+        &self,
+        namespace_id: tokeira_types::NamespaceId,
+        pinned: Option<(String, String)>,
+    ) {
+        let (Some(worker_deployments), Some((deployment_name, build_id))) =
+            (self.worker_deployments.as_ref(), pinned)
+        else {
+            return;
+        };
+        // v1.31.0 deliberately makes reactivation fire-and-forget: the workflow
+        // operation has already committed and a control-plane signal failure must
+        // not turn that success into an API error (`worker_versioning_util.go @
+        // v1.31.0`). Tokeira awaits its direct registry equivalent for ordering but
+        // preserves the same error isolation.
+        let _ = worker_deployments
+            .reactivate_pinned_version(namespace_id, deployment_name, build_id)
+            .await;
+    }
+
     pub fn worker_registry(&self) -> WorkerRegistry {
         self.worker_registry.clone()
     }
@@ -1654,12 +1724,12 @@ impl WorkflowService {
         worker_identity: &str,
         deployment: Option<&DeploymentId>,
         build_id: Option<&BuildId>,
-    ) -> WorkerRegistrationGuard {
+    ) {
         // Record liveness only after deployment admission has succeeded. The
         // max-version recovery path retains Temporal's ordinary active-poller delete
         // gate (`service/worker/workerdeployment/workflow.go:1485-1504 @ v1.31.0`),
         // while a rejected poll must not make its unregistered Version look active.
-        self.worker_registry.register_poll(
+        self.worker_registry.register(
             WorkerRegistrationKey {
                 worker_identity: WorkerIdentity(worker_identity.to_string()),
                 namespace_id: to_internal::namespace_id_for(namespace),
@@ -2799,6 +2869,7 @@ impl WorkflowService {
                     // Batch reset does not model reapply exclusion yet (UNSUPPORTED_FIELDS).
                     reapply_exclude_signal: false,
                     reapply_exclude_update: false,
+                    post_reset_versioning_overrides: Vec::new(),
                     reason,
                     request: batch_request_context(ctx),
                     now: OffsetDateTime::now_utc(),
@@ -2843,6 +2914,71 @@ impl WorkflowService {
             )
             .await
             .map_err(EdgeError::from)?;
+        self.notify_history_run_key(run_key, outcome.last_event_id)
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn update_workflow_execution_options_batch_internal(
+        &self,
+        ctx: &BatchDispatchContext,
+        workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
+        versioning_override: tokeira_kernel::VersioningOverrideChange,
+    ) -> EdgeResult<()> {
+        if matches!(
+            &versioning_override,
+            tokeira_kernel::VersioningOverrideChange::Unchanged
+        ) {
+            return Ok(());
+        }
+        ensure_local(
+            self.router
+                .route_workflow(&ctx.namespace_name, &workflow_ref.workflow_id)
+                .await?,
+        )?;
+        let run_key = self.resolve_batch_run_key(ctx, workflow_ref).await?;
+        let state = match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
+            LoadedRun::Existing(state) => state,
+            LoadedRun::Absent => {
+                return Err(EdgeError::WorkflowNotFound {
+                    namespace: ctx.namespace_name.clone(),
+                    workflow_id: workflow_ref.workflow_id.clone(),
+                });
+            }
+        };
+        let pinned = self
+            .validate_pinned_override(
+                state.namespace_id,
+                &state.task_queue.0,
+                match &versioning_override {
+                    tokeira_kernel::VersioningOverrideChange::Set(override_) => Some(override_),
+                    tokeira_kernel::VersioningOverrideChange::Clear
+                    | tokeira_kernel::VersioningOverrideChange::Unchanged
+                    | tokeira_kernel::VersioningOverrideChange::SetImpliedPinned => None,
+                },
+            )
+            .await?;
+        let outcome = self
+            .runtime
+            .update_workflow_execution_options(
+                run_key,
+                versioning_override,
+                batch_request_context(ctx),
+            )
+            .await
+            .map_err(EdgeError::from)?;
+        let post_state = match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
+            LoadedRun::Existing(post_state) => post_state,
+            LoadedRun::Absent => state.clone(),
+        };
+        let changed = state.versioning_override() != post_state.versioning_override();
+        let pinned = if changed {
+            pinned.or_else(|| pinned_override_ref(post_state.versioning_override()))
+        } else {
+            None
+        };
+        self.reactivate_pinned_override(state.namespace_id, pinned)
+            .await;
         self.notify_history_run_key(run_key, outcome.last_event_id)
             .await;
         Ok(())
@@ -3251,6 +3387,8 @@ impl WorkflowService {
         if applied {
             self.poller_registry
                 .remove_worker(namespace_id, &task_queue, &worker);
+            self.worker_registry
+                .remove_worker(namespace_id, &task_queue, &worker);
         }
         applied
     }
@@ -3493,11 +3631,22 @@ impl WorkflowService {
                 ensure_local(self.router.route_workflow(&namespace, &workflow_id).await?)?;
 
                 let internal = to_internal::start_request(req, &ctx);
+                let pinned = self
+                    .validate_pinned_override(
+                        internal.namespace_id,
+                        &internal.task_queue.0,
+                        internal.versioning_override.as_ref(),
+                    )
+                    .await?;
                 let outcome = self
                     .runtime
                     .start_workflow_with_policy(internal.clone())
                     .await
                     .map_err(EdgeError::from)?;
+                if !matches!(&outcome, StartWorkflowResult::Rejected { .. }) {
+                    self.reactivate_pinned_override(internal.namespace_id, pinned)
+                        .await;
+                }
                 match outcome {
                     StartWorkflowResult::Started {
                         mutation_metadata,
@@ -3793,7 +3942,7 @@ impl WorkflowService {
                         })
                         .await?;
                 }
-                let worker_poll = self.record_worker_poll(
+                self.record_worker_poll(
                     &req.namespace,
                     &req.task_queue,
                     &req.worker_identity,
@@ -3802,6 +3951,17 @@ impl WorkflowService {
                 );
                 let internal = to_internal::poll_request(req);
                 let scaling_queue = internal.queue.clone();
+                if internal.queue.deployment.is_some() {
+                    // A start can publish before this version's first poll has
+                    // registered task-queue membership. Re-key that disposable
+                    // unversioned offer now that the authoritative registry can
+                    // route it, mirroring v1.31.0's user-data-change re-resolution
+                    // of spooled work (`task_queue_partition_manager.go @
+                    // v1.31.0`). History remains the source of the pending WFT.
+                    self.runtime
+                        .absorb_unversioned_backlog(&internal.queue)
+                        .await;
+                }
                 let activation = self
                     .runtime
                     .poll_workflow_activation(
@@ -3822,10 +3982,8 @@ impl WorkflowService {
                         .await
                 {
                     poller.cancelled();
-                    drop(worker_poll);
                 } else {
                     poller.completed();
-                    worker_poll.completed();
                 }
                 let scaling_decision = if activation.is_some() {
                     self.runtime
@@ -5044,12 +5202,42 @@ impl WorkflowService {
                     )
                     .await?;
 
-                let versioning_override = match &req.versioning_override {
-                    VersioningOverrideChange::Set(override_) => {
-                        FieldChange::Set(to_internal::versioning_override_to_kernel(override_))
+                let state = match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
+                    LoadedRun::Existing(state) => state,
+                    LoadedRun::Absent => {
+                        return Err(EdgeError::WorkflowNotFound {
+                            namespace: req.namespace.clone(),
+                            workflow_id: req.workflow_id.clone(),
+                        });
                     }
-                    VersioningOverrideChange::Clear => FieldChange::Clear,
                 };
+
+                let versioning_override =
+                    resolve_versioning_override_change(&req.versioning_override);
+                let pinned = self
+                    .validate_pinned_override(
+                        state.namespace_id,
+                        &state.task_queue.0,
+                        match &versioning_override {
+                            tokeira_kernel::VersioningOverrideChange::Set(override_) => {
+                                Some(override_)
+                            }
+                            tokeira_kernel::VersioningOverrideChange::Clear
+                            | tokeira_kernel::VersioningOverrideChange::Unchanged
+                            | tokeira_kernel::VersioningOverrideChange::SetImpliedPinned => None,
+                        },
+                    )
+                    .await?;
+                if matches!(
+                    versioning_override,
+                    tokeira_kernel::VersioningOverrideChange::Unchanged
+                ) {
+                    return Ok(UpdateWorkflowExecutionOptionsResponse {
+                        versioning_override: state
+                            .versioning_override()
+                            .map(kernel_versioning_override_to_edge),
+                    });
+                }
                 let request = RequestContext {
                     request_id: RequestId(Uuid::new_v4().to_string()),
                     caller_identity: (!req.identity.is_empty()).then(|| req.identity.clone()),
@@ -5061,15 +5249,28 @@ impl WorkflowService {
                     .update_workflow_execution_options(run_key, versioning_override, request)
                     .await
                     .map_err(EdgeError::from)?;
-
-                // The post-update value mirrors the applied change (the only mutable
-                // option tokeira models): `Some` after a Set, `None` after a Clear.
-                let versioning_override = match req.versioning_override {
-                    VersioningOverrideChange::Set(override_) => Some(override_),
-                    VersioningOverrideChange::Clear => None,
+                let post_state = match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
+                    LoadedRun::Existing(post_state) => post_state,
+                    LoadedRun::Absent => {
+                        return Err(EdgeError::WorkflowNotFound {
+                            namespace: req.namespace,
+                            workflow_id: req.workflow_id,
+                        });
+                    }
                 };
+                let changed = state.versioning_override() != post_state.versioning_override();
+                let pinned = if changed {
+                    pinned.or_else(|| pinned_override_ref(post_state.versioning_override()))
+                } else {
+                    None
+                };
+                self.reactivate_pinned_override(state.namespace_id, pinned)
+                    .await;
+
                 Ok(UpdateWorkflowExecutionOptionsResponse {
-                    versioning_override,
+                    versioning_override: post_state
+                        .versioning_override()
+                        .map(kernel_versioning_override_to_edge),
                 })
             },
         )
@@ -5166,7 +5367,7 @@ impl WorkflowService {
     pub async fn reset_workflow_execution(
         &self,
         headers: &HeaderMap,
-        req: ResetWorkflowExecutionRequest,
+        mut req: ResetWorkflowExecutionRequest,
     ) -> EdgeResult<ResetWorkflowExecutionResponse> {
         let namespace_label = req.namespace.clone();
         self.observe_edge_call(
@@ -5210,22 +5411,75 @@ impl WorkflowService {
                 // request itself carries no run id — pass the resolved run's id so
                 // the runtime does not re-resolve open-only (which would miss a
                 // closed base).
-                let base_run_id =
-                    match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
-                        tokeira_kernel::LoadedRun::Existing(state) => Some(state.run_id),
-                        tokeira_kernel::LoadedRun::Absent => None,
-                    };
+                let base_state = match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
+                    tokeira_kernel::LoadedRun::Existing(state) => state,
+                    tokeira_kernel::LoadedRun::Absent => {
+                        return Err(EdgeError::WorkflowNotFound {
+                            namespace: req.namespace.clone(),
+                            workflow_id: req.workflow_id.clone(),
+                        });
+                    }
+                };
+                let base_run_id = Some(base_state.run_id);
                 let execution = ExecutionRef {
                     namespace_id: to_internal::namespace_id_for(&req.namespace),
                     workflow_id: tokeira_types::WorkflowId(req.workflow_id.clone()),
                     run_id: base_run_id,
                 };
-                let internal = to_internal::reset_request(req, &ctx);
+                let mut resolved_post_reset = Vec::new();
+                let mut pinned_versions = Vec::new();
+                for change in &req.post_reset_versioning_overrides {
+                    if matches!(change, VersioningOverrideChange::SetImpliedPinned) {
+                        // v1.31.0 validates post-reset overrides before the
+                        // successor exists; unlike the direct update API, this
+                        // surface therefore requires an explicit Version
+                        // (`resetworkflow/api.go:225-240 @ v1.31.0`).
+                        return Err(EdgeError::BadRequest(
+                            "must provide version if override is pinned.".to_string(),
+                        ));
+                    }
+                    let resolved = resolve_versioning_override_change(change);
+                    let pinned = self
+                        .validate_pinned_override(
+                            base_state.namespace_id,
+                            &base_state.task_queue.0,
+                            match &resolved {
+                                tokeira_kernel::VersioningOverrideChange::Set(override_) => {
+                                    Some(override_)
+                                }
+                                tokeira_kernel::VersioningOverrideChange::Clear
+                                | tokeira_kernel::VersioningOverrideChange::Unchanged
+                                | tokeira_kernel::VersioningOverrideChange::SetImpliedPinned => {
+                                    None
+                                }
+                            },
+                        )
+                        .await?;
+                    if let Some(pinned) = pinned {
+                        pinned_versions.push(pinned);
+                    }
+                    if !matches!(
+                        &resolved,
+                        tokeira_kernel::VersioningOverrideChange::Unchanged
+                    ) {
+                        resolved_post_reset.push(resolved);
+                    }
+                }
+                // The transport reducer cannot resolve implied pinning without
+                // mutable state. Replace its explicit-only reduction with the
+                // state-aware sequence resolved above.
+                req.post_reset_versioning_overrides.clear();
+                let mut internal = to_internal::reset_request(req, &ctx);
+                internal.post_reset_versioning_overrides = resolved_post_reset;
                 let outcome = self
                     .runtime
                     .reset_workflow(execution, internal)
                     .await
                     .map_err(EdgeError::from)?;
+                for pinned in pinned_versions {
+                    self.reactivate_pinned_override(base_state.namespace_id, Some(pinned))
+                        .await;
+                }
 
                 let last_event_id =
                     read_last_event_id(self.repo.as_ref(), outcome.successor_run_key).await?;
@@ -5266,12 +5520,26 @@ impl WorkflowService {
                         .await?,
                 )?;
                 let internal = to_internal::signal_with_start_request(req.clone(), &ctx);
-                match self
+                let pinned = self
+                    .validate_pinned_override(
+                        internal.namespace_id,
+                        &internal.task_queue.0,
+                        internal.versioning_override.as_ref(),
+                    )
+                    .await?;
+                let outcome = self
                     .runtime
                     .signal_with_start_workflow(internal)
                     .await
-                    .map_err(EdgeError::from)?
-                {
+                    .map_err(EdgeError::from)?;
+                if !matches!(&outcome, SignalWithStartResult::Rejected { .. }) {
+                    self.reactivate_pinned_override(
+                        to_internal::namespace_id_for(&req.namespace),
+                        pinned,
+                    )
+                    .await;
+                }
+                match outcome {
                     SignalWithStartResult::Started { run_key, run_id } => {
                         let last_event_id = read_last_event_id(self.repo.as_ref(), run_key).await?;
                         self.notify_history_run_key(run_key, last_event_id).await;
@@ -5511,7 +5779,7 @@ impl WorkflowService {
                         })
                         .await?;
                 }
-                let worker_poll = self.record_worker_poll(
+                self.record_worker_poll(
                     &req.namespace,
                     &req.task_queue,
                     &req.worker_identity,
@@ -5543,7 +5811,6 @@ impl WorkflowService {
                         .await
                 {
                     poller.completed();
-                    worker_poll.completed();
                     return Ok(None);
                 }
                 // The runtime evaluates durable rules when the broker offer is about to become a
@@ -5558,7 +5825,6 @@ impl WorkflowService {
                 // 617-621 @ v1.31.0`).
                 poller.completed();
                 let started = started.map_err(EdgeError::from)?;
-                worker_poll.completed();
                 let scaling_decision = if started.is_some() {
                     self.runtime
                         .activity_poller_scaling_decision(&scaling_queue)
@@ -7615,6 +7881,42 @@ fn batch_request_context(ctx: &BatchDispatchContext) -> RequestContext {
     }
 }
 
+fn resolve_versioning_override_change(
+    change: &VersioningOverrideChange,
+) -> tokeira_kernel::VersioningOverrideChange {
+    match change {
+        VersioningOverrideChange::Unchanged => tokeira_kernel::VersioningOverrideChange::Unchanged,
+        VersioningOverrideChange::Set(override_) => tokeira_kernel::VersioningOverrideChange::Set(
+            to_internal::versioning_override_to_kernel(override_),
+        ),
+        VersioningOverrideChange::Clear => tokeira_kernel::VersioningOverrideChange::Clear,
+        VersioningOverrideChange::SetImpliedPinned => {
+            tokeira_kernel::VersioningOverrideChange::SetImpliedPinned
+        }
+    }
+}
+
+fn kernel_versioning_override_to_edge(
+    override_: &tokeira_kernel::VersioningOverride,
+) -> VersioningOverride {
+    match override_ {
+        tokeira_kernel::VersioningOverride::Pinned { version } => VersioningOverride::Pinned {
+            deployment_series: version.deployment_name.clone(),
+            build_id: version.build_id.clone(),
+        },
+        tokeira_kernel::VersioningOverride::AutoUpgrade => VersioningOverride::AutoUpgrade,
+    }
+}
+
+fn pinned_override_ref(
+    override_: Option<&tokeira_kernel::VersioningOverride>,
+) -> Option<(String, String)> {
+    let Some(tokeira_kernel::VersioningOverride::Pinned { version }) = override_ else {
+        return None;
+    };
+    Some((version.deployment_name.clone(), version.build_id.clone()))
+}
+
 fn map_workflow_deletion_error(
     error: anyhow::Error,
     namespace: &str,
@@ -7855,6 +8157,8 @@ fn active_poller_to_edge(poller: ActivePoller) -> crate::translate::PollerInfo {
         identity: poller.identity.0,
         last_access_time: Some(poller.last_accessed_at),
         rate_per_second: 0.0,
+        deployment: poller.deployment.map(|deployment| deployment.0),
+        build_id: poller.build_id.map(|build_id| build_id.0),
     }
 }
 
@@ -8283,15 +8587,13 @@ mod tests {
         let build_id = BuildId("build-a".to_string());
         let observed_after = OffsetDateTime::now_utc();
 
-        service
-            .record_worker_poll(
-                "default",
-                "queue-a",
-                "worker-a",
-                Some(&deployment),
-                Some(&build_id),
-            )
-            .completed();
+        service.record_worker_poll(
+            "default",
+            "queue-a",
+            "worker-a",
+            Some(&deployment),
+            Some(&build_id),
+        );
 
         let metadata = service.worker_registry().lookup(&WorkerRegistrationKey {
             worker_identity: WorkerIdentity("worker-a".to_string()),

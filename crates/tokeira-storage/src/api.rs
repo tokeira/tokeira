@@ -21,10 +21,11 @@ use tokeira_kernel::{
     state::{VersioningBehavior, VersioningOverride},
 };
 use tokeira_types::{
-    ArchetypeId, EventPrincipal, ExecutionRef, ExecutionStatus, GenerationCounter, Memo,
-    NamespaceId, Payload, Payloads, ProjectionCursor, QueueKey, RequestId, RunId, RunKey,
-    SearchAttrValue, SearchAttributes, ShardEpoch, ShardId, TaskQueueName, TransitionSeq,
-    VisibilityLifecycleState, WorkerIdentity, WorkflowId, WorkflowRuleRecord, WorkflowType,
+    ArchetypeId, BuildId as RuntimeBuildId, DeploymentId, EventPrincipal, ExecutionRef,
+    ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload, Payloads, ProjectionCursor,
+    QueueKey, RequestId, RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch, ShardId,
+    TaskKind, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkerIdentity, WorkflowId,
+    WorkflowRuleRecord, WorkflowType,
 };
 use uuid::Uuid;
 
@@ -592,6 +593,81 @@ pub trait RunRepository: Send + Sync {
         _namespace_id: NamespaceId,
         _version: &WorkerDeploymentVersionKey,
     ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Return whether an exact Deployment-Version task queue has authoritative task
+    /// pressure since `rate_window_start`.
+    ///
+    /// v1.31.0 protects a current/ramping change only when a target-missing queue has
+    /// backlog or non-zero recent add-rate (`isTaskQueueExpectedInNewVersion`,
+    /// `service/worker/workerdeployment/client.go:1859-1926 @ v1.31.0`). Tokeira
+    /// derives both signals from durable dispatch state rather than its disposable
+    /// brokers: currently dispatchable tasks are backlog, while recently committed
+    /// enqueue effects are the add-rate window.
+    async fn has_deployment_task_queue_pressure(
+        &self,
+        namespace_id: NamespaceId,
+        version: &WorkerDeploymentVersionKey,
+        task_queue: &VersionTaskQueue,
+        rate_window_start: OffsetDateTime,
+    ) -> Result<bool> {
+        let task_kind = match task_queue.task_queue_type {
+            DeploymentTaskQueueType::Workflow => TaskKind::Workflow,
+            DeploymentTaskQueueType::Activity => TaskKind::Activity,
+            // Nexus queue resolution passes through endpoint state after the kernel
+            // emits its durable operation effect, so no exact physical QueueKey is
+            // available at this repository boundary.
+            DeploymentTaskQueueType::Nexus | DeploymentTaskQueueType::Unspecified => {
+                return Ok(false);
+            }
+        };
+        let queue = QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName(task_queue.name.clone()),
+            task_kind,
+            deployment: Some(DeploymentId(version.deployment_name.0.clone())),
+            build_id: Some(RuntimeBuildId(version.build_id.0.clone())),
+        };
+
+        let has_backlog = match task_kind {
+            TaskKind::Workflow => !self
+                .list_dispatchable_workflow_tasks(&queue, 1)
+                .await?
+                .is_empty(),
+            TaskKind::Activity => !self
+                .list_dispatchable_activity_tasks(&queue, 1)
+                .await?
+                .is_empty(),
+        };
+        if has_backlog {
+            return Ok(true);
+        }
+
+        for run_key in self.list_runs_for_namespace(namespace_id).await? {
+            for audit in self.read_transition_audit(run_key).await? {
+                let happened_at = audit
+                    .history_events
+                    .iter()
+                    .map(|event| event.happened_at)
+                    .max();
+                let recently_committed = happened_at.is_some_and(|at| at >= rate_window_start);
+                if !recently_committed {
+                    continue;
+                }
+                if audit.dispatch_ops.iter().any(|operation| match operation {
+                    DispatchOp::EnqueueWorkflowTask { queue: added, .. } => {
+                        task_kind == TaskKind::Workflow && added == &queue
+                    }
+                    DispatchOp::EnqueueActivityTask { queue: added, .. } => {
+                        task_kind == TaskKind::Activity && added == &queue
+                    }
+                    _ => false,
+                }) {
+                    return Ok(true);
+                }
+            }
+        }
         Ok(false)
     }
 

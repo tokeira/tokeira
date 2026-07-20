@@ -12,7 +12,9 @@ use std::sync::{
 use dashmap::DashMap;
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
-use tokeira_kernel::{ActivityControlTarget, ActivityRetryPolicyPatch, FieldChange};
+use tokeira_kernel::{
+    ActivityControlTarget, ActivityRetryPolicyPatch, FieldChange, VersioningOverrideChange,
+};
 use tokeira_types::{NamespaceId, Payloads, TaskQueueName};
 use tokio_util::sync::CancellationToken;
 
@@ -26,6 +28,8 @@ pub enum BatchOperationType {
     Signal,
     Delete,
     Reset,
+    /// Mutate workflow-execution options in every selected workflow.
+    UpdateWorkflowExecutionOptions,
     /// Unpause matching pending activities in every selected workflow.
     UnpauseActivity,
     /// Patch matching pending activity options in every selected workflow.
@@ -61,6 +65,13 @@ pub enum BatchOperationParams {
         target: BatchResetTarget,
         reason: String,
     },
+    /// Workflow-execution options mutation carried by a batch.
+    UpdateWorkflowExecutionOptions {
+        /// Client identity recorded on each workflow mutation.
+        identity: String,
+        /// Validated versioning-override change selected by the update mask.
+        versioning_override: VersioningOverrideChange,
+    },
     /// Workflow-scoped activity-unpause parameters carried by a batch.
     UnpauseActivity {
         /// Client identity recorded on each workflow mutation.
@@ -91,6 +102,7 @@ impl BatchOperationParams {
             | BatchOperationParams::Signal { identity, .. }
             | BatchOperationParams::Delete { identity }
             | BatchOperationParams::Reset { identity, .. }
+            | BatchOperationParams::UpdateWorkflowExecutionOptions { identity, .. }
             | BatchOperationParams::UnpauseActivity { identity, .. }
             | BatchOperationParams::UpdateActivityOptions { identity, .. } => identity,
         }
@@ -284,7 +296,17 @@ impl BatchOperationStore {
             .filter(|entry| entry.key().0 == namespace_id)
             .map(|entry| info_from_entry(entry.value()))
             .collect();
-        entries.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+        // ListBatchOperations delegates to visibility in v1.31.0, whose SQL
+        // listing puts the newest running execution first. Job ID is only a
+        // deterministic tie-break for equal process-clock timestamps.
+        // (`service/frontend/workflow_handler.go` and
+        // `common/persistence/visibility/store/sql/query_converter_legacy_postgresql.go`
+        // @ v1.31.0.)
+        entries.sort_by(|a, b| {
+            b.start_time
+                .cmp(&a.start_time)
+                .then_with(|| a.job_id.cmp(&b.job_id))
+        });
         let start = (decode_page_token(page_token).unwrap_or(0) as usize).min(entries.len());
         let limit = page_size.max(1);
         let end = (start + limit).min(entries.len());
@@ -365,6 +387,28 @@ mod tests {
             stop_reason: None,
             stop_identity: None,
         }
+    }
+
+    #[test]
+    fn list_orders_newest_batch_first() {
+        let store = BatchOperationStore::default();
+        let namespace_id = NamespaceId(Uuid::nil());
+        let older = sample_entry(namespace_id, "z-older");
+        let mut newer = sample_entry(namespace_id, "a-newer");
+        newer.start_time += time::Duration::seconds(1);
+        store.create(older).expect("older batch must be created");
+        store.create(newer).expect("newer batch must be created");
+
+        let (listed, next) = store.list(namespace_id, 100, &[]);
+
+        assert_eq!(next, None);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.job_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-newer", "z-older"]
+        );
     }
 
     // Feature: edge-batch-operations-transport, Property 1: Batch store CRUD correctness

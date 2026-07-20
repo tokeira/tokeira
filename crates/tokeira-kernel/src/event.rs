@@ -632,6 +632,9 @@ pub enum HistoryEventKind {
     /// Execution-level options (versioning, callbacks) were
     /// updated by an operator or API call.
     WorkflowExecutionOptionsUpdated {
+        /// Client/operator identity that requested the options mutation.
+        #[serde(default)]
+        identity: String,
         versioning_override: FieldChange<VersioningOverride>,
         completion_callbacks: FieldChange<Vec<CompletionCallback>>,
         attached_completion_callbacks: Vec<CompletionCallback>,

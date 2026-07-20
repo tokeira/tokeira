@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     activity_timeout::ActivityTrackingState,
     broker::{InMemoryActivityBroker, InMemoryBroker},
+    deployment_registry::DeploymentRegistry,
     fairness::DeliveryMetrics,
     lane::{DispatchPublisher, LaneHandle},
     metrics as runtime_metrics,
@@ -53,6 +54,7 @@ use crate::{
     },
     scanner::pick_lane_for_run_key,
     shard::{ShardOwner, shard_for},
+    workflow_task::resolve_workflow_task_target_version,
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -101,6 +103,9 @@ pub struct RuntimeDispatchPublisher<R> {
     completion_callback_tracking: CompletionCallbackTrackingState,
     activity_tracking: ActivityTrackingState,
     delivery_metrics: DeliveryMetrics,
+    /// Runtime-owned deployment registry used only to derive disposable queue
+    /// routing from committed run and deployment state.
+    worker_deployment_registry: Option<Arc<RwLock<Option<DeploymentRegistry>>>>,
     /// Resolves the originator namespace name for the External-endpoint outbound metric.
     /// `None` outside the full server (unit harnesses), where the metric is then omitted.
     namespace_resolver: Option<Arc<dyn NexusNamespaceResolver>>,
@@ -134,6 +139,7 @@ impl<R> Clone for RuntimeDispatchPublisher<R> {
             completion_callback_tracking: self.completion_callback_tracking.clone(),
             activity_tracking: self.activity_tracking.clone(),
             delivery_metrics: self.delivery_metrics.clone(),
+            worker_deployment_registry: self.worker_deployment_registry.clone(),
             namespace_resolver: self.namespace_resolver.clone(),
         }
     }
@@ -177,8 +183,59 @@ where
             completion_callback_tracking,
             activity_tracking,
             delivery_metrics,
+            worker_deployment_registry: None,
             namespace_resolver: None,
         }
+    }
+
+    /// Attach the shared deployment registry used for derived dispatch routing.
+    pub(crate) fn with_worker_deployment_registry(
+        mut self,
+        registry: Arc<RwLock<Option<DeploymentRegistry>>>,
+    ) -> Self {
+        self.worker_deployment_registry = Some(registry);
+        self
+    }
+
+    async fn route_workflow_task_queue(
+        &self,
+        run_key: RunKey,
+        mut queue: QueueKey,
+    ) -> Result<QueueKey> {
+        if queue.deployment.is_some() {
+            return Ok(queue);
+        }
+        let Some(registry_slot) = &self.worker_deployment_registry else {
+            return Ok(queue);
+        };
+        let Some(registry) = registry_slot
+            .read()
+            .expect("worker deployment registry lock poisoned")
+            .clone()
+        else {
+            return Ok(queue);
+        };
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Ok(queue);
+        };
+        let preferred_deployment = state
+            .effective_deployment()
+            .map(|version| version.deployment_name.as_str())
+            .or(state.worker_deployment_name.as_deref());
+        let routing = registry
+            .workflow_task_routing_config(
+                state.namespace_id,
+                &queue.task_queue.0,
+                preferred_deployment,
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+        let target = resolve_workflow_task_target_version(&routing, &state);
+        if let Some(version) = target.deployment_version {
+            queue.deployment = Some(tokeira_types::DeploymentId(version.deployment_name));
+            queue.build_id = Some(tokeira_types::BuildId(version.build_id));
+        }
+        Ok(queue)
     }
 
     /// Attach the namespace-name resolver used to tag the External-endpoint outbound metric.
@@ -1818,6 +1875,7 @@ where
                     } else {
                         (workflow_queue, sticky_preferred.clone())
                     };
+                    let final_queue = self.route_workflow_task_queue(run_key, final_queue).await?;
                     self.broker
                         .publish_workflow_task(
                             DispatchableWorkflowTask {

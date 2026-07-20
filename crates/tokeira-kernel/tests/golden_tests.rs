@@ -21,11 +21,12 @@ use tokeira_kernel::{
     TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest, TimerState,
     Transition, UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
     UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningBehavior,
-    VersioningOverride, WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef,
-    WorkerVersionStamp, WorkflowCommand, WorkflowExecutionTimedOutRequest,
-    WorkflowStartDelayElapsedRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTaskWorkerVersion, WorkflowTimeoutType,
+    VersioningOverride, VersioningOverrideChange, WORKFLOW_START_DELAY_TIMER_ID,
+    WorkerDeploymentVersionRef, WorkerVersionStamp, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTaskWorkerVersion,
+    WorkflowTimeoutType, WorkflowVersioningInfo,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -562,6 +563,7 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
             2,
             t0,
             HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                identity: "operator".into(),
                 versioning_override: FieldChange::Set(VersioningOverride::AutoUpgrade),
                 completion_callbacks: FieldChange::Set(vec![completion_callback()]),
                 attached_completion_callbacks: Vec::new(),
@@ -795,6 +797,7 @@ fn make_reset_request() -> ResetRequest {
         new_run_id: RunId::new(),
         reapply_exclude_signal: false,
         reapply_exclude_update: false,
+        post_reset_versioning_overrides: Vec::new(),
         reason: "operator reset".into(),
         request: request_context("reset-req"),
         now: now(),
@@ -1048,6 +1051,40 @@ fn start_from_absent() {
     );
     assert_eq!(transition.dispatch_ops.len(), 1);
     assert!(transition.next_state.pending_workflow_task.is_some());
+}
+
+#[test]
+fn pinned_start_records_worker_deployment_name_for_live_state_and_replay() {
+    let mut req = make_start_request();
+    let version = WorkerDeploymentVersionRef {
+        deployment_name: "payments".to_string(),
+        build_id: "build-7".to_string(),
+    };
+    req.versioning_override = Some(VersioningOverride::Pinned {
+        version: version.clone(),
+    });
+
+    let transition = kernel()
+        .apply(LoadedRun::Absent, Command::Start(req.clone()))
+        .unwrap();
+
+    assert_eq!(
+        transition.next_state.worker_deployment_name.as_deref(),
+        Some("payments")
+    );
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionStartedV2 {
+            worker_deployment_name: Some(name),
+            ..
+        } if name == "payments"
+    ));
+
+    let replayed = kernel()
+        .replay_history_prefix(replay_context_from_start(&req), &transition.history_events)
+        .unwrap();
+    assert_eq!(replayed.worker_deployment_name.as_deref(), Some("payments"));
+    assert_eq!(replayed.effective_deployment(), Some(&version));
 }
 
 #[test]
@@ -6746,7 +6783,7 @@ fn record_marker_after_close_rejected() {
 fn update_execution_options_happy_path() {
     let state = make_open_state();
     let req = UpdateExecutionOptionsRequest {
-        versioning_override: FieldChange::Set(VersioningOverride::AutoUpgrade),
+        versioning_override: VersioningOverrideChange::Set(VersioningOverride::AutoUpgrade),
         completion_callbacks: FieldChange::Set(vec![completion_callback()]),
         attached_completion_callbacks: Vec::new(),
         attached_links: Vec::new(),
@@ -6768,12 +6805,14 @@ fn update_execution_options_happy_path() {
     assert!(matches!(
         &transition.history_events[0].kind,
         HistoryEventKind::WorkflowExecutionOptionsUpdated {
+            identity,
             versioning_override,
             completion_callbacks,
             attached_completion_callbacks,
             attached_links,
             attached_request_id,
-        } if versioning_override == &req.versioning_override
+        } if identity == "tester"
+            && versioning_override == &FieldChange::Set(VersioningOverride::AutoUpgrade)
             && completion_callbacks == &FieldChange::Set(expected_callbacks.clone())
             && attached_completion_callbacks == &req.attached_completion_callbacks
             && attached_links == &req.attached_links
@@ -6811,7 +6850,7 @@ fn update_execution_options_clear_versioning() {
         .apply(
             LoadedRun::Existing(state),
             Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
-                versioning_override: FieldChange::Clear,
+                versioning_override: VersioningOverrideChange::Clear,
                 completion_callbacks: FieldChange::Unchanged,
                 attached_completion_callbacks: Vec::new(),
                 attached_links: Vec::new(),
@@ -6831,12 +6870,109 @@ fn update_execution_options_clear_versioning() {
 }
 
 #[test]
+fn update_execution_options_resolves_implied_pin_in_authoritative_state() {
+    let version = WorkerDeploymentVersionRef {
+        deployment_name: "deployment".into(),
+        build_id: "build-a".into(),
+    };
+    let mut state = make_open_state();
+    state.versioning_info = Some(WorkflowVersioningInfo {
+        behavior: VersioningBehavior::Pinned,
+        deployment_version: Some(version.clone()),
+        ..WorkflowVersioningInfo::default()
+    });
+
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+                versioning_override: VersioningOverrideChange::SetImpliedPinned,
+                completion_callbacks: FieldChange::Unchanged,
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
+                attached_request_id: None,
+                request: request_context("options-implied"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    let expected = VersioningOverride::Pinned {
+        version: version.clone(),
+    };
+    assert_eq!(transition.next_state.versioning_override(), Some(&expected));
+    assert!(matches!(
+        &transition.history_events[0].kind,
+        HistoryEventKind::WorkflowExecutionOptionsUpdated {
+            versioning_override: FieldChange::Set(actual),
+            ..
+        } if actual == &expected
+    ));
+}
+
+#[test]
+fn update_execution_options_rejects_implied_pin_before_run_is_pinned() {
+    let mut state = make_open_state();
+    state.versioning_info = Some(WorkflowVersioningInfo {
+        behavior: VersioningBehavior::AutoUpgrade,
+        ..WorkflowVersioningInfo::default()
+    });
+    let before = state.clone();
+
+    let reject = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+                versioning_override: VersioningOverrideChange::SetImpliedPinned,
+                completion_callbacks: FieldChange::Unchanged,
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
+                attached_request_id: None,
+                request: request_context("options-implied-error"),
+                now: now(),
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        reject,
+        Reject::InvalidVersioningOverride(format!(
+            "must specify a specific pinned override version because workflow with id {} has behavior AutoUpgrade and is not yet pinned to any version",
+            before.workflow_id.0
+        ))
+    );
+}
+
+#[test]
+fn update_execution_options_equal_value_is_an_explicit_noop() {
+    let state = with_execution_options(make_open_state());
+    let before = state.clone();
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+                versioning_override: VersioningOverrideChange::Set(VersioningOverride::AutoUpgrade),
+                completion_callbacks: FieldChange::Unchanged,
+                attached_completion_callbacks: Vec::new(),
+                attached_links: Vec::new(),
+                attached_request_id: None,
+                request: request_context("options-same"),
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(transition.is_noop());
+    assert_eq!(transition.next_state, before);
+}
+
+#[test]
 fn update_execution_options_missing_run() {
     let reject = kernel()
         .apply(
             LoadedRun::Absent,
             Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
-                versioning_override: FieldChange::Unchanged,
+                versioning_override: VersioningOverrideChange::Unchanged,
                 completion_callbacks: FieldChange::Unchanged,
                 attached_completion_callbacks: Vec::new(),
                 attached_links: Vec::new(),
@@ -6856,7 +6992,7 @@ fn update_execution_options_closed_run() {
         .apply(
             LoadedRun::Existing(make_closed_state()),
             Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
-                versioning_override: FieldChange::Unchanged,
+                versioning_override: VersioningOverrideChange::Unchanged,
                 completion_callbacks: FieldChange::Unchanged,
                 attached_completion_callbacks: Vec::new(),
                 attached_links: Vec::new(),

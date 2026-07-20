@@ -22,10 +22,10 @@ use tokeira_kernel::{
     TimerDueRequest, TimerOp, TimerState, Transition, UnpauseActivityRequest,
     UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
     UpdateProtocolBody, UpdateRequest, UserMetadata, VersioningBehavior, VersioningOverride,
-    WorkerDeploymentVersionRef, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
-    WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
-    WorkflowVersioningInfo,
+    VersioningOverrideChange, WorkerDeploymentVersionRef, WorkflowCommand,
+    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
+    WorkflowTaskTimeoutType, WorkflowTimeoutType, WorkflowVersioningInfo,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -480,6 +480,7 @@ fn arb_reset_request(
             new_run_id: RunId::new(),
             reapply_exclude_signal: false,
             reapply_exclude_update: false,
+            post_reset_versioning_overrides: Vec::new(),
             reason,
             request: request_context(&request_id, now),
             now,
@@ -699,9 +700,15 @@ fn arb_update_execution_options_request(
     now: OffsetDateTime,
 ) -> impl Strategy<Value = UpdateExecutionOptionsRequest> {
     (
-        arb_field_change(Just(VersioningOverride::AutoUpgrade)),
+        prop_oneof![
+            Just(VersioningOverrideChange::Unchanged),
+            Just(VersioningOverrideChange::Set(
+                VersioningOverride::AutoUpgrade
+            )),
+            Just(VersioningOverrideChange::Clear),
+        ],
         arb_field_change(prop::collection::vec(Just(completion_callback()), 0..3)),
-        prop::option::of(arb_small_string()),
+        arb_small_string().prop_map(Some),
         arb_small_string(),
     )
         .prop_map(
@@ -4707,13 +4714,21 @@ proptest! {
 
         match &transition.history_events[0].kind {
             HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                identity,
                 versioning_override,
                 completion_callbacks,
                 attached_completion_callbacks,
                 attached_links,
                 attached_request_id,
             } => {
-                prop_assert_eq!(versioning_override, &req.versioning_override);
+                prop_assert_eq!(identity, req.request.caller_identity.as_deref().unwrap_or_default());
+                let expected_versioning_override = match &req.versioning_override {
+                    VersioningOverrideChange::Unchanged => FieldChange::Unchanged,
+                    VersioningOverrideChange::Set(value) => FieldChange::Set(value.clone()),
+                    VersioningOverrideChange::Clear => FieldChange::Unchanged,
+                    VersioningOverrideChange::SetImpliedPinned => unreachable!("generator excludes state-dependent implied pins"),
+                };
+                prop_assert_eq!(versioning_override, &expected_versioning_override);
                 prop_assert_eq!(
                     completion_callbacks,
                     &stamp_callback_field_change(&req.completion_callbacks, req.now)
@@ -4739,9 +4754,10 @@ proptest! {
         ).unwrap();
 
         let expected_versioning_override = match req.versioning_override {
-            FieldChange::Unchanged => base.versioning_override().cloned(),
-            FieldChange::Set(versioning_override) => Some(versioning_override),
-            FieldChange::Clear => None,
+            VersioningOverrideChange::Unchanged => base.versioning_override().cloned(),
+            VersioningOverrideChange::Set(versioning_override) => Some(versioning_override),
+            VersioningOverrideChange::Clear => None,
+            VersioningOverrideChange::SetImpliedPinned => unreachable!("generator excludes state-dependent implied pins"),
         };
         let expected_completion_callbacks = match req.completion_callbacks {
             FieldChange::Unchanged => base.completion_callbacks,
@@ -4783,6 +4799,96 @@ proptest! {
         );
         prop_assert_eq!(transition.next_state.pending_workflow_task, pending);
         prop_assert_eq!(transition.next_state.status, ExecutionStatus::Running);
+    }
+
+    // Feature: api-conformance-workflow-options, Property 4
+    #[test]
+    fn property_63_implied_pin_resolves_from_the_serialized_state(
+        deployment_name in arb_small_string(),
+        build_id in arb_small_string(),
+        pinned_before_update in any::<bool>(),
+    ) {
+        let now = fixed_now();
+        let version = WorkerDeploymentVersionRef { deployment_name, build_id };
+        let mut state = make_open_state(now);
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior: if pinned_before_update {
+                VersioningBehavior::Pinned
+            } else {
+                VersioningBehavior::AutoUpgrade
+            },
+            deployment_version: Some(version.clone()),
+            ..WorkflowVersioningInfo::default()
+        });
+        let command = Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+            versioning_override: VersioningOverrideChange::SetImpliedPinned,
+            completion_callbacks: FieldChange::Unchanged,
+            attached_completion_callbacks: Vec::new(),
+            attached_links: Vec::new(),
+            attached_request_id: None,
+            request: request_context("implied", now),
+            now,
+        });
+
+        if pinned_before_update {
+            let transition = kernel()
+                .apply(LoadedRun::Existing(state), command)
+                .unwrap();
+            let expected = VersioningOverride::Pinned { version };
+            prop_assert_eq!(transition.next_state.versioning_override(), Some(&expected));
+            let event_records_concrete_pin = matches!(
+                &transition.history_events[0].kind,
+                HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                    versioning_override: FieldChange::Set(actual),
+                    ..
+                } if actual == &expected
+            );
+            prop_assert!(event_records_concrete_pin);
+        } else {
+            let before = state.clone();
+            let reject = kernel()
+                .apply(LoadedRun::Existing(state), command)
+                .unwrap_err();
+            prop_assert!(matches!(reject, Reject::InvalidVersioningOverride(_)));
+            prop_assert_eq!(before.versioning_override(), None);
+        }
+    }
+
+    // Feature: api-conformance-workflow-options, Property 5
+    #[test]
+    fn property_64_equal_execution_options_produce_no_write_set(
+        existing in prop::option::of(Just(VersioningOverride::AutoUpgrade)),
+        use_unchanged in any::<bool>(),
+    ) {
+        let now = fixed_now();
+        let mut state = make_open_state(now);
+        state.set_versioning_override(existing.clone());
+        let change = if use_unchanged {
+            VersioningOverrideChange::Unchanged
+        } else {
+            match existing {
+                Some(value) => VersioningOverrideChange::Set(value),
+                None => VersioningOverrideChange::Clear,
+            }
+        };
+        let before = state.clone();
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+                    versioning_override: change,
+                    completion_callbacks: FieldChange::Unchanged,
+                    attached_completion_callbacks: Vec::new(),
+                    attached_links: Vec::new(),
+                    attached_request_id: None,
+                    request: request_context("noop", now),
+                    now,
+                }),
+            )
+            .unwrap();
+
+        prop_assert!(transition.is_noop());
+        prop_assert_eq!(transition.next_state, before);
     }
 }
 

@@ -459,6 +459,14 @@ impl WorkflowState {
     pub fn set_versioning_override(&mut self, override_: Option<VersioningOverride>) {
         match override_ {
             Some(override_) => {
+                // A pinned override immediately becomes the effective deployment,
+                // so DescribeWorkflowExecution must expose its deployment name.
+                // AUTO_UPGRADE deliberately leaves the last worker deployment name
+                // unchanged (`updateVersioningOverride`,
+                // `service/history/workflow/mutable_state_impl.go @ v1.31.0`).
+                if let VersioningOverride::Pinned { version } = &override_ {
+                    self.worker_deployment_name = Some(version.deployment_name.clone());
+                }
                 self.versioning_info
                     .get_or_insert_with(WorkflowVersioningInfo::default)
                     .versioning_override = Some(override_);
@@ -466,7 +474,17 @@ impl WorkflowState {
             None => {
                 if let Some(info) = self.versioning_info.as_mut() {
                     info.versioning_override = None;
+                    // Clearing an override returns the workflow to the deployment
+                    // last reported by a successful WFT, or to no deployment when
+                    // no versioning state exists. This mirrors the same v1.31.0
+                    // mutable-state transition cited above.
+                    self.worker_deployment_name = info
+                        .deployment_version
+                        .as_ref()
+                        .map(|version| version.deployment_name.clone());
                     self.compact_versioning_info();
+                } else {
+                    self.worker_deployment_name = None;
                 }
             }
         }
@@ -1289,6 +1307,39 @@ mod tests {
 
         assert_eq!(state.effective_behavior(), VersioningBehavior::AutoUpgrade);
         assert_eq!(state.effective_deployment(), Some(&behavior_version));
+    }
+
+    #[test]
+    fn versioning_override_updates_the_described_worker_deployment_name() {
+        let worker_version = version("worker-deployment", "worker-build");
+        let pinned_version = version("pinned-deployment", "pinned-build");
+        let mut state = open_state();
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::AutoUpgrade,
+            deployment_version: Some(worker_version),
+            ..WorkflowVersioningInfo::default()
+        });
+        state.worker_deployment_name = Some("worker-deployment".to_string());
+
+        state.set_versioning_override(Some(VersioningOverride::Pinned {
+            version: pinned_version,
+        }));
+        assert_eq!(
+            state.worker_deployment_name.as_deref(),
+            Some("pinned-deployment")
+        );
+
+        state.set_versioning_override(Some(VersioningOverride::AutoUpgrade));
+        assert_eq!(
+            state.worker_deployment_name.as_deref(),
+            Some("pinned-deployment")
+        );
+
+        state.set_versioning_override(None);
+        assert_eq!(
+            state.worker_deployment_name.as_deref(),
+            Some("worker-deployment")
+        );
     }
 
     #[test]

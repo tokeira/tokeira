@@ -49,6 +49,24 @@ pub struct Transition {
     pub projection_ops: SmallVec<[ProjectionOp; 8]>,
 }
 
+impl Transition {
+    /// Whether the kernel deliberately produced no authoritative mutation.
+    ///
+    /// The runtime may return the loaded state without touching storage for
+    /// this exact shape. Requiring every write-set component to be empty keeps
+    /// the optimization from silently dropping a derived or dedupe effect.
+    pub fn is_noop(&self) -> bool {
+        self.next_state.transition_seq == self.expected_seq
+            && self.history_events.is_empty()
+            && self.event_principals.is_empty()
+            && self.request_dedupe_ops.is_empty()
+            && self.activity_ops.is_empty()
+            && self.timer_ops.is_empty()
+            && self.dispatch_ops.is_empty()
+            && self.projection_ops.is_empty()
+    }
+}
+
 /// Request-dedupe is part of the authoritative write set.
 ///
 /// Insight: the request id is intentionally carried beside history rather than

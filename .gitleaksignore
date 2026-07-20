@@ -1,0 +1,2 @@
+# ES256 test fixture removed in this PR; fixture-only, history intentionally not rewritten
+bfa2e5b5cede3f91476aea8ca43951748b9feed6:crates/tokeira-auth/src/jwt.rs:private-key:413

@@ -73,6 +73,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
 
+  # cargo-deny is split in two so the deterministic half can gate merges:
+  # bans/licenses/sources are a pure function of the committed tree and can be
+  # a required status check, while advisories fail on external events (a new
+  # RustSec entry against an unchanged tree) — that job is deliberately never
+  # required, and the weekly cron above re-runs it between pushes.
   cargo-deny:
     name: "Supply-chain & licenses"
     timeout-minutes: 15
@@ -83,7 +88,19 @@ jobs:
           persist-credentials: false # CI is read-only; don't leave the token in .git/config
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
-          command: check
+          command: check bans licenses sources
+
+  cargo-deny-advisories:
+    name: "Security advisories"
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false # CI is read-only; don't leave the token in .git/config
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          command: check advisories
 
   # Internal-link integrity for the docs/spec corpus. Offline mode checks
   # relative file links only — hermetic, no network flakes; external URLs are

@@ -31,6 +31,11 @@ pub struct PollNexusTaskQueueRequest {
     pub namespace: String,
     pub worker_identity: String,
     pub task_queue: String,
+    /// Worker observations piggybacked by the SDK on this long poll.
+    ///
+    /// They remain public protos until namespace admission because the edge
+    /// must retain their complete wire image for worker-inventory responses.
+    pub worker_heartbeats: Vec<tokeira_proto::public::temporal::api::worker::v1::WorkerHeartbeat>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -90,6 +95,7 @@ pub fn poll_request_to_edge(
         namespace: req.namespace,
         worker_identity: req.identity,
         task_queue: task_queue.name,
+        worker_heartbeats: req.worker_heartbeat,
     })
 }
 

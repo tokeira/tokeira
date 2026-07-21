@@ -156,6 +156,7 @@ pub mod routing;
 pub mod routing_cache;
 mod task_token;
 pub mod translate;
+mod worker_inventory;
 pub mod workflow_rules;
 pub mod workflow_service;
 

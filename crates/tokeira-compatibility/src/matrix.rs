@@ -23,6 +23,17 @@ const WORKER_DEPLOYMENT_EVIDENCE: &[CompatibilityEvidence] = &[
     },
 ];
 
+const WORKER_HEARTBEAT_EVIDENCE: &[CompatibilityEvidence] = &[
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/src/grpc/workflow_service.rs::worker_inventory_round_trips_complete_heartbeats",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/src/worker_inventory.rs::pagination_is_ordered_and_duplicate_free",
+    },
+];
+
 const ACTIVITY_EXECUTION_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
     kind: CompatibilitySurfaceKind::Rpc,
     identifier: "WorkflowService.ActivityExecutionManagement",
@@ -293,9 +304,7 @@ const WORKER_CONFIG_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
     identifier: "WorkflowService.WorkerConfig",
 }];
 const WORKER_CONFIG_RPCS: &[&str] = &[
-    "WorkflowService.DescribeWorker",
     "WorkflowService.FetchWorkerConfig",
-    "WorkflowService.ListWorkers",
     "WorkflowService.UpdateWorkerConfig",
 ];
 
@@ -329,6 +338,8 @@ const WORKER_HEARTBEAT_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurfac
     identifier: "WorkflowService.WorkerHeartbeats",
 }];
 const WORKER_HEARTBEAT_RPCS: &[&str] = &[
+    "WorkflowService.DescribeWorker",
+    "WorkflowService.ListWorkers",
     "WorkflowService.RecordWorkerHeartbeat",
     "WorkflowService.ShutdownWorker",
 ];
@@ -629,13 +640,13 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
     },
     FeatureEntry {
         id: "worker-config",
-        name: "Worker configuration and inventory",
+        name: "Worker configuration",
         state: FeatureState::Unsupported,
         surfaces: WORKER_CONFIG_SURFACES,
         capability_field: None,
         dynamic_config_key: None,
         rpcs: WORKER_CONFIG_RPCS,
-        notes: "Worker config and inventory APIs are distinct from the heartbeat ingestion path and are currently unsupported.",
+        notes: "FetchWorkerConfig and UpdateWorkerConfig remain unsupported; live worker inventory belongs to worker-heartbeats.",
         evidence: &[],
     },
     FeatureEntry {
@@ -651,14 +662,14 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
     },
     FeatureEntry {
         id: "worker-heartbeats",
-        name: "Worker heartbeats",
-        state: FeatureState::Partial,
+        name: "Worker heartbeats and live inventory",
+        state: FeatureState::Implemented,
         surfaces: WORKER_HEARTBEAT_SURFACES,
         capability_field: None,
         dynamic_config_key: None,
         rpcs: WORKER_HEARTBEAT_RPCS,
-        notes: "RecordWorkerHeartbeat and ShutdownWorker are implemented for observability but not yet claimed as fully Temporal-conformant.",
-        evidence: &[],
+        notes: "RecordWorkerHeartbeat, shutdown removal, Nexus-piggyback admission, and lossless DescribeWorker/ListWorkers inventory reads match Temporal v1.31.0's volatile registry behavior.",
+        evidence: WORKER_HEARTBEAT_EVIDENCE,
     },
     FeatureEntry {
         id: "worker-versioning-v1-v2",

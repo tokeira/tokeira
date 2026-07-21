@@ -8,7 +8,7 @@ The design is organised around seven principles that follow directly from Tokeir
 
 - **Proto resync is a single atomic commit.** `cargo run -p proto-sync -- v1.62.11` wipes `proto/upstream/` and re-exports from `buf.build/temporalio/api:v1.62.11`. The commit that lands the resync also bumps `proto/UPSTREAM_VERSION` and dissolves the four `Interim_Shims` introduced in `Commit_214895e`. No other behavioural edits land in the same commit — signature drift in translators is resolved in the same commit only to the minimum extent required to keep the workspace compiling (Req 1.3).
 - **Translation stays at the edge.** All proto-to-DTO and DTO-to-proto work lives in `crates/tokeira-edge/src/grpc/translate.rs` (the `Edge_Translate` module) and `crates/tokeira-edge/src/translate/mod.rs` (the `Edge_DTOs`). No proto types cross the edge boundary into `tokeira-runtime`, `tokeira-kernel`, or `tokeira-projection`. This is Rule 2 of `tokeira/AGENTS.md` applied to wire compatibility: the kernel stays pure, and the edge is the only place that knows proto.
-- **Classification is mechanical.** Every v1.43 → v1.62.11 delta gets placed into exactly one of five buckets (`Ignore`, `No-op stub`, `Capability advertise`, `Wire through`, `Full implementation (deferred)`). The Surface_Audit table in §5 is the single artifact that carries the classification; the Implementation & Escalation Matrix in §6 carries the concrete per-plane impact for every `Wire through` row that lands in this spec plus the `RecordWorkerHeartbeat` `No-op` handler plus every row escalated to `Deferred`; §7 records the principle that governed each bucket placement.
+- **Classification is mechanical.** Every v1.43 → v1.62.11 delta gets placed into exactly one of five buckets (`Ignore`, `No-op stub`, `Capability advertise`, `Wire through`, `Full implementation (deferred)`). The Surface_Audit table in §5 is the single artifact that carries the classification; follow-up owner specs amend rows when a deferred/no-op surface becomes implemented.
 - **Absorb only what costs less than deferring.** Three v1.62 surfaces are implemented in this spec rather than deferred: `CountSchedules` (a trivial count over the existing `ScheduleStore`), `UpdateTaskQueueConfig` (a setter over a new in-memory `TaskQueueConfigStore` that mirrors `ScheduleStore`/`VersioningRuleStore`), and Nexus v2 field wire-through on existing Nexus RPCs (decode, carry through `NexusTaskBroker`/`NexusEndpointRegistry`, re-emit). Every other feature area surfaces as an `Unimplemented` stub with a bracketed comment block naming the deferring spec.
 - **RPC renames are live-handler migrations.** The four `*ById` activity RPCs (`UpdateActivityOptionsById`, `PauseActivityById`, `UnpauseActivityById`, `ResetActivityById`) are renamed in-place to their unsuffixed v1.62 forms. Handler bodies are preserved modulo signature drift. These migrations are not stubs — they are live RPCs whose message types and field layouts changed, and they do not belong inside any deferred-block bracketed comment.
 - **Reviewability is a first-class artifact.** The Surface_Audit table is expected to carry 60–100+ rows covering every RPC, field, message, enum, and package change. Classification decisions are reviewable inline alongside the design, not buried in implementation PRs. The Implementation & Escalation Matrix enforces that every counted `Classification_WireThrough` surface row that is not `none`/`none`/`none` across all three downstream impact columns is escalated to `Classification_Deferred` if it would require more than a single-file change (Req 5.1.3, 5.1.4, 5.1.5).
@@ -52,8 +52,8 @@ graph TD
         SVCIMPL -.->|"Unimplemented"| PW["// Pause/Unpause Workflow (2 RPCs)"]
     end
 
-    subgraph "Live no-op / capability"
-        SVCIMPL -->|"RecordWorkerHeartbeat"| RWH["no-op handler<br/>validates namespace<br/>debug! per call"]
+    subgraph "Live observation / capability"
+        SVCIMPL -->|"RecordWorkerHeartbeat<br/>DescribeWorker<br/>ListWorkers"| RWH["process-local HeartbeatStore<br/>lossless inventory<br/>query + pagination"]
         SVCIMPL -->|"GetSystemInfo"| SYSCAP["SystemCapabilities<br/>+ server_scaled_deployments<br/>+ worker_heartbeats"]
         SVCIMPL -->|"DescribeNamespace"| NSCAP["NamespaceInfo.Capabilities<br/>+ worker_heartbeats: true<br/>+ reported_problems_search_attribute: false"]
     end
@@ -135,8 +135,8 @@ pub struct SystemCapabilities {
     /// Advertised as `false`: Worker Deployments are deferred to the
     /// `worker-deployments` spec. See Surface_Audit row for the wire-level rationale.
     pub server_scaled_deployments: bool,
-    /// Advertised as `true`: `record_worker_heartbeat` accepts calls and
-    /// returns `Ok`. Real observability deferred to `worker-heartbeat-observability`.
+    /// Advertised as `true`: heartbeat ingestion and live worker inventory are
+    /// implemented by `worker-heartbeat-observability`.
     pub worker_heartbeats: bool,
 }
 // impl Default for SystemCapabilities — see §Data Models for the body.
@@ -497,9 +497,7 @@ The rename migrations from §8 are emphatically not inside any deferred block �
 // ...hundreds of lines of live handlers...
 
 // === Worker Deployments — deferred to worker-deployments spec ===
-async fn describe_worker(...) -> Result<..., Status> { ... }
-async fn list_workers(...) -> Result<..., Status> { ... }
-// ...11 handlers total...
+// ...deployment handlers only; live worker inventory is not in this block...
 // === End Worker Deployments block ===
 
 // === Workflow Rules — deferred to workflow-rules spec ===
@@ -522,13 +520,13 @@ async fn list_workers(...) -> Result<..., Status> { ... }
 **Handler template** (Req 6.1.1, 6.1.3, 6.1.4):
 
 ```rust
-async fn describe_worker(
+async fn fetch_worker_config(
     &self,
-    _request: Request<workflowservice::DescribeWorkerRequest>,
-) -> Result<Response<workflowservice::DescribeWorkerResponse>, Status> {
-    tracing::debug!(rpc = "DescribeWorker", spec = "worker-deployments", "unimplemented RPC called");
+    _request: Request<workflowservice::FetchWorkerConfigRequest>,
+) -> Result<Response<workflowservice::FetchWorkerConfigResponse>, Status> {
+    tracing::debug!(rpc = "FetchWorkerConfig", spec = "worker-config-management", "unimplemented RPC called");
     Err(Status::unimplemented(
-        "DescribeWorker is not implemented; tracked in spec worker-deployments",
+        "FetchWorkerConfig is not implemented; tracked in spec worker-config-management",
     ))
 }
 ```
@@ -555,42 +553,11 @@ Migration steps:
 3. Edge_DTO names lose their `ById` suffixes: `PauseActivityByIdRequest` DTO → `PauseActivityRequest` DTO (Req 4.3.4). All callers are updated.
 4. The Surface_Audit Disposition column for each rename row records the handler migration and points to the separately classified request fields. Req 4.3.3 requires that if the v1.62 `PauseActivityRequest` / etc. gained new fields relative to its `*ById` predecessor, those fields are enumerated in the Surface_Audit, classified individually, and implemented according to that classification before the rename work is considered complete.
 
-### 9. `record_worker_heartbeat` migration (Req 3.4)
+### 9. Worker-heartbeat and inventory promotion (owner amendment)
 
-The existing no-op handler at `crates/tokeira-edge/src/grpc/workflow_service.rs` around line 621 is updated to accept the upstream-typed request and adds a namespace validation step:
+The original v1.62-sync no-op was superseded by `worker-heartbeat-observability`. The live edge now resolves the namespace, encodes each complete upstream heartbeat into an opaque response image, and inserts a compact process-local observation into `HeartbeatStore`. Runtime does not depend on Temporal protos, and neither kernel nor storage is involved.
 
-```rust
-async fn record_worker_heartbeat(
-    &self,
-    request: Request<workflowservice::RecordWorkerHeartbeatRequest>,
-) -> Result<Response<workflowservice::RecordWorkerHeartbeatResponse>, Status> {
-    let req = request.into_inner();
-    // Req 3.4.5: match the shutdown_worker convention for empty-namespace.
-    if req.namespace.is_empty() {
-        return Err(Status::invalid_argument("namespace is required"));
-    }
-    // Req 3.4.3: single debug line per call. A v0.4 worker emits one heartbeat
-    // every 30 s per registered worker; higher levels would flood operator logs.
-    tracing::debug!(
-        rpc = "RecordWorkerHeartbeat",
-        namespace = %req.namespace,
-        heartbeat_count = req.worker_heartbeat.len(),
-        "heartbeat accepted",
-    );
-    // Req 3.4.4 rationale comment: names this spec + the observability spec.
-    // Real persistent storage of WorkerHeartbeat records is tracked in the
-    // `worker-heartbeat-observability` spec.
-    Ok(Response::new(workflowservice::RecordWorkerHeartbeatResponse {}))
-}
-```
-
-The handler:
-
-- Accepts `worker_heartbeat: Vec<temporal::api::worker::v1::WorkerHeartbeat>` from the upstream-typed request (Req 3.4.1).
-- Returns `Ok(...)` with no side effects on Kernel, Runtime, Storage, or Projection (Req 3.4.2).
-- Emits exactly one `debug!` line per call, including the namespace and heartbeat count for operator diagnostics (Req 3.4.3).
-- Validates the namespace is non-empty and returns `invalid_argument` otherwise, matching `shutdown_worker` convention at `workflow_service.rs` lines 636–640 (Req 3.4.5).
-- Carries a rationale comment naming `temporal-api-v1.62-sync` as the spec that introduced the shape and `worker-heartbeat-observability` as the spec that owns real observability (Req 3.4.4, 3.3.3).
+`DescribeWorker` decodes and returns the complete latest heartbeat. `ListWorkers` evaluates the bounded v1.31.0 worker-query grammar, fills both the deprecated full and limited summary response fields, and cursor-paginates by worker-instance key. `PollNexusTaskQueue` records a piggybacked heartbeat batch before blocking, with best-effort failure semantics. A shutdown-status heartbeat removes the worker immediately instead of retaining a tombstone. The owning behavior and correctness properties are specified in `.kiro/specs/worker-heartbeat-observability/`.
 
 ### 10. Integration test harness (Req 7.1, 7.2)
 
@@ -743,8 +710,8 @@ impl Default for SystemCapabilities {
             nexus: false,
             // Worker Deployments are stubs in this spec; advertise `false`.
             server_scaled_deployments: false,
-            // No-op `RecordWorkerHeartbeat` handler accepts every call; the
-            // SDK v0.4 worker shuts down immediately if this is `false`.
+            // Heartbeat ingestion and live inventory are implemented; the SDK
+            // v0.4 worker shuts down immediately if this is `false`.
             worker_heartbeats: true,
         }
     }
@@ -771,7 +738,7 @@ pub struct NamespaceCapabilities {
 impl Default for NamespaceCapabilities {
     fn default() -> Self {
         Self {
-            // No-op `RecordWorkerHeartbeat` handler accepts every call;
+            // Heartbeat ingestion and live inventory are implemented;
             // advertise `true` so v0.4 workers stay alive.
             worker_heartbeats: true,
             // Tokeira does not emit reported-problems search attributes;
@@ -991,7 +958,7 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Package | `temporal.api.worker.v1` | v1.48 (heartbeat types) | No-op | Regenerate via resync; types compile in the generated tree but no DTO or translator work is introduced. `RecordWorkerHeartbeat` accepts `Vec<WorkerHeartbeat>` on its request and discards the payload — compile-only; no DTO/translator work. The row does NOT participate in the wire-through row-count property (§8 Property 2); see §7 Classification_NoOp for the sub-case distinction | `worker-heartbeat-observability` |
+| Package | `temporal.api.worker.v1` | v1.48 (heartbeat types) | Wire through | Generated types are consumed losslessly at the edge; runtime retains an opaque encoded response image plus compact query/liveness fields | `worker-heartbeat-observability` |
 | Package | `temporal.api.rules.v1` | v1.57 | Deferred | Regenerate via resync; no handler consumes these types today | `workflow-rules` |
 | Package | `temporal.api.protometa.v1` | v1.55 | Ignore | Informational annotations only; compile cleanly, no code consumes | — |
 
@@ -1001,9 +968,9 @@ Every `Classification_WireThrough` row whose Kernel, Runtime, or Projection impa
 |---|---|---|---|---|---|
 | RPC | `WorkflowService.CountSchedules` | v1.55 | Wire through | Implemented against `ScheduleStore::count_schedules`; filter via `filter.rs` | — |
 | RPC | `WorkflowService.UpdateTaskQueueConfig` | v1.58 | Wire through | Implemented; setter on new `TaskQueueConfigStore`; read-back on `DescribeTaskQueue` | — |
-| RPC | `WorkflowService.RecordWorkerHeartbeat` | v1.48 | Wire through | Observation-backed handler; validates namespace; decodes compact heartbeat model; inserts into `HeartbeatStore`; emits metrics | `worker-heartbeat-observability` |
-| RPC | `WorkflowService.DescribeWorker` | v1.55 | Deferred | Stub; inside Worker Deployments block | `worker-deployments` |
-| RPC | `WorkflowService.ListWorkers` | v1.55 | Deferred | Stub; inside Worker Deployments block | `worker-deployments` |
+| RPC | `WorkflowService.RecordWorkerHeartbeat` | v1.48 | Wire through | Observation-backed handler; resolves namespace; decodes compact heartbeat model plus lossless response image; inserts into `HeartbeatStore`; emits metrics | `worker-heartbeat-observability` |
+| RPC | `WorkflowService.DescribeWorker` | v1.55 | Wire through | Reads the live `HeartbeatStore` and returns the complete worker heartbeat | `worker-heartbeat-observability` |
+| RPC | `WorkflowService.ListWorkers` | v1.55 | Wire through | Reads, filters, and cursor-paginates live `HeartbeatStore` records; returns full and summary response fields | `worker-heartbeat-observability` |
 | RPC | `WorkflowService.DescribeWorkerDeployment` | v1.55 | Deferred | Stub; inside Worker Deployments block | `worker-deployments` |
 | RPC | `WorkflowService.DescribeWorkerDeploymentVersion` | v1.55 | Deferred | Stub; inside Worker Deployments block | `worker-deployments` |
 | RPC | `WorkflowService.SetWorkerDeploymentCurrentVersion` | v1.55 | Deferred | Stub; inside Worker Deployments block | `worker-deployments` |
@@ -1209,18 +1176,18 @@ Runtime wiring for these four request messages — reading the added fields and 
 
 ### Worker messages (in `temporal.api.worker.v1`)
 
-These messages are generated into the vendored proto tree by the resync but are NOT decoded into Edge DTOs — `RecordWorkerHeartbeat` accepts the full `Vec<WorkerHeartbeat>` on its request type and discards the payload on the handler's no-op path. Real observability (decoding the heartbeat sub-structure, persisting it, exposing metrics) is the `worker-heartbeat-observability` spec's concern. The rows below are classified `No-op` with Disposition `compile-only; no DTO/translator work` to make that explicit, and they are NOT counted by the wire-through structural property (§8 Property 2): no translator edit corresponds to a wire-through-field expectation for any of them.
+These generated messages are consumed by `worker-heartbeat-observability`. The edge preserves the complete `WorkerHeartbeat` protobuf image while extracting compact runtime fields; inventory responses decode that image and project `WorkerInfo` / `WorkerListInfo`. This gives complete wire fidelity without adding public proto types to runtime.
 
 | Kind | Qualified Name | Added In | Classification | Disposition | Target Spec |
 |---|---|---|---|---|---|
-| Message | `WorkerHeartbeat` | v1.48 | No-op | compile-only; no DTO/translator work. Accepted on `RecordWorkerHeartbeatRequest.worker_heartbeat` and discarded by the handler | `worker-heartbeat-observability` |
-| Message | `WorkerPollerInfo` | v1.48 | No-op | compile-only; no DTO/translator work. Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
-| Message | `WorkerSlotsInfo` | v1.48 | No-op | compile-only; no DTO/translator work. Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
-| Message | `WorkerHostInfo` | v1.48 | No-op | compile-only; no DTO/translator work. Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
-| Message | `WorkerInfo` | v1.55 | Deferred | Used by Worker Deployments | `worker-deployments` |
-| Message | `WorkerListInfo` | v1.55 | Deferred | Used by `ListWorkers` | `worker-deployments` |
-| Message | `PluginInfo` | v1.48 | No-op | compile-only; no DTO/translator work. Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
-| Message | `StorageDriverInfo` | v1.48 | No-op | compile-only; no DTO/translator work. Sub-field of `WorkerHeartbeat`; discarded with the parent | `worker-heartbeat-observability` |
+| Message | `WorkerHeartbeat` | v1.48 | Wire through | Complete encoded image retained; compact liveness/query fields extracted | `worker-heartbeat-observability` |
+| Message | `WorkerPollerInfo` | v1.48 | Wire through | Preserved inside the encoded heartbeat image | `worker-heartbeat-observability` |
+| Message | `WorkerSlotsInfo` | v1.48 | Wire through | Preserved inside the encoded heartbeat image | `worker-heartbeat-observability` |
+| Message | `WorkerHostInfo` | v1.48 | Wire through | Preserved losslessly and projected into worker-list summaries | `worker-heartbeat-observability` |
+| Message | `WorkerInfo` | v1.55 | Wire through | Returned by `DescribeWorker` and the deprecated `ListWorkers.workers_info` field | `worker-heartbeat-observability` |
+| Message | `WorkerListInfo` | v1.55 | Wire through | Projected by `ListWorkers` from the complete heartbeat | `worker-heartbeat-observability` |
+| Message | `PluginInfo` | v1.48 | Wire through | Preserved losslessly and copied into worker-list summaries | `worker-heartbeat-observability` |
+| Message | `StorageDriverInfo` | v1.48 | Wire through | Preserved losslessly and copied into worker-list summaries | `worker-heartbeat-observability` |
 
 ### Enum additions
 
@@ -1257,9 +1224,9 @@ The table above enumerates the expected surface deltas based on Temporal API rel
 
 The single implementation-scope view for this spec. Every row records the concrete per-plane impact of one surface-level decision:
 
-- **In scope** rows correspond 1:1 with counted `Classification_WireThrough` rows in the Surface_Audit plus the `RecordWorkerHeartbeat` `Classification_NoOp` handler work (§9). These are the rows that ship code in this spec. Rename metadata notes are not counted separately; the unsuffixed v1.62 rows carry the implementation work.
+- **In scope** rows correspond to work delivered by the original sync spec. Rows later promoted by an owning follow-up spec remain in this audit with that owner named, but are not retroactively counted against the original sync implementation budget.
 - **Classified Deferred** rows capture surfaces that would otherwise be in-scope wire-through but escalated to `Classification_Deferred` because their Kernel, Runtime, or Projection impact exceeded the single-file / no-kernel-change budget. Their Edge DTO, Kernel, Runtime, and Projection columns all read `none` because this spec explicitly drops the field or surface (Req 2.2.6 for fields) and emits the protobuf default on response paths where applicable; the escalation note names the follow-up spec that will reintroduce the field or surface with typed DTO and runtime semantics (Req 5.1.3–5.1.5).
-- Rows classified `Classification_NoOp` with a `compile-only; no DTO/translator work` disposition (e.g. the `temporal.api.worker.v1` sub-messages) are NOT included in this matrix because no implementation row corresponds to them. The `RecordWorkerHeartbeat` RPC itself is included because the handler carries real validation, logging, and the migration described in §9.
+- Worker heartbeat and inventory rows are included here as owner amendments because they now have concrete edge/runtime impact.
 
 The matrix below was historically called "Impact Matrix"; it is renamed to reflect that it carries both in-scope implementation rows and deferred-escalation rows in a single reviewable table. Structural properties in §8 reference it by the name "Implementation & Escalation Matrix".
 
@@ -1269,7 +1236,9 @@ Columns per Req 5.1.1.
 |---|---|---|---|---|---|
 | `WorkflowService.CountSchedules` | New `CountSchedulesRequest` / `Response` DTOs | none | existing `ScheduleStore` gains `count_schedules` method (single-file edit) | none | In scope; see §4 handler and store extension |
 | `WorkflowService.UpdateTaskQueueConfig` | New `UpdateTaskQueueConfigRequest` / `Response` DTOs + `TaskQueueConfig` | none | new `TaskQueueConfigStore` trait + in-memory backing (single new file) | none | In scope; see §5 |
-| `WorkflowService.RecordWorkerHeartbeat` | `RecordWorkerHeartbeatRequest` uses upstream `WorkerHeartbeat` types | none | new in-memory `HeartbeatStore`; heartbeat acceptance, active-worker, count, and staleness metrics | none | Promoted by `worker-heartbeat-observability`; accept, decode compact heartbeat model, insert into `HeartbeatStore`, emit metrics |
+| `WorkflowService.RecordWorkerHeartbeat` | Upstream `WorkerHeartbeat` plus edge-owned lossless encoding | none | process-local `HeartbeatStore`; heartbeat acceptance, active-worker, count, and staleness metrics | none | Promoted by `worker-heartbeat-observability`; resolve namespace, decode compact fields plus lossless response image, insert, and emit metrics |
+| `WorkflowService.DescribeWorker` | Complete `WorkerInfo` response | none | reads process-local `HeartbeatStore` | none | Promoted by `worker-heartbeat-observability`; exact-key live inventory read |
+| `WorkflowService.ListWorkers` | Complete and limited worker response fields | none | reads process-local `HeartbeatStore` | none | Promoted by `worker-heartbeat-observability`; bounded query evaluation and worker-key cursor pagination |
 | `UpdateActivityOptionsRequest.activity_type` | DTO gains `activity_type: Option<ActivityType>` | none | existing activity-options handler reads field; branches on id-vs-type addressing (single-file edit) | none | In scope |
 | `PauseActivityRequest.identity` | DTO gains `identity: String` | none | existing pause-activity handler passes through to runtime pause (single-file edit) | none | In scope |
 | `UnpauseActivityRequest.reset_heartbeat` | DTO gains `reset_heartbeat: bool` | none | existing unpause handler applies to `ActivityRetryState` (single-file edit in `runtime/src/activity_pump.rs`) | none | In scope |
@@ -1324,9 +1293,7 @@ An RPC or field is classified `Classification_Ignore` when SDKs never call it in
 
 ### Classification_NoOp
 
-An RPC is classified `Classification_NoOp` when SDKs call it during worker liveness loops and expect `Ok(_)`, but the RPC's payload carries no workflow-observable semantics that Tokeira must preserve. `RecordWorkerHeartbeat` is the canonical example: the SDK's `SharedNamespaceWorker` emits one heartbeat every 30 s per registered worker; if the server returns `Unimplemented`, the worker treats it as a capability regression and shuts down. Tokeira must return `Ok` to keep the worker alive, but need not persist the heartbeat payload — that persistence is the `worker-heartbeat-observability` spec's job. `Classification_NoOp` is therefore "respond correctly at the wire without committing to the feature's semantics". A no-op handler emits one `debug!` log per call so operators can confirm the RPC is being exercised during regression testing.
-
-The `Classification_NoOp` bucket also carries the *compile-only* sub-case for non-RPC rows: messages and sub-messages that appear in the generated proto tree as types reachable from a `Classification_NoOp` RPC's request or response but whose payload is accepted and discarded by the handler. The canonical set is `temporal.api.worker.v1::{WorkerHeartbeat, WorkerPollerInfo, WorkerSlotsInfo, WorkerHostInfo, PluginInfo, StorageDriverInfo}`, all reachable from `RecordWorkerHeartbeatRequest.worker_heartbeat`. These types compile in the generated tree, and `Vec<WorkerHeartbeat>` flows in on the request — but no Edge DTO mirrors them, no translator decodes their fields, and the handler never reads them. Their Disposition cell carries `compile-only; no DTO/translator work` to make the sub-case explicit, but the Classification column stays as `No-op` so the taxonomy remains five buckets. The Implementation & Escalation Matrix in §6 excludes these rows because no implementation row corresponds to them; the wire-through row-count property (§8 Property 2) excludes them for the same reason.
+An RPC is classified `Classification_NoOp` when clients require a successful wire response but the payload carries no behavior or observation Tokeira must preserve. This remains a valid classification bucket, but it no longer applies to `RecordWorkerHeartbeat`: `worker-heartbeat-observability` promoted that RPC and its reachable worker messages to wire-through because their payload now backs public inventory reads.
 
 ### Classification_Capability
 
@@ -1345,7 +1312,7 @@ An RPC or field is classified `Classification_Deferred` when implementing it wou
 | Placeholder spec name | Scope summary |
 |---|---|
 | `worker-deployments` | Full versioning + deployment-routing API. Implements 11 RPCs, `WorkerDeploymentOptions`, `WorkerDeploymentVersionInfo`, `WorkerDeploymentInfo`, `RoutingConfig`, and related messages. |
-| `worker-heartbeat-observability` | Persistent storage of `WorkerHeartbeat` records, kernel-observed worker liveness, metrics exposure, `ListWorkers` projection. |
+| `worker-heartbeat-observability` | Process-local `WorkerHeartbeat` observation storage, metrics, Nexus-poll ingestion, and live `DescribeWorker`/`ListWorkers` inventory reads. |
 | `workflow-rules` | Full workflow-rules feature — 5 RPCs, `temporal.api.rules.v1` package consumption, rule evaluation engine. |
 | `activity-executions-first-class` | Activities as first-class objects addressable by execution id — 8 RPCs, new kernel representation of pending activities as durable objects. |
 | `worker-config-management` | Operator-driven worker config fetch/update — 2 RPCs, server-side config store for SDK workers. |
@@ -1375,9 +1342,9 @@ The properties below are quantified explicitly over "for all" / "for any" inputs
 
 *For any* valid rendering of the Surface_Audit table and the Implementation & Escalation Matrix in this design document, three count equivalences SHALL hold:
 
-1. The count of counted Surface_Audit rows with `Classification == "Wire through"` SHALL equal the count of Matrix rows whose `Implementation Notes` column starts with `In scope` and does NOT start with `In scope (no-op handler)`. This is the 1:1 correspondence between `Wire through` classifications and the in-scope wire-through implementation rows. Rename metadata notes are outside the counted Surface_Audit table and are validated through their unsuffixed v1.62 rows.
+1. Every original-sync `Wire through` row SHALL have a matching in-scope Matrix row. Rows promoted later by an owning follow-up spec are validated by that owner's structural guard rather than retroactively counted against the original sync implementation budget.
 2. The count of Surface_Audit rows with `Classification == "Deferred"` SHALL be ≥ the count of Matrix rows whose `Implementation Notes` column starts with `**Classified Deferred**`. The inequality (rather than equality) allows for pure `Classification_Deferred` RPCs and messages that never reach the Matrix because they have no in-scope Implementation Notes to record — their stub handlers are counted in the Surface_Audit only.
-3. The count of Surface_Audit rows with `Classification == "No-op"` SHALL be ≥ the count of Matrix rows whose `Implementation Notes` column starts with `In scope (no-op handler)`. Today there is exactly one such Matrix row (`RecordWorkerHeartbeat`). Surface_Audit `No-op` rows whose Disposition cell carries `compile-only; no DTO/translator work` (e.g. the `temporal.api.worker.v1` sub-messages) are excluded from the Matrix on both sides.
+3. Every remaining `No-op` RPC SHALL have a Matrix entry when it requires handler work; compile-only annotations and messages require no Matrix row.
 
 **Validates: Requirements 2.3, 2.3.3, 5.1.1**
 
@@ -1445,7 +1412,6 @@ Every `Classification_Deferred` RPC returns `Err(Status::unimplemented(msg))` wh
 Concretely:
 
 ```
-"DescribeWorker is not implemented; tracked in spec worker-deployments"
 "CreateWorkflowRule is not implemented; tracked in spec workflow-rules"
 "StartActivityExecution is not implemented; tracked in spec activity-executions-first-class"
 "FetchWorkerConfig is not implemented; tracked in spec worker-config-management"
@@ -1476,13 +1442,17 @@ Namespace not found    → Status::not_found("namespace not found")
 
 The `TaskQueueConfigStore::set` call itself is infallible on the in-memory backing — `DashMap::insert` cannot fail. Future DSQL-backed persistence would introduce a real error path; that belongs to whichever spec lands DSQL-backed task-queue state.
 
-### `record_worker_heartbeat` error flow
+### Worker heartbeat and inventory error flow
 
 ```
-Empty namespace → Status::invalid_argument("namespace is required")
+RecordWorkerHeartbeat empty namespace → Status::invalid_argument("namespace is required")
+Unknown namespace                     → typed NamespaceNotFound
+Missing worker in a populated registry → Status::not_found("Worker <key> not found")
+Malformed ListWorkers query/token      → Status::invalid_argument(...)
+HeartbeatStore failure                 → Status::internal(...) on direct/read RPCs
 ```
 
-Matches `shutdown_worker`'s convention at `workflow_service.rs` lines 636–640 (Req 3.4.5). Any other condition (empty heartbeat list, missing sub-fields on `WorkerHeartbeat`) is treated as valid input — the handler is a no-op and does not validate the heartbeat payload at all.
+Heartbeat proto content remains permissive: empty batches, empty identity fields, missing optional sub-messages, and unknown enum values are accepted. Shutdown and Nexus-poll insertion are best effort; direct heartbeat admission and inventory reads surface store failures.
 
 ### `*ById` rename error flow
 
@@ -1647,10 +1617,10 @@ Each of the six steps is independently revertible. The proto-sync step (Step 1) 
 
 The specs this spec defers to, with one-sentence pointers to what each will build on top of the baseline this spec establishes:
 
-- **`worker-deployments`** — implements the 11 Worker Deployments RPCs (`DescribeWorker`, `ListWorkers`, `DescribeWorkerDeployment`, `DescribeWorkerDeploymentVersion`, `SetWorkerDeploymentCurrentVersion`, `SetWorkerDeploymentRampingVersion`, `DeleteWorkerDeployment`, `DeleteWorkerDeploymentVersion`, `ListWorkerDeployments`, `UpdateWorkerDeploymentVersionMetadata`, `SetWorkerDeploymentManager`) and flips `SystemCapabilities.server_scaled_deployments` from `false` to `true`; removes the Worker Deployments bracketed stub block from `workflow_service.rs` as a unit.
+- **`worker-deployments`** — implements the Worker Deployments RPCs (`DescribeWorkerDeployment`, `DescribeWorkerDeploymentVersion`, `SetWorkerDeploymentCurrentVersion`, `SetWorkerDeploymentRampingVersion`, `DeleteWorkerDeployment`, `DeleteWorkerDeploymentVersion`, `ListWorkerDeployments`, `UpdateWorkerDeploymentVersionMetadata`, `SetWorkerDeploymentManager`) and flips `SystemCapabilities.server_scaled_deployments` from `false` to `true`; worker inventory is owned separately by `worker-heartbeat-observability`.
 - **`workflow-rules`** — implements the 5 Workflow Rules RPCs (`CreateWorkflowRule`, `DescribeWorkflowRule`, `DeleteWorkflowRule`, `ListWorkflowRules`, `TriggerWorkflowRule`) and consumes the `temporal.api.rules.v1` package; removes the Workflow Rules bracketed stub block.
 - **`activity-executions-first-class`** — implements the 8 Activity Executions RPCs, introduces a new kernel representation of pending activities as durable, addressable objects, and removes the Activity Executions bracketed stub block.
-- **`worker-heartbeat-observability`** — persists `WorkerHeartbeat` records, exposes kernel-observed worker liveness, adds metrics, and implements a `ListWorkers` projection; promotes `record_worker_heartbeat` from a no-op handler to a real one.
+- **`worker-heartbeat-observability`** — retains process-local `WorkerHeartbeat` observations, exposes runtime liveness metrics, ingests direct and Nexus-poll heartbeat batches, and implements live `DescribeWorker`/`ListWorkers` inventory reads; no kernel or projection state is involved.
 - **`worker-config-management`** — implements `FetchWorkerConfig` / `UpdateWorkerConfig` with a server-side config store for SDK workers; removes the Worker Config bracketed stub block.
 - **`kernel-pause-workflow`** — introduces first-class pause/unpause-workflow as kernel transitions (distinct from v1.43 activity-level pause-by-id), implements `PauseWorkflowExecution` / `UnpauseWorkflowExecution`, and removes the Pause/Unpause Workflow bracketed stub block.
 

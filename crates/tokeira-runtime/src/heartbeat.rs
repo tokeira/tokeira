@@ -32,16 +32,16 @@ use tokio_util::sync::CancellationToken;
 use crate::metrics as runtime_metrics;
 
 /// Age past which a heartbeat is considered stale and TTL-evicted by
-/// [`maintain`](InMemoryHeartbeatStore::maintain). A day is generous on purpose:
-/// liveness churn is handled by frequent re-heartbeats, so the TTL only needs to
-/// reclaim workers that have genuinely disappeared.
-pub const DEFAULT_ENTRY_TTL: time::Duration = time::Duration::hours(24);
+/// [`maintain`](InMemoryHeartbeatStore::maintain). Five minutes is Temporal
+/// v1.31.0's stock `WorkerRegistryTTL` and bounds how long an abruptly vanished
+/// worker remains visible (`common/dynamicconfig/constants.go @ v1.31.0`).
+pub const DEFAULT_ENTRY_TTL: time::Duration = time::Duration::minutes(5);
 /// Minimum age an entry must reach before it is eligible for *capacity* (not
 /// TTL) eviction. This protects freshly-seen workers from being dropped just
 /// because the map is momentarily over capacity — evicting an entry that is
 /// still actively heartbeating would make the worker flicker out of operator
 /// views and immediately reappear on its next heartbeat.
-pub const DEFAULT_MIN_EVICT_AGE: time::Duration = time::Duration::minutes(10);
+pub const DEFAULT_MIN_EVICT_AGE: time::Duration = time::Duration::minutes(1);
 /// Hard ceiling on tracked entries. Bounds memory for an unbounded, untrusted
 /// population of worker instances; the store is observability state, so shedding
 /// the oldest entries past this cap is preferable to growing without limit.
@@ -49,7 +49,12 @@ pub const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 /// Cadence of the background maintenance loop (TTL/capacity eviction plus metric
 /// emission). Short relative to the TTL so stale entries and metrics are never
 /// far behind reality.
-pub const DEFAULT_MAINTENANCE_INTERVAL: time::Duration = time::Duration::seconds(10);
+pub const DEFAULT_MAINTENANCE_INTERVAL: time::Duration = time::Duration::minutes(1);
+
+// A final heartbeat is a removal instruction, not a queryable tombstone
+// (`service/matching/workers/registry_impl.go:76-108 @ v1.31.0`). Keeping the
+// raw value here avoids a runtime dependency on Temporal's generated enums.
+const WORKER_STATUS_SHUTDOWN: i32 = 3;
 
 type WorkerHeartbeatKey = (NamespaceId, WorkerInstanceKey);
 
@@ -87,6 +92,10 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
             heartbeat.namespace_id,
             heartbeat.worker_instance_key.clone(),
         );
+        if heartbeat.status.0 == WORKER_STATUS_SHUTDOWN {
+            self.entries.remove(&key);
+            return Ok(());
+        }
         match self.entries.get_mut(&key) {
             // Last-write-wins on the body (status, build/SDK metadata) but
             // monotonic on `last_seen`: heartbeats can arrive out of order
@@ -297,6 +306,7 @@ mod tests {
             deployment_name: None,
             sdk_name: None,
             sdk_version: None,
+            encoded_heartbeat: Vec::new(),
         }
     }
 
@@ -351,5 +361,33 @@ mod tests {
         assert_eq!(report.live.len(), 1);
         assert_eq!(report.namespace_counts, vec![(namespace_id, 1)]);
         assert_eq!(report.remaining, 1);
+    }
+
+    #[test]
+    fn shutdown_heartbeat_removes_only_the_matching_worker_and_is_idempotent() {
+        // Feature: worker-heartbeat-observability, Property 10: shutdown removal.
+        let store = InMemoryHeartbeatStore::new();
+        let namespace_id = namespace(1);
+        let now = OffsetDateTime::UNIX_EPOCH;
+        store.insert(heartbeat(namespace_id, "a", now)).unwrap();
+        store.insert(heartbeat(namespace_id, "b", now)).unwrap();
+
+        let mut shutdown = heartbeat(namespace_id, "a", now);
+        shutdown.status = WorkerHeartbeatStatus(WORKER_STATUS_SHUTDOWN);
+        store.insert(shutdown.clone()).unwrap();
+        store.insert(shutdown).unwrap();
+
+        assert!(
+            store
+                .get_worker(&namespace_id, &WorkerInstanceKey("a".to_string()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_worker(&namespace_id, &WorkerInstanceKey("b".to_string()))
+                .unwrap()
+                .is_some()
+        );
     }
 }

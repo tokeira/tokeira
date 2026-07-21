@@ -29,7 +29,7 @@ use tokeira_runtime::{
 use tokeira_types::{NamespaceId, TaskQueueName, WorkerIdentity};
 
 use tokeira_chasm_activity::ActivityStatus;
-use tokeira_proto::public::temporal::api::activity::v1 as activity_v1;
+use tokeira_proto::public::temporal::api::{activity::v1 as activity_v1, worker::v1 as worker_v1};
 
 use crate::{
     Action,
@@ -1719,17 +1719,35 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::RecordWorkerHeartbeatRequest>,
     ) -> Result<Response<workflowservice::RecordWorkerHeartbeatResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
         if req.namespace.is_empty() {
             tokeira_runtime::metrics::record_worker_heartbeat_rejected("", "invalid_namespace");
             return Err(Status::invalid_argument("namespace is required"));
         }
-        let namespace_id = crate::to_internal::namespace_id_for(&req.namespace);
-        let now = OffsetDateTime::now_utc();
+        let context = self
+            .inner
+            .admit_request(
+                &headers,
+                Some(&req.namespace),
+                Action::RecordWorkerHeartbeat,
+                false,
+            )
+            .await?;
+        let namespace_id = context
+            .namespace
+            .as_ref()
+            .map(|namespace| crate::to_internal::namespace_id_for(&namespace.name))
+            .ok_or_else(|| Status::internal("worker heartbeat admitted without namespace"))?;
         let heartbeat_count = req.worker_heartbeat.len();
         for proto in req.worker_heartbeat {
-            let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(namespace_id, proto, now);
+            let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(
+                namespace_id,
+                proto,
+                context.received_at,
+            );
             let key = heartbeat.worker_instance_key.clone();
+            let active = heartbeat.status.0 != 3;
             self.inner
                 .heartbeat_store()
                 .insert(heartbeat)
@@ -1741,7 +1759,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                     Status::internal(error.to_string())
                 })?;
             tokeira_runtime::metrics::record_worker_heartbeat_accepted(namespace_id, &key);
-            tokeira_runtime::metrics::record_worker_heartbeat_active(namespace_id, &key, true);
+            tokeira_runtime::metrics::record_worker_heartbeat_active(namespace_id, &key, active);
         }
         debug!(
             rpc = "RecordWorkerHeartbeat",
@@ -1757,27 +1775,42 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         &self,
         request: Request<workflowservice::ShutdownWorkerRequest>,
     ) -> Result<Response<workflowservice::ShutdownWorkerResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
         // v1.31.0 (`service/frontend/workflow_handler.go:2983 @ v1.31.0`) does NOT pre-validate
         // `sticky_task_queue`: it resolves the namespace and forwards the (possibly empty) sticky
         // queue straight to `ForceUnloadTaskQueuePartition`. A worker that never cached a workflow
         // (activity-only, or shut down before stickiness) sends an empty sticky queue on shutdown, so
         // rejecting it with `InvalidArgument` is an over-rejection (C6-class) that breaks SDK shutdown.
-        let namespace_id = crate::to_internal::namespace_id_for(&req.namespace);
+        let context = self
+            .inner
+            .admit_request(
+                &headers,
+                Some(&req.namespace),
+                Action::ShutdownWorker,
+                false,
+            )
+            .await?;
+        let namespace_id = context
+            .namespace
+            .as_ref()
+            .map(|namespace| crate::to_internal::namespace_id_for(&namespace.name))
+            .ok_or_else(|| Status::internal("worker shutdown admitted without namespace"))?;
         if let Some(proto) = req.worker_heartbeat {
             let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(
                 namespace_id,
                 proto,
-                OffsetDateTime::now_utc(),
+                context.received_at,
             );
             let key = heartbeat.worker_instance_key.clone();
+            let active = heartbeat.status.0 != 3;
             match self.inner.heartbeat_store().insert(heartbeat) {
                 Ok(()) => {
                     tokeira_runtime::metrics::record_worker_heartbeat_accepted(namespace_id, &key);
                     tokeira_runtime::metrics::record_worker_heartbeat_active(
                         namespace_id,
                         &key,
-                        true,
+                        active,
                     );
                 }
                 Err(error) => {
@@ -2568,18 +2601,95 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             translate::set_worker_deployment_manager_response_from_edge(&outcome.view),
         ))
     }
-    deferred_unary!(
-        describe_worker,
-        DescribeWorkerRequest,
-        DescribeWorkerResponse,
-        "worker-config"
-    );
-    deferred_unary!(
-        list_workers,
-        ListWorkersRequest,
-        ListWorkersResponse,
-        "worker-config"
-    );
+    async fn describe_worker(
+        &self,
+        request: Request<workflowservice::DescribeWorkerRequest>,
+    ) -> Result<Response<workflowservice::DescribeWorkerResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+        let context = self
+            .inner
+            .admit_request(
+                &headers,
+                Some(&req.namespace),
+                Action::DescribeWorker,
+                false,
+            )
+            .await?;
+        let namespace_id = context
+            .namespace
+            .as_ref()
+            .map(|namespace| crate::to_internal::namespace_id_for(&namespace.name))
+            .ok_or_else(|| Status::internal("worker describe admitted without namespace"))?;
+        let key = tokeira_types::WorkerInstanceKey(req.worker_instance_key);
+        let heartbeat = self
+            .inner
+            .heartbeat_store()
+            .get_worker(&namespace_id, &key)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("Worker {} not found", key.0)))?;
+        let heartbeat =
+            worker_heartbeat::worker_heartbeat_to_proto(&heartbeat).map_err(|error| {
+                Status::internal(format!("stored worker heartbeat is invalid: {error}"))
+            })?;
+        Ok(Response::new(workflowservice::DescribeWorkerResponse {
+            worker_info: Some(worker_v1::WorkerInfo {
+                worker_heartbeat: Some(heartbeat),
+            }),
+        }))
+    }
+
+    #[allow(deprecated)]
+    async fn list_workers(
+        &self,
+        request: Request<workflowservice::ListWorkersRequest>,
+    ) -> Result<Response<workflowservice::ListWorkersResponse>, Status> {
+        let headers = metadata_to_header_map(request.metadata());
+        let req = request.into_inner();
+        let context = self
+            .inner
+            .admit_request(&headers, Some(&req.namespace), Action::ListWorkers, false)
+            .await?;
+        let namespace_id = context
+            .namespace
+            .as_ref()
+            .map(|namespace| crate::to_internal::namespace_id_for(&namespace.name))
+            .ok_or_else(|| Status::internal("worker list admitted without namespace"))?;
+        let heartbeats = self
+            .inner
+            .heartbeat_store()
+            .list_workers(&namespace_id)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .into_iter()
+            .map(|heartbeat| {
+                worker_heartbeat::worker_heartbeat_to_proto(&heartbeat).map_err(|error| {
+                    Status::internal(format!("stored worker heartbeat is invalid: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let heartbeats = crate::worker_inventory::filter_workers(heartbeats, &req.query)?;
+        let (heartbeats, next_page_token) = crate::worker_inventory::paginate_workers(
+            heartbeats,
+            req.page_size,
+            &req.next_page_token,
+        )?;
+        let workers_info = heartbeats
+            .iter()
+            .cloned()
+            .map(|heartbeat| worker_v1::WorkerInfo {
+                worker_heartbeat: Some(heartbeat),
+            })
+            .collect();
+        let workers = heartbeats
+            .iter()
+            .map(crate::worker_inventory::worker_list_info)
+            .collect();
+        Ok(Response::new(workflowservice::ListWorkersResponse {
+            workers_info,
+            workers,
+            next_page_token,
+        }))
+    }
     // === End Worker Deployments block ===
 
     // === Workflow Rules ===
@@ -3404,8 +3514,9 @@ mod tests {
     };
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
     use tokeira_types::{
-        EventPrincipal, LogicalTaskSeq, Memo, Payloads, QueueKey, RequestContext, RequestId, RunId,
-        RunKey, SearchAttributes, ShardEpoch, TaskKind, TaskQueueName, WorkerIdentity,
+        EventPrincipal, EvictionReport, HeartbeatStore, HeartbeatStoreError, LogicalTaskSeq, Memo,
+        Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey, SearchAttributes, ShardEpoch,
+        TaskKind, TaskQueueName, WorkerHeartbeat as HeartbeatObservation, WorkerIdentity,
         WorkerInstanceKey, WorkflowId, WorkflowType,
     };
 
@@ -4180,6 +4291,39 @@ mod tests {
     #[derive(Default)]
     struct StaticNamespaceCache;
 
+    struct FailingHeartbeatStore;
+
+    impl HeartbeatStore for FailingHeartbeatStore {
+        fn insert(&self, _heartbeat: HeartbeatObservation) -> Result<(), HeartbeatStoreError> {
+            Err(HeartbeatStoreError::Backend("injected failure".to_owned()))
+        }
+
+        fn get_worker(
+            &self,
+            _namespace: &NamespaceId,
+            _worker_instance_key: &WorkerInstanceKey,
+        ) -> Result<Option<HeartbeatObservation>, HeartbeatStoreError> {
+            Err(HeartbeatStoreError::Backend("injected failure".to_owned()))
+        }
+
+        fn list_workers(
+            &self,
+            _namespace: &NamespaceId,
+        ) -> Result<Vec<HeartbeatObservation>, HeartbeatStoreError> {
+            Err(HeartbeatStoreError::Backend("injected failure".to_owned()))
+        }
+
+        fn maintain(
+            &self,
+            _now: OffsetDateTime,
+            _ttl: time::Duration,
+            _min_evict_age: time::Duration,
+            _max_entries: usize,
+        ) -> Result<EvictionReport, HeartbeatStoreError> {
+            Err(HeartbeatStoreError::Backend("injected failure".to_owned()))
+        }
+    }
+
     #[async_trait]
     impl ExecutionResolver for NoopResolver {
         async fn current_run_key(
@@ -4217,6 +4361,34 @@ mod tests {
 
     fn versioning_test_service() -> (WorkflowServiceGrpc, tokeira_runtime::InMemoryBroker) {
         let cache = Arc::new(InMemoryNamespaceCache::new());
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let broker = tokeira_runtime::InMemoryBroker::default();
+        let service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
+            Arc::new(PollNoneRuntime),
+            Arc::new(NoopResolver),
+            Arc::new(EmptyVisibilityApi),
+            Arc::new(tokeira_storage::InMemoryStore::default()),
+            operator_api,
+            cache.clone(),
+            Arc::new(EdgeInterceptors::permissive(cache)),
+            PollerRegistry::default(),
+            crate::PendingQueryStore::default(),
+            tokeira_runtime::BufferedQueryRegistry::default(),
+            broker.clone(),
+            LongPollGate::new(LongPollConfig::default()),
+            Arc::new(LocalOnlyRouter),
+            HistoryWaitRegistry::default(),
+        );
+        (WorkflowServiceGrpc::new(service), broker)
+    }
+
+    async fn worker_heartbeat_test_service()
+    -> (WorkflowServiceGrpc, tokeira_runtime::InMemoryBroker) {
+        let cache = Arc::new(InMemoryNamespaceCache::new());
+        cache
+            .insert(ResolvedNamespace::active("default"))
+            .await
+            .expect("default namespace should seed");
         let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
         let broker = tokeira_runtime::InMemoryBroker::default();
         let service = WorkflowService::new_with_buffered_queries_and_history_wait_registry(
@@ -4445,14 +4617,6 @@ mod tests {
     #[tokio::test]
     async fn deferred_handler_blocks_return_tracked_unimplemented_messages() {
         let (grpc, _broker) = versioning_test_service();
-
-        assert_deferred_rpc!(
-            grpc,
-            describe_worker,
-            DescribeWorkerRequest,
-            "worker-config"
-        );
-        assert_deferred_rpc!(grpc, list_workers, ListWorkersRequest, "worker-config");
 
         let status = grpc
             .trigger_workflow_rule(Request::new(
@@ -4916,7 +5080,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_worker_is_idempotent_and_blocks_workflow_delivery() {
-        let (grpc, broker) = versioning_test_service();
+        let (grpc, broker) = worker_heartbeat_test_service().await;
         let namespace_id = namespace_id_for("default");
         let queue = QueueKey {
             namespace_id,
@@ -4976,8 +5140,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_worker_heartbeat_stores_compact_heartbeat() {
-        let (grpc, _broker) = versioning_test_service();
+    async fn record_worker_heartbeat_stores_lossless_heartbeat() {
+        let (grpc, _broker) = worker_heartbeat_test_service().await;
         let store = grpc.inner.heartbeat_store();
 
         grpc.record_worker_heartbeat(Request::new(
@@ -5002,19 +5166,123 @@ mod tests {
         assert_eq!(stored.deployment_name.as_deref(), Some("deployment-a"));
         assert_eq!(stored.sdk_name, None);
         assert_eq!(stored.sdk_version.as_deref(), Some("rust-0.4"));
+        assert_eq!(
+            worker_heartbeat::worker_heartbeat_to_proto(&stored)
+                .expect("encoded heartbeat should decode"),
+            test_worker_heartbeat("worker-a")
+        );
     }
 
     #[tokio::test]
-    async fn shutdown_worker_records_final_heartbeat_before_denying_worker() {
-        let (grpc, _broker) = versioning_test_service();
+    async fn worker_inventory_round_trips_complete_heartbeats() {
+        // Feature: worker-heartbeat-observability, Property 8: lossless
+        // observation-backed worker inventory.
+        let (grpc, _broker) = worker_heartbeat_test_service().await;
+        let mut heartbeat = test_worker_heartbeat("worker-a");
+        heartbeat.total_sticky_cache_hit = 41;
+        heartbeat.total_sticky_cache_miss = 7;
+        heartbeat.current_sticky_cache_size = 3;
+        heartbeat.host_info = Some(worker_v1::WorkerHostInfo {
+            host_name: "host-a".to_owned(),
+            worker_grouping_key: "group-a".to_owned(),
+            process_id: "123".to_owned(),
+            current_host_cpu_usage: 0.25,
+            current_host_mem_usage: 0.5,
+        });
+        heartbeat.plugins = vec![worker_v1::PluginInfo {
+            name: "plugin-a".to_owned(),
+            version: "1.2.3".to_owned(),
+        }];
+
+        grpc.record_worker_heartbeat(Request::new(
+            workflowservice::RecordWorkerHeartbeatRequest {
+                namespace: "default".to_owned(),
+                identity: "client".to_owned(),
+                worker_heartbeat: vec![heartbeat.clone()],
+                resource_id: String::new(),
+            },
+        ))
+        .await
+        .expect("heartbeat should be admitted");
+
+        let described = grpc
+            .describe_worker(Request::new(workflowservice::DescribeWorkerRequest {
+                namespace: "default".to_owned(),
+                worker_instance_key: "worker-a".to_owned(),
+            }))
+            .await
+            .expect("existing worker should be described")
+            .into_inner();
+        assert_eq!(
+            described.worker_info.and_then(|info| info.worker_heartbeat),
+            Some(heartbeat.clone())
+        );
+
+        let listed = grpc
+            .list_workers(Request::new(workflowservice::ListWorkersRequest {
+                namespace: "default".to_owned(),
+                query: "WorkerInstanceKey='worker-a'".to_owned(),
+                page_size: 1,
+                next_page_token: Vec::new(),
+            }))
+            .await
+            .expect("worker query should succeed")
+            .into_inner();
+        assert_eq!(listed.workers_info.len(), 1);
+        assert_eq!(
+            listed.workers_info[0].worker_heartbeat,
+            Some(heartbeat.clone())
+        );
+        assert_eq!(listed.workers.len(), 1);
+        assert_eq!(listed.workers[0].worker_instance_key, "worker-a");
+        assert_eq!(listed.workers[0].host_name, "host-a");
+        assert_eq!(listed.workers[0].plugins, heartbeat.plugins);
+        assert!(listed.next_page_token.is_empty());
+
+        let missing = grpc
+            .describe_worker(Request::new(workflowservice::DescribeWorkerRequest {
+                namespace: "default".to_owned(),
+                worker_instance_key: "missing".to_owned(),
+            }))
+            .await
+            .expect_err("missing worker should return NotFound");
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        let unknown_namespace = grpc
+            .describe_worker(Request::new(workflowservice::DescribeWorkerRequest {
+                namespace: "unknown".to_owned(),
+                worker_instance_key: "worker-a".to_owned(),
+            }))
+            .await
+            .expect_err("unknown namespace should return NamespaceNotFound");
+        assert_eq!(unknown_namespace.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn shutdown_worker_removes_final_shutdown_heartbeat() {
+        let (grpc, _broker) = worker_heartbeat_test_service().await;
         let store = grpc.inner.heartbeat_store();
+
+        grpc.record_worker_heartbeat(Request::new(
+            workflowservice::RecordWorkerHeartbeatRequest {
+                namespace: "default".to_string(),
+                identity: "client".to_string(),
+                worker_heartbeat: vec![test_worker_heartbeat("worker-a")],
+                resource_id: String::new(),
+            },
+        ))
+        .await
+        .expect("running heartbeat should be accepted");
+
+        let mut final_heartbeat = test_worker_heartbeat("worker-a");
+        final_heartbeat.status = 3;
 
         grpc.shutdown_worker(Request::new(workflowservice::ShutdownWorkerRequest {
             namespace: "default".to_string(),
             sticky_task_queue: "sticky".to_string(),
             identity: "worker-a".to_string(),
             reason: "test".to_string(),
-            worker_heartbeat: Some(test_worker_heartbeat("worker-a")),
+            worker_heartbeat: Some(final_heartbeat),
             worker_instance_key: "worker-a".to_string(),
             task_queue: "queue".to_string(),
             task_queue_types: Vec::new(),
@@ -5027,12 +5295,8 @@ mod tests {
                 &namespace_id_for("default"),
                 &WorkerInstanceKey("worker-a".to_string()),
             )
-            .expect("store read should succeed")
-            .expect("heartbeat should be stored");
-        assert_eq!(
-            stored.worker_identity,
-            WorkerIdentity("identity-worker-a".to_string())
-        );
+            .expect("store read should succeed");
+        assert!(stored.is_none(), "shutdown is removal, not a tombstone");
     }
 
     #[tokio::test]
@@ -6013,12 +6277,50 @@ mod tests {
         assert!(response.request.is_none());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn poll_nexus_task_queue_ignores_piggyback_store_failure() {
+        // Feature: worker-heartbeat-observability, Property 13: observation
+        // failure cannot fail the Nexus delivery long poll.
+        let (mut grpc, _broker) = nexus_test_service(Arc::new(PollNoneRuntime));
+        grpc.inner = grpc
+            .inner
+            .clone()
+            .with_heartbeat_store(Arc::new(FailingHeartbeatStore));
+
+        let task = tokio::spawn(async move {
+            grpc.poll_nexus_task_queue(Request::new(workflowservice::PollNexusTaskQueueRequest {
+                namespace: "default".to_owned(),
+                task_queue: Some(
+                    tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                        name: "nexus-q".to_owned(),
+                        ..Default::default()
+                    },
+                ),
+                identity: "worker".to_owned(),
+                worker_heartbeat: vec![test_worker_heartbeat("nexus-worker")],
+                ..Default::default()
+            }))
+            .await
+            .expect("heartbeat-store failure must not fail the poll")
+            .into_inner()
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        let response = task.await.expect("poll task should join");
+        assert!(response.task_token.is_empty());
+        assert!(response.request.is_none());
+    }
+
     #[tokio::test]
     async fn poll_nexus_task_queue_wakes_on_publish() {
         let (grpc, broker) = nexus_test_service(Arc::new(PollNoneRuntime));
+        let mut heartbeat = test_worker_heartbeat("nexus-worker");
+        heartbeat.total_sticky_cache_hit = 55;
 
         let task = tokio::spawn({
             let grpc = grpc.clone();
+            let heartbeat = heartbeat.clone();
             async move {
                 grpc.poll_nexus_task_queue(Request::new(
                     workflowservice::PollNexusTaskQueueRequest {
@@ -6030,6 +6332,7 @@ mod tests {
                             },
                         ),
                         identity: "worker".to_string(),
+                        worker_heartbeat: vec![heartbeat],
                         ..Default::default()
                     },
                 ))
@@ -6074,6 +6377,21 @@ mod tests {
             }
             other => panic!("unexpected nexus request variant: {other:?}"),
         }
+        let stored = grpc
+            .inner
+            .heartbeat_store()
+            .get_worker(
+                &namespace_id_for("default"),
+                &WorkerInstanceKey("nexus-worker".to_owned()),
+            )
+            .expect("heartbeat store read should succeed")
+            .expect("Nexus poll should record its piggyback heartbeat");
+        assert_eq!(
+            worker_heartbeat::worker_heartbeat_to_proto(&stored)
+                .expect("stored Nexus heartbeat should decode")
+                .total_sticky_cache_hit,
+            55
+        );
     }
 
     #[tokio::test]

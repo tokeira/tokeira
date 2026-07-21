@@ -10,7 +10,7 @@
 > `crates/tokeira-edge/src/grpc/{workflow_service,operator_service}.rs`.
 > **Regenerate:** grep those two files for `unimplemented` and `deferred_unary!`, then drop any RPC that
 > `excluded.md`/`decisions.md` classifies as out-of-surface.
-> **As of:** regenerated for Tier 6.34 · 2026-07-15.
+> **As of:** regenerated for Tier 8.42 · 2026-07-21.
 
 ## Work to be done
 
@@ -25,8 +25,6 @@ only; _No (n/N)_ = `tasks.md` exists, n of N tasks checked.
 | `AddOrUpdateRemoteCluster` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) | No (0/14) |
 | `RemoveRemoteCluster` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) | No (0/14) |
 | `ListClusters` | Operator | `unimplemented` | `api-conformance-remote-cluster` (registry only) | No (0/14) |
-| `DescribeWorker` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
-| `ListWorkers` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
 | `FetchWorkerConfig` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
 | `UpdateWorkerConfig` | Workflow | `deferred_unary!` | `worker-config-management` | No spec (placeholder) |
 | `StartActivityExecution` | Workflow | `unimplemented` (off by default) | `activity-executions-first-class` | Partial (15/19) |
@@ -58,7 +56,7 @@ This list is **minimal and complete** when:
 | `DeprecateNamespace` | Namespaces |
 | `RemoveSearchAttributes` | Search attributes (operator) |
 | `AddOrUpdateRemoteCluster`, `RemoveRemoteCluster`, `ListClusters` | Remote-cluster registry |
-| `DescribeWorker`, `ListWorkers`, `FetchWorkerConfig`, `UpdateWorkerConfig` | Worker inventory |
+| `FetchWorkerConfig`, `UpdateWorkerConfig` | Worker configuration |
 | Standalone-activity RPCs (×8) | Standalone Activities (Public Preview) |
 
 To re-verify: confirm each row still maps to a `supported.md` feature area, and that no `supported.md`
@@ -70,6 +68,8 @@ area has an RPC answering `UNIMPLEMENTED` that is absent from this list.
   `crates/tokeira-edge/UNSUPPORTED_FIELDS.md`.
 - Worker Deployment RPCs are **not** here: they no longer answer `UNIMPLEMENTED` (the registry gates them
   with `FailedPrecondition` when unconfigured); they are tracked under `worker-deployments`.
+- `DescribeWorker` and `ListWorkers` are **not** here: Tier 8.42 implements them over the live,
+  process-local heartbeat registry; `worker-heartbeat-observability` owns that inventory surface.
 - The activity by-ID RPCs (`RecordActivityTaskHeartbeatById`, etc.) are **not** here — they were
   implemented via `api-conformance-activity-by-id`.
 - Workflow-rule CRUD is no longer deferred. `TriggerWorkflowRule` is also absent because its exact

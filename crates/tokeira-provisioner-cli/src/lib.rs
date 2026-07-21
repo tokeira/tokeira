@@ -28,6 +28,7 @@ mod destroy;
 mod gate;
 mod init;
 mod lock;
+mod marker;
 mod plan;
 mod revert;
 mod rollback;

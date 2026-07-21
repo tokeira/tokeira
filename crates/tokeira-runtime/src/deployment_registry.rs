@@ -39,7 +39,9 @@ use tokeira_storage::{
     StoredWorkerDeployment, VersionDrainageStatus, VersionMetadata, VersionTaskQueue,
     WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkerDeploymentVersionStatus,
 };
-use tokeira_types::{BuildId as RuntimeBuildId, DeploymentId, NamespaceId, Payload};
+use tokeira_types::{
+    BuildId as RuntimeBuildId, DeploymentId, NamespaceId, Payload, TaskKind, TaskQueueName,
+};
 
 use crate::WorkerRegistry;
 
@@ -285,6 +287,55 @@ impl DeploymentRegistry {
         self.clock.now()
     }
 
+    /// Determine whether a pinned workflow query has no eligible worker.
+    ///
+    /// A drained version is blackholed only when its workflow task-queue
+    /// family has no recent workflow poller. Activity pollers and pollers on a
+    /// sibling task queue cannot answer the query. This is the observable
+    /// `checkQueryBlackholed` contract from
+    /// `service/matching/task_queue_partition_manager.go @ v1.31.0`, derived
+    /// here from Tokeira's durable deployment registry plus ephemeral poll
+    /// observations rather than a Temporal matching-service topology.
+    pub async fn pinned_query_is_blackholed(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &TaskQueueName,
+        deployment_name: &str,
+        build_id: &str,
+    ) -> Result<bool, RegistryError> {
+        let key = DeploymentKey {
+            namespace_id,
+            deployment_name: DeploymentName(deployment_name.to_string()),
+        };
+        self.refresh_due_deployment_drainage(&key).await?;
+        let Some(deployment) = self
+            .repository
+            .load_deployment(&key)
+            .await
+            .map_err(RegistryError::from_storage_error)?
+        else {
+            return Ok(false);
+        };
+        let Some(version) = deployment.versions.get(&BuildId(build_id.to_string())) else {
+            return Ok(false);
+        };
+        if version.status != WorkerDeploymentVersionStatus::Drained {
+            return Ok(false);
+        }
+
+        Ok(!self
+            .worker_registry
+            .has_recent_poller_for_deployment_version_on_task_queue(
+                namespace_id,
+                &DeploymentId(deployment_name.to_string()),
+                &RuntimeBuildId(build_id.to_string()),
+                Some(task_queue),
+                Some(TaskKind::Workflow),
+                self.clock.now(),
+                active_poller_window(),
+            ))
+    }
+
     /// Validate that a pinned version has polled the workflow task-queue family.
     ///
     /// Both positive and negative results are cached. That staleness is part of
@@ -298,7 +349,37 @@ impl DeploymentRegistry {
         deployment_name: &str,
         build_id: &str,
     ) -> Result<(), RegistryError> {
-        self.validate_pinned_workflow_version_with_ttl(
+        let present = self
+            .version_has_workflow_task_queue_with_ttl(
+                namespace_id,
+                task_queue,
+                deployment_name,
+                build_id,
+                version_membership_cache_ttl(),
+            )
+            .await?;
+        membership_result(
+            present,
+            deployment_name,
+            build_id,
+            task_queue_family_name(task_queue),
+        )
+    }
+
+    /// Return whether a Version owns a workflow task-queue family.
+    ///
+    /// Continue-as-New uses absence as a normal non-inheritance decision,
+    /// unlike explicit pinned admission, which maps it to FAILED_PRECONDITION.
+    /// Both paths share v1.31.0's positive/negative membership cache so their
+    /// observations have the same staleness window.
+    pub(crate) async fn version_has_workflow_task_queue(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &str,
+        deployment_name: &str,
+        build_id: &str,
+    ) -> Result<bool, RegistryError> {
+        self.version_has_workflow_task_queue_with_ttl(
             namespace_id,
             task_queue,
             deployment_name,
@@ -308,14 +389,14 @@ impl DeploymentRegistry {
         .await
     }
 
-    async fn validate_pinned_workflow_version_with_ttl(
+    async fn version_has_workflow_task_queue_with_ttl(
         &self,
         namespace_id: NamespaceId,
         task_queue: &str,
         deployment_name: &str,
         build_id: &str,
         cache_ttl: Duration,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<bool, RegistryError> {
         let task_queue = task_queue_family_name(task_queue).to_string();
         let key = VersionMembershipCacheKey {
             namespace_id,
@@ -332,7 +413,7 @@ impl DeploymentRegistry {
             .copied()
             .filter(|cached| cached.expires_at > now)
         {
-            return membership_result(cached.present, deployment_name, build_id, &task_queue);
+            return Ok(cached.present);
         }
 
         let deployment_key = DeploymentKey {
@@ -366,7 +447,33 @@ impl DeploymentRegistry {
                     expires_at: now + cache_ttl,
                 },
             );
-        membership_result(present, deployment_name, build_id, &task_queue)
+        Ok(present)
+    }
+
+    #[cfg(test)]
+    async fn validate_pinned_workflow_version_with_ttl(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &str,
+        deployment_name: &str,
+        build_id: &str,
+        cache_ttl: Duration,
+    ) -> Result<(), RegistryError> {
+        let present = self
+            .version_has_workflow_task_queue_with_ttl(
+                namespace_id,
+                task_queue,
+                deployment_name,
+                build_id,
+                cache_ttl,
+            )
+            .await?;
+        membership_result(
+            present,
+            deployment_name,
+            build_id,
+            task_queue_family_name(task_queue),
+        )
     }
 
     /// Best-effort reactivation of a version targeted by a successful pinned operation.
@@ -862,6 +969,85 @@ impl DeploymentRegistry {
             .unwrap_or_default())
     }
 
+    /// Resolve the durable routing config governing an activity task queue.
+    ///
+    /// The workflow's deployment is preferred only when one of its versions has
+    /// actually polled this activity queue. Otherwise the activity is independent
+    /// and follows the deployment registered on its own queue. This is the
+    /// observable distinction made while adding an activity to matching
+    /// (`service/matching/task_queue_partition_manager.go:getPhysicalQueuesForAdd
+    /// @ v1.31.0`), expressed over Tokeira's durable registry rather than a
+    /// matching-service-local user-data cache.
+    pub(crate) async fn activity_task_routing_config(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &str,
+        preferred_deployment: Option<&str>,
+    ) -> Result<StoredRoutingConfig, RegistryError> {
+        let task_queue = task_queue_family_name(task_queue);
+        if let Some(deployment_name) = preferred_deployment {
+            let key = DeploymentKey {
+                namespace_id,
+                deployment_name: DeploymentName(deployment_name.to_string()),
+            };
+            if let Some(record) = self
+                .repository
+                .load_deployment(&key)
+                .await
+                .map_err(RegistryError::from_storage_error)?
+                && deployment_has_task_queue(&record, task_queue, DeploymentTaskQueueType::Activity)
+            {
+                return Ok(record.routing_config);
+            }
+        }
+
+        let mut deployments = self
+            .repository
+            .list_all_for_namespace(namespace_id)
+            .await
+            .map_err(RegistryError::from_storage_error)?;
+        deployments.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(deployments
+            .into_iter()
+            .find(|deployment| {
+                deployment_has_task_queue(deployment, task_queue, DeploymentTaskQueueType::Activity)
+            })
+            .map(|deployment| deployment.routing_config)
+            .unwrap_or_default())
+    }
+
+    /// Whether one concrete deployment version has polled an activity queue.
+    ///
+    /// A pinned workflow uses its pinned version only for dependent activities.
+    /// If this membership is absent, v1.31.0 ignores the pinned directive for
+    /// that activity and routes it through the activity queue's current version
+    /// (`service/matching/task_queue_partition_manager.go:getPhysicalQueuesForAdd
+    /// @ v1.31.0`).
+    pub(crate) async fn version_has_activity_task_queue(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: &str,
+        deployment_name: &str,
+        build_id: &str,
+    ) -> Result<bool, RegistryError> {
+        let key = DeploymentKey {
+            namespace_id,
+            deployment_name: DeploymentName(deployment_name.to_string()),
+        };
+        Ok(self
+            .repository
+            .load_deployment(&key)
+            .await
+            .map_err(RegistryError::from_storage_error)?
+            .and_then(|record| record.versions.get(&BuildId(build_id.to_string())).cloned())
+            .is_some_and(|version| {
+                version.polled_task_queues.iter().any(|polled| {
+                    polled.name == task_queue_family_name(task_queue)
+                        && polled.task_queue_type == DeploymentTaskQueueType::Activity
+                })
+            }))
+    }
+
     pub async fn describe_deployment(
         &self,
         key: DeploymentKey,
@@ -1209,6 +1395,8 @@ impl DeploymentRegistry {
                 next.routing_config.current_version = target.clone();
                 next.routing_config.current_version_changed_time = Some(now);
                 next.routing_config.revision_number += 1;
+                next.routing_config.current_version_revision_number =
+                    next.routing_config.revision_number;
                 // Promoting the version that is currently ramping to Current implicitly
                 // unsets the ramp: a version cannot be both Current and Ramping. Required
                 // side effect per the `SetWorkerDeploymentCurrentVersion` RPC doc comment
@@ -1221,6 +1409,8 @@ impl DeploymentRegistry {
                     next.routing_config.ramping_version_percentage = 0.0;
                     next.routing_config.ramping_version_changed_time = Some(now);
                     next.routing_config.ramping_version_percentage_changed_time = Some(now);
+                    next.routing_config.ramping_version_revision_number =
+                        next.routing_config.revision_number;
                 }
                 refresh_version_routing_state(&mut next, now);
                 Ok(RegistryMutation::Put(
@@ -1374,6 +1564,8 @@ impl DeploymentRegistry {
                     next.routing_config.ramping_version_percentage_changed_time = Some(now);
                 }
                 next.routing_config.revision_number += 1;
+                next.routing_config.ramping_version_revision_number =
+                    next.routing_config.revision_number;
                 refresh_version_routing_state(&mut next, now);
                 Ok(RegistryMutation::Put(
                     next,
@@ -2863,6 +3055,19 @@ fn deployment_task_queue_type_name(task_type: DeploymentTaskQueueType) -> &'stat
     }
 }
 
+fn deployment_has_task_queue(
+    deployment: &StoredWorkerDeployment,
+    task_queue: &str,
+    task_queue_type: DeploymentTaskQueueType,
+) -> bool {
+    deployment.versions.values().any(|version| {
+        version
+            .polled_task_queues
+            .iter()
+            .any(|polled| polled.name == task_queue && polled.task_queue_type == task_queue_type)
+    })
+}
+
 fn task_queue_family_name(task_queue: &str) -> &str {
     let Some(physical) = task_queue.strip_prefix("/_sys/") else {
         return task_queue;
@@ -3522,6 +3727,101 @@ mod tests {
         store.put_deployment(record, Some(expected)).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn pinned_query_blackhole_requires_matching_workflow_poller() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let (registry, store) = registry_with_store_at(now);
+        let namespace_id = NamespaceId::new();
+        registry
+            .create_deployment(create_cmd(
+                namespace_id,
+                "deployment-a",
+                "create-deployment",
+            ))
+            .await
+            .unwrap();
+        registry
+            .create_version(create_version_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "create-version",
+            ))
+            .await
+            .unwrap();
+
+        let key = deployment_key(namespace_id, "deployment-a");
+        let mut deployment = store.load_deployment(&key).await.unwrap().unwrap();
+        let expected = deployment.conflict_token;
+        let version = deployment
+            .versions
+            .get_mut(&BuildId("build-a".to_string()))
+            .unwrap();
+        version.status = WorkerDeploymentVersionStatus::Drained;
+        version.drainage_info = Some(DrainageInfo {
+            status: VersionDrainageStatus::Drained,
+            last_changed_time: now,
+            last_checked_time: now,
+        });
+        store
+            .put_deployment(deployment, Some(expected))
+            .await
+            .unwrap();
+
+        let queue = TaskQueueName("queue-a".to_string());
+        assert!(
+            registry
+                .pinned_query_is_blackholed(namespace_id, &queue, "deployment-a", "build-a")
+                .await
+                .unwrap()
+        );
+
+        for (worker, task_queue, task_kind) in [
+            ("activity", "queue-a", TaskKind::Activity),
+            ("other-queue", "queue-b", TaskKind::Workflow),
+        ] {
+            registry.worker_registry().register(
+                WorkerRegistrationKey {
+                    worker_identity: WorkerIdentity(worker.to_string()),
+                    namespace_id,
+                    task_queue: TaskQueueName(task_queue.to_string()),
+                    task_kind,
+                },
+                WorkerVersionMetadata {
+                    deployment: Some(DeploymentId("deployment-a".to_string())),
+                    build_id: Some(RuntimeBuildId("build-a".to_string())),
+                    last_seen_at: Some(now),
+                },
+            );
+        }
+        assert!(
+            registry
+                .pinned_query_is_blackholed(namespace_id, &queue, "deployment-a", "build-a")
+                .await
+                .unwrap()
+        );
+
+        registry.worker_registry().register(
+            WorkerRegistrationKey {
+                worker_identity: WorkerIdentity("workflow".to_string()),
+                namespace_id,
+                task_queue: queue.clone(),
+                task_kind: TaskKind::Workflow,
+            },
+            WorkerVersionMetadata {
+                deployment: Some(DeploymentId("deployment-a".to_string())),
+                build_id: Some(RuntimeBuildId("build-a".to_string())),
+                last_seen_at: Some(now),
+            },
+        );
+        assert!(
+            !registry
+                .pinned_query_is_blackholed(namespace_id, &queue, "deployment-a", "build-a")
+                .await
+                .unwrap()
+        );
+    }
+
     async fn seed_open_pinned_workflow(
         store: &InMemoryStore,
         namespace_id: NamespaceId,
@@ -3592,6 +3892,7 @@ mod tests {
             cron_schedule: None,
             eager_execution_accepted: false,
             reserved_poller_identity: None,
+            inherited_versioning_info: None,
         };
         let transition = BasicKernel
             .apply(LoadedRun::Absent, Command::Start(start))
@@ -7016,6 +7317,7 @@ mod tests {
                 worker_identity: WorkerIdentity("worker-a".to_string()),
                 namespace_id,
                 task_queue: TaskQueueName("queue-a".to_string()),
+                task_kind: TaskKind::Workflow,
             },
             WorkerVersionMetadata {
                 deployment: Some(DeploymentId("deployment-a".to_string())),
@@ -7242,6 +7544,20 @@ mod tests {
             .unwrap();
         assert_eq!(ramping.previous_ramping_version, None);
         assert_eq!(ramping.previous_ramping_percentage, 0.0);
+        assert_eq!(
+            ramping
+                .deployment
+                .routing_config
+                .current_version_revision_number,
+            1
+        );
+        assert_eq!(
+            ramping
+                .deployment
+                .routing_config
+                .ramping_version_revision_number,
+            2
+        );
         assert_eq!(
             ramping.deployment.routing_config.ramping_version_percentage,
             10.0

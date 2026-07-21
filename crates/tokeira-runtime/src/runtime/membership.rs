@@ -39,7 +39,7 @@ where
     ///    means another node owns it, surfaced as an error.
     /// 2. Record the shard locally in `Sweeping` and spawn the lease renewer,
     ///    which signals `lost_rx` if the lease is ever fenced.
-    /// 3. Run [`sweep_shard`] to rebuild in-memory dispatch and timeout state
+    /// 3. Run `sweep_shard` to rebuild in-memory dispatch and timeout state
     ///    from durable history.
     /// 4. Only then `mark_active`, so admission begins against fully
     ///    reconstructed state.
@@ -85,7 +85,8 @@ where
             lost_tx,
         ));
 
-        sweep_shard(
+        let deployment_registry = self.deployment_registry();
+        sweep_shard_with_registry(
             shard_id,
             self.repo.as_ref(),
             &self.broker,
@@ -97,6 +98,7 @@ where
             &self.activity_tracking,
             &self.nexus_timeout_tracking,
             &self.completion_callback_tracking,
+            deployment_registry.as_ref(),
         )
         .await?;
 

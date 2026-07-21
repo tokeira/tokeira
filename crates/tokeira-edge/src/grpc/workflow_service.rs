@@ -913,6 +913,12 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::PollActivityTaskQueueResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
+        // Translate before the standalone-activity fast path so shared Temporal
+        // poll validation (notably versioned sticky NormalName) runs before any
+        // task can be claimed (`validateVersioningInfo`, workflow_handler.go
+        // @ v1.31.0).
+        let edge_req = translate::poll_activity_request_to_edge(req.clone())
+            .map_err(proto_conversion_status)?;
         // CHASM-first: serve a queued standalone-activity task if one is waiting on
         // this task queue, before falling through to the workflow-activity path
         // (the two share this RPC).
@@ -935,8 +941,6 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 )));
             }
         }
-        let edge_req =
-            translate::poll_activity_request_to_edge(req).map_err(proto_conversion_status)?;
         debug!(task_queue = %edge_req.task_queue, "poll_activity_task_queue");
         let edge_resp = self
             .inner
@@ -5644,6 +5648,7 @@ mod tests {
             cron_schedule: None,
             reserved_poller_identity: None,
             eager_execution_accepted: false,
+            inherited_versioning_info: None,
         };
 
         let transition = BasicKernel

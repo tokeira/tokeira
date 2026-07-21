@@ -54,7 +54,9 @@ use crate::{
     },
     scanner::pick_lane_for_run_key,
     shard::{ShardOwner, shard_for},
-    workflow_task::resolve_workflow_task_target_version,
+    workflow_task::{
+        resolve_child_versioning, resolve_workflow_task_target_version, route_activity_task_queue,
+    },
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -238,6 +240,63 @@ where
         Ok(queue)
     }
 
+    fn worker_deployment_routing_enabled(&self) -> bool {
+        self.worker_deployment_registry
+            .as_ref()
+            .is_some_and(|slot| {
+                slot.read()
+                    .expect("worker deployment registry lock poisoned")
+                    .is_some()
+            })
+    }
+
+    async fn hydrate_sticky_workflow_task_target(
+        &self,
+        run_key: RunKey,
+        mut queue: QueueKey,
+    ) -> Result<QueueKey> {
+        if queue.deployment.is_some() && queue.build_id.is_some() {
+            return Ok(queue);
+        }
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Ok(queue);
+        };
+        // Sticky affinity is established by a completed WFT, so the run's
+        // effective Version identifies the cache-owning worker when an older
+        // dispatch envelope omitted deployment coordinates. Resolving this
+        // queue through Current would erase the old-vs-new comparison that
+        // determines whether the sticky coordinate is stale.
+        if let Some(version) = state.effective_deployment() {
+            queue.deployment.get_or_insert_with(|| {
+                tokeira_types::DeploymentId(version.deployment_name.clone())
+            });
+            queue
+                .build_id
+                .get_or_insert_with(|| tokeira_types::BuildId(version.build_id.clone()));
+        }
+        Ok(queue)
+    }
+
+    async fn route_activity_task_queue(
+        &self,
+        run_key: RunKey,
+        queue: QueueKey,
+        dispatch_revision: i64,
+    ) -> Result<(QueueKey, i64)> {
+        let registry = self.worker_deployment_registry.as_ref().and_then(|slot| {
+            slot.read()
+                .expect("worker deployment registry lock poisoned")
+                .clone()
+        });
+        let Some(registry) = registry else {
+            return Ok((queue, dispatch_revision));
+        };
+        let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
+            return Ok((queue, dispatch_revision));
+        };
+        route_activity_task_queue(Some(&registry), &state, queue, dispatch_revision).await
+    }
+
     /// Attach the namespace-name resolver used to tag the External-endpoint outbound metric.
     /// Set by the server bootstrap; left unset (and the metric omitted) in unit harnesses.
     pub fn with_namespace_resolver(
@@ -347,6 +406,87 @@ where
             .await
     }
 
+    /// Derive a child start's versioning inheritance from committed parent state.
+    ///
+    /// The child-start dispatch is emitted only after the parent's WFT completion
+    /// commits, so this load observes behavior and Version reported by that same
+    /// completion. Cross-task-queue compatibility is resolved through the runtime
+    /// registry; neither observation enters the pure kernel
+    /// (`transfer_queue_active_task_executor.go:915-979 @ v1.31.0`).
+    async fn resolve_child_versioning_info(
+        &self,
+        parent_run_key: RunKey,
+        child_namespace_id: NamespaceId,
+        child_task_queue: &TaskQueueName,
+    ) -> Result<Option<tokeira_kernel::WorkflowVersioningInfo>> {
+        let LoadedRun::Existing(parent) = self.repo.load_run(parent_run_key).await? else {
+            return Err(anyhow::anyhow!(
+                "parent run not found while preparing child versioning inheritance"
+            ));
+        };
+        let same_namespace = child_namespace_id == parent.namespace_id;
+        if !same_namespace {
+            return Ok(None);
+        }
+
+        let cross_task_queue = *child_task_queue != parent.task_queue;
+        let source_version = parent.effective_deployment().cloned();
+        let pinned_override_version = parent.versioning_override().and_then(|override_| {
+            let tokeira_kernel::VersioningOverride::Pinned { version } = override_ else {
+                return None;
+            };
+            Some(version.clone())
+        });
+        let registry = self.worker_deployment_registry.as_ref().and_then(|slot| {
+            slot.read()
+                .expect("worker deployment registry lock poisoned")
+                .clone()
+        });
+        let source_version_has_child_queue = if !cross_task_queue {
+            true
+        } else if let (Some(registry), Some(version)) = (registry.as_ref(), source_version.as_ref())
+        {
+            registry
+                .version_has_workflow_task_queue(
+                    parent.namespace_id,
+                    &child_task_queue.0,
+                    &version.deployment_name,
+                    &version.build_id,
+                )
+                .await
+                .map_err(anyhow::Error::new)?
+        } else {
+            false
+        };
+        let pinned_override_has_child_queue = if !cross_task_queue {
+            true
+        } else if pinned_override_version.as_ref() == source_version.as_ref() {
+            source_version_has_child_queue
+        } else if let (Some(registry), Some(version)) =
+            (registry.as_ref(), pinned_override_version.as_ref())
+        {
+            registry
+                .version_has_workflow_task_queue(
+                    parent.namespace_id,
+                    &child_task_queue.0,
+                    &version.deployment_name,
+                    &version.build_id,
+                )
+                .await
+                .map_err(anyhow::Error::new)?
+        } else {
+            false
+        };
+
+        Ok(resolve_child_versioning(
+            &parent,
+            child_task_queue,
+            same_namespace,
+            source_version_has_child_queue,
+            pinned_override_has_child_queue,
+        ))
+    }
+
     async fn handle_start_child_workflow(&self, spec: StartChildDispatch) {
         let StartChildDispatch {
             child_workflow_id,
@@ -395,6 +535,25 @@ where
         // The child's WorkflowExecutionStarted carries the PARENT namespace by
         // NAME; resolve it from the parent namespace id.
         let parent_namespace_name = self.resolve_namespace_name(parent_namespace_id).await;
+        let inherited_versioning_info = match self
+            .resolve_child_versioning_info(parent_run_key, namespace_id, &task_queue)
+            .await
+        {
+            Ok(info) => info,
+            Err(error) => {
+                // The parent transition is already authoritative. Starting a child
+                // without a required inheritance decision would create a different
+                // execution than the committed command requested, so leave the
+                // derived start absent for recovery instead of silently degrading it.
+                tracing::warn!(
+                    ?error,
+                    ?parent_run_key,
+                    ?child_workflow_id,
+                    "failed to resolve child workflow versioning inheritance"
+                );
+                return;
+            }
+        };
         let start_request = StartRequest {
             run_key: child_run_key,
             namespace_id,
@@ -449,6 +608,7 @@ where
             cron_schedule,
             eager_execution_accepted: false,
             reserved_poller_identity: None,
+            inherited_versioning_info,
         };
 
         // A running same-id conflict is resolved by the child's conflict policy,
@@ -1852,30 +2012,53 @@ where
                     normal_task_queue,
                     speculative,
                 } => {
-                    let _ = speculative;
                     let workflow_queue = queue.clone();
-                    // R.1: a SPECULATIVE task dispatched sticky-first falls back
-                    // to the normal queue immediately when no sticky poller is
-                    // waiting, so a lost sticky worker does not strand the update
-                    // behind the 5s schedule-to-start timeout
-                    // (`StickyWorkerUnavailable` → swap to normal + retry,
-                    // updateworkflow/api.go:224-233 @ v1.31.0). Normal-queue
-                    // fallback drops the sticky preference; the in-memory
-                    // schedule-to-start timer still guards the normal dispatch.
-                    let (final_queue, final_sticky) = if *speculative
-                        && sticky_preferred.is_some()
-                        && !self.has_workflow_poller(&workflow_queue).await
-                        && let Some(normal_name) = normal_task_queue
+                    let sticky_normal = sticky_preferred
+                        .as_ref()
+                        .zip(normal_task_queue.as_ref())
+                        .filter(|(_, normal_name)| **normal_name != queue.task_queue);
+                    let (final_queue, final_sticky) = if let Some((_, normal_name)) = sticky_normal
                     {
+                        let sticky_queue = self
+                            .hydrate_sticky_workflow_task_target(run_key, workflow_queue)
+                            .await?;
+                        // Re-resolve the normal queue without the sticky
+                        // offer's deployment fields. A Current change makes the
+                        // old versioned sticky partition unavailable in
+                        // v1.31.0, and history retries on the newly routed normal
+                        // queue (`task_queue_partition_manager.go:1918-1930` and
+                        // `mutable_state_impl.go:9084-9093 @ v1.31.0`). Tokeira
+                        // performs the equivalent derived-routing decision here;
+                        // no queue observation becomes authoritative state.
                         let normal = QueueKey {
                             task_queue: normal_name.clone(),
+                            deployment: None,
+                            build_id: None,
                             ..queue.clone()
                         };
-                        (normal, None)
+                        let routed_normal = self.route_workflow_task_queue(run_key, normal).await?;
+                        let sticky_target_changed = self.worker_deployment_routing_enabled()
+                            && (sticky_queue.deployment != routed_normal.deployment
+                                || sticky_queue.build_id != routed_normal.build_id);
+                        // R.1: a SPECULATIVE sticky offer also falls back
+                        // immediately when no sticky poller is waiting, rather
+                        // than waiting out schedule-to-start
+                        // (`StickyWorkerUnavailable`, updateworkflow/api.go:
+                        // 224-233 @ v1.31.0).
+                        let sticky_unavailable =
+                            *speculative && !self.has_workflow_poller(&sticky_queue).await;
+                        if sticky_target_changed || sticky_unavailable {
+                            (routed_normal, None)
+                        } else {
+                            (sticky_queue, sticky_preferred.clone())
+                        }
                     } else {
-                        (workflow_queue, sticky_preferred.clone())
+                        (
+                            self.route_workflow_task_queue(run_key, workflow_queue)
+                                .await?,
+                            sticky_preferred.clone(),
+                        )
                     };
-                    let final_queue = self.route_workflow_task_queue(run_key, final_queue).await?;
                     self.broker
                         .publish_workflow_task(
                             DispatchableWorkflowTask {
@@ -1929,14 +2112,17 @@ where
                         ..
                     } = op
                     {
+                        let (queue, dispatch_revision) = self
+                            .route_activity_task_queue(run_key, queue.clone(), *dispatch_revision)
+                            .await?;
                         let task = DispatchableActivityTask {
                             run_key,
-                            queue: queue.clone(),
+                            queue,
                             activity_id: activity_id.clone(),
                             input: input.clone(),
                             schedule_event_id: *schedule_event_id,
                             attempt: *attempt,
-                            dispatch_revision: *dispatch_revision,
+                            dispatch_revision,
                             stamp: *stamp,
                         };
                         let now = OffsetDateTime::now_utc();

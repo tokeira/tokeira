@@ -8,7 +8,7 @@ durable storage first (`WorkerDeploymentRepository`), then pure per-run kernel s
 runtime registry state machine and dispatch routing, then the edge handlers/adapter and the
 describe projection, finishing with the cleanup, compatibility-matrix, and integration work.
 Every mutation path follows load → validate (pure) → CAS-commit; the kernel stays pure; the edge
-talks to the runtime only through the new `WorkerDeploymentRuntimeApi` adapter. All 19 correctness
+talks to the runtime only through the new `WorkerDeploymentRuntimeApi` adapter. All 25 correctness
 properties from the design are implemented as required `proptest` tasks (minimum 100 iterations),
 each placed in the crate the design specifies.
 
@@ -338,11 +338,195 @@ each placed in the crate the design specifies.
       Cover both outcomes and ensure the check is re-evaluated after a CAS conflict.
     - _Requirements: 8.1-8.9, 9.9-9.11, 14.1-14.6; Properties 20 and 21_
 
+- [x] 15. Tier 8.41 kernel transition and history foundations
+  - [x] 15.1 Extend the serializable per-run versioning vocabulary
+    - Add the documented tri-state `VersionTarget` representation and defaulted
+      last-notified / declined-target lineage to `WorkflowVersioningInfo`. Extend
+      `ContinueAsNewVersioningBehavior` with `Unknown(i32)` so an unknown proto3 enum
+      value is not collapsed.
+    - Extend workflow-task-start, Continue-as-New, successor-start, pending-WFT, and
+      internal history types with the pre-resolved operands and decisions from the
+      design. The internal WFT-start event retains the policy and target as private
+      replay metadata in addition to its public Boolean. Append/default serializable
+      fields and add old-shape deserialization guards; do not add registry handles,
+      async work, I/O, clocks, or retained kernel state.
+    - _Requirements: 15.2, 15.11, 15.13, 15.22, 15.27, 15.28, 15.29, 15.33_
+  - [x] 15.2 Apply target-change notification in the pure WFT-start transition
+    - Implement the v1.31.0 five-way decision over the runtime-supplied policy and target:
+      disabled preserves lineage; override suppresses and clears lineage; AutoUpgrade or
+      unversioned suppresses; equal effective/target suppresses and clears; declined target
+      suppresses; otherwise notify, store last-notified, and clear the previous decline.
+    - Store the Boolean and private policy/target replay operands on the pending WFT
+      before any transient/speculative materialization and author the same values on the
+      internal `WorkflowTaskStarted`; replay must restore the lineage used by later
+      Continue-as-New decisions without consulting the registry.
+    - _Requirements: 15.2-15.11, 15.27, 15.30-15.32_
+  - [x] 15.3 Apply inherited Continue-as-New state in pure close/start transitions
+    - Preserve the command's initial behavior and runtime-resolved successor decision on
+      `WorkflowExecutionContinuedAsNew`. Initialize the successor from
+      `StartRequest.inherited_versioning_info`, combine it with any explicit compatible
+      override, and author the inherited pinned/AutoUpgrade/declined values into the
+      internal started event for replay and public serialization.
+    - Ensure an explicit initial behavior applies only to this successor's initial WFT
+      and retries; a later Continue-as-New command starts from its own wire value.
+    - _Requirements: 15.22-15.29, 15.33_
+  - [x] 15.4 Property test: Property 22 — target-change notification state machine
+    - Add a `proptest` reference model in `tokeira-kernel` with at least 100 cases over
+      enablement, effective behavior, override, effective/routing/declined targets, and
+      absent versus unversioned versus concrete lineage.
+    - Tag: `// Feature: worker-deployments, Property 22: target-change notification state machine`.
+    - _Requirements: 15.2-15.11, 15.30-15.32_
+
+- [x] 16. Tier 8.41 runtime target resolution and successor preparation
+  - [x] 16.1 Supply the WFT notification target and scoped policy input
+    - Reuse the existing durable routing resolver to retain both the effective dispatch
+      destination and the Current/Ramping target offered to the workflow. Supply that
+      target to `StartWorkflowTaskRequest` before invoking the kernel.
+    - Use the v1.31.0 production default `true` for
+      `system.enableSendTargetVersionChanged`; under the conformance feature, register
+      and consult the live namespace Boolean override at this call site. Do not expose a
+      production dynamic-config knob.
+    - _Requirements: 15.1, 15.2, 15.30, 15.31_
+  - [x] 16.2 Add the runtime-only Continue-as-New membership resolver
+    - Add a boolean-returning workflow-task-family membership lookup to the shared
+      `DeploymentRegistry`, reusing its positive/negative cache. Same-task-queue
+      inheritance needs no repository read; missing cross-task-queue membership is a
+      normal `false`, while storage failure aborts WFT completion with `INTERNAL`.
+    - Implement the pure `resolve_continue_as_new_versioning` reference-shaped helper
+      over the loaded predecessor, routing config, initial behavior, and pre-resolved
+      membership booleans. Unknown non-zero initial behaviors take the non-ramping
+      AutoUpgrade path.
+    - _Requirements: 15.14-15.21, 15.28, 15.34_
+  - [x] 16.3 Enrich the terminal command and start its successor from committed history
+    - In the serialized WFT-completion path, enrich the single terminal Continue-as-New
+      command before the authoritative transition commits. First project the same
+      completion's reported behavior, Deployment Version, and Worker Deployment name
+      onto an ephemeral predecessor clone, matching v1.31.0's
+      completion-before-command ordering. Resolve same/cross-queue pinned inheritance,
+      source Version/revision AutoUpgrade state, UseRamping initial placement, override
+      precedence, and last-notified-or-existing decline. For non-UseRamping inherited
+      AutoUpgrade first tasks, apply v1.31.0's same-Deployment revision comparison so a
+      current/equal-or-newer routing target wins while an older routing view cannot
+      bounce the run backward.
+    - Make lane successor creation read the committed close event and copy its concrete
+      decision into `StartRequest`; do not use a volatile side channel. A retried
+      derived start must reproduce the same request and remain request-id idempotent.
+    - _Requirements: 15.14-15.27, 15.34-15.36_
+  - [x] 16.4 Preserve v1.31.0 versioning state across workflow retries
+    - Extend retry successor preparation to read the predecessor's started event:
+      inherit pinned only when that run began inherited-pinned; carry current source
+      Version/revision and stored initial behavior for AutoUpgrade; preserve the decline
+      recorded on the started event. Keep UseRamping limited to the first WFT of each
+      retry.
+    - _Requirements: 15.25-15.27_
+  - [x] 16.5 Property test: Property 23 — Continue-as-New versioning decision
+    - Add a runtime `proptest` reference model with at least 100 cases covering
+      same/cross-queue membership, override precedence, known and unknown initial
+      behaviors, worker-reported same-completion behavior/Version changes,
+      Current/Ramping fallback, notification lineage, later CaN isolation, and retry
+      inheritance.
+    - Tag: `// Feature: worker-deployments, Property 23: Continue-as-New versioning decision`.
+    - _Requirements: 15.14-15.18, 15.20-15.23, 15.25, 15.26, 15.34-15.36_
+  - [x] 16.6 Property test: Property 25 — runtime-resolved boundary determinism
+    - Generate loaded runs, routing configs, policy values, and membership results;
+      assert runtime resolves every mutable operand before invocation and repeated
+      kernel evaluation returns equal next state/history without registry, cache,
+      clock, queue, randomness, or I/O access.
+    - Tag: `// Feature: worker-deployments, Property 25: runtime-resolved boundary determinism`.
+    - _Requirements: 15.1, 15.2, 15.19, 15.22, 15.28_
+  - [x] 16.7 Derive child-start versioning inheritance from the committed parent
+    - Load the parent after its WFT completion commits, resolve same/cross-task-queue
+      Version compatibility through the shared runtime registry, and pass only the
+      concrete inherited pinned/override/AutoUpgrade state on the child's StartRequest.
+      Never carry a parent's `USE_RAMPING_VERSION` instruction into the child.
+    - Add focused pure/runtime coverage for post-completion AutoUpgrade inheritance,
+      namespace and membership rejection, override precedence, and the unspecified
+      child initial behavior.
+    - _Requirements: 15.37-15.39_
+  - [x] 16.8 Preserve target-specific routing revisions
+    - Append durable Current/Ramping revision operands to `StoredRoutingConfig`, stamp
+      them on their respective mutations, and make runtime routing return the revision
+      belonging to the selected target. Preserve aggregate `revision_number` as the
+      public routing-config value and default older internal records safely.
+    - Extend storage round-trip and no-bounce tests so a later Ramping change does not
+      make an older Current target appear newer than an inherited source.
+    - _Requirements: 15.36, 15.40_
+  - [x] 16.9 Correct speculative, transient-activity, sticky-migration, and poll validation edges
+    - Suppress durable deployment-transition input for speculative WFT starts while
+      retaining normal/transient start behavior and completion-time Version adoption.
+    - When an unversioned run has no Deployment lookup source, resolve its workflow-task
+      routing through the versioned activity poller's Deployment before deciding whether
+      that activity must start a transition and be withheld. When this starts a transition
+      with an unstarted non-speculative WFT already pending, deterministically fence the
+      prior offer with a new logical sequence and emit its replacement dispatch without
+      adding history; retain timeout-driven handling for speculative WFTs.
+    - Resolve sticky work against the normal task-queue family; when the routing target
+      differs from the sticky worker Version, publish on the normal physical target and
+      clear the disposable sticky preference. Hydrate missing sticky queue deployment
+      coordinates from the run's committed effective Version before comparing, so a
+      pinned sticky task is not mistaken for Current merely because its envelope is old.
+    - Reject workflow and activity versioned sticky polls with empty `normal_name` at the
+      gRPC boundary, before CHASM fallback or long-poll admission, with v1.31.0's exact
+      `INVALID_ARGUMENT` text.
+    - Record bounded Deployment-Version poller presence before awaiting durable poll
+      registration, while retaining registration as the gate before task delivery, so a
+      concurrent query cannot race into a false drained-Version blackhole. Retain
+      separate physical-Version observations when one SDK worker identity polls more
+      than one Version.
+    - Extend Property 13 and focused runtime/edge tests for all five corrections.
+    - _Requirements: 2.20, 15.41-15.44_
+
+- [x] 17. Tier 8.41 edge translation and public-history fidelity
+  - [x] 17.1 Preserve Continue-as-New enum values and serialize versioning history
+    - Map known `initial_versioning_behavior` values to named internal variants and all
+      other integers to `Unknown(i32)`; emit the same raw value on
+      `WorkflowExecutionContinuedAsNew`.
+    - Serialize the stored WFT notification Boolean verbatim without exposing its
+      private policy/target replay operands. Map inherited pinned,
+      inherited AutoUpgrade source/revision/initial behavior, and the declined target
+      onto `WorkflowExecutionStarted`, preserving wrapper-present unversioned targets
+      and never emitting mutually exclusive inheritance fields together.
+    - _Requirements: 15.12, 15.13, 15.24, 15.29, 15.33_
+  - [x] 17.2 Property test: Property 24 — versioning history and replay round-trip
+    - Add the shared generated case model across kernel event/replay and edge history
+      serialization, with at least 100 cases covering absent/unversioned/concrete
+      targets, pinned/AutoUpgrade inheritance, overrides, known/unknown initial
+      behavior, and late WFT-start materialization.
+    - Tag: `// Feature: worker-deployments, Property 24: versioning history and replay round-trip`.
+    - _Requirements: 15.12, 15.13, 15.24, 15.27, 15.29, 15.33_
+
+- [x] 18. Tier 8.41 integration and conformance
+  - [x] 18.1 Add focused cross-plane integration coverage
+    - Drive pinned target change → WFT notification → Continue-as-New → successor start
+      and assert agreement between polled/public history, replayed state, Describe, and
+      physical Version placement. Cover same-queue inheritance, cross-queue membership
+      acceptance/rejection, override precedence, AutoUpgrade, UseRamping, unknown
+      behavior, restart recovery, and the scoped notification-disabled mode.
+    - _Requirements: 2.20, 15.1-15.44_
+  - [x] 18.2 Prove the Tier 8.41 corpus clean
+    - Run focused crate tests and the exact previously failing Continue-as-New leaves,
+      then two consecutive clean `TestVersioning3FunctionalSuite` conformance runs. Remove
+      only skips made obsolete by delivered public behavior and update the functional
+      conformance ledger with the command and evidence.
+    - _Requirements: 2.20, 15.1-15.44_
+
+- [x] 19. Tier 8.41 final checkpoint
+  - Run focused kernel/runtime/edge tests, then the enforced repository bar:
+    `cargo +nightly fmt --all --check`, `cargo lint`, `cargo test-lint`,
+    `cargo check --workspace`, `cargo test --workspace`, and
+    `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`, using `--locked` where
+    the command accepts it.
+  - Verify every new public item and non-obvious decision has a WHY comment and a checked
+    v1.31.0 source anchor, and mark tasks complete only after their code and tests land.
+
 ## Notes
 
 - Tasks follow the design's strict dependency order: storage → kernel → runtime registry → runtime dispatch → edge → describe projection → cleanup/matrix → integration. No new architecture is introduced beyond `design.md`.
-- Property tests are REQUIRED, not optional (no `*` markers). All 19 design properties are covered exactly once, each placed in the crate the design's Testing Strategy specifies: Properties 1–13, 16, and 19 in `tokeira-runtime` (registry/routing), Property 17 in `tokeira-storage`, Property 18 in `tokeira-kernel`, Property 14 in `tokeira-edge`, and Property 15 in `tokeira-runtime`. Each uses the workspace-standard `proptest` with ≥100 iterations and reference models/generators per the design; no hand-rolled property infrastructure.
-- The kernel stays pure: tasks under section 2 add only serializable per-run state and pure transition methods — no I/O, async, metrics, or storage.
+- Property tests are REQUIRED, not optional (no `*` markers). All 25 design properties are covered exactly once, each placed in the crate the design's Testing Strategy specifies: Properties 1–13, 15, 16, 19, 21, 23, and 25 in `tokeira-runtime` (registry/routing/boundary); Property 17 in `tokeira-storage`; Properties 18 and 22 in `tokeira-kernel`; Properties 14 and 20 in their existing edge/runtime placements; and Property 24 across kernel replay and edge history serialization. Each uses the workspace-standard `proptest` with ≥100 iterations and reference models/generators per the design; no hand-rolled property infrastructure.
+- The kernel stays pure: tasks under sections 2 and 15 add only serializable per-run
+  transition vocabulary and deterministic evaluation — no I/O, async, metrics, storage,
+  randomness, registry access, or internally retained state. Runtime/storage retain the
+  returned state and history between invocations.
 - The edge talks to the runtime only through the new `WorkerDeploymentRuntimeApi` adapter; `DeploymentMutationOutcome` (edge adapter) is kept distinct from the concrete runtime `CommitResult`. Translation uses free functions, not `TryFrom`.
 - Every mutating registry method follows load → validate (pure) → CAS-commit so a rejected request never partially mutates state (Property 16).
 - The 13 v2 RPCs never return `UNIMPLEMENTED`; the 5 deprecated `Deployment` companions return the exact v1.31.0 message, the single sanctioned `UNIMPLEMENTED` case (Requirement 11, matching `service/frontend/workflow_handler.go @ v1.31.0`).
@@ -367,7 +551,15 @@ each placed in the crate the design specifies.
     { "id": 10, "tasks": ["11.1", "11.2", "11.3"] },
     { "id": 11, "tasks": ["13.1", "13.2", "13.3", "13.4"] },
     { "id": 12, "tasks": ["14.1", "14.2", "14.3", "14.4"] },
-    { "id": 13, "tasks": ["14.5"] }
+    { "id": 13, "tasks": ["14.5", "16.9"] },
+    { "id": 14, "tasks": ["15.1"] },
+    { "id": 15, "tasks": ["15.2", "15.3"] },
+    { "id": 16, "tasks": ["15.4", "16.1", "16.2"] },
+    { "id": 17, "tasks": ["16.3", "16.4"] },
+    { "id": 18, "tasks": ["16.5", "16.6", "17.1"] },
+    { "id": 19, "tasks": ["17.2"] },
+    { "id": 20, "tasks": ["18.1"] },
+    { "id": 21, "tasks": ["18.2", "19"] }
   ]
 }
 ```

@@ -99,6 +99,17 @@ are durable and must survive process restart.
   answers to whether a Deployment Version has polled a workflow task queue.
 - **Version reactivation:** A best-effort, post-commit transition of a pinned target
   Version from `INACTIVE`/`DRAINED` back to `DRAINING`, gated and TTL-deduplicated.
+- **Version target observation:** A tri-state per-run value that distinguishes no
+  observed target, the unversioned target, and a concrete Deployment Version. The
+  distinction is required because an absent notification is not equivalent to a
+  notification that the target became unversioned.
+- **Target-change notification lineage:** The last Version target shown to a pinned
+  workflow and the Version target declined across Continue-as-New. These are durable
+  per-run transition facts, not Worker Deployment registry state.
+- **Inherited versioning decision:** The concrete versioning state selected by the
+  runtime for a Continue-as-New successor after applying the command's initial
+  behavior, the predecessor's effective behavior and override, and cross-task-queue
+  Version membership.
 
 ## Target State
 
@@ -129,6 +140,14 @@ are durable and must survive process restart.
   pinned operations may reactivate their target through one runtime-scoped,
   TTL-deduplicated cache. Dispatch derives physical Deployment-Version routing from the
   durable registry and authoritative run state before broker publication.
+- Pinned workflow tasks receive the v1.31.0 target-change notification exactly once per
+  non-declined target, including the distinct unversioned target, and Continue-as-New
+  successors inherit the target-decline lineage needed to suppress notification loops.
+- Continue-as-New successors inherit or change versioning behavior according to the
+  command's `initial_versioning_behavior`, same/cross-task-queue Version membership,
+  effective predecessor behavior, and any pinned override. Runtime performs registry
+  and membership reads; the pure kernel records the concrete decision in authoritative
+  per-run state and history.
 
 Behaviour is verified against Temporal server
 [tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0)
@@ -194,6 +213,26 @@ vendored API `v1.62.11`.
 - **Durable registry and per-run state:** Worker Deployment records live in
   `WorkerDeploymentRepository`; authoritative per-run versioning state is event-sourced
   in the pure kernel. Runtime caches and broker queues are derived and disposable.
+- **Target-change and Continue-as-New behavior (authoritative):**
+  `service/history/workflow/workflow_task_state_machine.go:495-532 @ v1.31.0` defines
+  target-change notification, override/AutoUpgrade suppression, target-equality reset,
+  and declined-target suppression;
+  `service/history/workflow/mutable_state_impl.go:2485-2630,2658-2674 @ v1.31.0`
+  defines pinned/AutoUpgrade Continue-as-New inheritance and declined-target carry;
+  `service/history/historybuilder/event_factory.go:82-86,146 @ v1.31.0` records those
+  decisions on history events.
+- **Current target-change gap:** `crates/tokeira-runtime/src/runtime/workflow_task.rs`
+  resolves the deployment routing target but supplies no target-notification input to
+  `StartWorkflowTaskRequest`; `crates/tokeira-kernel/src/event.rs`
+  `WorkflowTaskStarted` has no target-change field; and
+  `crates/tokeira-edge/src/translate/history_serializer.rs` therefore leaves
+  `target_worker_deployment_version_changed` default false.
+- **Current Continue-as-New gap:** `crates/tokeira-edge/src/grpc/translate.rs` drops
+  `ContinueAsNewWorkflowExecutionCommandAttributes.initial_versioning_behavior`, while
+  `crates/tokeira-runtime/src/lane.rs` creates the successor with only the predecessor's
+  explicit `versioning_override`. Pinned behavior inheritance, cross-task-queue
+  membership, AutoUpgrade/ramping initial behavior, and declined-target carry are not
+  represented.
 
 ## Field Policy
 
@@ -397,6 +436,17 @@ registry. The request fields are therefore not translated.
 | `WorkflowExecutionInfo.worker_deployment_name` | Populate from the deployment that completed the most recent workflow task | Describe projection |
 | `WorkflowExecutionInfo.assigned_build_id` / `inherited_build_id` / `most_recent_worker_version_stamp` (deprecated) | Leave default; superseded by v2 deployment-based fields per v1.31.0 | Describe projection (left default) |
 
+### Continue-as-New and target-notification history fields
+
+| Proto field | Target policy | Error if invalid | Persistence impact |
+|---|---|---|---|
+| `ContinueAsNewWorkflowExecutionCommandAttributes.initial_versioning_behavior` (16) | Preserve the numeric enum value; `UNSPECIFIED` permits pinned inheritance, `USE_RAMPING_VERSION` selects ramping-first placement, and every other non-zero value takes the non-ramping AutoUpgrade path (`mutable_state_impl.go:2494-2532,2621-2629,9130-9141 @ v1.31.0`) | none; v1.31.0 does not reject unknown numeric enum values | Continue-as-New close event and successor start decision |
+| `WorkflowExecutionContinuedAsNewEventAttributes.initial_versioning_behavior` (16) | Record the command value on the public close event | n/a | Authoritative predecessor history |
+| `WorkflowTaskStartedEventAttributes.target_worker_deployment_version_changed` (9) | True only for an enabled, unsuppressed target change observed by a versioned pinned workflow | n/a | Authoritative WFT-start history plus notification lineage in the next state |
+| `WorkflowExecutionStartedEventAttributes.inherited_pinned_version` (37) | Populate for a compatible pinned inheritance decision; mutually exclusive with `inherited_auto_upgrade_info` | n/a | Successor history and initial per-run versioning state |
+| `WorkflowExecutionStartedEventAttributes.inherited_auto_upgrade_info` (39) | Populate with source Version, source routing revision, and this CaN command's initial behavior for an eligible AutoUpgrade decision; mutually exclusive with `inherited_pinned_version` | n/a | Successor history and initial per-run versioning state |
+| `WorkflowExecutionStartedEventAttributes.declined_target_version_upgrade` (40) | Preserve the target declined by the preceding Continue-as-New chain, including the explicit unversioned target | n/a | Successor history and target-notification lineage |
+
 ## Requirements
 
 ### Requirement 1: Worker Deployment CRUD
@@ -533,6 +583,15 @@ deployment.
     poller history, which MAY retain a cancelled worker until its bounded history expires
     (`matching_engine.go:1194-1206` and `task_queue_partition_manager.go:601, 617-621 @
     v1.31.0`).
+20. WHEN a versioned poll resolves its physical Deployment-Version queue, THE runtime
+    SHALL record the bounded poller-presence observation before awaiting durable
+    Deployment-Version registration, so a query submitted concurrently with poll
+    admission observes the worker and is not falsely rejected as blackholed. Durable
+    registration SHALL still complete before the poll enters task delivery; IF that
+    registration rejects, THEN the bounded observation MAY remain until the configured
+    poller-history window expires without creating durable Deployment state
+    (`task_queue_partition_manager.go:601` and
+    `physical_task_queue_manager.go:462-475 @ v1.31.0`).
 
 ### Requirement 3: Current Version Selection
 
@@ -928,6 +987,153 @@ so that pinned routing is safe without adding latency or partial side effects.
    architecture-preserving implementation of
    `service/history/api/worker_versioning_util.go @ v1.31.0`.
 
+### Requirement 15: Target-Change Notification and Continue-as-New Versioning
+
+**User Story:** As an SDK user running deployment-versioned workflows, I want target
+changes and Continue-as-New successors to preserve v1.31.0 versioning semantics, so that
+pinned workflows can deliberately upgrade without notification loops or accidental
+placement on another Version.
+
+#### Acceptance Criteria
+
+1. WHEN the runtime prepares a workflow-task-start transition, THE runtime SHALL resolve
+   the task queue's current Version target from the durable Worker Deployment routing
+   config before submitting the transition.
+2. WHEN the runtime submits a workflow-task-start transition, THE runtime SHALL pass the
+   resolved Version target to the pure kernel as transition input.
+3. WHERE target-change notification is enabled, WHEN a pinned workflow without an
+   override has an effective Version different from a target it has not declined, THE
+   kernel SHALL set `target_worker_deployment_version_changed` true on the resulting
+   `WorkflowTaskStarted` event.
+4. WHEN the kernel notifies a workflow of a Version target, THE kernel SHALL set the
+   next state's last-notified target to that Version target in the same transition.
+5. WHEN an execution-scoped versioning override is active at workflow-task start, THE
+   kernel SHALL set `target_worker_deployment_version_changed` false.
+6. WHEN an execution-scoped versioning override is active at workflow-task start, THE
+   kernel SHALL clear stale target-notification lineage from the next state.
+7. WHEN an AutoUpgrade workflow task starts, THE kernel SHALL set
+   `target_worker_deployment_version_changed` false.
+8. WHEN a pinned workflow's effective Version equals the resolved Version target, THE
+   kernel SHALL set `target_worker_deployment_version_changed` false.
+9. WHEN a pinned workflow's effective Version equals the resolved Version target, THE
+   kernel SHALL clear stale target-notification lineage from the next state.
+10. WHEN a pinned workflow's resolved Version target equals its declined target, THE
+    kernel SHALL set `target_worker_deployment_version_changed` false.
+11. THE target-notification lineage SHALL distinguish no recorded target, the
+    unversioned target, and a concrete Deployment Version.
+12. WHEN history serialization encounters a `WorkflowTaskStarted` transition, THE Edge
+    SHALL emit the transition's `target_worker_deployment_version_changed` value on the
+    public history event.
+13. WHEN the Edge translates a Continue-as-New command, THE Edge SHALL preserve
+    `initial_versioning_behavior` in the internal command.
+14. WHEN a pinned workflow continues as new with unspecified initial behavior onto the
+    same task queue, THE runtime SHALL select the predecessor's effective Deployment
+    Version as the successor's inherited pinned Version.
+15. WHEN a pinned workflow continues as new with unspecified initial behavior onto a
+    different task queue, THE runtime SHALL inherit the predecessor's effective Version
+    only if that Version has workflow-task membership in the successor task queue.
+16. WHEN an AutoUpgrade workflow continues as new onto a task queue belonging to its
+    effective Deployment Version, THE runtime SHALL carry the source Version and routing
+    revision into the successor's initial AutoUpgrade state.
+17. WHEN a pinned workflow continues as new with `AUTO_UPGRADE`, THE runtime SHALL select
+    initial AutoUpgrade state instead of inherited pinned behavior unless a compatible
+    pinned override takes precedence.
+18. WHEN a pinned workflow continues as new with `USE_RAMPING_VERSION`, THE runtime SHALL
+    select the routing config's ramping Version when one exists and otherwise select its
+    current Version, unless a compatible pinned override takes precedence.
+19. WHEN a Continue-as-New successor targets a different task queue, THE runtime SHALL
+    perform all Deployment Version membership reads outside the kernel.
+20. WHEN a Continue-as-New command declines a target previously shown to the workflow,
+    THE successor's initial state SHALL record that last-notified target as its declined
+    target.
+21. WHEN a Continue-as-New predecessor has no last-notified target, THE successor's
+    initial state SHALL preserve any declined target inherited by the predecessor.
+22. WHEN the runtime submits a Continue-as-New successor start, THE runtime SHALL pass
+    the concrete inherited versioning decision and declined target as start-transition
+    input.
+23. WHEN the kernel applies a Continue-as-New successor start, THE kernel SHALL
+    initialize the successor's per-run versioning state from the runtime-supplied
+    decision.
+24. WHEN the kernel applies a Continue-as-New successor start, THE kernel SHALL record
+    the applicable `inherited_pinned_version`, `inherited_auto_upgrade_info`, and
+    `declined_target_version_upgrade` attributes on `WorkflowExecutionStarted`.
+25. WHEN a Continue-as-New command supplies `USE_RAMPING_VERSION`, THE successor's stored
+    `continue_as_new_initial_versioning_behavior` SHALL apply only to its first workflow
+    task and its retries.
+26. WHEN a future Continue-as-New command omits `initial_versioning_behavior`, THE
+    runtime SHALL NOT propagate an earlier Continue-as-New command's explicit initial
+    behavior into that future successor.
+27. WHEN the process restarts, THE runtime SHALL recover target-notification lineage and
+    inherited successor versioning from the authoritative per-run state and history.
+28. THE kernel SHALL remain a stateless transition evaluator with no deployment-registry
+    access, task-queue membership I/O, async work, metrics, randomness, or internally
+    retained state.
+29. WHEN the kernel emits `WorkflowExecutionContinuedAsNew`, THE kernel SHALL record the
+    command's `initial_versioning_behavior` on the internal history event.
+30. WHEN target-change notification is disabled, THE kernel SHALL set
+    `target_worker_deployment_version_changed` false.
+31. WHEN target-change notification is disabled, THE kernel SHALL preserve existing
+    target-notification lineage unchanged.
+32. WHEN an unversioned workflow task starts, THE kernel SHALL set
+    `target_worker_deployment_version_changed` false.
+33. WHEN a Continue-as-New command carries an unknown numeric
+    `initial_versioning_behavior`, THE Edge SHALL preserve that numeric value through
+    the internal command and public close event.
+34. WHEN a Continue-as-New command carries an unknown non-zero
+    `initial_versioning_behavior`, THE runtime SHALL apply the non-ramping AutoUpgrade
+    successor path used by v1.31.0.
+35. WHEN a workflow-task completion both reports its Versioning Behavior and issues a
+    Continue-as-New command, THE runtime SHALL resolve the successor from the
+    predecessor state after applying that completion's reported behavior, Deployment
+    Version, and Worker Deployment name, matching v1.31.0's completion-before-command
+    ordering.
+36. WHEN an inherited AutoUpgrade successor's initial behavior is not
+    `USE_RAMPING_VERSION`, THE runtime SHALL route its first workflow task to the
+    task-queue routing target when that target belongs to a different Deployment or its
+    routing revision is at least the inherited source revision; otherwise THE runtime
+    SHALL retain the inherited source Version, matching v1.31.0's revision-based
+    no-bounce decision.
+37. WHEN a committed workflow-task completion starts a child workflow, THE runtime
+    SHALL derive the child's versioning inheritance from the parent's committed
+    post-completion state, including behavior and Deployment Version reported by that
+    same completion.
+38. WHEN parent and child are in the same namespace, THE runtime SHALL inherit the
+    parent's effective pinned Version, compatible pinned override, or AutoUpgrade source
+    Version and revision when the child uses the same workflow task queue or that Version
+    has workflow-task membership in the child's queue; otherwise THE runtime SHALL omit
+    the incompatible inheritance, and a cross-namespace child SHALL inherit none of it.
+39. WHEN a child inherits AutoUpgrade source state, THE runtime SHALL set the child's
+    `continue_as_new_initial_versioning_behavior` to `UNSPECIFIED` rather than inheriting
+    the parent's `USE_RAMPING_VERSION` instruction.
+40. WHEN Current and Ramping routing fields change at different revisions, THE durable
+    routing record SHALL retain the revision associated with each target so inherited
+    AutoUpgrade first-task routing compares the selected target's revision rather than
+    the aggregate latest routing revision.
+41. WHEN a speculative workflow task starts on a Deployment Version different from the
+    workflow's effective Version, THE runtime SHALL NOT durably record a deployment
+    transition at task start; a successful completion SHALL apply the completing
+    worker's Version, while rejection, failure, or timeout SHALL leave the previously
+    committed effective Version unchanged.
+42. WHEN a versioned activity poller receives a backlogged activity for an unversioned
+    workflow and the execution carries no Deployment name from which to resolve its
+    workflow-task routing config, THE runtime SHALL use the activity poller's Deployment
+    as the lookup hint; IF that workflow-task queue would route to the poller's Version,
+    THEN the runtime SHALL start the workflow deployment transition and withhold the
+    activity from that poll. IF a non-speculative workflow task is pending and unstarted,
+    THEN the same authoritative transition SHALL fence its prior delivery token and emit
+    a replacement dispatch toward the transition Version without adding another history
+    event; a pending speculative task SHALL retain its existing timeout-driven behavior.
+43. WHEN a sticky workflow task belongs to a worker Deployment Version different from
+    the workflow's newly resolved Current/Ramping target, THE runtime SHALL abandon the
+    stale sticky delivery coordinate and publish the task on the normal task-queue
+    family at the resolved target Version, so that the next workflow task can complete
+    the transition instead of remaining stranded on an unpolled sticky/Version pair.
+44. IF a workflow-task or activity-task poll names a sticky task queue with an empty
+    `normal_name` AND either legacy `use_versioning` is true or `deployment_options` is
+    present, THEN THE Edge SHALL return `INVALID_ARGUMENT` with
+    `NormalName must be set on sticky queue when UseVersioning is true or DeploymentOptions are set.`
+    before registering the poller or entering a long poll.
+
 ## Iteration and Feedback Notes
 
 - 13 v2 worker-deployment RPCs are implemented; the 5 deprecated `Deployment` companion
@@ -968,3 +1174,12 @@ so that pinned routing is safe without adding latency or partial side effects.
   planes: task-queue membership and reactivation live in the runtime registry, dispatch
   remains derived before broker publication, and only durable per-run versioning state
   enters the pure kernel.
+- Tier 8.41 adds Requirement 15 after a public-corpus failure exposed two missing
+  v1.31.0 contracts: target-change notification lineage and Continue-as-New versioning
+  inheritance. The owner approved the narrow pure-kernel transition-shape extension;
+  deployment routing and membership remain runtime responsibilities, while storage
+  retains the kernel-produced state and history.
+- Tier 8.41 conformance subsequently exposed the distinct child-start inheritance
+  contract in criteria 37-39. The fix remains runtime-only: it derives from the
+  committed parent and the existing deployment-membership registry, while the child
+  kernel start receives only concrete inherited state.

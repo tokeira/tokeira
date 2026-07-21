@@ -145,6 +145,7 @@ pub fn start_request(req: StartWorkflowExecutionRequest, context: &EdgeContext) 
         // The runtime owns final admission (pinned enable + effective
         // first-WFT backoff); the edge only preserves the caller's candidate.
         eager_execution_accepted: req.request_eager_execution,
+        inherited_versioning_info: None,
     }
 }
 

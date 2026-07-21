@@ -146,6 +146,7 @@ fn make_start_request() -> StartRequest {
         cron_schedule: None,
         eager_execution_accepted: false,
         reserved_poller_identity: None,
+        inherited_versioning_info: None,
     }
 }
 
@@ -364,6 +365,9 @@ fn replay_history_reconstructs_workflow_task_lifecycle() {
                 request_id: "wft-start".into(),
                 history_size_bytes: 0,
                 suggest_continue_as_new: false,
+                target_worker_deployment_version_changed: false,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
             },
         ),
         history_event(
@@ -625,6 +629,9 @@ fn make_open_state_with_pending_wft() -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -640,6 +647,9 @@ fn make_open_state_with_started_wft() -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -916,6 +926,8 @@ fn make_continue_as_new_command() -> WorkflowCommand {
         workflow_run_timeout: Some(Duration::minutes(6)),
         workflow_task_timeout: Duration::seconds(11),
         retry_policy: Some(retry_policy()),
+        initial_versioning_behavior: tokeira_kernel::ContinueAsNewVersioningBehavior::Unspecified,
+        successor_versioning_info: None,
     }
 }
 
@@ -2426,6 +2438,9 @@ fn wft_failed_paused_workflow_no_redispatch() {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -2471,6 +2486,9 @@ fn wft_timed_out_paused_workflow_no_redispatch() {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -2510,6 +2528,9 @@ fn wft_completed_paused_workflow_no_force_wft() {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -2878,6 +2899,8 @@ fn workflow_task_started_with_sticky() {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: Some(Duration::seconds(30)),
                 now: now(),
             }),
@@ -2914,6 +2937,8 @@ fn workflow_task_started_with_deployment_transition_keeps_started_wft_running() 
                 suggest_continue_as_new: false,
                 deployment_transition: Some(target.clone()),
                 deployment_transition_revision_number: Some(42),
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: Some(Duration::seconds(30)),
                 now: now(),
             }),
@@ -2962,7 +2987,7 @@ fn start_deployment_transition_schedules_wft_when_missing() {
 }
 
 #[test]
-fn start_deployment_transition_reuses_pending_wft_without_double_schedule() {
+fn start_deployment_transition_fences_and_redispatches_pending_wft_without_history() {
     let target = WorkerDeploymentVersionRef {
         deployment_name: "deployment".into(),
         build_id: "build-a".into(),
@@ -2987,14 +3012,62 @@ fn start_deployment_transition_reuses_pending_wft_without_double_schedule() {
         .unwrap();
 
     assert!(transition.history_events.is_empty());
-    assert!(transition.dispatch_ops.is_empty());
+    assert_eq!(transition.dispatch_ops.len(), 1);
+    assert!(matches!(
+        &transition.dispatch_ops[0],
+        DispatchOp::EnqueueWorkflowTask {
+            queue,
+            logical_seq: LogicalTaskSeq(4),
+            sticky_preferred: None,
+            speculative: false,
+            ..
+        } if queue.task_queue.0 == "queue"
+            && queue.deployment.as_ref().map(|value| value.0.as_str()) == Some("deployment")
+            && queue.build_id.as_ref().map(|value| value.0.as_str()) == Some("build-a")
+    ));
     assert_eq!(transition.next_state.sticky, None);
     let pending = transition.next_state.pending_workflow_task.unwrap();
-    assert_eq!(pending.logical_seq, LogicalTaskSeq(3));
+    assert_eq!(pending.logical_seq, LogicalTaskSeq(4));
     assert_eq!(pending.started_event_id, None);
     let info = transition.next_state.versioning_info.unwrap();
     assert_eq!(info.version_transition, Some(target));
     assert_eq!(info.revision_number, 43);
+}
+
+#[test]
+fn start_deployment_transition_leaves_pending_speculative_delivery_to_its_timeout() {
+    let target = WorkerDeploymentVersionRef {
+        deployment_name: "deployment".into(),
+        build_id: "build-a".into(),
+    };
+    let mut state = make_open_state_with_pending_wft();
+    state
+        .pending_workflow_task
+        .as_mut()
+        .expect("pending workflow task")
+        .task_type = tokeira_kernel::WorkflowTaskType::Speculative;
+
+    let transition = kernel()
+        .apply(
+            LoadedRun::Existing(state),
+            Command::StartDeploymentTransition(StartDeploymentTransitionRequest {
+                target,
+                revision_number: 44,
+                now: now(),
+            }),
+        )
+        .unwrap();
+
+    assert!(transition.history_events.is_empty());
+    assert!(transition.dispatch_ops.is_empty());
+    assert_eq!(
+        transition
+            .next_state
+            .pending_workflow_task
+            .expect("speculative task remains pending")
+            .logical_seq,
+        LogicalTaskSeq(3)
+    );
 }
 
 #[test]
@@ -4061,6 +4134,8 @@ fn reject_wft_started_no_pending() {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: None,
                 now: now(),
             })
@@ -4082,6 +4157,8 @@ fn reject_wft_started_seq_mismatch() {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: None,
                 now: now(),
             })
@@ -4112,6 +4189,8 @@ fn reject_wft_started_already_started() {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: None,
                 now: now(),
             })
@@ -5185,6 +5264,8 @@ fn workflow_property_and_search_attribute_patches_record_merge_and_replay() {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: None,
                 now: now(),
             }),
@@ -5343,10 +5424,17 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
     let mut state = make_open_state_with_started_wft();
     let scheduled_at = now() - Duration::seconds(10);
     let started_at = now() - Duration::seconds(5);
+    let notification_target = WorkerDeploymentVersionRef {
+        deployment_name: "deployment".into(),
+        build_id: "target".into(),
+    };
     state.workflow_task_attempt = 3;
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: true,
+        target_version_changed_enabled: true,
+        target_deployment_version: Some(notification_target.clone()),
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 10, // virtual: last_event_id (9) + 1
         scheduled_at,
@@ -5409,6 +5497,18 @@ fn transient_completion_materializes_scheduled_started_with_task_times() {
         .expect("materialized WorkflowTaskStarted");
     assert_eq!(started.event_id, 11);
     assert_eq!(started.happened_at, started_at);
+    let HistoryEventKind::WorkflowTaskStarted {
+        target_worker_deployment_version_changed,
+        target_version_changed_enabled,
+        target_deployment_version,
+        ..
+    } = &started.kind
+    else {
+        unreachable!("the matching event is WorkflowTaskStarted");
+    };
+    assert!(*target_worker_deployment_version_changed);
+    assert!(*target_version_changed_enabled);
+    assert_eq!(target_deployment_version, &Some(notification_target));
     let completed = transition
         .history_events
         .iter()
@@ -5581,6 +5681,8 @@ fn cancel_then_cancel_workflow_e2e() {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: None,
                 now: now(),
             }),
@@ -5593,6 +5695,9 @@ fn cancel_then_cancel_workflow_e2e() {
         .unwrap_or(PendingWorkflowTask {
             task_type: tokeira_kernel::WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
+            target_worker_deployment_version_changed: false,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
             logical_seq: LogicalTaskSeq(4),
             scheduled_event_id: 11,
             scheduled_at: now(),
@@ -8279,6 +8384,8 @@ fn golden_message_too_large_terminate_history() {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: None,
                 now: now(),
             }),
@@ -8443,6 +8550,8 @@ fn start_pending_task(state: WorkflowState) -> Transition {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: None,
                 now: now(),
             }),
@@ -9260,4 +9369,109 @@ fn speculative_explicit_fail_materializes_and_keeps_update_admitted() {
     assert_eq!(retry.task_type, tokeira_kernel::WorkflowTaskType::Normal);
     assert_eq!(retry.scheduled_event_id, 8);
     assert!(failed.next_state.admitted_updates.contains("update-1"));
+}
+
+#[test]
+fn worker_deployment_appended_postcard_fields_require_a_fresh_pre_baseline_store() {
+    // Feature: worker-deployments, Property 24: these are genuine bytes for
+    // the immediately preceding positional shapes: each new field is trailing
+    // and its default postcard representation is removed. Serde defaults make
+    // named formats tolerant, but postcard reports end-of-input before it can
+    // apply them. Tokeira is pre-baseline, so a fresh store is the migration
+    // posture; this guard prevents a future compatibility claim from silently
+    // depending on postcard behavior it does not provide.
+    fn assert_old_shape_rejected<T>(value: &T, appended_default_bytes: usize)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+    {
+        let mut bytes = postcard::to_allocvec(value).expect("encode current positional shape");
+        assert!(
+            bytes
+                .iter()
+                .rev()
+                .take(appended_default_bytes)
+                .all(|byte| *byte == 0),
+            "the guard may strip only trailing default encodings"
+        );
+        bytes.truncate(bytes.len() - appended_default_bytes);
+        let error = postcard::from_bytes::<T>(&bytes)
+            .expect_err("postcard cannot default missing trailing sequence elements");
+        assert!(matches!(error, postcard::Error::DeserializeUnexpectedEnd));
+    }
+
+    assert_old_shape_rejected(&WorkflowVersioningInfo::default(), 2);
+    assert_old_shape_rejected(
+        &PendingWorkflowTask {
+            logical_seq: LogicalTaskSeq(1),
+            scheduled_event_id: 2,
+            scheduled_at: now(),
+            started_event_id: None,
+            started_at: None,
+            attempt: 1,
+            schedule_to_start_deadline: None,
+            task_type: tokeira_kernel::WorkflowTaskType::Normal,
+            target_worker_deployment_version_changed: false,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
+        },
+        3,
+    );
+    assert_old_shape_rejected(&make_start_request(), 1);
+    assert_old_shape_rejected(
+        &StartWorkflowTaskRequest {
+            logical_seq: LogicalTaskSeq(1),
+            worker_identity: WorkerIdentity("worker".into()),
+            request_id: "start".into(),
+            history_size_bytes: 0,
+            suggest_continue_as_new: false,
+            deployment_transition: None,
+            deployment_transition_revision_number: None,
+            sticky_ttl: None,
+            now: now(),
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
+        },
+        2,
+    );
+    assert_old_shape_rejected(
+        &HistoryEventKind::WorkflowTaskStarted {
+            logical_seq: LogicalTaskSeq(1),
+            scheduled_event_id: 2,
+            attempt: 1,
+            identity: WorkerIdentity("worker".into()),
+            request_id: "start".into(),
+            history_size_bytes: 0,
+            suggest_continue_as_new: false,
+            target_worker_deployment_version_changed: false,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
+        },
+        3,
+    );
+    assert_old_shape_rejected(&make_continue_as_new_command(), 2);
+    assert_old_shape_rejected(
+        &HistoryEventKind::WorkflowExecutionContinuedAsNew {
+            workflow_task_completed_event_id: 3,
+            new_run_id: RunId::new(),
+            workflow_type: WorkflowType("workflow".into()),
+            task_queue: TaskQueueName("queue".into()),
+            input: Payloads::default(),
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: Duration::seconds(10),
+            retry_policy: None,
+            initiator: tokeira_kernel::ContinueAsNewInitiator::Workflow,
+            failure: None,
+            last_completion_result: None,
+            backoff_start_interval: None,
+            cron_schedule: None,
+            header: None,
+            initial_versioning_behavior:
+                tokeira_kernel::ContinueAsNewVersioningBehavior::Unspecified,
+            successor_versioning_info: None,
+        },
+        2,
+    );
 }

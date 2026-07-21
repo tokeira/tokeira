@@ -443,18 +443,30 @@ async fn start_timeout_retry_successor<R: tokeira_storage::RunRepository + 'stat
     policy: tokeira_types::RetryPolicy,
     new_run_id: tokeira_types::RunId,
 ) {
-    let input = match repo
+    let (input, started_versioning_info) = match repo
         .read_history(predecessor_run_key, 0, 1)
         .await
         .ok()
         .and_then(|events| events.first().map(|event| event.kind.clone()))
     {
-        Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted { input, .. })
-        | Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 { input, .. }) => input,
-        _ => tokeira_types::Payloads::default(),
+        Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStarted {
+            input,
+            versioning_info,
+            ..
+        })
+        | Some(tokeira_kernel::HistoryEventKind::WorkflowExecutionStartedV2 {
+            input,
+            versioning_info,
+            ..
+        }) => (input, versioning_info),
+        _ => (tokeira_types::Payloads::default(), None),
     };
     let start_request = crate::runtime::workflow_task::build_retry_successor_start(
-        &state, &policy, input, new_run_id,
+        &state,
+        started_versioning_info.as_ref(),
+        &policy,
+        input,
+        new_run_id,
     );
     let successor_run_key = start_request.run_key;
     let successor_lane = pick_lane_for_run_key(lanes, lane_count, successor_run_key).clone();

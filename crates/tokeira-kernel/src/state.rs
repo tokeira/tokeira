@@ -359,12 +359,11 @@ impl WorkflowState {
             .get_or_insert_with(WorkflowVersioningInfo::default);
         info.version_transition = Some(target);
         info.revision_number = revision_number;
-        // Clear sticky affinity and reschedule any not-yet-started pending WFT:
-        // the workflow's effective deployment just changed, so the pending task
-        // must be re-dispatched to a poller on the new target deployment rather
-        // than served from the old sticky queue. A WFT already started on the
-        // old deployment is left to finish (started_event_id set) — the
-        // transition completes when a task next completes on the target.
+        // Clear sticky affinity because the workflow's effective deployment
+        // changed. The owning command emits any required replacement dispatch:
+        // state methods remain unaware of effects, while a WFT already started
+        // on the old deployment is left to finish. The transition completes
+        // when a task next completes on the target.
         self.sticky = None;
         if let Some(pending) = self.pending_workflow_task.as_mut()
             && pending.started_event_id.is_none()
@@ -373,6 +372,53 @@ impl WorkflowState {
             self.workflow_task_attempt = pending.attempt;
         }
         Ok(())
+    }
+
+    /// Apply a runtime-resolved target observation at workflow-task start.
+    ///
+    /// The runtime supplies both mutable operands (policy and routing target);
+    /// this method owns only the deterministic per-run lineage transition.
+    /// The branch order matches `workflow_task_state_machine.go:495-532 @
+    /// v1.31.0`: disabled/unversioned executions preserve lineage, overrides
+    /// and equal targets clear it, AutoUpgrade and declined targets suppress
+    /// notification, and every other pinned difference records a notification.
+    pub fn apply_target_version_observation(
+        &mut self,
+        enabled: bool,
+        target_deployment_version: Option<WorkerDeploymentVersionRef>,
+    ) -> bool {
+        let behavior = self.effective_behavior();
+        if !enabled || behavior == VersioningBehavior::Unspecified {
+            return false;
+        }
+
+        let has_override = self.versioning_override().is_some();
+        let effective_target = VersionTarget::from_deployment(self.effective_deployment().cloned());
+        let target = VersionTarget::from_deployment(target_deployment_version);
+        let info = self
+            .versioning_info
+            .get_or_insert_with(WorkflowVersioningInfo::default);
+
+        if has_override {
+            info.declined_target_version_upgrade = None;
+            info.last_notified_target_version = None;
+            return false;
+        }
+        if behavior == VersioningBehavior::AutoUpgrade {
+            return false;
+        }
+        if effective_target == target {
+            info.declined_target_version_upgrade = None;
+            info.last_notified_target_version = None;
+            return false;
+        }
+        if info.declined_target_version_upgrade.as_ref() == Some(&target) {
+            return false;
+        }
+
+        info.last_notified_target_version = Some(target);
+        info.declined_target_version_upgrade = None;
+        true
     }
 
     /// Apply worker-completed versioning fields from a workflow task completion.
@@ -555,6 +601,21 @@ pub struct PendingWorkflowTask {
     /// as Normal.
     #[serde(default)]
     pub task_type: WorkflowTaskType,
+    /// Public notification decision made when this task started.
+    ///
+    /// This is retained until a transient/speculative task materializes so
+    /// its eventual history event cannot observe a later routing decision.
+    #[serde(default)]
+    pub target_worker_deployment_version_changed: bool,
+    /// Policy operand used by replay to reproduce notification-lineage
+    /// updates without consulting mutable runtime configuration.
+    #[serde(default)]
+    pub target_version_changed_enabled: bool,
+    /// Routing target observed at task start. `None` means the unversioned
+    /// target, not an unresolved target; runtime always resolves it before
+    /// invoking the pure transition.
+    #[serde(default)]
+    pub target_deployment_version: Option<WorkerDeploymentVersionRef>,
 }
 
 /// Task mode for a pending workflow task (spec speculative-wft K1).
@@ -941,6 +1002,14 @@ pub struct WorkflowVersioningInfo {
     /// Most recent structured worker-version stamp from a completed WFT.
     #[serde(default)]
     pub most_recent_worker_version_stamp: Option<WorkerVersionStamp>,
+    /// Target most recently offered to a pinned execution through a WFT-start
+    /// notification. Outer absence, unversioned, and concrete targets remain
+    /// distinct because Continue-as-New observes all three states.
+    #[serde(default)]
+    pub last_notified_target_version: Option<VersionTarget>,
+    /// Target the current Continue-as-New chain has already declined.
+    #[serde(default)]
+    pub declined_target_version_upgrade: Option<VersionTarget>,
 }
 
 impl WorkflowVersioningInfo {
@@ -962,6 +1031,8 @@ impl WorkflowVersioningInfo {
         !self.has_execution_versioning_info()
             && self.build_id_search_attributes.is_empty()
             && self.most_recent_worker_version_stamp.is_none()
+            && self.last_notified_target_version.is_none()
+            && self.declined_target_version_upgrade.is_none()
     }
 }
 
@@ -972,6 +1043,26 @@ pub struct WorkerDeploymentVersionRef {
     pub deployment_name: String,
     /// Build identifier within the deployment.
     pub build_id: String,
+}
+
+/// Version target retained by per-run notification lineage.
+///
+/// `Option<VersionTarget>` is intentionally two-layered: `None` means no
+/// observation exists, while `Some(Unversioned)` preserves a present Temporal
+/// wrapper whose deployment Version is absent.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum VersionTarget {
+    /// The task queue currently routes to unversioned workers.
+    Unversioned,
+    /// The task queue currently routes to this concrete Deployment Version.
+    Deployment(WorkerDeploymentVersionRef),
+}
+
+impl VersionTarget {
+    /// Convert a runtime-resolved routing target into its durable lineage form.
+    pub fn from_deployment(version: Option<WorkerDeploymentVersionRef>) -> Self {
+        version.map_or(Self::Unversioned, Self::Deployment)
+    }
 }
 
 /// Workflow versioning behavior stored for a run.
@@ -996,6 +1087,12 @@ pub enum ContinueAsNewVersioningBehavior {
     AutoUpgrade,
     /// Start the new run using the ramping version.
     UseRampingVersion,
+    /// Unknown proto3 numeric value retained for wire-compatible round-trip.
+    ///
+    /// v1.31.0 treats every non-zero value except `USE_RAMPING_VERSION` as the
+    /// non-ramping AutoUpgrade successor path rather than rejecting it
+    /// (`service/history/workflow/mutable_state_impl.go @ v1.31.0`).
+    Unknown(i32),
 }
 
 /// Execution-scoped worker versioning override configuration.
@@ -1381,6 +1478,9 @@ mod tests {
         state.pending_workflow_task = Some(PendingWorkflowTask {
             task_type: WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
+            target_worker_deployment_version_changed: false,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
             logical_seq: LogicalTaskSeq(2),
             scheduled_event_id: 10,
             scheduled_at: now(),
@@ -1413,6 +1513,9 @@ mod tests {
         state.pending_workflow_task = Some(PendingWorkflowTask {
             task_type: WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
+            target_worker_deployment_version_changed: false,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
             logical_seq: LogicalTaskSeq(2),
             scheduled_event_id: 10,
             scheduled_at: now(),

@@ -1160,7 +1160,7 @@ impl ExecutionResolver for InMemoryExecutionResolver {
 }
 
 /// The subset of a run's internal mutable state exposed by the AdminService's
-/// `DescribeMutableState` — only what the reset conformance suite reads.
+/// `DescribeMutableState` for scoped conformance projections.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MutableStateSummary {
     /// The run's raw execution status.
@@ -1169,6 +1169,8 @@ pub struct MutableStateSummary {
     pub reset_run_id: Option<RunId>,
     /// The original run of the chain (`ExecutionInfo.OriginalExecutionRunId`).
     pub original_execution_run_id: Option<RunId>,
+    /// Current sticky task queue, if sticky affinity is active.
+    pub sticky_task_queue: Option<TaskQueueName>,
 }
 
 #[derive(Clone)]
@@ -1721,19 +1723,25 @@ impl WorkflowService {
         &self,
         namespace: &str,
         task_queue: &str,
+        task_kind: TaskKind,
         worker_identity: &str,
         deployment: Option<&DeploymentId>,
         build_id: Option<&BuildId>,
     ) {
-        // Record liveness only after deployment admission has succeeded. The
-        // max-version recovery path retains Temporal's ordinary active-poller delete
-        // gate (`service/worker/workerdeployment/workflow.go:1485-1504 @ v1.31.0`),
-        // while a rejected poll must not make its unregistered Version look active.
+        // This bounded observation precedes durable Deployment-Version registration:
+        // v1.31.0 updates the selected physical queue's poller history before
+        // `ensureRegisteredInDeploymentVersion` runs, so a query submitted as the
+        // poll begins cannot be falsely rejected as blackholed
+        // (`task_queue_partition_manager.go:601` and
+        // `physical_task_queue_manager.go:462-475 @ v1.31.0`). A registration
+        // rejection may consequently leave only this expiring, non-durable
+        // observation; it never admits the poll into runtime delivery.
         self.worker_registry.register(
             WorkerRegistrationKey {
                 worker_identity: WorkerIdentity(worker_identity.to_string()),
                 namespace_id: to_internal::namespace_id_for(namespace),
                 task_queue: TaskQueueName(task_queue.to_string()),
+                task_kind,
             },
             WorkerVersionMetadata {
                 deployment: deployment.cloned(),
@@ -3301,6 +3309,7 @@ impl WorkflowService {
             cron_schedule: None,
             reserved_poller_identity: None,
             eager_execution_accepted: false,
+            inherited_versioning_info: None,
         };
         self.schedule_store.acquire_start_permit(namespace_id).await;
         let outcome = self
@@ -3485,6 +3494,10 @@ impl WorkflowService {
         let sticky_preferred = state.sticky.as_ref().and_then(|affinity| {
             (affinity.expires_at > now).then_some(affinity.worker_identity.clone())
         });
+        let sticky_queue = state.sticky.as_ref().and_then(|affinity| {
+            (affinity.expires_at > now && !affinity.sticky_queue.0.is_empty())
+                .then_some(affinity.sticky_queue.clone())
+        });
         let sticky_deadline = state
             .sticky
             .as_ref()
@@ -3510,6 +3523,7 @@ impl WorkflowService {
                     query_args: query.query_args,
                     queue: queue.clone(),
                     sticky_preferred: sticky_preferred.clone(),
+                    sticky_queue: sticky_queue.clone(),
                     sticky_deadline,
                     response_tx: query.response_tx,
                 })
@@ -3921,6 +3935,14 @@ impl WorkflowService {
                     ),
                     WorkerIdentity(req.worker_identity.clone()),
                 );
+                self.record_worker_poll(
+                    &req.namespace,
+                    &req.task_queue,
+                    TaskKind::Workflow,
+                    &req.worker_identity,
+                    req.deployment.as_ref(),
+                    req.build_id.as_ref(),
+                );
                 // A versioned poll is admitted only after its deployment/version/task
                 // queue registration commits. v1.31.0 returns the registration limit
                 // failure to the poller (`physical_task_queue_manager.go:768-786`), so
@@ -3942,13 +3964,6 @@ impl WorkflowService {
                         })
                         .await?;
                 }
-                self.record_worker_poll(
-                    &req.namespace,
-                    &req.task_queue,
-                    &req.worker_identity,
-                    req.deployment.as_ref(),
-                    req.build_id.as_ref(),
-                );
                 let internal = to_internal::poll_request(req);
                 let scaling_queue = internal.queue.clone();
                 if internal.queue.deployment.is_some() {
@@ -5759,6 +5774,14 @@ impl WorkflowService {
                     ),
                     WorkerIdentity(req.worker_identity.clone()),
                 );
+                self.record_worker_poll(
+                    &req.namespace,
+                    &req.task_queue,
+                    TaskKind::Activity,
+                    &req.worker_identity,
+                    req.deployment.as_ref(),
+                    req.build_id.as_ref(),
+                );
                 // Activity polls use the same authoritative admission as workflow
                 // polls. Both task types are recorded, while the configured capacity
                 // counts distinct task-queue family names (`version_workflow.go:625-642
@@ -5779,13 +5802,6 @@ impl WorkflowService {
                         })
                         .await?;
                 }
-                self.record_worker_poll(
-                    &req.namespace,
-                    &req.task_queue,
-                    &req.worker_identity,
-                    req.deployment.as_ref(),
-                    req.build_id.as_ref(),
-                );
                 let internal = to_internal::poll_activity_request(req);
                 let scaling_queue = internal.queue.clone();
                 if internal.queue.deployment.is_some() {
@@ -7476,10 +7492,11 @@ impl WorkflowService {
         })
     }
 
-    /// Read the internal mutable-state summary a run — its raw status and the
-    /// `ResetRunId` link — for the AdminService's `DescribeMutableState`. Only the
-    /// fields the reset conformance suite reads are surfaced; this is deliberately
-    /// not the full persistence image.
+    /// Read the small internal mutable-state summary exposed by AdminService.
+    ///
+    /// This is deliberately not the full persistence image: reset tests consume
+    /// lineage/status, while the V3 conformance bridge consumes the current sticky
+    /// queue to reproduce HistoryService's read-only `GetMutableState` observation.
     pub async fn describe_mutable_state(
         &self,
         namespace: &str,
@@ -7502,6 +7519,7 @@ impl WorkflowService {
             status: state.status,
             reset_run_id: state.reset_run_id,
             original_execution_run_id: state.original_execution_run_id,
+            sticky_task_queue: state.sticky.map(|sticky| sticky.sticky_queue),
         })
     }
 
@@ -7761,6 +7779,10 @@ async fn append_transient_suffix(
                 request_id: format!("transient-{}-{}", pending.logical_seq.0, pending.attempt),
                 history_size_bytes: 0,
                 suggest_continue_as_new: false,
+                target_worker_deployment_version_changed: pending
+                    .target_worker_deployment_version_changed,
+                target_version_changed_enabled: pending.target_version_changed_enabled,
+                target_deployment_version: pending.target_deployment_version.clone(),
             },
         });
         principals.push(None);
@@ -8271,8 +8293,8 @@ mod tests {
     use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
     use tokeira_types::{
         BuildId, DeploymentId, ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext,
-        RequestId, RunId, RunKey, SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId,
-        WorkflowType,
+        RequestId, RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity,
+        WorkflowId, WorkflowType,
     };
 
     use crate::{
@@ -8571,6 +8593,7 @@ mod tests {
                 cron_schedule: None,
                 reserved_poller_identity: None,
                 eager_execution_accepted: false,
+                inherited_versioning_info: None,
             })
             .await?;
         assert!(matches!(result, CommitResult::Applied { .. }));
@@ -8590,6 +8613,7 @@ mod tests {
         service.record_worker_poll(
             "default",
             "queue-a",
+            TaskKind::Workflow,
             "worker-a",
             Some(&deployment),
             Some(&build_id),
@@ -8599,6 +8623,7 @@ mod tests {
             worker_identity: WorkerIdentity("worker-a".to_string()),
             namespace_id,
             task_queue: TaskQueueName("queue-a".to_string()),
+            task_kind: TaskKind::Workflow,
         });
         assert_eq!(metadata.deployment, Some(deployment));
         assert_eq!(metadata.build_id, Some(build_id));

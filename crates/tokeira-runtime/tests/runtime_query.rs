@@ -407,6 +407,7 @@ async fn start_workflow(
             cron_schedule: None,
             eager_execution_accepted: false,
             reserved_poller_identity: None,
+            inherited_versioning_info: None,
         })
         .await?;
     Ok(match result {

@@ -107,6 +107,9 @@ fn with_started_attempt1(mut state: WorkflowState) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -123,6 +126,9 @@ fn with_started_attempt2_virtual(mut state: WorkflowState) -> WorkflowState {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 10,
         scheduled_at: now(),
@@ -374,6 +380,9 @@ fn schedule_to_start_timeout_never_counts() {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: Some(now()),
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -460,6 +469,9 @@ fn poll_hint_does_not_clobber_real_sticky_affinity() {
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(3),
         scheduled_event_id: 8,
         scheduled_at: now(),
@@ -478,6 +490,8 @@ fn poll_hint_does_not_clobber_real_sticky_affinity() {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: Some(Duration::seconds(30)),
                 now: now(),
             }),

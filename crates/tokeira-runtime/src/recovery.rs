@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use time::OffsetDateTime;
-use tokeira_kernel::Command;
+use tokeira_kernel::{Command, LoadedRun};
 use tokeira_storage::{LeaseOutcome, LeaseRepository, RunRepository};
 use tokeira_types::{ShardEpoch, ShardId};
 use tokio::sync::oneshot;
@@ -43,11 +43,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     activity_timeout::{ActivityTrackingEntry, ActivityTrackingState},
     broker::{InMemoryActivityBroker, InMemoryBroker},
+    deployment_registry::DeploymentRegistry,
     lane::LaneHandle,
     nexus::{
         CompletionCallbackTrackingEntry, CompletionCallbackTrackingState, NexusTimeoutEntry,
         NexusTimeoutTrackingState,
     },
+    runtime::workflow_task::route_activity_task_queue,
     scanner::pick_lane_for_run_key,
     timeout::{WorkflowTimeoutEntry, WorkflowTimeoutTrackingState},
     wft_timeout::{WftTimeoutEntry, WftTimeoutKind, WftTimeoutTrackingState},
@@ -98,6 +100,46 @@ pub async fn sweep_shard<R>(
 where
     R: RunRepository + ?Sized,
 {
+    sweep_shard_with_registry(
+        shard_id,
+        repo,
+        broker,
+        activity_broker,
+        lanes,
+        lane_count,
+        workflow_timeout_tracking,
+        wft_timeout_tracking,
+        activity_tracking,
+        nexus_timeout_tracking,
+        completion_callback_tracking,
+        None,
+    )
+    .await
+}
+
+/// Reconstruct one shard while re-deriving deployment-aware activity queues.
+///
+/// A fully wired runtime supplies its shared deployment registry so physical
+/// queue coordinates stored before a routing change never regain correctness
+/// weight during recovery. Callers without Worker Deployment routing use the
+/// public [`sweep_shard`] wrapper.
+pub(crate) async fn sweep_shard_with_registry<R>(
+    shard_id: ShardId,
+    repo: &R,
+    broker: &InMemoryBroker,
+    activity_broker: &InMemoryActivityBroker,
+    lanes: &[LaneHandle],
+    lane_count: usize,
+    workflow_timeout_tracking: &WorkflowTimeoutTrackingState,
+    wft_timeout_tracking: &WftTimeoutTrackingState,
+    activity_tracking: &ActivityTrackingState,
+    nexus_timeout_tracking: &NexusTimeoutTrackingState,
+    completion_callback_tracking: &CompletionCallbackTrackingState,
+    deployment_registry: Option<&DeploymentRegistry>,
+) -> Result<SweepResult>
+where
+    R: RunRepository + ?Sized,
+{
     let mut result = SweepResult::default();
     let now = OffsetDateTime::now_utc();
 
@@ -122,10 +164,23 @@ where
         result.workflow_tasks_republished += 1;
     }
 
-    for task in repo
+    for mut task in repo
         .list_dispatchable_activity_tasks_for_shard(shard_id, usize::MAX)
         .await?
     {
+        if deployment_registry.is_some()
+            && let LoadedRun::Existing(state) = repo.load_run(task.run_key).await?
+        {
+            let (queue, dispatch_revision) = route_activity_task_queue(
+                deployment_registry,
+                &state,
+                task.queue,
+                task.dispatch_revision,
+            )
+            .await?;
+            task.queue = queue;
+            task.dispatch_revision = dispatch_revision;
+        }
         activity_broker.publish_activity_task(task, None).await?;
         result.activity_tasks_republished += 1;
     }
@@ -369,6 +424,9 @@ mod tests {
             pending_workflow_task: Some(PendingWorkflowTask {
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
+                target_worker_deployment_version_changed: false,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 logical_seq: LogicalTaskSeq(1),
                 scheduled_event_id: 1,
                 scheduled_at: fixed_now(),
@@ -475,6 +533,9 @@ mod tests {
         transition.next_state.pending_workflow_task = Some(PendingWorkflowTask {
             task_type: tokeira_kernel::WorkflowTaskType::Normal,
             schedule_to_start_deadline: None,
+            target_worker_deployment_version_changed: false,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
             logical_seq: LogicalTaskSeq(7),
             scheduled_event_id: 1,
             scheduled_at: fixed_now(),

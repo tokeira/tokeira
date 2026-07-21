@@ -2,10 +2,11 @@
 //!
 //! tokeira serves only `DescribeMutableState`, which the reset conformance suite
 //! (`TestWorkflowResetTestSuite`) uses to read a run's internal `ResetRunId` link
-//! and raw status. The response populates only `ExecutionInfo.reset_run_id` and
-//! `ExecutionState.status`; every other `WorkflowMutableState` field defaults (the
-//! proto's field numbers match the real persistence proto, so the harness client
-//! decodes it correctly). Every other AdminService RPC is `Unimplemented`.
+//! and raw status. It also exposes `ExecutionInfo.sticky_task_queue` for the
+//! conformance harness's scoped read-only HistoryService projection. Every other
+//! `WorkflowMutableState` field defaults (the proto's field numbers match the real
+//! persistence proto, so the harness client decodes it correctly). Every other
+//! AdminService RPC is `Unimplemented`.
 
 use tonic::{Request, Response, Status, codec::CompressionEncoding};
 
@@ -68,6 +69,10 @@ impl AdminServiceGrpcApi for AdminServiceGrpc {
                 original_execution_run_id: summary
                     .original_execution_run_id
                     .map(|id| id.0.to_string())
+                    .unwrap_or_default(),
+                sticky_task_queue: summary
+                    .sticky_task_queue
+                    .map(|queue| queue.0)
                     .unwrap_or_default(),
             }),
             execution_state: Some(WorkflowExecutionState {

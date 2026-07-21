@@ -313,6 +313,20 @@ pub struct StoredRoutingConfig {
     pub ramping_version_percentage_changed_time: Option<OffsetDateTime>,
     /// Monotonic routing revision.
     pub revision_number: i64,
+    /// Revision at which `current_version` last changed.
+    ///
+    /// Dispatch compares this target-specific revision with inherited
+    /// AutoUpgrade source state so a later ramp update cannot make an older
+    /// Current target appear newer (`chooseTargetQueueByFlag`,
+    /// `task_queue_partition_manager.go:2061-2078 @ v1.31.0`).
+    #[serde(default)]
+    pub current_version_revision_number: i64,
+    /// Revision at which the ramping Version or percentage last changed.
+    ///
+    /// Kept separately from the aggregate revision for the same no-bounce
+    /// comparison as `current_version_revision_number`.
+    #[serde(default)]
+    pub ramping_version_revision_number: i64,
 }
 
 impl Default for StoredRoutingConfig {
@@ -326,6 +340,8 @@ impl Default for StoredRoutingConfig {
             ramping_version_changed_time: None,
             ramping_version_percentage_changed_time: None,
             revision_number: 0,
+            current_version_revision_number: 0,
+            ramping_version_revision_number: 0,
         }
     }
 }
@@ -1244,13 +1260,21 @@ fn unix_epoch() -> OffsetDateTime {
     OffsetDateTime::UNIX_EPOCH
 }
 
-/// Build the complete post-transition workflow visibility image used by both
-/// storage backends.
+/// Build a complete workflow visibility image while retaining projection-owned
+/// historical worker-deployment observations from the preceding image.
 ///
-/// Keeping this producer in storage prevents the in-memory and DSQL logs from
-/// drifting on fields whose omission would freeze stale visibility values.
-pub(crate) fn workflow_projection_context(state: &WorkflowState) -> Result<ProjectionContext> {
-    projection_context(
+/// `TemporalUsedWorkerDeploymentVersions` is a visibility-only accumulator:
+/// v1.31.0 appends a version only after a WFT completes and preserves every
+/// earlier version (`addUsedDeploymentVersionToLoadedSearchAttribute`,
+/// `service/history/workflow/mutable_state_impl.go @ v1.31.0`). Tokeira keeps
+/// that read-model concern outside the kernel. Storage commits merge the prior
+/// atomically-written projection image so every emitted record remains a full
+/// post-transition snapshot and projection replay stays self-contained.
+pub(crate) fn workflow_projection_context_with_previous(
+    state: &WorkflowState,
+    previous: Option<&ProjectionContext>,
+) -> Result<ProjectionContext> {
+    let mut context = projection_context(
         state,
         if state.status.is_open() {
             VisibilityLifecycleState::Open
@@ -1259,7 +1283,39 @@ pub(crate) fn workflow_projection_context(state: &WorkflowState) -> Result<Proje
         },
         state.closed_at.unwrap_or(state.started_at),
         false,
-    )
+    )?;
+
+    let mut used_versions = previous
+        .and_then(|previous| {
+            previous
+                .search_attributes
+                .0
+                .get("TemporalUsedWorkerDeploymentVersions")
+        })
+        .and_then(|value| match value {
+            SearchAttrValue::KeywordList(values) => Some(values.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if let Some(SearchAttrValue::KeywordList(current)) = context
+        .search_attributes
+        .0
+        .get("TemporalUsedWorkerDeploymentVersions")
+    {
+        for version in current {
+            if !used_versions.contains(version) {
+                used_versions.push(version.clone());
+            }
+        }
+    }
+    if !used_versions.is_empty() {
+        context.search_attributes.0.insert(
+            "TemporalUsedWorkerDeploymentVersions".to_owned(),
+            SearchAttrValue::KeywordList(used_versions),
+        );
+    }
+
+    Ok(context)
 }
 
 /// Build the non-queryable high-water visibility image for a deleted run.
@@ -1292,20 +1348,34 @@ fn projection_context(
         SearchAttributes::default()
     } else {
         let mut search_attributes = state.search_attributes.clone();
-        if let Some(build_ids) = state
-            .versioning_info
-            .as_ref()
-            .map(|info| &info.build_id_search_attributes)
-            .filter(|build_ids| !build_ids.is_empty())
-        {
-            // BuildIds is server-managed visibility state, not a user SA and
-            // not part of continue-as-new inheritance. Project it from the
-            // history-derived per-run summary (`updateBuildIdsAndDeploymentSearchAttributes`,
-            // mutable_state_impl.go @ v1.31.0).
-            search_attributes.0.insert(
-                "BuildIds".to_owned(),
-                SearchAttrValue::KeywordList(build_ids.clone()),
-            );
+        if let Some(info) = state.versioning_info.as_ref() {
+            let mut build_ids = info.build_id_search_attributes.clone();
+            build_ids.retain(|value| !value.starts_with("pinned:"));
+            if state.effective_behavior() == VersioningBehavior::Pinned
+                && let Some(version) = state.effective_deployment()
+                && !version.deployment_name.is_empty()
+                && !version.build_id.is_empty()
+            {
+                // v1.31.0 replaces any prior pinned reachability tag with the
+                // effective pinned version and puts it first
+                // (`addBuildIdToLoadedSearchAttribute`,
+                // mutable_state_impl.go @ v1.31.0). This is visibility state,
+                // so deriving it here avoids mutating authoritative history.
+                build_ids.insert(
+                    0,
+                    format!("pinned:{}:{}", version.deployment_name, version.build_id),
+                );
+            }
+            if !build_ids.is_empty() {
+                // BuildIds is server-managed visibility state, not a user SA and
+                // not part of continue-as-new inheritance. Project it from the
+                // history-derived per-run summary (`updateBuildIdsAndDeploymentSearchAttributes`,
+                // mutable_state_impl.go @ v1.31.0).
+                search_attributes.0.insert(
+                    "BuildIds".to_owned(),
+                    SearchAttrValue::KeywordList(build_ids),
+                );
+            }
         }
         if let Some(info) = state.versioning_info.as_ref() {
             // These are mutable-state-derived visibility attributes, not client-authored
@@ -1361,6 +1431,22 @@ fn projection_context(
                 search_attributes.0.insert(
                     "TemporalWorkflowVersioningBehavior".to_owned(),
                     SearchAttrValue::Keyword(behavior.to_owned()),
+                );
+            }
+            if let Some(version) = info.deployment_version.as_ref().filter(|version| {
+                !version.deployment_name.is_empty() && !version.build_id.is_empty()
+            }) {
+                // Only a successfully completed WFT populates
+                // `deployment_version`; a start-time pinned override therefore
+                // cannot appear in the used-version index prematurely. Storage
+                // folds this observation into the preceding projection image
+                // above, matching v1.31.0's completion-side update.
+                search_attributes.0.insert(
+                    "TemporalUsedWorkerDeploymentVersions".to_owned(),
+                    SearchAttrValue::KeywordList(vec![format!(
+                        "{}:{}",
+                        version.deployment_name, version.build_id
+                    )]),
                 );
             }
         }

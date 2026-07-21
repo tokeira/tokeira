@@ -22,6 +22,10 @@ application**. It does four things:
 4. **Validates and reactivates pinned targets** through runtime-scoped TTL caches shared
    by every public path, while keeping queue publication a derived effect of durable
    registry and per-run state.
+5. **Completes v1.31.0 Continue-as-New and target-change semantics** by resolving
+   deployment and task-queue inputs in runtime, applying the notification state machine
+   through the pure kernel transition, and recording inherited/declined decisions in
+   authoritative history.
 
 The wire shapes are derived from the vendored API `v1.62.11`
 (`proto/upstream/temporal/api/deployment/v1/message.proto`,
@@ -58,6 +62,12 @@ restored on replay — so it belongs on the kernel `WorkflowState`, exactly like
 recently added `cancel_requested` and `root_*` fields
 (`crates/tokeira-kernel/src/state.rs`). It is consumed at dispatch time to decide
 routing and projected by `DescribeWorkflowExecution`.
+
+The kernel does not retain that state between invocations. Runtime/storage load a
+`WorkflowState`, invoke the stateless transition evaluator, and durably commit the
+returned `next_state` and events. Target-notification lineage follows this existing
+model: it is part of the stored per-run state image because it changes future history,
+but the kernel owns no cache, registry, connection, or background process.
 
 ## Dependencies and Non-Goals
 
@@ -97,6 +107,9 @@ routing and projected by `DescribeWorkflowExecution`.
   `COMPLETED` (`service/worker/workerdeployment/client.go:1759 @ v1.31.0`). Tokeira
   commits routing synchronously, so there are no propagating revisions and the field is
   reported `COMPLETED` once the registry write commits.
+- **Deployment-registry or task-queue-membership access from the kernel** remains
+  prohibited. Runtime resolves all such inputs before the transition. The kernel only
+  applies deterministic rules to the supplied target and inherited-versioning decision.
 
 ## Architecture
 
@@ -162,6 +175,100 @@ already in-flight transition is also rejected (`recordactivitytaskstarted/api.go
 v1.31.0`). The transition is completed at WFT completion
 (`service/history/workflow/workflow_task_state_machine.go`
 `afterAddWorkflowTaskCompletedEvent @ v1.31.0`).
+
+Three dispatch refinements preserve that behavior without importing Temporal's
+matching/history service topology:
+
+1. A speculative WFT may calculate the differing poller Version for its response, but
+   its start must not commit the transition. v1.31.0 marks the mutable-state write as a
+   no-op for speculative starts and applies the completing worker's Version only if the
+   speculative WFT commits (`recordworkflowtaskstarted/api.go:178-197 @ v1.31.0`).
+   Tokeira therefore suppresses the transition operand before invoking the pure kernel;
+   its existing speculative completion/rollback transition decides whether the
+   worker-reported Version becomes authoritative.
+2. An activity-start lookup normally derives the workflow task queue's routing config
+   from the run's effective/recorded Deployment. An unversioned run has neither. In that
+   case the runtime uses the activity poller's Deployment solely as the registry lookup
+   hint, still resolving the workflow task queue (not the activity queue) before it
+   decides whether to start a transition. This is Tokeira's registry-shaped equivalent
+   of `getDeploymentVersionAndRevisionNumberForWorkflowID`
+   (`recordactivitytaskstarted/api.go:195-225 @ v1.31.0`). Starting that transition also
+   regenerates delivery for an unstarted, non-speculative pending WFT. v1.31.0 bumps its
+   workflow-task stamp and generates another scheduling task without adding history
+   (`mutable_state_impl.go:9178-9212 @ v1.31.0`). Tokeira uses a new internal
+   `logical_seq` as the equivalent stale-offer fence and emits a replacement
+   `EnqueueWorkflowTask` effect from the pure transition; the runtime remains the only
+   layer that performs the queue write.
+3. Sticky queues have no versioned physical queues in v1.31.0. If Current/Ramping moves
+   away from the sticky worker's Version, matching returns `StickyWorkerUnavailable`
+   and history retries the task on its normal queue
+   (`task_queue_partition_manager.go:1918-1930 @ v1.31.0`). Tokeira compares the
+   normal-family resolved target with the sticky offer's Version. If an older dispatch
+   envelope omits deployment coordinates, the runtime first hydrates that sticky Version
+   from the run's committed effective Version; resolving the sticky side through Current
+   would erase the old-vs-new comparison and incorrectly migrate pinned work. On a real
+   mismatch Tokeira clears the disposable sticky coordinate and publishes the normal task
+   directly at the new target. The committed pending WFT remains authoritative throughout.
+
+At the gRPC boundary, both poll request translators retain the task-queue kind long
+enough to enforce v1.31.0's shared frontend validation: a sticky queue with empty
+`normal_name` is invalid whenever deployment options are present or legacy
+`use_versioning` is true (`workflow_handler.go:6356-6375 @ v1.31.0`). Validation occurs
+before standalone-activity fallback, poller registration, or long-poll admission.
+
+### Target notification and Continue-as-New path (Requirement 15)
+
+```mermaid
+flowchart TD
+    Registry[("WorkerDeploymentRepository")] --> Resolve["runtime resolves current/ramping target<br/>and cross-TQ Version membership"]
+    Policy["runtime policy<br/>system.enableSendTargetVersionChanged"] --> WftInput["StartWorkflowTaskRequest<br/>target + enabled"]
+    Resolve --> WftInput
+    State["storage-loaded WorkflowState"] --> Kernel["pure kernel transition"]
+    WftInput --> Kernel
+    Kernel --> WftEvent["WorkflowTaskStarted<br/>target-change flag"]
+    Kernel --> NextState["next_state<br/>notified/declined lineage"]
+    EdgeCommand["edge preserves CaN<br/>initial_versioning_behavior"] --> Prepare["runtime prepares successor decision"]
+    Registry --> Prepare
+    State --> Prepare
+    Prepare --> Kernel
+    Kernel --> CloseEvent["WorkflowExecutionContinuedAsNew<br/>initial behavior + successor decision"]
+    CloseEvent --> Successor["runtime submits StartRequest<br/>with inherited versioning info"]
+    Successor --> KernelStart["pure kernel Start transition"]
+    KernelStart --> StartedEvent["WorkflowExecutionStarted<br/>inherited / declined fields"]
+    Kernel --> ChildDispatch["committed child-start dispatch"]
+    ChildDispatch --> ChildResolve["runtime loads committed parent<br/>and resolves Version membership"]
+    Registry --> ChildResolve
+    ChildResolve --> KernelStart
+```
+
+The runtime resolves the mutable control-plane facts before invoking the kernel. At WFT
+start it supplies the concrete target (`None` means the unversioned target) and the
+notification-policy boolean. At WFT completion it first projects the completion's
+worker-reported behavior, Deployment Version, and Worker Deployment name onto a clone
+of the loaded predecessor, then enriches the single terminal Continue-as-New command
+with a concrete successor decision after reading cross-task-queue Version membership.
+This ordering is observable when a workflow's first WFT reports `PINNED` and issues
+Continue-as-New in that same completion: v1.31.0 applies
+`afterAddWorkflowTaskCompletedEvent` before handling commands, so the successor sees
+the reported `PINNED` state (`workflow_task_state_machine.go` and
+`mutable_state_impl.go:2485-2630 @ v1.31.0`). The kernel never performs the mutable
+reads; it atomically applies the already-resolved inputs to the same transition that
+authors the public history.
+
+Child starts use the same architectural boundary without pretending that they are
+Continue-as-New successors. The derived child-start publisher loads the already-
+committed parent, so a behavior or Version reported by the completion that issued the
+child command is visible. It resolves cross-task-queue Version membership in the
+runtime and supplies concrete `inherited_versioning_info` on the child's `StartRequest`.
+This is Tokeira's equivalent of the observable child-start inheritance assembled in
+`service/history/transfer_queue_active_task_executor.go:915-979 @ v1.31.0`; it does not
+introduce Temporal's transfer/matching architecture.
+
+The production policy is the v1.31.0 default `true`
+(`common/dynamicconfig/constants.go:931-935 @ v1.31.0`). Conformance builds consult the
+live override for `system.enableSendTargetVersionChanged` at the runtime call site so
+the corpus's scoped `true`/`false` modes exercise the same transition without exposing
+Temporal dynamic configuration as a Tokeira production setting.
 
 ## Components and Interfaces
 
@@ -282,6 +389,21 @@ runtime accessors. Production builds return those constants; conformance builds 
 read a delivered override at the same consult site. No mutable configuration reaches
 the kernel.
 
+Poller presence and durable registration deliberately have different ordering and
+weight. Once the edge has resolved the physical Deployment-Version queue it records
+the poll in the runtime's bounded `WorkerRegistry`, then awaits the durable registry
+mutation before entering broker delivery. This prevents a query submitted concurrently
+with a newly-started poll from observing a false blackhole. It also matches v1.31.0's
+ordering, where `UpdatePollerInfo` precedes
+`ensureRegisteredInDeploymentVersion`; a rejected registration can leave an expiring
+poller-history observation but cannot create durable Deployment state
+(`task_queue_partition_manager.go:601` and
+`physical_task_queue_manager.go:462-475 @ v1.31.0`).
+Observations are keyed by physical Deployment Version as well as identity: one SDK
+process may poll v1 and v2 under the same worker identity, and the later v2 poll must
+not erase v1's still-live history. This is the direct Tokeira equivalent of v1.31.0's
+per-physical-queue `pollerHistory` ownership (`poller_history.go @ v1.31.0`).
+
 At the Version limit, every add path (explicit create, poll auto-create, and
 `allow_no_pollers` auto-create) sorts Versions by `(create_time, build_id)` and removes
 the first candidate satisfying the normal current/ramping, recent-poller, and drainage
@@ -388,10 +510,23 @@ pub struct WorkflowVersioningInfo {
     pub revision_number: i64,
     /// CaN initial behavior, only for the first task of this run / its retries.
     pub continue_as_new_initial_versioning_behavior: ContinueAsNewVersioningBehavior,
+    /// Target most recently exposed through WorkflowTaskStarted.
+    #[serde(default)]
+    pub last_notified_target_version: Option<VersionTarget>,
+    /// Target declined by this Continue-as-New chain.
+    #[serde(default)]
+    pub declined_target_version_upgrade: Option<VersionTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerDeploymentVersionRef { pub deployment_name: String, pub build_id: String }
+
+/// `None`, unversioned, and concrete Version are observably distinct on the wire.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum VersionTarget {
+    Unversioned,
+    Deployment(WorkerDeploymentVersionRef),
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VersioningOverride {
@@ -399,6 +534,21 @@ pub enum VersioningOverride {
     AutoUpgrade,
 }
 ```
+
+`Option<VersionTarget>` deliberately uses both layers: outer `None` means no target has
+been notified/declined, `Some(Unversioned)` represents the protobuf wrapper being
+present with no deployment Version, and `Some(Deployment(_))` represents a concrete
+Version. Collapsing the first two would break
+`TestPinnedCaN_NeverSignaled_NewRunGetsSignalForUnversioned` and the wrapper semantics of
+`WorkflowExecutionStartedEventAttributes.declined_target_version_upgrade`
+(`history/v1/message.proto:198-216`). These values are retained by storage as part of
+`WorkflowState`; the kernel instance retains nothing.
+
+`ContinueAsNewVersioningBehavior` gains `Unknown(i32)` so proto3 unknown numeric enum
+values round-trip through the command and close event. v1.31.0 does not validate this
+field: any non-zero value prevents pinned inheritance, and only the known
+`USE_RAMPING_VERSION` value selects ramping-first routing
+(`mutable_state_impl.go:2494-2532,2621-2629,9130-9141 @ v1.31.0`).
 
 `WorkflowState` gains `#[serde(default)] pub versioning_info: Option<WorkflowVersioningInfo>`
 (absent == unversioned, matching the proto: "Absent value means the workflow execution
@@ -420,6 +570,11 @@ methods (pure):
   (transition > override > behavior+deployment_version), the Tokeira analog of
   `GetEffectiveDeployment` / `GetEffectiveVersioningBehavior`
   (`service/history/workflow/util.go @ v1.31.0`).
+- `apply_target_version_observation(enabled, target)` — applies the five-way v1.31.0
+  notification decision (override suppression, AutoUpgrade suppression, equal-target
+  reset, declined-target suppression, otherwise notify) and returns the event boolean.
+  It mutates only the supplied state image and is called inside the existing WFT-start
+  transition (`workflow_task_state_machine.go:495-532 @ v1.31.0`).
 
 ### Kernel command + event additions (`command.rs`, `event.rs`, `kernel.rs`)
 
@@ -434,6 +589,60 @@ methods (pure):
   extend it with `deployment_version` and `versioning_behavior` (persisted by
   wft-completion) so `apply_wft_versioning` runs deterministically on both the live
   transition and replay.
+- `StartWorkflowTaskRequest` gains `target_version_changed_enabled: bool` and
+  `target_deployment_version: Option<WorkerDeploymentVersionRef>`. The latter is a
+  concrete runtime-resolved Version; `None` means the unversioned target whenever the
+  enable bit is true. The kernel does not receive a registry handle or a resolver.
+- `PendingWorkflowTask` and `HistoryEventKind::WorkflowTaskStarted` gain the resolved
+  `target_worker_deployment_version_changed: bool` plus private replay operands
+  `target_version_changed_enabled: bool` and
+  `target_deployment_version: Option<WorkerDeploymentVersionRef>`. Retaining all three
+  on the pending task is necessary because transient/speculative WFT starts may
+  materialize their started event later; the materialized internal history must carry
+  both the public decision and enough input to reconstruct its lineage effects without
+  consulting the mutable registry. The edge exposes only the public Boolean
+  (`workflow_task_state_machine.go:190-224,485-532 @ v1.31.0`).
+- `WorkflowCommand::ContinueAsNew` gains
+  `initial_versioning_behavior: ContinueAsNewVersioningBehavior` and
+  `successor_versioning_info: Option<WorkflowVersioningInfo>`. Edge initializes the
+  behavior from the wire; runtime enriches the successor info before submitting the
+  completion; kernel passes both through to
+  `HistoryEventKind::WorkflowExecutionContinuedAsNew`.
+- `StartRequest` gains
+  `inherited_versioning_info: Option<WorkflowVersioningInfo>`. Runtime copies the
+  committed Continue-as-New event's concrete decision into the successor start. The
+  kernel combines that inheritance state with the existing explicit
+  `versioning_override`, initializes `next_state.versioning_info`, and authors the same
+  values on `WorkflowExecutionStartedV2`.
+
+All new serializable fields are appended and `#[serde(default)]` where an older
+postcard shape can omit them. The existing pre-baseline posture remains the migration
+reason; old-shape deserialization tests are retained as forward guards rather than
+assuming postcard is self-describing.
+
+### Edge command and history translation (`crates/tokeira-edge/src/grpc/translate.rs`, `translate/history_serializer.rs`)
+
+`proto_command_to_workflow_command` preserves the raw
+`ContinueAsNewWorkflowExecutionCommandAttributes.initial_versioning_behavior`, mapping
+known values to named variants and every other integer to `Unknown(i32)`. The reverse
+translator and `WorkflowExecutionContinuedAsNew` serializer emit the same integer.
+
+The history serializer maps the internal start decision to the mutually exclusive
+public fields:
+
+- PINNED inherited behavior → `inherited_pinned_version`;
+- AUTO_UPGRADE inherited behavior with a source Version and non-zero revision →
+  `inherited_auto_upgrade_info` containing the source Version, revision, and CaN
+  initial behavior;
+- `declined_target_version_upgrade` outer presence follows
+  `Option<VersionTarget>`, with `Unversioned` encoded as a present wrapper whose
+  `deployment_version` is absent;
+- `WorkflowTaskStarted.target_worker_deployment_version_changed` is copied verbatim
+  from the internal event. Its private policy/target replay operands are never exposed
+  on the Temporal event.
+
+The internal event continues to carry the full `WorkflowVersioningInfo` used by replay;
+the edge does not recompute a placement or notification decision while serializing.
 
 ### Runtime dispatch integration (`crates/tokeira-runtime/src/runtime/workflow_task.rs`, `runtime/activity.rs`, `publisher.rs`)
 
@@ -464,6 +673,113 @@ queue from the deployment registry's routing config:
 
 Routing decisions are derived effects of durable registry + per-run state; no
 correctness weight rests on transient queues (Requirement 13.6).
+
+#### WFT target-notification input
+
+`start_polled_workflow_task` already calls `resolve_polled_workflow_task_target` before
+submitting `Command::WorkflowTaskStarted`. It reuses that routing result as the
+notification target and supplies `target_version_changed_enabled()` alongside it. The
+production helper returns the v1.31.0 default `true`; under the `conformance` feature it
+reads `system.enableSendTargetVersionChanged` from `tokeira-conformance` with the same
+default. The key is added to the conformance override catalog as a namespace Boolean.
+
+The routing target used for this notification is the task queue's Current/Ramping target,
+not the pinned dispatch destination. Accordingly the runtime keeps two values in the
+resolved-start structure: the existing effective dispatch target and the routing-config
+target offered for notification comparison. This mirrors the observable operands of
+`AddWorkflowTaskStartedEvent(..., targetDeploymentVersion)` without importing
+Temporal's matching/history split.
+
+#### Continue-as-New successor preparation
+
+Before `complete_workflow_task` submits the completion, it loads the token-validated run
+state and enriches the terminal Continue-as-New command with a pure
+`resolve_continue_as_new_versioning` decision. The resolver takes:
+
+```rust
+fn resolve_continue_as_new_versioning(
+    post_completion_predecessor: &WorkflowState,
+    successor_task_queue: &TaskQueueName,
+    initial_behavior: ContinueAsNewVersioningBehavior,
+    source_version_has_successor_queue: bool,
+    pinned_override_has_successor_queue: bool,
+) -> Option<WorkflowVersioningInfo>;
+```
+
+Runtime obtains the two membership booleans from the shared `DeploymentRegistry`. Same
+task queue means membership is already established and needs no repository read;
+cross-task-queue membership is checked at workflow-task-family granularity. A new
+boolean-returning registry method shares the existing positive/negative membership cache
+but treats absence as `false` rather than turning normal non-inheritance into a public
+`FAILED_PRECONDITION`.
+
+The `post_completion_predecessor` is an ephemeral clone, not retained kernel or runtime
+state. Runtime applies the same pure `WorkflowState::apply_wft_versioning` operation the
+kernel will apply in the authoritative completion transition before it determines the
+effective source Version or performs membership reads. This preserves v1.31.0's
+completion-before-command ordering without moving registry access into the kernel or
+making the clone authoritative.
+
+The resolver follows `mutable_state_impl.go:2485-2630 @ v1.31.0`:
+
+1. An effective PINNED predecessor plus `UNSPECIFIED` initial behavior inherits its
+   effective Version only when the successor queue belongs to that Version.
+2. An effective AUTO_UPGRADE predecessor, or a PINNED predecessor with any non-zero
+   initial behavior, carries source Version + revision as initial AutoUpgrade state only
+   when both exist and the successor queue belongs to that source Version.
+3. A compatible pinned override is carried independently and retains effective
+   precedence over inherited AutoUpgrade/ramping behavior.
+4. For ordinary inherited AutoUpgrade first tasks, normal Current/Ramping selection
+   wins when its target belongs to a different Deployment or its routing revision is at
+   least the inherited source revision. An older target revision in the same Deployment
+   retains the inherited source Version to prevent bounce-back
+   (`chooseTargetQueueByFlag`, `task_queue_partition_manager.go:2061-2078 @ v1.31.0`).
+   Tokeira's centralized `StoredRoutingConfig` retains separate Current and Ramping
+   field revisions alongside the aggregate revision. This preserves the observable
+   comparison without introducing Temporal's independently propagated matching data.
+5. `USE_RAMPING_VERSION` makes only the successor's first WFT (and retry first WFTs)
+   select the ramping Version directly, falling back to Current when no ramping target
+   exists. Later WFTs resume normal percentage routing.
+6. The successor's declined target is `last_notified_target_version` when present,
+   otherwise the predecessor's existing `declined_target_version_upgrade`.
+
+The enriched command commits the decision with the predecessor close. Lane successor
+creation reads the committed event, not a volatile map, and copies its decision into
+`StartRequest.inherited_versioning_info`. If the derived start is retried after a crash,
+the event supplies identical operands and the deterministic successor request id still
+deduplicates the start.
+
+Workflow retry successors use the same start input without pretending that a retry is a
+new CaN decision. `start_retry_successor` already reads the predecessor's
+`WorkflowExecutionStarted` event for original input; it also reads that event's initial
+versioning info. A retry inherits pinned placement only when that predecessor itself
+started with inherited pinned state, while an AutoUpgrade predecessor carries its
+current effective source Version/revision and the stored
+`continue_as_new_initial_versioning_behavior`. The retry preserves the declined target
+from the predecessor's started event, not a target merely notified later in that failed
+run (`service/history/workflow/retry.go:253-338 @ v1.31.0`). This makes
+`USE_RAMPING_VERSION` apply to the first WFT of every retry as specified, without
+propagating it to an unrelated future CaN command.
+
+#### Child-start versioning inheritance
+
+After the parent completion commits, `RuntimeDispatchPublisher` loads that committed
+parent and calls a pure `resolve_child_versioning` helper with runtime-resolved
+membership booleans. Same-queue, same-namespace inheritance needs no registry read;
+cross-queue inheritance requires workflow-task-family membership in the effective
+source Version, and cross-namespace children inherit no v3 versioning state. Effective
+PINNED state carries the source Version, a compatible pinned override is copied, and
+effective AUTO_UPGRADE carries source Version plus revision when both are concrete.
+
+The child helper always writes
+`continue_as_new_initial_versioning_behavior = UNSPECIFIED`. The parent's
+`USE_RAMPING_VERSION` flag was an instruction for that parent's initial WFT only and is
+not lineage state. This matches
+`transfer_queue_active_task_executor.go:950-979 @ v1.31.0`, which constructs child
+`InheritedAutoUpgradeInfo` from the committed parent but explicitly sets the initial
+behavior to unspecified. Registry/storage failure leaves the derived child start
+unpublished rather than silently starting an incorrectly routed execution; the parent
+history remains authoritative for recovery.
 
 ### Pinned membership and reactivation (`deployment_registry.rs`, edge/runtime adapters)
 
@@ -624,6 +940,39 @@ deprecated `deployment` (2), `version` (5), and `deployment_transition` (4) are 
 stored; describe leaves them default. `worker_deployment_name` projects from the
 run's `worker_deployment_name` (the deployment that completed the most recent WFT,
 `WorkflowExecutionInfo.worker_deployment_name`, field 23).
+
+The two internal target-lineage fields are not members of public
+`WorkflowExecutionVersioningInfo`; they map instead to history behavior:
+
+| Internal field | Public/history contract |
+|---|---|
+| `last_notified_target_version: Option<VersionTarget>` | Determines whether a CaN that does not accept the offered target records it as declined; public WFT history records only the corresponding Boolean, while internal history retains the policy/target replay operands |
+| `declined_target_version_upgrade: Option<VersionTarget>` | `WorkflowExecutionStartedEventAttributes.declined_target_version_upgrade` (40); outer absence versus present-unversioned is preserved |
+| `PendingWorkflowTask.target_worker_deployment_version_changed` + private policy/target operands | `WorkflowTaskStartedEventAttributes.target_worker_deployment_version_changed` (9), including late materialization; private operands make lineage replay independent of the registry |
+
+These fields participate in internal event/replay equality but do not by themselves
+manufacture a non-empty `WorkflowExecutionInfo.versioning_info` for an otherwise
+unversioned run. `has_execution_versioning_info()` continues to consider only the public
+versioning-info fields; replay still retains the internal lineage.
+
+### Continue-as-New start mapping
+
+`WorkflowExecutionStartedV2.versioning_info` is the single internal event payload used
+for replay. Serialization derives the public start attributes as follows:
+
+| Internal decision | Started-event fields | Initial effective state |
+|---|---|---|
+| behavior PINNED + deployment Version | `inherited_pinned_version` | PINNED on that Version |
+| behavior AUTO_UPGRADE + source Version + non-zero revision | `inherited_auto_upgrade_info` | AUTO_UPGRADE with source Version/revision; initial CaN behavior retained |
+| compatible pinned override | `versioning_override` in addition to either row above | Override wins effective routing |
+| declined `Unversioned` | present `declined_target_version_upgrade`, absent nested Version | lineage distinguishes unversioned from never notified |
+| declined concrete Version | present wrapper + nested Version | same concrete declined target |
+| no inherited behavior/override/lineage | all fields absent | unversioned default |
+
+`WorkflowExecutionContinuedAsNew.initial_versioning_behavior` always carries the raw
+known/unknown numeric value from the command. The internal close event additionally
+carries the full successor decision because Tokeira's runtime creates the successor
+from that committed event rather than from a Temporal history-service request object.
 
 ### Describe projection mapping (Requirement 10)
 
@@ -829,7 +1178,13 @@ completion: in v1.31.0 it is assigned only in `StartDeploymentTransition`
 (`mutable_state_impl.go:2963 @ v1.31.0`); `afterAddWorkflowTaskCompletedEvent`
 (`workflow_task_state_machine.go:1283-1396 @ v1.31.0`) never assigns it.
 
-**Validates: Requirements 9.2, 9.5, 9.6**
+The generated cases additionally distinguish normal/transient WFT starts (which may
+commit a transition) from speculative starts (which must not), and cover the
+unversioned-run activity lookup fallback plus sticky-target migration. Poll translation
+tests cover workflow and activity requests with deployment options and legacy
+capabilities.
+
+**Validates: Requirements 9.2, 9.5, 9.6, 15.41, 15.42, 15.43, 15.44**
 
 ### Property 14: Versioning-info projection fidelity
 
@@ -911,6 +1266,63 @@ permits a later reactivation. Failures and non-pinned/no-change inputs never rea
 
 **Validates: Requirements 14.3, 14.4, 14.5, 14.6**
 
+### Property 22: Target-change notification state machine
+
+*For any* notification-enable value, effective behavior, optional override, effective
+Version target, routing-config Version target (including unversioned), last-notified
+target, and declined target, applying a workflow-task-start transition matches the
+v1.31.0 reference model: disabled and unversioned/AutoUpgrade executions never notify;
+an override suppresses notification and clears both lineage values; an effective target
+equal to the routing target suppresses notification and clears both lineage values; a
+target equal to the declined target suppresses notification without changing that
+decline; every other pinned target difference emits true, stores that target as
+last-notified, and clears the prior decline. Repeating the transition with identical
+inputs is deterministic, and concrete/unversioned/absent targets remain distinct.
+
+**Validates: Requirements 15.2, 15.3, 15.4, 15.5, 15.6, 15.7, 15.8, 15.9, 15.10, 15.11, 15.30, 15.31, 15.32**
+
+### Property 23: Continue-as-New versioning decision
+
+*For any* predecessor versioning state, worker-reported completion behavior/Version,
+same/cross-task-queue choice, generated source and override membership booleans, routing
+config, known or unknown initial behavior, and notification lineage,
+`resolve_continue_as_new_versioning` matches a reference model after applying the same
+completion-before-command projection: unspecified PINNED inherits only a compatible
+source Version; AUTO_UPGRADE or a non-zero PINNED initial behavior carries compatible
+source Version/revision as initial AutoUpgrade state; a compatible pinned override
+retains precedence; known
+ordinary inherited AutoUpgrade first-task placement follows the same-Deployment
+revision comparison; `USE_RAMPING_VERSION` selects ramping then Current only for the
+initial WFT; unknown non-zero values take non-ramping AutoUpgrade; and the successor decline is
+last-notified-or-existing-declined. A later CaN with unspecified behavior does not
+inherit an earlier command's explicit behavior. For retries, the same model carries the
+stored initial behavior/source revision and started-event decline, while pinned
+inheritance occurs only when the failed run itself began with inherited pinned state.
+
+**Validates: Requirements 15.14, 15.15, 15.16, 15.17, 15.18, 15.20, 15.21, 15.22, 15.23, 15.25, 15.26, 15.34, 15.35, 15.36**
+
+### Property 24: Versioning history and replay round-trip
+
+*For any* target-notification result and private policy/target replay operands, inherited
+pinned/AutoUpgrade decision, declined target (absent, unversioned, or concrete),
+override, and known/unknown CaN initial behavior, serializing the internal events emits the exact public
+`WorkflowTaskStarted`, `WorkflowExecutionContinuedAsNew`, and
+`WorkflowExecutionStarted` fields; replaying those internal events restores equal
+per-run versioning and lineage state. Mutually exclusive inherited fields are never
+emitted together, private replay operands never leak to the public event, and a
+late-materialized WFT-start event preserves its original decision and operands.
+
+**Validates: Requirements 15.12, 15.13, 15.24, 15.27, 15.29, 15.33**
+
+### Property 25: Runtime-resolved boundary determinism
+
+*For any* loaded run, routing config, task queue, membership results, and policy value,
+the runtime supplies concrete target/successor operands before kernel invocation, and
+repeated pure-kernel evaluation of the same loaded state and command yields equal next
+state and history without consulting a registry, cache, clock, queue, or I/O source.
+
+**Validates: Requirements 15.1, 15.2, 15.19, 15.22, 15.28, 15.37, 15.38, 15.39, 15.40**
+
 ## Error Handling
 
 The runtime registry returns `RegistryError`; the edge maps it to `EdgeError`, which
@@ -937,6 +1349,8 @@ action_name) and `grpc/errors.rs` (tonic mapping) get entries for the new varian
 | Ramping version equals non-nil Current | `FailedPrecondition` | `FailedPrecondition` | `FAILED_PRECONDITION` |
 | Missing target membership for a still-owned queue with backlog/add-rate, guard flag false | `FailedPrecondition` (v1.31.0 `ErrCurrentVersionDoesNotHaveAllTaskQueues` / `ErrRampingVersionDoesNotHaveAllTaskQueues`) | `FailedPrecondition` | `FAILED_PRECONDITION` |
 | Pinned run cannot transition (dispatch path) | kernel `ErrPinnedWorkflowCannotTransition` → drop stale task | n/a (matching drops) | n/a |
+| Cross-task-queue CaN Version membership absent | normal non-inheritance decision | n/a | no error; successor follows its eligible initial routing |
+| Registry/storage read fails while preparing CaN operands | runtime error before WFT completion submission | `Internal` | `INTERNAL`; predecessor WFT remains uncompleted |
 | 5 deprecated `Deployment` companions | n/a (no state access) | `Unimplemented` (exact v1.31.0 message) | `UNIMPLEMENTED` |
 
 The 13 v2 RPCs never return `UNIMPLEMENTED` (Requirement 12.5). `EdgeError::Internal`
@@ -946,7 +1360,7 @@ is not used for any of these user-facing conditions.
 
 ### Dual testing approach
 
-- **Property tests (proptest, required)** implement Properties 1–19, each tagged
+- **Property tests (proptest, required)** implement Properties 1–25, each tagged
   `// Feature: worker-deployments, Property N: <text>` and configured for a minimum of
   100 iterations. They use a reference model for the CRUD/state-machine properties
   (Properties 1, 3, 5, 8, 9), deterministic generators for routing and ids
@@ -955,6 +1369,13 @@ is not used for any of these user-facing conditions.
   `.`/`:`/`__`, out-of-range percentages, bad mask paths, overlapping upsert/remove
   sets, unknown build_ids) so the validation and `NO mutation on rejection` properties
   (Properties 6, 7, 16) exercise them.
+  The target-notification model generates all combinations of enabled state, behavior,
+  override, effective/target/declined values (Property 22); the CaN model generates
+  same/cross-queue membership, known/unknown initial behavior, source revision, routing
+  config, and lineage (Property 23); event/replay generators cover
+  absent/unversioned/concrete wrappers and late WFT materialization (Property 24); and
+  the boundary property repeats pure transitions over pre-resolved operands (Property
+  25).
 - **Unit tests (example-based)** cover the deterministic edge/example criteria that are
   not input-varying: the exact `UNIMPLEMENTED` message for each of the 5 deprecated
   companions and that they touch no registry state (Requirement 11.1–11.6); empty
@@ -963,7 +1384,12 @@ is not used for any of these user-facing conditions.
   task-queue-family exhaustion with exact messages (2.5, 2.17, 2.18); overlapping
   upsert/remove and update/remove → `INVALID_ARGUMENT` (6.3, 5.3);
   `eager_worker_deployment_options` applied iff `request_eager_execution` (9.7); and
-  that all 13 v2 RPCs accept valid input without `UNIMPLEMENTED` (12.5).
+  that all 13 v2 RPCs accept valid input without `UNIMPLEMENTED` (12.5). Tier 8.41
+  examples cover notification-disabled lineage preservation, pinned-override
+  suppression, target-to-unversioned, same/cross-task-queue pinned CaN, override
+  precedence, AutoUpgrade/UseRamping first-task placement, unknown enum round-trip,
+  committed-parent child inheritance, and reset of the child's initial behavior to
+  unspecified.
 - **Integration tests** exercise the full edge → runtime adapter → registry → storage
   path for a representative RPC of each family (create/describe deployment, create
   version, set-current with ramp-unset, set-ramping, manager mismatch, drainage
@@ -971,7 +1397,12 @@ is not used for any of these user-facing conditions.
   drops the in-memory runtime, reloads from the store, and asserts describe/list return
   the pre-restart state (Requirements 13.2, 13.3). Routing integration covers a
   start → dispatch → WFT-completion → describe cycle confirming the transition and
-  projected `versioning_info`.
+  projected `versioning_info`. Tier 8.41 integration runs a pinned workflow through
+  target change → WFT notification → Continue-as-New → successor start and asserts
+  agreement between polled history, stored history, Describe, and physical Version
+  placement. A cross-task-queue pair proves membership-controlled inheritance, and a
+  conformance-policy case proves the scoped disabled value reaches the runtime consult
+  site.
 
 ### Property-test placement and libraries
 
@@ -984,6 +1415,13 @@ and `crates/tokeira-edge` respectively. Use the workspace-standard `proptest`
 (matching `crates/tokeira-runtime/src/versioning.rs` and
 `crates/tokeira-storage/src/preservation_property_tests.rs`); do not hand-roll
 property infrastructure.
+
+Property 22 lives in `crates/tokeira-kernel` beside the pure WFT-start state transition.
+Property 23 lives in `crates/tokeira-runtime/src/runtime/workflow_task.rs` beside the
+pure CaN resolver. Property 24 is split across kernel event/replay and edge history
+serialization while retaining one generated shared case model. Property 25 lives in
+runtime and invokes the kernel only with pre-resolved generated operands; its code and
+crate dependency graph make registry access from the kernel unrepresentable.
 
 ### Behaviour-conformance anchors
 
@@ -1005,3 +1443,10 @@ in `service/history/workflow/util.go`; transition start/complete is in
 and task-start triggers in `service/history/api/recordworkflowtaskstarted` /
 `recordactivitytaskstarted/api.go:188`; and deprecated-companion `UNIMPLEMENTED`
 responses are in `service/frontend/workflow_handler.go` — all at tag `v1.31.0`.
+Target-change notification and lineage are anchored to
+`service/history/workflow/workflow_task_state_machine.go:495-532`; CaN inheritance and
+declined-target propagation to
+`service/history/workflow/mutable_state_impl.go:2485-2630,2658-2674`; retry carry to
+`service/history/workflow/retry.go:253-338`; history field copying to
+`service/history/historybuilder/event_factory.go:82-86,146`; and the default-enabled
+policy to `common/dynamicconfig/constants.go:931-935` — all at tag `v1.31.0`.

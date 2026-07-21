@@ -3,7 +3,10 @@
 //! When a worker polls, the edge registers its deployment and build identifiers
 //! here. The runtime consults the registry to resolve versioning metadata for
 //! task routing, ensuring that workflow tasks are dispatched to workers running
-//! compatible code.
+//! compatible code. One SDK identity may poll more than one physical Deployment
+//! Version concurrently, so observations are retained per Version rather than
+//! overwritten by identity; explicit worker shutdown removes every observation
+//! for that identity on the task-queue family.
 
 use std::{
     collections::HashMap,
@@ -11,13 +14,14 @@ use std::{
 };
 
 use time::OffsetDateTime;
-use tokeira_types::{BuildId, DeploymentId, NamespaceId, TaskQueueName, WorkerIdentity};
+use tokeira_types::{BuildId, DeploymentId, NamespaceId, TaskKind, TaskQueueName, WorkerIdentity};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WorkerRegistrationKey {
     pub worker_identity: WorkerIdentity,
     pub namespace_id: NamespaceId,
     pub task_queue: TaskQueueName,
+    pub task_kind: TaskKind,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -34,7 +38,7 @@ struct WorkerRegistration {
 
 #[derive(Debug, Default)]
 struct WorkerRegistryState {
-    registrations: HashMap<WorkerRegistrationKey, WorkerRegistration>,
+    registrations: HashMap<WorkerRegistrationKey, Vec<WorkerRegistration>>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -45,9 +49,22 @@ pub struct WorkerRegistry {
 impl WorkerRegistry {
     pub fn register(&self, key: WorkerRegistrationKey, metadata: WorkerVersionMetadata) {
         let mut state = self.inner.lock().expect("inner lock poisoned");
-        state
-            .registrations
-            .insert(key, WorkerRegistration { metadata });
+        let registrations = state.registrations.entry(key).or_default();
+        // One SDK process commonly uses the same identity for workers on two
+        // Deployment Versions. Temporal keeps those observations on separate
+        // physical queues, so replacing by identity would erase the older
+        // Version's live poller and falsely blackhole its queries
+        // (`poller_history.go` and `checkQueryBlackholed`,
+        // `service/matching/task_queue_partition_manager.go @ v1.31.0`). Move an
+        // existing physical-Version observation to the end so `lookup` retains
+        // its historical "most recently registered" contract.
+        if let Some(index) = registrations.iter().position(|registration| {
+            registration.metadata.deployment == metadata.deployment
+                && registration.metadata.build_id == metadata.build_id
+        }) {
+            registrations.remove(index);
+        }
+        registrations.push(WorkerRegistration { metadata });
     }
 
     /// Remove one worker's liveness observation after an explicit worker-shutdown
@@ -77,6 +94,7 @@ impl WorkerRegistry {
             .expect("inner lock poisoned")
             .registrations
             .get(key)
+            .and_then(|registrations| registrations.last())
             .map(|registration| registration.metadata.clone())
             .unwrap_or_default()
     }
@@ -89,19 +107,51 @@ impl WorkerRegistry {
         now: OffsetDateTime,
         recent_window: time::Duration,
     ) -> bool {
+        self.has_recent_poller_for_deployment_version_on_task_queue(
+            namespace_id,
+            deployment,
+            build_id,
+            None,
+            None,
+            now,
+            recent_window,
+        )
+    }
+
+    /// Return whether a deployment version has a recent poll observation for
+    /// one task-queue family and kind, with absent filters matching either.
+    ///
+    /// The kind filter matters for query blackhole detection: an activity
+    /// poller cannot answer a workflow query even when it shares the same task
+    /// queue family and deployment version (`checkQueryBlackholed`,
+    /// `service/matching/task_queue_partition_manager.go @ v1.31.0`).
+    pub fn has_recent_poller_for_deployment_version_on_task_queue(
+        &self,
+        namespace_id: NamespaceId,
+        deployment: &DeploymentId,
+        build_id: &BuildId,
+        task_queue: Option<&TaskQueueName>,
+        task_kind: Option<TaskKind>,
+        now: OffsetDateTime,
+        recent_window: time::Duration,
+    ) -> bool {
         self.inner
             .lock()
             .expect("inner lock poisoned")
             .registrations
             .iter()
-            .any(|(key, registration)| {
-                let metadata = &registration.metadata;
+            .any(|(key, registrations)| {
                 key.namespace_id == namespace_id
-                    && metadata.deployment.as_ref() == Some(deployment)
-                    && metadata.build_id.as_ref() == Some(build_id)
-                    && metadata
-                        .last_seen_at
-                        .is_some_and(|last_seen| now - last_seen <= recent_window)
+                    && task_queue.is_none_or(|queue| &key.task_queue == queue)
+                    && task_kind.is_none_or(|kind| key.task_kind == kind)
+                    && registrations.iter().any(|registration| {
+                        let metadata = &registration.metadata;
+                        metadata.deployment.as_ref() == Some(deployment)
+                            && metadata.build_id.as_ref() == Some(build_id)
+                            && metadata
+                                .last_seen_at
+                                .is_some_and(|last_seen| now - last_seen <= recent_window)
+                    })
             })
     }
 }
@@ -109,7 +159,9 @@ impl WorkerRegistry {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use tokeira_types::{BuildId, DeploymentId, NamespaceId, TaskQueueName, WorkerIdentity};
+    use tokeira_types::{
+        BuildId, DeploymentId, NamespaceId, TaskKind, TaskQueueName, WorkerIdentity,
+    };
 
     use super::{WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata};
 
@@ -133,6 +185,7 @@ mod tests {
                 worker_identity: WorkerIdentity(worker_identity),
                 namespace_id: NamespaceId::new(),
                 task_queue: TaskQueueName(task_queue),
+                task_kind: TaskKind::Workflow,
             };
 
             prop_assert_eq!(registry.lookup(&key), WorkerVersionMetadata::default());
@@ -162,6 +215,7 @@ mod tests {
             worker_identity: WorkerIdentity("worker".to_string()),
             namespace_id: NamespaceId::new(),
             task_queue: TaskQueueName("queue".to_string()),
+            task_kind: TaskKind::Workflow,
         };
         let metadata = WorkerVersionMetadata {
             deployment: Some(DeploymentId("deployment".to_string())),
@@ -173,5 +227,46 @@ mod tests {
         assert_eq!(registry.lookup(&key), metadata);
         registry.remove_worker(key.namespace_id, &key.task_queue, &key.worker_identity);
         assert_eq!(registry.lookup(&key), WorkerVersionMetadata::default());
+    }
+
+    #[test]
+    fn one_worker_identity_retains_observations_on_multiple_physical_versions() {
+        let registry = WorkerRegistry::default();
+        let namespace_id = NamespaceId::new();
+        let key = WorkerRegistrationKey {
+            worker_identity: WorkerIdentity("worker".to_string()),
+            namespace_id,
+            task_queue: TaskQueueName("queue".to_string()),
+            task_kind: TaskKind::Workflow,
+        };
+        let now = time::OffsetDateTime::now_utc();
+        for build_id in ["build-a", "build-b"] {
+            registry.register(
+                key.clone(),
+                WorkerVersionMetadata {
+                    deployment: Some(DeploymentId("deployment".to_string())),
+                    build_id: Some(BuildId(build_id.to_string())),
+                    last_seen_at: Some(now),
+                },
+            );
+        }
+
+        for build_id in ["build-a", "build-b"] {
+            assert!(
+                registry.has_recent_poller_for_deployment_version_on_task_queue(
+                    namespace_id,
+                    &DeploymentId("deployment".to_string()),
+                    &BuildId(build_id.to_string()),
+                    Some(&key.task_queue),
+                    Some(TaskKind::Workflow),
+                    now,
+                    time::Duration::minutes(5),
+                )
+            );
+        }
+        assert_eq!(
+            registry.lookup(&key).build_id,
+            Some(BuildId("build-b".to_string()))
+        );
     }
 }

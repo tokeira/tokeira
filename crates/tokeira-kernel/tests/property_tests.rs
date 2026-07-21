@@ -21,8 +21,8 @@ use tokeira_kernel::{
     RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
     TimerDueRequest, TimerOp, TimerState, Transition, UnpauseActivityRequest,
     UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
-    UpdateProtocolBody, UpdateRequest, UserMetadata, VersioningBehavior, VersioningOverride,
-    VersioningOverrideChange, WorkerDeploymentVersionRef, WorkflowCommand,
+    UpdateProtocolBody, UpdateRequest, UserMetadata, VersionTarget, VersioningBehavior,
+    VersioningOverride, VersioningOverrideChange, WorkerDeploymentVersionRef, WorkflowCommand,
     WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
     WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
     WorkflowTaskTimeoutType, WorkflowTimeoutType, WorkflowVersioningInfo,
@@ -203,6 +203,9 @@ fn with_pending_wft(
     state.pending_workflow_task = Some(PendingWorkflowTask {
         task_type: tokeira_kernel::WorkflowTaskType::Normal,
         schedule_to_start_deadline: None,
+        target_worker_deployment_version_changed: false,
+        target_version_changed_enabled: false,
+        target_deployment_version: None,
         logical_seq: LogicalTaskSeq(logical_seq),
         scheduled_event_id: state.last_event_id - 1,
         scheduled_at: state.started_at,
@@ -827,6 +830,7 @@ fn arb_start_request() -> impl Strategy<Value = StartRequest> {
                     cron_schedule: None,
                     eager_execution_accepted: false,
                     reserved_poller_identity: None,
+                    inherited_versioning_info: None,
                 }
             },
         )
@@ -855,6 +859,7 @@ fn arb_continue_as_new_versioning_behavior()
         Just(ContinueAsNewVersioningBehavior::Unspecified),
         Just(ContinueAsNewVersioningBehavior::AutoUpgrade),
         Just(ContinueAsNewVersioningBehavior::UseRampingVersion),
+        (3i32..32).prop_map(ContinueAsNewVersioningBehavior::Unknown),
     ]
 }
 
@@ -863,6 +868,15 @@ fn arb_versioning_override() -> impl Strategy<Value = VersioningOverride> {
         arb_worker_deployment_version_ref()
             .prop_map(|version| VersioningOverride::Pinned { version }),
         Just(VersioningOverride::AutoUpgrade),
+    ]
+}
+
+fn arb_version_target_lineage() -> impl Strategy<Value = Option<VersionTarget>> {
+    prop_oneof![
+        Just(None),
+        Just(Some(VersionTarget::Unversioned)),
+        arb_worker_deployment_version_ref()
+            .prop_map(|version| Some(VersionTarget::Deployment(version))),
     ]
 }
 
@@ -1154,6 +1168,8 @@ fn arb_continue_as_new_command() -> impl Strategy<Value = WorkflowCommand> {
                 workflow_run_timeout,
                 workflow_task_timeout,
                 retry_policy: None,
+                initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified,
+                successor_versioning_info: None,
             },
         )
 }
@@ -1359,6 +1375,8 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 suggest_continue_as_new: false,
                 deployment_transition: None,
                 deployment_transition_revision_number: None,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 sticky_ttl: Some(Duration::seconds(30)),
                 now,
             };
@@ -2785,6 +2803,9 @@ proptest! {
                     request_id: format!("wft-start-{index}"),
                     history_size_bytes: 0,
                     suggest_continue_as_new: false,
+                    target_worker_deployment_version_changed: false,
+                    target_version_changed_enabled: false,
+                    target_deployment_version: None,
                 },
             });
             next_event_id += 1;
@@ -4225,6 +4246,8 @@ fn property_42_parent_close_policy_all_paths() {
                 workflow_run_timeout: None,
                 workflow_task_timeout: default_workflow_task_timeout(),
                 retry_policy: None,
+                initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified,
+                successor_versioning_info: None,
             }),
         ];
 
@@ -4580,6 +4603,8 @@ fn property_57_close_clears_pending_updates() {
             workflow_run_timeout: None,
             workflow_task_timeout: default_workflow_task_timeout(),
             retry_policy: None,
+            initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified,
+            successor_versioning_info: None,
         }),
     ];
 
@@ -4999,6 +5024,8 @@ fn property_63_close_preserves_execution_options() {
                 workflow_run_timeout: None,
                 workflow_task_timeout: default_workflow_task_timeout(),
                 retry_policy: None,
+                initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified,
+                successor_versioning_info: None,
             }),
             false,
         ),
@@ -5232,6 +5259,9 @@ proptest! {
                         workflow_run_timeout: None,
                         workflow_task_timeout: default_workflow_task_timeout(),
                         retry_policy: None,
+                        initial_versioning_behavior:
+                            ContinueAsNewVersioningBehavior::Unspecified,
+                        successor_versioning_info: None,
                     }],
                     force_new_workflow_task: false,
                     delivered_update_ids: Vec::new(),
@@ -5789,6 +5819,8 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
             workflow_run_timeout: None,
             workflow_task_timeout: default_workflow_task_timeout(),
             retry_policy: None,
+            initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified,
+            successor_versioning_info: None,
         }),
     ];
 
@@ -6463,4 +6495,142 @@ fn wft_failed_with_buffered_events_schedules_fresh_normal_task() {
     assert_eq!(pending.attempt, 1);
     assert!(pending.started_event_id.is_none());
     assert!(transition.next_state.buffered_events.is_empty());
+}
+
+fn reference_target_version_observation(
+    info: &mut WorkflowVersioningInfo,
+    enabled: bool,
+    target_deployment_version: Option<WorkerDeploymentVersionRef>,
+) -> bool {
+    let effective_behavior = if info.version_transition.is_some() {
+        VersioningBehavior::AutoUpgrade
+    } else {
+        match &info.versioning_override {
+            Some(VersioningOverride::Pinned { .. }) => VersioningBehavior::Pinned,
+            Some(VersioningOverride::AutoUpgrade) => VersioningBehavior::AutoUpgrade,
+            None => info.behavior,
+        }
+    };
+    if !enabled || effective_behavior == VersioningBehavior::Unspecified {
+        return false;
+    }
+
+    let effective_deployment =
+        info.version_transition
+            .clone()
+            .or_else(|| match &info.versioning_override {
+                Some(VersioningOverride::Pinned { version }) => Some(version.clone()),
+                Some(VersioningOverride::AutoUpgrade) | None => (effective_behavior
+                    != VersioningBehavior::Unspecified)
+                    .then(|| info.deployment_version.clone())
+                    .flatten(),
+            });
+    let effective_target = VersionTarget::from_deployment(effective_deployment);
+    let routing_target = VersionTarget::from_deployment(target_deployment_version);
+
+    match (
+        info.versioning_override.is_some(),
+        effective_behavior,
+        effective_target == routing_target,
+        info.declined_target_version_upgrade.as_ref() == Some(&routing_target),
+    ) {
+        (true, _, _, _) => {
+            info.last_notified_target_version = None;
+            info.declined_target_version_upgrade = None;
+            false
+        }
+        (false, VersioningBehavior::AutoUpgrade, _, _) => false,
+        (false, _, true, _) => {
+            info.last_notified_target_version = None;
+            info.declined_target_version_upgrade = None;
+            false
+        }
+        (false, VersioningBehavior::Pinned, false, true) => false,
+        (false, VersioningBehavior::Pinned, false, false) => {
+            info.last_notified_target_version = Some(routing_target);
+            info.declined_target_version_upgrade = None;
+            true
+        }
+        (false, VersioningBehavior::Unspecified, _, _) => false,
+    }
+}
+
+proptest! {
+    // Feature: worker-deployments, Property 22: target-change notification state machine
+    #[test]
+    fn property_75_target_change_notification_matches_v1_31_reference(
+        enabled in any::<bool>(),
+        behavior in arb_versioning_behavior(),
+        deployment_version in prop::option::of(arb_worker_deployment_version_ref()),
+        versioning_override in prop::option::of(arb_versioning_override()),
+        version_transition in prop::option::of(arb_worker_deployment_version_ref()),
+        routing_target in prop::option::of(arb_worker_deployment_version_ref()),
+        last_notified in arb_version_target_lineage(),
+        declined in arb_version_target_lineage(),
+    ) {
+        let now = fixed_now();
+        let mut info = WorkflowVersioningInfo {
+            behavior,
+            deployment_version,
+            versioning_override,
+            version_transition,
+            last_notified_target_version: last_notified.clone(),
+            declined_target_version_upgrade: declined.clone(),
+            ..WorkflowVersioningInfo::default()
+        };
+        let expected_notification = reference_target_version_observation(
+            &mut info,
+            enabled,
+            routing_target.clone(),
+        );
+
+        let mut state = with_pending_wft(make_open_state(now), 30, None, 1);
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior,
+            deployment_version: info.deployment_version.clone(),
+            versioning_override: info.versioning_override.clone(),
+            version_transition: info.version_transition.clone(),
+            last_notified_target_version: last_notified,
+            declined_target_version_upgrade: declined,
+            ..WorkflowVersioningInfo::default()
+        });
+        let command = Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+            logical_seq: LogicalTaskSeq(30),
+            worker_identity: WorkerIdentity("worker".into()),
+            request_id: "target-observation".into(),
+            history_size_bytes: 0,
+            suggest_continue_as_new: false,
+            deployment_transition: None,
+            deployment_transition_revision_number: None,
+            target_version_changed_enabled: enabled,
+            target_deployment_version: routing_target.clone(),
+            sticky_ttl: None,
+            now,
+        });
+
+        let first = kernel()
+            .apply(LoadedRun::Existing(state.clone()), command.clone())
+            .unwrap();
+        let second = kernel()
+            .apply(LoadedRun::Existing(state), command)
+            .unwrap();
+
+        let HistoryEventKind::WorkflowTaskStarted {
+            target_worker_deployment_version_changed,
+            target_version_changed_enabled,
+            target_deployment_version,
+            ..
+        } = &first.history_events[0].kind else {
+            prop_assert!(false, "workflow-task start must emit its started event");
+            return Ok(());
+        };
+        prop_assert_eq!(
+            *target_worker_deployment_version_changed,
+            expected_notification
+        );
+        prop_assert_eq!(*target_version_changed_enabled, enabled);
+        prop_assert_eq!(target_deployment_version, &routing_target);
+        prop_assert_eq!(first.next_state.versioning_info.as_ref(), Some(&info));
+        prop_assert_eq!(first, second);
+    }
 }

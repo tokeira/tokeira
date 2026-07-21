@@ -15,7 +15,7 @@
 //! query path can run concurrently with, and independently of, the run's
 //! workflow-task lane without coordinating on history.
 
-use tokeira_types::{Payloads, QueueKey, RunKey, WorkerIdentity};
+use tokeira_types::{Payloads, QueueKey, RunKey, TaskQueueName, WorkerIdentity};
 use tokio::sync::oneshot;
 
 /// A transient read-only query task delivered to a worker.
@@ -31,6 +31,12 @@ pub struct QueryTask {
     pub queue: QueueKey,
     /// Sticky worker hint when one is currently active.
     pub sticky_preferred: Option<WorkerIdentity>,
+    /// Sticky task-queue name that may claim this query before fallback.
+    ///
+    /// The task remains indexed by its normal queue so a normal poll can take
+    /// it after `sticky_deadline`; this name lets a poll on the SDK-generated
+    /// sticky queue find the same transient task without duplicating it.
+    pub sticky_queue: Option<TaskQueueName>,
     /// Deadline after which a sticky-only query becomes live-deliverable.
     ///
     /// Temporal v1.31.0 first attempts a direct query on the sticky task queue
@@ -149,6 +155,7 @@ mod tests {
             cron_schedule: None,
             eager_execution_accepted: false,
             reserved_poller_identity: None,
+            inherited_versioning_info: None,
         }
     }
 
@@ -520,6 +527,7 @@ mod tests {
                             query_args: Payloads::default(),
                             queue: queue.clone(),
                             sticky_preferred: None,
+                            sticky_queue: None,
                             sticky_deadline: None,
                             response_tx: tx,
                         })

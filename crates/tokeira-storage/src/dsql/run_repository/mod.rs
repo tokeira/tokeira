@@ -31,7 +31,7 @@ use crate::{
     ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
     WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
     WorkflowTimeoutSweepEntry, deleted_workflow_projection_context, metrics,
-    workflow_is_open_and_pinned_to_version, workflow_projection_context,
+    workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -1654,6 +1654,9 @@ mod tests {
                 started_event_id: None,
                 started_at: None,
                 attempt: 1,
+                target_worker_deployment_version_changed: false,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
             }),
             previous_started_event_id: 0,
             workflow_task_attempt: 1,

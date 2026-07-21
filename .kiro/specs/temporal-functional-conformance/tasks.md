@@ -10,7 +10,7 @@ into a previous step. Focus ONLY on tasks that involve writing, modifying, or te
 This is a **Tier-2, two-repo** spec. The work is split across two checkouts and two toolchains, and
 the task list keeps that split explicit:
 
-- **TOKEIRA side (Rust)** — this workspace at `/Users/iw/Projects/tokeira/tokeira`. The wire-coverage
+- **TOKEIRA side (Rust)** — this workspace (the repo root). The wire-coverage
   recorder in `tokeira-edge`, the coverage report generator (joining recorder observations + matrix
   claims via the already-landed `tokeira_compatibility::coverage::resolve` + the per-test ledger),
   the ledger/record data models, and the report-side gates. Rust tasks follow `AGENTS.md`:

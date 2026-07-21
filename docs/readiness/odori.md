@@ -21,7 +21,7 @@ The Nexus dependency chain Odori's 2.4 build needs from the tokeira engine:
 | Worker-targeted dispatch → external poller | ✅ Verified | Odori `nexus-roundtrip-probe`, 2026-06-22. |
 | **Synchronous** Nexus round-trip (poll → respond → route back, cross-namespace) | ✅ Verified | Same probe + Python handler verify; result routes back as workflow output. |
 | Cross-language payloads (Rust ↔ Python via nexus-rpc serializer) | ✅ Verified | Python handler verify, 2026-06-22. |
-| **Asynchronous** completion (`WorkflowRunOperation` / `AgentWorkflow`) | ⏳ In progress | `nexus-async-completion` spec; `DispatchCompletionCallback` is a no-op stub today. Wave 0 landed; Wave 1 handed to Claude (`docs/HANDOVER-nexus-async-completion.md`). |
+| **Asynchronous** completion (`WorkflowRunOperation` / `AgentWorkflow`) | ⏳ In progress | `nexus-async-completion` spec; `DispatchCompletionCallback` is a no-op stub today. Wave 0 landed; Wave 1 handed to Claude (`docs/HANDOVER-nexus-async-completion.md`, retired to git history). |
 
 **Implication for 2.4:** the synchronous handler path works on `main` today; the durable async
 `WorkflowRunOperation` path is blocked on `nexus-async-completion`. Odori can stage 2.4 on a sync stub

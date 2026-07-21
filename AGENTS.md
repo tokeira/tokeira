@@ -541,7 +541,8 @@ tools/      tkw (fleet worktrees) · proto-sync · simulation (excluded)
 proto/      upstream/ — vendored Temporal protos (authoritative wire shape, §8)
 .kiro/specs/  feature specs        spec/  TLA+/refinement stack
 scenarios/  e2e samples (excluded)        spikes/  throwaway probes
-docs/       agents · architecture · adr · readiness · operations · runbooks · testing
+docs/       agents · adr · architecture · conformance · operations · platforms ·
+            readiness · runbooks · testing · crates
 ```
 
 ### Working agreements
@@ -585,7 +586,7 @@ checksum-verified, and rejects gaps and duplicates.
 ### Pointers
 
 - `.kiro/specs/*/` — feature specs (requirements, design, tasks).
-- [docs/deployment-definitions.md](docs/deployment-definitions.md) — authoring and
+- [deployment-definitions.md](docs/platforms/deployment-definitions.md) — authoring and
   operating `.tkd` deployment definitions (the rust-syn DSL and `tkp` lifecycle).
 - Temporal ground truth (§8): `proto/upstream/` (API `v1.62.11`) and the server source
   at tag `v1.31.0` — local checkout `../temporal`, or

@@ -36,8 +36,8 @@ observable effect is inside a conformance build.
   campaign: it converts a recurring skip class into real coverage. It does **not** replace the
   "independent runs" convention (still used for feature modes and for kernel-const cases) or the skip
   registry (still used for genuinely-unbridgeable cases).
-- **The conformance metrics bridge** (`docs/HANDOVER-conformance-metrics-bridge.md`,
-  `tests/testcore/tokeira_metrics_bridge.go`) is the **direct precedent**: it makes an in-process
+- **The conformance metrics bridge** (`docs/HANDOVER-conformance-metrics-bridge.md`, retired to git
+  history; `tests/testcore/tokeira_metrics_bridge.go`) is the **direct precedent**: it makes an in-process
   Temporal test seam (`CaptureMetricsHandler`) work against out-of-process `tokeirad` by pointing it at
   a tokeira endpoint, under a strict honesty boundary. This spec applies the same pattern to
   `OverrideDynamicConfig` and adopts the same honesty boundary.

@@ -298,7 +298,7 @@ This plan integrates Aurora DSQL as a storage backend for the compose platform b
 - Property tests validate universal correctness properties from the design document
 - Unit tests validate specific examples and edge cases
 - The design uses Rust throughout — no language selection needed
-- Dashboard improvements reference the EKS project at `/Users/iw/Projects/temporalio/temporal-dsql-deploy-eks/grafana/` for panel layout inspiration but use tokeira-specific metric names (`tokeira_*` prefix)
+- Dashboard improvements reference the `temporal-dsql-deploy-eks` project's `grafana/` dashboards for panel layout inspiration but use tokeira-specific metric names (`tokeira_*` prefix)
 - Datasource UIDs must be `mimir` and `loki` (matching the provisioned datasources in the compose platform)
 - Code documentation follows AGENTS.md rules: comments explain WHY, not WHAT
 

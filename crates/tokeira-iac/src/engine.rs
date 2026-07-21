@@ -275,6 +275,24 @@ impl Engine {
         destroy_changes(known, ctx, changes, saver).await
     }
 
+    /// Delete exactly `ids` over the current state, with `known` collected
+    /// and validated from the composition — the rollback B-pass entry point
+    /// (task 19.3). Collection and validation here; the fail-closed,
+    /// reverse-dependency-ordered, idempotent semantics live in
+    /// [`destroy_selected`](Self::destroy_selected).
+    pub async fn destroy_selected_in(
+        &self,
+        composition: &InfraComposition,
+        ids: &HashSet<ResourceId>,
+        ctx: &mut ProvisionContext,
+        saver: Option<&StateSaver>,
+    ) -> Result<Vec<Change>, IacError> {
+        validate_composition(composition, ctx)?;
+        let known = collect_resources_from(&composition.known_modules, ctx)?;
+        let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
+        self.destroy_selected(&known_refs, ids, ctx, saver).await
+    }
+
     /// Destroy restricted to the active modules in the composition.
     pub async fn destroy_for_modules(
         &self,

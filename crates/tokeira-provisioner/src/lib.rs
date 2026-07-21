@@ -43,6 +43,16 @@ pub use integrity::{ChecksumFormatError, IntegrityError, Sha256Digest, sha256_he
 pub use migration::{MigrationError, MigrationRegistry, envelope_migrations};
 pub use upgrade::{UpgradeDecision, evaluate_upgrade};
 
+/// Env vars an orchestrator (`tkr`'s two-binary rollback, task 19.3) sets so
+/// a spawned `tkp` **adopts** the orchestrator's operation lease instead of
+/// acquiring its own: the lock is held continuously across the relaunch
+/// boundary — no window between B's exit and A's start where a third writer
+/// could acquire. The adopting process renews but never acquires or
+/// releases; the orchestrator owns the lease lifecycle.
+pub const ORCHESTRATED_LOCK_HOLDER_ENV: &str = "TKP_LOCK_HOLDER";
+/// See [`ORCHESTRATED_LOCK_HOLDER_ENV`].
+pub const ORCHESTRATED_LOCK_TOKEN_ENV: &str = "TKP_LOCK_TOKEN";
+
 /// Current `DeploymentStateEnvelope` schema version.
 ///
 /// v2 (task 16.2): the integrity manifest is keyed by [`EngineIdentity`] —
@@ -251,6 +261,13 @@ pub struct DeploymentStateEnvelope {
     pub infra_head: Option<SnapshotRef>,
     pub runtime_head: Option<SnapshotRef>,
     pub effective_config_ref: Option<String>,
+    /// Resource ids created since the rollback checkpoint was captured — the
+    /// running total of `keys(S_B) − keys(S_A)`, maintained incrementally
+    /// from every post-checkpoint apply's audit entries (task 19.3). The
+    /// rollback B-delete pass consumes exactly this set; empty whenever no
+    /// checkpoint is open. Ids only — the engine's `ResourceId`s.
+    #[serde(default)]
+    pub created_since_checkpoint: Vec<String>,
 }
 
 impl Default for DeploymentStateEnvelope {
@@ -267,6 +284,7 @@ impl Default for DeploymentStateEnvelope {
             infra_head: None,
             runtime_head: None,
             effective_config_ref: None,
+            created_since_checkpoint: Vec::new(),
         }
     }
 }
@@ -321,6 +339,9 @@ impl DeploymentStateEnvelope {
             recorded_at,
         });
         self.binding = Some(to);
+        // A fresh checkpoint means a fresh baseline: nothing has been created
+        // since it yet (task 19.3).
+        self.created_since_checkpoint.clear();
         self.operation = Some(Operation {
             operation_id: operation_id.into(),
             kind: OperationKind::UpgradeInFlight,
@@ -358,6 +379,9 @@ impl DeploymentStateEnvelope {
         self.infra_head = checkpoint.from_infra_head;
         self.runtime_head = checkpoint.from_runtime_head;
         self.effective_config_ref = checkpoint.from_config_ref;
+        // The B-delete pass ran just before this re-pin and consumed the
+        // creation set (task 19.3): the commit that re-pins also empties it.
+        self.created_since_checkpoint.clear();
         self.operation = Some(Operation {
             operation_id: operation_id.into(),
             kind: OperationKind::RollbackInFlight,
@@ -372,11 +396,38 @@ impl DeploymentStateEnvelope {
     pub fn complete_rollback(&mut self) {
         self.operation = None;
         self.checkpoint = None;
+        self.created_since_checkpoint.clear();
     }
 
     /// Close the in-flight operation marker (the upgrade or rollback completed).
     pub fn close_operation(&mut self) {
         self.operation = None;
+    }
+
+    /// Fold an apply's audit entries into the post-checkpoint creation set
+    /// (task 19.3). A no-op while no checkpoint is open — the set is exactly
+    /// `keys(S_B) − keys(S_A)`, and without an `[A final]` there is no
+    /// baseline to diverge from. `Created` ids join (deduplicated); `Deleted`
+    /// ids leave (a resource B created and then deleted is not B's to delete
+    /// again); `Updated` never moves the set — updates to A's resources are
+    /// reconciled forward by A's re-apply, not deleted (Proposal 002).
+    pub fn record_post_checkpoint_changes(&mut self, entries: &[ChangeLogEntry]) {
+        if self.checkpoint.is_none() {
+            return;
+        }
+        for entry in entries {
+            match entry.op {
+                ChangeOp::Created => {
+                    if !self.created_since_checkpoint.contains(&entry.id) {
+                        self.created_since_checkpoint.push(entry.id.clone());
+                    }
+                }
+                ChangeOp::Deleted => {
+                    self.created_since_checkpoint.retain(|id| id != &entry.id);
+                }
+                ChangeOp::Updated => {}
+            }
+        }
     }
 
     /// Stamp the current schema version before a mutating save.
@@ -591,6 +642,63 @@ mod tests {
         assert!(env.operation.is_none());
         assert!(env.checkpoint.is_none());
         assert_eq!(env.binding.as_ref(), Some(&a));
+    }
+
+    // Task 19.3: the post-checkpoint creation set — keys(S_B) − keys(S_A),
+    // maintained incrementally from audit entries.
+    #[test]
+    fn creation_set_folds_only_under_an_open_checkpoint() {
+        let entry = |id: &str, op: ChangeOp| ChangeLogEntry { id: id.into(), op };
+        let mut env = DeploymentStateEnvelope::default();
+
+        // No checkpoint → no baseline → nothing tracked.
+        env.record_post_checkpoint_changes(&[entry("orphan", ChangeOp::Created)]);
+        assert!(env.created_since_checkpoint.is_empty());
+
+        // Open a checkpoint (upgrade transfer) — the set starts fresh.
+        env.binding = Some(ProvenanceStamp {
+            version: "1.0.0".into(),
+            git_sha: "s".into(),
+            source_tree_hash: "hA".into(),
+            build_mode: BuildMode::Versioned,
+            recorded_at: Utc::now(),
+        });
+        env.created_since_checkpoint = vec!["stale".into()];
+        env.begin_upgrade(
+            ProvenanceStamp {
+                source_tree_hash: "hB".into(),
+                version: "2.0.0".into(),
+                ..env.binding.clone().unwrap()
+            },
+            "op",
+            Utc::now(),
+        );
+        assert!(
+            env.created_since_checkpoint.is_empty(),
+            "a fresh checkpoint starts a fresh baseline"
+        );
+
+        // Created joins (deduplicated); Updated never moves the set;
+        // Deleted removes.
+        env.record_post_checkpoint_changes(&[
+            entry("db", ChangeOp::Created),
+            entry("db", ChangeOp::Created),
+            entry("cache", ChangeOp::Created),
+            entry("legacy", ChangeOp::Updated),
+        ]);
+        assert_eq!(env.created_since_checkpoint, vec!["db", "cache"]);
+        env.record_post_checkpoint_changes(&[entry("cache", ChangeOp::Deleted)]);
+        assert_eq!(
+            env.created_since_checkpoint,
+            vec!["db"],
+            "a resource B created then deleted is not B's to delete again"
+        );
+
+        // The re-pin consumes the set; completion keeps it empty.
+        env.begin_rollback("op-rb", Utc::now()).unwrap();
+        assert!(env.created_since_checkpoint.is_empty());
+        env.complete_rollback();
+        assert!(env.created_since_checkpoint.is_empty());
     }
 
     #[test]

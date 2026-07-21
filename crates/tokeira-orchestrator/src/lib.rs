@@ -402,6 +402,28 @@ impl<D: Deployment> InfraEngine<D> {
         Ok(result?)
     }
 
+    /// Delete exactly the named resource ids and persist state — the rollback
+    /// B-delete pass (task 19.3): fail-closed (an id outside the composition's
+    /// known set errors rather than orphaning), reverse-dependency-ordered,
+    /// idempotent (an id absent from state is done); every other resource
+    /// untouched.
+    pub async fn destroy_selected(
+        &mut self,
+        composition: &iac::InfraComposition,
+        ids: &std::collections::HashSet<iac::ResourceId>,
+    ) -> Result<Vec<iac::Change>> {
+        let (state, version) = self.state_store.load().await?;
+        self.ctx.state = state;
+        self.ctx.set_extension(iac::DestroyMode);
+        let saver = self.make_saver(version);
+        let result = self
+            .engine
+            .destroy_selected_in(composition, ids, &mut self.ctx, Some(&saver))
+            .await;
+        self.ctx.remove_extension::<iac::DestroyMode>();
+        Ok(result?)
+    }
+
     /// Return writeback values derived from the latest in-memory state.
     pub fn collect_writeback(&self) -> Vec<(String, String)> {
         self.deployment

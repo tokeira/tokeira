@@ -10,6 +10,7 @@ use std::{path::Path, process, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use tokeira_provisioner::{ORCHESTRATED_LOCK_HOLDER_ENV, ORCHESTRATED_LOCK_TOKEN_ENV};
 use tokeira_state::{LocalBackend, OperationLock};
 
 /// Lease duration.
@@ -27,10 +28,16 @@ fn operation_lock(deployment_dir: &Path) -> OperationLock {
     )
 }
 
-/// Run `body` while holding the deployment's operation lock — acquired before any
-/// work, **renewed on an interval** so an operation longer than the lease cannot
-/// have its lock stolen mid-mutation, and released afterwards. Refuses if another
-/// provisioner already holds the lock.
+/// Run `body` while holding the deployment's operation lock. Two modes:
+///
+/// - **Standalone** (the default): acquire before any work, renew on an
+///   interval, release afterwards. Refuses if another provisioner holds it.
+/// - **Adopted** (task 19.3): when the orchestrator's env names a lease
+///   ([`ORCHESTRATED_LOCK_HOLDER_ENV`]/[`ORCHESTRATED_LOCK_TOKEN_ENV`]),
+///   join it — renew around the body, but never acquire and never release:
+///   the orchestrator owns the lease lifecycle, so the lock is held
+///   continuously across the two-binary relaunch boundary (extends 12.2
+///   from single-process to two-binary).
 pub(crate) async fn with_operation_lock<F, Fut>(
     deployment_dir: &Path,
     verb: &str,
@@ -41,8 +48,41 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     let lock = operation_lock(deployment_dir);
-    let holder = format!("tkp-{verb}-pid{}", process::id());
-    run_locked(&lock, &holder, LOCK_TTL, RENEW_INTERVAL, body).await
+    let orchestrated = std::env::var(ORCHESTRATED_LOCK_HOLDER_ENV)
+        .ok()
+        .zip(std::env::var(ORCHESTRATED_LOCK_TOKEN_ENV).ok());
+    match orchestrated {
+        Some((holder, token)) => {
+            run_adopted(&lock, &holder, &token, LOCK_TTL, RENEW_INTERVAL, body).await
+        }
+        None => {
+            let holder = format!("tkp-{verb}-pid{}", process::id());
+            run_locked(&lock, &holder, LOCK_TTL, RENEW_INTERVAL, body).await
+        }
+    }
+}
+
+/// Adopted-mode core: join the orchestrator's lease, drive the body under
+/// renewal, and hand the (still-live) lease back by simply not releasing it.
+async fn run_adopted<F, Fut>(
+    lock: &OperationLock,
+    holder: &str,
+    token: &str,
+    ttl: Duration,
+    renew_interval: Duration,
+    body: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let guard = lock.adopt(holder, token, ttl).await.with_context(|| {
+        "failed to adopt the orchestrator's operation lease — it may have lapsed or been \
+         taken over"
+    })?;
+    let (result, _guard) = drive_with_renewal(lock, guard, ttl, renew_interval, body).await;
+    // Deliberately no release: the orchestrator owns the lease.
+    result
 }
 
 /// Core of [`with_operation_lock`], parameterized on the lease/renew timing so
@@ -58,17 +98,39 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let mut guard = lock.acquire(holder, ttl).await.with_context(|| {
+    let guard = lock.acquire(holder, ttl).await.with_context(|| {
         "failed to acquire the remote operation lock — another provisioner may be operating this \
          deployment"
     })?;
+    let (result, guard) = drive_with_renewal(lock, guard, ttl, renew_interval, body).await;
 
-    // Drive the body while renewing the lease on an interval. A renew failure is
-    // tolerated as long as the current lease is still valid (transient backend
-    // blip); once the lease has actually lapsed we can no longer guarantee
-    // exclusivity, so we abort rather than risk a second concurrent writer. (A
-    // takeover can only occur *after* our lease lapses — `acquire` refuses an
-    // active lease — so the lapse check also catches genuine takeovers.)
+    // Release regardless of outcome; a failed release is non-fatal (the lease
+    // expires) but should not mask the operation's own error.
+    if let Err(release_err) = lock.release(guard).await {
+        eprintln!("warning: failed to release the operation lock: {release_err}");
+    }
+    result
+}
+
+/// Drive `body` while renewing `guard` on an interval — the shared core of
+/// both lock modes. A renew failure is tolerated as long as the current lease
+/// is still valid (transient backend blip); once the lease has actually
+/// lapsed we can no longer guarantee exclusivity, so we abort rather than
+/// risk a second concurrent writer. (A takeover can only occur *after* the
+/// lease lapses — `acquire` refuses an active lease — so the lapse check
+/// also catches genuine takeovers.) Returns the guard so the caller decides
+/// its fate: release (standalone) or keep alive (adopted).
+async fn drive_with_renewal<F, Fut>(
+    lock: &OperationLock,
+    mut guard: tokeira_state::OperationLockGuard,
+    ttl: Duration,
+    renew_interval: Duration,
+    body: F,
+) -> (Result<()>, tokeira_state::OperationLockGuard)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let body_fut = body();
     tokio::pin!(body_fut);
     let result = loop {
@@ -87,13 +149,7 @@ where
             }
         }
     };
-
-    // Release regardless of outcome; a failed release is non-fatal (the lease
-    // expires) but should not mask the operation's own error.
-    if let Err(release_err) = lock.release(guard).await {
-        eprintln!("warning: failed to release the operation lock: {release_err}");
-    }
-    result
+    (result, guard)
 }
 
 #[cfg(test)]
@@ -138,6 +194,72 @@ mod tests {
             err.to_string().contains("operation lock"),
             "unexpected: {err}"
         );
+    }
+
+    // Task 19.3: the adopted mode — a child joins the orchestrator's lease,
+    // works under it, and leaves it live: the lock is continuous across the
+    // two-binary boundary, and only the orchestrator releases.
+    #[tokio::test]
+    async fn adopted_mode_works_under_the_orchestrators_lease_and_never_releases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = operation_lock(tmp.path());
+        // The orchestrator (tkr) acquires…
+        let orchestrator = lock.acquire("tkr-rollback", LOCK_TTL).await.unwrap();
+        let token = orchestrator.token.clone();
+
+        // …the child adopts and runs its body…
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        run_adopted(
+            &lock,
+            "tkr-rollback",
+            &token,
+            LOCK_TTL,
+            RENEW_INTERVAL,
+            || async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("adopted body runs");
+        assert!(ran.load(Ordering::SeqCst));
+
+        // …and the lease SURVIVES the child: a third party still cannot
+        // acquire until the orchestrator releases.
+        assert!(
+            lock.acquire("intruder", LOCK_TTL).await.is_err(),
+            "the lease is still the orchestrator's"
+        );
+        lock.release(orchestrator).await.unwrap();
+        lock.acquire("next", LOCK_TTL)
+            .await
+            .expect("free after the orchestrator releases");
+    }
+
+    #[tokio::test]
+    async fn adoption_with_a_wrong_token_refuses_before_any_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = operation_lock(tmp.path());
+        let _held = lock.acquire("tkr-rollback", LOCK_TTL).await.unwrap();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let err = run_adopted(
+            &lock,
+            "tkr-rollback",
+            "not-the-token",
+            LOCK_TTL,
+            RENEW_INTERVAL,
+            || async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a mismatched lease refuses adoption");
+        assert!(err.to_string().contains("adopt"), "unexpected: {err}");
+        assert!(!ran.load(Ordering::SeqCst), "the body never ran");
     }
 
     // Fix for the "lease lapses mid-operation" finding: an operation that outlives

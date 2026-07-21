@@ -17,8 +17,8 @@
 //! classes' checksum against the recorded manifest (abort on mismatch, Req 7.2 —
 //! rollback launches `B`, which the envelope's manifest still records at launch
 //! time), and execs `tkp <verb> --deployment-dir <dir>`. The candidate-upgrade
-//! external-metadata verification and the two-binary rollback re-exec (the
-//! retained-`A` reconcile phase) are follow-ons.
+//! external-metadata verification is a follow-on; the two-binary rollback
+//! re-exec is [`launch_rollback`] (task 19.3).
 
 use std::{
     path::{Path, PathBuf},
@@ -26,8 +26,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope, Target};
-use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
+use tokeira_provisioner::{
+    BinaryStore, BuildMode, DeploymentStateEnvelope, ORCHESTRATED_LOCK_HOLDER_ENV,
+    ORCHESTRATED_LOCK_TOKEN_ENV, Target,
+};
+use tokeira_state::{CasStore, DeploymentStore, LocalBackend, OperationLock};
+
+use crate::deployment_dir::PROVISIONER_BIN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchClass {
@@ -204,6 +209,17 @@ pub(crate) async fn launch(
     verb: &[&str],
     extra_args: &[String],
 ) -> Result<()> {
+    launch_with_envs(deployment_dir, verb, extra_args, &[]).await
+}
+
+/// [`launch`], additionally exporting `envs` to the spawned `tkp` — the
+/// orchestrated-rollback lease handoff (task 19.3) rides these.
+async fn launch_with_envs(
+    deployment_dir: &Path,
+    verb: &[&str],
+    extra_args: &[String],
+    envs: &[(&str, String)],
+) -> Result<()> {
     let envelope = load_envelope(deployment_dir).await?;
     let class = resolve_class(verb, &envelope);
     let binary = TkpBinary::resolve(deployment_dir);
@@ -232,6 +248,7 @@ pub(crate) async fn launch(
     );
     let status = tokio::process::Command::new(&program)
         .args(&args)
+        .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -245,6 +262,112 @@ pub(crate) async fn launch(
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+/// The two-binary rollback orchestration (task 19.3, Proposal 002):
+///
+/// 1. acquire the deployment's operation lease — held by THIS process across
+///    the whole sequence (12.2 extended to two binaries: no window at the
+///    process boundary where a third writer could take the lock);
+/// 2. launch **B** (the bound binary) with `--handoff`: it verifies both
+///    binaries, runs the delete-only pass, commits the re-pin to A, and
+///    stops with the marker open;
+/// 3. retrieve **A**'s retained bytes (identity-keyed, verified against the
+///    re-pinned envelope's manifest — A's own) and place them as the
+///    deployment's `tkp` — the physical half of re-marrying A;
+/// 4. relaunch `rollback`, now A: the 19.4 resume path reconciles and
+///    completes;
+/// 5. release the lease.
+///
+/// A **pre-identity** checkpoint has no retained A to relaunch: the flow
+/// falls back to the single-process rollback (the dev loop, where A and B
+/// are the same build) — same verb, no handoff.
+pub(crate) async fn launch_rollback(deployment_dir: &Path) -> Result<()> {
+    let envelope = load_envelope(deployment_dir).await?;
+    let retained_identity = envelope
+        .checkpoint
+        .as_ref()
+        .and_then(|c| c.from_integrity.engine_identity.clone());
+    // No checkpoint (tkp refuses with its own message) or a pre-identity A
+    // (nothing retained to relaunch): the single-process flow.
+    let Some(identity) = retained_identity else {
+        return launch(deployment_dir, &["rollback"], &[]).await;
+    };
+
+    let lock = OperationLock::new(
+        Box::new(LocalBackend::new(deployment_dir.join("state/lock"))),
+        "operation",
+    );
+    let holder = format!("tkr-rollback-pid{}", std::process::id());
+    let guard = lock
+        .acquire(&holder, ORCHESTRATION_LOCK_TTL)
+        .await
+        .context(
+            "failed to acquire the operation lease for the two-binary rollback — another \
+             provisioner may be operating this deployment",
+        )?;
+    let lease_envs = [
+        (ORCHESTRATED_LOCK_HOLDER_ENV, guard.holder.clone()),
+        (ORCHESTRATED_LOCK_TOKEN_ENV, guard.token.clone()),
+    ];
+
+    let result = orchestrate_rollback(deployment_dir, &identity, &lease_envs).await;
+    // Release regardless of outcome; an interrupted sequence is recovered by
+    // re-running `rollback` (19.4), which re-acquires.
+    if let Err(release_err) = lock.release(guard).await {
+        eprintln!("warning: failed to release the rollback lease: {release_err}");
+    }
+    result
+}
+
+/// Lease TTL for the orchestrated rollback — matches tkp's own lock lease.
+const ORCHESTRATION_LOCK_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+async fn orchestrate_rollback(
+    deployment_dir: &Path,
+    identity: &tokeira_provisioner::EngineIdentity,
+    lease_envs: &[(&str, String)],
+) -> Result<()> {
+    // Phase 1 — B: verify both, delete what B created, re-pin, stop.
+    launch_with_envs(
+        deployment_dir,
+        &["rollback"],
+        &["--handoff".to_string()],
+        lease_envs,
+    )
+    .await
+    .context("rollback phase 1 (B undo + re-pin) failed")?;
+
+    // Phase 2 — place the retained A as the deployment's `tkp`. The re-pinned
+    // envelope now records A's manifest, so retrieval re-verifies A's exact
+    // bytes against it (trust flows from the CAS-guarded manifest, never the
+    // stored blob).
+    let repinned = load_envelope(deployment_dir).await?;
+    let manifest = repinned.integrity.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("the re-pinned envelope records no integrity manifest — cannot place A")
+    })?;
+    let retention = BinaryStore::new(
+        Box::new(LocalBackend::new(deployment_dir.join("state"))),
+        "binaries",
+    );
+    let bytes = retention
+        .retrieve_verified(identity, &Target(env!("TKR_TARGET").to_string()), manifest)
+        .await
+        .context("A's retained binary failed retrieval/verification at placement")?;
+    let dest = deployment_dir.join(PROVISIONER_BIN);
+    std::fs::write(&dest, &bytes)
+        .with_context(|| format!("failed to place A at {}", dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+    eprintln!("launcher: retained A placed as the deployment's tkp — relaunching to reconcile");
+
+    // Phase 3 — A resumes `rollback` (19.4) and completes.
+    launch_with_envs(deployment_dir, &["rollback"], &[], lease_envs)
+        .await
+        .context("rollback phase 2 (A reconcile) failed — re-run `rollback` to resume")
 }
 
 /// Forward `infra apply`, first forwarding the internal `init` when the

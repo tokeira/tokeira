@@ -12,11 +12,11 @@
 //! `tokeira_orchestrator::Deployment` — the structure is config, not compiled
 //! code.
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
 use tokeira_compose::{ComposeError, ComposePlatform};
-use tokeira_iac::{Change, ModuleSelection};
+use tokeira_iac::{Change, ModuleSelection, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_provisioner_cli::{
     ChangeLogEntry, ProvisionerPlatform, Realization, change_log_entries,
@@ -80,6 +80,23 @@ impl ProvisionerPlatform for ComposeSynPlatform {
             .await
             .context("infrastructure destroy failed")?;
         Ok(removed.len())
+    }
+
+    async fn infra_destroy_selected(
+        &self,
+        deployment_dir: &Path,
+        ids: &[String],
+    ) -> Result<Vec<ChangeLogEntry>> {
+        let config = load_tkd_config(deployment_dir)?;
+        // Deleting live containers needs the Docker handle, like destroy.
+        let mut engine = open_engine(config, deployment_dir, true).await?;
+        let composition = engine.compose(ModuleSelection::All)?;
+        let id_set: HashSet<ResourceId> = ids.iter().cloned().map(ResourceId).collect();
+        let deleted = engine
+            .destroy_selected(&composition, &id_set)
+            .await
+            .context("the delete-only pass failed")?;
+        Ok(change_log_entries(&deleted))
     }
 
     async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<Vec<Change>>> {

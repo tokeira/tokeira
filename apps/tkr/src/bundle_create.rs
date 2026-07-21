@@ -3,9 +3,9 @@
 //!
 //! The canonical inception: **snapshot the source closure → resolve
 //! `EngineIdentity` → obtain a verified bundle (CAS hit, else one hermetic
-//! Dagger build, published back) → retain it in the deployment → place `tkp`
-//! + the manifest sidecar** that `tkp init` records as the Day-0 stamp after
-//! verifying itself against it. The Phase-0 native copy
+//! Dagger build, published back) → retain it in the deployment → place
+//! `tkp` and the manifest sidecar** that `tkp init` records as the Day-0
+//! stamp after verifying itself against it. The Phase-0 native copy
 //! ([`place_provisioner`](crate::deployment_dir::DeploymentResolver::place_provisioner))
 //! stays the default — the dev loop never pays a hermetic build.
 //!

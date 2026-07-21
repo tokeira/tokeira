@@ -54,6 +54,9 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     // The deployment identity seeds the platform context; it was set at `init`.
     let project_name = deployment_identity(&envelope.deployment_id);
     let applied = platform.infra_apply(deployment_dir).await?;
+    // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
+    // — the set the rollback B-delete pass consumes (task 19.3).
+    envelope.record_post_checkpoint_changes(&applied);
     println!(
         "[{}] infra apply: {} change(s)",
         applied.len(),

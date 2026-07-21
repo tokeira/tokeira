@@ -6,10 +6,10 @@
 //! (`src/bin/tkp.rs`) still exists: it exercises the real shell binary end to
 //! end without Docker, keeping "one tkp per platform" uniform.
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
-use tokeira_iac::{Change, ModuleSelection};
+use tokeira_iac::{Change, ModuleSelection, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_provisioner_cli::{
     ChangeLogEntry, ProvisionerPlatform, Realization, change_log_entries,
@@ -61,6 +61,21 @@ impl ProvisionerPlatform for LocalPlatform {
             .await
             .context("infrastructure destroy failed")?;
         Ok(removed.len())
+    }
+
+    async fn infra_destroy_selected(
+        &self,
+        deployment_dir: &Path,
+        ids: &[String],
+    ) -> Result<Vec<ChangeLogEntry>> {
+        let mut engine = open_engine(deployment_dir).await?;
+        let composition = engine.compose(ModuleSelection::All)?;
+        let id_set: HashSet<ResourceId> = ids.iter().cloned().map(ResourceId).collect();
+        let deleted = engine
+            .destroy_selected(&composition, &id_set)
+            .await
+            .context("the delete-only pass failed")?;
+        Ok(change_log_entries(&deleted))
     }
 
     async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<Vec<Change>>> {

@@ -104,6 +104,9 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
         }
         Realization::Realized(entries) => entries,
     };
+    // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
+    // — the set the rollback B-delete pass consumes (task 19.3).
+    envelope.record_post_checkpoint_changes(&applied);
     println!(
         "[{}] deploy apply: {} change(s)",
         platform.label(deployment_dir),

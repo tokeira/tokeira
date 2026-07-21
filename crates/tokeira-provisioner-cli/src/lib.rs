@@ -87,6 +87,17 @@ pub trait ProvisionerPlatform {
     /// Tear down the deployment's infrastructure. Returns the removed count.
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize>;
 
+    /// Delete **exactly** the named resource ids — the rollback B-delete pass
+    /// (task 19.3, Proposal 002): fail-closed (an id the platform does not
+    /// know errors rather than orphaning), reverse-dependency-ordered,
+    /// idempotent (an id absent from state is already done); every other
+    /// resource untouched. Returns the deleted entries.
+    async fn infra_destroy_selected(
+        &self,
+        deployment_dir: &Path,
+        ids: &[String],
+    ) -> Result<Vec<ChangeLogEntry>>;
+
     /// Preview the workload Delta (read-only). A platform whose workload rides
     /// the infra universe (compose-syn models its containers as infra
     /// resources) realizes this as the infra plan.
@@ -104,10 +115,13 @@ pub trait ProvisionerPlatform {
 
 /// Map an applied engine Delta to the ids-only audit entries (task 19.2).
 ///
-/// The id is `module/resource` — the engine's stable resource address. Kinds
-/// map onto the audit vocabulary: `Replace` records as `Updated` (the id
-/// survives a delete-then-recreate; the audit log tracks identities, not
-/// mechanics), and `NoChange` records nothing.
+/// The id is the engine's **`ResourceId`** (`Change::resource`) — the exact
+/// address `destroy_selected` keys on, so the audit entries double as the
+/// rollback delete-set's feed (task 19.3); the module is grouping metadata
+/// the ids-only log deliberately drops. Kinds map onto the audit vocabulary:
+/// `Replace` records as `Updated` (the id survives a delete-then-recreate;
+/// the audit log tracks identities, not mechanics), and `NoChange` records
+/// nothing.
 pub fn change_log_entries(changes: &[Change]) -> Vec<ChangeLogEntry> {
     changes
         .iter()
@@ -119,7 +133,7 @@ pub fn change_log_entries(changes: &[Change]) -> Vec<ChangeLogEntry> {
                 ChangeKind::NoChange => return None,
             };
             Some(ChangeLogEntry {
-                id: format!("{}/{}", change.module, change.resource),
+                id: change.resource.clone(),
                 op,
             })
         })
@@ -173,6 +187,22 @@ impl ProvisionerPlatform for TestPlatform {
         Ok(0)
     }
 
+    async fn infra_destroy_selected(
+        &self,
+        _deployment_dir: &Path,
+        ids: &[String],
+    ) -> Result<Vec<ChangeLogEntry>> {
+        // The no-op platform "deletes" whatever it is asked to: the shell's
+        // rollback tests observe the pass through the returned entries.
+        Ok(ids
+            .iter()
+            .map(|id| ChangeLogEntry {
+                id: id.clone(),
+                op: ChangeOp::Deleted,
+            })
+            .collect())
+    }
+
     async fn deploy_plan(&self, _deployment_dir: &Path) -> Result<Realization<Vec<Change>>> {
         Ok(Realization::Realized(Vec::new()))
     }
@@ -206,19 +236,23 @@ mod tests {
         }
     }
 
-    // Task 19.2: the audit mapping — module/resource ids, Replace folds to
-    // Updated (the id survives the delete-then-recreate), NoChange vanishes.
+    // Task 19.2/19.3: the audit mapping — ids are the engine's ResourceId
+    // (the destroy_selected key), Replace folds to Updated (the id survives
+    // the delete-then-recreate), NoChange vanishes.
     #[test]
     fn change_log_entries_map_ids_and_ops() {
         let entries = change_log_entries(&[
-            change(ChangeKind::Create, "vpc", "main"),
+            change(ChangeKind::Create, "vpc", "main-vpc"),
             change(ChangeKind::Update, "svc", "web"),
             change(ChangeKind::Replace, "db", "primary"),
             change(ChangeKind::Delete, "svc", "old"),
             change(ChangeKind::NoChange, "svc", "steady"),
         ]);
         assert_eq!(entries.len(), 4, "NoChange records nothing");
-        assert_eq!(entries[0].id, "vpc/main");
+        assert_eq!(
+            entries[0].id, "main-vpc",
+            "the id IS the engine ResourceId — the delete-set key"
+        );
         assert_eq!(entries[0].op, ChangeOp::Created);
         assert_eq!(entries[1].op, ChangeOp::Updated);
         assert_eq!(

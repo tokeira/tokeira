@@ -1,6 +1,6 @@
 # Codex project-scoped configuration (read by the ChatGPT app / Codex when
 # this workspace is trusted). The permission profile named here is defined in
-# the user-level ~/.codex/config.toml — see docs/concurrent-agents.md.
+# the user-level ~/.codex/config.toml — see docs/agents/concurrent-agents.md.
 #
 # project_doc_max_bytes: AGENTS.md exceeds the 32 KiB default; without this,
 # Codex silently truncates the project constitution.

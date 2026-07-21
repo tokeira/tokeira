@@ -1,140 +1,211 @@
 # AGENTS.md — Tokeira
 
+The operating contract for every agent working in this repository — Claude Code, Codex
+(ChatGPT app), and Kiro CLI — and for the humans working alongside them.
+
+## How to read this file
+
+- The numbered rules **§1–§12** are binding. Cite them as `AGENTS.md §8` (or `root §8`
+  from a crate). Numbers are **stable**: new rules append; existing rules are never
+  renumbered — code comments, crate docs, and out-of-repo agent configs cite them.
+- **Precedence:** crate-local `AGENTS.md` (strictest; table under *Doing the work*) →
+  this file → `docs/`. The stricter rule wins; a genuine contradiction is a defect —
+  report it rather than picking silently.
+- **Contracts here, mechanics elsewhere.** Fleet/worktree/kache mechanics:
+  [concurrent-agents.md](docs/agents/concurrent-agents.md). Codex operator guide:
+  [codex-chatgpt-worktrees.md](docs/agents/codex-chatgpt-worktrees.md). Task-specific
+  reference contracts and recipes (equally binding):
+  [engineering-reference.md](docs/agents/engineering-reference.md). Design:
+  [docs/architecture/000-overview.md](docs/architecture/000-overview.md), `docs/adr/`.
+- **Budget:** keep this file under 32 KiB (Codex's default project-doc cap; the tracked
+  `.codex/config.toml` raises it, but every byte here is context every agent pays every
+  session). Cut before you append.
+
 ## Mission
 
-Build a Temporal-compatible durable execution engine in Rust, specialized for Aurora DSQL. Preserve the public Temporal contract that SDKs, operators, and tooling depend on. Collapse internal correctness around a single authoritative per-run transition log.
+Build a Temporal-compatible durable execution engine in Rust, specialized for Aurora
+DSQL. Preserve the public Temporal contract that SDKs, operators, and tooling depend on.
+Collapse internal correctness around a single authoritative per-run transition log.
 
-This is a product-from-scratch. The architecture is informed by Temporal but the implementation is original. Do not port Temporal code.
+This is a product-from-scratch: informed by Temporal, original implementation. **Do not
+port Temporal code** — reading it to determine the contract is required (§8); copying
+its implementation is forbidden.
 
-### Compatibility Target
+DSQL is the design centre, not a pluggable afterthought. Never trade DSQL-layer
+correctness or elegance for speed of conformance progress.
 
-- **Temporal server compatibility: v1.31.0.** This is the release whose public API *behaviour* Tokeira claims to match. It is the authority for every API-behaviour question (see §8). Pinned as `TEMPORAL_SERVER_COMPAT` in `crates/tokeira-build-info/src/pinned.rs`.
-- **Temporal API: v1.62.11.** This is the vendored proto surface Tokeira builds against (`proto/upstream/`, mirrored by `proto/UPSTREAM_VERSION`). Pinned as `TEMPORAL_PROTO_VERSION`.
-- These pins are independent and tracked ahead on purpose: the vendored API `v1.62.11` is newer than the API version Temporal server `1.31.0` ships (`v1.62.8`). RPCs present only in `v1.62.11` (e.g. Nexus operation execution) are **not** part of the `1.31.0` behavioural claim and are tracked separately in the api-conformance tracker. Do not bump the server compatibility claim just because the vendored proto version moved.
+**Values, in tiebreak order:** 1. **Correctness over speed** — a slow transition that
+commits correctly beats a fast one that corrupts state. 2. **Explicitness over magic**
+— every resource, permission, config field visible in code. 3. **Operator empathy** —
+errors say what happened, why, what to do next. 4. **Minimal surface** — every
+dependency, abstraction, and config option must earn its place (§1).
 
----
+### Compatibility target
 
-## Non-Negotiable Rules
+- **Temporal server compatibility: v1.31.0** — the release whose public API *behaviour*
+  Tokeira claims to match; the authority for every API-behaviour question (§8). Pinned
+  as `TEMPORAL_SERVER_COMPAT` in `crates/tokeira-build-info/src/pinned.rs`.
+- **Temporal API: v1.62.11** — the vendored proto surface (`proto/upstream/`, mirrored
+  by `proto/UPSTREAM_VERSION`). Pinned as `TEMPORAL_PROTO_VERSION`.
+- The pins are independent and deliberately skewed: the vendored API is newer than what
+  server 1.31.0 ships (v1.62.8). RPCs present only in the newer API are **not** part of
+  the 1.31.0 behavioural claim (tracked in the api-conformance tracker). Never bump the
+  server-compat claim because the proto pin moved.
 
-### 1. Rust Standards
+## Architecture
 
-- Edition 2024, stable toolchain pinned to 1.96.
-- `cargo clippy --workspace --all-targets` must pass. No suppressed warnings without a comment explaining why.
-- `cargo +nightly fmt` for formatting (some settings require nightly). Just run it — don't check first.
-- Error handling: `thiserror` in library crates, `anyhow` in binary crates. No `.unwrap()` outside tests.
-- All public types derive `Debug`. Serializable types derive `Serialize, Deserialize`.
-- No `unsafe`. No runtime reflection (no trait-object downcasting to concrete types driven by runtime values).
-- Typed extension bags (`HashMap<TypeId, Box<dyn Any + Send + Sync>>` keyed by `TypeId::of::<T>()`, accessed via a type-parameterised `extension::<T>()` helper) are the sanctioned exception. They exist in `ProvisionContext`, `ModuleContext`, `ServiceContext`, and `ImageContext` because the library crates holding these types (`tokeira-iac`, `tokeira-deploy-engine`) cannot depend on the platform crates that register handles into them. This keeps the platform boundary clean at the cost of one well-contained `Box<dyn Any>` per context type. New contexts SHALL NOT introduce additional `Box<dyn Any>` usage beyond this bounded set.
-- Prefer `&str` over `String` in function signatures where ownership isn't needed.
-- Use `tracing` for structured logging. No `println!` or `eprintln!` in library code.
-- Comments and documentation follow the Code Documentation standard (§9). The bar is high: every module, public item, and non-obvious decision carries rationale. Comments explain WHY, never restate WHAT.
-- Do NOT put `use` statements in function scope. Always at the top of the file or module.
-- No explicit sleeps in test code. Use synchronization (channels, `tokio::sync::Notify`, condition variables) instead of `tokio::time::sleep` or `std::thread::sleep`.
-- Rust compilation takes time. Do not interrupt builds or tests unless they are taking more than 5 minutes.
+Three planes — details in
+[docs/architecture/000-overview.md](docs/architecture/000-overview.md), decisions in
+`docs/adr/`:
 
-### 2. The Kernel Stays Pure
+- **Compatibility edge** (`tokeira-edge`, `tokeira-proto`, `tokeira-types`) — admits and
+  translates requests. Owns no workflow semantics.
+- **Authoritative runtime and storage** (`tokeira-kernel`, `tokeira-chasm*`,
+  `tokeira-runtime`, `tokeira-storage`) — owns correctness: shard/bundle ownership,
+  lane-local execution, durable transitions, derived dispatch.
+- **Projection plane** (`tokeira-projection`) — owns read models: visibility, rollups,
+  custom sinks. Outside the correctness path.
 
-`tokeira-kernel` is a deterministic state machine. No I/O, no async, no storage, no metrics, no network. If a change would add any of these to the kernel, it belongs in `tokeira-runtime`, `tokeira-storage`, or `tokeira-edge` instead.
+Per-crate boundary contracts (state stores, provider-agnosticism, config ownership):
+[engineering-reference.md](docs/agents/engineering-reference.md).
 
-### 3. History is Authority
+## The Rules
 
-Every state-changing request becomes a per-run transition. Dispatch and projection are derived effects. If a design puts correctness weight on a queue write or a visibility update, the design is wrong.
+### §1. Rust standards
 
-### 4. Review Before Action
+- Edition 2024; stable toolchain pinned to 1.96 (`rust-toolchain.toml`). Formatting uses
+  nightly-only options: run `cargo +nightly fmt --all` — don't check first. (CI pins a
+  dated nightly for fmt; advance it together with local dev.)
+- **The lint wall is compiler-enforced** in `[workspace.lints]` — prose rules drift;
+  lints survive refactors. Binding today: `unsafe_code = deny` (exactly four carve-outs,
+  each `#[allow]` + `// SAFETY:`), `undocumented_unsafe_blocks = deny`,
+  `unwrap_used = deny` (tests exempt via `clippy.toml`), `print_stdout`/`print_stderr =
+  deny` (use `tracing`; CLI/bench/probe crates carry documented allows),
+  `missing_debug_implementations = deny`. `expect` with an invariant message is the
+  sanctioned unwrap remedy — `expect_used` deliberately not adopted. `missing_docs` is a
+  staged campaign (~9,000 sites), not yet a flip.
+- `cargo lint` passes with zero warnings; no suppression without a comment saying why.
+- `thiserror` in library crates, `anyhow` in binaries. Serializable types derive
+  `Serialize, Deserialize`.
+- No runtime reflection. The typed extension bags in `ProvisionContext` /
+  `ModuleContext` / `ServiceContext` / `ImageContext`
+  (`HashMap<TypeId, Box<dyn Any + Send + Sync>>` behind `extension::<T>()`) are the one
+  sanctioned exception — `tokeira-iac`/`tokeira-deploy-engine` cannot depend on the
+  platform crates that register handles into them. New contexts SHALL NOT introduce
+  additional `Box<dyn Any>`.
+- Prefer `&str` over `String` in signatures where ownership isn't needed. `use` at
+  module top, never in function scope.
+- No explicit sleeps in tests — synchronize (channels, `tokio::sync::Notify`, condition
+  variables).
+- Every dependency must earn its place; adding one is architectural (see *Change
+  classification*).
+- Rust compilation takes time. Don't interrupt builds or tests under 5 minutes.
 
-The CLI follows a `plan → confirm → apply` model. Silent mutations are a bug.
+### §2. The kernel stays pure
 
-- `tkr infra plan` shows what will change before `tkr infra apply` does it.
-- `tkr deploy plan` shows service manifest changes.
-- Destructive operations (`infra destroy`, `deployment destroy`, `scale down`) require `--yes` or interactive confirmation.
+`tokeira-kernel` is a deterministic state machine. No I/O, no async, no storage, no
+metrics, no network. If a change would add any of these to the kernel, it belongs in
+`tokeira-runtime`, `tokeira-storage`, or `tokeira-edge` instead.
 
-### 5. Revert Safety (worktree integrity)
+### §3. History is authority
 
-The working tree frequently contains unstaged edits that represent hours of in-flight work. Reverting files from the git index or HEAD destroys that work irreversibly.
+Every state-changing request becomes a per-run transition. Dispatch and projection are
+derived effects. If a design puts correctness weight on a queue write or a visibility
+update, the design is wrong.
 
-- NEVER run `git checkout`, `git checkout-index`, `git restore`, `git reset --hard`, `git clean -f`, or any equivalent command to revert files without explicit user approval of the exact command.
-- When asked to "undo your changes", produce a reverse patch (`git diff | patch -R`) that reverses ONLY the hunks you introduced. Do not restore files from the index.
-- Before any revert operation, run `git status` and `git diff` and explicitly confirm with the user whether the unstaged changes belong to them.
-- If you did not snapshot the pre-edit content yourself, do not attempt an automatic revert. Stop and ask.
+### §4. Review before action
+
+The CLI follows `plan → confirm → apply`; silent mutations are a bug. `tkr infra plan`
+before `tkr infra apply`; `tkr deploy plan` for service manifests. Destructive
+operations (`infra destroy`, `deployment destroy`, `scale down`) require `--yes` or
+interactive confirmation.
+
+### §5. Revert safety (worktree integrity)
+
+A working tree may hold unstaged edits representing hours of in-flight work. Restoring
+files from the index or HEAD destroys that work irreversibly.
+
+- NEVER run `git checkout`, `git checkout-index`, `git restore`, `git reset --hard`,
+  `git clean -f`, or any equivalent revert without explicit user approval of the exact
+  command.
+- "Undo your changes" means: produce a reverse patch (`git diff | patch -R`) covering
+  ONLY the hunks you introduced. Do not restore files from the index.
+- Before any revert, run `git status` and `git diff` and confirm whose changes are in
+  the tree. If you did not snapshot the pre-edit content yourself, stop and ask.
 - Treat all unstaged changes as user work unless proven otherwise.
 
-### 6. Spec editing safety
+### §6. Spec editing safety
 
-The following requires the explicit instruction from the user. They need to explicitly indicate they want a spec snapshot.
-
-Before editing any file under `.kiro/specs/**`, snapshot the pre-edit state:
-
-```bash
-mkdir -p /tmp/tokeira-spec-snapshots
-cp .kiro/specs/**/*.md /tmp/tokeira-spec-snapshots/$(date +%Y%m%d-%H%M%S)/
-```
-
-or equivalently produce a patch:
+Files under `.kiro/specs/**` are edited only on explicit user instruction. Before
+editing, snapshot the pre-edit state and report the path:
 
 ```bash
 git diff -- .kiro/specs > /tmp/spec-before-$(date +%Y%m%d-%H%M%S).patch
 ```
 
-After editing, report the snapshot or patch path to the user. If asked to undo, apply a reverse patch for only the assistant-authored hunks.
+If asked to undo, reverse only the assistant-authored hunks (§5). If the tree holds
+uncommitted spec edits and the instruction is broad ("undo your changes"), clarify
+before touching anything — never assume it means restore-from-index.
 
-If the working tree has uncommitted spec edits and the user gives a broad instruction like "undo your changes", clarify first: "Undo only the hunks I just introduced; do not restore files from git." Do not assume the broad instruction means restore-from-index.
+### §7. Commit messages via `-F` file (Kiro-specific)
 
-### 7. Commit messages via `-F` file (Kiro-specific)
+Kiro's embedded terminal silently truncates long single-line `git commit -m` invocations
+AND heredocs containing backticks — the commit fails to parse or records a short prefix.
+Always commit from a message file: author it with `fsWrite` (not a terminal heredoc)
+under the workspace root, e.g. `artifacts/commit-msg.txt` (`/tmp/` is outside the
+`fsWrite` sandbox); then `git commit -F artifacts/commit-msg.txt`; then remove the file.
 
-Kiro's embedded terminal truncates long single-line `git commit -m "..."` invocations AND heredocs that embed backticks. The failure is silent — the terminal delivers a truncated command and the commit either fails parsing or records a short prefix.
+`-m "short"` is acceptable only for one-liners under ~60 characters with no backticks or
+angle brackets. Never fake multi-line via `\n` escapes and never heredoc the message —
+both route through the same truncating buffer. The `-F` file is also where the §11
+trailers are authored.
 
-Always write commit messages to a file and pass them via `-F`. The reliable pattern:
+### §8. Temporal behaviour defers to the targeted release
 
-1. Author the message file via the `fsWrite` tool (NOT via terminal heredoc). This bypasses the embedded terminal entirely. Use a path under the workspace root such as `artifacts/commit-msg.txt` — paths starting with `/tmp/` are outside the `fsWrite` sandbox.
-2. `git commit -F artifacts/commit-msg.txt` from bash.
-3. `rm -rf artifacts/commit-msg.txt` (or the whole `artifacts/` dir if you created it just for this) after the commit lands.
+The targeted release is pinned by `TEMPORAL_SERVER_COMPAT` (currently `1.31.0`), the
+vendored API by `TEMPORAL_PROTO_VERSION` (`v1.62.11`), both in
+`crates/tokeira-build-info/src/pinned.rs`.
 
-```bash
-# Step 2 and 3 only — step 1 is a fsWrite call in Kiro, not bash
-git commit -F artifacts/commit-msg.txt
-rm artifacts/commit-msg.txt
-```
+For any question about public API **behaviour** — field semantics, error/status mapping,
+defaulting, lifecycle ordering, inheritance rules — the contract is **whatever the
+targeted release does**, verified against ground truth in this order:
 
-Benefits:
-
-- Supports multi-line messages (title + blank line + body paragraphs + trailers) without shell-quoting gymnastics.
-- Bypasses the terminal's per-line input cap.
-- Bypasses the shell's `argv` size limit (256 KB on macOS default, but the terminal cap bites first).
-- Bypasses heredoc backtick issues.
-- Lets you preview the message by `cat`ing the file before committing.
-
-`-m "short"` is acceptable only for terse single-line messages (under ~60 characters, no backticks, no angle brackets). Never use `-m` with a multi-line message via `\n` escapes — those route through the terminal's input buffer and hit the same truncation. Never use `cat <<'EOF' > file.txt` heredocs for commit messages — backticks inside the heredoc body can still hit the terminal cap.
-
-### 8. Temporal Behaviour Defers to the Targeted Release
-
-The targeted Temporal release is pinned by `TEMPORAL_SERVER_COMPAT` (currently `1.31.0`) and the vendored API by `TEMPORAL_PROTO_VERSION` (currently `v1.62.11`), both in `crates/tokeira-build-info/src/pinned.rs`.
-
-For any question about public API **behaviour** — field semantics, error/status mapping, defaulting, lifecycle ordering, inheritance rules — the contract is **whatever the targeted release does**, verified against ground truth in this order:
-
-1. **Vendored protos in `proto/upstream/`** for wire shape: messages, field numbers, enums, oneofs. NEVER read generated artifacts under `target/` — they can be stale; `proto/upstream/` is the source of truth.
-2. **Temporal server source at the matching tag** for runtime behaviour the proto does not specify. **Read it from the local checkout** — there is a clone at `../temporal` (sibling of this repo) with the `v1.31.0` tag available. Use `git -C <temporal-checkout> show v1.31.0:<path>` and `git grep <pattern> v1.31.0 -- <path>` to read the exact tagged source offline; this is faster, pinned, and grep-able. Do NOT use web search/fetch for Temporal source when the local checkout is available. Read the actual code (e.g. `service/history/...`, `service/worker/...`, `common/...`) — do not infer behaviour from proto doc comments, SDK docs, blog posts, or memory. In specs/PRs, cite the source by repo-relative path + tag (e.g. `service/frontend/workflow_handler.go @ v1.31.0`, optionally linked as [`github.com/temporalio/temporal` tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0)). Never hardcode an absolute developer-machine path in committed specs, code, or docs.
+1. **Vendored protos in `proto/upstream/`** for wire shape: messages, field numbers,
+   enums, oneofs. NEVER read generated artifacts under `target/` — they can be stale;
+   `proto/upstream/` is the source of truth.
+2. **Temporal server source at the matching tag** for behaviour the proto does not
+   specify. **Read the local checkout** at `../temporal` (sibling of this repo, tag
+   `v1.31.0` available): `git -C <temporal-checkout> show v1.31.0:<path>` and
+   `git grep <pattern> v1.31.0 -- <path>` — offline, pinned, grep-able. Do NOT
+   web-search for Temporal source when the local checkout is available. Read the actual
+   code (`service/history/...`, `service/worker/...`, `common/...`) — never infer
+   behaviour from proto doc comments, SDK docs, blog posts, or memory. Cite by
+   repo-relative path + tag (e.g. `service/frontend/workflow_handler.go @ v1.31.0`);
+   never hardcode an absolute developer-machine path in committed specs, code, or docs.
 
 Rules:
 
-- When a behaviour question arises, resolve it against the targeted release **before** writing or amending a spec. A spec or requirement that contradicts the targeted release is wrong; fix the spec.
-- This is distinct from "Do not port Temporal code" in the Mission: **reading** Temporal source to determine the contract is required; **copying** its implementation is forbidden. Tokeira's implementation stays original; only the observable contract is shared.
-- Where a Tokeira mechanism has no exact Temporal analog (e.g. history replay reconstruction), the test of correctness is: *does Tokeira's response match what the targeted release would return for the same execution lineage?*
-- Cite the verifying source (proto path or server source path + tag) in the spec/PR when a behaviour decision is non-obvious, so reviewers can confirm against the same ground truth.
+- Resolve behaviour questions against the targeted release **before** writing or
+  amending a spec. A spec that contradicts the targeted release is wrong; fix the spec.
+- Distinct from "do not port Temporal code": **reading** Temporal source is required;
+  **copying** its implementation is forbidden.
+- Where a Tokeira mechanism has no exact Temporal analog (e.g. history replay
+  reconstruction), the correctness test is: *does Tokeira's response match what the
+  targeted release would return for the same execution lineage?*
+- Cite the verifying source in the spec/PR when a behaviour decision is non-obvious, so
+  reviewers confirm against the same ground truth.
 
-### 9. Code Documentation
+### §9. Code documentation
 
-Tokeira is a correctness-critical durable execution engine whose behaviour mirrors a
-specific external contract (Temporal v1.31.0). Code that is merely correct is not
-enough — the *reasoning* behind it must survive in the source, because the next reader
-(human or agent) cannot re-derive a concurrency invariant, an ordering subtlety, or a
-ground-truthed behaviour decision from the code alone. Comments are part of the
-deliverable, not an afterthought. A change that adds non-obvious logic without
+Tokeira is a correctness-critical engine mirroring an external contract. The *reasoning*
+must survive in the source — the next reader (human or agent) cannot re-derive a
+concurrency invariant or a ground-truthed behaviour decision from the code alone.
+Comments are part of the deliverable; a change that adds non-obvious logic without
 explaining why it is correct is incomplete.
 
 **The WHY-not-WHAT rule.** A comment must add information the code cannot. Restating a
-type signature, a variable name, or obvious control flow is noise — it is worse than no
-comment because it rots, misleads, and trains readers to skip comments. Delete such
-comments when you see them.
+signature, a name, or control flow is noise — worse than none: it rots and trains
+readers to skip comments. Delete such comments when you see them.
 
 ```rust
 // BAD — restates the code:
@@ -147,94 +218,171 @@ info.revision_number += 1;
 info.revision_number += 1;
 ```
 
-**What MUST be documented:**
+**MUST be documented:** every module (`//!`: what it owns, where it sits, its
+invariants — the first screen tells a cold reader purpose and contract); every public
+item (`///`: guarantees, caller assumptions, non-obvious failure/edge behaviour — "pub"
+means someone depends on it); correctness-critical decisions (inline WHY: concurrency
+hazards and the invariant making the code race-free — lock ordering, TOCTOU windows,
+why an operation serializes; ordering/idempotency assumptions; CAS/OCC and fencing
+semantics; why a value is computed live vs stored; anything a future editor could
+"simplify" into a bug); ground-truthed behaviour (cite proto path or server path + tag
+inline, per §8 — never invent an anchor); deliberate deviations and tradeoffs (stated
+explicitly so they are not mistaken for oversights and silently "fixed").
 
-- **Every module** carries a `//!` doc: what it owns, where it sits in the architecture
-  (which plane/crate boundary), and the key invariants it upholds. A reader landing in
-  the file cold should learn its purpose and its contract in the first screen.
-- **Every public item** (type, trait, function, field) carries a `///` doc stating its
-  contract: what it guarantees, what it assumes of callers, and any non-obvious failure
-  or edge behaviour. "Pub" means "someone else depends on this" — document the promise.
-- **Correctness-critical decisions** carry an inline WHY: concurrency hazards and the
-  invariant that makes the code race-free (lock ordering, TOCTOU windows, why an
-  operation is serialized); ordering and idempotency assumptions; CAS/OCC and fencing
-  semantics; why a value is computed live vs. stored; precedence rules; and anything a
-  future editor could plausibly "simplify" into a bug.
-- **Ground-truthed behaviour** cites its source. Where behaviour matches the targeted
-  Temporal release, cite the proto path or server source path + tag inline (e.g.
-  `service/history/workflow/util.go @ v1.31.0`), per §8. Never invent an anchor; only
-  cite what you have verified. This is what lets a reviewer confirm against ground truth
-  without re-investigating.
-- **Deliberate deviations and non-obvious tradeoffs** are stated explicitly, so they are
-  not mistaken for oversights and silently "fixed".
+**Must NOT be documented:** anything obvious from the code — no narrated control flow,
+no paraphrased next line, no ceremonial headers. Test scaffolding stays uncommented;
+property tests carry a one-line invariant statement (and a `// Feature: <name>,
+Property N` tag where a spec defines one).
 
-**What must NOT be documented:** anything already obvious from the code. Do not narrate
-control flow, paraphrase the next line, or add ceremonial headers. When in doubt, ask
-"does this sentence tell the reader something the code does not?" — if no, omit it.
+Enforced like any other standard: missing module docs, undocumented public items, and
+uncommented non-obvious logic are defects to fix before the change is complete — the
+same weight as a failing lint.
 
-**Tests.** Property-based tests carry a one-line statement of the invariant they prove
-(and a `// Feature: <name>, Property N` tag where a spec defines one). Do not comment
-obvious test scaffolding.
+### §10. Concurrent agents — fleet discipline and the git protocol
 
-**This is enforced like any other standard.** A pre-commit review (and any agent doing
-implementation) treats missing module docs, undocumented public items, and uncommented
-non-obvious logic as defects to fix before the change is complete — the same weight as a
-failing lint. Comment density is not the metric; comment *quality and coverage of the
-non-obvious* is.
+Several agents and one human work this repository simultaneously. These rules are the
+contract; mechanics live in [concurrent-agents.md](docs/agents/concurrent-agents.md).
+Every task follows one lifecycle:
 
-### 10. Concurrent Agents (fleet discipline)
+> **worktree + branch → work → finish green → rebase (or recommend) → push + PR →
+> human approval, serial merge → cleanup**
 
-Several agents (and one human) may work on this repository at the same time, each in its
-own git worktree. Mechanics and per-agent setup live in `docs/concurrent-agents.md`;
-these rules are the contract, and they are not optional.
+#### §10.1 Fleet model
 
 - **One agent, one worktree, one branch, one task.** Work only inside your own worktree.
-  Never run git or cargo commands against another checkout of this repository — including
-  the main checkout.
-- **Stay within the crate(s) your task names.** No drive-by edits to other workspace
-  crates, shared configs, CI files, or the workspace `Cargo.toml` unless the task says so.
-- **Dependencies are single-writer.** Do not add, remove, or upgrade dependencies unless
-  the task explicitly calls for it — assume another agent holds the lockfile this window.
-  When not changing dependencies, build with `--locked` so `Cargo.lock` can never be
-  rewritten by accident.
-- **Never `cargo clean`.** It defeats the shared build cache and is never the fix. If the
-  build seems inconsistent, say so and stop. Likewise never delete or move `target/`, and
-  never modify `~/.cargo/config.toml`, rustup toolchains, `RUSTC_WRAPPER`, or any
-  `KACHE_*` / `CARGO_*` environment configuration.
-- **Finish green.** Before declaring a task done: `cargo +nightly fmt --all`, `cargo lint`,
-  and the tests for the crate(s) you touched — the full Enforced Commands bar applies
-  before anything merges.
-- **Commit only your own coherent work** on your own branch (Kiro: via `-F`, §7). If you
-  cannot complete the task, leave the worktree dirty and report what remains — do not
-  half-commit. Do not push, merge, rebase, or open PRs unless the task says so:
-  integration is handled by the human, serially, one branch at a time.
+  Never run git or cargo against a checkout you don't own — including the main checkout
+  at the repo root, which is the human's integration seat.
+- Worktree homes: `.claude/worktrees/…` (Claude, native), `$CODEX_HOME/worktrees/…`
+  (ChatGPT app, managed), `<repo>-wt/…` (`tkw new` — Kiro CLI and manual).
+  `.worktreeinclude` (tracked) lists the gitignored files copied into new worktrees.
+- Shared machine-wide, therefore off-limits: the git object DB and refs, `~/.cargo`, and
+  the kache store (every cargo build routes through the kache `RUSTC_WRAPPER`;
+  per-worktree `target/` dirs dedupe into one content-addressed store). **Never
+  `cargo clean`** — it defeats the shared cache and is never the fix. Never delete or
+  move `target/`; never modify `~/.cargo/config.toml`, rustup toolchains,
+  `RUSTC_WRAPPER`, or `KACHE_*`/`CARGO_*` configuration. If the build seems
+  inconsistent, stop and report.
 
-### 11. Commit attribution — recognise agent work (required)
+#### §10.2 Start: worktree + branch
 
-Kiro, Claude Code, and Codex do a large share of the daily work in this repo, and that contribution
-is recognised **in the history** — never flattened into a lone human author. The human operator stays
-the git `author`; the agents are credited with **required** commit trailers:
+- Branch naming: **`agent/<provider>/<task-slug>`** — `agent/claude/…`, `agent/codex/…`,
+  `agent/kiro/…`. Rename harness-default names (Claude's `worktree-*`, tkw's
+  `agent/<name>`, Codex's detached HEAD at **Create branch here**) to the convention
+  before the first push. Never finish agent work on `main`.
+- Base every task worktree on **`origin/main`** via the harness's fresh mechanism
+  (Claude `worktree.baseRef: "fresh"`; `tkw new` default; the app's `main` picker after
+  the operator preflight). Never copy unstaged main-checkout state into a task worktree.
+- Building on another agent's unmerged branch is allowed **only** when the task declares
+  that dependency: base on the parent (`tkw new --base <ref>`) and wait for the parent
+  to merge first.
 
-- **`Co-authored-by: <Agent> <email>`** — one line for **every agent that authored** part of the
-  change (wrote code, docs, tests, or specs). GitHub renders these as co-authors on the commit and PR.
-- **`Assisted-by: <Agent> <email>`** — one line for **every agent that assisted** without primary
-  authorship: review, verification, ground-truthing, or pairing.
+#### §10.3 Work discipline
 
-Both trailers are required whenever their role applies: **no agent-produced commit ships without a
-`Co-authored-by:` for its authoring agent(s)**, and any agent that reviewed or verified the change
-**must** be credited with `Assisted-by:`. Credit every agent that took part — generously, not
-grudgingly. A commit with genuine agent involvement and no attribution trailer is an incomplete
-change, the same as a missing test or a failing lint.
+- Stay within the crate(s) the task names. No drive-by edits to other crates, shared
+  configs, CI files, or the workspace `Cargo.toml` unless the task says so.
+- **Dependencies are single-writer.** No add/remove/upgrade unless the task explicitly
+  calls for it — assume another agent holds the lockfile this window. Otherwise build
+  `--locked` so `Cargo.lock` can never be rewritten by accident.
+- Commit only your own coherent work, on your own branch (Kiro: via `-F`, §7), with §11
+  trailers. If you cannot finish, leave the worktree dirty and report what remains — do
+  not half-commit.
 
-Canonical identities (use exactly these; if an agent's address changes, update it here so all three
-agents stay consistent):
+#### §10.4 Finish green — the Enforced Commands bar
+
+Run before any push or PR. The per-turn hook (`tkw hook stop` → `cargo check
+--workspace`) is a compile gate, not this bar.
+
+```bash
+cargo +nightly fmt --all                                  # CI verifies with --check
+cargo lint --locked                                       # clippy: workspace + all targets
+cargo test-lint --locked                                  # clippy over tests
+cargo check --workspace --locked
+cargo test --workspace --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+```
+
+- `cargo lint` builds test targets; `cargo check` alone does not.
+- CI (`.github/workflows/ci.yml`) additionally enforces: `cargo-deny`
+  bans/licenses/sources (merge-gating; the advisories job is advisory-only, re-run
+  weekly), a lychee offline link check over every `*.md` including `.kiro/` (broken
+  relative links redden CI), and `git diff --exit-code` (builds must not dirty the
+  tree). Everything runs `--locked`: dependency movement is a reviewed change, never a
+  CI side effect.
+
+#### §10.5 Rebase — or recommend
+
+- At the PR boundary, rebase **once**: `git fetch --prune && git rebase origin/main`.
+  If the rebase changed anything, re-run the bar.
+- Conflicts within your task's scope: resolve and continue. Conflicts that are semantic
+  — overlapping another agent's slice, or code your task doesn't own — **stop before
+  pushing**: leave the branch pre-rebase and report a *recommendation* instead
+  (conflicting paths, the overlapping branch/PR, suggested merge order, whether a
+  hand-back is needed). The integration seat decides.
+- Never merge `main` into a task branch. After a PR exists, updates are additional
+  commits — no history rewrites without explicit approval, and then only
+  `--force-with-lease`.
+
+#### §10.6 Push + PR
+
+- Push at the boundary the goal statement dictates — per-slice by default; a goal may
+  batch slices into one PR. `git push --set-upstream origin agent/<provider>/<slug>`,
+  then `gh pr create --base main`.
+- PR body: what/why summary; validation commands actually run (name anything skipped,
+  and why); base and head SHAs; dependency/lockfile notes; known risks. GitHub renders
+  co-authors from the §11 trailers.
+- Harness gates apply (push is ask-gated for Claude and Kiro). Codex cannot push — it
+  finishes at a named branch and hands off (§12.2).
+
+#### §10.7 Approval + serial merge
+
+- The human integration seat processes PRs **one at a time**: inspect, let required
+  checks run green, merge server-side with a merge commit pinned to the reviewed head —
+  `gh pr merge --merge --match-head-commit <sha>` — then `git pull --ff-only` in the
+  main checkout. Merge commits preserve branch ancestry, which keeps ancestry-based
+  cleanup valid.
+- Agents never merge, never approve their own work, and never resolve another branch's
+  conflicts unless handed that task. Review feedback returns to the owning agent, in its
+  own worktree, as additional commits on the same branch.
+
+#### §10.8 Cleanup
+
+Only after the merge is verified:
+
+- Worktrees are removed **by their owner**: `tkw rm <name>` for tkw worktrees (tkw
+  refuses to remove worktrees it didn't create), Claude removes its own on exit, the
+  ChatGPT app LRU-cleans its managed ones. Never remove another agent's worktree.
+- Branches are collected by ancestry once merged: `tkw clean`, or `git branch -d` —
+  never `-D` an unmerged branch.
+- `tkw tidy` periodically sweeps the edges: merged-worktree cleanup, prune,
+  `cargo sweep`, machete report, `kache gc`.
+
+### §11. Commit attribution — recognise agent work (required)
+
+Kiro, Claude Code, and Codex do a large share of the daily work in this repo, and that
+contribution is recognised **in the history** — never flattened into a lone human
+author. The human operator stays the git `author`; the agents are credited with
+**required** commit trailers:
+
+- **`Co-authored-by: <Agent> <email>`** — one line for **every agent that authored**
+  part of the change (code, docs, tests, or specs). GitHub renders these as co-authors
+  on the commit and PR.
+- **`Assisted-by: <Agent> <email>`** — one line for **every agent that assisted**
+  without primary authorship: review, verification, ground-truthing, or pairing.
+
+Both trailers are required whenever their role applies. Credit every agent that took
+part — generously, not grudgingly. A commit with genuine agent involvement and no
+attribution trailer is an incomplete change, the same as a missing test or a failing
+lint.
+
+Canonical identities (use exactly these; if an address changes, update it here so all
+three agents stay consistent):
 
 - `Kiro <kiro@kiro.dev>`
 - `Claude <noreply@anthropic.com>`
 - `Codex <codex@openai.com>`
 
-Trailers go at the end of the message, after a blank line — which is why the `-F` message file is
-authored to end with them. Example message file:
+Trailers go at the end of the message, after a blank line — which is why the `-F`
+message file is authored to end with them. Example message file:
 
 ```text
 feat(placement): fence slot leases on the monotonic token
@@ -245,185 +393,77 @@ Co-authored-by: Kiro <kiro@kiro.dev>
 Assisted-by: Claude <noreply@anthropic.com>
 ```
 
----
+### §12. Per-agent direction
 
-## Architecture
+What differs per harness. Everything in §10 applies to all three agents.
 
-Three planes:
+#### §12.1 Claude Code
 
-- **Compatibility edge** (`tokeira-edge`, `tokeira-proto`, `tokeira-types`) — admits and translates requests. Does not own workflow semantics.
-- **Authoritative runtime and storage** (`tokeira-kernel`, `tokeira-runtime`, `tokeira-storage`) — owns correctness. Shard/bundle ownership, lane-local execution, durable transitions, derived dispatch.
-- **Projection plane** (`tokeira-projection`) — owns read models. Visibility, rollups, custom sinks. Outside the correctness path.
+- Worktrees are native: `.claude/worktrees/<name>`, with `worktree.baseRef: "fresh"`
+  (`.claude/settings.json`) so branches start from `origin/main`. Rename `worktree-*` →
+  `agent/claude/<slug>` before the first push.
+- Hooks: `tkw hook post-edit` after each edit (single-file nightly rustfmt);
+  `tkw hook stop` at each turn end (`cargo check --workspace`, blocking). These are
+  compile gates — §10.4 is the completion bar.
+- Permission gates are policy, not friction: push/rebase/checkout/reset ask first;
+  force-push, `git clean`, `branch -D`, `reset --hard` are denied. Work with the gates,
+  never around them.
+- `../temporal` is the read-only §8 reference checkout — read via `git -C ../temporal`;
+  writes there are denied.
+- The full lifecycle is yours, including `git push` and `gh pr create` (§10.5–§10.6).
 
-Detailed architecture docs: `docs/architecture/000-overview.md` and linked documents.
+#### §12.2 Codex (ChatGPT app)
 
----
+- You run inside an app-managed worktree (`$CODEX_HOME/worktrees/…`, detached HEAD, own
+  `target/`) — a real linked worktree of this repository. Work only there. **Local**
+  (non-worktree) chats are research-only: read and answer; never edit from Local.
+- **Your sandbox has no network** (permission profile `tokeira`, selected by the tracked
+  `.codex/config.toml`; the profile itself is defined user-level). Consequences: build
+  from the warm registry with `--locked`; no dependency changes unless the task
+  explicitly says so; no `git fetch`, no push, no `gh`. kache works invisibly underneath
+  cargo — never configure around it (§10.1).
+- **Your finishing move** (replaces §10.6): run the §10.4 bar and report any check not
+  run and why; present the diff; create the branch via **Create branch here** named
+  `agent/codex/<task-slug>`; commit through the app's git controls with §11 trailers
+  (`Co-authored-by: Codex <codex@openai.com>`). Push and PR happen outside your sandbox,
+  from your named branch.
+- **Your half of §10.5:** you can see local refs. If local `main` has moved past your
+  base, say so (base SHA vs current `main`) and recommend; the rebase itself belongs to
+  the operator or Claude.
+- Final report: branch, head SHA, bar results, files touched, known risks, merge-order
+  recommendation when relevant.
+- Operator guide (Worktree chats, permission profiles, integration):
+  [codex-chatgpt-worktrees.md](docs/agents/codex-chatgpt-worktrees.md).
 
-## Workspace Structure
+#### §12.3 Kiro CLI
 
-```
-tokeira/
-├── Cargo.toml                    # Workspace root
-├── apps/
-│   ├── tokeirad/                 # Server binary
-│   └── tkr/                      # Operator/developer CLI
-├── crates/
-│   ├── tokeira-types/            # Shared identifiers and value types
-│   ├── tokeira-proto/            # Wire types (public + internal)
-│   ├── tokeira-kernel/           # Pure deterministic transition engine
-│   ├── tokeira-storage/          # Persistence interfaces + in-memory store
-│   ├── tokeira-runtime/          # Lanes, broker, sweepers, timers
-│   ├── tokeira-edge/             # Compatibility shell for public APIs
-│   ├── tokeira-projection/       # Projection workers + visibility API
-│   ├── tokeira-observability/    # Metrics/label definitions
-│   ├── tokeira-build-info/       # Compatibility pins (proto + server-compat)
-│   ├── tokeira-compatibility/    # Feature/SDK compatibility matrices
-│   ├── tokeira-compatibility-proto/    # Tokeira-owned compatibility wire types
-│   ├── tokeira-compatibility-service/  # Compatibility metadata service
-│   ├── tokeira-state/            # Deployment state (CAS store + S3 store)
-│   ├── tokeira-iac/              # IaC engine (plan/apply/destroy)
-│   ├── tokeira-deploy-engine/    # Service lifecycle engine
-│   ├── tokeira-config/           # Server config + generic TOML loader
-│   ├── tokeira-orchestrator/     # Deployment orchestration facade
-│   ├── tokeira-compose/          # Docker Compose provider (bollard)
-│   ├── tokeira-aws/              # AWS resource implementations
-│   ├── tokeira-build/            # Dagger image build recipes
-│   ├── tokeira-controller/       # Control-plane service
-│   ├── tokeira-autoscaler/       # Autoscaling service
-│   ├── tokeira-remote-workstation/     # Remote workstation support
-│   └── dagger-client/            # Dagger GraphQL client
-├── proto/
-│   └── upstream/                 # Vendored Temporal protos (authoritative; API v1.62.11)
-├── platforms/
-│   ├── local/                    # Bare-process local platform
-│   └── compose/                  # Docker Compose platform with observability + DSQL module
-├── docs/
-│   └── architecture/             # Design documents (000–131)
-└── .kiro/specs/                  # Feature specs (requirements, design, tasks)
-```
+- Worktrees via tkw: `tkw new <slug>` → `<repo>-wt/<slug>` on branch `agent/<slug>`;
+  rename to `agent/kiro/<slug>` before the first push (§10.2).
+- Spec-driven: `.kiro/specs/` + `/spec`, house style in
+  `.agents/skills/kiro-spec-driven-development/` (EARS requirements, design, tasks,
+  property-based testing, ground-truth verification).
+- Commits via the `-F` message file — §7 is non-negotiable in Kiro's terminal.
+- Hooks (`.kiro/hooks/rust-quality.json`) are advisory on Stop — Kiro does not block
+  there, so running the §10.4 bar before declaring done is on you.
+- Permissions are user-level (`~/.kiro/settings/permissions.yaml`), deliberately outside
+  the repo; push and worktree removal are ask-gated there.
 
----
+## Doing the work
 
-## Package Boundaries
+### Decision process
 
-- `tokeira-kernel` is pure — no I/O, no async, no storage, no metrics.
-- `tokeira-edge` is thin — translates requests, does not implement workflow semantics.
-- `tokeira-projection` owns visibility types and the `VisibilityApi` trait. Edge re-exports them.
-- `tokeira-state` provides two store implementations: `CasStore` (backend-agnostic single-document CAS) and `S3StateStore` (manifest + immutable snapshots).
-- `tokeira-iac` and `tokeira-deploy-engine` are provider-agnostic. Platform-specific resources and services live in platform crates.
-- Platform crates (`platforms/local`, `platforms/compose`) follow the deploy-eks `project` pattern: `config.rs`, `modules.rs`, `services.rs`, `compose.rs`.
-- `tokeira-config` owns both the server runtime config model (`TokeiraConfig`) and the generic TOML loader. These are in the same crate because there is currently one consumer.
-- `proto/upstream/` holds the vendored Temporal protos (API `v1.62.11`) and is the authoritative wire shape. `tokeira-proto` generates from it. Never treat generated output under `target/` as authoritative.
-
----
-
-## IaC Engine Contracts
-
-The engine distinguishes **desired** resources (what should exist) from **known** resources (everything the deployment can manage, including resources that may need deletion). The `InfraComposition` carries both sets plus `active_modules` for scoped operations.
-
-- Resources implement `create()`, `update()`, `delete()`, `describe()`, `diff()`, `dependencies()`.
-- Modules implement `name()`, `dependencies()`, `resources()`.
-- Both modules and resources are topologically sorted by dependencies before execution.
-- `describe()` is called during `refresh_state` to get live provider state before diffing.
-- The engine calls an optional `StateSaver` callback after each mutating operation for incremental crash-safety.
-- State backends must tolerate a missing backing store on `load()` (return default) so the remote-state module can bootstrap the store during the first apply.
-
----
-
-## Configuration
-
-- Server config: `tokeirad.toml` — `TokeiraConfig` with four sections: infrastructure, policy, capacity, emergency.
-- Platform config: `deployment.toml` — platform-specific (`LocalConfig` or `ComposeConfig`). Compose DSQL deployments carry `storage = "dsql"` plus `[dsql]` mode/endpoint/arn/region fields.
-- Compose DSQL writeback updates `tokeirad.toml` with `infrastructure.storage = "dsql"` plus `infrastructure.dsql.endpoint` and `infrastructure.dsql.region`.
-- `serde(deny_unknown_fields)` on all config structs — typos are caught at parse time.
-- `RuntimeConfig` is always `Default` — not configurable from TOML. Mechanical settings are auto-tuned.
-- No env vars on invocation. Defaults characterized by expected performance, not deployment environment.
-- Emergency overrides (`disable_stickiness`, `freeze_projection`, `cap_poll_admission`) are logged as warnings.
-
----
-
-## Testing
-
-- Unit tests co-located in each module (`#[cfg(test)]`).
-- Property-based tests using `proptest` for config validation, serialization round-trips, dependency ordering.
-- `cargo test` runs all unit tests. All tests must pass before committing.
-- No tests that require live AWS credentials or Docker in the default test suite.
-- Some tests cause intentional panics. Only consider tests that have failed according to the test harness to be a real problem.
-- Key properties to maintain:
-  - Config TOML round-trips without loss.
-  - Unknown config fields are rejected.
-  - Module dependency graph is a DAG (no cycles).
-  - Service dependency graph is a DAG (no cycles, no missing deps).
-  - State CAS: two concurrent saves from the same version — at most one succeeds.
-
-### Functional conformance harness (Tier 2)
-
-Behavioural conformance against Temporal is validated separately from `cargo test`
-by replaying Temporal's functional Go corpus (pinned at `TEMPORAL_SERVER_COMPAT`)
-over the real gRPC wire against a running `tokeirad`. It is operator-invoked and
-lives in the sibling Temporal fork, not the default test suite. Do not assume it
-runs under `cargo test`. See `docs/testing/functional-conformance-harness.md` for
-what it proves, how it works, and the conventions binding any fix derived from a
-run (v1.31.0 ground truth, no kernel additions, config-as-constant, feature modes
-as independent runs, raise ambiguity).
-
-Three Go runners live in the fork (`../temporal`, branch `tokeira/conformance-v1.31.0`); each
-boots-or-reuses `tokeirad` on a shared lifecycle and pins the corpus toolchain
-(`GOTOOLCHAIN=go1.26.2`). Build `tokeirad` first (`cargo build -p tokeirad`, or with
-`--features conformance` for the dynamic-config control listener), then invoke from the fork:
-
-```bash
-# Full corpus baseline — every entrypoint, each isolated — emitting a combined -json stream:
-TOKEIRA_BIN=<workspace>/target/debug/tokeirad \
-  go run -tags test_dep ./tests/tokeira_conformance_runall/
-
-# Single suite (or any -run regexp) for iteration, with a per-leaf PASS/FAIL/SKIP tally:
-TOKEIRA_BIN=<workspace>/target/debug/tokeirad \
-  go run -tags test_dep ./tests/tokeira_conformance_runsuite/ '^TestSuiteName$'
-
-# Distil the run-all -json stream into per-test outcomes:
-go run -tags test_dep ./tests/tokeira_conformance_ledger/ \
-  tokeira-conformance-results.json outcomes.json
-```
-
-A run never excludes a test; out-of-scope cases are skipped **by name** through the fork's
-conformance skip registry (`tests/testcore/tokeira_conformance_skip.go`) — never by editing a corpus
-test body — applied via the `SetupTest`/`SetupSubTest` hooks and a runner-derived `go test -skip`
-regexp for raw `t.Run` sub-tests. Each skip carries a cited reason and still emits a classified `skip`
-outcome. A test needing a non-default dynamic-config value is **no longer** a blanket skip: the
-conformance-only dynamic-config override bridge delivers `OverrideDynamicConfig` to a
-`--features conformance` `tokeirad` for **wired** keys (`.kiro/specs/conformance-config-override/`);
-only unwired, kernel-excluded, or not-enforced keys fall back to the skip registry.
-
-## Enforced Commands
-
-The following commands are enforced for each pull request:
-
-```bash
-cargo +nightly fmt --all --check   # formatting
-cargo lint                         # clippy on workspace + all targets
-cargo test-lint                    # clippy on tests
-cargo check --workspace            # compilation
-cargo test --workspace             # unit tests
-cargo doc --workspace --no-deps    # documentation (RUSTDOCFLAGS="-D warnings")
-tkr ci check                       # compatibility invariants once Dagger module is available
-```
-
-Use `cargo lint` to check if everything compiles without running tests. `cargo check` alone does not build test targets.
-
----
-
-## Decision Process
-
-0. **For API-behaviour questions, resolve against the targeted Temporal release first.** See §8 — `proto/upstream/` for shape, Temporal server source at tag `v1.31.0` for behaviour. This tier sits above the spec: a spec that contradicts the targeted release is the thing that's wrong.
-1. **Check the spec first.** Requirements and design docs are in `.kiro/specs/`. They're the source of truth.
-2. **Check existing patterns.** Look at how similar things are done in the codebase before inventing a new approach.
-3. **Prefer boring solutions.** The simplest approach that satisfies the requirement is the right one.
-4. **Ask if unsure.** If a decision has architectural implications, surface it rather than guessing.
+0. **API-behaviour questions → the targeted release first** (§8): `proto/upstream/` for
+   shape, server source at `v1.31.0` for behaviour. This tier sits above the spec — a
+   spec that contradicts the targeted release is the thing that's wrong.
+1. **Check the spec.** `.kiro/specs/` is the source of truth for what to build.
+2. **Check existing patterns** before inventing a new approach.
+3. **Prefer boring solutions.** The simplest approach that satisfies the requirement.
+4. **Ask if unsure.** Surface architectural implications rather than guessing.
 
 ### Crate-local AGENTS.md (read before editing a high-risk crate)
 
-Some crates carry their own `AGENTS.md` that refines this root file for that crate. When editing under one of these paths, read its `AGENTS.md` first and treat it as binding; on conflict with this root file, the crate-local (stricter) rule wins. This applies to every agent, not only Codex — do not rely on automatic nested-file loading; open it explicitly.
+Binding refinements of this root file; the stricter crate-local rule wins. Do not rely
+on automatic nested-file loading — open it explicitly. Applies to every agent.
 
 | Crate | Concentrates |
 |-------|--------------|
@@ -433,106 +473,120 @@ Some crates carry their own `AGENTS.md` that refines this root file for that cra
 | `crates/tokeira-edge/AGENTS.md` | Thin translation only; public-API behaviour ground-truthed to the targeted release (§8). |
 | `crates/tokeira-state/AGENTS.md` | CAS-not-force-overwrite; immutable snapshots; tolerate a missing store on load. |
 
-### Change Classification
+### Change classification
 
 | Change Type | Examples | Required |
 |-------------|----------|----------|
-| **Trivial** | Fix typo, add doc comment, rename local variable | Tests pass |
-| **Standard** | New resource, new service, new CLI command | Tests pass + follows existing patterns |
-| **Architectural** | New crate, new dependency, change to state format | Spec update or explicit approval |
-| **Destructive** | Remove crate, change config schema, break state compatibility | Spec update AND explicit approval |
+| **Trivial** | Typo fix, doc comment, local rename | Tests pass |
+| **Standard** | New resource, service, CLI command | Tests pass + follows existing patterns |
+| **Architectural** | New crate, new dependency, state-format change | Spec update or explicit approval |
+| **Destructive** | Remove crate, config-schema break, state-compat break | Spec update AND explicit approval |
 
----
+## Verification
 
-## Working Agreements
+### Tests
 
-### Temporal Compatibility Changes
+- Unit tests co-located per module (`#[cfg(test)]`); property-based tests with
+  `proptest` for config validation, serialization round-trips, dependency ordering.
+- `cargo test --workspace` passes before every commit. The default suite requires no
+  live AWS credentials and no Docker.
+- Some tests panic intentionally; only failures reported by the test harness are real
+  problems.
+- Standing properties: config TOML round-trips losslessly; unknown config fields
+  rejected; module and service dependency graphs are DAGs; state CAS admits at most one
+  of two concurrent saves from the same version.
 
-1. `TEMPORAL_PROTO_VERSION` (API surface, `v1.62.11`) and `TEMPORAL_SERVER_COMPAT` (behavioural target, `1.31.0`) are independent pins in `crates/tokeira-build-info/src/pinned.rs`. `TEMPORAL_SERVER_COMPAT` is the authority for every API-behaviour question (see §8). Do not bump the server compatibility claim just because the vendored proto version changed.
-2. New WorkflowService or OperatorService surfaces must be classified in `FEATURE_MATRIX` in `crates/tokeira-compatibility/src/matrix.rs`.
-3. New SDK claims must update `SDK_MATRIX` in `crates/tokeira-compatibility/src/sdk.rs` with evidence and verification state.
-4. Tokeira-owned compatibility metadata uses Buffa/connect-rust under `proto/tokeira/compatibility/v1/`; do not add Tokeira extension fields to upstream Temporal protos.
-5. Run `tkr ci check` when the Dagger compatibility module is available. Until then, use the focused matrix, CLI, and edge tests described in `.kiro/specs/temporal-compatibility/`.
+### Functional conformance harness (Tier 2)
 
-### Adding a New Platform
+Behavioural conformance is validated separately from `cargo test` by replaying
+Temporal's functional Go corpus (pinned at `TEMPORAL_SERVER_COMPAT`) over the real gRPC
+wire against a running `tokeirad`. Operator-invoked; lives in the sibling fork
+(`../temporal`, branch `tokeira/conformance-v1.31.0`) — never assume it runs under
+`cargo test`. The runbook (build `tokeirad`, run the full corpus or one suite, distil
+outcomes) and the conventions binding any fix derived from a run (v1.31.0 ground truth,
+no kernel additions, config-as-constant, feature modes as independent runs, raise
+ambiguity):
+[docs/testing/functional-conformance-harness.md](docs/testing/functional-conformance-harness.md).
 
-1. Create `platforms/{name}/` with `config.rs`, `modules.rs`, `services.rs`, `compose.rs` (or equivalent).
-2. Implement `Deployment` and `Ops` traits from `tokeira-orchestrator`.
-3. Add `PlatformKind` variant and `CliPlatformKind` variant.
-4. Add prototypical config generation in `tkr/src/prototypical.rs`.
-5. Add tests for config generation, module composition, and service ordering.
+Contract highlights: a run never excludes a test — out-of-scope cases are skipped **by
+name** in the fork's skip registry (`tests/testcore/tokeira_conformance_skip.go`), each
+with a cited reason and a classified `skip` outcome, never by editing a corpus test
+body. Tests needing non-default dynamic config are not blanket skips: the override
+bridge delivers wired keys to a `--features conformance` `tokeirad`
+(`.kiro/specs/conformance-config-override/`); only unwired, kernel-excluded, or
+not-enforced keys fall back to the registry.
 
-### Adding a New IaC Module
+Campaign order and per-tier ledger:
+[docs/readiness/functional-test-order.md](docs/readiness/functional-test-order.md) ·
+[docs/readiness/conformance.md](docs/readiness/conformance.md).
 
-1. Create the module in the platform's `modules.rs`.
-2. Implement `Module` trait with `name()`, `dependencies()`, `resources()`.
-3. Register it in the platform's `infra_modules()` method.
-4. Add tests for resource enumeration and dependency ordering.
-5. For compose storage modules, use `DsqlModule` as the reference pattern: module-owned config, explicit dependencies, and provider handles registered through `register_infra_extensions()`.
+## Reference
 
-### Adding a New CLI Command
+### Workspace map
 
-1. Add subcommand enum variant in `tkr/src/cli.rs`.
-2. Create handler in `tkr/src/commands/{group}.rs`.
-3. Wire into the command tree in `main.rs`.
-4. Add CLI parse tests.
-5. For multi-file command groups, use `.kiro/specs/image-lifecycle/` as the reference pattern: clap variant, handler module, main wiring, and any command-specific session re-exec helper.
+The workspace `Cargo.toml` member list is the authority; this is orientation
+(`tokeira-` prefixes elided):
 
-### Adding a New Image
+```
+apps/       tokeirad (server) · tkr (operator CLI) · controller · autoscaler · bench
+crates/     engine   types · proto · kernel · chasm{,-derive,-activity} · storage ·
+                     runtime · projection · edge · observability · auth
+            compat   build-info · compatibility{,-proto,-service} ·
+                     conformance{,-proto,-control}
+            deploy   state · iac · deploy-engine · config · orchestrator · tkd · k8s ·
+                     aws · compose · build · provisioner{,-cli} · autoscaler ·
+                     controller · remote-workstation · dagger-client
+platforms/  local · compose · compose-syn · ecs · eks
+tools/      tkw (fleet worktrees) · proto-sync · simulation (excluded)
+proto/      upstream/ — vendored Temporal protos (authoritative wire shape, §8)
+.kiro/specs/  feature specs        spec/  TLA+/refinement stack
+scenarios/  e2e samples (excluded)        spikes/  throwaway probes
+docs/       agents · architecture · adr · readiness · operations · runbooks · testing
+```
 
-1. Decide which platform(s) need the image (compose, ECS, or both).
-2. In each owning platform's `src/images/` module, declare a struct implementing `tokeira_deploy_engine::image::Image`.
-3. Add the struct to that submodule's `all()` function, such as `images::tokeirad::all()` or `images::observability::all()`.
-4. If the image's remote ref is referenced by config, override `writeback_targets(ctx)` to list the dotted TOML keys.
-5. Add property-test coverage if `desired_ref` or `writeback_targets` logic is non-trivial.
-6. If the image needs a new build recipe, add a free function to `tokeira-build` with its own hardcoded Dagger pipeline.
+### Working agreements
 
-### Adding or Changing a DSQL Migration
+Package boundaries, configuration contracts, IaC engine contracts, the
+adding-a-platform / IaC-module / CLI-command / image recipes, and the observability
+stack pins live in [engineering-reference.md](docs/agents/engineering-reference.md) —
+equally binding, loaded when the task needs them. Two agreements stay here because
+other files depend on them by name:
 
-DSQL migrations live in `crates/tokeira-storage/migrations/` as `VNNN__snake_case.sql`, one statement per file. `build.rs` embeds them at compile time; the runner (`crates/tokeira-storage/src/dsql/migration.rs`) is forward-only, checksum-verified, and rejects version gaps and duplicates.
+#### Temporal compatibility changes
 
-- **Initial build phase (now): no `ALTER TABLE`.** There is no baseline schema to preserve, so a new column/constraint MUST be folded into the table's base `CREATE TABLE` migration rather than added as a follow-up `ALTER`. Editing an already-embedded migration is fine — its checksum simply changes and the schema is recreated from scratch. Keep versions contiguous (no gaps); deleting the highest migration is acceptable.
-- **After a baseline is cut, this flips to strictly forward-only.** Once any environment has applied the migrations, an embedded migration MUST NOT be edited — the runner rejects a changed checksum for an applied version. From that point every schema change is a new `VNNN` migration (including `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`), never an in-place edit of an existing one. Removing the build-phase "fold into base / no ALTER" rule is itself the signal that the baseline has been cut.
-- DSQL DDL constraints still apply at all times: one statement per file, secondary indexes created `ASYNC`, no `CHECK` constraints (validate in the application), no `BIGSERIAL` (generate IDs in-app). The `DdlValidator` enforces the DSQL-safe subset.
-- There is no historical hand-maintained schema dump — the migrations directory is the single authoritative schema source.
+The two pins are independent (see *Compatibility target*); never bump the server-compat
+claim because the proto pin moved. New WorkflowService/OperatorService surfaces are
+classified in `FEATURE_MATRIX` (`crates/tokeira-compatibility/src/matrix.rs`); SDK
+claims update `SDK_MATRIX` (`crates/tokeira-compatibility/src/sdk.rs`) with evidence and
+verification state. Tokeira-owned compatibility metadata uses Buffa/connect-rust under
+`proto/tokeira/compatibility/v1/` — never add Tokeira extension fields to upstream
+Temporal protos. Run `tkr ci check` once the Dagger compatibility module is available;
+until then, the focused matrix/CLI/edge tests in `.kiro/specs/temporal-compatibility/`.
 
----
+#### Adding or Changing a DSQL Migration
 
-## Observability Stack (Compose Platform)
+Migrations live in `crates/tokeira-storage/migrations/` as `VNNN__snake_case.sql`, one
+statement per file; `build.rs` embeds them; the runner is forward-only,
+checksum-verified, and rejects gaps and duplicates.
 
-Pinned versions:
-- Mimir: `grafana/mimir:3.0.6`
-- Loki: `grafana/loki:3.7.1`
-- Grafana: `grafana/grafana-oss:12.4.3`
-- Alloy: `grafana/alloy:v1.16.0`
-- AWS CLI: `public.ecr.aws/aws-cli/aws-cli:latest`
-- BusyBox: `public.ecr.aws/docker/library/busybox:latest`
+- **Initial build phase (now): no `ALTER TABLE`.** Fold new columns/constraints into the
+  table's base `CREATE TABLE` migration. Editing an already-embedded migration is fine —
+  its checksum changes and the schema recreates from scratch. Keep versions contiguous;
+  deleting the highest migration is acceptable.
+- **After a baseline is cut, strictly forward-only:** an applied migration is never
+  edited (the runner rejects a changed checksum); every schema change is a new `VNNN`
+  (including `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`). Removing the build-phase rule
+  from this file is itself the signal that the baseline has been cut.
+- DSQL DDL constraints always apply: one statement per file, secondary indexes `ASYNC`,
+  no `CHECK` constraints (validate in the application), no `BIGSERIAL` (generate IDs
+  in-app). `DdlValidator` enforces the subset. The migrations directory is the single
+  authoritative schema source — there is no hand-maintained dump.
 
-Three compose IaC modules are relevant in DSQL mode: `local-state`, `dsql`, `observability`, then `runtime` by dependency order. In-memory compose deployments omit `dsql`.
+### Pointers
 
-Provisioned Grafana dashboards:
-- `broker-runtime-health.json`
-- `grpc-edge-health.json`
-- `storage-projection-health.json`
-- `log-exploration.json`
-
-The six mirror images (Mimir, Loki, Grafana, Alloy, AWS CLI, BusyBox) are declared in each platform's `src/images/observability/mod.rs` via a platform-local `mirror_image!` macro. Version bumps are a one-line change in the platform's `ObservabilityConfig::default()` defaults or the `default_<field>_image()` helpers for `aws_cli_image` and `busybox_image`.
-
----
-
-## Repository Values
-
-1. **Correctness over speed.** A slow transition that commits correctly beats a fast one that corrupts state.
-2. **Explicitness over magic.** Every resource, every permission, every config field — visible in code.
-3. **Operator empathy.** Error messages tell the operator what happened, why, and what to do next.
-4. **Minimal surface.** Every dependency, every abstraction, every config option must earn its place.
-
----
-
-## Spec Reference
-
-- `.kiro/specs/*/` — feature specs (requirements, design, tasks)
-- `docs/architecture/` — architecture design documents
-- `docs/deployment-definitions.md` — authoring + operating `.tkd` deployment definitions (the rust-syn DSL and `tkp` lifecycle)
-- `proto/upstream/` — vendored Temporal protos (API `v1.62.11`); authoritative wire shape
-- Temporal server source for behaviour: [`github.com/temporalio/temporal` at tag `v1.31.0`](https://github.com/temporalio/temporal/tree/v1.31.0) (the `TEMPORAL_SERVER_COMPAT` target) — see §8
+- `.kiro/specs/*/` — feature specs (requirements, design, tasks).
+- [docs/deployment-definitions.md](docs/deployment-definitions.md) — authoring and
+  operating `.tkd` deployment definitions (the rust-syn DSL and `tkp` lifecycle).
+- Temporal ground truth (§8): `proto/upstream/` (API `v1.62.11`) and the server source
+  at tag `v1.31.0` — local checkout `../temporal`, or
+  [github.com/temporalio/temporal @ v1.31.0](https://github.com/temporalio/temporal/tree/v1.31.0).

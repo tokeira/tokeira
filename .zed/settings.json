@@ -1,6 +1,6 @@
 {
   // Zed project settings for tokeira. Tracked, so every worktree opened in
-  // Zed inherits them. See docs/concurrent-agents.md ("Repo-specific notes").
+  // Zed inherits them. See docs/agents/concurrent-agents.md ("Repo-specific notes").
   "lsp": {
     "rust-analyzer": {
       "initialization_options": {

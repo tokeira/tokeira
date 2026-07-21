@@ -1,8 +1,8 @@
 # Concurrent AI agents on one machine
 
 *Working practice for running Claude Code, Codex (ChatGPT app), and Kiro CLI in parallel
-against this repository. The non-negotiable rules live in `AGENTS.md` §10; this document
-is the mechanics. Statements tagged `[observed]` are local measurements or behaviors of
+against this repository. The non-negotiable rules live in `AGENTS.md` §10–§12; this
+document is the mechanics. Statements tagged `[observed]` are local measurements or behaviors of
 the installed tool versions — re-verify them on upgrade; everything else follows upstream
 documentation.*
 
@@ -151,7 +151,9 @@ session automatically.
 ### Codex — ChatGPT app managed worktrees
 
 Codex runs through the ChatGPT app's **Local | Worktree** environment picker, not the
-CLI. Day to day:
+CLI. The agent-facing contract is `AGENTS.md` §12.2; the operator guide (Worktree
+chats end to end: configuration, starting, finishing, integration) is
+[codex-chatgpt-worktrees.md](codex-chatgpt-worktrees.md). Day to day:
 
 - **Research / questions** → Local (the main checkout, read-only).
 - **Coding task** → Worktree, based on `main` — only valid when local `main` equals

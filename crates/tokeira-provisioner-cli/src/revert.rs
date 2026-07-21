@@ -37,6 +37,10 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
+    // ── Operation-marker gate (task 19.4): an interrupted upgrade/rollback
+    // is recovered by re-running THAT verb; everything else refuses. ──
+    crate::marker::refuse_if_marked(&envelope, "revert")?;
+
     // ── Gate before any mutation (a revert is a config apply) ──
     match evaluate_gate(envelope.binding.as_ref(), &running) {
         GateOutcome::Refuse { verdict, reason } => {

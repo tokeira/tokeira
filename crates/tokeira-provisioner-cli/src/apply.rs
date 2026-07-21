@@ -27,6 +27,10 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
+    // ── Operation-marker gate (task 19.4): an interrupted upgrade/rollback
+    // is recovered by re-running THAT verb; everything else refuses. ──
+    crate::marker::refuse_if_marked(&envelope, "apply")?;
+
     // ── Gate before any mutation ──
     match evaluate_gate(envelope.binding.as_ref(), &running) {
         GateOutcome::Refuse { verdict, reason } => {
@@ -128,6 +132,31 @@ mod tests {
     use super::*;
     use crate::TestPlatform;
     use tokeira_provisioner::DeploymentStateEnvelope;
+
+    // Task 19.4: while an upgrade/rollback marker is open, `apply` refuses —
+    // recovery goes through the interrupted verb, never around it.
+    #[tokio::test]
+    async fn apply_refuses_while_an_operation_marker_is_open() {
+        use chrono::Utc;
+        use tokeira_provisioner::ProvenanceStamp;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::envelope_store(tmp.path());
+        // A dev binding that would otherwise DevIterate straight through.
+        let running = ProvenanceStamp::current(Utc::now());
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(running.clone()),
+            ..Default::default()
+        };
+        env.begin_upgrade(running, "op-open", Utc::now());
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        let err = apply(&TestPlatform, tmp.path())
+            .await
+            .expect_err("the open marker gates apply");
+        assert!(err.to_string().contains("in flight"), "unexpected: {err}");
+    }
 
     #[tokio::test]
     async fn apply_refuses_an_unstamped_deployment() {

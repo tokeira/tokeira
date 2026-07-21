@@ -16,8 +16,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::{
-    DeploymentStateEnvelope, ENVELOPE_SCHEMA_VERSION, MigrationRegistry, ProvenanceStamp,
-    UpgradeDecision, envelope_migrations, evaluate_upgrade,
+    DeploymentStateEnvelope, ENVELOPE_SCHEMA_VERSION, MigrationRegistry, OperationKind,
+    ProvenanceStamp, UpgradeDecision, envelope_migrations, evaluate_upgrade,
 };
 
 use crate::{ProvisionerPlatform, envelope_store, init::running_integrity_manifest};
@@ -32,6 +32,48 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         .load()
         .await
         .context("failed to load the deployment envelope")?;
+
+    // ── Operation-marker gate (task 19.4): a re-run of an interrupted
+    // upgrade RESUMES from the recorded phase — the transfer already
+    // happened, the binding already names B, so the decision gate below
+    // (which would now see B == B and refuse) is exactly what resume skips.
+    // An open ROLLBACK marker refuses: it is finished by `rollback`.
+    if let crate::marker::MarkerDisposition::Resume(operation) =
+        crate::marker::check_marker(&envelope, "upgrade", Some(OperationKind::UpgradeInFlight))?
+    {
+        println!(
+            "resuming interrupted upgrade {} from phase '{}'",
+            operation.operation_id, operation.phase
+        );
+        // The binding must name the engine resuming it — a DIFFERENT binary
+        // than the one that transferred ownership must not finish its upgrade.
+        let bound = envelope
+            .binding
+            .as_ref()
+            .map(|b| b.source_tree_hash.as_str());
+        if bound != Some(running.source_tree_hash.as_str()) {
+            anyhow::bail!(
+                "the open upgrade marker belongs to another engine (bound {}, running {}) — \
+                 run that binary to resume, or `rollback` to abort forward to A",
+                bound.unwrap_or("unstamped"),
+                running.source_tree_hash
+            );
+        }
+        // Idempotent remainder: apply B's plan, close the marker.
+        let change_count = platform.infra_apply(deployment_dir).await?;
+        println!("infra apply under the new engine: {change_count} change(s)");
+        envelope.close_operation();
+        envelope.stamp_current_schema();
+        store
+            .save(&envelope, &version)
+            .await
+            .context("failed to close the operation marker")?;
+        println!(
+            "upgrade complete (resumed) — bound to version {}",
+            running.version
+        );
+        return Ok(());
+    }
 
     // Upgrade advances *from* a recorded engine A.
     let Some(recorded) = envelope.binding.clone() else {
@@ -192,5 +234,81 @@ mod tests {
         let refreshed = env.integrity.as_ref().expect("integrity re-recorded");
         assert_ne!(refreshed.artifacts[0].sha256, "sha-of-A");
         assert!(!refreshed.artifacts[0].sha256.is_empty());
+    }
+
+    // Task 19.4: an interrupted upgrade is recovered by RE-RUNNING `upgrade` —
+    // the marker's phase says the transfer already committed, so the re-run
+    // skips straight to B's apply and the close.
+    #[tokio::test]
+    async fn rerun_resumes_an_interrupted_upgrade_and_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        // Mid-upgrade state: binding already names B (the RUNNING binary),
+        // checkpoint holds [A final], marker open at ownership-transferred.
+        let running = ProvenanceStamp::current(Utc::now());
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(ProvenanceStamp {
+                source_tree_hash: "hash-of-A".into(),
+                ..running.clone()
+            }),
+            effective_config_ref: Some("cfg-A".into()),
+            ..Default::default()
+        };
+        env.begin_upgrade(running.clone(), "op-interrupted", Utc::now());
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        upgrade(&TestPlatform, tmp.path())
+            .await
+            .expect("the re-run resumes and completes");
+
+        let (after, _) = store.load().await.unwrap();
+        assert!(after.operation.is_none(), "marker closed by the resume");
+        assert_eq!(
+            after.binding.as_ref().unwrap().source_tree_hash,
+            running.source_tree_hash,
+            "still bound to B"
+        );
+        assert!(
+            after.checkpoint.is_some(),
+            "[A final] stays retained — the rollback window survives the resume"
+        );
+        // Idempotent: a second re-run refuses cleanly (nothing in flight,
+        // B == B is not an upgrade).
+        let err = upgrade(&TestPlatform, tmp.path())
+            .await
+            .expect_err("nothing to resume");
+        assert!(err.to_string().contains("refused"), "unexpected: {err}");
+    }
+
+    // Only the engine that transferred ownership may finish its upgrade — a
+    // different binary re-running `upgrade` against the open marker refuses.
+    #[tokio::test]
+    async fn a_different_engine_cannot_resume_anothers_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        let running = ProvenanceStamp::current(Utc::now());
+        let other_engine = ProvenanceStamp {
+            source_tree_hash: "hash-of-someone-else".into(),
+            ..running
+        };
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(ProvenanceStamp {
+                source_tree_hash: "hash-of-A".into(),
+                ..other_engine.clone()
+            }),
+            ..Default::default()
+        };
+        env.begin_upgrade(other_engine, "op-foreign", Utc::now());
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        let err = upgrade(&TestPlatform, tmp.path())
+            .await
+            .expect_err("a foreign marker refuses");
+        assert!(
+            err.to_string().contains("another engine"),
+            "unexpected: {err}"
+        );
     }
 }

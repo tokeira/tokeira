@@ -97,8 +97,12 @@ pub(crate) async fn place_bundle_provisioner(
         .persist(&obtained.bundle.identity, &host_target, bytes)
         .await
         .context("failed to retain the bundle in the deployment")?;
-    let mut manifest = obtained.bundle.integrity_manifest();
-    for artifact in &mut manifest.artifacts {
+    // Record the retention ref inside the bundle itself — the sidecar carries
+    // the FULL bundle (task 19.1: describe surfaces identity fields, build
+    // provenance, and test evidence from it; init extracts the integrity
+    // manifest after self-verifying).
+    let mut bundle = obtained.bundle;
+    for artifact in &mut bundle.artifacts {
         if artifact.target == host_target {
             artifact.retrieval_ref = Some(retrieval_ref.clone());
         }
@@ -113,12 +117,12 @@ pub(crate) async fn place_bundle_provisioner(
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
     }
     let sidecar = deployment_dir.join(BUNDLE_MANIFEST_BASENAME);
-    std::fs::write(&sidecar, serde_json::to_vec_pretty(&manifest)?)
+    std::fs::write(&sidecar, serde_json::to_vec_pretty(&bundle)?)
         .with_context(|| format!("failed to write {}", sidecar.display()))?;
 
     println!(
         "provisioner: bundle {} ({}) placed as `tkp` — retained at {}",
-        &obtained.bundle.identity_digest().to_hex()[..12],
+        &bundle.identity_digest().to_hex()[..12],
         if obtained.cache_hit {
             "CAS hit, re-verified"
         } else {

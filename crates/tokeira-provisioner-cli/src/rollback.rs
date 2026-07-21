@@ -34,6 +34,36 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
+    // ── Operation-marker gate (task 19.4) ──
+    // Rollback is BOTH the resumer of its own interrupted run and the abort
+    // path for an interrupted upgrade. Its own marker resumes here: the
+    // re-pin already committed (binding names A again), so the sequence
+    // re-enters at A's reconcile — idempotent — and completes.
+    if let crate::marker::MarkerDisposition::Resume(operation) = crate::marker::check_marker(
+        &envelope,
+        "rollback",
+        Some(tokeira_provisioner::OperationKind::RollbackInFlight),
+    )? {
+        println!(
+            "resuming interrupted rollback {} from phase '{}'",
+            operation.operation_id, operation.phase
+        );
+        let change_count = platform.infra_apply(deployment_dir).await?;
+        println!("A reconcile (re-apply retained revision): {change_count} change(s)");
+        envelope.complete_rollback();
+        envelope.stamp_current_schema();
+        store
+            .save(&envelope, &version)
+            .await
+            .context("failed to complete the resumed rollback")?;
+        println!("rollback complete (resumed)");
+        return Ok(());
+    }
+    // (An open UPGRADE marker falls through: aborting an interrupted upgrade
+    // IS a rollback — the checkpoint the transfer captured is exactly what
+    // the sequence below consumes, and its own marker supersedes the
+    // upgrade's at the re-pin commit.)
+
     // ── Binding gate, before any mutation ──
     // Like every other mutating verb, `rollback` gates the running binary against
     // the deployment's *current* recorded engine (B, post-upgrade): only the
@@ -236,5 +266,81 @@ mod tests {
         );
         assert!(after.checkpoint.is_none(), "checkpoint consumed");
         assert!(after.operation.is_none(), "marker closed");
+    }
+
+    // Task 19.4: an interrupted rollback is recovered by RE-RUNNING
+    // `rollback` — the marker's phase says the re-pin already committed, so
+    // the re-run skips to A's reconcile and completes.
+    #[tokio::test]
+    async fn rerun_resumes_an_interrupted_rollback_and_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        // Mid-rollback state: an upgrade happened (A → B), then rollback
+        // re-pinned to A and was interrupted before the reconcile.
+        let a = ProvenanceStamp {
+            source_tree_hash: "hash-of-A".into(),
+            ..ProvenanceStamp::current(Utc::now())
+        };
+        let b = ProvenanceStamp::current(Utc::now());
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(a.clone()),
+            effective_config_ref: Some("cfg-A".into()),
+            ..Default::default()
+        };
+        env.begin_upgrade(b, "op-up", Utc::now());
+        env.begin_rollback("op-rb-interrupted", Utc::now())
+            .expect("checkpoint present");
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        rollback(&TestPlatform, tmp.path())
+            .await
+            .expect("the re-run resumes and completes");
+
+        let (after, _) = store.load().await.unwrap();
+        assert!(after.operation.is_none(), "marker closed");
+        assert!(after.checkpoint.is_none(), "checkpoint consumed");
+        assert_eq!(
+            after.binding.as_ref().unwrap().source_tree_hash,
+            a.source_tree_hash,
+            "bound to A"
+        );
+    }
+
+    // Task 19.4: `rollback` is the abort path for an interrupted upgrade —
+    // the open UPGRADE marker does not block it; the checkpoint the transfer
+    // captured is exactly what the abort consumes.
+    #[tokio::test]
+    async fn rollback_aborts_an_interrupted_upgrade_forward_to_a() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        // Interrupted mid-upgrade: binding names B (the running binary — the
+        // binding gate requires the owner), checkpoint holds [A final],
+        // upgrade marker still open.
+        let running_b = ProvenanceStamp::current(Utc::now());
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(ProvenanceStamp {
+                source_tree_hash: "hash-of-A".into(),
+                ..running_b.clone()
+            }),
+            effective_config_ref: Some("cfg-A".into()),
+            ..Default::default()
+        };
+        env.begin_upgrade(running_b, "op-up-interrupted", Utc::now());
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        rollback(&TestPlatform, tmp.path())
+            .await
+            .expect("rollback aborts the interrupted upgrade");
+
+        let (after, _) = store.load().await.unwrap();
+        assert!(after.operation.is_none(), "no marker survives the abort");
+        assert!(after.checkpoint.is_none(), "checkpoint consumed");
+        assert_eq!(
+            after.binding.as_ref().unwrap().source_tree_hash,
+            "hash-of-A",
+            "aborted forward to A"
+        );
     }
 }

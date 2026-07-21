@@ -608,19 +608,27 @@ multi-consumer decision) are out of scope.
         18.1–18.3 depends on it (the same `build_provisioner` runs under any invoker).
         _Requirements: 15.1_
 
-- [ ] 19. Complete the revisions & ownership verbs (Requirements 4, 9, 13; Proposal 002)
+- [~] 19. Complete the revisions & ownership verbs (Requirements 4, 9, 13; Proposal 002)
       The verbs are wired and their envelope state-machines are tested, but exercised only against the
       `local` platform's empty apply. This task brings them to completion against real platforms.
       (`revert` (task 14.3) is already complete as a single-binary flow; its only remaining dependency is
       that the platform `apply` it drives becomes real — covered by task 15 + the compose-syn exercise.)
       `resume` is **dropped** — recovery is by re-running the interrupted verb (19.4).
-  - [ ] 19.1 `describe` — **two views** (design §Command behaviour and outputs). Split today's single
+  - [x] 19.1 `describe` — **two views** (design §Command behaviour and outputs). Split today's single
         consolidated view into a short **operator** view (default: name/id, platform, storage, short engine
         identity, binding status, `config_revision`, health, last operation) and a **verification/debug**
         view (`--verbose`; `--json` already emits the full record): the complete per-artifact integrity
         manifest (SHA-256), the closure-scoped `EngineIdentity` fields (task 16), the source-snapshot ref
         (task 17), the retained-revision list, and the operation marker + lock holder. Never gates.
-        _Requirements: 13.2_ (depends on 16, 17 for the identity/snapshot fields)
+        DONE (the two-view split itself landed at 15.3; this completes the verification content) — the
+        record now carries the **full identity field set** (`IdentityView`: digest, source/lock closure
+        digests, toolchain, container digest or `native`, features, profile) and **bundle build
+        provenance** (`BundleView`: snapshot tree + audit-commit oids, builder, build toolchain,
+        request id, test evidence) read from the deployment's bundle sidecar — which now carries the
+        **full `ProvisionerBundle`** (create writes it with the retention ref recorded inside; `init`
+        extracts `integrity_manifest()` after the 18.3c self-check). A corrupt sidecar is reported to
+        stderr and omitted — `describe` never gates and never fails on diagnostics inputs.
+        _Requirements: 13.2_
   - [ ] 19.2 `upgrade` — real cross-engine re-provisioning. Dispatch "apply B's plan" through the
         per-platform seam (task 15) so a versioned advance reconciles the **real** footprint (compose-syn),
         not `local`'s empty apply; populate the `MigrationRegistry` (task 5.1) so a state-schema transition
@@ -633,11 +641,23 @@ multi-consumer decision) are out of scope.
         order, fail-closed, idempotent); verify **both** binaries' checksums before any destructive work;
         hold the operation lock across the relaunch boundary (extend 12.2 from single-process to two-binary).
         _Requirements: 9; Proposal 002_ (depends on 15 and the `tkr` launcher, tasks 9/10)
-  - [ ] 19.4 Marker-driven recovery (**replaces the dropped `resume` verb**). An interrupted `upgrade`/
+  - [x] 19.4 Marker-driven recovery (**replaces the dropped `resume` verb**). An interrupted `upgrade`/
         `rollback` is recovered by **re-running that same verb**: its steps are idempotent and read the
         operation marker's `phase` to skip completed work. While a marker is open, only the in-flight verb
         (re-run resumes), `rollback` (abort an interrupted upgrade forward to A), and `describe` are
-        permitted; every other mutating verb refuses. Remove the `tkp resume` stub. _Requirements: 9.7, 11_
+        permitted; every other mutating verb refuses. Remove the `tkp resume` stub. DONE —
+        `marker.rs::{check_marker, refuse_if_marked}` gates every mutating verb after envelope load,
+        **before** the binding gate (a half-transferred deployment names its in-flight operation, never a
+        confusing `Mismatch`): `apply`/`deploy apply`/`scale`/`revert`/`destroy` refuse with the marker
+        and the recovery guidance named; `upgrade` re-runs **resume** from the recorded phase (transfer
+        committed → skip decision+transfer, run B's apply, close — and only the engine the binding names
+        may finish its own upgrade: a foreign binary is refused toward `rollback`); `rollback` resumes
+        its own marker (re-pin committed → reconcile + complete) and **aborts an open upgrade** (falls
+        through — the checkpoint the transfer captured is exactly what the abort consumes, and its
+        marker supersedes the upgrade's at the re-pin). Read-only verbs (`describe`, both `plan`s) never
+        gate. The `resume` stub needed no removal — it died with the pre-split `apps/tkp` (verified
+        absent). Tests: gate unit matrix (6), apply-refuses-mid-operation, upgrade resume + foreign-
+        engine refusal, rollback resume + upgrade-abort. _Requirements: 9.7, 11_
 
 ## Task Dependency Graph
 

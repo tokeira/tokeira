@@ -40,6 +40,7 @@ pub(crate) async fn describe<P: ProvisionerPlatform>(
         &envelope,
         platform.label(deployment_dir),
         retained,
+        load_bundle_view(deployment_dir),
     );
 
     if json {
@@ -52,6 +53,30 @@ pub(crate) async fn describe<P: ProvisionerPlatform>(
         report.print_operator();
     }
     Ok(())
+}
+
+/// Read the deployment's bundle sidecar for the verification view. `describe`
+/// never gates and never fails on diagnostics inputs: an absent sidecar is
+/// simply a pre-bundle deployment, and a corrupt one is reported to stderr
+/// and omitted.
+fn load_bundle_view(deployment_dir: &Path) -> Option<BundleView> {
+    let raw =
+        std::fs::read(deployment_dir.join(tokeira_provisioner::BUNDLE_MANIFEST_BASENAME)).ok()?;
+    match serde_json::from_slice::<tokeira_provisioner::ProvisionerBundle>(&raw) {
+        Ok(bundle) => Some(BundleView {
+            source_tree_oid: bundle.build.source_tree_oid,
+            snapshot_commit_oid: bundle.build.snapshot_commit_oid,
+            build_toolchain: bundle.build.toolchain,
+            builder: bundle.build.builder,
+            request_id: bundle.build.request_id,
+            tests_passed: bundle.tests.passed,
+            test_command: bundle.tests.command,
+        }),
+        Err(e) => {
+            eprintln!("warning: bundle sidecar unreadable ({e}) — omitting build provenance");
+            None
+        }
+    }
 }
 
 // ── Report model (also the `--json` shape) ────────────────────────────────
@@ -94,15 +119,56 @@ struct ArtifactView {
 #[derive(Serialize)]
 struct IntegrityView {
     provisioner_version: String,
-    /// The engine-identity digest the artifacts are keyed by (task 16.2);
-    /// `None` is a pre-identity (native dev) manifest. The full identity
-    /// fields join the verification view with tasks 17/19.1.
-    engine_identity: Option<String>,
+    /// The full closure-scoped identity the artifacts are keyed by
+    /// (tasks 16.2/19.1); `None` is a pre-identity (native dev) manifest.
+    engine_identity: Option<IdentityView>,
     /// Who built the bytes (the admission gate's input).
     authority: BuildAuthority,
     /// The complete per-artifact record — this is what verifies a binding by
     /// hand (verification view; the operator view shows only the count).
     artifacts: Vec<ArtifactView>,
+}
+
+/// The complete `EngineIdentity` field set (task 19.1) — the verification
+/// view's answer to "what exactly is this engine keyed on?".
+#[derive(Serialize)]
+struct IdentityView {
+    digest: String,
+    source_closure: String,
+    lock_closure: String,
+    toolchain: String,
+    /// `None` = a native (non-hermetic) build.
+    build_container: Option<String>,
+    features: Vec<String>,
+    profile: tokeira_provisioner::BuildProfile,
+}
+
+impl IdentityView {
+    fn of(identity: &tokeira_provisioner::EngineIdentity) -> Self {
+        Self {
+            digest: identity.digest().to_hex(),
+            source_closure: identity.source_closure.to_hex(),
+            lock_closure: identity.lock_closure.to_hex(),
+            toolchain: identity.toolchain.clone(),
+            build_container: identity.build_container.map(|d| d.to_hex()),
+            features: identity.features.iter().cloned().collect(),
+            profile: identity.profile,
+        }
+    }
+}
+
+/// Build provenance from the deployment's bundle sidecar (task 19.1): the
+/// frozen source refs (task 17), the builder, and the test evidence — where
+/// the bound bytes came from. Absent for pre-bundle deployments.
+#[derive(Serialize)]
+struct BundleView {
+    source_tree_oid: String,
+    snapshot_commit_oid: String,
+    build_toolchain: String,
+    builder: String,
+    request_id: String,
+    tests_passed: bool,
+    test_command: String,
 }
 
 #[derive(Serialize)]
@@ -117,6 +183,9 @@ struct DescribeReport {
     retained_revisions: Vec<u64>,
     binding: BindingView,
     integrity: Option<IntegrityView>,
+    /// Build provenance from the bundle sidecar, when the deployment carries
+    /// one (never gates; a corrupt sidecar is reported and omitted).
+    bundle: Option<BundleView>,
     infra_head_present: bool,
     runtime_head_present: bool,
     operation: Option<String>,
@@ -129,6 +198,7 @@ impl DescribeReport {
         envelope: &DeploymentStateEnvelope,
         platform: &'static str,
         retained_revisions: Vec<u64>,
+        bundle: Option<BundleView>,
     ) -> Self {
         let verdict = check_binding(envelope.binding.as_ref(), running);
         Self {
@@ -147,7 +217,7 @@ impl DescribeReport {
             },
             integrity: envelope.integrity.as_ref().map(|m| IntegrityView {
                 provisioner_version: m.provisioner_version.clone(),
-                engine_identity: m.engine_identity.as_ref().map(|id| id.digest().to_hex()),
+                engine_identity: m.engine_identity.as_ref().map(IdentityView::of),
                 authority: m.authority.clone(),
                 artifacts: m
                     .artifacts
@@ -159,6 +229,7 @@ impl DescribeReport {
                     })
                     .collect(),
             }),
+            bundle,
             infra_head_present: envelope.infra_head.is_some(),
             runtime_head_present: envelope.runtime_head.is_some(),
             operation: envelope
@@ -289,12 +360,6 @@ impl DescribeReport {
         match &self.integrity {
             Some(i) => {
                 println!("Integrity           provisioner {}", i.provisioner_version);
-                println!(
-                    "  engine identity   {}",
-                    i.engine_identity
-                        .as_deref()
-                        .unwrap_or("none (pre-identity build)")
-                );
                 let authority = match &i.authority {
                     BuildAuthority::LocalDeveloper => "local developer".to_string(),
                     BuildAuthority::TrustedCi {
@@ -302,6 +367,30 @@ impl DescribeReport {
                     } => format!("trusted CI ({provider} build {build_id})"),
                 };
                 println!("  authority         {authority}");
+                match &i.engine_identity {
+                    Some(id) => {
+                        println!("  engine identity   {}", id.digest);
+                        println!("    source closure  {}", id.source_closure);
+                        println!("    lock closure    {}", id.lock_closure);
+                        println!("    toolchain       {}", id.toolchain);
+                        println!(
+                            "    container       {}",
+                            id.build_container
+                                .as_deref()
+                                .unwrap_or("native (non-hermetic)")
+                        );
+                        println!(
+                            "    features        {} · profile {:?}",
+                            if id.features.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                id.features.join(", ")
+                            },
+                            id.profile
+                        );
+                    }
+                    None => println!("  engine identity   none (pre-identity build)"),
+                }
                 for artifact in &i.artifacts {
                     println!(
                         "  {}  {} bytes\n    sha256:{}",
@@ -311,6 +400,21 @@ impl DescribeReport {
                 println!();
             }
             None => println!("Integrity           none recorded\n"),
+        }
+
+        // Build provenance (task 19.1) — where the bound bytes came from:
+        // the frozen source refs, the builder, the test evidence.
+        if let Some(b) = &self.bundle {
+            println!("Bundle provenance   request {}", b.request_id);
+            println!("  source tree       {}", b.source_tree_oid);
+            println!("  snapshot commit   {}", b.snapshot_commit_oid);
+            println!("  toolchain         {}", b.build_toolchain);
+            println!("  builder           {}", b.builder);
+            println!(
+                "  tests             {} ({})\n",
+                if b.tests_passed { "passed" } else { "FAILED" },
+                b.test_command
+            );
         }
 
         println!("State heads");
@@ -385,7 +489,7 @@ mod tests {
         assert!(envelope.binding.is_none());
 
         let running = ProvenanceStamp::current(Utc::now());
-        let report = DescribeReport::build(&running, &envelope, "test", Vec::new());
+        let report = DescribeReport::build(&running, &envelope, "test", Vec::new(), None);
         assert_eq!(report.binding.verdict, "Unknown");
         assert!(!report.binding.proceeds, "an unstamped deployment refuses");
         assert!(report.integrity.is_none());
@@ -421,7 +525,7 @@ mod tests {
 
         // Re-load and describe — round-trips through the envelope store.
         let (loaded, _) = store.load().await.unwrap();
-        let report = DescribeReport::build(&running, &loaded, "test", vec![1, 3]);
+        let report = DescribeReport::build(&running, &loaded, "test", vec![1, 3], None);
         assert_eq!(report.deployment_id, "dep-1");
         assert_eq!(report.config_revision, 3);
         assert_eq!(report.binding.verdict, "Match");
@@ -441,7 +545,7 @@ mod tests {
             build_mode: BuildMode::Dev,
             ..versioned_stamp("hashA")
         };
-        let report = DescribeReport::build(&dev_running, &envelope, "test", Vec::new());
+        let report = DescribeReport::build(&dev_running, &envelope, "test", Vec::new(), None);
         assert_eq!(report.binding.verdict, "ModeRegression");
         assert!(!report.binding.proceeds);
     }
@@ -466,13 +570,105 @@ mod tests {
             }),
             ..Default::default()
         };
-        let report =
-            DescribeReport::build(&versioned_stamp("hashA"), &envelope, "test", Vec::new());
+        let report = DescribeReport::build(
+            &versioned_stamp("hashA"),
+            &envelope,
+            "test",
+            Vec::new(),
+            None,
+        );
         let integrity = report.integrity.expect("manifest present");
         assert_eq!(integrity.artifacts.len(), 1);
         assert_eq!(integrity.artifacts[0].sha256, "abc123");
         assert_eq!(integrity.artifacts[0].target, "aarch64-apple-darwin");
         assert_eq!(integrity.artifacts[0].size_bytes, 42);
+    }
+
+    // Task 19.1: the verification record carries the FULL identity field set
+    // and the bundle sidecar's build provenance.
+    #[test]
+    fn verification_record_carries_identity_fields_and_bundle_provenance() {
+        use tokeira_provisioner::{
+            BuildProfile, EngineIdentity, IntegrityManifest, ProvisionerBundle, Sha256Digest,
+            bundle::{BuildManifest, TestEvidence},
+        };
+
+        let identity = EngineIdentity {
+            source_closure: Sha256Digest::from_bytes(b"src"),
+            lock_closure: Sha256Digest::from_bytes(b"lock"),
+            toolchain: "1.95".into(),
+            build_container: Some(Sha256Digest::from_bytes(b"img")),
+            features: ["provisioner".to_string()].into(),
+            profile: BuildProfile::Dist,
+        };
+        let envelope = DeploymentStateEnvelope {
+            binding: Some(versioned_stamp("hashA")),
+            integrity: Some(IntegrityManifest {
+                engine_identity: Some(identity.clone()),
+                provisioner_version: "1.0.0".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // A sidecar on disk feeds the bundle-provenance view.
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = ProvisionerBundle {
+            identity: identity.clone(),
+            authority: tokeira_provisioner::BuildAuthority::LocalDeveloper,
+            provisioner_version: "1.0.0".into(),
+            artifacts: vec![],
+            tests: TestEvidence {
+                command: "cargo test --locked".into(),
+                passed: true,
+            },
+            build: BuildManifest {
+                request_id: "req-9".into(),
+                source_tree_oid: "tree-abc".into(),
+                snapshot_commit_oid: "commit-def".into(),
+                toolchain: "1.95".into(),
+                builder: "dagger-local".into(),
+            },
+        };
+        std::fs::write(
+            tmp.path()
+                .join(tokeira_provisioner::BUNDLE_MANIFEST_BASENAME),
+            serde_json::to_vec(&bundle).unwrap(),
+        )
+        .unwrap();
+
+        let report = DescribeReport::build(
+            &versioned_stamp("hashA"),
+            &envelope,
+            "test",
+            Vec::new(),
+            load_bundle_view(tmp.path()),
+        );
+
+        let id_view = report
+            .integrity
+            .expect("manifest present")
+            .engine_identity
+            .expect("identity present");
+        assert_eq!(id_view.digest, identity.digest().to_hex());
+        assert_eq!(id_view.source_closure, identity.source_closure.to_hex());
+        assert_eq!(id_view.toolchain, "1.95");
+        assert_eq!(id_view.features, vec!["provisioner"]);
+
+        let bundle_view = report.bundle.expect("sidecar surfaced");
+        assert_eq!(bundle_view.source_tree_oid, "tree-abc");
+        assert_eq!(bundle_view.snapshot_commit_oid, "commit-def");
+        assert!(bundle_view.tests_passed);
+
+        // A corrupt sidecar is omitted, never fatal — describe must work
+        // precisely when things are broken.
+        std::fs::write(
+            tmp.path()
+                .join(tokeira_provisioner::BUNDLE_MANIFEST_BASENAME),
+            b"not json",
+        )
+        .unwrap();
+        assert!(load_bundle_view(tmp.path()).is_none());
     }
 
     #[test]

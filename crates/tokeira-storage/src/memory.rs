@@ -38,7 +38,7 @@ use crate::{
         TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentRepository,
         WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
         WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
-        workflow_is_open_and_pinned_to_version, workflow_projection_context,
+        workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
     },
     metrics as storage_metrics,
 };
@@ -784,12 +784,21 @@ impl RunRepository for InMemoryStore {
         // image. Emitting a row for every committed transition keeps the
         // in-memory reference store aligned with DSQL and prevents visibility
         // freshness from depending on whether the kernel emitted a legacy delta.
+        let previous_projection = store
+            .projection_log
+            .iter()
+            .rev()
+            .find(|record| record.run_key == run_key)
+            .map(|record| record.context.clone());
         store.projection_log.push(ProjectionRecord {
             partition_id: partition_for(run_key),
             fanout: 1,
             run_key,
             transition_seq: state.transition_seq,
-            context: workflow_projection_context(&state)?,
+            context: workflow_projection_context_with_previous(
+                &state,
+                previous_projection.as_ref(),
+            )?,
         });
 
         if transition.expected_seq == tokeira_types::TransitionSeq::ZERO {
@@ -2236,6 +2245,9 @@ mod tests {
                 started_event_id: None,
                 started_at: None,
                 attempt: 1,
+                target_worker_deployment_version_changed: false,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
             }),
             previous_started_event_id: 0,
             workflow_task_attempt: 1,
@@ -2354,7 +2366,7 @@ mod tests {
             ..WorkflowVersioningInfo::default()
         });
 
-        let projection = workflow_projection_context(&state).unwrap();
+        let projection = workflow_projection_context_with_previous(&state, None).unwrap();
         assert_eq!(
             projection
                 .search_attributes
@@ -2376,12 +2388,58 @@ mod tests {
                 .get("TemporalWorkerDeploymentVersion"),
             Some(&SearchAttrValue::Keyword("deployment:build-id".to_owned()))
         );
+        assert_eq!(
+            projection.search_attributes.0.get("BuildIds"),
+            Some(&SearchAttrValue::KeywordList(vec![
+                "pinned:deployment:build-id".to_owned()
+            ]))
+        );
+        assert!(
+            !projection
+                .search_attributes
+                .0
+                .contains_key("TemporalUsedWorkerDeploymentVersions"),
+            "a pinned override is not a used version until a WFT completes"
+        );
         assert!(
             !state
                 .search_attributes
                 .0
                 .contains_key("TemporalWorkflowVersioningBehavior"),
             "server-managed visibility attributes must not mutate authoritative history state"
+        );
+    }
+
+    #[test]
+    fn projection_accumulates_used_worker_deployment_versions_after_completion() {
+        let run_key = RunKey::new();
+        let mut state = sample_state(run_key);
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior: tokeira_kernel::VersioningBehavior::AutoUpgrade,
+            deployment_version: Some(WorkerDeploymentVersionRef {
+                deployment_name: "deployment".to_owned(),
+                build_id: "build-1".to_owned(),
+            }),
+            ..WorkflowVersioningInfo::default()
+        });
+
+        let first = workflow_projection_context_with_previous(&state, None).unwrap();
+        state.versioning_info.as_mut().unwrap().deployment_version =
+            Some(WorkerDeploymentVersionRef {
+                deployment_name: "deployment".to_owned(),
+                build_id: "build-2".to_owned(),
+            });
+        let second = workflow_projection_context_with_previous(&state, Some(&first)).unwrap();
+
+        assert_eq!(
+            second
+                .search_attributes
+                .0
+                .get("TemporalUsedWorkerDeploymentVersions"),
+            Some(&SearchAttrValue::KeywordList(vec![
+                "deployment:build-1".to_owned(),
+                "deployment:build-2".to_owned(),
+            ]))
         );
     }
 
@@ -3674,6 +3732,9 @@ mod tests {
                     request_id: "wft-start".into(),
                     history_size_bytes: 0,
                     suggest_continue_as_new: false,
+                    target_worker_deployment_version_changed: false,
+                    target_version_changed_enabled: false,
+                    target_deployment_version: None,
                 },
             ),
             history_event(

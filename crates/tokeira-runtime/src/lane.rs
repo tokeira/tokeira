@@ -1066,6 +1066,7 @@ where
                                             header,
                                             initiator,
                                             last_completion_result,
+                                            successor_versioning_info,
                                             ..
                                         } => Some((
                                             *new_run_id,
@@ -1083,6 +1084,7 @@ where
                                             header.clone(),
                                             *initiator,
                                             last_completion_result.clone(),
+                                            successor_versioning_info.clone(),
                                         )),
                                         _ => None,
                                     });
@@ -1102,6 +1104,7 @@ where
                                     header,
                                     initiator,
                                     successor_last_completion_result,
+                                    successor_versioning_info,
                                 )) = successor_event
                                 {
                                     // Carry the chain's origin forward: the
@@ -1152,9 +1155,11 @@ where
                                         },
                                         deployment: new_state.deployment.clone(),
                                         build_id: new_state.build_id.clone(),
-                                        versioning_override: new_state
-                                            .versioning_override()
-                                            .cloned(),
+                                        // Runtime already resolved whether an
+                                        // override is compatible with the
+                                        // successor queue and committed it in
+                                        // `successor_versioning_info`.
+                                        versioning_override: None,
                                         workflow_start_delay: backoff_start_interval,
                                         // Temporal carries completion callbacks
                                         // and priority into continue-as-new start
@@ -1240,6 +1245,7 @@ where
                                         cron_schedule,
                                         eager_execution_accepted: false,
                                         reserved_poller_identity: None,
+                                        inherited_versioning_info: successor_versioning_info,
                                     };
                                     let publisher = publisher.clone();
                                     let workflow_timeout_tracking =
@@ -1959,8 +1965,9 @@ mod tests {
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{
         ActivityState, CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback,
-        HistoryEvent, LoadedRun, PendingWorkflowTask, ProjectionOp, Reject, RequestDedupeOp,
-        TimerOp, Transition, WorkflowState,
+        ContinueAsNewVersioningBehavior, HistoryEvent, LoadedRun, PendingWorkflowTask,
+        ProjectionOp, Reject, RequestDedupeOp, TimerOp, Transition, VersionTarget,
+        VersioningBehavior, WorkerDeploymentVersionRef, WorkflowState, WorkflowVersioningInfo,
     };
     use tokeira_storage::{
         BacklogEntry, CommitResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
@@ -2586,6 +2593,8 @@ mod tests {
         workflow_run_timeout: Option<Duration>,
         retry_policy: Option<tokeira_types::RetryPolicy>,
         first_run_started_at: Option<OffsetDateTime>,
+        initial_versioning_behavior: ContinueAsNewVersioningBehavior,
+        successor_versioning_info: Option<WorkflowVersioningInfo>,
     }
 
     impl ContinueAsNewKernel {
@@ -2597,6 +2606,8 @@ mod tests {
                 workflow_run_timeout: Some(Duration::minutes(5)),
                 retry_policy: None,
                 first_run_started_at: None,
+                initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified,
+                successor_versioning_info: None,
             }
         }
     }
@@ -2638,6 +2649,8 @@ mod tests {
                         cron_schedule: None,
                         header: None,
                         workflow_task_completed_event_id: 0,
+                        initial_versioning_behavior: self.initial_versioning_behavior,
+                        successor_versioning_info: self.successor_versioning_info.clone(),
                     },
                 }]
             } else {
@@ -2721,6 +2734,9 @@ mod tests {
             pending_workflow_task: Some(PendingWorkflowTask {
                 task_type: tokeira_kernel::WorkflowTaskType::Normal,
                 schedule_to_start_deadline: None,
+                target_worker_deployment_version_changed: false,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
                 logical_seq: LogicalTaskSeq::ONE,
                 scheduled_event_id: 1,
                 scheduled_at: OffsetDateTime::now_utc(),
@@ -3671,6 +3687,18 @@ mod tests {
             maximum_attempts: 9,
             non_retryable_error_types: vec!["fatal".to_string()],
         });
+        let inherited_versioning_info = WorkflowVersioningInfo {
+            behavior: VersioningBehavior::AutoUpgrade,
+            deployment_version: Some(WorkerDeploymentVersionRef {
+                deployment_name: "deployment".into(),
+                build_id: "source".into(),
+            }),
+            revision_number: 41,
+            continue_as_new_initial_versioning_behavior:
+                ContinueAsNewVersioningBehavior::UseRampingVersion,
+            declined_target_version_upgrade: Some(VersionTarget::Unversioned),
+            ..WorkflowVersioningInfo::default()
+        };
 
         let successor_run_key = RunKey::new();
         let mut successor_state = sample_state(successor_run_key);
@@ -3687,6 +3715,8 @@ mod tests {
         );
         let mut kernel = ContinueAsNewKernel::continued_as_new();
         kernel.retry_policy = successor_retry_policy.clone();
+        kernel.initial_versioning_behavior = ContinueAsNewVersioningBehavior::UseRampingVersion;
+        kernel.successor_versioning_info = Some(inherited_versioning_info.clone());
         let publisher = MockPublisher::new()
             .with_submit_result(CommitResult::Applied {
                 new_state: successor_state.clone(),
@@ -3723,7 +3753,7 @@ mod tests {
             CommitResult::Applied { .. }
         ));
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        publisher.wait_for_submits(1).await;
         let snapshot = publisher.snapshot().await;
         assert_eq!(snapshot.submits.len(), 1);
         match &snapshot.submits[0].1 {
@@ -3741,6 +3771,11 @@ mod tests {
                 );
                 assert_eq!(request.workflow_run_timeout, Some(Duration::minutes(5)));
                 assert_eq!(request.completion_callbacks, vec![callback]);
+                assert_eq!(
+                    request.inherited_versioning_info,
+                    Some(inherited_versioning_info)
+                );
+                assert_eq!(request.versioning_override, None);
                 assert!(
                     request
                         .completion_callbacks

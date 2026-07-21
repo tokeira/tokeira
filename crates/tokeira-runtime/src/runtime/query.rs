@@ -77,6 +77,31 @@ where
             });
         }
 
+        // A pinned query must not enter the broker when its target version is
+        // drained and its workflow task-queue family has no eligible poller:
+        // there is no worker that can ever answer it. v1.31.0 fails this
+        // synchronously with ErrBlackholedQuery (`checkQueryBlackholed`,
+        // task_queue_partition_manager.go @ v1.31.0). The runtime combines
+        // authoritative per-run routing with the deployment registry's durable
+        // status and ephemeral poll observations; the edge remains translation-only.
+        if state.effective_behavior() == tokeira_kernel::VersioningBehavior::Pinned
+            && let Some(version) = state.effective_deployment()
+            && let Some(registry) = self.deployment_registry()
+            && registry
+                .pinned_query_is_blackholed(
+                    state.namespace_id,
+                    &state.task_queue,
+                    &version.deployment_name,
+                    &version.build_id,
+                )
+                .await?
+        {
+            return Err(crate::errors::BlackholedQuery {
+                version: version.build_id.clone(),
+            }
+            .into());
+        }
+
         // v1.31.0's pre-dispatch guards (queryworkflow/api.go:116-143): a
         // query can only ever be answered by a worker that has completed at
         // least one workflow task for this run (the SDK cannot evaluate a
@@ -133,7 +158,7 @@ where
             .into());
         }
 
-        let queue = QueueKey {
+        let mut queue = QueueKey {
             namespace_id: state.namespace_id,
             task_queue: state.task_queue.clone(),
             task_kind: TaskKind::Workflow,
@@ -141,9 +166,54 @@ where
             build_id: state.build_id.clone(),
         };
 
+        // V3 query routing follows the same live target as a workflow task.
+        // In particular, AUTO_UPGRADE queries move to a newly-current version
+        // without waiting for another WFT to record that version on the run
+        // (`TestUnpinnedQuery_Sticky`, versioning_3_test.go @ v1.31.0).
+        // Reuse Tokeira's runtime resolver so routing remains a derived effect
+        // of authoritative run + deployment state rather than edge state.
+        let mut routed_version = state.effective_deployment().cloned();
+        if state.versioning_info.is_some()
+            && let Some(registry) = self.deployment_registry()
+        {
+            let preferred_deployment = state
+                .effective_deployment()
+                .map(|version| version.deployment_name.as_str())
+                .or(state.worker_deployment_name.as_deref());
+            let routing = registry
+                .workflow_task_routing_config(
+                    state.namespace_id,
+                    &state.task_queue.0,
+                    preferred_deployment,
+                )
+                .await?;
+            routed_version =
+                super::workflow_task::resolve_workflow_task_target_version(&routing, &state)
+                    .deployment_version;
+            queue.deployment = routed_version
+                .as_ref()
+                .map(|version| DeploymentId(version.deployment_name.clone()));
+            queue.build_id = routed_version
+                .as_ref()
+                .map(|version| BuildId(version.build_id.clone()));
+        }
+
         let now = OffsetDateTime::now_utc();
+        // A sticky worker is eligible only while it still owns the version to
+        // which the query routes. If AUTO_UPGRADE moved the target, v1.31.0
+        // bypasses the old sticky queue and sends the query to the new normal
+        // queue (`TestUnpinnedQuery_Sticky`, versioning_3_test.go @ v1.31.0).
+        let sticky_route_eligible = state.versioning_info.is_none()
+            || routed_version.as_ref() == state.effective_deployment();
         let sticky_preferred = state.sticky.as_ref().and_then(|affinity| {
-            (affinity.expires_at > now).then_some(affinity.worker_identity.clone())
+            (sticky_route_eligible && affinity.expires_at > now)
+                .then_some(affinity.worker_identity.clone())
+        });
+        let sticky_queue = state.sticky.as_ref().and_then(|affinity| {
+            (sticky_route_eligible
+                && affinity.expires_at > now
+                && !affinity.sticky_queue.0.is_empty())
+            .then_some(affinity.sticky_queue.clone())
         });
         let sticky_deadline = state
             .sticky
@@ -153,7 +223,9 @@ where
             // worker completes a WFT with sticky attributes. Direct queries
             // reuse that same deadline for sticky-first fallback
             // (`service/history/api/queryworkflow/api.go:350-410 @ v1.31.0`).
-            .and_then(|affinity| (affinity.expires_at > now).then_some(affinity.expires_at));
+            .and_then(|affinity| {
+                (sticky_route_eligible && affinity.expires_at > now).then_some(affinity.expires_at)
+            });
         let required_barrier = state.last_event_id;
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -203,6 +275,7 @@ where
                     query_args,
                     queue,
                     sticky_preferred,
+                    sticky_queue,
                     sticky_deadline,
                     response_tx,
                 })

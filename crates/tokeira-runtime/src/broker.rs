@@ -438,18 +438,29 @@ impl InMemoryBroker {
     /// Publish a query task without deduplication or backlog participation.
     pub async fn publish_query_task(&self, task: QueryTask) {
         let queue = task.queue.clone();
+        let sticky_queue = task.sticky_queue.as_ref().map(|sticky_queue| QueueKey {
+            task_queue: sticky_queue.clone(),
+            ..queue.clone()
+        });
         let mut inner = self.inner.lock().await;
         inner
             .query_ready
             .entry(queue.clone())
             .or_default()
             .push_back(task);
-        // Direct queries are matched by workflow-task polls in Temporal
-        // (`service/matching/matching_engine.go:1084 @ v1.31.0`); the queue-scoped
-        // wake covers both query and workflow pollers parked on this queue.
-        let wake = inner.wakes.entry(queue).or_default().clone();
+        // The task stays indexed by its normal queue for fallback, but a live
+        // sticky poll is parked on the SDK-generated sticky queue. Wake both
+        // observations so the sticky-first attempt does not wait for an
+        // unrelated event (`queryworkflow/api.go:350-410 @ v1.31.0`).
+        let normal_wake = inner.wakes.entry(queue.clone()).or_default().clone();
+        let sticky_wake = sticky_queue
+            .filter(|sticky| sticky != &queue)
+            .map(|sticky| inner.wakes.entry(sticky).or_default().clone());
         drop(inner);
-        wake.notify_waiters();
+        normal_wake.notify_waiters();
+        if let Some(wake) = sticky_wake {
+            wake.notify_waiters();
+        }
     }
 
     /// Long-poll for a read-only query task on `queue`.
@@ -772,7 +783,6 @@ impl InMemoryBroker {
 
     async fn try_take_query(&self, queue: &QueueKey, worker: &WorkerIdentity) -> Option<QueryTask> {
         let mut inner = self.inner.lock().await;
-        let ready = inner.query_ready.get_mut(queue)?;
 
         // Expire sticky preferences FIRST: past the sticky deadline v1.31.0
         // abandons the sticky attempt and re-dispatches on the normal queue
@@ -780,25 +790,52 @@ impl InMemoryBroker {
         // preferred worker must then receive the task as a NON-sticky
         // delivery (its cache may be gone; empty history would strand it).
         let now = OffsetDateTime::now_utc();
-        for task in ready.iter_mut() {
-            if task.sticky_deadline.is_some_and(|deadline| deadline <= now) {
-                task.sticky_preferred = None;
-                task.sticky_deadline = None;
+        for ready in inner.query_ready.values_mut() {
+            for task in ready.iter_mut() {
+                if task.sticky_deadline.is_some_and(|deadline| deadline <= now) {
+                    task.sticky_preferred = None;
+                    task.sticky_queue = None;
+                    task.sticky_deadline = None;
+                }
             }
         }
 
-        if let Some(idx) = ready
-            .iter()
-            .position(|task| task.sticky_preferred.as_ref() == Some(worker))
-        {
-            return ready.remove(idx);
+        if let Some(ready) = inner.query_ready.get_mut(queue) {
+            if let Some(idx) = ready.iter().position(|task| {
+                task.sticky_preferred.as_ref() == Some(worker)
+                    && task
+                        .sticky_queue
+                        .as_ref()
+                        .is_none_or(|sticky| sticky == &queue.task_queue)
+            }) {
+                return ready.remove(idx);
+            }
+
+            if let Some(idx) = ready
+                .iter()
+                .position(|task| task.sticky_preferred.is_none())
+            {
+                return ready.remove(idx);
+            }
         }
 
-        if let Some(idx) = ready
-            .iter()
-            .position(|task| task.sticky_preferred.is_none())
-        {
-            return ready.remove(idx);
+        // Sticky query tasks remain indexed by their normal queue. A poll on
+        // the sticky queue may claim exactly the task carrying that sticky
+        // queue name and worker identity, but cannot see siblings from another
+        // namespace or deployment version.
+        for (normal_queue, ready) in &mut inner.query_ready {
+            if normal_queue.namespace_id != queue.namespace_id
+                || normal_queue.deployment != queue.deployment
+                || normal_queue.build_id != queue.build_id
+            {
+                continue;
+            }
+            if let Some(idx) = ready.iter().position(|task| {
+                task.sticky_preferred.as_ref() == Some(worker)
+                    && task.sticky_queue.as_ref() == Some(&queue.task_queue)
+            }) {
+                return ready.remove(idx);
+            }
         }
 
         None
@@ -1177,6 +1214,93 @@ impl InMemoryActivityBroker {
         let wake = inner.wakes.entry(target.clone()).or_default().clone();
         drop(inner);
         wake.notify_waiters();
+    }
+
+    /// Snapshot live-ready unversioned activities for authoritative rerouting.
+    ///
+    /// The caller resolves each task outside the broker lock because routing
+    /// may read durable run and deployment state. The subsequent selective
+    /// rekey applies only identities still present, closing the race with a
+    /// concurrent poll or grace demotion without making broker state authoritative.
+    pub(crate) async fn unversioned_ready_tasks(
+        &self,
+        target: &QueueKey,
+    ) -> Vec<DispatchableActivityTask> {
+        let source = QueueKey {
+            namespace_id: target.namespace_id,
+            task_queue: target.task_queue.clone(),
+            task_kind: target.task_kind,
+            deployment: None,
+            build_id: None,
+        };
+        self.inner
+            .lock()
+            .await
+            .ready
+            .get(&source)
+            .map(|ready| ready.iter().map(|entry| entry.task.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Selectively rekey live-ready unversioned activities after routing was
+    /// re-derived from authoritative state.
+    ///
+    /// Timestamps and deduplication identities are preserved: this is only a
+    /// disposable queue-coordinate correction, not a new task publication.
+    pub(crate) async fn reroute_unversioned_ready_tasks(
+        &self,
+        target: &QueueKey,
+        routes: &HashMap<(RunKey, String, u32), QueueKey>,
+    ) {
+        if routes.is_empty() {
+            return;
+        }
+        let source = QueueKey {
+            namespace_id: target.namespace_id,
+            task_queue: target.task_queue.clone(),
+            task_kind: target.task_kind,
+            deployment: None,
+            build_id: None,
+        };
+        let mut inner = self.inner.lock().await;
+        let Some(mut ready) = inner.ready.remove(&source) else {
+            return;
+        };
+        let mut kept = VecDeque::new();
+        let mut destinations = HashSet::new();
+        while let Some(mut entry) = ready.pop_front() {
+            let identity = (
+                entry.task.run_key,
+                entry.task.activity_id.clone(),
+                entry.task.attempt,
+            );
+            if let Some(queue) = routes.get(&identity) {
+                entry.task.queue = queue.clone();
+                destinations.insert(queue.clone());
+                inner
+                    .ready
+                    .entry(queue.clone())
+                    .or_default()
+                    .push_back(entry);
+            } else {
+                kept.push_back(entry);
+            }
+        }
+        if !kept.is_empty() {
+            inner.ready.insert(source.clone(), kept);
+        }
+        Self::emit_queue_depth(&inner, &source);
+        let wakes: Vec<Arc<Notify>> = destinations
+            .iter()
+            .map(|queue| {
+                Self::emit_queue_depth(&inner, queue);
+                inner.wakes.entry(queue.clone()).or_default().clone()
+            })
+            .collect();
+        drop(inner);
+        for wake in wakes {
+            wake.notify_waiters();
+        }
     }
 
     /// Take a specific activity out of the ready queue by run key and activity
@@ -1999,6 +2123,7 @@ mod tests {
                     query_args: Payloads::default(),
                     queue: queue.clone(),
                     sticky_preferred: None,
+                    sticky_queue: None,
                     sticky_deadline: None,
                     response_tx: tx,
                 })
@@ -2038,6 +2163,7 @@ mod tests {
                 query_args: Payloads::default(),
                 queue: queue.clone(),
                 sticky_preferred: Some(WorkerIdentity("worker-a".into())),
+                sticky_queue: None,
                 sticky_deadline: None,
                 response_tx: sticky_tx,
             })
@@ -2050,6 +2176,7 @@ mod tests {
                 query_args: Payloads::default(),
                 queue: queue.clone(),
                 sticky_preferred: None,
+                sticky_queue: None,
                 sticky_deadline: None,
                 response_tx: general_tx,
             })
@@ -2077,6 +2204,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sticky_queue_poll_claims_normal_indexed_query_for_its_owner_only() {
+        let broker = InMemoryBroker::default();
+        let normal_queue = workflow_queue("queue-a", None, None);
+        let sticky_name = TaskQueueName("sticky-queue-a".into());
+        let sticky_queue = QueueKey {
+            task_queue: sticky_name.clone(),
+            ..normal_queue.clone()
+        };
+        let worker = WorkerIdentity("worker-a".into());
+        let (tx, _rx) = oneshot::channel();
+        broker
+            .publish_query_task(QueryTask {
+                run_key: RunKey::new(),
+                query_type: "sticky".into(),
+                query_args: Payloads::default(),
+                queue: normal_queue.clone(),
+                sticky_preferred: Some(worker.clone()),
+                sticky_queue: Some(sticky_name),
+                sticky_deadline: None,
+                response_tx: tx,
+            })
+            .await;
+
+        assert!(
+            broker
+                .try_take_query(&normal_queue, &WorkerIdentity("worker-b".into()))
+                .await
+                .is_none()
+        );
+        assert!(
+            broker
+                .try_take_query(&sticky_queue, &WorkerIdentity("worker-b".into()))
+                .await
+                .is_none()
+        );
+
+        let task = broker
+            .try_take_query(&sticky_queue, &worker)
+            .await
+            .expect("the named sticky queue and owning worker must claim the query");
+        assert_eq!(task.query_type, "sticky");
+    }
+
+    #[tokio::test]
     async fn workflow_poll_delivers_direct_query_task() {
         let broker = InMemoryBroker::default();
         let queue = workflow_queue("queue-a", None, None);
@@ -2088,6 +2259,7 @@ mod tests {
                 query_args: Payloads::default(),
                 queue: queue.clone(),
                 sticky_preferred: None,
+                sticky_queue: None,
                 sticky_deadline: None,
                 response_tx: tx,
             })
@@ -2121,6 +2293,7 @@ mod tests {
                 query_args: Payloads::default(),
                 queue: queue.clone(),
                 sticky_preferred: Some(WorkerIdentity("worker-a".into())),
+                sticky_queue: None,
                 sticky_deadline: Some(OffsetDateTime::UNIX_EPOCH),
                 response_tx: tx,
             })
@@ -2157,6 +2330,7 @@ mod tests {
                 query_args: Payloads::default(),
                 queue: queue.clone(),
                 sticky_preferred: Some(WorkerIdentity("worker-a".into())),
+                sticky_queue: None,
                 sticky_deadline: Some(OffsetDateTime::now_utc() + TimeDuration::milliseconds(1)),
                 response_tx: tx,
             })

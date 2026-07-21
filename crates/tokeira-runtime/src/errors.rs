@@ -135,6 +135,22 @@ pub struct WorkflowNotReady {
     pub message: &'static str,
 }
 
+/// A closed pinned workflow targets a drained Worker Deployment Version whose
+/// workflow task queue has no pollers capable of answering a query.
+///
+/// v1.31.0 rejects this before dispatch with FAILED_PRECONDITION instead of
+/// leaving the query to time out (`ErrBlackholedQuery` and
+/// `checkQueryBlackholed`, `service/matching/{physical_task_queue_manager,
+/// task_queue_partition_manager}.go @ v1.31.0`).
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error(
+    "You are trying to query a closed Workflow that is PINNED to Worker Deployment Version {version}, but {version} is drained and has no pollers to answer the query. Immediately: You can re-deploy Workers in this Deployment Version to take those queries, or you can workflow update-options to change your workflow to AUTO_UPGRADE. For the future: In your infrastructure, consider waiting longer after the last queried timestamp as reported in Describe Deployment before you sunset Workers. Or mark this workflow as AUTO_UPGRADE."
+)]
+pub struct BlackholedQuery {
+    /// Build identifier rendered by v1.31.0's current deployment-data format.
+    pub version: String,
+}
+
 /// A query waited out its deadline without any worker answering — the
 /// frontend rewrites context-deadline errors to
 /// `DeadlineExceeded("query timed out before a worker could process it")`

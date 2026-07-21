@@ -158,6 +158,14 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Bool,
         disposition: Disposition::Wired,
     },
+    // Workflow-task admission consults this namespace policy before invoking
+    // the pure notification transition. v1.31.0 defaults it true
+    // (`common/dynamicconfig/constants.go:931-935 @ v1.31.0`).
+    KeySpec {
+        key: "system.enableSendTargetVersionChanged",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
     // Workflow-rule CRUD and evaluation are namespace frontend policy. The
     // v1.31.0 corpus enables the otherwise-false gate in suite setup
     // (`service/frontend/workflow_handler.go:6985-7088 @ v1.31.0`).

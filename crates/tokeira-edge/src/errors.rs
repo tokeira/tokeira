@@ -322,6 +322,13 @@ impl From<anyhow::Error> for EdgeError {
         if let Some(not_ready) = value.downcast_ref::<tokeira_runtime::WorkflowNotReady>() {
             return Self::WorkflowNotReady(not_ready.message.to_string());
         }
+        // A closed pinned workflow whose drained version has no workflow
+        // pollers fails before dispatch with an ordinary FAILED_PRECONDITION;
+        // unlike WorkflowNotReady, v1.31.0 attaches no typed failure detail
+        // (`checkQueryBlackholed`, task_queue_partition_manager.go @ v1.31.0).
+        if let Some(blackholed) = value.downcast_ref::<tokeira_runtime::BlackholedQuery>() {
+            return Self::FailedPrecondition(blackholed.to_string());
+        }
         // Visibility syntax/type/unknown-attribute failures are client query
         // errors, not projection failures (`List/CountActivityExecutions @ v1.31.0`).
         if let Some(invalid) = value.downcast_ref::<tokeira_projection::InvalidVisibilityQuery>() {

@@ -1382,6 +1382,7 @@ where
         cron_schedule: None,
         eager_execution_accepted: false,
         reserved_poller_identity: None,
+        inherited_versioning_info: None,
     };
 
     store.acquire_start_permit(namespace_id).await;

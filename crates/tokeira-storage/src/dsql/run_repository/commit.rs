@@ -748,7 +748,19 @@ async fn insert_projection_log(
 ) -> Result<()> {
     // Projection log rows are grouped per transition. Visibility sinks can
     // replay the projection stream without rereading workflow state/history.
-    let context = workflow_projection_context(state)?;
+    let previous_context = sqlx::query_as::<_, (Vec<u8>,)>(
+        "SELECT context_data
+         FROM projection_log
+         WHERE run_key = $1
+         ORDER BY transition_seq DESC
+         LIMIT 1",
+    )
+    .bind(run_key.0)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|(data,)| codec::decode_projection_context(&data))
+    .transpose()?;
+    let context = workflow_projection_context_with_previous(state, previous_context.as_ref())?;
     sqlx::query(
         "INSERT INTO projection_log
          (partition_id, fanout, run_key, transition_seq, context_data, ops_data, created_at)

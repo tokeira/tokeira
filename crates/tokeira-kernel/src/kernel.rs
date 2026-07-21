@@ -477,9 +477,12 @@ impl BasicKernel {
         let canonical_root_run_id = req.root_run_id.unwrap_or(req.run_id);
         let event_root_workflow_id = req.root_workflow_id.clone();
         let event_root_run_id = req.root_run_id;
-        let initial_versioning_info = initial_versioning_info(req.versioning_override.clone());
+        let initial_versioning_info = combined_initial_versioning_info(
+            req.inherited_versioning_info.clone(),
+            req.versioning_override.clone(),
+        );
         let initial_worker_deployment_name =
-            initial_worker_deployment_name(req.versioning_override.as_ref());
+            initial_worker_deployment_name_from_info(initial_versioning_info.as_ref());
         let mut completion_callbacks = req.completion_callbacks.clone();
         stamp_callback_registration_times(&mut completion_callbacks, req.now);
         let initial = WorkflowState {
@@ -1678,6 +1681,13 @@ impl BasicKernel {
         }
 
         let mut builder = TransitionBuilder::new(state, req.now, None);
+        let target_version_changed_enabled = req.target_version_changed_enabled;
+        let target_deployment_version = req.target_deployment_version.clone();
+        let target_worker_deployment_version_changed =
+            builder.state.apply_target_version_observation(
+                target_version_changed_enabled,
+                target_deployment_version.clone(),
+            );
         let attempt = pending.attempt.max(1);
         // Transient (attempt>1) and SPECULATIVE starts persist no
         // WorkflowTaskStarted event: the started id is virtual
@@ -1713,6 +1723,9 @@ impl BasicKernel {
                 request_id: req.request_id,
                 history_size_bytes: req.history_size_bytes,
                 suggest_continue_as_new: req.suggest_continue_as_new,
+                target_worker_deployment_version_changed,
+                target_version_changed_enabled,
+                target_deployment_version: target_deployment_version.clone(),
             });
             (scheduled, started)
         } else {
@@ -1724,6 +1737,9 @@ impl BasicKernel {
                 request_id: req.request_id,
                 history_size_bytes: req.history_size_bytes,
                 suggest_continue_as_new: req.suggest_continue_as_new,
+                target_worker_deployment_version_changed,
+                target_version_changed_enabled,
+                target_deployment_version: target_deployment_version.clone(),
             });
             (pending.scheduled_event_id, started)
         };
@@ -1737,6 +1753,9 @@ impl BasicKernel {
         current.started_event_id = Some(started_event_id);
         current.started_at = Some(req.now);
         current.attempt = builder.state.workflow_task_attempt;
+        current.target_worker_deployment_version_changed = target_worker_deployment_version_changed;
+        current.target_version_changed_enabled = target_version_changed_enabled;
+        current.target_deployment_version = target_deployment_version;
         if new_events_since_schedule {
             // The conversion branch persisted real Scheduled/Started — the
             // task is normal from here on (`workflowTask.Type = NORMAL`,
@@ -1812,7 +1831,7 @@ impl BasicKernel {
         let mut builder = TransitionBuilder::new(state, req.now, None);
         builder
             .state
-            .start_version_transition(req.target, req.revision_number)
+            .start_version_transition(req.target.clone(), req.revision_number)
             .map_err(|error| match error {
                 crate::state::VersionTransitionError::PinnedWorkflowCannotTransition => {
                     Reject::PinnedWorkflowCannotTransition
@@ -1820,6 +1839,8 @@ impl BasicKernel {
             })?;
         if builder.state.pending_workflow_task.is_none() {
             builder.schedule_workflow_task();
+        } else {
+            builder.redispatch_pending_workflow_task_for_transition(&req.target);
         }
         Ok(builder.finish())
     }
@@ -2013,6 +2034,10 @@ impl BasicKernel {
                         request_id: format!("transient-materialize-{}", pending.logical_seq.0),
                         history_size_bytes: 0,
                         suggest_continue_as_new: false,
+                        target_worker_deployment_version_changed: pending
+                            .target_worker_deployment_version_changed,
+                        target_version_changed_enabled: pending.target_version_changed_enabled,
+                        target_deployment_version: pending.target_deployment_version.clone(),
                     },
                 );
                 (scheduled, started)
@@ -3021,6 +3046,10 @@ impl BasicKernel {
                         request_id: format!("transient-materialize-{}", pending.logical_seq.0),
                         history_size_bytes: 0,
                         suggest_continue_as_new: false,
+                        target_worker_deployment_version_changed: pending
+                            .target_worker_deployment_version_changed,
+                        target_version_changed_enabled: pending.target_version_changed_enabled,
+                        target_deployment_version: pending.target_deployment_version.clone(),
                     },
                 );
                 let current = builder
@@ -3045,6 +3074,10 @@ impl BasicKernel {
                         request_id: format!("reset-materialize-{}", pending.logical_seq.0),
                         history_size_bytes: 0,
                         suggest_continue_as_new: false,
+                        target_worker_deployment_version_changed: pending
+                            .target_worker_deployment_version_changed,
+                        target_version_changed_enabled: pending.target_version_changed_enabled,
+                        target_deployment_version: pending.target_deployment_version.clone(),
                     },
                 );
                 let current = builder
@@ -3522,6 +3555,10 @@ impl BasicKernel {
                         request_id: format!("transient-materialize-{}", pending.logical_seq.0),
                         history_size_bytes: 0,
                         suggest_continue_as_new: false,
+                        target_worker_deployment_version_changed: pending
+                            .target_worker_deployment_version_changed,
+                        target_version_changed_enabled: pending.target_version_changed_enabled,
+                        target_deployment_version: pending.target_deployment_version.clone(),
                     },
                 );
                 // The events are durable now; the (about-to-be-replaced or
@@ -3817,6 +3854,9 @@ impl BasicKernel {
                 state.pending_workflow_task = Some(PendingWorkflowTask {
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
+                    target_worker_deployment_version_changed: false,
+                    target_version_changed_enabled: false,
+                    target_deployment_version: None,
                     logical_seq: *logical_seq,
                     scheduled_event_id: event.event_id,
                     scheduled_at: event.happened_at,
@@ -3833,11 +3873,26 @@ impl BasicKernel {
                 logical_seq,
                 scheduled_event_id,
                 attempt,
+                target_worker_deployment_version_changed,
+                target_version_changed_enabled,
+                target_deployment_version,
                 ..
             } => {
+                let replayed_decision = state.apply_target_version_observation(
+                    *target_version_changed_enabled,
+                    target_deployment_version.clone(),
+                );
+                debug_assert_eq!(
+                    replayed_decision, *target_worker_deployment_version_changed,
+                    "stored WFT target-change result must match its replay operands"
+                );
                 state.pending_workflow_task = Some(PendingWorkflowTask {
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
+                    target_worker_deployment_version_changed:
+                        *target_worker_deployment_version_changed,
+                    target_version_changed_enabled: *target_version_changed_enabled,
+                    target_deployment_version: target_deployment_version.clone(),
                     logical_seq: *logical_seq,
                     scheduled_event_id: *scheduled_event_id,
                     scheduled_at: state
@@ -3906,6 +3961,9 @@ impl BasicKernel {
                     state.pending_workflow_task = Some(PendingWorkflowTask {
                         task_type: WorkflowTaskType::Normal,
                         schedule_to_start_deadline: None,
+                        target_worker_deployment_version_changed: false,
+                        target_version_changed_enabled: false,
+                        target_deployment_version: None,
                         logical_seq: *logical_seq,
                         scheduled_event_id: *scheduled_event_id,
                         scheduled_at: state
@@ -3949,6 +4007,9 @@ impl BasicKernel {
                 state.pending_workflow_task = Some(PendingWorkflowTask {
                     task_type: WorkflowTaskType::Normal,
                     schedule_to_start_deadline: None,
+                    target_worker_deployment_version_changed: false,
+                    target_version_changed_enabled: false,
+                    target_deployment_version: None,
                     logical_seq: *logical_seq,
                     scheduled_event_id: *scheduled_event_id,
                     scheduled_at: state
@@ -4417,6 +4478,38 @@ fn initial_versioning_info(
     })
 }
 
+fn combined_initial_versioning_info(
+    inherited: Option<WorkflowVersioningInfo>,
+    versioning_override: Option<VersioningOverride>,
+) -> Option<WorkflowVersioningInfo> {
+    if inherited.is_none() && versioning_override.is_none() {
+        return None;
+    }
+
+    let mut info = inherited.unwrap_or_default();
+    if let Some(versioning_override) = versioning_override {
+        // The runtime has already checked cross-task-queue membership. The
+        // explicit start override remains the highest-precedence input, while
+        // the inherited source/revision and decline remain durable lineage
+        // (`mutable_state_impl.go:2485-2630 @ v1.31.0`).
+        info.versioning_override = Some(versioning_override);
+    }
+    Some(info)
+}
+
+fn initial_worker_deployment_name_from_info(
+    versioning_info: Option<&WorkflowVersioningInfo>,
+) -> Option<String> {
+    let info = versioning_info?;
+    match info.versioning_override.as_ref() {
+        Some(VersioningOverride::Pinned { version }) => Some(version.deployment_name.clone()),
+        Some(VersioningOverride::AutoUpgrade) | None => info
+            .deployment_version
+            .as_ref()
+            .map(|version| version.deployment_name.clone()),
+    }
+}
+
 fn initial_worker_deployment_name(
     versioning_override: Option<&VersioningOverride>,
 ) -> Option<String> {
@@ -4871,6 +4964,8 @@ fn apply_workflow_command(
             workflow_task_timeout,
             retry_policy,
             header,
+            initial_versioning_behavior,
+            successor_versioning_info,
         } => {
             // A close command with buffered events is an UnhandledCommand:
             // the workflow must observe the buffered events before closing
@@ -4952,6 +5047,8 @@ fn apply_workflow_command(
                 backoff_start_interval,
                 cron_schedule: None,
                 header,
+                initial_versioning_behavior,
+                successor_versioning_info,
             });
             builder.close(ExecutionStatus::ContinuedAsNew);
             builder.apply_parent_close_policy();
@@ -6259,6 +6356,10 @@ impl TransitionBuilder {
                         request_id: format!("transient-materialize-{}", pending.logical_seq.0),
                         history_size_bytes: 0,
                         suggest_continue_as_new: false,
+                        target_worker_deployment_version_changed: pending
+                            .target_worker_deployment_version_changed,
+                        target_version_changed_enabled: pending.target_version_changed_enabled,
+                        target_deployment_version: pending.target_deployment_version.clone(),
                     },
                 );
                 (scheduled, started)
@@ -6324,6 +6425,49 @@ impl TransitionBuilder {
     /// No-ops if the workflow is paused.
     fn schedule_workflow_task(&mut self) {
         self.schedule_workflow_task_typed(WorkflowTaskType::Normal);
+    }
+
+    /// Fence and regenerate delivery for an unstarted WFT after its deployment target changes.
+    ///
+    /// Temporal v1.31.0 bumps `WorkflowTaskStamp` and regenerates the scheduling
+    /// task without changing history (`mutable_state_impl.go:9178-9212`).
+    /// Tokeira's broker token is `logical_seq`, so advancing that internal value
+    /// makes any already-offered task stale while the replacement effect carries
+    /// the same history schedule id and attempt. The effect remains declarative:
+    /// only the runtime performs the eventual queue write.
+    fn redispatch_pending_workflow_task_for_transition(
+        &mut self,
+        target: &crate::state::WorkerDeploymentVersionRef,
+    ) {
+        let Some(mut pending) = self.state.pending_workflow_task.clone() else {
+            return;
+        };
+        if pending.started_event_id.is_some() || pending.task_type == WorkflowTaskType::Speculative
+        {
+            return;
+        }
+
+        let logical_seq = self.state.next_workflow_task_seq;
+        self.state.next_workflow_task_seq = logical_seq.next();
+        self.state.wft_stamp = self.state.wft_stamp.saturating_add(1);
+        pending.logical_seq = logical_seq;
+        pending.target_worker_deployment_version_changed = false;
+        pending.target_version_changed_enabled = false;
+        pending.target_deployment_version = None;
+        self.state.pending_workflow_task = Some(pending);
+        self.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+            queue: QueueKey {
+                namespace_id: self.state.namespace_id,
+                task_queue: self.state.task_queue.clone(),
+                task_kind: tokeira_types::TaskKind::Workflow,
+                deployment: Some(DeploymentId(target.deployment_name.clone())),
+                build_id: Some(BuildId(target.build_id.clone())),
+            },
+            logical_seq,
+            sticky_preferred: None,
+            normal_task_queue: Some(self.state.task_queue.clone()),
+            speculative: false,
+        });
     }
 
     /// Schedule a SPECULATIVE workflow task: nothing persists at
@@ -6406,6 +6550,9 @@ impl TransitionBuilder {
             started_at: None,
             attempt: self.state.workflow_task_attempt,
             schedule_to_start_deadline,
+            target_worker_deployment_version_changed: false,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
         });
         self.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
             queue: QueueKey {
@@ -6445,6 +6592,9 @@ impl TransitionBuilder {
             request_id: format!("sync-match-{}", pending.logical_seq.0),
             history_size_bytes: self.state.last_event_id,
             suggest_continue_as_new: false,
+            target_worker_deployment_version_changed: false,
+            target_version_changed_enabled: false,
+            target_deployment_version: None,
         });
         let current = self
             .state

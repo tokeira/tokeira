@@ -168,6 +168,7 @@ where
                                     query_args: query.query_args,
                                     queue: queue.clone(),
                                     sticky_preferred: None,
+                                    sticky_queue: None,
                                     sticky_deadline: None,
                                     response_tx: query.response_tx,
                                 })

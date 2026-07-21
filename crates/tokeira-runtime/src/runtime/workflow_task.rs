@@ -16,8 +16,8 @@
 use super::*;
 use prost::Message as _;
 use tokeira_kernel::{
-    RetryContinuation, RetryState, VersioningBehavior, VersioningOverride,
-    WorkerDeploymentVersionRef,
+    ContinueAsNewVersioningBehavior, RetryContinuation, RetryState, VersioningBehavior,
+    VersioningOverride, WorkerDeploymentVersionRef, WorkflowVersioningInfo,
 };
 use tokeira_observability::OutcomeLabel;
 use tokeira_proto::failure::{Failure, failure::FailureInfo};
@@ -48,6 +48,21 @@ pub(crate) struct ResolvedWorkflowTaskTarget {
 struct PolledWorkflowTaskTarget {
     resolved: ResolvedWorkflowTaskTarget,
     deployment_transition: Option<WorkerDeploymentVersionRef>,
+    /// Current/Ramping target offered for SDK notification, distinct from a
+    /// pinned effective dispatch destination.
+    routing_target: Option<WorkerDeploymentVersionRef>,
+}
+
+#[cfg(not(feature = "conformance"))]
+fn target_version_changed_enabled() -> bool {
+    true
+}
+
+#[cfg(feature = "conformance")]
+fn target_version_changed_enabled() -> bool {
+    tokeira_conformance::overrides()
+        .get_bool("system.enableSendTargetVersionChanged")
+        .unwrap_or(true)
 }
 
 /// Resolve the deployment version a polled workflow task should target.
@@ -66,9 +81,11 @@ pub(crate) fn resolve_workflow_task_target_version(
     state: &WorkflowState,
 ) -> ResolvedWorkflowTaskTarget {
     let Some(info) = state.versioning_info.as_ref() else {
+        let (deployment_version, revision_number) =
+            routing_config_target_with_revision(routing_config, &state.workflow_id);
         return ResolvedWorkflowTaskTarget {
-            deployment_version: routing_config_target(routing_config, &state.workflow_id),
-            revision_number: routing_config.revision_number,
+            deployment_version,
+            revision_number,
             pinned: false,
         };
     };
@@ -81,27 +98,41 @@ pub(crate) fn resolve_workflow_task_target_version(
         };
     }
 
+    if info.versioning_override.is_none()
+        && let Some(initial_target) = inherited_auto_upgrade_target(routing_config, state)
+    {
+        return initial_target;
+    }
+
     match &info.versioning_override {
         Some(VersioningOverride::Pinned { version }) => ResolvedWorkflowTaskTarget {
             deployment_version: Some(version.clone()),
             revision_number: info.revision_number,
             pinned: true,
         },
-        Some(VersioningOverride::AutoUpgrade) => ResolvedWorkflowTaskTarget {
-            deployment_version: routing_config_target(routing_config, &state.workflow_id),
-            revision_number: routing_config.revision_number,
-            pinned: false,
-        },
+        Some(VersioningOverride::AutoUpgrade) => {
+            let (deployment_version, revision_number) =
+                routing_config_target_with_revision(routing_config, &state.workflow_id);
+            ResolvedWorkflowTaskTarget {
+                deployment_version,
+                revision_number,
+                pinned: false,
+            }
+        }
         None if info.behavior == VersioningBehavior::Pinned => ResolvedWorkflowTaskTarget {
             deployment_version: info.deployment_version.clone(),
             revision_number: info.revision_number,
             pinned: true,
         },
-        None => ResolvedWorkflowTaskTarget {
-            deployment_version: routing_config_target(routing_config, &state.workflow_id),
-            revision_number: routing_config.revision_number,
-            pinned: false,
-        },
+        None => {
+            let (deployment_version, revision_number) =
+                routing_config_target_with_revision(routing_config, &state.workflow_id);
+            ResolvedWorkflowTaskTarget {
+                deployment_version,
+                revision_number,
+                pinned: false,
+            }
+        }
     }
 }
 
@@ -123,15 +154,366 @@ pub(crate) fn routing_config_target(
     routing_config: &StoredRoutingConfig,
     workflow_id: &WorkflowId,
 ) -> Option<WorkerDeploymentVersionRef> {
-    let current = routing_config.current_version.as_ref()?;
-    if let Some(ramping) = routing_config.ramping_version.as_ref()
+    routing_config_target_with_revision(routing_config, workflow_id).0
+}
+
+/// Return the selected routing target and the revision belonging to that target.
+///
+/// Temporal's task-queue data can observe Current and Ramping changes at different
+/// revisions. Tokeira keeps one centralized routing record, so retaining the two
+/// field revisions preserves the same no-bounce comparison without recreating
+/// matching-local propagation state (`CalculateTaskQueueVersioningInfo` and
+/// `chooseTargetQueueByFlag @ v1.31.0`). Zero-valued fields from pre-field records
+/// fall back to the aggregate revision.
+fn routing_config_target_with_revision(
+    routing_config: &StoredRoutingConfig,
+    workflow_id: &WorkflowId,
+) -> (Option<WorkerDeploymentVersionRef>, i64) {
+    let ramping_is_configured =
+        routing_config.ramping_version.is_some() || routing_config.ramping_to_unversioned;
+    if ramping_is_configured
         && routing_config.ramping_version_percentage > 0.0
         && deterministic_bucket(&workflow_id.0)
             < (f64::from(routing_config.ramping_version_percentage) * 100.0) as u64
     {
-        return Some(version_key_to_ref(ramping));
+        return (
+            routing_config
+                .ramping_version
+                .as_ref()
+                .map(version_key_to_ref),
+            routing_target_revision(
+                routing_config.ramping_version_revision_number,
+                routing_config.revision_number,
+            ),
+        );
     }
-    Some(version_key_to_ref(current))
+    (
+        routing_config
+            .current_version
+            .as_ref()
+            .map(version_key_to_ref),
+        routing_target_revision(
+            routing_config.current_version_revision_number,
+            routing_config.revision_number,
+        ),
+    )
+}
+
+fn routing_target_revision(target_revision: i64, aggregate_revision: i64) -> i64 {
+    if target_revision == 0 {
+        aggregate_revision
+    } else {
+        target_revision
+    }
+}
+
+/// Resolve the versioning state committed with a Continue-as-New successor.
+///
+/// All mutable membership observations are Boolean inputs supplied by runtime;
+/// this function is pure and therefore suitable for reference-model testing.
+/// It implements `mutable_state_impl.go:2485-2630 @ v1.31.0` without importing
+/// Temporal's history/matching architecture.
+pub(crate) fn resolve_continue_as_new_versioning(
+    predecessor: &WorkflowState,
+    successor_task_queue: &TaskQueueName,
+    initial_behavior: ContinueAsNewVersioningBehavior,
+    source_version_has_successor_queue: bool,
+    pinned_override_has_successor_queue: bool,
+) -> Option<WorkflowVersioningInfo> {
+    let same_task_queue = predecessor.task_queue == *successor_task_queue;
+    let source_compatible = same_task_queue || source_version_has_successor_queue;
+    let override_compatible = same_task_queue || pinned_override_has_successor_queue;
+    let effective_behavior = predecessor.effective_behavior();
+    let effective_version = predecessor.effective_deployment().cloned();
+    let revision_number = predecessor
+        .versioning_info
+        .as_ref()
+        .map(|info| info.revision_number)
+        .unwrap_or_default();
+    let declined_target_version_upgrade = predecessor.versioning_info.as_ref().and_then(|info| {
+        info.last_notified_target_version
+            .clone()
+            .or_else(|| info.declined_target_version_upgrade.clone())
+    });
+    let pinned_override = predecessor
+        .versioning_override()
+        .and_then(|override_| match override_ {
+            VersioningOverride::Pinned { .. } if override_compatible => Some(override_.clone()),
+            VersioningOverride::Pinned { .. } | VersioningOverride::AutoUpgrade => None,
+        });
+
+    let inherited_pinned = (effective_behavior == VersioningBehavior::Pinned
+        && initial_behavior == ContinueAsNewVersioningBehavior::Unspecified
+        && source_compatible)
+        .then_some(effective_version.clone())
+        .flatten();
+    let requests_auto_upgrade = initial_behavior != ContinueAsNewVersioningBehavior::Unspecified;
+    let inherited_auto_upgrade = ((effective_behavior == VersioningBehavior::AutoUpgrade
+        || (effective_behavior == VersioningBehavior::Pinned && requests_auto_upgrade))
+        && source_compatible
+        && revision_number != 0)
+        .then_some(effective_version)
+        .flatten();
+
+    if inherited_pinned.is_none()
+        && inherited_auto_upgrade.is_none()
+        && pinned_override.is_none()
+        && declined_target_version_upgrade.is_none()
+    {
+        return None;
+    }
+
+    let mut info = WorkflowVersioningInfo {
+        versioning_override: pinned_override,
+        declined_target_version_upgrade,
+        ..WorkflowVersioningInfo::default()
+    };
+    if let Some(version) = inherited_pinned {
+        info.behavior = VersioningBehavior::Pinned;
+        info.deployment_version = Some(version);
+        info.revision_number = revision_number;
+    } else if let Some(version) = inherited_auto_upgrade {
+        info.behavior = VersioningBehavior::AutoUpgrade;
+        info.deployment_version = Some(version);
+        info.revision_number = revision_number;
+        info.continue_as_new_initial_versioning_behavior = initial_behavior;
+    }
+    Some(info)
+}
+
+/// Resolve versioning state inherited by a child workflow start.
+///
+/// Child workflows inherit the parent's effective pinned Version or AutoUpgrade
+/// source only when the child remains in the same namespace and its workflow task
+/// queue belongs to that Version. A pinned override follows the same compatibility
+/// rule. Unlike Continue-as-New, a child never inherits the parent's one-run
+/// `USE_RAMPING_VERSION` instruction; its AutoUpgrade source always starts with an
+/// unspecified initial behavior (`transfer_queue_active_task_executor.go:915-979 @
+/// v1.31.0`). Mutable membership observations are supplied by the runtime caller so
+/// this decision remains pure.
+pub(crate) fn resolve_child_versioning(
+    parent: &WorkflowState,
+    child_task_queue: &TaskQueueName,
+    same_namespace: bool,
+    source_version_has_child_queue: bool,
+    pinned_override_has_child_queue: bool,
+) -> Option<WorkflowVersioningInfo> {
+    if !same_namespace {
+        return None;
+    }
+
+    let same_task_queue = parent.task_queue == *child_task_queue;
+    let source_compatible = same_task_queue || source_version_has_child_queue;
+    let override_compatible = same_task_queue || pinned_override_has_child_queue;
+    let effective_behavior = parent.effective_behavior();
+    let effective_version = parent.effective_deployment().cloned();
+    let revision_number = parent
+        .versioning_info
+        .as_ref()
+        .map(|info| info.revision_number)
+        .unwrap_or_default();
+    let pinned_override = parent
+        .versioning_override()
+        .and_then(|override_| match override_ {
+            VersioningOverride::Pinned { .. } if override_compatible => Some(override_.clone()),
+            VersioningOverride::Pinned { .. } | VersioningOverride::AutoUpgrade => None,
+        });
+    let inherited_pinned = (effective_behavior == VersioningBehavior::Pinned && source_compatible)
+        .then_some(effective_version.clone())
+        .flatten();
+    let inherited_auto_upgrade = (effective_behavior == VersioningBehavior::AutoUpgrade
+        && source_compatible
+        && revision_number != 0)
+        .then_some(effective_version)
+        .flatten();
+
+    if inherited_pinned.is_none() && inherited_auto_upgrade.is_none() && pinned_override.is_none() {
+        return None;
+    }
+
+    let mut info = WorkflowVersioningInfo {
+        versioning_override: pinned_override,
+        ..WorkflowVersioningInfo::default()
+    };
+    if let Some(version) = inherited_pinned {
+        info.behavior = VersioningBehavior::Pinned;
+        info.deployment_version = Some(version);
+        info.revision_number = revision_number;
+    } else if let Some(version) = inherited_auto_upgrade {
+        info.behavior = VersioningBehavior::AutoUpgrade;
+        info.deployment_version = Some(version);
+        info.revision_number = revision_number;
+        info.continue_as_new_initial_versioning_behavior =
+            ContinueAsNewVersioningBehavior::Unspecified;
+    }
+    Some(info)
+}
+
+/// Project the versioning state that command handling observes on this completion.
+///
+/// The clone is only a runtime decision operand; the kernel still performs the
+/// authoritative mutation. v1.31.0 applies the completing worker's behavior and
+/// Version in `afterAddWorkflowTaskCompletedEvent` before it evaluates a
+/// Continue-as-New command, so resolving from the loaded pre-completion state would
+/// lose a first-task `PINNED` report (`workflow_task_state_machine.go` and
+/// `mutable_state_impl.go:2485-2630 @ v1.31.0`).
+fn state_after_wft_completion_versioning(
+    predecessor: &WorkflowState,
+    behavior: VersioningBehavior,
+    deployment_version: Option<WorkerDeploymentVersionRef>,
+    worker_deployment_name: Option<String>,
+) -> WorkflowState {
+    let mut projected = predecessor.clone();
+    projected.apply_wft_versioning(behavior, deployment_version, worker_deployment_name);
+    projected
+}
+
+/// Resolve the first WFT target for inherited AutoUpgrade state.
+///
+/// Ordinary AutoUpgrade uses the routing target unless its revision is older
+/// than the inherited source revision within the same Deployment; retaining the
+/// source in that one case prevents bounce-back while task-queue routing
+/// converges (`chooseTargetQueueByFlag`,
+/// `task_queue_partition_manager.go:2061-2078 @ v1.31.0`).
+/// `USE_RAMPING_VERSION` bypasses percentage bucketing only until the first
+/// successful WFT (and therefore across its failed retries); afterward normal
+/// Current/Ramping routing resumes (`GetShouldUseRampingVersion`,
+/// `mutable_state_impl.go:9122-9141 @ v1.31.0`).
+fn inherited_auto_upgrade_target(
+    routing_config: &StoredRoutingConfig,
+    state: &WorkflowState,
+) -> Option<ResolvedWorkflowTaskTarget> {
+    let info = state.versioning_info.as_ref()?;
+    if state.previous_started_event_id != 0 || info.behavior != VersioningBehavior::AutoUpgrade {
+        return None;
+    }
+    if info.continue_as_new_initial_versioning_behavior
+        == ContinueAsNewVersioningBehavior::UseRampingVersion
+    {
+        let (target, revision_number) =
+            if routing_config.ramping_version.is_some() || routing_config.ramping_to_unversioned {
+                (
+                    routing_config
+                        .ramping_version
+                        .as_ref()
+                        .map(version_key_to_ref),
+                    routing_target_revision(
+                        routing_config.ramping_version_revision_number,
+                        routing_config.revision_number,
+                    ),
+                )
+            } else {
+                (
+                    routing_config
+                        .current_version
+                        .as_ref()
+                        .map(version_key_to_ref),
+                    routing_target_revision(
+                        routing_config.current_version_revision_number,
+                        routing_config.revision_number,
+                    ),
+                )
+            };
+        return Some(ResolvedWorkflowTaskTarget {
+            deployment_version: target,
+            revision_number,
+            pinned: false,
+        });
+    }
+
+    let (routing_target, routing_revision) =
+        routing_config_target_with_revision(routing_config, &state.workflow_id);
+    let Some(routing_target) = routing_target else {
+        // With no Current/Ramping target, v1.31.0's matching path falls back to
+        // the default unversioned queue rather than forcing the inherited
+        // source (`getPhysicalQueuesForAdd`, task_queue_partition_manager.go
+        // @ v1.31.0).
+        return Some(ResolvedWorkflowTaskTarget {
+            deployment_version: None,
+            revision_number: routing_revision,
+            pinned: false,
+        });
+    };
+    let source = info.deployment_version.clone();
+    let routing_target_wins = source.as_ref().is_none_or(|source| {
+        routing_target.deployment_name != source.deployment_name
+            || routing_revision >= info.revision_number
+    });
+    if routing_target_wins {
+        Some(ResolvedWorkflowTaskTarget {
+            deployment_version: Some(routing_target),
+            revision_number: routing_revision,
+            pinned: false,
+        })
+    } else {
+        Some(ResolvedWorkflowTaskTarget {
+            deployment_version: source,
+            revision_number: info.revision_number,
+            pinned: false,
+        })
+    }
+}
+
+/// Re-derive an activity task's disposable queue from authoritative run and
+/// Worker Deployment state.
+///
+/// Pinned dependent activities remain on the workflow's pinned version. A
+/// pinned activity whose queue has no membership in that version is independent
+/// and follows the activity queue's own current/ramping routing, as do
+/// AUTO_UPGRADE activities. Temporal makes this choice when the task is added
+/// to matching, including when an activity retry timer fires
+/// (`service/matching/task_queue_partition_manager.go:getPhysicalQueuesForAdd
+/// @ v1.31.0`). Tokeira performs the equivalent derivation immediately before
+/// broker publication so durable run state, rather than a stored broker target,
+/// remains authoritative.
+pub(crate) async fn route_activity_task_queue(
+    registry: Option<&DeploymentRegistry>,
+    state: &WorkflowState,
+    mut queue: QueueKey,
+    fallback_revision: i64,
+) -> Result<(QueueKey, i64)> {
+    let Some(registry) = registry else {
+        return Ok((queue, fallback_revision));
+    };
+
+    let effective_deployment = state.effective_deployment();
+    if state.effective_behavior() == VersioningBehavior::Pinned
+        && let Some(version) = effective_deployment
+        && registry
+            .version_has_activity_task_queue(
+                state.namespace_id,
+                &queue.task_queue.0,
+                &version.deployment_name,
+                &version.build_id,
+            )
+            .await?
+    {
+        queue.deployment = Some(DeploymentId(version.deployment_name.clone()));
+        queue.build_id = Some(BuildId(version.build_id.clone()));
+        return Ok((queue, 0));
+    }
+
+    let preferred_deployment = effective_deployment
+        .map(|version| version.deployment_name.as_str())
+        .or(state.worker_deployment_name.as_deref());
+    let routing = registry
+        .activity_task_routing_config(
+            state.namespace_id,
+            &queue.task_queue.0,
+            preferred_deployment,
+        )
+        .await?;
+    match routing_config_target(&routing, &state.workflow_id) {
+        Some(version) => {
+            queue.deployment = Some(DeploymentId(version.deployment_name));
+            queue.build_id = Some(BuildId(version.build_id));
+        }
+        None => {
+            queue.deployment = None;
+            queue.build_id = None;
+        }
+    }
+    Ok((queue, routing.revision_number))
 }
 
 /// Stable per-workflow-id bucket in `[0, 9999]` for ramp splits.
@@ -181,8 +563,14 @@ fn transition_for_polled_workflow_task(
     state: &WorkflowState,
     target: &ResolvedWorkflowTaskTarget,
     queue: &QueueKey,
+    speculative: bool,
 ) -> Option<WorkerDeploymentVersionRef> {
-    if target.pinned {
+    // A speculative start is transactionally a no-op in v1.31.0: its worker-
+    // deployment transition may be computed, but is applied only if completion
+    // later materializes the speculative task (`recordworkflowtaskstarted/api.go:
+    // 178-197 @ v1.31.0`). Tokeira expresses that observable contract by
+    // withholding the transition operand from the pure start transition.
+    if speculative || target.pinned {
         return None;
     }
     let poller_version = poller_deployment_version(queue)?;
@@ -394,17 +782,24 @@ where
                     pinned: false,
                 },
                 deployment_transition: None,
+                routing_target: None,
             });
         };
         let routing_config = self
             .load_worker_deployment_routing_config(&state, &offered.queue)
             .await?;
         let resolved = resolve_workflow_task_target_version(&routing_config, &state);
+        let routing_target = routing_config_target(&routing_config, &state.workflow_id);
+        let speculative = state.pending_workflow_task.as_ref().is_some_and(|pending| {
+            pending.logical_seq == offered.logical_seq
+                && pending.task_type == tokeira_kernel::WorkflowTaskType::Speculative
+        });
         let deployment_transition =
-            transition_for_polled_workflow_task(&state, &resolved, &offered.queue);
+            transition_for_polled_workflow_task(&state, &resolved, &offered.queue, speculative);
         Ok(PolledWorkflowTaskTarget {
             resolved,
             deployment_transition,
+            routing_target,
         })
     }
 
@@ -428,6 +823,108 @@ where
             .await?
             .map(|record| record.routing_config)
             .unwrap_or_default())
+    }
+
+    async fn prepare_continue_as_new_versioning(
+        &self,
+        run_key: RunKey,
+        completion_behavior: VersioningBehavior,
+        completion_deployment_version: Option<WorkerDeploymentVersionRef>,
+        completion_worker_deployment_name: Option<String>,
+        commands: &mut [WorkflowCommand],
+    ) -> Result<()> {
+        let Some((command_index, requested_task_queue, initial_behavior)) =
+            commands.iter().enumerate().find_map(|(index, command)| {
+                let WorkflowCommand::ContinueAsNew {
+                    task_queue,
+                    initial_versioning_behavior,
+                    ..
+                } = command
+                else {
+                    return None;
+                };
+                Some((index, task_queue.clone(), *initial_versioning_behavior))
+            })
+        else {
+            return Ok(());
+        };
+        let LoadedRun::Existing(predecessor) = self.repo.load_run(run_key).await? else {
+            return Err(anyhow!(
+                "predecessor run not found while preparing continue-as-new"
+            ));
+        };
+        // The kernel applies these same concrete fields before processing the
+        // command batch. Use an ephemeral clone for runtime-only membership
+        // resolution so the pre-resolved successor decision observes that exact
+        // ordering without giving this clone any authoritative role.
+        let predecessor = state_after_wft_completion_versioning(
+            &predecessor,
+            completion_behavior,
+            completion_deployment_version,
+            completion_worker_deployment_name,
+        );
+        let successor_task_queue = if requested_task_queue.0.is_empty() {
+            predecessor.task_queue.clone()
+        } else {
+            requested_task_queue
+        };
+        let cross_task_queue = successor_task_queue != predecessor.task_queue;
+        let source_version = predecessor.effective_deployment().cloned();
+        let pinned_override_version = predecessor.versioning_override().and_then(|override_| {
+            let VersioningOverride::Pinned { version } = override_ else {
+                return None;
+            };
+            Some(version.clone())
+        });
+        let registry = self.deployment_registry();
+        let source_version_has_successor_queue = if !cross_task_queue {
+            true
+        } else if let (Some(registry), Some(version)) = (registry.as_ref(), source_version.as_ref())
+        {
+            registry
+                .version_has_workflow_task_queue(
+                    predecessor.namespace_id,
+                    &successor_task_queue.0,
+                    &version.deployment_name,
+                    &version.build_id,
+                )
+                .await?
+        } else {
+            false
+        };
+        let pinned_override_has_successor_queue = if !cross_task_queue {
+            true
+        } else if pinned_override_version.as_ref() == source_version.as_ref() {
+            source_version_has_successor_queue
+        } else if let (Some(registry), Some(version)) =
+            (registry.as_ref(), pinned_override_version.as_ref())
+        {
+            registry
+                .version_has_workflow_task_queue(
+                    predecessor.namespace_id,
+                    &successor_task_queue.0,
+                    &version.deployment_name,
+                    &version.build_id,
+                )
+                .await?
+        } else {
+            false
+        };
+        let successor_versioning_info = resolve_continue_as_new_versioning(
+            &predecessor,
+            &successor_task_queue,
+            initial_behavior,
+            source_version_has_successor_queue,
+            pinned_override_has_successor_queue,
+        );
+        if let WorkflowCommand::ContinueAsNew {
+            successor_versioning_info: slot,
+            ..
+        } = &mut commands[command_index]
+        {
+            *slot = successor_versioning_info;
+        }
+        Ok(())
     }
 
     /// Record the completion of a workflow task and
@@ -460,6 +957,18 @@ where
         // task — K7). Read now, before the commit processes the worker's
         // accept/reject commands (spec speculative-wft Req 9).
         let mut req = req;
+        // Registry membership is mutable runtime state, so resolve it before
+        // invoking the pure transition. The resulting decision is committed on
+        // the predecessor close event and becomes the sole successor-start
+        // source after crashes (`mutable_state_impl.go:2485-2630 @ v1.31.0`).
+        self.prepare_continue_as_new_versioning(
+            run_key,
+            req.versioning_behavior,
+            req.deployment_version.clone(),
+            req.worker_deployment_name.clone(),
+            &mut req.commands,
+        )
+        .await?;
         req.delivered_update_ids = self.update_registry.sent_update_ids(run_key);
         // Rejections write NO history event (v1.31.0's
         // RejectWorkflowExecutionUpdate is a documented no-op), so the lane's
@@ -959,12 +1468,26 @@ where
             return Err(anyhow!("retry successor requested without a retry policy"));
         };
         let start_event = self.repo.read_history(predecessor_run_key, 0, 1).await?;
-        let input = match start_event.first().map(|event| &event.kind) {
-            Some(HistoryEventKind::WorkflowExecutionStarted { input, .. })
-            | Some(HistoryEventKind::WorkflowExecutionStartedV2 { input, .. }) => input.clone(),
-            _ => Payloads::default(),
+        let (input, started_versioning_info) = match start_event.first().map(|event| &event.kind) {
+            Some(HistoryEventKind::WorkflowExecutionStarted {
+                input,
+                versioning_info,
+                ..
+            })
+            | Some(HistoryEventKind::WorkflowExecutionStartedV2 {
+                input,
+                versioning_info,
+                ..
+            }) => (input.clone(), versioning_info.as_ref()),
+            _ => (Payloads::default(), None),
         };
-        let start_request = build_retry_successor_start(&state, &policy, input, new_run_id);
+        let start_request = build_retry_successor_start(
+            &state,
+            started_versioning_info,
+            &policy,
+            input,
+            new_run_id,
+        );
         let successor_run_key = start_request.run_key;
         let shard_id = self.shard_id_for(successor_run_key).await;
         match self
@@ -1115,6 +1638,8 @@ where
                 .deployment_transition
                 .as_ref()
                 .map(|_| target.resolved.revision_number),
+            target_version_changed_enabled: target_version_changed_enabled(),
+            target_deployment_version: target.routing_target,
             sticky_ttl: Some(Duration::seconds(30)),
             now,
         };
@@ -1210,6 +1735,8 @@ where
             started_time: pending.started_at.unwrap_or(now),
             workflow_task_timeout: new_state.workflow_task_timeout,
             worker_identity,
+            target_worker_deployment_version_changed: pending
+                .target_worker_deployment_version_changed,
             token,
         })
     }
@@ -1262,6 +1789,8 @@ where
             started_time: started_at,
             workflow_task_timeout: state.workflow_task_timeout,
             worker_identity: worker_identity.clone(),
+            target_worker_deployment_version_changed: pending
+                .target_worker_deployment_version_changed,
             token,
         })
     }
@@ -1373,6 +1902,7 @@ fn is_stale_workflow_task_start(error: &anyhow::Error) -> bool {
 /// workflow task by the recomputed backoff.
 pub(crate) fn build_retry_successor_start(
     state: &tokeira_kernel::WorkflowState,
+    started_versioning_info: Option<&WorkflowVersioningInfo>,
     policy: &tokeira_types::RetryPolicy,
     input: Payloads,
     new_run_id: RunId,
@@ -1389,6 +1919,7 @@ pub(crate) fn build_retry_successor_start(
     } else {
         (None, None)
     };
+    let inherited_versioning_info = retry_successor_versioning_info(state, started_versioning_info);
     StartRequest {
         run_key: successor_run_key,
         namespace_id: state.namespace_id,
@@ -1453,7 +1984,55 @@ pub(crate) fn build_retry_successor_start(
         cron_schedule: None,
         eager_execution_accepted: false,
         reserved_poller_identity: None,
+        inherited_versioning_info,
     }
+}
+
+fn retry_successor_versioning_info(
+    state: &WorkflowState,
+    started_versioning_info: Option<&WorkflowVersioningInfo>,
+) -> Option<WorkflowVersioningInfo> {
+    let started_decline =
+        started_versioning_info.and_then(|info| info.declined_target_version_upgrade.clone());
+    let pinned_override = state.versioning_override().and_then(|override_| {
+        matches!(override_, VersioningOverride::Pinned { .. }).then(|| override_.clone())
+    });
+    let effective_behavior = state.effective_behavior();
+    let effective_version = state.effective_deployment().cloned();
+    let revision_number = state
+        .versioning_info
+        .as_ref()
+        .map(|info| info.revision_number)
+        .unwrap_or_default();
+    let began_inherited_pinned =
+        started_versioning_info.is_some_and(|info| info.behavior == VersioningBehavior::Pinned);
+
+    let mut inherited = WorkflowVersioningInfo {
+        versioning_override: pinned_override,
+        declined_target_version_upgrade: started_decline,
+        ..WorkflowVersioningInfo::default()
+    };
+    if effective_behavior == VersioningBehavior::Pinned && began_inherited_pinned {
+        inherited.behavior = VersioningBehavior::Pinned;
+        inherited.deployment_version = effective_version;
+        inherited.revision_number = revision_number;
+    } else if effective_behavior == VersioningBehavior::AutoUpgrade
+        && effective_version.is_some()
+        && revision_number != 0
+    {
+        inherited.behavior = VersioningBehavior::AutoUpgrade;
+        inherited.deployment_version = effective_version;
+        inherited.revision_number = revision_number;
+        inherited.continue_as_new_initial_versioning_behavior = state
+            .versioning_info
+            .as_ref()
+            .map(|info| info.continue_as_new_initial_versioning_behavior)
+            .unwrap_or_default();
+    }
+
+    (inherited.has_execution_versioning_info()
+        || inherited.declined_target_version_upgrade.is_some())
+    .then_some(inherited)
 }
 
 /// The `Failure` payload a cron run's timeout hands to its successor, so the
@@ -1567,6 +2146,7 @@ pub(crate) fn build_cron_successor_start(
         cron_schedule: Some(cron_schedule),
         eager_execution_accepted: false,
         reserved_poller_identity: None,
+        inherited_versioning_info: None,
     })
 }
 
@@ -1576,13 +2156,14 @@ pub(crate) mod tests {
 
     use proptest::prelude::*;
     use tokeira_kernel::{
-        CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback,
-        ContinueAsNewVersioningBehavior, WorkflowVersioningInfo,
+        BasicKernel, CallbackSpec, CallbackState, CallbackTrigger, Command, CompletionCallback,
+        ContinueAsNewVersioningBehavior, Kernel, LoadedRun, StartWorkflowTaskRequest,
+        VersionTarget, WorkflowVersioningInfo,
     };
     use tokeira_storage::{BuildId as StorageBuildId, DeploymentName};
     use tokeira_types::{
         BuildId as RuntimeBuildId, DeploymentId, LogicalTaskSeq, Memo, SearchAttributes, TaskKind,
-        WorkflowType,
+        WorkerIdentity, WorkflowType,
     };
 
     use super::*;
@@ -1766,6 +2347,7 @@ pub(crate) mod tests {
 
             let successor = build_retry_successor_start(
                 &state,
+                None,
                 &policy,
                 Payloads::default(),
                 RunId::new(),
@@ -1799,6 +2381,54 @@ pub(crate) mod tests {
         ]
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum ContinueAsNewSourceCase {
+        Unversioned,
+        Pinned,
+        AutoUpgrade,
+        PinnedOverride,
+        AutoUpgradeOverride,
+    }
+
+    fn arb_continue_as_new_source_case() -> impl Strategy<Value = ContinueAsNewSourceCase> {
+        prop_oneof![
+            Just(ContinueAsNewSourceCase::Unversioned),
+            Just(ContinueAsNewSourceCase::Pinned),
+            Just(ContinueAsNewSourceCase::AutoUpgrade),
+            Just(ContinueAsNewSourceCase::PinnedOverride),
+            Just(ContinueAsNewSourceCase::AutoUpgradeOverride),
+        ]
+    }
+
+    fn arb_continue_as_new_initial_behavior()
+    -> impl Strategy<Value = ContinueAsNewVersioningBehavior> {
+        prop_oneof![
+            Just(ContinueAsNewVersioningBehavior::Unspecified),
+            Just(ContinueAsNewVersioningBehavior::AutoUpgrade),
+            Just(ContinueAsNewVersioningBehavior::UseRampingVersion),
+            (3i32..32).prop_map(ContinueAsNewVersioningBehavior::Unknown),
+        ]
+    }
+
+    fn arb_versioning_behavior() -> impl Strategy<Value = VersioningBehavior> {
+        prop_oneof![
+            Just(VersioningBehavior::Unspecified),
+            Just(VersioningBehavior::Pinned),
+            Just(VersioningBehavior::AutoUpgrade),
+        ]
+    }
+
+    fn arb_version_target_lineage() -> impl Strategy<Value = Option<VersionTarget>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(VersionTarget::Unversioned)),
+            Just(Some(VersionTarget::Deployment(version_ref(
+                "deployment",
+                "lineage"
+            )))),
+        ]
+    }
+
     fn now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp")
     }
@@ -1808,6 +2438,299 @@ pub(crate) mod tests {
             deployment_name: deployment_name.into(),
             build_id: build_id.into(),
         }
+    }
+
+    fn continue_as_new_source_info(
+        case: ContinueAsNewSourceCase,
+        revision_number: i64,
+        last_notified: Option<VersionTarget>,
+        declined: Option<VersionTarget>,
+    ) -> Option<WorkflowVersioningInfo> {
+        let source = version_ref("deployment", "source");
+        let override_version = version_ref("deployment", "override");
+        let (behavior, versioning_override) = match case {
+            ContinueAsNewSourceCase::Unversioned => {
+                if last_notified.is_none() && declined.is_none() {
+                    return None;
+                }
+                return Some(WorkflowVersioningInfo {
+                    last_notified_target_version: last_notified,
+                    declined_target_version_upgrade: declined,
+                    ..WorkflowVersioningInfo::default()
+                });
+            }
+            ContinueAsNewSourceCase::Pinned => (VersioningBehavior::Pinned, None),
+            ContinueAsNewSourceCase::AutoUpgrade => (VersioningBehavior::AutoUpgrade, None),
+            ContinueAsNewSourceCase::PinnedOverride => (
+                VersioningBehavior::AutoUpgrade,
+                Some(VersioningOverride::Pinned {
+                    version: override_version,
+                }),
+            ),
+            ContinueAsNewSourceCase::AutoUpgradeOverride => (
+                VersioningBehavior::Pinned,
+                Some(VersioningOverride::AutoUpgrade),
+            ),
+        };
+        Some(WorkflowVersioningInfo {
+            behavior,
+            deployment_version: Some(source),
+            versioning_override,
+            revision_number,
+            last_notified_target_version: last_notified,
+            declined_target_version_upgrade: declined,
+            ..WorkflowVersioningInfo::default()
+        })
+    }
+
+    fn reference_continue_as_new_versioning(
+        predecessor: &WorkflowState,
+        same_task_queue: bool,
+        source_member: bool,
+        override_member: bool,
+        initial_behavior: ContinueAsNewVersioningBehavior,
+    ) -> Option<WorkflowVersioningInfo> {
+        let source_compatible = same_task_queue || source_member;
+        let override_compatible = same_task_queue || override_member;
+        let info = predecessor.versioning_info.as_ref();
+        let (effective_behavior, effective_version) =
+            match info.and_then(|info| info.versioning_override.as_ref()) {
+                Some(VersioningOverride::Pinned { version }) => {
+                    (VersioningBehavior::Pinned, Some(version.clone()))
+                }
+                Some(VersioningOverride::AutoUpgrade) => (
+                    VersioningBehavior::AutoUpgrade,
+                    info.and_then(|info| info.deployment_version.clone()),
+                ),
+                None => (
+                    info.map(|info| info.behavior).unwrap_or_default(),
+                    info.and_then(|info| info.deployment_version.clone()),
+                ),
+            };
+        let revision_number = info.map(|info| info.revision_number).unwrap_or_default();
+        let pinned_override = info
+            .and_then(|info| info.versioning_override.as_ref())
+            .and_then(|override_| match override_ {
+                VersioningOverride::Pinned { version } if override_compatible => {
+                    Some(VersioningOverride::Pinned {
+                        version: version.clone(),
+                    })
+                }
+                VersioningOverride::Pinned { .. } | VersioningOverride::AutoUpgrade => None,
+            });
+        let inherited_pinned = (effective_behavior == VersioningBehavior::Pinned
+            && initial_behavior == ContinueAsNewVersioningBehavior::Unspecified
+            && source_compatible)
+            .then(|| effective_version.clone())
+            .flatten();
+        let inherited_auto_upgrade = ((effective_behavior == VersioningBehavior::AutoUpgrade
+            || (effective_behavior == VersioningBehavior::Pinned
+                && initial_behavior != ContinueAsNewVersioningBehavior::Unspecified))
+            && source_compatible
+            && revision_number != 0)
+            .then_some(effective_version)
+            .flatten();
+        let declined_target_version_upgrade = info.and_then(|info| {
+            info.last_notified_target_version
+                .clone()
+                .or_else(|| info.declined_target_version_upgrade.clone())
+        });
+
+        if inherited_pinned.is_none()
+            && inherited_auto_upgrade.is_none()
+            && pinned_override.is_none()
+            && declined_target_version_upgrade.is_none()
+        {
+            return None;
+        }
+
+        let mut info = WorkflowVersioningInfo {
+            versioning_override: pinned_override,
+            declined_target_version_upgrade,
+            ..WorkflowVersioningInfo::default()
+        };
+        if let Some(version) = inherited_pinned {
+            info.behavior = VersioningBehavior::Pinned;
+            info.deployment_version = Some(version);
+            info.revision_number = revision_number;
+        } else if let Some(version) = inherited_auto_upgrade {
+            info.behavior = VersioningBehavior::AutoUpgrade;
+            info.deployment_version = Some(version);
+            info.revision_number = revision_number;
+            info.continue_as_new_initial_versioning_behavior = initial_behavior;
+        }
+        Some(info)
+    }
+
+    #[test]
+    fn continue_as_new_observes_behavior_reported_by_same_completion() {
+        let mut loaded = open_state(
+            "same-completion-source".into(),
+            continue_as_new_source_info(ContinueAsNewSourceCase::AutoUpgrade, 1, None, None),
+        );
+        loaded.task_queue = TaskQueueName("source-queue".into());
+        let reported_version = version_ref("deployment", "source");
+        let projected = state_after_wft_completion_versioning(
+            &loaded,
+            VersioningBehavior::Pinned,
+            Some(reported_version.clone()),
+            Some("deployment".into()),
+        );
+
+        let successor = resolve_continue_as_new_versioning(
+            &projected,
+            &TaskQueueName("successor-queue".into()),
+            ContinueAsNewVersioningBehavior::Unspecified,
+            true,
+            false,
+        )
+        .expect("the reported pinned version belongs to the successor queue");
+
+        assert_eq!(successor.behavior, VersioningBehavior::Pinned);
+        assert_eq!(successor.deployment_version, Some(reported_version));
+        assert_eq!(
+            successor.continue_as_new_initial_versioning_behavior,
+            ContinueAsNewVersioningBehavior::Unspecified
+        );
+    }
+
+    #[test]
+    fn child_inherits_auto_upgrade_source_without_use_ramping_instruction() {
+        let source = version_ref("deployment", "ramping");
+        let mut parent = open_state(
+            "child-parent".into(),
+            Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::AutoUpgrade,
+                deployment_version: Some(source.clone()),
+                revision_number: 7,
+                continue_as_new_initial_versioning_behavior:
+                    ContinueAsNewVersioningBehavior::UseRampingVersion,
+                ..WorkflowVersioningInfo::default()
+            }),
+        );
+        parent.task_queue = TaskQueueName("shared-queue".into());
+
+        let inherited = resolve_child_versioning(
+            &parent,
+            &TaskQueueName("shared-queue".into()),
+            true,
+            true,
+            true,
+        )
+        .expect("same-namespace child inherits the parent's AutoUpgrade source");
+
+        assert_eq!(inherited.behavior, VersioningBehavior::AutoUpgrade);
+        assert_eq!(inherited.deployment_version, Some(source));
+        assert_eq!(inherited.revision_number, 7);
+        assert_eq!(
+            inherited.continue_as_new_initial_versioning_behavior,
+            ContinueAsNewVersioningBehavior::Unspecified
+        );
+    }
+
+    #[test]
+    fn child_versioning_inheritance_requires_namespace_and_queue_compatibility() {
+        let mut parent = open_state(
+            "child-compatibility-parent".into(),
+            Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::AutoUpgrade,
+                deployment_version: Some(version_ref("deployment", "source")),
+                revision_number: 4,
+                ..WorkflowVersioningInfo::default()
+            }),
+        );
+        parent.task_queue = TaskQueueName("parent-queue".into());
+        let child_queue = TaskQueueName("child-queue".into());
+
+        assert_eq!(
+            resolve_child_versioning(&parent, &child_queue, true, false, false),
+            None
+        );
+        assert_eq!(
+            resolve_child_versioning(&parent, &child_queue, false, true, true),
+            None
+        );
+        assert!(resolve_child_versioning(&parent, &child_queue, true, true, false).is_some());
+    }
+
+    #[test]
+    fn child_inherits_compatible_pinned_override() {
+        let override_version = version_ref("deployment", "override");
+        let mut parent = open_state(
+            "child-override-parent".into(),
+            Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::AutoUpgrade,
+                deployment_version: Some(version_ref("deployment", "reported")),
+                versioning_override: Some(VersioningOverride::Pinned {
+                    version: override_version.clone(),
+                }),
+                revision_number: 9,
+                ..WorkflowVersioningInfo::default()
+            }),
+        );
+        parent.task_queue = TaskQueueName("parent-queue".into());
+
+        let inherited = resolve_child_versioning(
+            &parent,
+            &TaskQueueName("child-queue".into()),
+            true,
+            true,
+            true,
+        )
+        .expect("compatible pinned override is inherited");
+
+        assert_eq!(inherited.behavior, VersioningBehavior::Pinned);
+        assert_eq!(inherited.deployment_version, Some(override_version.clone()));
+        assert_eq!(
+            inherited.versioning_override,
+            Some(VersioningOverride::Pinned {
+                version: override_version
+            })
+        );
+    }
+
+    #[test]
+    fn inherited_auto_upgrade_first_task_uses_revision_no_bounce_rule() {
+        let source = version_ref("deployment", "source");
+        let mut successor = open_state(
+            "auto-upgrade-successor".into(),
+            Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::AutoUpgrade,
+                deployment_version: Some(source.clone()),
+                revision_number: 5,
+                continue_as_new_initial_versioning_behavior:
+                    ContinueAsNewVersioningBehavior::AutoUpgrade,
+                ..WorkflowVersioningInfo::default()
+            }),
+        );
+        successor.previous_started_event_id = 0;
+        let mut routing = routing_config(Some(version_key("deployment", "current")), None, 0.0);
+
+        routing.revision_number = 6;
+        routing.current_version_revision_number = 6;
+        assert_eq!(
+            resolve_workflow_task_target_version(&routing, &successor),
+            ResolvedWorkflowTaskTarget {
+                deployment_version: Some(version_ref("deployment", "current")),
+                revision_number: 6,
+                pinned: false,
+            }
+        );
+
+        // A later ramp update advances the aggregate config revision, but the
+        // selected Current target still carries its older field revision. The
+        // inherited source must not bounce backward merely because an unrelated
+        // routing field changed.
+        routing.revision_number = 7;
+        routing.current_version_revision_number = 4;
+        assert_eq!(
+            resolve_workflow_task_target_version(&routing, &successor),
+            ResolvedWorkflowTaskTarget {
+                deployment_version: Some(source),
+                revision_number: 5,
+                pinned: false,
+            }
+        );
     }
 
     fn version_key(deployment_name: &str, build_id: &str) -> WorkerDeploymentVersionKey {
@@ -1831,6 +2754,8 @@ pub(crate) mod tests {
             ramping_version_changed_time: None,
             ramping_version_percentage_changed_time: None,
             revision_number: 100,
+            current_version_revision_number: 100,
+            ramping_version_revision_number: 100,
         }
     }
 
@@ -1969,21 +2894,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn expected_routing_target(
-        routing_config: &StoredRoutingConfig,
-        workflow_id: &WorkflowId,
-    ) -> Option<WorkerDeploymentVersionRef> {
-        let current = routing_config.current_version.as_ref()?;
-        if let Some(ramping) = routing_config.ramping_version.as_ref()
-            && routing_config.ramping_version_percentage > 0.0
-            && deterministic_bucket(&workflow_id.0)
-                < (f64::from(routing_config.ramping_version_percentage) * 100.0) as u64
-        {
-            return Some(version_key_to_ref(ramping));
-        }
-        Some(version_key_to_ref(current))
-    }
-
     fn workflow_queue(deployment_name: Option<&str>, build_id: Option<&str>) -> QueueKey {
         QueueKey {
             namespace_id: NamespaceId::new(),
@@ -2017,11 +2927,15 @@ pub(crate) mod tests {
             },
             VersioningCase::OverrideAutoUpgrade
             | VersioningCase::BehaviorAutoUpgrade
-            | VersioningCase::Unversioned => ResolvedWorkflowTaskTarget {
-                deployment_version: expected_routing_target(routing_config, workflow_id),
-                revision_number: routing_config.revision_number,
-                pinned: false,
-            },
+            | VersioningCase::Unversioned => {
+                let (deployment_version, revision_number) =
+                    routing_config_target_with_revision(routing_config, workflow_id);
+                ResolvedWorkflowTaskTarget {
+                    deployment_version,
+                    revision_number,
+                    pinned: false,
+                }
+            }
         }
     }
 
@@ -2043,6 +2957,7 @@ pub(crate) mod tests {
                 &state,
                 &target,
                 &workflow_queue(Some("deployment"), Some("current")),
+                false,
             ),
             Some(version_ref("deployment", "current"))
         );
@@ -2051,14 +2966,30 @@ pub(crate) mod tests {
                 &state,
                 &target,
                 &workflow_queue(Some("deployment"), Some("stale")),
+                false,
             ),
             Some(version_ref("deployment", "stale"))
         );
         // An unversioned poller (no deployment/build_id) cannot start a
         // transition.
         assert_eq!(
-            transition_for_polled_workflow_task(&state, &target, &workflow_queue(None, None)),
+            transition_for_polled_workflow_task(
+                &state,
+                &target,
+                &workflow_queue(None, None),
+                false,
+            ),
             None
+        );
+        assert_eq!(
+            transition_for_polled_workflow_task(
+                &state,
+                &target,
+                &workflow_queue(Some("deployment"), Some("current")),
+                true,
+            ),
+            None,
+            "a speculative start must not persist its computed transition"
         );
 
         let already_effective = open_state(
@@ -2081,6 +3012,7 @@ pub(crate) mod tests {
                 &already_effective,
                 &target,
                 &workflow_queue(Some("deployment"), Some("current")),
+                false,
             ),
             None
         );
@@ -2105,8 +3037,29 @@ pub(crate) mod tests {
                 &pinned,
                 &target,
                 &workflow_queue(Some("deployment"), Some("current")),
+                false,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn partial_ramp_from_unversioned_can_select_the_ramping_version() {
+        let routing = routing_config(None, Some(version_key("deployment", "ramping")), 25.0);
+        let state = open_state("workflow-0".into(), None);
+
+        // A nil Current target is the unversioned side of a ramp, not a reason
+        // to bypass the ramp. v1.31.0 explicitly covers partial ramping from
+        // unversioned to a Deployment Version
+        // (`TestFindDeploymentVersionForWorkflowID_PartialRamp`,
+        // `common/worker_versioning/worker_versioning_test.go @ v1.31.0`).
+        assert_eq!(
+            resolve_workflow_task_target_version(&routing, &state),
+            ResolvedWorkflowTaskTarget {
+                deployment_version: Some(version_ref("deployment", "ramping")),
+                revision_number: 100,
+                pinned: false,
+            }
         );
     }
 
@@ -2126,7 +3079,14 @@ pub(crate) mod tests {
                 ramping_present.then(|| version_key("deployment", "ramping")),
                 ramping_percentage,
             );
-            let state = open_state(format!("workflow-{workflow_suffix}"), info_for_case(&case));
+            let mut state = open_state(format!("workflow-{workflow_suffix}"), info_for_case(&case));
+            if matches!(case, VersioningCase::BehaviorAutoUpgrade) {
+                // This older property models ordinary routing after an SDK has
+                // completed a WFT as AUTO_UPGRADE. A source-bearing run with no
+                // successful WFT instead means inherited first-task placement,
+                // which Property 23 exercises independently.
+                state.previous_started_event_id = 1;
+            }
 
             let resolved = resolve_workflow_task_target_version(&routing, &state);
             let resolved_again = resolve_workflow_task_target_version(&routing, &state);
@@ -2134,16 +3094,293 @@ pub(crate) mod tests {
 
             prop_assert_eq!(&resolved, &resolved_again);
             prop_assert_eq!(&resolved, &expected);
-            if !current_present
-                && matches!(
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Feature: worker-deployments, Property 23: Continue-as-New versioning decision
+        #[test]
+        fn continue_as_new_versioning_matches_v1_31_reference(
+            case in arb_continue_as_new_source_case(),
+            same_task_queue in any::<bool>(),
+            source_member in any::<bool>(),
+            override_member in any::<bool>(),
+            revision_number in 0i64..4,
+            initial_behavior in arb_continue_as_new_initial_behavior(),
+            last_notified in arb_version_target_lineage(),
+            declined in arb_version_target_lineage(),
+            completion_behavior in arb_versioning_behavior(),
+            completion_version_present in any::<bool>(),
+            current_present in any::<bool>(),
+            ramping_present in any::<bool>(),
+            routing_revision in 0i64..4,
+            routing_same_deployment in any::<bool>(),
+        ) {
+            let mut predecessor = open_state(
+                "continue-as-new-source".into(),
+                continue_as_new_source_info(
                     case,
-                    VersioningCase::OverrideAutoUpgrade
-                        | VersioningCase::BehaviorAutoUpgrade
-                        | VersioningCase::Unversioned
-                )
-            {
-                prop_assert!(resolved.deployment_version.is_none());
+                    revision_number,
+                    last_notified.clone(),
+                    declined.clone(),
+                ),
+            );
+            predecessor.task_queue = TaskQueueName("source-queue".into());
+            let completion_deployment_version = (completion_behavior
+                != VersioningBehavior::Unspecified
+                && completion_version_present)
+                .then(|| version_ref("deployment", "completion"));
+            let projected_predecessor = state_after_wft_completion_versioning(
+                &predecessor,
+                completion_behavior,
+                completion_deployment_version,
+                (completion_behavior != VersioningBehavior::Unspecified)
+                    .then(|| "deployment".to_string()),
+            );
+            let successor_task_queue = if same_task_queue {
+                projected_predecessor.task_queue.clone()
+            } else {
+                TaskQueueName("successor-queue".into())
+            };
+            let expected = reference_continue_as_new_versioning(
+                &projected_predecessor,
+                same_task_queue,
+                source_member,
+                override_member,
+                initial_behavior,
+            );
+
+            let actual = resolve_continue_as_new_versioning(
+                &projected_predecessor,
+                &successor_task_queue,
+                initial_behavior,
+                source_member,
+                override_member,
+            );
+            let repeated = resolve_continue_as_new_versioning(
+                &projected_predecessor,
+                &successor_task_queue,
+                initial_behavior,
+                source_member,
+                override_member,
+            );
+            prop_assert_eq!(&actual, &expected);
+            prop_assert_eq!(&actual, &repeated);
+
+            if let Some(successor_info) = actual.clone() {
+                let routing_deployment = if routing_same_deployment {
+                    "deployment"
+                } else {
+                    "other-deployment"
+                };
+                let mut routing = routing_config(
+                    current_present.then(|| version_key(routing_deployment, "current")),
+                    ramping_present.then(|| version_key(routing_deployment, "ramping")),
+                    50.0,
+                );
+                routing.revision_number = routing_revision;
+                routing.current_version_revision_number = routing_revision;
+                routing.ramping_version_revision_number = routing_revision;
+                let mut successor = open_state("continue-as-new-successor".into(), Some(successor_info.clone()));
+                successor.task_queue = successor_task_queue.clone();
+                if successor_info.versioning_override.is_none()
+                    && successor_info.behavior == VersioningBehavior::AutoUpgrade
+                {
+                    let initial_target = resolve_workflow_task_target_version(&routing, &successor);
+                    if initial_behavior == ContinueAsNewVersioningBehavior::UseRampingVersion {
+                        let expected_target = routing
+                            .ramping_version
+                            .as_ref()
+                            .map(version_key_to_ref)
+                            .or_else(|| routing.current_version.as_ref().map(version_key_to_ref));
+                        prop_assert_eq!(initial_target.deployment_version, expected_target);
+                        prop_assert_eq!(initial_target.revision_number, routing.revision_number);
+                    } else {
+                        let routing_target = routing_config_target(&routing, &successor.workflow_id);
+                        let routing_target_wins = routing_target.as_ref().is_none_or(|target| {
+                            successor_info.deployment_version.as_ref().is_none_or(|source| {
+                                target.deployment_name != source.deployment_name
+                                    || routing.revision_number >= successor_info.revision_number
+                            })
+                        });
+                        let (expected_target, expected_revision) = if routing_target_wins {
+                            (routing_target, routing.revision_number)
+                        } else {
+                            (
+                                successor_info.deployment_version.clone(),
+                                successor_info.revision_number,
+                            )
+                        };
+                        prop_assert_eq!(
+                            initial_target.deployment_version,
+                            expected_target
+                        );
+                        prop_assert_eq!(initial_target.revision_number, expected_revision);
+                    }
+
+                    successor.previous_started_event_id = 1;
+                    let later_target = resolve_workflow_task_target_version(&routing, &successor);
+                    prop_assert_eq!(
+                        later_target.deployment_version,
+                        routing_config_target(&routing, &successor.workflow_id)
+                    );
+                }
+
+                let next_hop = resolve_continue_as_new_versioning(
+                    &successor,
+                    &successor_task_queue,
+                    ContinueAsNewVersioningBehavior::Unspecified,
+                    true,
+                    true,
+                );
+                if let Some(next_hop) = next_hop
+                    && next_hop.behavior == VersioningBehavior::AutoUpgrade
+                {
+                    prop_assert_eq!(
+                        next_hop.continue_as_new_initial_versioning_behavior,
+                        ContinueAsNewVersioningBehavior::Unspecified
+                    );
+                }
             }
+
+            let started_decline = declined.or(last_notified);
+            let started_info = WorkflowVersioningInfo {
+                behavior: if matches!(case, ContinueAsNewSourceCase::Pinned | ContinueAsNewSourceCase::PinnedOverride) {
+                    VersioningBehavior::Pinned
+                } else {
+                    VersioningBehavior::Unspecified
+                },
+                declined_target_version_upgrade: started_decline.clone(),
+                ..WorkflowVersioningInfo::default()
+            };
+            let retry = retry_successor_versioning_info(&predecessor, Some(&started_info));
+            if predecessor.effective_behavior() == VersioningBehavior::Pinned
+                && started_info.behavior != VersioningBehavior::Pinned
+            {
+                prop_assert!(retry.as_ref().is_none_or(|info| info.behavior != VersioningBehavior::Pinned));
+            }
+            if let Some(retry) = retry {
+                prop_assert_eq!(retry.declined_target_version_upgrade, started_decline);
+                if retry.behavior == VersioningBehavior::AutoUpgrade {
+                    prop_assert_eq!(
+                        retry.continue_as_new_initial_versioning_behavior,
+                        predecessor
+                            .versioning_info
+                            .as_ref()
+                            .map(|info| info.continue_as_new_initial_versioning_behavior)
+                            .unwrap_or_default()
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Feature: worker-deployments, Property 25: runtime-resolved boundary determinism
+        #[test]
+        fn runtime_resolves_mutable_inputs_before_pure_kernel_evaluation(
+            case in arb_continue_as_new_source_case(),
+            same_task_queue in any::<bool>(),
+            source_member in any::<bool>(),
+            override_member in any::<bool>(),
+            revision_number in 0i64..4,
+            initial_behavior in arb_continue_as_new_initial_behavior(),
+            notification_enabled in any::<bool>(),
+            current_present in any::<bool>(),
+            ramping_present in any::<bool>(),
+            ramping_percentage in prop_oneof![Just(0.0f32), Just(50.0), Just(100.0)],
+        ) {
+            let now = now();
+            let mut predecessor = open_state(
+                "boundary-source".into(),
+                continue_as_new_source_info(case, revision_number, None, None),
+            );
+            predecessor.task_queue = TaskQueueName("source-queue".into());
+            let successor_task_queue = if same_task_queue {
+                predecessor.task_queue.clone()
+            } else {
+                TaskQueueName("successor-queue".into())
+            };
+            let routing = routing_config(
+                current_present.then(|| version_key("deployment", "current")),
+                ramping_present.then(|| version_key("deployment", "ramping")),
+                ramping_percentage,
+            );
+
+            let successor_info = resolve_continue_as_new_versioning(
+                &predecessor,
+                &successor_task_queue,
+                initial_behavior,
+                source_member,
+                override_member,
+            );
+            let dispatch_target = resolve_workflow_task_target_version(&routing, &predecessor);
+            let repeated_dispatch_target =
+                resolve_workflow_task_target_version(&routing, &predecessor);
+            let notification_target = routing_config_target(&routing, &predecessor.workflow_id);
+            prop_assert_eq!(dispatch_target, repeated_dispatch_target);
+
+            let policy = RetryPolicy {
+                initial_interval: Duration::seconds(1),
+                backoff_coefficient: 1.0,
+                maximum_interval: None,
+                maximum_attempts: 2,
+                non_retryable_error_types: Vec::new(),
+            };
+            let mut start = build_retry_successor_start(
+                &predecessor,
+                None,
+                &policy,
+                Payloads::default(),
+                RunId::new(),
+            );
+            start.task_queue = successor_task_queue;
+            start.versioning_override = None;
+            start.workflow_start_delay = None;
+            start.inherited_versioning_info = successor_info;
+            start.now = now;
+            start.request.received_at = now;
+
+            let first_start = BasicKernel
+                .apply(LoadedRun::Absent, Command::Start(start.clone()))
+                .unwrap();
+            let second_start = BasicKernel
+                .apply(LoadedRun::Absent, Command::Start(start))
+                .unwrap();
+            prop_assert_eq!(&first_start, &second_start);
+
+            let pending = first_start
+                .next_state
+                .pending_workflow_task
+                .as_ref()
+                .expect("a non-delayed successor schedules its first workflow task");
+            let start_wft = Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                logical_seq: pending.logical_seq,
+                worker_identity: WorkerIdentity("boundary-worker".into()),
+                request_id: "boundary-wft-start".into(),
+                history_size_bytes: 0,
+                suggest_continue_as_new: false,
+                deployment_transition: None,
+                deployment_transition_revision_number: None,
+                target_version_changed_enabled: notification_enabled,
+                target_deployment_version: notification_target,
+                sticky_ttl: None,
+                now,
+            });
+            let first_wft = BasicKernel
+                .apply(
+                    LoadedRun::Existing(first_start.next_state.clone()),
+                    start_wft.clone(),
+                )
+                .unwrap();
+            let second_wft = BasicKernel
+                .apply(LoadedRun::Existing(first_start.next_state), start_wft)
+                .unwrap();
+            prop_assert_eq!(first_wft, second_wft);
         }
     }
 }

@@ -12,8 +12,9 @@ use crate::{
         WorkflowTaskTimeoutType, WorkflowTaskWorkerVersion, WorkflowTimeoutType,
     },
     state::{
-        CompletionCallback, Link, ParentClosePolicy, Priority, UserMetadata, VersioningBehavior,
-        VersioningOverride, WorkerDeploymentVersionRef, WorkflowVersioningInfo,
+        CompletionCallback, ContinueAsNewVersioningBehavior, Link, ParentClosePolicy, Priority,
+        UserMetadata, VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef,
+        WorkflowVersioningInfo,
     },
 };
 
@@ -214,6 +215,16 @@ pub enum HistoryEventKind {
         request_id: String,
         history_size_bytes: i64,
         suggest_continue_as_new: bool,
+        /// Public v1.31.0 target-change notification decision.
+        #[serde(default)]
+        target_worker_deployment_version_changed: bool,
+        /// Private policy operand retained solely for deterministic replay.
+        #[serde(default)]
+        target_version_changed_enabled: bool,
+        /// Private routing-target operand retained solely for deterministic
+        /// replay. `None` represents the unversioned target.
+        #[serde(default)]
+        target_deployment_version: Option<WorkerDeploymentVersionRef>,
     },
     /// The worker successfully completed the workflow task
     /// and returned a batch of workflow commands.
@@ -697,6 +708,14 @@ pub enum HistoryEventKind {
         /// retained so the runtime authors it on the successor start).
         #[serde(default)]
         header: Option<Headers>,
+        /// Initial placement behavior supplied by the command that created
+        /// this successor, including unknown proto3 numeric values.
+        #[serde(default)]
+        initial_versioning_behavior: ContinueAsNewVersioningBehavior,
+        /// Runtime-resolved successor state committed with the predecessor
+        /// close so crash recovery does not repeat mutable registry reads.
+        #[serde(default)]
+        successor_versioning_info: Option<WorkflowVersioningInfo>,
     },
     /// The workflow was canceled via a `CancelWorkflow`
     /// workflow command (cooperative cancellation completed).

@@ -1267,6 +1267,27 @@ pub fn signal_request_to_edge(
 // v1.62-sync: reads deprecated `PollWorkflowTaskQueueRequest.worker_version_capabilities`
 // for wire-compat with v0.4-era SDK workers. v1.62 replaces it with
 // `deployment_options`; migration is tracked under `runtime-worker-versioning`.
+const VERSIONED_STICKY_NORMAL_NAME_REQUIRED: &str = "NormalName must be set on sticky queue when UseVersioning is true or DeploymentOptions are set.";
+
+fn validate_versioned_sticky_normal_name(
+    task_queue: &taskqueue_proto::TaskQueue,
+    deployment_options_present: bool,
+    legacy_use_versioning: bool,
+) -> Result<(), ProtoConversionError> {
+    // v1.31.0 rejects before poll admission because a versioned sticky queue
+    // cannot be redirected through its normal family when NormalName is absent
+    // (`WorkflowHandler.validateVersioningInfo`, workflow_handler.go:6356-6375).
+    if enums::TaskQueueKind::try_from(task_queue.kind).ok() == Some(enums::TaskQueueKind::Sticky)
+        && task_queue.normal_name.is_empty()
+        && (deployment_options_present || legacy_use_versioning)
+    {
+        return Err(ProtoConversionError::InvalidArgument(
+            VERSIONED_STICKY_NORMAL_NAME_REQUIRED.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(deprecated)]
 pub fn poll_request_to_edge(
     req: workflowservice::PollWorkflowTaskQueueRequest,
@@ -1277,6 +1298,13 @@ pub fn poll_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "PollWorkflowTaskQueueRequest.task_queue",
         ))?;
+    validate_versioned_sticky_normal_name(
+        task_queue,
+        req.deployment_options.is_some(),
+        req.worker_version_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.use_versioning),
+    )?;
 
     let (deployment, build_id) = req
         .deployment_options
@@ -2314,18 +2342,33 @@ fn compute_config_summary_from_edge(config: &ComputeConfig) -> compute_proto::Co
 fn version_task_queue_from_edge(
     view: &tokeira_runtime::VersionTaskQueueView,
 ) -> workflowservice::describe_worker_deployment_version_response::VersionTaskQueue {
+    // Tokeira's delivery backlog currently has one priority band. v1.31.0's
+    // backlog manager exposes that band under DefaultPriorityKey = 3 even when
+    // its count is zero (`service/matching/{config,backlog_manager}.go @
+    // v1.31.0`). Mirror the aggregate into that key until multi-band scheduling
+    // is implemented; do not fabricate additional priority keys.
+    let stats_by_priority_key = view
+        .stats
+        .map(|stats| BTreeMap::from([(3, broker_backlog_stats_to_proto(stats))]))
+        .unwrap_or_default();
     workflowservice::describe_worker_deployment_version_response::VersionTaskQueue {
         name: view.task_queue.name.clone(),
         r#type: deployment_task_queue_type_to_proto(view.task_queue.task_queue_type),
-        stats: view.stats.map(|stats| taskqueue_proto::TaskQueueStats {
-            approximate_backlog_count: stats.count as i64,
-            approximate_backlog_age: time::Duration::try_from(stats.oldest_age)
-                .ok()
-                .map(to_proto_duration),
-            tasks_add_rate: 0.0,
-            tasks_dispatch_rate: 0.0,
-        }),
-        stats_by_priority_key: BTreeMap::new(),
+        stats: view.stats.map(broker_backlog_stats_to_proto),
+        stats_by_priority_key,
+    }
+}
+
+fn broker_backlog_stats_to_proto(
+    stats: tokeira_runtime::BrokerBacklogStats,
+) -> taskqueue_proto::TaskQueueStats {
+    taskqueue_proto::TaskQueueStats {
+        approximate_backlog_count: stats.count as i64,
+        approximate_backlog_age: time::Duration::try_from(stats.oldest_age)
+            .ok()
+            .map(to_proto_duration),
+        tasks_add_rate: 0.0,
+        tasks_dispatch_rate: 0.0,
     }
 }
 
@@ -4236,6 +4279,13 @@ pub fn describe_task_queue_response_to_proto(
     let versioning_info = resp
         .versioning_info
         .map(task_queue_versioning_info_to_proto);
+    // v1.31.0 always returns the actively-used default backlog band at key 3
+    // when stats are requested. Tokeira currently supports exactly that single
+    // band, so its aggregate and per-priority views are identical.
+    let stats_by_priority_key = resp
+        .stats
+        .map(|stats| BTreeMap::from([(3, task_queue_stats_to_proto(stats))]))
+        .unwrap_or_default();
     let stats = resp.stats.map(task_queue_stats_to_proto);
     let mut versions_info = std::collections::BTreeMap::new();
     if resp.workflow_stats.is_some() || resp.activity_stats.is_some() {
@@ -4287,7 +4337,7 @@ pub fn describe_task_queue_response_to_proto(
             )
             .collect(),
         stats,
-        stats_by_priority_key: Default::default(),
+        stats_by_priority_key,
         versioning_info,
         config: Some(task_queue_config_to_proto(resp.config)),
         effective_rate_limit: None,
@@ -4882,6 +4932,12 @@ pub fn proto_command_to_workflow_command(
                 .unwrap_or(time::Duration::seconds(10)),
                 retry_policy: attrs.retry_policy.as_ref().map(retry_policy_to_domain),
                 header: attrs.header.as_ref().map(headers_to_domain),
+                initial_versioning_behavior: continue_as_new_behavior_from_proto(
+                    attrs.initial_versioning_behavior,
+                ),
+                // Runtime fills this only after resolving predecessor state and
+                // cross-task-queue membership.
+                successor_versioning_info: None,
             })
         }
         Some(Attributes::StartChildWorkflowExecutionCommandAttributes(attrs)) => {
@@ -5205,6 +5261,7 @@ pub fn workflow_command_to_proto(
             workflow_run_timeout,
             workflow_task_timeout,
             retry_policy,
+            initial_versioning_behavior,
             ..
         } => Some(Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(
             command::ContinueAsNewWorkflowExecutionCommandAttributes {
@@ -5220,6 +5277,9 @@ pub fn workflow_command_to_proto(
                 retry_policy: retry_policy.as_ref().map(retry_policy_from_domain),
                 memo: Some(memo_from_domain(memo)),
                 search_attributes: Some(search_attributes_from_domain(search_attributes)),
+                initial_versioning_behavior: continue_as_new_behavior_to_proto(
+                    *initial_versioning_behavior,
+                ),
                 ..Default::default()
             },
         )),
@@ -5529,9 +5589,14 @@ fn workflow_versioning_info_from_edge(
 fn deployment_version_transition_from_edge(
     value: &WorkerDeploymentVersionRef,
 ) -> workflow::DeploymentVersionTransition {
+    // DescribeWorkflowExecution backfills both the v0.31 dot-form string and
+    // the structured replacement even though mutable state stores only the
+    // structured field (`common/testing/testvars/test_vars.go:276-282` and
+    // `service/history/workflow/mutable_state_impl.go:9084-9088 @ v1.31.0`).
+    #[allow(deprecated)]
     workflow::DeploymentVersionTransition {
+        version: format!("{}.{}", value.deployment_name, value.build_id),
         deployment_version: Some(worker_deployment_version_ref_to_proto(value)),
-        ..Default::default()
     }
 }
 
@@ -5581,6 +5646,22 @@ fn continue_as_new_behavior_to_proto(value: ContinueAsNewVersioningBehavior) -> 
         ContinueAsNewVersioningBehavior::UseRampingVersion => {
             enums::ContinueAsNewVersioningBehavior::UseRampingVersion as i32
         }
+        ContinueAsNewVersioningBehavior::Unknown(value) => value,
+    }
+}
+
+fn continue_as_new_behavior_from_proto(value: i32) -> ContinueAsNewVersioningBehavior {
+    match value {
+        value if value == enums::ContinueAsNewVersioningBehavior::Unspecified as i32 => {
+            ContinueAsNewVersioningBehavior::Unspecified
+        }
+        value if value == enums::ContinueAsNewVersioningBehavior::AutoUpgrade as i32 => {
+            ContinueAsNewVersioningBehavior::AutoUpgrade
+        }
+        value if value == enums::ContinueAsNewVersioningBehavior::UseRampingVersion as i32 => {
+            ContinueAsNewVersioningBehavior::UseRampingVersion
+        }
+        value => ContinueAsNewVersioningBehavior::Unknown(value),
     }
 }
 
@@ -5644,6 +5725,13 @@ pub fn poll_activity_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "PollActivityTaskQueueRequest.task_queue",
         ))?;
+    validate_versioned_sticky_normal_name(
+        task_queue,
+        req.deployment_options.is_some(),
+        req.worker_version_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.use_versioning),
+    )?;
 
     let (deployment, build_id) = req
         .deployment_options
@@ -6762,6 +6850,38 @@ mod tests {
         std::sync::Mutex::new(());
 
     #[test]
+    fn describe_task_queue_projects_single_default_priority_band() {
+        let response = describe_task_queue_response_to_proto(EdgeDescribeTaskQueueResponse {
+            pollers: Vec::new(),
+            backlog_count_hint: None,
+            config: Default::default(),
+            versioning_info: None,
+            stats: Some(crate::translate::TaskQueueStatsDto {
+                approximate_backlog_count: 7,
+                approximate_backlog_age: std::time::Duration::from_secs(2),
+            }),
+            workflow_stats: None,
+            activity_stats: None,
+        });
+
+        assert_eq!(
+            response
+                .stats_by_priority_key
+                .get(&3)
+                .expect("default priority band")
+                .approximate_backlog_count,
+            7
+        );
+        assert_eq!(
+            response
+                .stats
+                .expect("aggregate stats")
+                .approximate_backlog_count,
+            7
+        );
+    }
+
+    #[test]
     fn activity_count_extracts_execution_status_group_by() {
         let request = workflowservice::CountActivityExecutionsRequest {
             namespace: "default".to_owned(),
@@ -7869,6 +7989,46 @@ mod tests {
     }
 
     #[test]
+    fn versioned_sticky_polls_require_a_normal_queue_name() {
+        let sticky_without_normal_name = || taskqueue::TaskQueue {
+            name: "sticky".to_string(),
+            kind: enums::TaskQueueKind::Sticky as i32,
+            normal_name: String::new(),
+            ..Default::default()
+        };
+
+        let workflow_error = poll_request_to_edge(workflowservice::PollWorkflowTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(sticky_without_normal_name()),
+            deployment_options: Some(deployment_proto::WorkerDeploymentOptions::default()),
+            ..Default::default()
+        })
+        .expect_err("deployment options require a normal sticky-queue name");
+        let ProtoConversionError::InvalidArgument(workflow_message) = workflow_error else {
+            panic!("expected invalid-argument error");
+        };
+        assert_eq!(workflow_message, VERSIONED_STICKY_NORMAL_NAME_REQUIRED);
+
+        let activity_error =
+            poll_activity_request_to_edge(workflowservice::PollActivityTaskQueueRequest {
+                namespace: "default".to_string(),
+                task_queue: Some(sticky_without_normal_name()),
+                worker_version_capabilities: Some(
+                    tokeira_proto::public::temporal::api::common::v1::WorkerVersionCapabilities {
+                        use_versioning: true,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            })
+            .expect_err("legacy versioning requires a normal sticky-queue name");
+        let ProtoConversionError::InvalidArgument(activity_message) = activity_error else {
+            panic!("expected invalid-argument error");
+        };
+        assert_eq!(activity_message, VERSIONED_STICKY_NORMAL_NAME_REQUIRED);
+    }
+
+    #[test]
     fn respond_completed_request_decodes_speculative_capability() {
         let edge = respond_completed_request_to_edge(
             workflowservice::RespondWorkflowTaskCompletedRequest {
@@ -8509,16 +8669,23 @@ mod tests {
         }
     }
 
+    #[allow(deprecated)]
     fn assert_optional_deployment_transition(
         actual: Option<&workflow::DeploymentVersionTransition>,
         expected: Option<&WorkerDeploymentVersionRef>,
     ) -> Result<(), TestCaseError> {
         match (actual, expected) {
             (None, None) => Ok(()),
-            (Some(actual), Some(expected)) => assert_optional_deployment_version(
-                actual.deployment_version.as_ref(),
-                Some(expected),
-            ),
+            (Some(actual), Some(expected)) => {
+                prop_assert_eq!(
+                    &actual.version,
+                    &format!("{}.{}", expected.deployment_name, expected.build_id)
+                );
+                assert_optional_deployment_version(
+                    actual.deployment_version.as_ref(),
+                    Some(expected),
+                )
+            }
             (actual, expected) => Err(TestCaseError::fail(format!(
                 "deployment transition mismatch: actual={actual:?} expected={expected:?}"
             ))),

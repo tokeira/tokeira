@@ -552,6 +552,7 @@ async fn seed_workflow(
             cron_schedule: None,
             reserved_poller_identity: None,
             eager_execution_accepted: false,
+            inherited_versioning_info: None,
         })
         .await
         .expect("seed workflow");

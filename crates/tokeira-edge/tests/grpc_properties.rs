@@ -1250,6 +1250,9 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                         workflow_task_timeout: time::Duration::seconds(10),
                         retry_policy: None,
                         header: None,
+                        initial_versioning_behavior:
+                            tokeira_kernel::ContinueAsNewVersioningBehavior::Unspecified,
+                        successor_versioning_info: None,
                     }
                 }
             ),

@@ -19,9 +19,12 @@
 use super::*;
 use crate::runtime::workflow_task::{
     ResolvedWorkflowTaskTarget, poller_deployment_version, resolve_workflow_task_target_version,
+    route_activity_task_queue,
 };
 use tokeira_observability::OutcomeLabel;
 use tokeira_types::TaskKind;
+
+const ACTIVITY_BACKLOG_REPROCESS_BATCH: usize = 100;
 
 /// Decide whether an activity-start poller should move the workflow deployment.
 ///
@@ -79,6 +82,120 @@ impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + 'static,
 {
+    /// Re-evaluate unversioned activity backlog after a deployment version first
+    /// registers this activity task queue.
+    ///
+    /// v1.31.0 reprocesses already-spooled tasks when deployment user data
+    /// changes, so an activity initially classified as independent can become
+    /// dependent on its pinned workflow version before dispatch
+    /// (`TestPinnedWorkflowWithLateActivityPoller`; task-queue user-data change
+    /// handling in `service/matching/task_queue_partition_manager.go @
+    /// v1.31.0`). Tokeira applies the observable behavior to its disposable
+    /// live and durable backlog coordinates, re-deriving every candidate from
+    /// authoritative run and deployment state.
+    pub async fn reprocess_unversioned_activity_backlog(&self, target: &QueueKey) -> Result<()> {
+        let Some(registry) = self.deployment_registry() else {
+            return Ok(());
+        };
+        let source = QueueKey {
+            namespace_id: target.namespace_id,
+            task_queue: target.task_queue.clone(),
+            task_kind: TaskKind::Activity,
+            deployment: None,
+            build_id: None,
+        };
+
+        let mut routes = std::collections::HashMap::new();
+        for task in self.activity_broker.unversioned_ready_tasks(target).await {
+            let LoadedRun::Existing(state) = self.repo.load_run(task.run_key).await? else {
+                continue;
+            };
+            let (queue, _) = route_activity_task_queue(
+                Some(&registry),
+                &state,
+                task.queue.clone(),
+                task.dispatch_revision,
+            )
+            .await?;
+            if queue != source {
+                routes.insert(
+                    (task.run_key, task.activity_id.clone(), task.attempt),
+                    queue,
+                );
+            }
+        }
+        self.activity_broker
+            .reroute_unversioned_ready_tasks(target, &routes)
+            .await;
+
+        loop {
+            let entries = self
+                .repo
+                .drain_backlog(&source, ACTIVITY_BACKLOG_REPROCESS_BATCH)
+                .await?;
+            let exhausted = entries.len() < ACTIVITY_BACKLOG_REPROCESS_BATCH;
+            for entry in entries {
+                let tokeira_storage::BacklogPayload::Activity {
+                    activity_id,
+                    input,
+                    schedule_event_id,
+                    attempt,
+                    dispatch_revision,
+                    stamp,
+                } = entry.payload.clone()
+                else {
+                    // A workflow payload under an activity QueueKey is corrupt
+                    // derived state. Put it back rather than discarding work.
+                    self.repo.persist_to_backlog(vec![entry]).await?;
+                    return Err(anyhow!(
+                        "workflow payload found in unversioned activity backlog"
+                    ));
+                };
+                let LoadedRun::Existing(state) = self.repo.load_run(entry.run_key).await? else {
+                    // The authoritative run no longer exists, so the derived
+                    // backlog entry is stale and can be discarded.
+                    continue;
+                };
+                let (queue, dispatch_revision) = match route_activity_task_queue(
+                    Some(&registry),
+                    &state,
+                    source.clone(),
+                    dispatch_revision,
+                )
+                .await
+                {
+                    Ok(route) => route,
+                    Err(error) => {
+                        self.repo.persist_to_backlog(vec![entry]).await?;
+                        return Err(error);
+                    }
+                };
+                let task = DispatchableActivityTask {
+                    run_key: entry.run_key,
+                    queue,
+                    activity_id,
+                    input,
+                    schedule_event_id,
+                    attempt,
+                    dispatch_revision,
+                    stamp,
+                };
+                if let Err(error) = self
+                    .activity_broker
+                    .publish_activity_task(task, Some(&self.delivery_metrics))
+                    .await
+                {
+                    self.repo.persist_to_backlog(vec![entry]).await?;
+                    return Err(error);
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Long-poll for an activity task, then atomically mark it as started.
     pub async fn poll_activity_task(
         &self,
@@ -857,8 +974,21 @@ where
                 namespace_id: state.namespace_id,
                 task_queue: state.task_queue.clone(),
                 task_kind: TaskKind::Workflow,
-                deployment: state.deployment.clone(),
-                build_id: state.build_id.clone(),
+                // An unversioned run has no durable deployment family yet. In
+                // that case v1.31.0 still looks up the workflow queue's Current
+                // target using the polling activity worker's Deployment before
+                // deciding whether to start a transition and withhold the
+                // activity (`recordactivitytaskstarted/api.go:188-225 @
+                // v1.31.0`). The poller's version is only a registry lookup
+                // hint; the workflow task queue name remains authoritative.
+                deployment: state
+                    .deployment
+                    .clone()
+                    .or_else(|| task.queue.deployment.clone()),
+                build_id: state
+                    .build_id
+                    .clone()
+                    .or_else(|| task.queue.build_id.clone()),
             };
             let routing_config = self
                 .load_worker_deployment_routing_config(&state, &workflow_queue)
@@ -1173,6 +1303,7 @@ where
             broker: self.activity_broker.clone(),
             delivery_metrics: self.delivery_metrics.clone(),
             tracking: self.activity_tracking.clone(),
+            worker_deployment_registry: self.worker_deployment_registry.clone(),
         }
     }
 }
@@ -1188,6 +1319,7 @@ pub(crate) struct ActivityRetryDeps<R> {
     pub broker: InMemoryActivityBroker,
     pub delivery_metrics: DeliveryMetrics,
     pub tracking: ActivityTrackingState,
+    pub worker_deployment_registry: Arc<RwLock<Option<DeploymentRegistry>>>,
 }
 
 impl<R> Clone for ActivityRetryDeps<R> {
@@ -1200,6 +1332,7 @@ impl<R> Clone for ActivityRetryDeps<R> {
             broker: self.broker.clone(),
             delivery_metrics: self.delivery_metrics.clone(),
             tracking: self.tracking.clone(),
+            worker_deployment_registry: self.worker_deployment_registry.clone(),
         }
     }
 }
@@ -1430,7 +1563,7 @@ where
                         match prepare_activity_retry_publish(&timer_deps, &dispatch_task, backoff)
                             .await
                         {
-                            Ok(true) => {
+                            Ok(Some(dispatch_task)) => {
                                 if let Err(error) = timer_deps
                                     .broker
                                     .publish_activity_task(
@@ -1442,7 +1575,7 @@ where
                                     tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish backoff-delayed activity retry");
                                 }
                             }
-                            Ok(false) => {}
+                            Ok(None) => {}
                             Err(error) => {
                                 // Rule evaluation is a correctness gate. On an unavailable
                                 // authoritative read, recovery may reconstruct the durable
@@ -1452,10 +1585,12 @@ where
                             }
                         }
                     });
-                } else if let Err(error) = deps
-                    .broker
-                    .publish_activity_task(dispatch_task, Some(&deps.delivery_metrics))
-                    .await
+                } else if let Some(dispatch_task) =
+                    prepare_activity_retry_publish(deps, &dispatch_task, backoff).await?
+                    && let Err(error) = deps
+                        .broker
+                        .publish_activity_task(dispatch_task, Some(&deps.delivery_metrics))
+                        .await
                 {
                     tracing::warn!(?error, run_key = ?run_key, activity_id, "failed to publish retried activity task");
                 }
@@ -1481,20 +1616,20 @@ async fn prepare_activity_retry_publish<R>(
     deps: &ActivityRetryDeps<R>,
     task: &DispatchableActivityTask,
     backoff: time::Duration,
-) -> Result<bool>
+) -> Result<Option<DispatchableActivityTask>>
 where
     R: RunRepository + 'static,
 {
     let mut attempts = 0u32;
     loop {
         let LoadedRun::Existing(state) = deps.repo.load_run(task.run_key).await? else {
-            return Ok(false);
+            return Ok(None);
         };
         if !state.is_open() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(current) = state.activities.get(&task.activity_id).cloned() else {
-            return Ok(false);
+            return Ok(None);
         };
         if current.attempt != task.attempt
             || current.schedule_event_id != task.schedule_event_id
@@ -1502,7 +1637,7 @@ where
             || current.started_event_id.is_some()
             || current.pause_info.is_some()
         {
-            return Ok(false);
+            return Ok(None);
         }
 
         let rules = deps.repo.list_workflow_rules(state.namespace_id).await?;
@@ -1510,7 +1645,22 @@ where
         let Some(rule) =
             matching_pause_rule(&state, &current, &rules, now, Some(backoff.whole_seconds()))
         else {
-            return Ok(true);
+            let registry = deps
+                .worker_deployment_registry
+                .read()
+                .expect("worker deployment registry lock poisoned")
+                .clone();
+            let (queue, dispatch_revision) = route_activity_task_queue(
+                registry.as_ref(),
+                &state,
+                task.queue.clone(),
+                task.dispatch_revision,
+            )
+            .await?;
+            let mut routed = task.clone();
+            routed.queue = queue;
+            routed.dispatch_revision = dispatch_revision;
+            return Ok(Some(routed));
         };
 
         let mut next_state = state.clone();
@@ -1556,7 +1706,7 @@ where
         {
             CommitResult::Applied { .. } => {
                 deps.tracking.remove(task.run_key, &task.activity_id);
-                return Ok(false);
+                return Ok(None);
             }
             CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {
                 if attempts >= deps.max_occ_retries {
@@ -1564,7 +1714,7 @@ where
                 }
                 attempts += 1;
             }
-            CommitResult::Duplicate => return Ok(false),
+            CommitResult::Duplicate => return Ok(None),
         }
     }
 }
@@ -1582,12 +1732,17 @@ mod tests {
         ContinueAsNewVersioningBehavior, VersioningBehavior, VersioningOverride,
         WorkerDeploymentVersionRef, WorkflowVersioningInfo,
     };
-    use tokeira_storage::{InMemoryStore, WorkflowRuleCreateResult};
+    use tokeira_storage::{
+        BuildId as StoredBuildId, DeploymentName, DeploymentTaskQueueType, InMemoryStore,
+        WorkflowRuleCreateResult,
+    };
     use tokeira_types::{
         BuildId as RuntimeBuildId, DeploymentId, LogicalTaskSeq, Memo, NamespaceId, Payload,
         RequestId, SearchAttributes, TaskKind, TaskQueueName, WorkflowId, WorkflowRuleAction,
         WorkflowRuleRecord, WorkflowRuleTrigger, WorkflowType,
     };
+
+    use crate::{RegisterPolledDeployment, SetCurrent};
 
     use super::*;
 
@@ -1782,6 +1937,46 @@ mod tests {
         }
     }
 
+    async fn register_activity_version(
+        registry: &DeploymentRegistry,
+        namespace_id: NamespaceId,
+        deployment_name: &str,
+        build_id: &str,
+        task_queue: &str,
+    ) {
+        registry
+            .register_polled_deployment(RegisterPolledDeployment {
+                namespace_id,
+                deployment_name: DeploymentName(deployment_name.to_string()),
+                build_id: StoredBuildId(build_id.to_string()),
+                task_queue: task_queue.to_string(),
+                task_queue_type: DeploymentTaskQueueType::Activity,
+                identity: format!("worker-{build_id}"),
+            })
+            .await
+            .expect("register activity worker deployment version");
+    }
+
+    async fn set_current_activity_version(
+        registry: &DeploymentRegistry,
+        namespace_id: NamespaceId,
+        deployment_name: &str,
+        build_id: &str,
+    ) {
+        registry
+            .set_current_version(SetCurrent {
+                namespace_id,
+                deployment_name: DeploymentName(deployment_name.to_string()),
+                build_id: Some(StoredBuildId(build_id.to_string())),
+                conflict_token: None,
+                identity: "operator".to_string(),
+                allow_no_pollers: false,
+                ignore_missing_task_queues: true,
+            })
+            .await
+            .expect("set current activity worker deployment version");
+    }
+
     async fn seed_started_activity(
         runtime: &TokeiraRuntime<InMemoryStore>,
         repo: &InMemoryStore,
@@ -1880,7 +2075,15 @@ mod tests {
         runtime: &TokeiraRuntime<InMemoryStore>,
         repo: &InMemoryStore,
     ) -> (WorkflowState, QueueKey, DispatchableActivityTask) {
-        let mut state = open_state(None);
+        seed_scheduled_activity_with_versioning(runtime, repo, None).await
+    }
+
+    async fn seed_scheduled_activity_with_versioning(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        repo: &InMemoryStore,
+        versioning_info: Option<WorkflowVersioningInfo>,
+    ) -> (WorkflowState, QueueKey, DispatchableActivityTask) {
+        let mut state = open_state(versioning_info);
         let run_key = state.run_key;
         let scheduled_at = OffsetDateTime::now_utc();
         let activity = tokeira_kernel::ActivityState {
@@ -1952,6 +2155,183 @@ mod tests {
             .await
             .expect("publish scheduled activity");
         (state, queue, task)
+    }
+
+    #[tokio::test]
+    async fn late_pinned_activity_poller_reprocesses_unversioned_ready_task() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        )
+        .with_worker_deployment_repository(repo.clone());
+        let pinned = pinned_state().versioning_info;
+        let (state, source, task) =
+            seed_scheduled_activity_with_versioning(&runtime, &repo, pinned).await;
+        let registry = runtime
+            .deployment_registry()
+            .expect("deployment registry configured");
+
+        // The activity was published before this membership existed, so its
+        // disposable queue coordinate is still unversioned at this point.
+        register_activity_version(
+            &registry,
+            state.namespace_id,
+            "deployment",
+            "pinned",
+            &source.task_queue.0,
+        )
+        .await;
+        let target = QueueKey {
+            deployment: Some(DeploymentId("deployment".to_string())),
+            build_id: Some(RuntimeBuildId("pinned".to_string())),
+            ..source.clone()
+        };
+        runtime
+            .reprocess_unversioned_activity_backlog(&target)
+            .await
+            .expect("reprocess late activity membership");
+
+        assert_eq!(
+            runtime.activity_broker.backlog_stats(&source).await.count,
+            0
+        );
+        assert_eq!(
+            runtime.activity_broker.backlog_stats(&target).await.count,
+            1
+        );
+        let offered = runtime
+            .activity_broker
+            .poll_activity_task(&target, tokio::time::Duration::from_millis(1))
+            .await
+            .expect("poll rerouted activity")
+            .expect("rerouted activity available")
+            .0;
+        assert_eq!(offered.run_key, task.run_key);
+        assert_eq!(offered.activity_id, task.activity_id);
+    }
+
+    #[tokio::test]
+    async fn auto_upgrade_activity_retry_rederives_current_version_at_publish_time() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        )
+        .with_worker_deployment_repository(repo);
+        let registry = runtime
+            .deployment_registry()
+            .expect("deployment registry configured");
+        let state = auto_upgrade_state("v1");
+        let namespace_id = state.namespace_id;
+        for build_id in ["v1", "v2"] {
+            register_activity_version(
+                &registry,
+                namespace_id,
+                "deployment",
+                build_id,
+                "activity-task-queue",
+            )
+            .await;
+        }
+        set_current_activity_version(&registry, namespace_id, "deployment", "v1").await;
+
+        let mut original_queue = activity_queue(Some("deployment"), Some("v1"));
+        original_queue.namespace_id = namespace_id;
+        let (before, before_revision) =
+            route_activity_task_queue(Some(&registry), &state, original_queue.clone(), 10)
+                .await
+                .expect("route activity before deployment change");
+        assert_eq!(
+            before.deployment.as_ref().map(|value| value.0.as_str()),
+            Some("deployment")
+        );
+        assert_eq!(
+            before.build_id.as_ref().map(|value| value.0.as_str()),
+            Some("v1")
+        );
+
+        set_current_activity_version(&registry, namespace_id, "deployment", "v2").await;
+        let (after, after_revision) =
+            route_activity_task_queue(Some(&registry), &state, original_queue, before_revision)
+                .await
+                .expect("route activity retry after deployment change");
+        assert_eq!(
+            after.deployment.as_ref().map(|value| value.0.as_str()),
+            Some("deployment")
+        );
+        assert_eq!(
+            after.build_id.as_ref().map(|value| value.0.as_str()),
+            Some("v2")
+        );
+        assert!(after_revision > before_revision);
+    }
+
+    #[tokio::test]
+    async fn unversioned_run_uses_activity_poller_family_to_find_workflow_current() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        )
+        .with_worker_deployment_repository(repo.clone());
+        let (state, source, mut task) = seed_scheduled_activity(&runtime, &repo).await;
+        let registry = runtime
+            .deployment_registry()
+            .expect("deployment registry configured");
+        register_activity_version(
+            &registry,
+            state.namespace_id,
+            "deployment",
+            "current",
+            &source.task_queue.0,
+        )
+        .await;
+        set_current_activity_version(&registry, state.namespace_id, "deployment", "current").await;
+        task.queue.deployment = Some(DeploymentId("deployment".to_string()));
+        task.queue.build_id = Some(RuntimeBuildId("current".to_string()));
+
+        let started = runtime
+            .start_activity_task(
+                &task,
+                tokio::time::Instant::now(),
+                &WorkerIdentity("activity-worker".to_string()),
+            )
+            .await
+            .expect("activity poll should be evaluated");
+        assert!(
+            started.is_none(),
+            "the activity is withheld while the workflow transitions"
+        );
+
+        let LoadedRun::Existing(after) = repo.load_run(task.run_key).await.unwrap() else {
+            panic!("seeded run should exist");
+        };
+        assert_eq!(
+            after
+                .versioning_info
+                .as_ref()
+                .and_then(|info| info.version_transition.as_ref()),
+            Some(&version_ref("deployment", "current"))
+        );
+        assert!(after.pending_workflow_task.is_some());
+        assert!(
+            after.activities[&task.activity_id]
+                .started_event_id
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2204,9 +2584,10 @@ mod tests {
         .await
         .expect("store rule during retry backoff");
         assert!(
-            !prepare_activity_retry_publish(&deps, &task, backoff)
+            prepare_activity_retry_publish(&deps, &task, backoff)
                 .await
                 .expect("evaluate delayed retry")
+                .is_none()
         );
 
         let LoadedRun::Existing(after) = repo.load_run(token.run_key).await.unwrap() else {

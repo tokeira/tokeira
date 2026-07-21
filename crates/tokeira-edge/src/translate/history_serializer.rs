@@ -21,7 +21,10 @@ use prost::Message;
 use tokeira_kernel::{
     command::{FieldChange, MemoPatch, SearchAttributesPatch},
     event::{HistoryEvent, HistoryEventKind},
-    state::{VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef},
+    state::{
+        ContinueAsNewVersioningBehavior, VersionTarget, VersioningBehavior, VersioningOverride,
+        WorkerDeploymentVersionRef, WorkflowVersioningInfo,
+    },
 };
 use tokeira_proto::{
     conversions::common::{
@@ -529,7 +532,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             continued_failure,
             last_completion_result,
             cron_schedule,
-            versioning_info: _,
+            versioning_info,
             worker_deployment_name: _,
             priority,
             ..
@@ -566,7 +569,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             continued_failure,
             last_completion_result,
             cron_schedule,
-            versioning_info: _,
+            versioning_info,
             worker_deployment_name: _,
             priority,
             ..
@@ -621,6 +624,18 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                     .collect(),
                 priority: priority.as_ref().map(priority_to_proto),
                 eager_execution_accepted: event.kind.eager_execution_accepted(),
+                versioning_override: versioning_info
+                    .as_ref()
+                    .and_then(|info| info.versioning_override.as_ref())
+                    .map(versioning_override_from_kernel),
+                inherited_pinned_version: inherited_pinned_version(versioning_info.as_ref()),
+                inherited_auto_upgrade_info: inherited_auto_upgrade_info(
+                    versioning_info.as_ref(),
+                ),
+                declined_target_version_upgrade: versioning_info
+                    .as_ref()
+                    .and_then(|info| info.declined_target_version_upgrade.as_ref())
+                    .map(declined_target_version_to_proto),
                 ..Default::default()
             },
         ),
@@ -733,6 +748,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             // The CaN event proto has no header field — it is authored on the
             // successor run's WorkflowExecutionStarted instead.
             header: _,
+            initial_versioning_behavior,
+            successor_versioning_info: _,
             workflow_task_completed_event_id,
         } => Attributes::WorkflowExecutionContinuedAsNewEventAttributes(
             history::WorkflowExecutionContinuedAsNewEventAttributes {
@@ -751,6 +768,9 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 last_completion_result: last_completion_result.as_ref().map(payloads_from_domain),
                 backoff_start_interval: to_opt_proto_duration(*backoff_start_interval),
                 workflow_task_completed_event_id: *workflow_task_completed_event_id,
+                initial_versioning_behavior: continue_as_new_versioning_behavior_i32(
+                    *initial_versioning_behavior,
+                ),
                 ..Default::default()
             },
         ),
@@ -809,6 +829,9 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             request_id,
             history_size_bytes,
             suggest_continue_as_new,
+            target_worker_deployment_version_changed,
+            target_version_changed_enabled: _,
+            target_deployment_version: _,
         } => Attributes::WorkflowTaskStartedEventAttributes(
             history::WorkflowTaskStartedEventAttributes {
                 scheduled_event_id: *scheduled_event_id,
@@ -816,6 +839,8 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 request_id: request_id.clone(),
                 history_size_bytes: *history_size_bytes,
                 suggest_continue_as_new: *suggest_continue_as_new,
+                target_worker_deployment_version_changed:
+                    *target_worker_deployment_version_changed,
                 ..Default::default()
             },
         ),
@@ -1844,6 +1869,69 @@ fn versioning_override_from_kernel(
     }
 }
 
+fn inherited_pinned_version(
+    info: Option<&WorkflowVersioningInfo>,
+) -> Option<deployment_proto::WorkerDeploymentVersion> {
+    let info = info?;
+    (info.behavior == VersioningBehavior::Pinned)
+        .then(|| {
+            info.deployment_version
+                .as_ref()
+                .map(deployment_version_to_proto)
+        })
+        .flatten()
+}
+
+fn inherited_auto_upgrade_info(
+    info: Option<&WorkflowVersioningInfo>,
+) -> Option<deployment_proto::InheritedAutoUpgradeInfo> {
+    let info = info?;
+    if info.behavior != VersioningBehavior::AutoUpgrade
+        || info.revision_number == 0
+        || info.deployment_version.is_none()
+    {
+        return None;
+    }
+    Some(deployment_proto::InheritedAutoUpgradeInfo {
+        source_deployment_version: info
+            .deployment_version
+            .as_ref()
+            .map(deployment_version_to_proto),
+        source_deployment_revision_number: info.revision_number,
+        continue_as_new_initial_versioning_behavior: continue_as_new_versioning_behavior_i32(
+            info.continue_as_new_initial_versioning_behavior,
+        ),
+    })
+}
+
+fn declined_target_version_to_proto(
+    target: &VersionTarget,
+) -> history::DeclinedTargetVersionUpgrade {
+    let deployment_version = match target {
+        VersionTarget::Unversioned => None,
+        VersionTarget::Deployment(version) => Some(deployment_version_to_proto(version)),
+    };
+    history::DeclinedTargetVersionUpgrade {
+        deployment_version,
+        revision_number: 0,
+    }
+}
+
+fn continue_as_new_versioning_behavior_i32(value: ContinueAsNewVersioningBehavior) -> i32 {
+    match value {
+        ContinueAsNewVersioningBehavior::Unspecified => {
+            enums::ContinueAsNewVersioningBehavior::Unspecified as i32
+        }
+        ContinueAsNewVersioningBehavior::AutoUpgrade => {
+            enums::ContinueAsNewVersioningBehavior::AutoUpgrade as i32
+        }
+        ContinueAsNewVersioningBehavior::UseRampingVersion => {
+            enums::ContinueAsNewVersioningBehavior::UseRampingVersion as i32
+        }
+        ContinueAsNewVersioningBehavior::Unknown(value) => value,
+    }
+}
+
 fn retry_policy_to_proto(rp: &tokeira_types::RetryPolicy) -> proto_common::RetryPolicy {
     proto_common::RetryPolicy {
         initial_interval: Some(to_proto_duration(rp.initial_interval)),
@@ -2015,13 +2103,14 @@ mod tests {
     use prost::Message;
     use time::OffsetDateTime;
     use tokeira_kernel::{
+        BasicKernel, Command, Kernel, ReplayContext, StartWorkflowTaskRequest,
         command::{ContinueAsNewInitiator, RetryState},
         event::{HistoryEvent, HistoryEventKind},
         state::{CallbackState, CallbackTrigger, ParentClosePolicy},
     };
     use tokeira_proto::conversions::common::failure_to_payload;
     use tokeira_types::{
-        Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy, RunId,
+        Headers, LogicalTaskSeq, Memo, NamespaceId, Payload, Payloads, RetryPolicy, RunId, RunKey,
         SearchAttributes, TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
     };
     use uuid::Uuid;
@@ -2083,6 +2172,29 @@ mod tests {
             Just(RetryState::RetryPolicyNotSet),
             Just(RetryState::InternalServerError),
             Just(RetryState::CancelRequested),
+        ]
+    }
+
+    fn arb_version_target_lineage() -> impl Strategy<Value = Option<VersionTarget>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(VersionTarget::Unversioned)),
+            Just(Some(VersionTarget::Deployment(
+                WorkerDeploymentVersionRef {
+                    deployment_name: "deployment".into(),
+                    build_id: "lineage".into(),
+                }
+            ))),
+        ]
+    }
+
+    fn arb_continue_as_new_versioning_behavior()
+    -> impl Strategy<Value = ContinueAsNewVersioningBehavior> {
+        prop_oneof![
+            Just(ContinueAsNewVersioningBehavior::Unspecified),
+            Just(ContinueAsNewVersioningBehavior::AutoUpgrade),
+            Just(ContinueAsNewVersioningBehavior::UseRampingVersion),
+            (3i32..32).prop_map(ContinueAsNewVersioningBehavior::Unknown),
         ]
     }
 
@@ -2207,6 +2319,9 @@ mod tests {
                     request_id: "start-req".to_string(),
                     history_size_bytes: 0,
                     suggest_continue_as_new: false,
+                    target_worker_deployment_version_changed: false,
+                    target_version_changed_enabled: false,
+                    target_deployment_version: None,
                 }
             }),
             (1u64..100, 1i64..100, 1i64..100).prop_map(|(seq, sched, started)| {
@@ -2660,6 +2775,9 @@ mod tests {
                 request_id: "req-1".to_string(),
                 history_size_bytes: 0,
                 suggest_continue_as_new: false,
+                target_worker_deployment_version_changed: false,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
             },
         };
 
@@ -3720,6 +3838,9 @@ mod tests {
                     backoff_start_interval: None,
                     cron_schedule: None,
                     header: None,
+                    initial_versioning_behavior:
+                        ContinueAsNewVersioningBehavior::Unspecified,
+                    successor_versioning_info: None,
                 },
             };
             let proto = history_event_to_proto(&event);
@@ -3899,6 +4020,238 @@ mod tests {
                 }
                 other => panic!("unexpected attributes: {other:?}"),
             }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Feature: worker-deployments, Property 24: versioning history and replay round-trip
+        #[test]
+        fn versioning_history_and_replay_round_trip(
+            inheritance_case in 0u8..3,
+            override_case in 0u8..3,
+            initial_behavior in arb_continue_as_new_versioning_behavior(),
+            last_notified in arb_version_target_lineage(),
+            declined in arb_version_target_lineage(),
+            notification_enabled in any::<bool>(),
+            notification_target_is_versioned in any::<bool>(),
+        ) {
+            let happened_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let inherited_version = WorkerDeploymentVersionRef {
+                deployment_name: "deployment".into(),
+                build_id: "inherited".into(),
+            };
+            let routing_target = notification_target_is_versioned.then(|| {
+                WorkerDeploymentVersionRef {
+                    deployment_name: "deployment".into(),
+                    build_id: "target".into(),
+                }
+            });
+            let versioning_override = match override_case {
+                0 => None,
+                1 => Some(VersioningOverride::Pinned {
+                    version: WorkerDeploymentVersionRef {
+                        deployment_name: "deployment".into(),
+                        build_id: "override".into(),
+                    },
+                }),
+                _ => Some(VersioningOverride::AutoUpgrade),
+            };
+            let (behavior, deployment_version, revision_number) = match inheritance_case {
+                0 => (VersioningBehavior::Unspecified, None, 0),
+                1 => (VersioningBehavior::Pinned, Some(inherited_version), 17),
+                _ => (VersioningBehavior::AutoUpgrade, Some(inherited_version), 17),
+            };
+            let versioning_info = WorkflowVersioningInfo {
+                behavior,
+                deployment_version,
+                versioning_override,
+                revision_number,
+                continue_as_new_initial_versioning_behavior: initial_behavior,
+                last_notified_target_version: last_notified,
+                declined_target_version_upgrade: declined,
+                ..WorkflowVersioningInfo::default()
+            };
+            let start_event = HistoryEvent {
+                event_id: 1,
+                happened_at,
+                kind: HistoryEventKind::WorkflowExecutionStarted {
+                    workflow_type: WorkflowType("workflow".into()),
+                    task_queue: TaskQueueName("queue".into()),
+                    input: Payloads::default(),
+                    header: None,
+                    memo: Memo::default(),
+                    search_attributes: SearchAttributes::default(),
+                    request_id: "start".into(),
+                    identity: "client".into(),
+                    continued_execution_run_id: None,
+                    first_execution_run_id: None,
+                    retry_policy: None,
+                    initiator: None,
+                    attempt: 1,
+                    workflow_execution_timeout: None,
+                    workflow_run_timeout: None,
+                    workflow_task_timeout: time::Duration::seconds(10),
+                    parent_workflow_id: None,
+                    parent_run_id: None,
+                    parent_namespace_id: None,
+                    parent_namespace_name: None,
+                    parent_initiated_event_id: 0,
+                    root_workflow_id: None,
+                    root_run_id: None,
+                    original_execution_run_id: None,
+                    continued_failure: None,
+                    last_completion_result: None,
+                    cron_schedule: None,
+                    workflow_start_delay: None,
+                    completion_callbacks: Vec::new(),
+                    user_metadata: None,
+                    links: Vec::new(),
+                    priority: None,
+                    versioning_info: Some(versioning_info),
+                    worker_deployment_name: None,
+                },
+            };
+            let scheduled_event = HistoryEvent {
+                event_id: 2,
+                happened_at,
+                kind: HistoryEventKind::WorkflowTaskScheduled {
+                    logical_seq: LogicalTaskSeq(1),
+                    task_queue: TaskQueueName("queue".into()),
+                    workflow_task_timeout: time::Duration::seconds(10),
+                    attempt: 1,
+                },
+            };
+            let replay_context = ReplayContext {
+                run_key: RunKey::new(),
+                namespace_id: NamespaceId::new(),
+                workflow_id: WorkflowId("workflow-id".into()),
+                run_id: RunId::new(),
+                deployment: None,
+                build_id: None,
+                parent_run_key: None,
+                parent_workflow_id: None,
+                first_run_started_at: None,
+            };
+            let kernel = BasicKernel;
+            let prefix = vec![start_event.clone(), scheduled_event.clone()];
+            let before_start = kernel
+                .replay_history_prefix(replay_context.clone(), &prefix)
+                .unwrap();
+            let started = kernel
+                .apply(
+                    tokeira_kernel::LoadedRun::Existing(before_start),
+                    Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                        logical_seq: LogicalTaskSeq(1),
+                        worker_identity: WorkerIdentity("worker".into()),
+                        request_id: "wft-start".into(),
+                        history_size_bytes: 0,
+                        suggest_continue_as_new: false,
+                        deployment_transition: None,
+                        deployment_transition_revision_number: None,
+                        target_version_changed_enabled: notification_enabled,
+                        target_deployment_version: routing_target,
+                        sticky_ttl: None,
+                        now: happened_at,
+                    }),
+                )
+                .unwrap();
+            let mut internal_history = prefix;
+            internal_history.extend(started.history_events.clone());
+            let encoded = serde_json::to_vec(&internal_history).unwrap();
+            let decoded: Vec<HistoryEvent> = serde_json::from_slice(&encoded).unwrap();
+            let replayed = kernel
+                .replay_history_prefix(replay_context, &decoded)
+                .unwrap();
+            prop_assert_eq!(
+                &replayed.versioning_info,
+                &started.next_state.versioning_info
+            );
+            prop_assert_eq!(
+                &replayed.pending_workflow_task,
+                &started.next_state.pending_workflow_task
+            );
+            prop_assert_eq!(replayed.last_event_id, started.next_state.last_event_id);
+
+            let start_proto = history_event_to_proto(&start_event);
+            let Attributes::WorkflowExecutionStartedEventAttributes(start_attrs) =
+                start_proto.attributes.unwrap()
+            else {
+                prop_assert!(false, "expected WorkflowExecutionStarted attributes");
+                return Ok(());
+            };
+            prop_assert!(!(start_attrs.inherited_pinned_version.is_some()
+                && start_attrs.inherited_auto_upgrade_info.is_some()));
+            prop_assert_eq!(
+                start_attrs.inherited_pinned_version.is_some(),
+                inheritance_case == 1
+            );
+            prop_assert_eq!(
+                start_attrs.inherited_auto_upgrade_info.is_some(),
+                inheritance_case == 2
+            );
+            prop_assert_eq!(start_attrs.versioning_override.is_some(), override_case != 0);
+
+            let wft_proto = history_event_to_proto(&started.history_events[0]);
+            let Attributes::WorkflowTaskStartedEventAttributes(wft_attrs) =
+                wft_proto.attributes.unwrap()
+            else {
+                prop_assert!(false, "expected WorkflowTaskStarted attributes");
+                return Ok(());
+            };
+            let HistoryEventKind::WorkflowTaskStarted {
+                target_worker_deployment_version_changed,
+                ..
+            } = &started.history_events[0].kind else {
+                prop_assert!(false, "kernel must author WorkflowTaskStarted");
+                return Ok(());
+            };
+            prop_assert_eq!(
+                wft_attrs.target_worker_deployment_version_changed,
+                *target_worker_deployment_version_changed
+            );
+
+            let continued = HistoryEvent {
+                event_id: 4,
+                happened_at,
+                kind: HistoryEventKind::WorkflowExecutionContinuedAsNew {
+                    workflow_task_completed_event_id: 3,
+                    new_run_id: RunId::new(),
+                    workflow_type: WorkflowType("workflow".into()),
+                    task_queue: TaskQueueName("queue".into()),
+                    input: Payloads::default(),
+                    memo: Memo::default(),
+                    search_attributes: SearchAttributes::default(),
+                    workflow_execution_timeout: None,
+                    workflow_run_timeout: None,
+                    workflow_task_timeout: time::Duration::seconds(10),
+                    retry_policy: None,
+                    initiator: ContinueAsNewInitiator::Workflow,
+                    failure: None,
+                    last_completion_result: None,
+                    backoff_start_interval: None,
+                    cron_schedule: None,
+                    header: None,
+                    initial_versioning_behavior: initial_behavior,
+                    successor_versioning_info: replayed.versioning_info.clone(),
+                },
+            };
+            let continued_proto = history_event_to_proto(&continued);
+            let Attributes::WorkflowExecutionContinuedAsNewEventAttributes(continued_attrs) =
+                continued_proto.attributes.unwrap()
+            else {
+                prop_assert!(false, "expected ContinuedAsNew attributes");
+                return Ok(());
+            };
+            prop_assert_eq!(
+                continued_attrs.initial_versioning_behavior,
+                continue_as_new_versioning_behavior_i32(initial_behavior)
+            );
+            let continued_round_trip: HistoryEvent = serde_json::from_slice(
+                &serde_json::to_vec(&continued).unwrap()
+            ).unwrap();
+            prop_assert_eq!(continued_round_trip, continued);
         }
     }
 }

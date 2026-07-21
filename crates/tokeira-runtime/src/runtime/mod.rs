@@ -62,7 +62,7 @@ use crate::{
     },
     publisher::{RuntimeDispatchPublisher, run_completion_callback_scanner},
     query::{QueryResult, QueryTask},
-    recovery::{lease_rejected_error, run_lease_renewer, sweep_shard},
+    recovery::{lease_rejected_error, run_lease_renewer, sweep_shard_with_registry},
     retry::{RetryDecision, RetryExhaustedReason, evaluate_activity_retry},
     scanner::{
         TimerScannerConfig, lane_index_for_run_key, pick_lane_for_run_key, run_timer_scanner,
@@ -796,6 +796,7 @@ where
                 broker: activity_broker.clone(),
                 delivery_metrics: delivery_metrics.clone(),
                 tracking: activity_tracking.clone(),
+                worker_deployment_registry: worker_deployment_registry.clone(),
             },
             lanes.clone(),
             lane_count,
@@ -1023,6 +1024,7 @@ where
         worker_identity: WorkerIdentity,
         namespace_id: NamespaceId,
         task_queue: TaskQueueName,
+        task_kind: TaskKind,
         deployment: Option<DeploymentId>,
         build_id: Option<BuildId>,
     ) {
@@ -1031,6 +1033,7 @@ where
                 worker_identity,
                 namespace_id,
                 task_queue,
+                task_kind,
             },
             WorkerVersionMetadata {
                 deployment,
@@ -1399,6 +1402,9 @@ pub struct StartedWorkflowTask {
     pub workflow_task_timeout: time::Duration,
     /// Identity of the polling worker (transient `WorkflowTaskStarted` synthesis).
     pub worker_identity: tokeira_types::WorkerIdentity,
+    /// Target-change decision attached to this specific WFT start. Transient
+    /// wire-history synthesis must not recompute it from later routing state.
+    pub target_worker_deployment_version_changed: bool,
     /// Opaque token used to complete the task.
     pub token: WorkflowTaskToken,
 }
@@ -1578,6 +1584,7 @@ mod tests {
     use super::*;
     use crate::{
         broker::InMemoryBroker,
+        deployment_registry::{RegisterPolledDeployment, SetCurrent},
         drain::RuntimeDrainState,
         lane::DispatchPublisher,
         nexus::{
@@ -1596,10 +1603,12 @@ mod tests {
     };
     use tokeira_kernel::{
         CallbackSpec, CallbackState, CallbackTrigger, CompletionCallback, Link, OnConflictOptions,
-        RetryState, WorkflowTaskFailedCause,
+        RetryState, VersioningBehavior, WorkerDeploymentVersionRef, WorkflowTaskFailedCause,
+        WorkflowVersioningInfo,
     };
     use tokeira_storage::{
-        BacklogEntry, CommitResult, DispatchableWorkflowTask, InMemoryStore, RequestRecord,
+        BacklogEntry, BuildId as StoredBuildId, CommitResult, DeploymentName,
+        DeploymentTaskQueueType, DispatchableWorkflowTask, InMemoryStore, RequestRecord,
         RunRepository, TransitionAuditRecord,
     };
     use tokeira_types::{
@@ -2398,6 +2407,179 @@ mod tests {
         assert_eq!(task.0.run_key, run_key);
         assert_eq!(task.0.activity_id, "activity-1");
         assert_eq!(task.0.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn sticky_dispatch_moves_to_normal_queue_when_current_target_changes() {
+        let repo = Arc::new(InMemoryStore::default());
+        let runtime = TokeiraRuntime::new(
+            repo.clone(),
+            1,
+            LaneConfig::default(),
+            TimerScannerConfig::default(),
+            WorkflowTimeoutScannerConfig::default(),
+            BacklogConfig::default(),
+        )
+        .with_worker_deployment_repository(repo.clone());
+        let registry = runtime
+            .deployment_registry()
+            .expect("deployment registry configured");
+        let mut state = crate::runtime::workflow_task::tests::open_state(
+            "sticky-current-change".to_string(),
+            Some(WorkflowVersioningInfo {
+                behavior: VersioningBehavior::AutoUpgrade,
+                deployment_version: Some(WorkerDeploymentVersionRef {
+                    deployment_name: "deployment".to_string(),
+                    build_id: "v1".to_string(),
+                }),
+                revision_number: 1,
+                ..WorkflowVersioningInfo::default()
+            }),
+        );
+        state.worker_deployment_name = Some("deployment".to_string());
+        let run_key = state.run_key;
+        let namespace_id = state.namespace_id;
+        let normal_task_queue = state.task_queue.clone();
+        repo.commit_transition(
+            run_key,
+            Transition {
+                expected_seq: TransitionSeq::ZERO,
+                next_state: state,
+                history_events: SmallVec::new(),
+                event_principals: SmallVec::new(),
+                request_dedupe_ops: SmallVec::new(),
+                activity_ops: SmallVec::new(),
+                timer_ops: SmallVec::new(),
+                dispatch_ops: SmallVec::new(),
+                projection_ops: SmallVec::new(),
+            },
+            ShardEpoch::ZERO,
+        )
+        .await
+        .expect("seed versioned workflow");
+
+        for build_id in ["v1", "v2"] {
+            registry
+                .register_polled_deployment(RegisterPolledDeployment {
+                    namespace_id,
+                    deployment_name: DeploymentName("deployment".to_string()),
+                    build_id: StoredBuildId(build_id.to_string()),
+                    task_queue: normal_task_queue.0.clone(),
+                    task_queue_type: DeploymentTaskQueueType::Workflow,
+                    identity: format!("worker-{build_id}"),
+                })
+                .await
+                .expect("register workflow worker deployment version");
+        }
+        registry
+            .set_current_version(SetCurrent {
+                namespace_id,
+                deployment_name: DeploymentName("deployment".to_string()),
+                build_id: Some(StoredBuildId("v1".to_string())),
+                conflict_token: None,
+                identity: "operator".to_string(),
+                allow_no_pollers: false,
+                ignore_missing_task_queues: true,
+            })
+            .await
+            .expect("set initial deployment Current");
+
+        let workflow_broker = InMemoryBroker::default();
+        let publisher = RuntimeDispatchPublisher::new(
+            workflow_broker.clone(),
+            InMemoryActivityBroker::default(),
+            repo,
+            Arc::new(Mutex::new(Vec::new())),
+            1,
+            1,
+            Arc::new(NoopNexusHttpClient),
+            Arc::new(NoopNexusCompletionClient),
+            NexusCompletionRuntimeConfig::default(),
+            NexusEndpointRegistry::default(),
+            NexusTaskBroker::default(),
+            NexusTimeoutTrackingState::default(),
+            CompletionCallbackTrackingState::default(),
+            ActivityTrackingState::default(),
+            DeliveryMetrics::new(),
+        )
+        .with_worker_deployment_registry(runtime.worker_deployment_registry.clone());
+        let sticky_queue = QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("sticky-v1".to_string()),
+            task_kind: TaskKind::Workflow,
+            deployment: None,
+            build_id: None,
+        };
+        publisher
+            .publish(
+                run_key,
+                &[DispatchOp::EnqueueWorkflowTask {
+                    queue: sticky_queue.clone(),
+                    logical_seq: LogicalTaskSeq::ONE,
+                    sticky_preferred: Some(WorkerIdentity("worker-v1".to_string())),
+                    normal_task_queue: Some(normal_task_queue.clone()),
+                    speculative: false,
+                }],
+            )
+            .await
+            .expect("publish current sticky dispatch");
+        let hydrated_sticky = QueueKey {
+            deployment: Some(DeploymentId("deployment".to_string())),
+            build_id: Some(BuildId("v1".to_string())),
+            ..sticky_queue.clone()
+        };
+        assert!(
+            workflow_broker.has_runnable_backlog(&hydrated_sticky).await,
+            "an omitted queue target is hydrated from committed effective state"
+        );
+        assert!(
+            workflow_broker
+                .try_claim_workflow_task_for_worker(
+                    &hydrated_sticky,
+                    run_key,
+                    Some(&WorkerIdentity("worker-v1".to_string())),
+                )
+                .await
+                .is_some()
+        );
+
+        registry
+            .set_current_version(SetCurrent {
+                namespace_id,
+                deployment_name: DeploymentName("deployment".to_string()),
+                build_id: Some(StoredBuildId("v2".to_string())),
+                conflict_token: None,
+                identity: "operator".to_string(),
+                allow_no_pollers: false,
+                ignore_missing_task_queues: true,
+            })
+            .await
+            .expect("move deployment Current");
+        publisher
+            .publish(
+                run_key,
+                &[DispatchOp::EnqueueWorkflowTask {
+                    queue: sticky_queue.clone(),
+                    logical_seq: LogicalTaskSeq(2),
+                    sticky_preferred: Some(WorkerIdentity("worker-v1".to_string())),
+                    normal_task_queue: Some(normal_task_queue.clone()),
+                    speculative: false,
+                }],
+            )
+            .await
+            .expect("publish stale sticky dispatch");
+
+        let routed_normal = QueueKey {
+            task_queue: normal_task_queue,
+            deployment: Some(DeploymentId("deployment".to_string())),
+            build_id: Some(BuildId("v2".to_string())),
+            ..sticky_queue.clone()
+        };
+        assert_eq!(
+            workflow_broker.backlog_stats(&hydrated_sticky).await.count,
+            0
+        );
+        assert_eq!(workflow_broker.backlog_stats(&routed_normal).await.count, 1);
     }
 
     #[test]
@@ -3272,6 +3454,7 @@ mod tests {
             cron_schedule: None,
             eager_execution_accepted: false,
             reserved_poller_identity: None,
+            inherited_versioning_info: None,
         }
     }
 

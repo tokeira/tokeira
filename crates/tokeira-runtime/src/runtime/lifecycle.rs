@@ -1840,6 +1840,7 @@ mod tests {
             cron_schedule: None,
             eager_execution_accepted: false,
             reserved_poller_identity: None,
+            inherited_versioning_info: None,
         }
     }
 

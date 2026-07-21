@@ -279,6 +279,23 @@ where
     }
 
     async fn absorb_unversioned_backlog(&self, queue: &tokeira_types::QueueKey) {
+        if queue.task_kind == TaskKind::Activity {
+            if let Err(error) = self
+                .runtime
+                .reprocess_unversioned_activity_backlog(queue)
+                .await
+            {
+                // Poll admission remains available: the durable run/dispatch
+                // state survives and a later poll or recovery sweep retries
+                // this derived-coordinate reconciliation.
+                tracing::warn!(
+                    ?error,
+                    ?queue,
+                    "failed to reprocess unversioned activity backlog"
+                );
+            }
+            return;
+        }
         let (Some(deployment), Some(build_id), Some(registry)) = (
             queue.deployment.as_ref(),
             queue.build_id.as_ref(),
@@ -301,20 +318,10 @@ where
         if !routes_to_worker {
             return;
         }
-        match queue.task_kind {
-            TaskKind::Workflow => {
-                self.runtime
-                    .broker()
-                    .promote_unversioned_backlog(queue)
-                    .await;
-            }
-            TaskKind::Activity => {
-                self.runtime
-                    .activity_broker()
-                    .promote_unversioned_backlog(queue)
-                    .await;
-            }
-        }
+        self.runtime
+            .broker()
+            .promote_unversioned_backlog(queue)
+            .await;
     }
 
     async fn cancel_outstanding_worker_polls(

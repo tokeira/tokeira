@@ -89,6 +89,10 @@ pub async fn poll_response(
                 ),
                 history_size_bytes: 0,
                 suggest_continue_as_new: false,
+                target_worker_deployment_version_changed: started
+                    .target_worker_deployment_version_changed,
+                target_version_changed_enabled: false,
+                target_deployment_version: None,
             },
         });
         history_principals.push(None);
@@ -308,6 +312,7 @@ mod tests {
             is_sticky_match,
             scheduled_time: OffsetDateTime::UNIX_EPOCH,
             started_time: OffsetDateTime::UNIX_EPOCH,
+            target_worker_deployment_version_changed: false,
         }
     }
 

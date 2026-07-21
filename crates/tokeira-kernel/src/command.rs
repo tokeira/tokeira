@@ -11,8 +11,9 @@ use tokeira_types::{
 use crate::{
     event::{ActivityResolution, HistoryEventKind},
     state::{
-        ActivityState, CompletionCallback, Link, OnConflictOptions, ParentClosePolicy, Priority,
-        UserMetadata, VersioningBehavior, VersioningOverride, WorkerDeploymentVersionRef,
+        ActivityState, CompletionCallback, ContinueAsNewVersioningBehavior, Link,
+        OnConflictOptions, ParentClosePolicy, Priority, UserMetadata, VersioningBehavior,
+        VersioningOverride, WorkerDeploymentVersionRef, WorkflowVersioningInfo,
     },
 };
 
@@ -562,6 +563,12 @@ pub struct StartRequest {
     pub eager_execution_accepted: bool,
     /// Worker identity reserved by the runtime for synchronous first-WFT delivery.
     pub reserved_poller_identity: Option<WorkerIdentity>,
+    /// Runtime-resolved versioning decision inherited from a predecessor run.
+    ///
+    /// Registry and task-queue membership reads happen before this request is
+    /// constructed; the kernel only records and applies the concrete result.
+    #[serde(default)]
+    pub inherited_versioning_info: Option<WorkflowVersioningInfo>,
 }
 
 /// Request to create a brand-new workflow with an update already admitted —
@@ -1056,6 +1063,14 @@ pub struct StartWorkflowTaskRequest {
     pub sticky_ttl: Option<Duration>,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
+    /// Whether target-change notification is enabled for this namespace.
+    /// Runtime resolves the conformance policy before kernel invocation.
+    #[serde(default)]
+    pub target_version_changed_enabled: bool,
+    /// Current/Ramping routing target offered to the workflow. `None` means
+    /// the resolved unversioned target.
+    #[serde(default)]
+    pub target_deployment_version: Option<WorkerDeploymentVersionRef>,
 }
 
 /// Request to clear a run's sticky affinity (`ResetStickyTaskQueue`
@@ -1717,6 +1732,13 @@ pub enum WorkflowCommand {
         retry_policy: Option<RetryPolicy>,
         #[serde(default)]
         header: Option<Headers>,
+        /// Wire-supplied initial placement behavior for this successor only.
+        #[serde(default)]
+        initial_versioning_behavior: ContinueAsNewVersioningBehavior,
+        /// Concrete successor decision prepared by runtime before completion.
+        /// The kernel commits it with the predecessor close event.
+        #[serde(default)]
+        successor_versioning_info: Option<WorkflowVersioningInfo>,
     },
     /// Cancel the workflow (cooperative cancellation
     /// completed). Closes the run.

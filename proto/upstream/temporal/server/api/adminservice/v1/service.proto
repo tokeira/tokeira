@@ -10,7 +10,8 @@ import "temporal/api/enums/v1/workflow.proto";
 // tokeira serves only `DescribeMutableState`, which the reset conformance suite
 // (`TestWorkflowResetTestSuite`) uses to read a run's INTERNAL `ResetRunId` link
 // and raw execution status — bookkeeping the public `WorkflowService` surface
-// does not expose. The message and field numbers below MATCH the real
+// does not expose. The V3 conformance bridge also projects the sticky queue
+// through this read-only response. The message and field numbers below MATCH the real
 // `temporal.server.api.{adminservice,persistence}.v1` protos so the response is
 // wire-compatible with the harness's client (protobuf decodes by field number);
 // every other `WorkflowMutableState` field is intentionally omitted and defaults
@@ -20,6 +21,7 @@ import "temporal/api/enums/v1/workflow.proto";
 // Mirrors `temporal.server.api.persistence.v1.WorkflowExecutionInfo`
 // (only the fields the corpus reads).
 message WorkflowExecutionInfo {
+  string sticky_task_queue = 33;
   string reset_run_id = 97;
   string original_execution_run_id = 99;
 }

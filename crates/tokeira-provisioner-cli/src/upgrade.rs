@@ -68,6 +68,9 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
             "infra apply under the new engine: {} change(s)",
             applied.len()
         );
+        // B's creations join keys(S_B) − keys(S_A) — the rollback delete-set
+        // (task 19.3) — in the same save as the audit log.
+        envelope.record_post_checkpoint_changes(&applied);
         version = record_audit_log(store.as_ref(), &mut envelope, version, &applied).await?;
         envelope.close_operation();
         envelope.stamp_current_schema();
@@ -147,9 +150,11 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         applied.len()
     );
 
-    // ── Record the ids-only audit change log in the open marker (19.2),
-    // persisted BEFORE the close: an interruption here leaves the evidence of
-    // what B committed visible to `describe` and the resume. ──
+    // ── Record the ids-only audit change log in the open marker (19.2) and
+    // fold B's creations into the rollback delete-set (19.3), persisted
+    // BEFORE the close: an interruption here leaves both the evidence and
+    // the undo-set durable. ──
+    envelope.record_post_checkpoint_changes(&applied);
     version = record_audit_log(store.as_ref(), &mut envelope, version, &applied).await?;
 
     // ── Close the operation marker ──

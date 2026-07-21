@@ -85,6 +85,9 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
     );
 
     let applied = platform.infra_apply(deployment_dir).await?;
+    // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
+    // — the set the rollback B-delete pass consumes (task 19.3).
+    envelope.record_post_checkpoint_changes(&applied);
     println!(
         "[{}] revert reconcile: {} change(s)",
         applied.len(),

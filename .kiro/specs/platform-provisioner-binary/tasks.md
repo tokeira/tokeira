@@ -608,7 +608,9 @@ multi-consumer decision) are out of scope.
         18.1–18.3 depends on it (the same `build_provisioner` runs under any invoker).
         _Requirements: 15.1_
 
-- [~] 19. Complete the revisions & ownership verbs (Requirements 4, 9, 13; Proposal 002)
+- [x] 19. Complete the revisions & ownership verbs (Requirements 4, 9, 13; Proposal 002) — **COMPLETE**
+      (19.1–19.4 all DONE; Wave 11 closed. Remaining anywhere in this plan: the ECS-deferred partials
+      8.4/8.5-remainders/9.2, measurement task 7.1, and the SKIPPED 18.4 — all recorded at their tasks.)
       The verbs are wired and their envelope state-machines are tested, but exercised only against the
       `local` platform's empty apply. This task brings them to completion against real platforms.
       (`revert` (task 14.3) is already complete as a single-binary flow; its only remaining dependency is
@@ -649,12 +651,34 @@ multi-consumer decision) are out of scope.
         *Advisory = the recorded-baseline check: no cross-version authoritative reconcile, and
         provider-level live drift detection rides the 19.3 relaunch machinery.* _Requirements: 4.5,
         4.6, 4.7, 9_
-  - [ ] 19.3 `rollback` — two-binary orchestration + real resources. `tkr` relaunches `A` to perform the
+  - [x] 19.3 `rollback` — two-binary orchestration + real resources. `tkr` relaunches `A` to perform the
         reconcile after `B`'s re-pin (today `B` runs the whole sequence in one process); implement the real
         `Engine::destroy_selected` delete-only pass over live resources (`keys(S_B) − keys(S_A)`, reverse-dep
         order, fail-closed, idempotent); verify **both** binaries' checksums before any destructive work;
         hold the operation lock across the relaunch boundary (extend 12.2 from single-process to two-binary).
-        _Requirements: 9; Proposal 002_ (depends on 15 and the `tkr` launcher, tasks 9/10)
+        DONE — four pieces. **The delete-set**: `keys(S_B) − keys(S_A)` is maintained *incrementally* on
+        the envelope (`created_since_checkpoint`, fed by every post-checkpoint apply's 19.2 audit
+        entries — whose id is now the bare engine `ResourceId`, the exact `destroy_selected` key;
+        `Created` joins, `Deleted` leaves, `Updated` never moves it — A reconciles updates forward,
+        Proposal 002), cleared by the re-pin commit / completion / a fresh checkpoint. This is
+        deliberately NOT a state-head diff: envelope heads are unwired (13.1 note) and local stores mint
+        no `SnapshotRef`s — the incremental set is exact, store-agnostic, and interruption-safe (the
+        pass is idempotent; re-run consumes survivors). **The real pass**: `Engine::destroy_selected_in`
+        (composition-validating wrapper) → `InfraEngine::destroy_selected` → seam
+        `infra_destroy_selected` on both platforms — fail-closed, reverse-dep, idempotent (11.3c
+        semantics). **Both binaries verified before any destructive work**: B by the launcher's
+        rollback class (pre-re-pin manifest = B's), A's retained bytes verified against the checkpoint
+        manifest *before the delete pass* (a rollback that cannot finish must not start) and again at
+        placement against the re-pinned envelope (= A's manifest); a pre-identity checkpoint refuses
+        the orchestrated handoff (nothing retained to relaunch) and falls back single-process — the dev
+        loop, where A and B are the same build. **Lock across the boundary**: `OperationLock::adopt`
+        (join an existing lease by holder+token; renew, never acquire/release) + tkp's adopted lock
+        mode (orchestrator env) + `tkr::launch_rollback` holding one lease across `B --handoff` →
+        place-A → relaunch — B stops after the re-pin with the marker open, and A's re-run **resumes
+        through 19.4's path**: the two-binary orchestration is literally handoff + resume. *Recorded
+        wart: the bundle sidecar still shows B's provenance after a rollback re-marries A (placement
+        refreshes bytes, not the sidecar) — cosmetic, describe's envelope manifest is authoritative.*
+        _Requirements: 9; Proposal 002_
   - [x] 19.4 Marker-driven recovery (**replaces the dropped `resume` verb**). An interrupted `upgrade`/
         `rollback` is recovered by **re-running that same verb**: its steps are idempotent and read the
         operation marker's `phase` to skip completed work. While a marker is open, only the in-flight verb

@@ -145,7 +145,7 @@ pub(crate) async fn run(
         }
         DeploymentAction::Rollback => {
             let dir = deployments.resolve_dir(selected)?;
-            launcher::launch(&dir, &["rollback"], &[]).await?;
+            launcher::launch_rollback(&dir).await?;
         }
     }
     Ok(())

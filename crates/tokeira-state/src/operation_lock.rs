@@ -167,6 +167,39 @@ impl OperationLock {
         }
     }
 
+    /// Adopt an **existing** lease by holder identity + token — the
+    /// orchestrated two-binary flow (task 19.3): a parent process acquired
+    /// the lease and hands it to a child, which renews around its work but
+    /// never acquires or releases (the parent owns the lease lifecycle, so
+    /// the lock is held continuously across the process boundary).
+    ///
+    /// Verifies the lease is live and matches, then renews for `ttl` and
+    /// returns the guard. [`StateError::LockLost`] when the lease is gone,
+    /// released, or held under a different token.
+    pub async fn adopt(
+        &self,
+        holder: &str,
+        token: &str,
+        ttl: Duration,
+    ) -> Result<OperationLockGuard, StateError> {
+        let (current, version) = self.read_lease().await?;
+        let current =
+            current.ok_or_else(|| StateError::LockLost("no operation lease to adopt".into()))?;
+        if current.token != token || current.holder != holder || current.released {
+            return Err(StateError::LockLost(
+                "the lease to adopt is gone, released, or held by another".into(),
+            ));
+        }
+        let mut guard = OperationLockGuard {
+            holder: current.holder.clone(),
+            token: current.token.clone(),
+            expires_at: current.expires_at,
+            version,
+        };
+        self.renew(&mut guard, ttl).await?;
+        Ok(guard)
+    }
+
     /// Renew a held lock for another `ttl`.
     ///
     /// Returns [`StateError::LockLost`] if the lock was taken over (token

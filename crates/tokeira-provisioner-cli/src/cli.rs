@@ -56,7 +56,20 @@ enum Command {
     /// Upgrade to a new engine identity.
     Upgrade(LifecycleArgs),
     /// Roll back to the retained prior configuration revision.
-    Rollback(LifecycleArgs),
+    Rollback(RollbackArgs),
+}
+
+#[derive(Args)]
+struct RollbackArgs {
+    /// Deployment directory holding the state envelope.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Two-binary orchestration (task 19.3): stop after B's delete-only pass
+    /// and the re-pin commit, leaving the rollback marker open — the
+    /// orchestrator relaunches the retained A, whose `rollback` re-run
+    /// resumes at the reconcile. Internal — set by `tkr`, hidden from help.
+    #[arg(long, hide = true)]
+    handoff: bool,
 }
 
 #[derive(Subcommand)]
@@ -182,8 +195,11 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
         }
         Command::Rollback(args) => {
             let dir = args.deployment_dir;
-            lock::with_operation_lock(&dir, "rollback", || rollback::rollback(&platform, &dir))
-                .await
+            let handoff = args.handoff;
+            lock::with_operation_lock(&dir, "rollback", || {
+                rollback::rollback(&platform, &dir, handoff)
+            })
+            .await
         }
     }
 }

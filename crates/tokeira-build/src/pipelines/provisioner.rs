@@ -18,7 +18,7 @@
 //! Tests run inside the same container, on the same frozen source; reaching
 //! the packaging step at all means they passed ([`TestEvidence`]).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tokeira_provisioner::{
     BinaryArtifactDescriptor, BuildAuthority, BuildProfile, EngineIdentity, ProvisionerBundle,
@@ -275,7 +275,7 @@ fn as_strs(args: &[String]) -> Vec<&str> {
 mod tests {
     use super::*;
     use crate::testing::{MockCall, MockDaggerClient, mock_artifact_bytes};
-    use std::process::Command;
+    use std::{path::Path, process::Command};
 
     fn git(dir: &Path, args: &[&str]) {
         let output = Command::new("git")

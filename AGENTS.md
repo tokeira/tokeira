@@ -1,7 +1,18 @@
 # AGENTS.md — Tokeira
 
-The operating contract for every agent working in this repository — Claude Code, Codex
-(ChatGPT app), and Kiro CLI — and for the humans working alongside them.
+## Mission
+
+Build a Temporal-compatible durable execution engine in Rust, specialized for Aurora DSQL. Preserve the public Temporal contract that SDKs, operators, and tooling depend on. Collapse internal correctness around a single authoritative per-run transition log.
+
+This is a product-from-scratch. The architecture is informed by Temporal but the implementation is original. Do not port Temporal code.
+
+### Compatibility Target
+
+- **Temporal server compatibility: v1.31.0.** This is the release whose public API *behaviour* Tokeira claims to match. It is the authority for every API-behaviour question (see §8). Pinned as `TEMPORAL_SERVER_COMPAT` in `crates/tokeira-build-info/src/pinned.rs`.
+- **Temporal API: v1.62.11.** This is the vendored proto surface Tokeira builds against (`proto/upstream/`, mirrored by `proto/UPSTREAM_VERSION`). Pinned as `TEMPORAL_PROTO_VERSION`.
+- These pins are independent and tracked ahead on purpose: the vendored API `v1.62.11` is newer than the API version Temporal server `1.31.0` ships (`v1.62.8`). RPCs present only in `v1.62.11` (e.g. Nexus operation execution) are **not** part of the `1.31.0` behavioural claim and are tracked separately in the api-conformance tracker. Do not bump the server compatibility claim just because the vendored proto version moved.
+
+---
 
 ## How to read this file
 
@@ -21,36 +32,16 @@ The operating contract for every agent working in this repository — Claude Cod
   `.codex/config.toml` raises it, but every byte here is context every agent pays every
   session). Cut before you append.
 
-## Mission
-
-Build a Temporal-compatible durable execution engine in Rust, specialized for Aurora
-DSQL. Preserve the public Temporal contract that SDKs, operators, and tooling depend on.
-Collapse internal correctness around a single authoritative per-run transition log.
-
-This is a product-from-scratch: informed by Temporal, original implementation. **Do not
-port Temporal code** — reading it to determine the contract is required (§8); copying
-its implementation is forbidden.
+## Values
 
 DSQL is the design centre, not a pluggable afterthought. Never trade DSQL-layer
 correctness or elegance for speed of conformance progress.
 
-**Values, in tiebreak order:** 1. **Correctness over speed** — a slow transition that
-commits correctly beats a fast one that corrupts state. 2. **Explicitness over magic**
-— every resource, permission, config field visible in code. 3. **Operator empathy** —
-errors say what happened, why, what to do next. 4. **Minimal surface** — every
-dependency, abstraction, and config option must earn its place (§1).
-
-### Compatibility target
-
-- **Temporal server compatibility: v1.31.0** — the release whose public API *behaviour*
-  Tokeira claims to match; the authority for every API-behaviour question (§8). Pinned
-  as `TEMPORAL_SERVER_COMPAT` in `crates/tokeira-build-info/src/pinned.rs`.
-- **Temporal API: v1.62.11** — the vendored proto surface (`proto/upstream/`, mirrored
-  by `proto/UPSTREAM_VERSION`). Pinned as `TEMPORAL_PROTO_VERSION`.
-- The pins are independent and deliberately skewed: the vendored API is newer than what
-  server 1.31.0 ships (v1.62.8). RPCs present only in the newer API are **not** part of
-  the 1.31.0 behavioural claim (tracked in the api-conformance tracker). Never bump the
-  server-compat claim because the proto pin moved.
+In tiebreak order: 1. **Correctness over speed** — a slow transition that commits
+correctly beats a fast one that corrupts state. 2. **Explicitness over magic** — every
+resource, permission, config field visible in code. 3. **Operator empathy** — errors
+say what happened, why, what to do next. 4. **Minimal surface** — every dependency,
+abstraction, and config option must earn its place (§1).
 
 ## Architecture
 
@@ -555,8 +546,8 @@ other files depend on them by name:
 
 #### Temporal compatibility changes
 
-The two pins are independent (see *Compatibility target*); never bump the server-compat
-claim because the proto pin moved. New WorkflowService/OperatorService surfaces are
+The two pins are independent — see *Compatibility Target* at the head of this file.
+New WorkflowService/OperatorService surfaces are
 classified in `FEATURE_MATRIX` (`crates/tokeira-compatibility/src/matrix.rs`); SDK
 claims update `SDK_MATRIX` (`crates/tokeira-compatibility/src/sdk.rs`) with evidence and
 verification state. Tokeira-owned compatibility metadata uses Buffa/connect-rust under

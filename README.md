@@ -53,7 +53,7 @@ Dagger-generated manifest; local dev builds use workspace-derived fallback
 metadata. Ambient environment variables are not the source of release
 provenance.
 
-See `docs/compatibility.md` for the feature matrix, SDK matrix,
+See `docs/conformance/compatibility.md` for the feature matrix, SDK matrix,
 Buffa/connect-rust service, Dagger check, and compatibility bump workflow.
 
 ### Functional conformance (Tier 2)
@@ -114,7 +114,7 @@ Tokeira is organized into three planes:
 |-------|---------|
 | `platforms/local` | Bare-process local execution — spawns tokeirad directly |
 | `platforms/compose` | Docker Compose stack with observability services (Mimir, Loki, Grafana, Alloy) |
-| `platforms/compose-syn` | The compose stack as an interpreted `definition.tkd` deployment definition — see `docs/deployment-definitions.md` |
+| `platforms/compose-syn` | The compose stack as an interpreted `definition.tkd` deployment definition — see `docs/platforms/deployment-definitions.md` |
 
 ### Applications
 
@@ -122,7 +122,7 @@ Tokeira is organized into three planes:
 |--------|---------|
 | `tokeirad` | Server process — wires kernel, runtime, storage, edge, and projection into one binary |
 | `tkr` | CLI — deployment lifecycle, infrastructure management, and developer workflows |
-| `tkp` | Platform provisioner — one deployment's lifecycle (init/plan/apply/revert/upgrade), gated on engine provenance; see `docs/deployment-definitions.md` |
+| `tkp` | Platform provisioner — one deployment's lifecycle (init/plan/apply/revert/upgrade), gated on engine provenance; see `docs/platforms/deployment-definitions.md` |
 
 ## Quick Start
 

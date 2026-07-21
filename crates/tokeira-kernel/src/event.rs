@@ -905,8 +905,8 @@ pub enum ActivityResolution {
         /// Why retries stopped, computed by the caller's retry evaluation and
         /// carried onto the `ActivityTaskFailed` event
         /// (`AddActivityTaskFailedEvent(..., retryState)` via `RetryActivity`,
-        /// mutable_state_impl.go:6235-6320 @ v1.31.0). Kernel raise K1,
-        /// docs/HANDOVER-activity-kernel-gaps.md.
+        /// mutable_state_impl.go:6235-6320 @ v1.31.0). Kernel raise K1
+        /// (docs/readiness/conformance.md, Tier 1.3).
         #[serde(default = "default_failed_retry_state")]
         retry_state: RetryState,
     },
@@ -916,7 +916,7 @@ pub enum ActivityResolution {
         /// Why retries stopped, carried onto the `ActivityTaskTimedOut` event
         /// (`AddActivityTaskTimedOutEvent(..., retryState)`,
         /// timer_queue_active_task_executor.go:281-362 @ v1.31.0). Kernel
-        /// raise K1, docs/HANDOVER-activity-kernel-gaps.md.
+        /// raise K1 (docs/readiness/conformance.md, Tier 1.3).
         #[serde(default = "default_timed_out_retry_state")]
         retry_state: RetryState,
         /// The caller-built timeout failure carried onto the event (kernel

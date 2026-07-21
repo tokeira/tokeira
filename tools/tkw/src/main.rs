@@ -1,6 +1,6 @@
 //! `tkw` — Tokeira worktree and fleet-hygiene tool.
 //!
-//! One binary serving the concurrent-agents practice (docs/concurrent-agents.md):
+//! One binary serving the concurrent-agents practice (docs/agents/concurrent-agents.md):
 //!
 //! - `new`/`ls`/`rm`/`clean` manage **tkw-owned** agent worktrees at a sibling
 //!   directory of the main checkout (for Kiro CLI and manual sessions; Claude
@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "tkw",
-    about = "Tokeira worktree + fleet hygiene tool (see docs/concurrent-agents.md)",
+    about = "Tokeira worktree + fleet hygiene tool (see docs/agents/concurrent-agents.md)",
     version
 )]
 struct Cli {

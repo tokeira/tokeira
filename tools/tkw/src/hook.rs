@@ -10,7 +10,7 @@
 //! - Kiro CLI v3: exit 2 blocks only `PreToolUse`/`UserPromptSubmit`; on
 //!   `Stop` a non-zero exit surfaces as a warning. The gate is therefore
 //!   enforced under Claude and advisory under Kiro — stated in
-//!   docs/concurrent-agents.md rather than papered over here.
+//!   docs/agents/concurrent-agents.md rather than papered over here.
 //!
 //! `post_edit` always exits 0: formatting is a convenience and must never
 //! block an edit, and hooks also fire for non-Rust writes we simply ignore.

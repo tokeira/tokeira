@@ -5,7 +5,7 @@
 This document captures the requirements for a kernel state-machine feature that adopts Temporal's
 **buffered-event model** and the **force-close workflow-task ordering** that terminate performs when a
 workflow task is in flight. It was raised by the functional-conformance drive (see
-[docs/HANDOVER-kernel-event-buffering.md](../../../docs/HANDOVER-kernel-event-buffering.md)) as the
+`docs/HANDOVER-kernel-event-buffering.md`, retired to git history) as the
 load-bearing gap behind `TestTerminateWorkflowOnMessageTooLargeFailure` and, more broadly, behind every
 history assertion that involves an event arriving while a workflow task is started.
 

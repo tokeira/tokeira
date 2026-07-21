@@ -123,7 +123,7 @@ pub(crate) fn new(name: &str, base: Option<&str>) -> Result<()> {
 
     let branch = format!("agent/{name}");
     // PR-flow default: base on the remote default branch so unpushed local work
-    // never leaks into agent branches (docs/concurrent-agents.md, preflight).
+    // never leaks into agent branches (docs/agents/concurrent-agents.md, preflight).
     // `--base` declares a dependent task's parent; HEAD is the remote-less fallback.
     let base = match base {
         Some(b) => b.to_string(),

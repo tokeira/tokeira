@@ -64,7 +64,7 @@ accessor instead.
 - `requirements.md` override-target table (13.4) + `docs/readiness/conformance.md` Tier 3.22 row.
 - Commits: engine (`main`) + fork **not yet committed**.
 
-**Unrelated cleanup this session:** removed hardcoded `/Users/iw` home paths from six temporal-fork
+**Unrelated cleanup this session:** removed hardcoded home paths from six temporal-fork
 helper scripts (`run_suite.sh`, `run_nexus_outbound_conformance.sh`, and four `diag_*.sh`) →
 `SCRIPT_DIR`-relative with a `TOKEIRA_BIN` env override.
 

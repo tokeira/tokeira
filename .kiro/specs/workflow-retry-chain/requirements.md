@@ -6,7 +6,7 @@ This document captures the requirements for **workflow-retry-on-failure**: when 
 a `RetryPolicy` fails, v1.31.0 closes the run as `Failed` carrying `new_execution_run_id` and starts an
 attempt-N+1 successor run (inherited input/policy/timeouts, run-id-chained, backoff-delayed first
 workflow task). It was raised by the functional-conformance drive (see
-[docs/HANDOVER-workflow-retry-chain.md](../../../docs/HANDOVER-workflow-retry-chain.md)) as the
+`docs/HANDOVER-workflow-retry-chain.md`, retired to git history) as the
 load-bearing gap behind `TestWorkflowRetry` and `TestWorkflowRetryFailures`
 (`tests/workflow_test.go:1440-1520 @ v1.31.0`).
 

@@ -4,7 +4,7 @@
 
 This spec adopts Temporal's **transient workflow-task model** into `tokeira-kernel` and the derived
 runtime/edge paths. It was raised by the functional-conformance drive
-([docs/HANDOVER-transient-wft.md](../../../docs/HANDOVER-transient-wft.md)) as the load-bearing gap
+(`docs/HANDOVER-transient-wft.md`, retired to git history) as the load-bearing gap
 behind the remaining `TestWorkflowTaskTestSuite` failures (Tier 1.2).
 
 A continuously-failing workflow task is **transient**: at `attempt > 1` its Scheduled/Started/Failed

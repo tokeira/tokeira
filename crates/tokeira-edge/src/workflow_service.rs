@@ -119,7 +119,7 @@ use crate::{
         UpdateWorkflowExecutionOptionsRequest, UpdateWorkflowExecutionOptionsResponse,
         UpdateWorkflowExecutionRequest, UpdateWorkflowExecutionResponse, VersioningOverride,
         VersioningOverrideChange, WorkflowExecutionDescription, WorkflowQueryDto, from_internal,
-        to_internal,
+        to_internal, worker_heartbeat,
     },
     workflow_rules::{WorkflowRuleError, WorkflowRuleStore},
 };
@@ -1919,7 +1919,7 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                let context = self
                     .interceptors
                     .begin(
                         headers,
@@ -1928,6 +1928,57 @@ impl WorkflowService {
                         true,
                     )
                     .await?;
+                let resolved_namespace = context.namespace.as_ref().ok_or_else(|| {
+                    EdgeError::Internal(
+                        "namespace-scoped worker poll admitted without namespace metadata"
+                            .to_owned(),
+                    )
+                })?;
+                let namespace_id = to_internal::namespace_id_for(&resolved_namespace.name);
+                let heartbeat_count = req.worker_heartbeats.len();
+                for proto in req.worker_heartbeats {
+                    let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(
+                        namespace_id,
+                        proto,
+                        context.received_at,
+                    );
+                    let key = heartbeat.worker_instance_key.clone();
+                    let active = heartbeat.status.0 != 3;
+                    match self.heartbeat_store.insert(heartbeat) {
+                        Ok(()) => {
+                            tokeira_runtime::metrics::record_worker_heartbeat_accepted(
+                                namespace_id,
+                                &key,
+                            );
+                            tokeira_runtime::metrics::record_worker_heartbeat_active(
+                                namespace_id,
+                                &key,
+                                active,
+                            );
+                        }
+                        Err(error) => {
+                            // Temporal dispatches this observation batch
+                            // asynchronously and does not fail the Nexus poll
+                            // when matching cannot record it
+                            // (`workflow_handler.go:5957-5978 @ v1.31.0`).
+                            tokeira_runtime::metrics::record_worker_heartbeat_rejected(
+                                &req.namespace,
+                                "store_error",
+                            );
+                            tracing::warn!(
+                                ?error,
+                                namespace = %req.namespace,
+                                worker_instance_key = %key.0,
+                                "failed to record Nexus-piggybacked worker heartbeat"
+                            );
+                        }
+                    }
+                }
+                tracing::debug!(
+                    namespace = %req.namespace,
+                    heartbeat_count,
+                    "recorded Nexus-piggybacked worker heartbeats"
+                );
                 crate::metrics::record_nexus_task_request(
                     &req.namespace,
                     "PollNexusTaskQueue",
@@ -1941,7 +1992,7 @@ impl WorkflowService {
                 )?;
 
                 let _permit = self.long_polls.acquire().await?;
-                let (namespace_id, task_queue) =
+                let (_, task_queue) =
                     crate::translate::nexus::broker_queue(&req.namespace, &req.task_queue);
                 let task = self
                     .nexus_broker

@@ -65,6 +65,10 @@ pub enum Action {
     ResetActivity,
     WorkflowRulesRead,
     WorkflowRulesWrite,
+    RecordWorkerHeartbeat,
+    ShutdownWorker,
+    DescribeWorker,
+    ListWorkers,
     PollNexusTaskQueue,
     RespondNexusTaskCompleted,
     RespondNexusTaskFailed,
@@ -143,6 +147,10 @@ impl Action {
             Action::ResetActivity => "reset_activity",
             Action::WorkflowRulesRead => "workflow_rules_read",
             Action::WorkflowRulesWrite => "workflow_rules_write",
+            Action::RecordWorkerHeartbeat => "record_worker_heartbeat",
+            Action::ShutdownWorker => "shutdown_worker",
+            Action::DescribeWorker => "describe_worker",
+            Action::ListWorkers => "list_workers",
             Action::PollNexusTaskQueue => "poll_nexus_task_queue",
             Action::RespondNexusTaskCompleted => "respond_nexus_task_completed",
             Action::RespondNexusTaskFailed => "respond_nexus_task_failed",
@@ -237,6 +245,10 @@ impl Action {
             Action::ResetActivity => "ResetActivity",
             Action::WorkflowRulesRead => "DescribeWorkflowRule",
             Action::WorkflowRulesWrite => "CreateWorkflowRule",
+            Action::RecordWorkerHeartbeat => "RecordWorkerHeartbeat",
+            Action::ShutdownWorker => "ShutdownWorker",
+            Action::DescribeWorker => "DescribeWorker",
+            Action::ListWorkers => "ListWorkers",
             Action::PollNexusTaskQueue => "PollNexusTaskQueue",
             Action::RespondNexusTaskCompleted => "RespondNexusTaskCompleted",
             Action::RespondNexusTaskFailed => "RespondNexusTaskFailed",
@@ -394,6 +406,16 @@ impl Action {
                 "CreateWorkflowRule" => {
                     "/temporal.api.workflowservice.v1.WorkflowService/CreateWorkflowRule"
                 }
+                "RecordWorkerHeartbeat" => {
+                    "/temporal.api.workflowservice.v1.WorkflowService/RecordWorkerHeartbeat"
+                }
+                "ShutdownWorker" => {
+                    "/temporal.api.workflowservice.v1.WorkflowService/ShutdownWorker"
+                }
+                "DescribeWorker" => {
+                    "/temporal.api.workflowservice.v1.WorkflowService/DescribeWorker"
+                }
+                "ListWorkers" => "/temporal.api.workflowservice.v1.WorkflowService/ListWorkers",
                 "PollNexusTaskQueue" => {
                     "/temporal.api.workflowservice.v1.WorkflowService/PollNexusTaskQueue"
                 }
@@ -536,6 +558,8 @@ impl Action {
             | Action::ListBatchOperations
             | Action::WorkflowRulesRead
             | Action::ListSearchAttributes
+            | Action::DescribeWorker
+            | Action::ListWorkers
             | Action::DescribeActivityExecution
             | Action::PollActivityExecution => (Scope::Namespace, Access::ReadOnly),
             Action::RegisterNamespace
@@ -558,6 +582,8 @@ impl Action {
             | Action::UnpauseActivity
             | Action::ResetActivity
             | Action::WorkflowRulesWrite
+            | Action::RecordWorkerHeartbeat
+            | Action::ShutdownWorker
             | Action::PollNexusTaskQueue
             | Action::RespondNexusTaskCompleted
             | Action::RespondNexusTaskFailed

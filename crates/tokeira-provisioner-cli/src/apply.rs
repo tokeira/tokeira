@@ -53,9 +53,10 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     // ── Engine apply (realized by the injected platform) ──
     // The deployment identity seeds the platform context; it was set at `init`.
     let project_name = deployment_identity(&envelope.deployment_id);
-    let change_count = platform.infra_apply(deployment_dir).await?;
+    let applied = platform.infra_apply(deployment_dir).await?;
     println!(
-        "[{}] infra apply: {change_count} change(s)",
+        "[{}] infra apply: {} change(s)",
+        applied.len(),
         platform.label(deployment_dir)
     );
 

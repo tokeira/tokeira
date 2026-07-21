@@ -48,8 +48,11 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
             "resuming interrupted rollback {} from phase '{}'",
             operation.operation_id, operation.phase
         );
-        let change_count = platform.infra_apply(deployment_dir).await?;
-        println!("A reconcile (re-apply retained revision): {change_count} change(s)");
+        let applied = platform.infra_apply(deployment_dir).await?;
+        println!(
+            "A reconcile (re-apply retained revision): {} change(s)",
+            applied.len()
+        );
         envelope.complete_rollback();
         envelope.stamp_current_schema();
         store
@@ -125,8 +128,11 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
     );
 
     // ── A forward-reconciles toward its retained prior configuration revision ──
-    let change_count = platform.infra_apply(deployment_dir).await?;
-    println!("A reconcile (re-apply retained revision): {change_count} change(s)");
+    let applied = platform.infra_apply(deployment_dir).await?;
+    println!(
+        "A reconcile (re-apply retained revision): {} change(s)",
+        applied.len()
+    );
 
     // ── Complete: clear the marker and consume the checkpoint ──
     envelope.complete_rollback();

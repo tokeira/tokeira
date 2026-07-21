@@ -18,7 +18,9 @@ use anyhow::{Context, Result};
 use tokeira_compose::{ComposeError, ComposePlatform};
 use tokeira_iac::{Change, ModuleSelection};
 use tokeira_orchestrator::InfraEngine;
-use tokeira_provisioner_cli::{ProvisionerPlatform, Realization};
+use tokeira_provisioner_cli::{
+    ChangeLogEntry, ProvisionerPlatform, Realization, change_log_entries,
+};
 
 use crate::{
     adapter::{TkdConfig, TkdDeployment},
@@ -58,7 +60,7 @@ impl ProvisionerPlatform for ComposeSynPlatform {
             .context("infrastructure plan failed")
     }
 
-    async fn infra_apply(&self, deployment_dir: &Path) -> Result<usize> {
+    async fn infra_apply(&self, deployment_dir: &Path) -> Result<Vec<ChangeLogEntry>> {
         let config = load_tkd_config(deployment_dir)?;
         let mut engine = open_engine(config, deployment_dir, true).await?;
         let composition = engine.compose(ModuleSelection::All)?;
@@ -66,7 +68,7 @@ impl ProvisionerPlatform for ComposeSynPlatform {
             .apply(&composition, ModuleSelection::All)
             .await
             .context("infrastructure apply failed")?;
-        Ok(changes.len())
+        Ok(change_log_entries(&changes))
     }
 
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
@@ -88,7 +90,10 @@ impl ProvisionerPlatform for ComposeSynPlatform {
         ))
     }
 
-    async fn deploy_apply(&self, deployment_dir: &Path) -> Result<Realization<usize>> {
+    async fn deploy_apply(
+        &self,
+        deployment_dir: &Path,
+    ) -> Result<Realization<Vec<ChangeLogEntry>>> {
         Ok(Realization::Realized(
             self.infra_apply(deployment_dir).await?,
         ))

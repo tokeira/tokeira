@@ -98,15 +98,16 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
     }
 
     // ── Workload apply (realized by the injected platform) ──
-    let change_count = match platform.deploy_apply(deployment_dir).await? {
+    let applied = match platform.deploy_apply(deployment_dir).await? {
         Realization::NotApplicable { reason } => {
             anyhow::bail!("not applicable: {reason}");
         }
-        Realization::Realized(count) => count,
+        Realization::Realized(entries) => entries,
     };
     println!(
-        "[{}] deploy apply: {change_count} change(s)",
-        platform.label(deployment_dir)
+        "[{}] deploy apply: {} change(s)",
+        platform.label(deployment_dir),
+        applied.len()
     );
 
     // ── Re-stamp: a workload apply advances the config revision like any apply ──

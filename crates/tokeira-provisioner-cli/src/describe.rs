@@ -232,10 +232,17 @@ impl DescribeReport {
             bundle,
             infra_head_present: envelope.infra_head.is_some(),
             runtime_head_present: envelope.runtime_head.is_some(),
-            operation: envelope
-                .operation
-                .as_ref()
-                .map(|op| format!("{:?} (phase: {})", op.kind, op.phase)),
+            operation: envelope.operation.as_ref().map(|op| {
+                match op.audit_log.as_ref().map(|log| log.entries.len()) {
+                    // The in-flight audit log (task 19.2): what B committed,
+                    // visible exactly when recovery needs it.
+                    Some(recorded) => format!(
+                        "{:?} (phase: {}, {recorded} change(s) recorded)",
+                        op.kind, op.phase
+                    ),
+                    None => format!("{:?} (phase: {})", op.kind, op.phase),
+                }
+            }),
             lock_holder: envelope.lock.as_ref().map(|l| l.holder.clone()),
         }
     }

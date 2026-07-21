@@ -84,9 +84,10 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
         config_history::config_file(deployment_dir, config_basename).display()
     );
 
-    let change_count = platform.infra_apply(deployment_dir).await?;
+    let applied = platform.infra_apply(deployment_dir).await?;
     println!(
-        "[{}] revert reconcile: {change_count} change(s)",
+        "[{}] revert reconcile: {} change(s)",
+        applied.len(),
         platform.label(deployment_dir)
     );
 

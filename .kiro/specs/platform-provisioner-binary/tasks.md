@@ -629,12 +629,26 @@ multi-consumer decision) are out of scope.
         extracts `integrity_manifest()` after the 18.3c self-check). A corrupt sidecar is reported to
         stderr and omitted — `describe` never gates and never fails on diagnostics inputs.
         _Requirements: 13.2_
-  - [ ] 19.2 `upgrade` — real cross-engine re-provisioning. Dispatch "apply B's plan" through the
+  - [x] 19.2 `upgrade` — real cross-engine re-provisioning. Dispatch "apply B's plan" through the
         per-platform seam (task 15) so a versioned advance reconciles the **real** footprint (compose-syn),
         not `local`'s empty apply; populate the `MigrationRegistry` (task 5.1) so a state-schema transition
         actually migrates the envelope/state docs; record the ids-only audit change log; add the advisory
-        baseline drift gate (refuse-and-surface live drift from `[A final]`, Req 4.7). _Requirements: 4.5,
-        4.6, 4.7, 9_ (depends on 15)
+        baseline drift gate (refuse-and-surface live drift from `[A final]`, Req 4.7). DONE — the seam
+        dispatch landed with 15.4 (upgrade's apply IS `platform.infra_apply`; compose-syn reconciles the
+        real interpreted footprint) and the registry population with 16.2 (`envelope_migrations()`, run
+        at the upgrade boundary); this slice adds the remaining two. **Audit change log**: the applying
+        seam verbs now return the committed change *identities* (`Vec<ChangeLogEntry>`, mapped from the
+        engine Delta by `change_log_entries` — `module/resource` ids; `Replace` folds to `Updated`, the
+        audit tracks identities not mechanics; `NoChange` records nothing), and `upgrade` persists the
+        ids-only log into the still-open marker at phase `applied` — one save between B's apply and the
+        close, so the evidence of what B committed survives an interruption and `describe` shows it
+        (`… phase: applied, N change(s) recorded`) exactly when recovery needs it. Ids only, never
+        before-images (Proposal 002). **Advisory baseline gate** (Req 4.7): before B's apply — fresh and
+        resume paths alike — the envelope heads must still be exactly `[A final]`'s; divergence means
+        another writer touched state mid-upgrade → refuse-and-surface, `rollback` aborts forward to A.
+        *Advisory = the recorded-baseline check: no cross-version authoritative reconcile, and
+        provider-level live drift detection rides the 19.3 relaunch machinery.* _Requirements: 4.5,
+        4.6, 4.7, 9_
   - [ ] 19.3 `rollback` — two-binary orchestration + real resources. `tkr` relaunches `A` to perform the
         reconcile after `B`'s re-pin (today `B` runs the whole sequence in one process); implement the real
         `Engine::destroy_selected` delete-only pass over live resources (`keys(S_B) − keys(S_A)`, reverse-dep

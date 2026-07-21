@@ -16,9 +16,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::{
-    DeploymentStateEnvelope, ENVELOPE_SCHEMA_VERSION, MigrationRegistry, OperationKind,
-    ProvenanceStamp, UpgradeDecision, envelope_migrations, evaluate_upgrade,
+    ChangeLog, ChangeLogEntry, DeploymentStateEnvelope, ENVELOPE_SCHEMA_VERSION, MigrationRegistry,
+    OperationKind, ProvenanceStamp, UpgradeDecision, envelope_migrations, evaluate_upgrade,
 };
+use tokeira_state::DeploymentStore;
 
 use crate::{ProvisionerPlatform, envelope_store, init::running_integrity_manifest};
 
@@ -59,9 +60,15 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
                 running.source_tree_hash
             );
         }
-        // Idempotent remainder: apply B's plan, close the marker.
-        let change_count = platform.infra_apply(deployment_dir).await?;
-        println!("infra apply under the new engine: {change_count} change(s)");
+        // Idempotent remainder: drift gate, apply B's plan, record the audit
+        // log, close the marker — the same tail the fresh path runs.
+        check_baseline_drift(&envelope)?;
+        let applied = platform.infra_apply(deployment_dir).await?;
+        println!(
+            "infra apply under the new engine: {} change(s)",
+            applied.len()
+        );
+        version = record_audit_log(store.as_ref(), &mut envelope, version, &applied).await?;
         envelope.close_operation();
         envelope.stamp_current_schema();
         store
@@ -126,9 +133,24 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         .context("failed to commit the atomic ownership transfer")?;
     println!("ownership transferred — [A final] checkpoint captured, operation marker open");
 
-    // ── Apply B's plan (realized by the injected platform). Migrations would run here on a schema change. ──
-    let change_count = platform.infra_apply(deployment_dir).await?;
-    println!("infra apply under the new engine: {change_count} change(s)");
+    // ── Advisory baseline gate (Req 4.7, task 19.2): the envelope heads must
+    // still be exactly [A final]'s — drift between the transfer and B's apply
+    // means something else wrote state mid-upgrade. Refuse and surface;
+    // `rollback` is the way out. (Provider-level live drift detection rides
+    // the 19.3 relaunch machinery — this gate covers the recorded baseline.) ──
+    check_baseline_drift(&envelope)?;
+
+    // ── Apply B's plan (realized by the injected platform) ──
+    let applied = platform.infra_apply(deployment_dir).await?;
+    println!(
+        "infra apply under the new engine: {} change(s)",
+        applied.len()
+    );
+
+    // ── Record the ids-only audit change log in the open marker (19.2),
+    // persisted BEFORE the close: an interruption here leaves the evidence of
+    // what B committed visible to `describe` and the resume. ──
+    version = record_audit_log(store.as_ref(), &mut envelope, version, &applied).await?;
 
     // ── Close the operation marker ──
     envelope.close_operation();
@@ -141,6 +163,62 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         running.version
     );
     Ok(())
+}
+
+/// The advisory baseline gate (Req 4.7, task 19.2): between the ownership
+/// transfer and B's apply, the envelope heads must still be exactly what
+/// `[A final]` recorded — divergence means another writer touched state
+/// mid-upgrade (tampering, or an ungated older binary). Refuse and surface;
+/// `rollback` aborts forward to A. Advisory means exactly this recorded-
+/// baseline check — there is no cross-version authoritative reconcile, and
+/// provider-level live drift detection rides the 19.3 relaunch machinery.
+fn check_baseline_drift(envelope: &DeploymentStateEnvelope) -> Result<()> {
+    let Some(checkpoint) = &envelope.checkpoint else {
+        return Ok(());
+    };
+    let infra_drifted = envelope.infra_head != checkpoint.from_infra_head;
+    let runtime_drifted = envelope.runtime_head != checkpoint.from_runtime_head;
+    if infra_drifted || runtime_drifted {
+        anyhow::bail!(
+            "baseline drift from [A final]: the deployment's {} advanced since the ownership \
+             transfer — another writer touched state mid-upgrade. Refusing to apply; `rollback` \
+             aborts forward to A",
+            match (infra_drifted, runtime_drifted) {
+                (true, true) => "infra and runtime heads",
+                (true, false) => "infra head",
+                _ => "runtime head",
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Persist the ids-only audit change log into the still-open marker
+/// (task 19.2): one save between B's apply and the close, so the evidence of
+/// what B committed survives an interruption — visible to `describe` and the
+/// resume. Ids only, never before-images (Proposal 002); an empty apply
+/// records no log, but the phase still advances to `applied` (the resume
+/// waypoint).
+async fn record_audit_log(
+    store: &dyn DeploymentStore<DeploymentStateEnvelope>,
+    envelope: &mut DeploymentStateEnvelope,
+    version: String,
+    applied: &[ChangeLogEntry],
+) -> Result<String> {
+    if let Some(operation) = envelope.operation.as_mut() {
+        operation.phase = "applied".to_string();
+        operation.audit_log = if applied.is_empty() {
+            None
+        } else {
+            Some(ChangeLog {
+                entries: applied.to_vec(),
+            })
+        };
+    }
+    store
+        .save(envelope, &version)
+        .await
+        .context("failed to record the upgrade audit log")
 }
 
 /// The in-memory ownership transfer: flip the binding to the running engine `B`
@@ -279,6 +357,95 @@ mod tests {
             .await
             .expect_err("nothing to resume");
         assert!(err.to_string().contains("refused"), "unexpected: {err}");
+    }
+
+    // Task 19.2: the audit save between apply and close — the marker carries
+    // the ids-only log at phase 'applied', durably, before the close wipes it.
+    #[tokio::test]
+    async fn record_audit_log_persists_entries_in_the_open_marker() {
+        use tokeira_provisioner::ChangeOp;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        let running = ProvenanceStamp::current(Utc::now());
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(running.clone()),
+            ..Default::default()
+        };
+        env.begin_upgrade(running, "op-audit", Utc::now());
+        let (_, v0) = store.load().await.unwrap();
+        let v1 = store.save(&env, &v0).await.unwrap();
+
+        let applied = vec![
+            ChangeLogEntry {
+                id: "vpc/main".into(),
+                op: ChangeOp::Created,
+            },
+            ChangeLogEntry {
+                id: "svc/web".into(),
+                op: ChangeOp::Updated,
+            },
+        ];
+        record_audit_log(store.as_ref(), &mut env, v1, &applied)
+            .await
+            .expect("audit save");
+
+        let (saved, _) = store.load().await.unwrap();
+        let mut empty_env = saved.clone();
+        let operation = saved.operation.expect("marker still open");
+        assert_eq!(operation.phase, "applied", "the resume waypoint advanced");
+        let log = operation.audit_log.expect("log recorded");
+        assert_eq!(
+            log.entries, applied,
+            "ids-only evidence of what B committed"
+        );
+
+        // An empty apply advances the phase but records no log.
+        let (_, v) = store.load().await.unwrap();
+        record_audit_log(store.as_ref(), &mut empty_env, v, &[])
+            .await
+            .expect("audit save");
+        assert!(empty_env.operation.expect("open").audit_log.is_none());
+    }
+
+    // Task 19.2: the advisory baseline gate — heads that moved since the
+    // transfer refuse B's apply; rollback is the way out.
+    #[tokio::test]
+    async fn drifted_heads_refuse_the_upgrade_apply() {
+        use tokeira_state::SnapshotRef;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        let running = ProvenanceStamp::current(Utc::now());
+        let mut env = DeploymentStateEnvelope {
+            binding: Some(ProvenanceStamp {
+                source_tree_hash: "hash-of-A".into(),
+                ..running.clone()
+            }),
+            ..Default::default()
+        };
+        env.begin_upgrade(running, "op-drift", Utc::now());
+        // Someone advances the infra head AFTER the transfer captured [A final].
+        env.infra_head = Some(SnapshotRef {
+            snapshot_key: "k".into(),
+            snapshot_version_id: None,
+            snapshot_etag: "e".into(),
+            sha256_hex: "deadbeef".into(),
+            size_bytes: 1,
+            commit_id: "c".into(),
+            committed_at: Utc::now(),
+            committed_by: "intruder".into(),
+        });
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        let err = upgrade(&TestPlatform, tmp.path())
+            .await
+            .expect_err("drift refuses the resume/apply");
+        assert!(
+            err.to_string().contains("baseline drift"),
+            "unexpected: {err}"
+        );
     }
 
     // Only the engine that transferred ownership may finish its upgrade — a

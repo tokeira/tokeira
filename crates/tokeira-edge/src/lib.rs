@@ -44,8 +44,9 @@
 //!   runtime, and return [`errors::EdgeError`] on failure.
 //! - **Transport adapters** — [`grpc`] wraps each domain service in a `tonic`
 //!   server impl: it decodes the proto request, calls the domain service, and maps
-//!   the result back to a proto response. [`http_proxy`] serves the Temporal HTTP
-//!   API over the same path.
+//!   the result back to a proto response. [`http_api`] derives Temporal's
+//!   annotated HTTP/JSON surface from the same public descriptors and dispatches
+//!   through those existing gRPC adapters.
 //!
 //! The pivot between the two is [`errors::EdgeError`]: domain services speak it, and
 //! `From<EdgeError> for tonic::Status` (`grpc::errors`) is the single place edge
@@ -92,7 +93,7 @@
 //!
 //! ## Module map
 //!
-//! Request lifecycle: [`grpc`]/[`http_proxy`] (transport) → [`interceptors`] (authz)
+//! Request lifecycle: [`grpc`]/[`http_api`] (transport) → [`interceptors`] (authz)
 //! → [`workflow_service`]/[`operator_service`] (edge logic) → [`routing`] (forward
 //! if not local) → runtime, with [`translate`] converting at the wire boundary and
 //! [`errors`] shaping every failure.
@@ -140,7 +141,7 @@ pub mod errors;
 pub mod grpc;
 pub mod health_service;
 pub mod history_wait;
-pub mod http_proxy;
+pub mod http_api;
 pub mod interceptors;
 pub mod long_poll;
 pub mod metrics;
@@ -166,7 +167,7 @@ pub use errors::*;
 pub use grpc::*;
 pub use health_service::*;
 pub use history_wait::*;
-pub use http_proxy::*;
+pub use http_api::*;
 pub use interceptors::*;
 pub use long_poll::*;
 pub use metrics::*;

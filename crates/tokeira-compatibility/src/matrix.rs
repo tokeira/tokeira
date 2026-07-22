@@ -128,6 +128,20 @@ const EAGER_WORKFLOW_START_EVIDENCE: &[CompatibilityEvidence] = &[
         reference: "crates/tokeira-storage/src/dsql/codec.rs::legacy_workflow_started_fixture_decodes_and_v2_round_trips",
     },
 ];
+const HTTP_JSON_API_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
+    kind: CompatibilitySurfaceKind::BehaviouralInvariant,
+    identifier: "WorkflowService+OperatorService.google.api.http",
+}];
+const HTTP_JSON_API_EVIDENCE: &[CompatibilityEvidence] = &[
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "Temporal functional corpus TestHttpApiTestSuite @ v1.31.0: 11 pass / 0 fail / 0 skip (2 consecutive fresh-process runs)",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/src/http_api: Properties 1-7 and 9-11; apps/tokeirad/src/http_api_transport.rs: Property 8 and layer integration tests",
+    },
+];
 const WORKFLOW_DELETION_EVIDENCE: &[CompatibilityEvidence] = &[
     CompatibilityEvidence {
         kind: crate::CompatibilityEvidenceKind::Test,
@@ -516,6 +530,17 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         rpcs: EMPTY_RPCS,
         notes: "StartWorkflowExecution atomically commits and returns the first WFT when eager execution is requested and no first-WFT backoff applies. Fresh and immediate request-id retry responses derive from authoritative started-task state; the v1.31.0 enabled default is pinned as a constant rather than an operator knob.",
         evidence: EAGER_WORKFLOW_START_EVIDENCE,
+    },
+    FeatureEntry {
+        id: "http-json-api",
+        name: "Temporal HTTP/JSON API gateway",
+        state: FeatureState::Implemented,
+        surfaces: HTTP_JSON_API_SURFACES,
+        capability_field: None,
+        dynamic_config_key: Some("frontend.httpAllowedHosts"),
+        rpcs: EMPTY_RPCS,
+        notes: "WorkflowService and OperatorService google.api.http annotations are discovered from the pinned descriptor set and transcoded on the existing listener into the ordinary Tonic service stack. Host/header policy, protobuf JSON, Temporal payload shorthand, v2/v3 OpenAPI documents, gRPC status translation, and admitted-request metrics match v1.31.0 without adding workflow semantics or another internal service.",
+        evidence: HTTP_JSON_API_EVIDENCE,
     },
     FeatureEntry {
         id: "legacy-visibility",

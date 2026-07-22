@@ -32,7 +32,7 @@
   <rect x="460" y="148" width="100" height="20" rx="3" fill="#fff" stroke="#f57c00"/>
   <text x="510" y="162" text-anchor="middle" font-size="8" fill="#333">HealthService</text>
   <rect x="580" y="148" width="100" height="20" rx="3" fill="#fff" stroke="#f57c00"/>
-  <text x="630" y="162" text-anchor="middle" font-size="8" fill="#333">HttpProxy</text>
+  <text x="630" y="162" text-anchor="middle" font-size="8" fill="#333">HTTP/JSON API</text>
 
   <!-- Interceptors -->
   <rect x="40" y="185" width="250" height="50" rx="5" fill="#fff" stroke="#f57c00"/>

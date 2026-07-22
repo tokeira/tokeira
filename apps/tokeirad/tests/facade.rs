@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use hyper_legacy::{Body, Client, Request, StatusCode, body::to_bytes};
 use tokio::{net::TcpStream, sync::Notify};
 
 use tokeirad::TokeiradHandle;
@@ -39,6 +40,53 @@ async fn start_in_memory_binds_serves_and_shuts_down() {
     drop(connect);
 
     // Shutdown drains the server task without error.
+    handle
+        .shutdown()
+        .await
+        .expect("TokeiradHandle::shutdown should drain cleanly");
+}
+
+/// An empty unary `GetSystemInfo` call proves the HTTP gateway delegates
+/// gRPC-Web framing unchanged to tonic-web on the shared production listener.
+#[tokio::test]
+async fn grpc_web_remains_reachable_through_the_shared_listener() {
+    let handle = TokeiradHandle::start_in_memory("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("start_in_memory should succeed on an ephemeral port");
+
+    let request = Request::post(format!(
+        "http://{}/temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo",
+        handle.bound_addr()
+    ))
+    .header("content-type", "application/grpc-web+proto")
+    .header("x-grpc-web", "1")
+    .header("te", "trailers")
+    .body(Body::from(vec![0, 0, 0, 0, 0]))
+    .expect("the static gRPC-Web request should be valid");
+
+    let response = tokio::time::timeout(Duration::from_secs(5), Client::new().request(request))
+        .await
+        .expect("gRPC-Web request should complete within the test budget")
+        .expect("shared listener should accept the gRPC-Web request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/grpc-web+proto")
+    );
+
+    let body = to_bytes(response.into_body())
+        .await
+        .expect("gRPC-Web response body should be readable");
+    assert!(
+        body.windows(b"grpc-status:0".len())
+            .any(|window| window == b"grpc-status:0"),
+        "the encoded gRPC-Web trailer must report success"
+    );
+
     handle
         .shutdown()
         .await

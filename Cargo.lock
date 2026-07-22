@@ -3265,7 +3265,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b305d85504de270ad3525d726a6b69cc59ee7b2269b014387651107ab9f0755b"
 dependencies = [
  "bstr",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5836,6 +5836,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-reflect"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "057237efdb71cf4b3f9396302a3d6599a92fa94063ba537b66130980ea9909f3"
+dependencies = [
+ "base64 0.21.7",
+ "once_cell",
+ "prost 0.12.6",
+ "prost-types 0.12.6",
+ "serde",
+ "serde-value",
+]
+
+[[package]]
 name = "prost-types"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8088,6 +8102,7 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "prost 0.12.6",
+ "prost-reflect",
  "prost-types 0.12.6",
  "serde",
  "serde_json",
@@ -8297,6 +8312,7 @@ dependencies = [
  "prost-types 0.12.6",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 1.0.69",
  "time",
  "tokeira-types",
@@ -8497,9 +8513,11 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "connectrpc 0.8.1",
+ "http 1.4.0",
  "http-body 0.4.6",
  "http-body-util",
  "hyper 0.14.32",
@@ -8512,6 +8530,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "percent-encoding",
  "proptest",
  "prost 0.12.6",
  "prost-types 0.12.6",

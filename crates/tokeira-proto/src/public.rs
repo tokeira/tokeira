@@ -181,6 +181,22 @@ pub mod temporal {
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     tonic::include_file_descriptor_set!("tokeira_public_descriptor");
 
+/// Official Temporal API v1.62.11 OpenAPI v2 document served by the HTTP API.
+///
+/// This is the decompressed `OpenAPIV2JSONSpec` artifact from the same upstream API
+/// release as the vendored protobuf surface. It intentionally remains an opaque byte
+/// asset so serving it cannot drift from the pinned upstream document.
+pub const OPENAPI_V2_JSON: &[u8] =
+    include_bytes!("../../../proto/upstream/temporalproto/openapi/openapiv2.swagger.json");
+
+/// Official Temporal API v1.62.11 OpenAPI v3 document served by the HTTP API.
+///
+/// This is the decompressed `OpenAPIV3YAMLSpec` artifact from the same upstream API
+/// release as the vendored protobuf surface. It intentionally remains an opaque byte
+/// asset so serving it cannot drift from the pinned upstream document.
+pub const OPENAPI_V3_YAML: &[u8] =
+    include_bytes!("../../../proto/upstream/temporalproto/openapi/openapiv3.yaml");
+
 pub use temporal::{
     api::{
         common::v1 as common, enums::v1 as enums, failure::v1 as failure, history::v1 as history,
@@ -199,16 +215,18 @@ pub const WORKFLOW_SERVICE_NAME: &str = "temporal.api.workflowservice.v1.Workflo
 /// Fully-qualified gRPC service name.
 pub const OPERATOR_SERVICE_NAME: &str = "temporal.api.operatorservice.v1.OperatorService";
 
-/// HTTP proxy service segment commonly used by the Temporal UI and compatibility HTTP layers.
-///
-/// The concrete route shape depends on your HTTP adapter, but the default pattern is:
-///
-/// `/api/v1/{service}/{method}`
-pub const WORKFLOW_HTTP_SERVICE: &str = "workflowservice.WorkflowService";
+#[cfg(test)]
+mod tests {
+    use super::{OPENAPI_V2_JSON, OPENAPI_V3_YAML};
 
-/// HTTP proxy service segment commonly used by the Temporal UI and compatibility HTTP layers.
-pub const OPERATOR_HTTP_SERVICE: &str = "operatorservice.OperatorService";
+    #[test]
+    fn pinned_openapi_documents_are_valid() {
+        let v2: serde_json::Value =
+            serde_json::from_slice(OPENAPI_V2_JSON).expect("valid official OpenAPI v2 JSON");
+        assert_eq!(v2["swagger"], "2.0");
 
-pub fn http_proxy_path(service: &str, method: &str) -> String {
-    format!("/api/v1/{service}/{method}")
+        let v3: serde_yaml::Value =
+            serde_yaml::from_slice(OPENAPI_V3_YAML).expect("valid official OpenAPI v3 YAML");
+        assert_eq!(v3["openapi"], "3.0.3");
+    }
 }

@@ -110,7 +110,7 @@ dependency then cost.
 
 | # | Suite | Exercises |
 |---|-------|-----------|
-| 43 | `TestHttpApiTestSuite` | HTTP/gRPC-gateway surface. |
+| 43 | `TestHttpApiTestSuite` | HTTP/gRPC-gateway surface. **CLEAN twice: 11 pass / 0 fail / 0 skip.** |
 | 44 | `TestClientMiscTestSuite`, `TestClientDataConverterTestSuite` | Client-visible misc + data-converter passthrough. |
 
 ## Deferred — in v1.31.0 but blocked on a decision/research

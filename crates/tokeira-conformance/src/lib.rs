@@ -129,6 +129,14 @@ pub struct KeySpec {
 /// `Wired` set always equals the set of keys a real accessor reads — which is
 /// exactly the honesty boundary the spec requires.
 pub static KEY_CLASSIFICATION: &[KeySpec] = &[
+    // The HTTP gateway consults the global Host allow-list before body decode
+    // on every annotated request (`allowedHostsMiddleware`,
+    // service/frontend/http_api_server.go @ v1.31.0).
+    KeySpec {
+        key: "frontend.httpAllowedHosts",
+        value_type: ValueType::Json,
+        disposition: Disposition::Wired,
+    },
     // The Nexus HTTP authorization adapter consults this gate live before it
     // surfaces an authorizer failure. Denials are never exposed by the gate.
     KeySpec {

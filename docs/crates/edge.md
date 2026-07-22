@@ -9,7 +9,7 @@ Public API compatibility shell for Tokeira. This crate admits and translates req
 - `tokeira-runtime` — runtime API types (`StartedWorkflowTask`, `StartedActivityTask`, `UpdateOutcome`, etc.)
 - `tokeira-storage` — `RunRepository` for history reads
 - `tokeira-types` — identity types, tokens, queue keys
-- External: `anyhow`, `async-trait`, `http`, `prost`, `prost-types`, `serde`, `serde_json`, `thiserror`, `time`, `tokio`, `tonic`, `tracing`, `uuid`
+- External: `anyhow`, `async-trait`, `http`, `prost`, `prost-reflect`, `prost-types`, `serde`, `serde_json`, `thiserror`, `time`, `tokio`, `tonic`, `tracing`, `uuid`
 
 ## Module Structure
 
@@ -23,7 +23,7 @@ Public API compatibility shell for Tokeira. This crate admits and translates req
 | `poller_registry.rs` | `PollerRegistry` for tracking active pollers per queue, RAII `PollerGuard` |
 | `history_wait.rs` | `HistoryWaitRegistry` for long-poll notifications via watch channels, `HistoryNotifyingRepository` wrapper |
 | `long_poll.rs` | `LongPollGate` — semaphore-based admission control (default 10k concurrent) |
-| `http_proxy.rs` | HTTP `/api/v1/{service}/{method}` route parsing, JSON error responses |
+| `http_api/` | Descriptor-derived Temporal HTTP routes, ProtoJSON/payload shorthand, Host/header policy, request transcoding, and response/status rendering |
 | `request_id.rs` | Request ID assignment and propagation |
 | `routing.rs` | `EdgeRouter` trait, execution-home and queue-home routing |
 | `errors.rs` | `EdgeError` enum with status codes and action names |
@@ -77,7 +77,7 @@ Public API compatibility shell for Tokeira. This crate admits and translates req
 - **HistoryNotifyingRepository** — wraps `RunRepository` to automatically notify history waiters on `commit_transition` and `materialize_reset_successor`
 - **PollerRegistry** — tracks active pollers per queue with RAII guards for automatic cleanup
 - **Close-event filter** — `history_event_filter_type` support for `get_result()` style calls
-- **HTTP proxy** — `/api/v1/{service}/{method}` route parsing for gRPC-Web compatibility
+- **Temporal HTTP/JSON API** — `google.api.http` bindings discovered from the pinned descriptor set and dispatched through the existing Tonic service stack
 
 ## Tests
 

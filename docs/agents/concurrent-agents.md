@@ -168,8 +168,8 @@ chats end to end: configuration, starting, finishing, integration) is
 Configuration is split in two, per Codex's project-config rules:
 
 - **Tracked, in this repo** — `.codex/config.toml`: selects the permission profile and
-  raises `project_doc_max_bytes` (this repo's `AGENTS.md` exceeds the 32 KiB default,
-  which would otherwise be silently truncated).
+  raises `project_doc_max_bytes` (the combined chain — global + root + crate-local
+  `AGENTS.md` — exceeds the 32 KiB default, which would otherwise silently truncate it).
 - **User-level** — `~/.codex/config.toml` defines the profile (profiles cannot live in
   project config). Permission profiles are beta; do **not** combine them with the older
   `sandbox_mode` / `[sandbox_workspace_write]` keys, which take precedence if present:

@@ -61,6 +61,9 @@ tokeirad.log
 # <SHA after next commit>.
 /tokeira.code-workspace
 
+# Codex silently prefers this file over AGENTS.md — never commit one
+AGENTS.override.md
+
 # Claude Code session-local state
 .claude/settings.local.json
 .claude/worktrees/

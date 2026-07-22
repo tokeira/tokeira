@@ -2,8 +2,10 @@
 # this workspace is trusted). The permission profile named here is defined in
 # the user-level ~/.codex/config.toml — see docs/agents/concurrent-agents.md.
 #
-# project_doc_max_bytes: AGENTS.md exceeds the 32 KiB default; without this,
-# Codex silently truncates the project constitution.
+# project_doc_max_bytes: the instruction chain Codex assembles (global AGENTS.md +
+# this repo's root AGENTS.md + any crate-local AGENTS.md on the path to cwd)
+# exceeds the 32 KiB default; without this raise, Codex silently truncates the
+# project constitution.
 
 default_permissions = "tokeira"
 project_doc_max_bytes = 131072

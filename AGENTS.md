@@ -28,9 +28,13 @@ This is a product-from-scratch. The architecture is informed by Temporal but the
   reference contracts and recipes (equally binding):
   [engineering-reference.md](docs/agents/engineering-reference.md). Design:
   [docs/architecture/000-overview.md](docs/architecture/000-overview.md), `docs/adr/`.
-- **Budget:** keep this file under 32 KiB (Codex's default project-doc cap; the tracked
-  `.codex/config.toml` raises it, but every byte here is context every agent pays every
-  session). Cut before you append.
+- **Harness reality:** Kiro reads this file natively; Claude Code only via the root
+  `CLAUDE.md` `@AGENTS.md` import (§12.1); Codex concatenates global → root → cwd
+  `AGENTS.md` under `project_doc_max_bytes` and silently truncates overflow — the
+  tracked `.codex/config.toml` raises that cap to 128 KiB.
+- **Budget (CI-enforced ≤ 32 KiB):** the binding constraint is context cost — every
+  byte here is paid by every agent every session. Cut before you append. Never commit
+  an `AGENTS.override.md` — Codex silently prefers it over this file.
 
 ## Values
 
@@ -153,8 +157,7 @@ trailers are authored.
 
 ### §8. Temporal behaviour defers to the targeted release
 
-The targeted release is pinned by `TEMPORAL_SERVER_COMPAT` (currently `1.31.0`), the
-vendored API by `TEMPORAL_PROTO_VERSION` (`v1.62.11`), both in
+Pins: *Compatibility Target* (head of this file); constants in
 `crates/tokeira-build-info/src/pinned.rs`.
 
 For any question about public API **behaviour** — field semantics, error/status mapping,
@@ -454,7 +457,7 @@ What differs per harness. Everything in §10 applies to all three agents.
 ### Decision process
 
 0. **API-behaviour questions → the targeted release first** (§8): `proto/upstream/` for
-   shape, server source at `v1.31.0` for behaviour. This tier sits above the spec — a
+   shape, server source at the pinned tag for behaviour. This tier sits above the spec — a
    spec that contradicts the targeted release is the thing that's wrong.
 1. **Check the spec.** `.kiro/specs/` is the source of truth for what to build. When
    authoring or amending one, follow the house-style skill
@@ -559,8 +562,7 @@ other files depend on them by name:
 
 #### Temporal compatibility changes
 
-The two pins are independent — see *Compatibility Target* at the head of this file.
-New WorkflowService/OperatorService surfaces are
+Pins: see *Compatibility Target*. New WorkflowService/OperatorService surfaces are
 classified in `FEATURE_MATRIX` (`crates/tokeira-compatibility/src/matrix.rs`); SDK
 claims update `SDK_MATRIX` (`crates/tokeira-compatibility/src/sdk.rs`) with evidence and
 verification state. Tokeira-owned compatibility metadata uses Buffa/connect-rust under
@@ -570,22 +572,10 @@ until then, the focused matrix/CLI/edge tests in `.kiro/specs/temporal-compatibi
 
 #### Adding or Changing a DSQL Migration
 
-Migrations live in `crates/tokeira-storage/migrations/` as `VNNN__snake_case.sql`, one
-statement per file; `build.rs` embeds them; the runner is forward-only,
-checksum-verified, and rejects gaps and duplicates.
-
-- **Initial build phase (now): no `ALTER TABLE`.** Fold new columns/constraints into the
-  table's base `CREATE TABLE` migration. Editing an already-embedded migration is fine —
-  its checksum changes and the schema recreates from scratch. Keep versions contiguous;
-  deleting the highest migration is acceptable.
-- **After a baseline is cut, strictly forward-only:** an applied migration is never
-  edited (the runner rejects a changed checksum); every schema change is a new `VNNN`
-  (including `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`). Removing the build-phase rule
-  from this file is itself the signal that the baseline has been cut.
-- DSQL DDL constraints always apply: one statement per file, secondary indexes `ASYNC`,
-  no `CHECK` constraints (validate in the application), no `BIGSERIAL` (generate IDs
-  in-app). `DdlValidator` enforces the subset. The migrations directory is the single
-  authoritative schema source — there is no hand-maintained dump.
+Canonical rules: [crates/tokeira-storage/AGENTS.md](crates/tokeira-storage/AGENTS.md)
+(build-phase no-`ALTER`, forward-only after baseline, DSQL DDL subset, contiguous
+versions). The heading stays here because other files cite it by name; the crate file
+carries the full agreement, including the baseline-cut signal.
 
 ### Pointers
 

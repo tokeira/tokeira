@@ -373,6 +373,13 @@ edges trimmed; it prints `kache stats` and a `df` so the reclaim is visible. Del
   checkout runs it — per-worktree targets mean parallel suites don't collide on the
   binary, but they do share the DSQL/storage layer a suite points at; keep live-suite
   runs to one at a time unless configs isolate storage.
+- **§8 reference checkout from a worktree:** `../temporal` is a sibling of the *main*
+  checkout, so the relative path breaks from every worktree home. Resolve it:
+  `TEMPORAL="$(git rev-parse --path-format=absolute --git-common-dir)/../../temporal"`,
+  then `git -C "$TEMPORAL" …` (verified from `.claude/worktrees/…`). The path resolves
+  inside `$CODEX_HOME` worktrees too, but whether Codex's sandbox may *read* it is
+  user-level permission-profile config — absent that grant, Codex tasks rely on
+  pre-ground-truthed specs.
 - **Zed / rust-analyzer:** the tracked `.zed/settings.json` sets rust-analyzer's
   `cargo.targetDir: true`, giving RA its own `target/rust-analyzer` so save-triggered
   checks never serialize against terminal or agent builds in the same checkout — and

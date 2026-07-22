@@ -165,9 +165,15 @@ targeted release does**, verified against ground truth in this order:
    enums, oneofs. NEVER read generated artifacts under `target/` — they can be stale;
    `proto/upstream/` is the source of truth.
 2. **Temporal server source at the matching tag** for behaviour the proto does not
-   specify. **Read the local checkout** at `../temporal` (sibling of this repo, tag
-   `v1.31.0` available): `git -C <temporal-checkout> show v1.31.0:<path>` and
-   `git grep <pattern> v1.31.0 -- <path>` — offline, pinned, grep-able. Do NOT
+   specify. **Read the local reference checkout** — a sibling of the **main** checkout;
+   `../temporal` is correct from the repo root only, so resolve it from any worktree:
+
+   ```bash
+   TEMPORAL="$(git rev-parse --path-format=absolute --git-common-dir)/../../temporal"
+   git -C "$TEMPORAL" show v1.31.0:<path>   # grep: git -C "$TEMPORAL" grep <pattern> v1.31.0
+   ```
+
+   Offline, pinned, grep-able. Do NOT
    web-search for Temporal source when the local checkout is available. Read the actual
    code (`service/history/...`, `service/worker/...`, `common/...`) — never infer
    behaviour from proto doc comments, SDK docs, blog posts, or memory. Cite by
@@ -401,8 +407,10 @@ What differs per harness. Everything in §10 applies to all three agents.
 - Permission gates are policy, not friction: push/rebase/checkout/reset ask first;
   force-push, `git clean`, `branch -D`, `reset --hard` are denied. Work with the gates,
   never around them.
-- `../temporal` is the read-only §8 reference checkout — read via `git -C ../temporal`;
-  writes there are denied.
+- The §8 reference checkout is `../temporal` only from the main checkout — in a
+  worktree, resolve the path per §8. Ground-truth reads never modify it, and your
+  harness denies edits there; the clone doubles as the conformance fork, whose branch
+  is updated only in dedicated functional-conformance work (see Verification).
 - The full lifecycle is yours, including `git push` and `gh pr create` (§10.5–§10.6).
 
 #### §12.2 Codex (ChatGPT app)
@@ -582,5 +590,5 @@ checksum-verified, and rejects gaps and duplicates.
 - [deployment-definitions.md](docs/platforms/deployment-definitions.md) — authoring and
   operating `.tkd` deployment definitions (the rust-syn DSL and `tkp` lifecycle).
 - Temporal ground truth (§8): `proto/upstream/` (API `v1.62.11`) and the server source
-  at tag `v1.31.0` — local checkout `../temporal`, or
+  at tag `v1.31.0` — the local reference checkout (sibling of the main checkout, §8), or
   [github.com/temporalio/temporal @ v1.31.0](https://github.com/temporalio/temporal/tree/v1.31.0).

@@ -38,8 +38,8 @@ emitting. (This bit `placement` in the simulators; the same class of bug applies
 
 ## Behaviour ground truth
 
-Observable behaviour follows the targeted Temporal release (root §8). Read the local
-`../temporal` checkout at the `TEMPORAL_SERVER_COMPAT` tag; cite path + tag in comments
+Observable behaviour follows the targeted Temporal release (root §8). Read the §8
+reference checkout at the `TEMPORAL_SERVER_COMPAT` tag; cite path + tag in comments
 for non-obvious decisions.
 
 ## Where things belong instead

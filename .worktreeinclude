@@ -5,3 +5,5 @@
 # Add local-only config that builds/tests need as it appears.
 .env
 .env.local
+# Machine-local Claude Code grants (absolute-path allow rules survive into worktrees)
+.claude/settings.local.json

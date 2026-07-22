@@ -7,12 +7,6 @@ lint = [
     "--workspace",
     "--all-targets",
 ]
-test-lint = [
-    "clippy",
-    "--workspace",
-    "--all-targets",
-    "--tests",
-]
 
 [profile.dev]
 # Reduce debug info to line-tables only — still gives backtraces, cuts link time ~40%

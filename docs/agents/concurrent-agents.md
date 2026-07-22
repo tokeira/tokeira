@@ -245,8 +245,6 @@ cd ../<repo>-wt/docs-pass && kiro-cli --v3
       - cargo +nightly fmt *
       - cargo lint
       - cargo lint *
-      - cargo test-lint
-      - cargo test-lint *
       - cargo doc *
       - cargo metadata *
       - cargo tree *

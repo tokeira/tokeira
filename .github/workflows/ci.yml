@@ -56,7 +56,6 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
       - run: cargo lint --locked
-      - run: cargo test-lint --locked
       - run: cargo check --workspace --locked
       - run: git diff --exit-code
 

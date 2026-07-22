@@ -295,7 +295,6 @@ Run before any push or PR. The per-turn hook (`tkw hook stop` → `cargo check
 ```bash
 cargo +nightly fmt --all                                  # CI verifies with --check
 cargo lint --locked                                       # clippy: workspace + all targets
-cargo test-lint --locked                                  # clippy over tests
 cargo check --workspace --locked
 cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked

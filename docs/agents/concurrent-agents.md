@@ -119,7 +119,8 @@ not active for that build; investigate before relying on the cache.
 
 ## The agents
 
-`AGENTS.md` is the shared contract, read natively by all three agents. `.worktreeinclude`
+`AGENTS.md` is the shared contract — read natively by Kiro and Codex; Claude Code loads
+it via the root `CLAUDE.md` `@AGENTS.md` import (`AGENTS.md` §12.1). `.worktreeinclude`
 (tracked, gitignore syntax) lists gitignored files copied into new worktrees — honored
 natively by Claude Code and the ChatGPT app, and applied by `tkw` for the rest.
 

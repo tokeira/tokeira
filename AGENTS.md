@@ -390,6 +390,8 @@ What differs per harness. Everything in §10 applies to all three agents.
 
 #### §12.1 Claude Code
 
+- Session context arrives via the root `CLAUDE.md` (`@AGENTS.md` import) — Claude Code
+  does not read `AGENTS.md` natively. Never remove the shim.
 - Worktrees are native: `.claude/worktrees/<name>`, with `worktree.baseRef: "fresh"`
   (`.claude/settings.json`) so branches start from `origin/main`. Rename `worktree-*` →
   `agent/claude/<slug>` before the first push.

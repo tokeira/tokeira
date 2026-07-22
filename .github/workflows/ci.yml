@@ -56,7 +56,6 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
       - run: cargo lint --locked
-      - run: cargo test-lint --locked
       - run: cargo check --workspace --locked
       - run: git diff --exit-code
 
@@ -125,6 +124,12 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false # CI is read-only; don't leave the token in .git/config
+      # Agent-file invariants: the AGENTS.md byte budget ("How to read this file")
+      # and the Claude Code bridge (§12.1) are load-bearing — fail loud.
+      - name: Agent-file invariants
+        run: |
+          test "$(wc -c < AGENTS.md)" -le 32768
+          test -f CLAUDE.md
       - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           args: --offline --no-progress --hidden --exclude-path .git --exclude-path target './**/*.md'

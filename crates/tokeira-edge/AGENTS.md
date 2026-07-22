@@ -24,7 +24,7 @@ does NOT own workflow semantics.
 Public-API behaviour follows the targeted Temporal release (root §8), verified in order:
 
 1. `proto/upstream/` for wire shape (messages, field numbers, enums, oneofs).
-2. The local `../temporal` checkout at the `TEMPORAL_SERVER_COMPAT` tag for runtime
+2. The §8 reference checkout at the `TEMPORAL_SERVER_COMPAT` tag for runtime
    behaviour the proto does not specify (error/status mapping, defaulting, NOT_FOUND vs
    INVALID_ARGUMENT, blocking contracts).
 

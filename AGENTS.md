@@ -28,9 +28,13 @@ This is a product-from-scratch. The architecture is informed by Temporal but the
   reference contracts and recipes (equally binding):
   [engineering-reference.md](docs/agents/engineering-reference.md). Design:
   [docs/architecture/000-overview.md](docs/architecture/000-overview.md), `docs/adr/`.
-- **Budget:** keep this file under 32 KiB (Codex's default project-doc cap; the tracked
-  `.codex/config.toml` raises it, but every byte here is context every agent pays every
-  session). Cut before you append.
+- **Harness reality:** Kiro reads this file natively; Claude Code only via the root
+  `CLAUDE.md` `@AGENTS.md` import (§12.1); Codex concatenates global → root → cwd
+  `AGENTS.md` under `project_doc_max_bytes` and silently truncates overflow — the
+  tracked `.codex/config.toml` raises that cap to 128 KiB.
+- **Budget (CI-enforced ≤ 32 KiB):** the binding constraint is context cost — every
+  byte here is paid by every agent every session. Cut before you append. Never commit
+  an `AGENTS.override.md` — Codex silently prefers it over this file.
 
 ## Values
 
@@ -66,7 +70,7 @@ Per-crate boundary contracts (state stores, provider-agnosticism, config ownersh
 
 - Edition 2024; stable toolchain pinned to 1.96 (`rust-toolchain.toml`). Formatting uses
   nightly-only options: run `cargo +nightly fmt --all` — don't check first. (CI pins a
-  dated nightly for fmt; advance it together with local dev.)
+  dated nightly for fmt — advance together.)
 - **The lint wall is compiler-enforced** in `[workspace.lints]` — prose rules drift;
   lints survive refactors. Binding today: `unsafe_code = deny` (exactly four carve-outs,
   each `#[allow]` + `// SAFETY:`), `undocumented_unsafe_blocks = deny`,
@@ -153,8 +157,7 @@ trailers are authored.
 
 ### §8. Temporal behaviour defers to the targeted release
 
-The targeted release is pinned by `TEMPORAL_SERVER_COMPAT` (currently `1.31.0`), the
-vendored API by `TEMPORAL_PROTO_VERSION` (`v1.62.11`), both in
+Pins: *Compatibility Target* (head of this file); constants in
 `crates/tokeira-build-info/src/pinned.rs`.
 
 For any question about public API **behaviour** — field semantics, error/status mapping,
@@ -165,9 +168,15 @@ targeted release does**, verified against ground truth in this order:
    enums, oneofs. NEVER read generated artifacts under `target/` — they can be stale;
    `proto/upstream/` is the source of truth.
 2. **Temporal server source at the matching tag** for behaviour the proto does not
-   specify. **Read the local checkout** at `../temporal` (sibling of this repo, tag
-   `v1.31.0` available): `git -C <temporal-checkout> show v1.31.0:<path>` and
-   `git grep <pattern> v1.31.0 -- <path>` — offline, pinned, grep-able. Do NOT
+   specify. **Read the local reference checkout** — a sibling of the **main** checkout;
+   `../temporal` is correct from the repo root only, so resolve it from any worktree:
+
+   ```bash
+   TEMPORAL="$(git rev-parse --path-format=absolute --git-common-dir)/../../temporal"
+   git -C "$TEMPORAL" show v1.31.0:<path>   # grep: git -C "$TEMPORAL" grep <pattern> v1.31.0
+   ```
+
+   Offline, pinned, grep-able. Do NOT
    web-search for Temporal source when the local checkout is available. Read the actual
    code (`service/history/...`, `service/worker/...`, `common/...`) — never infer
    behaviour from proto doc comments, SDK docs, blog posts, or memory. Cite by
@@ -201,8 +210,6 @@ readers to skip comments. Delete such comments when you see them.
 ```rust
 // BAD — restates the code:
 // increment the revision number
-info.revision_number += 1;
-
 // GOOD — explains why this is safe/necessary:
 // Bump the revision so any task dispatched against the prior routing decision
 // is fenced as stale at start time (recordworkflowtaskstarted/api.go @ v1.31.0).
@@ -247,8 +254,8 @@ Every task follows one lifecycle:
   (ChatGPT app, managed), `<repo>-wt/…` (`tkw new` — Kiro CLI and manual).
   `.worktreeinclude` (tracked) lists the gitignored files copied into new worktrees.
 - Shared machine-wide, therefore off-limits: the git object DB and refs, `~/.cargo`, and
-  the kache store (every cargo build routes through the kache `RUSTC_WRAPPER`;
-  per-worktree `target/` dirs dedupe into one content-addressed store). **Never
+  the kache store (the kache `RUSTC_WRAPPER` dedupes per-worktree `target/` into one
+  content-addressed store). **Never
   `cargo clean`** — it defeats the shared cache and is never the fix. Never delete or
   move `target/`; never modify `~/.cargo/config.toml`, rustup toolchains,
   `RUSTC_WRAPPER`, or `KACHE_*`/`CARGO_*` configuration. If the build seems
@@ -277,6 +284,8 @@ Every task follows one lifecycle:
 - Commit only your own coherent work, on your own branch (Kiro: via `-F`, §7), with §11
   trailers. If you cannot finish, leave the worktree dirty and report what remains — do
   not half-commit.
+- Never read or commit secrets (`.env*`, keys, tokens) — fleet-wide, not just where
+  harness deny rules enforce it.
 
 #### §10.4 Finish green — the Enforced Commands bar
 
@@ -286,7 +295,6 @@ Run before any push or PR. The per-turn hook (`tkw hook stop` → `cargo check
 ```bash
 cargo +nightly fmt --all                                  # CI verifies with --check
 cargo lint --locked                                       # clippy: workspace + all targets
-cargo test-lint --locked                                  # clippy over tests
 cargo check --workspace --locked
 cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
@@ -390,6 +398,8 @@ What differs per harness. Everything in §10 applies to all three agents.
 
 #### §12.1 Claude Code
 
+- Session context arrives via the root `CLAUDE.md` (`@AGENTS.md` import) — Claude Code
+  does not read `AGENTS.md` natively. Never remove the shim.
 - Worktrees are native: `.claude/worktrees/<name>`, with `worktree.baseRef: "fresh"`
   (`.claude/settings.json`) so branches start from `origin/main`. Rename `worktree-*` →
   `agent/claude/<slug>` before the first push.
@@ -399,43 +409,44 @@ What differs per harness. Everything in §10 applies to all three agents.
 - Permission gates are policy, not friction: push/rebase/checkout/reset ask first;
   force-push, `git clean`, `branch -D`, `reset --hard` are denied. Work with the gates,
   never around them.
-- `../temporal` is the read-only §8 reference checkout — read via `git -C ../temporal`;
-  writes there are denied.
+- The §8 reference checkout is `../temporal` only from the main checkout — in a
+  worktree, resolve the path per §8. Ground-truth reads never modify it, and your
+  harness denies edits there; the clone doubles as the conformance fork, whose branch
+  is updated only in dedicated functional-conformance work (see Verification).
 - The full lifecycle is yours, including `git push` and `gh pr create` (§10.5–§10.6).
 
 #### §12.2 Codex (ChatGPT app)
 
-- You run inside an app-managed worktree (`$CODEX_HOME/worktrees/…`, detached HEAD, own
-  `target/`) — a real linked worktree of this repository. Work only there. **Local**
+- You run inside an app-managed linked worktree of this repository
+  (`$CODEX_HOME/worktrees/…`, detached HEAD, own `target/`). Work only there. **Local**
   (non-worktree) chats are research-only: read and answer; never edit from Local.
-- **Your sandbox has no network** (permission profile `tokeira`, selected by the tracked
-  `.codex/config.toml`; the profile itself is defined user-level). Consequences: build
+- **Your sandbox has no network** (profile `tokeira` via the tracked
+  `.codex/config.toml`; defined user-level). Consequences: build
   from the warm registry with `--locked`; no dependency changes unless the task
   explicitly says so; no `git fetch`, no push, no `gh`. kache works invisibly underneath
   cargo — never configure around it (§10.1).
 - **Your finishing move** (replaces §10.6): run the §10.4 bar and report any check not
   run and why; present the diff; create the branch via **Create branch here** named
-  `agent/codex/<task-slug>`; commit through the app's git controls with §11 trailers
-  (`Co-authored-by: Codex <codex@openai.com>`). Push and PR happen outside your sandbox,
+  `agent/codex/<task-slug>`; commit through the app's git controls with §11 trailers.
+  Push and PR happen outside your sandbox,
   from your named branch.
 - **Your half of §10.5:** you can see local refs. If local `main` has moved past your
   base, say so (base SHA vs current `main`) and recommend; the rebase itself belongs to
   the operator or Claude.
 - Final report: branch, head SHA, bar results, files touched, known risks, merge-order
   recommendation when relevant.
-- Operator guide (Worktree chats, permission profiles, integration):
-  [codex-chatgpt-worktrees.md](docs/agents/codex-chatgpt-worktrees.md).
+- Operator guide: [codex-chatgpt-worktrees.md](docs/agents/codex-chatgpt-worktrees.md).
 
 #### §12.3 Kiro CLI
 
 - Worktrees via tkw: `tkw new <slug>` → `<repo>-wt/<slug>` on branch `agent/<slug>`;
   rename to `agent/kiro/<slug>` before the first push (§10.2).
 - Spec-driven: `.kiro/specs/` + `/spec`, house style in
-  `.agents/skills/kiro-spec-driven-development/` (EARS requirements, design, tasks,
-  property-based testing, ground-truth verification).
+  `.agents/skills/kiro-spec-driven-development/` (EARS, property-based testing,
+  ground-truth verification; auto-discovered via the `.kiro/skills/` symlink).
 - Commits via the `-F` message file — §7 is non-negotiable in Kiro's terminal.
-- Hooks (`.kiro/hooks/rust-quality.json`) are advisory on Stop — Kiro does not block
-  there, so running the §10.4 bar before declaring done is on you.
+- Hooks (`.kiro/hooks/rust-quality.json`) are advisory on Stop — running the §10.4 bar
+  before declaring done is on you.
 - Permissions are user-level (`~/.kiro/settings/permissions.yaml`), deliberately outside
   the repo; push and worktree removal are ask-gated there.
 
@@ -444,17 +455,20 @@ What differs per harness. Everything in §10 applies to all three agents.
 ### Decision process
 
 0. **API-behaviour questions → the targeted release first** (§8): `proto/upstream/` for
-   shape, server source at `v1.31.0` for behaviour. This tier sits above the spec — a
+   shape, server source at the pinned tag for behaviour. This tier sits above the spec — a
    spec that contradicts the targeted release is the thing that's wrong.
-1. **Check the spec.** `.kiro/specs/` is the source of truth for what to build.
+1. **Check the spec.** `.kiro/specs/` is the source of truth for what to build. When
+   authoring or amending one, follow the house-style skill
+   `.agents/skills/kiro-spec-driven-development/` — auto-discovered by Kiro and
+   Claude; Codex (no skills mechanism) opens its `SKILL.md` explicitly.
 2. **Check existing patterns** before inventing a new approach.
 3. **Prefer boring solutions.** The simplest approach that satisfies the requirement.
 4. **Ask if unsure.** Surface architectural implications rather than guessing.
 
 ### Crate-local AGENTS.md (read before editing a high-risk crate)
 
-Binding refinements of this root file; the stricter crate-local rule wins. Do not rely
-on automatic nested-file loading — open it explicitly. Applies to every agent.
+Binding refinements; the stricter crate-local rule wins. Never rely on automatic
+nested loading — open explicitly. Applies to every agent.
 
 | Crate | Concentrates |
 |-------|--------------|
@@ -475,25 +489,27 @@ on automatic nested-file loading — open it explicitly. Applies to every agent.
 
 ## Verification
 
+**Inner loop** (§10.4 is the finishing bar, not the per-edit loop): `cargo check -p` /
+`cargo clippy -p <crate> --all-targets` for seconds-fast leaf feedback; `cargo nextest
+run -p <crate> -E 'test(<name>)'` isolates one test per process and kills hangs at
+180 s (`.config/nextest.toml`); doctests still need `cargo test --doc`.
+
 ### Tests
 
 - Unit tests co-located per module (`#[cfg(test)]`); property-based tests with
   `proptest` for config validation, serialization round-trips, dependency ordering.
 - `cargo test --workspace` passes before every commit. The default suite requires no
   live AWS credentials and no Docker.
-- Some tests panic intentionally; only failures reported by the test harness are real
-  problems.
-- Standing properties: config TOML round-trips losslessly; unknown config fields
-  rejected; module and service dependency graphs are DAGs; state CAS admits at most one
-  of two concurrent saves from the same version.
+- Some tests panic intentionally; only harness-reported failures are real problems.
+- Standing properties: config TOML round-trips losslessly; unknown fields rejected;
+  dependency graphs are DAGs; state CAS admits one of two concurrent same-version saves.
 
 ### Functional conformance harness (Tier 2)
 
 Behavioural conformance is validated separately from `cargo test` by replaying
 Temporal's functional Go corpus (pinned at `TEMPORAL_SERVER_COMPAT`) over the real gRPC
-wire against a running `tokeirad`. Operator-invoked; lives in the sibling fork
-(`../temporal`, branch `tokeira/conformance-v1.31.0`) — never assume it runs under
-`cargo test`. The runbook (build `tokeirad`, run the full corpus or one suite, distil
+wire against a running `tokeirad`. Operator-invoked from the sibling fork's branch
+`tokeira/conformance-v1.31.0` — never assume it runs under `cargo test`. The runbook (build `tokeirad`, run the full corpus or one suite, distil
 outcomes) and the conventions binding any fix derived from a run (v1.31.0 ground truth,
 no kernel additions, config-as-constant, feature modes as independent runs, raise
 ambiguity):
@@ -533,21 +549,19 @@ proto/      upstream/ — vendored Temporal protos (authoritative wire shape, §
 .kiro/specs/  feature specs        spec/  TLA+/refinement stack
 scenarios/  e2e samples (excluded)        spikes/  throwaway probes
 docs/       agents · adr · architecture · conformance · operations · platforms ·
-            readiness · runbooks · testing · crates
+            readiness · runbooks · testing · crates · diagrams
 ```
 
 ### Working agreements
 
-Package boundaries, configuration contracts, IaC engine contracts, the
-adding-a-platform / IaC-module / CLI-command / image recipes, and the observability
-stack pins live in [engineering-reference.md](docs/agents/engineering-reference.md) —
-equally binding, loaded when the task needs them. Two agreements stay here because
-other files depend on them by name:
+Package boundaries, configuration contracts, IaC engine contracts, recipes
+(platform / IaC-module / CLI-command / image), and observability pins:
+[engineering-reference.md](docs/agents/engineering-reference.md) — equally binding,
+loaded when needed. Two agreements stay here because other files cite them by name:
 
 #### Temporal compatibility changes
 
-The two pins are independent — see *Compatibility Target* at the head of this file.
-New WorkflowService/OperatorService surfaces are
+Pins: see *Compatibility Target*. New WorkflowService/OperatorService surfaces are
 classified in `FEATURE_MATRIX` (`crates/tokeira-compatibility/src/matrix.rs`); SDK
 claims update `SDK_MATRIX` (`crates/tokeira-compatibility/src/sdk.rs`) with evidence and
 verification state. Tokeira-owned compatibility metadata uses Buffa/connect-rust under
@@ -557,28 +571,16 @@ until then, the focused matrix/CLI/edge tests in `.kiro/specs/temporal-compatibi
 
 #### Adding or Changing a DSQL Migration
 
-Migrations live in `crates/tokeira-storage/migrations/` as `VNNN__snake_case.sql`, one
-statement per file; `build.rs` embeds them; the runner is forward-only,
-checksum-verified, and rejects gaps and duplicates.
-
-- **Initial build phase (now): no `ALTER TABLE`.** Fold new columns/constraints into the
-  table's base `CREATE TABLE` migration. Editing an already-embedded migration is fine —
-  its checksum changes and the schema recreates from scratch. Keep versions contiguous;
-  deleting the highest migration is acceptable.
-- **After a baseline is cut, strictly forward-only:** an applied migration is never
-  edited (the runner rejects a changed checksum); every schema change is a new `VNNN`
-  (including `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`). Removing the build-phase rule
-  from this file is itself the signal that the baseline has been cut.
-- DSQL DDL constraints always apply: one statement per file, secondary indexes `ASYNC`,
-  no `CHECK` constraints (validate in the application), no `BIGSERIAL` (generate IDs
-  in-app). `DdlValidator` enforces the subset. The migrations directory is the single
-  authoritative schema source — there is no hand-maintained dump.
+Canonical rules: [crates/tokeira-storage/AGENTS.md](crates/tokeira-storage/AGENTS.md)
+(build-phase no-`ALTER`, forward-only after baseline, DSQL DDL subset, contiguous
+versions). The heading stays here because other files cite it by name; the crate file
+carries the full agreement, including the baseline-cut signal.
 
 ### Pointers
 
-- `.kiro/specs/*/` — feature specs (requirements, design, tasks).
+- `.kiro/specs/*/` — feature specs.
 - [deployment-definitions.md](docs/platforms/deployment-definitions.md) — authoring and
   operating `.tkd` deployment definitions (the rust-syn DSL and `tkp` lifecycle).
 - Temporal ground truth (§8): `proto/upstream/` (API `v1.62.11`) and the server source
-  at tag `v1.31.0` — local checkout `../temporal`, or
+  at tag `v1.31.0` — the local reference checkout (sibling of the main checkout, §8), or
   [github.com/temporalio/temporal @ v1.31.0](https://github.com/temporalio/temporal/tree/v1.31.0).

@@ -35,7 +35,7 @@ fenced commit, not a kernel command.
 ## Behaviour ground truth
 
 Workflow-transition behaviour follows the targeted Temporal release (root §8):
-`proto/upstream/` for wire shape, the local `../temporal` checkout at the
+`proto/upstream/` for wire shape, the §8 reference checkout at the
 `TEMPORAL_SERVER_COMPAT` tag for runtime behaviour. Cite the source path + tag in a
 comment when a transition decision is non-obvious.
 

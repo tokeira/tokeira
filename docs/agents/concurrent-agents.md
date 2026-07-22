@@ -119,7 +119,8 @@ not active for that build; investigate before relying on the cache.
 
 ## The agents
 
-`AGENTS.md` is the shared contract, read natively by all three agents. `.worktreeinclude`
+`AGENTS.md` is the shared contract — read natively by Kiro and Codex; Claude Code loads
+it via the root `CLAUDE.md` `@AGENTS.md` import (`AGENTS.md` §12.1). `.worktreeinclude`
 (tracked, gitignore syntax) lists gitignored files copied into new worktrees — honored
 natively by Claude Code and the ChatGPT app, and applied by `tkw` for the rest.
 
@@ -143,6 +144,15 @@ session automatically.
   --workspace`; exit 2 blocks until the tree compiles, with loop protection via
   `stop_hook_active`). The per-turn gate is a compile gate, not the release bar — the
   full Enforced Commands run belongs to task completion, before commit and PR.
+- Claude's native worktrees nest *inside* the repo, so the main checkout's
+  `.cargo/config.toml` is an ancestor config from every worktree cwd and cargo merges
+  the two — **array values concatenate** (a doubled alias broke `cargo lint` in every
+  such worktree) and a **string-vs-array mismatch on any key is fatal** to every cargo
+  command. Converting a key's form therefore breaks live nested worktrees until they
+  are recreated: the alias paid that one-time cost knowingly (string-form resolves
+  closest-wins, fixing the doubling); `rustflags` stays an array because its
+  self-concatenation is harmless and the transition would buy nothing. Prefer
+  string-form for new keys.
 - Cleanup is Claude's: clean worktrees are removed on exit, dirty ones prompt, and agent
   worktrees are `git worktree lock`ed while running so sweeps can't remove them.
 - Rename the branch to the fleet convention before its first push:
@@ -167,8 +177,8 @@ chats end to end: configuration, starting, finishing, integration) is
 Configuration is split in two, per Codex's project-config rules:
 
 - **Tracked, in this repo** — `.codex/config.toml`: selects the permission profile and
-  raises `project_doc_max_bytes` (this repo's `AGENTS.md` exceeds the 32 KiB default,
-  which would otherwise be silently truncated).
+  raises `project_doc_max_bytes` (the combined chain — global + root + crate-local
+  `AGENTS.md` — exceeds the 32 KiB default, which would otherwise silently truncate it).
 - **User-level** — `~/.codex/config.toml` defines the profile (profiles cannot live in
   project config). Permission profiles are beta; do **not** combine them with the older
   `sandbox_mode` / `[sandbox_workspace_write]` keys, which take precedence if present:
@@ -244,8 +254,6 @@ cd ../<repo>-wt/docs-pass && kiro-cli --v3
       - cargo +nightly fmt *
       - cargo lint
       - cargo lint *
-      - cargo test-lint
-      - cargo test-lint *
       - cargo doc *
       - cargo metadata *
       - cargo tree *
@@ -364,6 +372,11 @@ edges trimmed; it prints `kache stats` and a `df` so the reclaim is visible. Del
 
 ## Repo-specific notes
 
+- **Environment prerequisites:** toolchain via `rust-toolchain.toml` (stable 1.96); fmt
+  needs the dated nightly (`NIGHTLY_FMT_TOOLCHAIN` in ci.yml, currently
+  `nightly-2026-06-16` — advance with local dev); `protoc` on PATH (prost-build compiles
+  `proto/upstream/`; CI installs protobuf-compiler for exactly this); `gh` only at the
+  §10.6 PR boundary (never Codex).
 - **Linker:** the tracked `.cargo/config.toml` links with lld (`-fuse-ld=lld` via clang)
   on aarch64 and sets `debug = "line-tables-only"` — deliberate link-time tuning that
   every worktree inherits. kache skips linked outputs, so link time is unaffected by the
@@ -372,6 +385,13 @@ edges trimmed; it prints `kache stats` and a `df` so the reclaim is visible. Del
   checkout runs it — per-worktree targets mean parallel suites don't collide on the
   binary, but they do share the DSQL/storage layer a suite points at; keep live-suite
   runs to one at a time unless configs isolate storage.
+- **§8 reference checkout from a worktree:** `../temporal` is a sibling of the *main*
+  checkout, so the relative path breaks from every worktree home. Resolve it:
+  `TEMPORAL="$(git rev-parse --path-format=absolute --git-common-dir)/../../temporal"`,
+  then `git -C "$TEMPORAL" …` (verified from `.claude/worktrees/…`). The path resolves
+  inside `$CODEX_HOME` worktrees too, but whether Codex's sandbox may *read* it is
+  user-level permission-profile config — absent that grant, Codex tasks rely on
+  pre-ground-truthed specs.
 - **Zed / rust-analyzer:** the tracked `.zed/settings.json` sets rust-analyzer's
   `cargo.targetDir: true`, giving RA its own `target/rust-analyzer` so save-triggered
   checks never serialize against terminal or agent builds in the same checkout — and

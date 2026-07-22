@@ -11,15 +11,18 @@ one statement per file. `build.rs` embeds them at compile time; the runner
 and duplicates. There is no hand-maintained schema dump — the migrations directory IS
 the schema.
 
-Follow the root `AGENTS.md` section "Adding or Changing a DSQL Migration" in full. The
-rules that bite most often:
+This file is the **canonical** home of the root heading *Adding or Changing a DSQL
+Migration* (the root keeps the name and points here). The rules:
 
 - **Build phase (now): no `ALTER TABLE`.** Fold a new column/constraint into the
   table's base `CREATE TABLE` migration and let its checksum change. Do not add a
-  follow-up `ALTER`. (This flips to strictly forward-only once a baseline is cut; the
-  moment that rule is removed from the root file is the signal the baseline exists.)
+  follow-up `ALTER`. (This flips to strictly forward-only once a baseline is cut;
+  removing the build-phase rule from this file is itself the signal the baseline
+  exists.)
 - **Contiguous versions.** No gaps, no duplicate `VNNN`. Deleting the highest migration
-  is acceptable during the build phase; editing an applied one after baseline is not.
+  is acceptable during the build phase; editing an applied one after baseline is not —
+  each post-baseline change is a new `VNNN` (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+  included).
 - **DSQL DDL subset always.** One statement per file; secondary indexes created `ASYNC`;
   no `CHECK` constraints (validate in the application); no `BIGSERIAL` (generate IDs
   in-app). `src/dsql/validation.rs` (`DdlValidator`) enforces the safe subset — if it

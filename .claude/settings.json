@@ -39,7 +39,6 @@
       "Bash(cargo nextest:*)",
       "Bash(cargo clippy:*)",
       "Bash(cargo lint:*)",
-      "Bash(cargo test-lint:*)",
       "Bash(cargo fmt:*)",
       "Bash(cargo +nightly fmt:*)",
       "Bash(cargo doc:*)",

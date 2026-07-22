@@ -427,16 +427,15 @@ What differs per harness. Everything in §10 applies to all three agents.
   cargo — never configure around it (§10.1).
 - **Your finishing move** (replaces §10.6): run the §10.4 bar and report any check not
   run and why; present the diff; create the branch via **Create branch here** named
-  `agent/codex/<task-slug>`; commit through the app's git controls with §11 trailers
-  (`Co-authored-by: Codex <codex@openai.com>`). Push and PR happen outside your sandbox,
+  `agent/codex/<task-slug>`; commit through the app's git controls with §11 trailers.
+  Push and PR happen outside your sandbox,
   from your named branch.
 - **Your half of §10.5:** you can see local refs. If local `main` has moved past your
   base, say so (base SHA vs current `main`) and recommend; the rebase itself belongs to
   the operator or Claude.
 - Final report: branch, head SHA, bar results, files touched, known risks, merge-order
   recommendation when relevant.
-- Operator guide (Worktree chats, permission profiles, integration):
-  [codex-chatgpt-worktrees.md](docs/agents/codex-chatgpt-worktrees.md).
+- Operator guide: [codex-chatgpt-worktrees.md](docs/agents/codex-chatgpt-worktrees.md).
 
 #### §12.3 Kiro CLI
 
@@ -468,8 +467,8 @@ What differs per harness. Everything in §10 applies to all three agents.
 
 ### Crate-local AGENTS.md (read before editing a high-risk crate)
 
-Binding refinements of this root file; the stricter crate-local rule wins. Do not rely
-on automatic nested-file loading — open it explicitly. Applies to every agent.
+Binding refinements; the stricter crate-local rule wins. Never rely on automatic
+nested loading — open explicitly. Applies to every agent.
 
 | Crate | Concentrates |
 |-------|--------------|
@@ -555,11 +554,10 @@ docs/       agents · adr · architecture · conformance · operations · platfo
 
 ### Working agreements
 
-Package boundaries, configuration contracts, IaC engine contracts, the
-adding-a-platform / IaC-module / CLI-command / image recipes, and the observability
-stack pins live in [engineering-reference.md](docs/agents/engineering-reference.md) —
-equally binding, loaded when the task needs them. Two agreements stay here because
-other files depend on them by name:
+Package boundaries, configuration contracts, IaC engine contracts, recipes
+(platform / IaC-module / CLI-command / image), and observability pins:
+[engineering-reference.md](docs/agents/engineering-reference.md) — equally binding,
+loaded when needed. Two agreements stay here because other files cite them by name:
 
 #### Temporal compatibility changes
 
@@ -580,7 +578,7 @@ carries the full agreement, including the baseline-cut signal.
 
 ### Pointers
 
-- `.kiro/specs/*/` — feature specs (requirements, design, tasks).
+- `.kiro/specs/*/` — feature specs.
 - [deployment-definitions.md](docs/platforms/deployment-definitions.md) — authoring and
   operating `.tkd` deployment definitions (the rust-syn DSL and `tkp` lifecycle).
 - Temporal ground truth (§8): `proto/upstream/` (API `v1.62.11`) and the server source

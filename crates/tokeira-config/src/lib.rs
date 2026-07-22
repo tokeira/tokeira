@@ -226,10 +226,42 @@ pub struct PolicyConfig {
     pub nexus_endpoint_limits: NexusEndpointLimitsConfig,
     #[serde(default)]
     pub nexus_completion: NexusCompletionConfig,
+    /// Temporal HTTP/JSON gateway admission and metadata-forwarding policy.
+    #[serde(default)]
+    pub http_api: HttpApiPolicyConfig,
     /// Configured identity sources and authorization policy. Absence preserves
     /// the stock permissive server.
     #[serde(default)]
     pub authorization: Option<AuthorizationConfig>,
+}
+
+/// Static policy for Temporal's public HTTP/JSON compatibility gateway.
+///
+/// The gateway remains enabled when this section is absent. Defaults mirror
+/// `frontend.httpAllowedHosts` and the empty operator-supplied forwarded-header
+/// list in `http_api_server.go @ v1.31.0`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpApiPolicyConfig {
+    /// Full-host, case-sensitive wildcard patterns; only `*` is special.
+    #[serde(default = "default_http_api_allowed_hosts")]
+    pub allowed_hosts: Vec<String>,
+    /// Extra exact header names or prefixes ending in one `*`.
+    #[serde(default)]
+    pub additional_forwarded_headers: Vec<String>,
+}
+
+impl Default for HttpApiPolicyConfig {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: default_http_api_allowed_hosts(),
+            additional_forwarded_headers: Vec::new(),
+        }
+    }
+}
+
+fn default_http_api_allowed_hosts() -> Vec<String> {
+    vec!["*".to_owned()]
 }
 
 /// Presence-enabled authentication and authorization policy.
@@ -770,6 +802,7 @@ impl Default for PolicyConfig {
             compatibility: CompatibilityConfig::default(),
             nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
             nexus_completion: NexusCompletionConfig::default(),
+            http_api: HttpApiPolicyConfig::default(),
             authorization: None,
         }
     }
@@ -1056,6 +1089,23 @@ impl TokeiraConfig {
                 field: "policy.nexus_completion.retry_backoff_coefficient".to_string(),
                 message: "must be greater than or equal to 1.0".to_string(),
             });
+        }
+        for (index, rule) in self
+            .policy
+            .http_api
+            .additional_forwarded_headers
+            .iter()
+            .enumerate()
+        {
+            let trimmed = rule.trim();
+            let stars = trimmed.bytes().filter(|byte| *byte == b'*').count();
+            if trimmed.is_empty() || stars > 1 || (stars == 1 && !trimmed.ends_with('*')) {
+                errors.push(ValidationError::Field {
+                    field: format!("policy.http_api.additional_forwarded_headers[{index}]"),
+                    message: "must be a non-empty exact header or a prefix ending in one `*`"
+                        .to_owned(),
+                });
+            }
         }
         if let Some(authorization) = self.policy.authorization.as_ref() {
             validate_authorization(authorization, &mut errors);
@@ -1762,6 +1812,45 @@ mod tests {
         assert!(config.to_redacted_json().get("_warnings").is_some());
     }
 
+    #[test]
+    fn http_api_policy_defaults_and_header_rules_validate() {
+        let decoded: TokeiraConfig = toml::from_str("").expect("default config");
+        assert_eq!(decoded.policy.http_api.allowed_hosts, ["*"]);
+        assert!(
+            decoded
+                .policy
+                .http_api
+                .additional_forwarded_headers
+                .is_empty()
+        );
+
+        let mut config = TokeiraConfig::default();
+        config.policy.http_api.additional_forwarded_headers = vec![
+            "this-header-forwarded".to_owned(),
+            "this-header-prefix-forwarded-*".to_owned(),
+        ];
+        assert!(config.validate().is_ok());
+
+        for invalid in ["", "prefix-*suffix", "two-*-stars-*"] {
+            config.policy.http_api.additional_forwarded_headers = vec![invalid.to_owned()];
+            assert!(
+                config.validate().is_err(),
+                "invalid additional header rule `{invalid}` was accepted"
+            );
+        }
+
+        let encoded = toml::to_string(&TokeiraConfig::default()).expect("serialize config");
+        let round_trip: TokeiraConfig = toml::from_str(&encoded).expect("round trip config");
+        assert_eq!(round_trip.policy.http_api, HttpApiPolicyConfig::default());
+        assert!(
+            toml::from_str::<TokeiraConfig>(
+                "[policy.http_api]\nallowed_hosts = [\"*\"]\nunknown = true\n"
+            )
+            .is_err(),
+            "strict config must reject unknown HTTP API policy fields"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -1943,6 +2032,7 @@ mod tests {
                         compatibility: CompatibilityConfig::default(),
                         nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
                         nexus_completion: NexusCompletionConfig::default(),
+                        http_api: HttpApiPolicyConfig::default(),
                         authorization: None,
                     },
                     capacity: CapacityConfig {

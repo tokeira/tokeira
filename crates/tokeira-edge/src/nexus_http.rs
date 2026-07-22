@@ -431,7 +431,15 @@ impl NexusHttpHandler {
 
     /// Whether `path` belongs to a caller-facing Nexus route rather than tonic.
     pub fn recognizes_path(path: &str) -> bool {
-        path.starts_with("/namespaces/") || path.starts_with("/nexus/endpoints/")
+        let parts = path.trim_start_matches('/').split('/').collect::<Vec<_>>();
+        (parts.len() >= 7
+            && parts.first() == Some(&"namespaces")
+            && parts.get(2) == Some(&"task-queues")
+            && parts.get(4) == Some(&"nexus-services"))
+            || (parts.len() >= 6
+                && parts.first() == Some(&"nexus")
+                && parts.get(1) == Some(&"endpoints")
+                && parts.get(3) == Some(&"services"))
     }
 
     /// Process one caller-facing Nexus HTTP request through the complete

@@ -14,7 +14,7 @@ That means this crate is responsible for:
 - long-poll admission,
 - request/response translation,
 - optional front-door routing/forwarding decisions,
-- HTTP proxy path parsing for Temporal-style `/api/v1/{service}/{method}` routes.
+- descriptor-derived Temporal HTTP/JSON route recognition and protobuf transcoding.
 
 And it is deliberately **not** responsible for:
 
@@ -43,7 +43,7 @@ Even though this is still a starter crate, it contains concrete shapes for:
 - `EdgeInterceptors`
 - `LongPollGate`
 - `NamespaceCache`
-- `HttpProxy` route parsing
+- `http_api` route, ProtoJSON/payload, Host/header, transcoding, and status adapters
 - translation between edge DTOs and internal runtime/kernel requests
 
 ## Design choices reflected in the code

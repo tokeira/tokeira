@@ -48,13 +48,19 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 #[cfg(feature = "conformance")]
+mod conformance_grpc_authenticator;
+#[cfg(feature = "conformance")]
 mod conformance_nexus_authorizer;
 pub mod correlation_format;
+mod http_api_transport;
 mod nexus_http_transport;
 pub mod observability;
 
 #[cfg(feature = "conformance")]
+use conformance_grpc_authenticator::ConformanceGrpcAuthenticator;
+#[cfg(feature = "conformance")]
 use conformance_nexus_authorizer::ConformanceNexusHttpAuthorizer;
+use http_api_transport::HttpApiLayer;
 use nexus_http_transport::NexusHttpLayer;
 use tokeira_auth::{
     Authorizer, ClaimMapper, DefaultAuthorizer, GrantRule, GrantRules, JwksKeyProvider,
@@ -64,10 +70,10 @@ use tokeira_chasm::Library as _;
 use tokeira_config::{Cli, ConfigStorageKind, TokeiraConfig};
 use tokeira_edge::{
     Authenticator, CacheBackedRouter, CallbackResponse, EdgeInterceptors, EdgeRoutingConfig,
-    HistoryNotifyingRepository, HistoryWaitRegistry, InMemoryNamespaceCache, InMemoryOperatorApi,
-    LocalOnlyRouter, LongPollConfig, LongPollGate, NamespaceCache, OperatorService,
-    PendingQueryStore, PollerRegistry, ResolvedNamespace, RoutingCache,
-    WorkflowExecutionDescription, WorkflowService,
+    HistoryNotifyingRepository, HistoryWaitRegistry, HttpApiCatalog, HttpApiPolicy,
+    InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig, LongPollGate,
+    NamespaceCache, OperatorService, PendingQueryStore, PollerRegistry, ResolvedNamespace,
+    RoutingCache, WorkflowExecutionDescription, WorkflowService,
     conformance::{WireCoverageLayer, WireCoverageRecorder},
     grpc::{
         admin_service::AdminServiceGrpc, operator_service::OperatorServiceGrpc,
@@ -93,11 +99,18 @@ async fn build_authorization_stack(config: &TokeiraConfig) -> Result<Authorizati
         .as_ref()
         .filter(|authorization| authorization.has_identity_source())
     else {
-        return Ok(AuthorizationStack {
-            grpc: Arc::new(tokeira_edge::AllowAllAuthenticator),
+        #[cfg(feature = "conformance")]
+        let grpc = ConformanceGrpcAuthenticator::from_environment()
+            .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
+            .unwrap_or_else(|| Arc::new(tokeira_edge::AllowAllAuthenticator));
+        #[cfg(not(feature = "conformance"))]
+        let grpc = Arc::new(tokeira_edge::AllowAllAuthenticator) as Arc<dyn Authenticator>;
+        let stack = AuthorizationStack {
+            grpc,
             nexus: Arc::new(tokeira_edge::nexus_http::PermissiveNexusHttpAuthorizer),
             principal_attribution: false,
-        });
+        };
+        return Ok(stack);
     };
 
     let mut profiles = Vec::with_capacity(authorization.jwt.issuers.len());
@@ -1154,6 +1167,18 @@ where
             nexus_http_waiters,
             nexus_http_authorizer,
         )));
+    let http_api_layer = HttpApiLayer::new(
+        HttpApiCatalog::pinned().context("failed to build Temporal HTTP API route catalog")?,
+        HttpApiPolicy::new(
+            effective_config.policy.http_api.allowed_hosts.clone(),
+            effective_config
+                .policy
+                .http_api
+                .additional_forwarded_headers
+                .clone(),
+        )
+        .context("failed to compile Temporal HTTP API policy")?,
+    );
 
     // Wire the standalone-activity (CHASM) bridge onto the gRPC adapter: a CHASM
     // engine over the backend's node repository, an activity-library registry, and
@@ -1289,6 +1314,7 @@ where
                 Server::builder()
                     .accept_http1(true)
                     .layer(nexus_http_layer.clone())
+                    .layer(http_api_layer.clone())
                     .layer(CorsLayer::permissive())
                     .layer(GrpcWebLayer::new())
                     .layer(WireCoverageLayer::new(recorder))
@@ -1303,6 +1329,7 @@ where
                 Server::builder()
                     .accept_http1(true)
                     .layer(nexus_http_layer)
+                    .layer(http_api_layer)
                     .layer(CorsLayer::permissive())
                     .layer(GrpcWebLayer::new())
                     .add_service(workflow_grpc.into_service())

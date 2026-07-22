@@ -14,6 +14,8 @@ pub const GRPC_REQUEST_TOTAL: &str = "tokeira_edge_grpc_request_total";
 pub const GRPC_REQUEST_DURATION_SECONDS: &str = "tokeira_edge_grpc_request_duration_seconds";
 pub const GRPC_ERROR_TOTAL: &str = "tokeira_edge_grpc_error_total";
 pub const GRPC_ACTIVE_REQUESTS: &str = "tokeira_edge_grpc_active_requests";
+/// HTTP/JSON requests admitted to the existing gRPC service path.
+pub const HTTP_SERVICE_REQUESTS_TOTAL: &str = "tokeira_edge_http_service_requests_total";
 /// Authorization admission latency by public API and outcome.
 pub const AUTHORIZATION_DURATION_SECONDS: &str = "tokeira_edge_authorization_duration_seconds";
 /// Intentional policy denials by public API.
@@ -65,6 +67,7 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
     (GRPC_REQUEST_DURATION_SECONDS, MetricType::DurationHistogram),
     (GRPC_ERROR_TOTAL, MetricType::Counter),
     (GRPC_ACTIVE_REQUESTS, MetricType::Gauge),
+    (HTTP_SERVICE_REQUESTS_TOTAL, MetricType::Counter),
     (
         AUTHORIZATION_DURATION_SECONDS,
         MetricType::DurationHistogram,
@@ -120,6 +123,16 @@ pub fn record_grpc_error(method: &str, namespace: &str, error_code: &str) {
         "method" => method.to_string(),
         "namespace" => namespace.to_string(),
         "error_code" => error_code.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record one descriptor-transcoded HTTP call immediately before gRPC admission.
+pub fn record_http_service_request(operation: &str, namespace: &str) {
+    counter!(
+        HTTP_SERVICE_REQUESTS_TOTAL,
+        "operation" => operation.to_owned(),
+        "namespace" => namespace.to_owned(),
     )
     .increment(1);
 }
@@ -431,6 +444,35 @@ mod tests {
         assert_eq!(labels.get("stage"), Some(&"authorizer".to_owned()));
         assert_eq!(labels.len(), 2);
         assert_eq!(value, &DebugValue::Counter(1));
+    }
+
+    proptest! {
+        // Feature: edge-http-api-gateway, Property 11
+        #[test]
+        fn property_http_admission_emits_one_counter_increment_per_call(
+            calls in 1_u16..100,
+            namespace in "[a-z0-9_-]{1,24}",
+        ) {
+            let recorder = DebuggingRecorder::new();
+            with_local_recorder(&recorder, || {
+                for _ in 0..calls {
+                    record_http_service_request(
+                        "/temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo",
+                        &namespace,
+                    );
+                }
+            });
+            let snapshot = snapshot_map(&recorder);
+            let (labels, value) = snapshot
+                .get(HTTP_SERVICE_REQUESTS_TOTAL)
+                .expect("HTTP service counter");
+            prop_assert_eq!(labels.get("namespace"), Some(&namespace));
+            prop_assert_eq!(
+                labels.get("operation"),
+                Some(&"/temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo".to_owned())
+            );
+            prop_assert_eq!(value, &DebugValue::Counter(u64::from(calls)));
+        }
     }
 
     #[test]

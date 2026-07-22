@@ -49,6 +49,10 @@ parse time):
     across permissions claims and grants. ~10 field definitions, all defaulted or per-issuer;
     Temporal's `global.authorization` YAML (selectors, regex, header renames) deliberately
     collapsed — the "before" doc's authorization surface answers to this section.
+  - `[policy.http_api]` — same-listener Temporal HTTP/JSON policy. `allowed_hosts` defaults to
+    `["*"]`; entries are full-string, case-sensitive globs where only `*` is special.
+    `additional_forwarded_headers` accepts exact names or one trailing-`*` prefix and defaults to
+    empty. The gateway itself remains enabled when the section is absent.
 - **`[capacity]`** — `[capacity.performance]` (`target_workflow_starts_per_second`, `target_p99_wft_latency_ms`),
   `[capacity.dsql]` (`max_connections`, `connection_rate_per_second`, `burst_capacity`).
 - **`[emergency]`** — break-glass: `disable_stickiness`, `freeze_projection`, `cap_poll_admission`

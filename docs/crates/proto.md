@@ -25,7 +25,9 @@ Uses upstream Temporal API protos (v1.62.11) vendored via `tools/proto-sync`. Th
 
 Convenience re-exports: `common`, `enums`, `failure`, `history`, `operatorservice`, `taskqueue`, `workflow`, `workflowservice`.
 
-Service constants: `WORKFLOW_SERVICE_NAME`, `OPERATOR_SERVICE_NAME`, `WORKFLOW_HTTP_SERVICE`, `OPERATOR_HTTP_SERVICE`, `http_proxy_path()`.
+Service constants: `WORKFLOW_SERVICE_NAME` and `OPERATOR_SERVICE_NAME`. The complete public file
+descriptor set drives the HTTP/JSON gateway, and `OPENAPI_V2_JSON` / `OPENAPI_V3_YAML` expose the
+official immutable API v1.62.11 documents without runtime filesystem I/O.
 
 ## Conversions
 

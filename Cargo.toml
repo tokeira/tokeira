@@ -92,6 +92,7 @@ mimalloc = { version = "0.1.48", default-features = false }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+prost-reflect = { version = "0.12", features = ["serde"] }
 proptest = "1"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
 jsonwebtoken = "9"

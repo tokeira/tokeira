@@ -11,7 +11,7 @@ This guide is for the person who authors or operates such a file. It assumes lit
 experience: the dialect is small enough to learn from this page. The reference definition it walks
 through is `platforms/compose-syn/definition.tkd`, the live definition of the Docker-compose
 platform. The engine underneath (resources, plan/apply, state) is documented separately in
-[`docs/architecture/120-iac-framework.md`](../architecture/120-iac-framework.md); deeper design
+[`docs/architecture/120-iac-framework.md`](../../architecture/120-iac-framework.md); deeper design
 reading is collected at the end.
 
 ## The one idea
@@ -399,7 +399,7 @@ What happens on `tkp apply`, end to end:
    checked against it.
 3. **Build structure.** `deployment(cfg, cx)` runs; each builder call records a module, resource,
    service, or writeback into an in-memory deployment. Nothing external is touched.
-4. **Plan.** The engine (see [`docs/architecture/120-iac-framework.md`](../architecture/120-iac-framework.md))
+4. **Plan.** The engine (see [`docs/architecture/120-iac-framework.md`](../../architecture/120-iac-framework.md))
    refreshes live state per resource, diffs desired against actual, and produces
    Create/Update/Delete changes ordered by module dependencies.
 5. **Apply.** Changes execute in dependency order (deletes in reverse), with state saved
@@ -628,7 +628,7 @@ come for free.
 
 Deeper reading, in order of usefulness:
 
-- [`docs/architecture/120-iac-framework.md`](../architecture/120-iac-framework.md) — the engine the
+- [`docs/architecture/120-iac-framework.md`](../../architecture/120-iac-framework.md) — the engine the
   definitions realize into: resources, modules, plan/apply, state persistence.
 - `.kiro/specs/platform-config-dsl/proposals/003-rust-via-syn-deployment-definition.md` — why the
   dialect is a Rust subset, and the capability map it projects.

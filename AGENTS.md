@@ -441,8 +441,8 @@ What differs per harness. Everything in §10 applies to all three agents.
 - Worktrees via tkw: `tkw new <slug>` → `<repo>-wt/<slug>` on branch `agent/<slug>`;
   rename to `agent/kiro/<slug>` before the first push (§10.2).
 - Spec-driven: `.kiro/specs/` + `/spec`, house style in
-  `.agents/skills/kiro-spec-driven-development/` (EARS requirements, design, tasks,
-  property-based testing, ground-truth verification).
+  `.agents/skills/kiro-spec-driven-development/` (EARS, property-based testing,
+  ground-truth verification; auto-discovered via the `.kiro/skills/` symlink).
 - Commits via the `-F` message file — §7 is non-negotiable in Kiro's terminal.
 - Hooks (`.kiro/hooks/rust-quality.json`) are advisory on Stop — Kiro does not block
   there, so running the §10.4 bar before declaring done is on you.
@@ -456,7 +456,10 @@ What differs per harness. Everything in §10 applies to all three agents.
 0. **API-behaviour questions → the targeted release first** (§8): `proto/upstream/` for
    shape, server source at `v1.31.0` for behaviour. This tier sits above the spec — a
    spec that contradicts the targeted release is the thing that's wrong.
-1. **Check the spec.** `.kiro/specs/` is the source of truth for what to build.
+1. **Check the spec.** `.kiro/specs/` is the source of truth for what to build. When
+   authoring or amending one, follow the house-style skill
+   `.agents/skills/kiro-spec-driven-development/` — auto-discovered by Kiro and
+   Claude; Codex (no skills mechanism) opens its `SKILL.md` explicitly.
 2. **Check existing patterns** before inventing a new approach.
 3. **Prefer boring solutions.** The simplest approach that satisfies the requirement.
 4. **Ask if unsure.** Surface architectural implications rather than guessing.

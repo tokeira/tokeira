@@ -144,6 +144,15 @@ session automatically.
   --workspace`; exit 2 blocks until the tree compiles, with loop protection via
   `stop_hook_active`). The per-turn gate is a compile gate, not the release bar — the
   full Enforced Commands run belongs to task completion, before commit and PR.
+- Claude's native worktrees nest *inside* the repo, so the main checkout's
+  `.cargo/config.toml` is an ancestor config from every worktree cwd and cargo merges
+  the two — **array values concatenate** (a doubled alias broke `cargo lint` in every
+  such worktree) and a **string-vs-array mismatch on any key is fatal** to every cargo
+  command. Converting a key's form therefore breaks live nested worktrees until they
+  are recreated: the alias paid that one-time cost knowingly (string-form resolves
+  closest-wins, fixing the doubling); `rustflags` stays an array because its
+  self-concatenation is harmless and the transition would buy nothing. Prefer
+  string-form for new keys.
 - Cleanup is Claude's: clean worktrees are removed on exit, dirty ones prompt, and agent
   worktrees are `git worktree lock`ed while running so sweeps can't remove them.
 - Rename the branch to the fleet convention before its first push:

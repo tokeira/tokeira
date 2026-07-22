@@ -1,12 +1,14 @@
 [env]
 LOOM_WORKSPACE_ROOT = { value = "", relative = true }
 
+# Aliases are string-form: .claude/worktrees/ nest inside the repo, so this file
+# merges with the main checkout's copy from a worktree cwd — cargo concatenates
+# array values (a doubled alias breaks clippy), strings resolve closest-wins.
+# rustflags stays an array: changing an existing value's form is a fatal
+# string-vs-array merge for every live nested worktree (its harmless self-
+# concatenation is the lesser evil). See docs/agents/concurrent-agents.md.
 [alias]
-lint = [
-    "clippy",
-    "--workspace",
-    "--all-targets",
-]
+lint = "clippy --workspace --all-targets"
 
 [profile.dev]
 # Reduce debug info to line-tables only — still gives backtraces, cuts link time ~40%

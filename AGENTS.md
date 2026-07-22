@@ -70,7 +70,7 @@ Per-crate boundary contracts (state stores, provider-agnosticism, config ownersh
 
 - Edition 2024; stable toolchain pinned to 1.96 (`rust-toolchain.toml`). Formatting uses
   nightly-only options: run `cargo +nightly fmt --all` — don't check first. (CI pins a
-  dated nightly for fmt; advance it together with local dev.)
+  dated nightly for fmt — advance together.)
 - **The lint wall is compiler-enforced** in `[workspace.lints]` — prose rules drift;
   lints survive refactors. Binding today: `unsafe_code = deny` (exactly four carve-outs,
   each `#[allow]` + `// SAFETY:`), `undocumented_unsafe_blocks = deny`,
@@ -210,8 +210,6 @@ readers to skip comments. Delete such comments when you see them.
 ```rust
 // BAD — restates the code:
 // increment the revision number
-info.revision_number += 1;
-
 // GOOD — explains why this is safe/necessary:
 // Bump the revision so any task dispatched against the prior routing decision
 // is fenced as stale at start time (recordworkflowtaskstarted/api.go @ v1.31.0).
@@ -256,8 +254,8 @@ Every task follows one lifecycle:
   (ChatGPT app, managed), `<repo>-wt/…` (`tkw new` — Kiro CLI and manual).
   `.worktreeinclude` (tracked) lists the gitignored files copied into new worktrees.
 - Shared machine-wide, therefore off-limits: the git object DB and refs, `~/.cargo`, and
-  the kache store (every cargo build routes through the kache `RUSTC_WRAPPER`;
-  per-worktree `target/` dirs dedupe into one content-addressed store). **Never
+  the kache store (the kache `RUSTC_WRAPPER` dedupes per-worktree `target/` into one
+  content-addressed store). **Never
   `cargo clean`** — it defeats the shared cache and is never the fix. Never delete or
   move `target/`; never modify `~/.cargo/config.toml`, rustup toolchains,
   `RUSTC_WRAPPER`, or `KACHE_*`/`CARGO_*` configuration. If the build seems
@@ -286,6 +284,8 @@ Every task follows one lifecycle:
 - Commit only your own coherent work, on your own branch (Kiro: via `-F`, §7), with §11
   trailers. If you cannot finish, leave the worktree dirty and report what remains — do
   not half-commit.
+- Never read or commit secrets (`.env*`, keys, tokens) — fleet-wide, not just where
+  harness deny rules enforce it.
 
 #### §10.4 Finish green — the Enforced Commands bar
 
@@ -418,11 +418,11 @@ What differs per harness. Everything in §10 applies to all three agents.
 
 #### §12.2 Codex (ChatGPT app)
 
-- You run inside an app-managed worktree (`$CODEX_HOME/worktrees/…`, detached HEAD, own
-  `target/`) — a real linked worktree of this repository. Work only there. **Local**
+- You run inside an app-managed linked worktree of this repository
+  (`$CODEX_HOME/worktrees/…`, detached HEAD, own `target/`). Work only there. **Local**
   (non-worktree) chats are research-only: read and answer; never edit from Local.
-- **Your sandbox has no network** (permission profile `tokeira`, selected by the tracked
-  `.codex/config.toml`; the profile itself is defined user-level). Consequences: build
+- **Your sandbox has no network** (profile `tokeira` via the tracked
+  `.codex/config.toml`; defined user-level). Consequences: build
   from the warm registry with `--locked`; no dependency changes unless the task
   explicitly says so; no `git fetch`, no push, no `gh`. kache works invisibly underneath
   cargo — never configure around it (§10.1).
@@ -447,8 +447,8 @@ What differs per harness. Everything in §10 applies to all three agents.
   `.agents/skills/kiro-spec-driven-development/` (EARS, property-based testing,
   ground-truth verification; auto-discovered via the `.kiro/skills/` symlink).
 - Commits via the `-F` message file — §7 is non-negotiable in Kiro's terminal.
-- Hooks (`.kiro/hooks/rust-quality.json`) are advisory on Stop — Kiro does not block
-  there, so running the §10.4 bar before declaring done is on you.
+- Hooks (`.kiro/hooks/rust-quality.json`) are advisory on Stop — running the §10.4 bar
+  before declaring done is on you.
 - Permissions are user-level (`~/.kiro/settings/permissions.yaml`), deliberately outside
   the repo; push and worktree removal are ask-gated there.
 
@@ -491,25 +491,27 @@ on automatic nested-file loading — open it explicitly. Applies to every agent.
 
 ## Verification
 
+**Inner loop** (§10.4 is the finishing bar, not the per-edit loop): `cargo check -p` /
+`cargo clippy -p <crate> --all-targets` for seconds-fast leaf feedback; `cargo nextest
+run -p <crate> -E 'test(<name>)'` isolates one test per process and kills hangs at
+180 s (`.config/nextest.toml`); doctests still need `cargo test --doc`.
+
 ### Tests
 
 - Unit tests co-located per module (`#[cfg(test)]`); property-based tests with
   `proptest` for config validation, serialization round-trips, dependency ordering.
 - `cargo test --workspace` passes before every commit. The default suite requires no
   live AWS credentials and no Docker.
-- Some tests panic intentionally; only failures reported by the test harness are real
-  problems.
-- Standing properties: config TOML round-trips losslessly; unknown config fields
-  rejected; module and service dependency graphs are DAGs; state CAS admits at most one
-  of two concurrent saves from the same version.
+- Some tests panic intentionally; only harness-reported failures are real problems.
+- Standing properties: config TOML round-trips losslessly; unknown fields rejected;
+  dependency graphs are DAGs; state CAS admits one of two concurrent same-version saves.
 
 ### Functional conformance harness (Tier 2)
 
 Behavioural conformance is validated separately from `cargo test` by replaying
 Temporal's functional Go corpus (pinned at `TEMPORAL_SERVER_COMPAT`) over the real gRPC
-wire against a running `tokeirad`. Operator-invoked; lives in the sibling fork
-(`../temporal`, branch `tokeira/conformance-v1.31.0`) — never assume it runs under
-`cargo test`. The runbook (build `tokeirad`, run the full corpus or one suite, distil
+wire against a running `tokeirad`. Operator-invoked from the sibling fork's branch
+`tokeira/conformance-v1.31.0` — never assume it runs under `cargo test`. The runbook (build `tokeirad`, run the full corpus or one suite, distil
 outcomes) and the conventions binding any fix derived from a run (v1.31.0 ground truth,
 no kernel additions, config-as-constant, feature modes as independent runs, raise
 ambiguity):
@@ -549,7 +551,7 @@ proto/      upstream/ — vendored Temporal protos (authoritative wire shape, §
 .kiro/specs/  feature specs        spec/  TLA+/refinement stack
 scenarios/  e2e samples (excluded)        spikes/  throwaway probes
 docs/       agents · adr · architecture · conformance · operations · platforms ·
-            readiness · runbooks · testing · crates
+            readiness · runbooks · testing · crates · diagrams
 ```
 
 ### Working agreements

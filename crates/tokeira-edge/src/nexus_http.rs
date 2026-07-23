@@ -946,7 +946,14 @@ fn parse_request_timeout(headers: &[(String, String)]) -> Result<Option<Duration
         .parse::<f64>()
         .map_err(|_| HandlerError::bad_request("invalid request timeout header"))?
         * unit;
-    Ok(Some(Duration::seconds_f64(seconds)))
+    // A long digit run parses to a magnitude above `i64::MAX` seconds (or `f64`
+    // rounds it to INFINITY); `Duration::seconds_f64` *panics* on both. This runs
+    // before authorization on the namespace-dispatch route and the server is built
+    // `panic = "abort"`, so a panic here is an unauthenticated whole-process abort.
+    // Construct the duration totally and reject an unrepresentable value as bad input.
+    let timeout = Duration::checked_seconds_f64(seconds)
+        .ok_or_else(|| HandlerError::bad_request("invalid request timeout header"))?;
+    Ok(Some(timeout))
 }
 
 fn dispatch_deadline(
@@ -957,7 +964,20 @@ fn dispatch_deadline(
     let dispatch_deadline = now + DISPATCH_TIMEOUT;
     request_timeout
         .filter(|timeout| timeout.is_positive())
-        .map(|timeout| (request_started + timeout - CALLER_DEADLINE_BUFFER).max(now))
+        // A caller-supplied `Request-Timeout` can be a valid `Duration` yet large
+        // enough (up to ~i64::MAX seconds) to overflow the datetime addition.
+        // `OffsetDateTime`'s `+`/`-` panic on overflow, aborting under `panic =
+        // "abort"`, so derive the caller deadline with checked arithmetic; an
+        // un-representable deadline is treated as "no bound tighter than our own
+        // dispatch timeout". `now + DISPATCH_TIMEOUT` above is server-controlled
+        // (a small constant added to the current clock) and cannot be driven to
+        // overflow by request input.
+        .and_then(|timeout| {
+            request_started
+                .checked_add(timeout)
+                .and_then(|deadline| deadline.checked_sub(CALLER_DEADLINE_BUFFER))
+        })
+        .map(|caller_deadline| caller_deadline.max(now))
         .map_or(dispatch_deadline, |caller_deadline| {
             caller_deadline.min(dispatch_deadline)
         })
@@ -978,6 +998,22 @@ fn parse_links(headers: &[(String, String)]) -> Result<Vec<NexusTaskLink>, Handl
         .map(parse_link)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| HandlerError::bad_request("invalid \"nexus-link\" header"))
+}
+
+/// Strip a single pair of surrounding double quotes from an HTTP header parameter
+/// value, returning `None` when the quoting is unbalanced (including a lone `"`).
+///
+/// A single `"` satisfies both `starts_with('"')` and `ends_with('"')`, so the naive
+/// `&value[1..value.len() - 1]` becomes `&value[1..0]` and panics — an unauthenticated
+/// process abort under `panic = "abort"`. Requiring a matching closing quote on the
+/// post-prefix remainder makes the strip total for any attacker-controlled input:
+/// `strip_suffix` on the (possibly empty) remainder yields `None` for a lone quote.
+fn strip_optional_quotes(value: &str) -> Option<&str> {
+    match value.strip_prefix('"') {
+        Some(inner) => inner.strip_suffix('"'),
+        None if value.ends_with('"') => None,
+        None => Some(value),
+    }
 }
 
 fn parse_link(value: &str) -> Result<NexusTaskLink, ()> {
@@ -1001,12 +1037,7 @@ fn parse_link(value: &str) -> Result<NexusTaskLink, ()> {
         let (key, mut value) = parameter.split_once('=').ok_or(())?;
         let key = key.trim();
         value = value.trim();
-        if value.starts_with('"') != value.ends_with('"') {
-            return Err(());
-        }
-        if value.starts_with('"') {
-            value = &value[1..value.len() - 1];
-        }
+        value = strip_optional_quotes(value).ok_or(())?;
         if key == "type" {
             validate_link_type(value)?;
             link_type = Some(value.to_owned());
@@ -1134,12 +1165,7 @@ fn parse_media_type(value: &str) -> Option<(String, BTreeMap<String, String>)> {
         let (name, mut value) = part.trim().split_once('=')?;
         let name = name.trim().to_ascii_lowercase();
         value = value.trim();
-        if value.starts_with('"') != value.ends_with('"') {
-            return None;
-        }
-        if value.starts_with('"') {
-            value = &value[1..value.len() - 1];
-        }
+        value = strip_optional_quotes(value)?;
         parameters.insert(name, value.to_owned());
     }
     Some((media_type, parameters))
@@ -2064,6 +2090,50 @@ mod tests {
         }
         let headers = vec![("Request-Timeout".to_owned(), "1h".to_owned())];
         assert!(parse_request_timeout(&headers).is_err());
+    }
+
+    // Security F1: an unauthenticated `Request-Timeout` header must never reach a
+    // panicking duration/datetime constructor — the process runs `panic = "abort"`, so
+    // a panic on this pre-authorization path is a whole-node denial of service.
+    #[test]
+    fn request_timeout_rejects_out_of_range_values_without_panicking() {
+        // ~20 digits exceeds i64::MAX seconds; a 400-digit run rounds to f64 INFINITY.
+        // Both panic in `Duration::seconds_f64`; both must be clean bad requests.
+        let infinity = format!("{}s", "9".repeat(400));
+        for value in ["10000000000000000000s", infinity.as_str()] {
+            let headers = vec![("Request-Timeout".to_owned(), value.to_owned())];
+            assert!(
+                parse_request_timeout(&headers).is_err(),
+                "expected bad request, not a panic, for {value:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_deadline_saturates_on_caller_timeout_overflow() {
+        // A large-but-valid caller timeout overflows `request_started + timeout`;
+        // checked arithmetic must fall back to the dispatch-timeout bound, not panic.
+        let now = OffsetDateTime::now_utc();
+        let deadline = dispatch_deadline(now, Some(Duration::seconds(i64::MAX)), now);
+        assert_eq!(deadline, now + DISPATCH_TIMEOUT);
+    }
+
+    // Security F2: a lone `"` satisfied the old balanced-quote guard and drove
+    // `&value[1..0]`, a slice panic (→ abort). Quote-stripping must be total.
+    #[test]
+    fn nexus_link_rejects_lone_quote_parameter_without_panicking() {
+        assert!(parse_link("<http://x>; type=\"").is_err());
+        let link = parse_link("<http://x>; type=\"application/json\"").expect("valid link");
+        assert_eq!(link.link_type, "application/json");
+    }
+
+    #[test]
+    fn media_type_rejects_lone_quote_parameter_without_panicking() {
+        assert!(parse_media_type("text/plain; charset=\"").is_none());
+        let (media_type, parameters) =
+            parse_media_type("text/plain; charset=\"utf-8\"").expect("valid media type");
+        assert_eq!(media_type, "text/plain");
+        assert_eq!(parameters.get("charset").map(String::as_str), Some("utf-8"));
     }
 
     #[test]

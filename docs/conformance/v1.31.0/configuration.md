@@ -104,7 +104,7 @@ frontend.nexusRequestHeadersBlacklist             # multi-cluster forwarding —
 tokeira-owned (Wave 0 `PolicyConfig.nexus_completion`; not a Temporal key):
 
 ```
-nexus_completion.http_addr            # inbound /nexus/callback listener bind (default 0.0.0.0:7253)
+nexus_completion.http_addr            # inbound /nexus/callback listener bind (default 127.0.0.1:7253, loopback)
 nexus_completion.system_callback_url  # URL workers POST completions to (default http://127.0.0.1:7253)
 nexus_completion.retry_policy         # 1s initial / 1h max / 2.0 coeff; unbounded attempts
 ```

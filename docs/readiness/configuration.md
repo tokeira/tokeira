@@ -38,8 +38,8 @@ parse time):
   - `[policy.quotas]` — `max_workflow_timeout_seconds`, `max_signal_payload_bytes`.
   - `[policy.compatibility]` — `enable_standalone_activities` (off = v1.31.0 baseline; on = declared deviation).
   - `[policy.nexus_endpoint_limits]` — the six endpoint admin limits (v1.31.0-faithful defaults).
-  - `[policy.nexus_completion]` — `http_addr` (`0.0.0.0:7253`), `system_callback_url`
-    (`http://127.0.0.1:7253`), retry policy (1s / 1h / 2.0 / unbounded).
+  - `[policy.nexus_completion]` — `http_addr` (`127.0.0.1:7253`, loopback by default),
+    `system_callback_url` (`http://127.0.0.1:7253`), retry policy (1s / 1h / 2.0 / unbounded).
   - `[policy.authorization]` — authn/authz, **presence-enables** — the section absent is the
     permissive default (the empty-file claim is untouched), and configuring an identity source
     *is* the enforcement switch (no `enabled` boolean, no selector strings).

@@ -1047,16 +1047,17 @@ where
             // stores it verbatim and Describe falls back on empty.
             next_activity.started_identity = Some(worker_identity.clone());
 
-            // Emit ActivityTaskStarted so the SDK's activity state machine
-            // sees the required Scheduled → Started → Completed sequence — UNLESS
-            // a workflow task is currently started, in which case the event
-            // buffers: the worker's history view is frozen, so it is held on
-            // state and flushed (reordered before its resolution) when the WFT
-            // closes (`bufferEvent`, event_store.go:263 @ v1.31.0;
-            // TestBufferedEventsOutOfOrder). The activity task still dispatches —
-            // its token is keyed on the scheduled event id, not the started id —
-            // and the matching resolution buffers in the kernel, wired to this
-            // event's real id at flush.
+            // A retry-policy activity start is transient: v1.31.0 persists
+            // mutable start metadata but does not consume a history event until
+            // terminal resolution (`AddActivityTaskStartedEvent`,
+            // mutable_state_impl.go:4082-4152 @ v1.31.0). A retryable failure
+            // clears this marker when advancing the attempt, so neither Started
+            // nor Failed appears for an intermediate attempt.
+            //
+            // A non-retry start remains immediate unless a WFT is running. In
+            // that case the worker's history view is frozen, so Started buffers
+            // and is flushed before its matching resolution (`bufferEvent`,
+            // event_store.go:263 @ v1.31.0; TestBufferedEventsOutOfOrder).
             let started_activity_kind = HistoryEventKind::ActivityTaskStarted {
                 activity_id: task.activity_id.clone(),
                 scheduled_event_id: current.schedule_event_id,
@@ -1069,7 +1070,11 @@ where
                 .pending_workflow_task
                 .as_ref()
                 .is_some_and(|pending| pending.started_event_id.is_some());
-            let started_history_events = if workflow_task_started {
+            let started_history_events = if current.retry_policy.is_some() {
+                next_activity.started_event_id =
+                    Some(tokeira_kernel::TRANSIENT_ACTIVITY_STARTED_EVENT_ID);
+                SmallVec::new()
+            } else if workflow_task_started {
                 next_activity.started_event_id = Some(tokeira_kernel::BUFFERED_EVENT_ID);
                 next_state
                     .buffered_events
@@ -1094,15 +1099,16 @@ where
                 .activities
                 .insert(task.activity_id.clone(), next_activity.clone());
 
+            let event_principals = if started_history_events.is_empty() {
+                SmallVec::new()
+            } else {
+                smallvec![None]
+            };
             let transition = Transition {
                 expected_seq: state.transition_seq,
                 next_state,
                 history_events: started_history_events,
-                event_principals: if workflow_task_started {
-                    SmallVec::new()
-                } else {
-                    smallvec![None]
-                },
+                event_principals,
                 request_dedupe_ops: SmallVec::new(),
                 activity_ops: smallvec![ActivityOp::Upsert(next_activity.clone())],
                 timer_ops: SmallVec::new(),
@@ -1869,6 +1875,7 @@ mod tests {
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
             buffered_events: Vec::new(),
+            auto_reset_points: Vec::new(),
         }
     }
 

@@ -5112,7 +5112,8 @@ mod tests {
                     queue: queue.clone(),
                     logical_seq: LogicalTaskSeq(1),
                     sticky_preferred: None,
-                    sticky_expires_at: None,
+                    normal_queue: None,
+                    sticky_deadline: None,
                 },
                 None,
             )

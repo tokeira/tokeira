@@ -133,6 +133,7 @@ impl StoreExecutionResolver {
                     first_run_id: state.first_execution_run_id,
                     memo: state.memo,
                     search_attributes: state.search_attributes,
+                    auto_reset_points: state.auto_reset_points,
                     pending_activities: state
                         .activities
                         .values()

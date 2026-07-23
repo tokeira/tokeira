@@ -55,7 +55,6 @@ does not support or cannot yet populate, along with rationale.
 |---|---|---|
 | `execution_config.user_metadata` | Not populated | Start user metadata is not retained yet |
 | `workflow_execution_info.versioning_info`, worker deployment/build-id fields | Not populated | Worker deployment/versioning state is not retained yet |
-| `workflow_execution_info.auto_reset_points` | Not populated | Reset-point tracking is not retained yet |
 | `workflow_execution_info.priority` | Not populated | Workflow priority state is not modeled yet |
 | `workflow_execution_info.external_payload_size_bytes`, `external_payload_count` | Not populated | External payload accounting is not modeled yet |
 | `pending_activities.heartbeat_details`, heartbeat/retry timing fields | Not populated | Activity heartbeat and attempt timing state is not retained yet |

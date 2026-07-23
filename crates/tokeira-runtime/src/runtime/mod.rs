@@ -2225,6 +2225,7 @@ mod tests {
             sticky: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
@@ -2253,7 +2254,8 @@ mod tests {
                     queue: queue.clone(),
                     logical_seq: LogicalTaskSeq(logical_seq),
                     sticky_preferred: None,
-                    sticky_expires_at: None,
+                    normal_queue: None,
+                    sticky_deadline: None,
                 };
 
                 broker.publish_workflow_task(task.clone(), None).await;
@@ -2510,6 +2512,22 @@ mod tests {
             deployment: None,
             build_id: None,
         };
+        let hydrated_sticky = QueueKey {
+            deployment: Some(DeploymentId("deployment".to_string())),
+            build_id: Some(BuildId("v1".to_string())),
+            ..sticky_queue.clone()
+        };
+        assert!(
+            workflow_broker
+                .poll_workflow_task(
+                    &hydrated_sticky,
+                    &WorkerIdentity("worker-v1".to_string()),
+                    std::time::Duration::ZERO,
+                )
+                .await
+                .expect("sticky liveness observation")
+                .is_none()
+        );
         publisher
             .publish(
                 run_key,
@@ -2523,11 +2541,6 @@ mod tests {
             )
             .await
             .expect("publish current sticky dispatch");
-        let hydrated_sticky = QueueKey {
-            deployment: Some(DeploymentId("deployment".to_string())),
-            build_id: Some(BuildId("v1".to_string())),
-            ..sticky_queue.clone()
-        };
         assert!(
             workflow_broker.has_runnable_backlog(&hydrated_sticky).await,
             "an omitted queue target is hydrated from committed effective state"

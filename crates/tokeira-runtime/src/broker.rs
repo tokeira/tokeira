@@ -11,11 +11,10 @@
 //! Workflow tasks and direct query tasks share the same poll wake path because
 //! Temporal SDKs only poll `PollWorkflowTaskQueue` for both surfaces
 //! (`service/matching/matching_engine.go:1084 @ v1.31.0`). Work enters a
-//! *sticky* tier when a worker owns cache affinity. If that worker does not
-//! take the item before the item-specific sticky deadline, it is promoted to
-//! the *live* tier where any matching poller can claim it. Durable backlog
-//! scanning remains outside this broker: the broker is a disposable delivery
-//! optimizer, never the source of correctness.
+//! *sticky* tier only when that worker has polled recently or is actively
+//! parked. Otherwise publication immediately selects the supplied normal-queue
+//! fallback. A pending WFT deadline is a timeout fence, not an affinity expiry;
+//! durable backlog scanning remains outside this broker.
 //!
 //! ## Deduplication
 //!
@@ -63,13 +62,15 @@ use crate::{
     DeliveryMetrics, QueryResult, QueryTask, StartedWorkflowTask, metrics as runtime_metrics,
 };
 
+const STICKY_POLLER_AVAILABILITY_WINDOW: Duration = Duration::from_secs(10);
+
 /// Lightweight in-memory workflow-task broker.
 ///
 /// The broker exists so pollers do not become durable objects. The interesting
 /// thing here is not the data structure sophistication, but the contract:
 /// - worker polls stay memory-only,
 /// - sticky preference is honored when possible,
-/// - stale sticky hints are allowed to decay into general readiness,
+/// - unavailable sticky hints fall back atomically at publication,
 /// - duplicate publications are suppressed by logical task identity.
 #[derive(Default, Clone)]
 pub struct InMemoryBroker {
@@ -132,6 +133,7 @@ struct BrokerState {
     query_ready: HashMap<QueueKey, VecDeque<QueryTask>>,
     query_waiter_counts: HashMap<QueueKey, usize>,
     denied_workers: HashSet<(NamespaceId, TaskQueueName, WorkerIdentity)>,
+    poller_observations: HashMap<(QueueKey, WorkerIdentity), Instant>,
     /// Per-queue wake handles, created on first use and shared by workflow and
     /// query pollers on that queue (they share the poll path). Grows with
     /// distinct queues seen, like the ready/waiter maps; the broker is
@@ -363,59 +365,14 @@ impl InMemoryBroker {
             return None;
         }
 
-        let now = OffsetDateTime::now_utc();
-        let mut promote_to_general = Vec::new();
-        let mut matched = None;
-
-        if let Some(sticky) = inner.sticky_ready.get_mut(queue) {
-            let mut idx = 0;
-            while idx < sticky.len() {
-                let action = match sticky.get(idx) {
-                    Some(task)
-                        if task.task.run_key == run_key
-                            && worker.is_some()
-                            && task.task.sticky_preferred.as_ref() == worker =>
-                    {
-                        StickyAction::Take
-                    }
-                    Some(task)
-                        if task
-                            .task
-                            .sticky_expires_at
-                            .is_some_and(|expires_at| expires_at <= now) =>
-                    {
-                        StickyAction::Promote
-                    }
-                    Some(task) if task.task.sticky_preferred.is_none() => StickyAction::Promote,
-                    Some(_) => StickyAction::Keep,
-                    None => break,
-                };
-
-                match action {
-                    StickyAction::Take => {
-                        matched = sticky.remove(idx);
-                        break;
-                    }
-                    StickyAction::Promote => {
-                        if let Some(mut task) = sticky.remove(idx) {
-                            task.task.sticky_preferred = None;
-                            task.task.sticky_expires_at = None;
-                            promote_to_general.push(task);
-                        }
-                    }
-                    StickyAction::Keep => {
-                        idx += 1;
-                    }
-                }
-            }
-        }
-
-        if !promote_to_general.is_empty() {
-            let general = inner.general_ready.entry(queue.clone()).or_default();
-            for task in promote_to_general {
-                general.push_back(task);
-            }
-        }
+        let matched = inner.sticky_ready.get_mut(queue).and_then(|sticky| {
+            let index = sticky.iter().position(|task| {
+                task.task.run_key == run_key
+                    && worker.is_some()
+                    && task.task.sticky_preferred.as_ref() == worker
+            })?;
+            sticky.remove(index)
+        });
 
         let matched = matched.or_else(|| {
             let ready = inner.general_ready.get_mut(queue)?;
@@ -436,13 +393,33 @@ impl InMemoryBroker {
     }
 
     /// Publish a query task without deduplication or backlog participation.
-    pub async fn publish_query_task(&self, task: QueryTask) {
+    pub async fn publish_query_task(&self, mut task: QueryTask) {
         let queue = task.queue.clone();
-        let sticky_queue = task.sticky_queue.as_ref().map(|sticky_queue| QueueKey {
-            task_queue: sticky_queue.clone(),
-            ..queue.clone()
-        });
+        let sticky_queue = task
+            .sticky_queue
+            .as_ref()
+            .map(|sticky_queue| QueueKey {
+                task_queue: sticky_queue.clone(),
+                ..queue.clone()
+            })
+            .or_else(|| task.sticky_preferred.as_ref().map(|_| queue.clone()));
         let mut inner = self.inner.lock().await;
+        // Matching returns StickyWorkerUnavailable immediately when the
+        // targeted sticky worker has no active/recent poll, so history can
+        // retry the query on the normal queue without consuming the entire
+        // sticky S2S window (`matching_engine.go:1093-1099` and
+        // `queryworkflow/api.go:350-410 @ v1.31.0`). This is transient routing
+        // only: durable affinity is left for the normal fallback start/query
+        // lifecycle to resolve.
+        if let (Some(sticky_queue), Some(worker)) =
+            (sticky_queue.as_ref(), task.sticky_preferred.as_ref())
+            && !Self::sticky_worker_available(&inner, sticky_queue, worker)
+        {
+            task.sticky_preferred = None;
+            task.sticky_queue = None;
+            task.sticky_deadline = None;
+        }
+        let wake_sticky = task.sticky_preferred.is_some();
         inner
             .query_ready
             .entry(queue.clone())
@@ -453,7 +430,10 @@ impl InMemoryBroker {
         // observations so the sticky-first attempt does not wait for an
         // unrelated event (`queryworkflow/api.go:350-410 @ v1.31.0`).
         let normal_wake = inner.wakes.entry(queue.clone()).or_default().clone();
-        let sticky_wake = sticky_queue
+        let sticky_wake = wake_sticky
+            .then_some(())
+            .and(sticky_queue.as_ref())
+            .cloned()
             .filter(|sticky| sticky != &queue)
             .map(|sticky| inner.wakes.entry(sticky).or_default().clone());
         drop(inner);
@@ -541,13 +521,15 @@ impl InMemoryBroker {
         wait_for: Duration,
         include_query: bool,
     ) -> Result<Option<WorkflowPollResult>> {
-        if self.is_denied(queue, worker).await {
+        if !self.record_workflow_poller(queue, worker).await {
             return Ok(None);
         }
         if let Some(task) = self.try_take(queue, worker).await? {
+            let _ = self.record_workflow_poller(queue, worker).await;
             return Ok(Some(WorkflowPollResult::Queued(task.0, task.1)));
         }
         if include_query && let Some(task) = self.try_take_query(queue, worker).await {
+            let _ = self.record_workflow_poller(queue, worker).await;
             return Ok(Some(WorkflowPollResult::Query(task)));
         }
 
@@ -599,6 +581,12 @@ impl InMemoryBroker {
         };
 
         self.remove_workflow_waiter(queue, waiter_id).await;
+        // Reaching this point is a normal completion or timeout. Client
+        // cancellation drops the future before here, so it deliberately does
+        // not refresh the admission observation
+        // (`ctx.Err() != context.Canceled`,
+        // task_queue_partition_manager.go:617-621 @ v1.31.0).
+        let _ = self.record_workflow_poller(queue, worker).await;
         result
     }
 
@@ -609,12 +597,20 @@ impl InMemoryBroker {
     /// placed in the sticky tier; all others go to general.
     pub async fn publish_workflow_task(
         &self,
-        task: DispatchableWorkflowTask,
+        mut task: DispatchableWorkflowTask,
         metrics: Option<&DeliveryMetrics>,
     ) {
+        let mut inner = self.inner.lock().await;
+        if task.sticky_preferred.is_some()
+            && !Self::sticky_poller_available(&inner, &task)
+            && let Some(normal_queue) = task.normal_queue.take()
+        {
+            task.queue = normal_queue;
+            task.sticky_preferred = None;
+            task.sticky_deadline = None;
+        }
         runtime_metrics::record_broker_publish(&task.queue);
         let queue = task.queue.clone();
-        let mut inner = self.inner.lock().await;
         let dedupe_key = (task.run_key, task.logical_seq);
         if !inner.enqueued.insert(dedupe_key) {
             return;
@@ -652,6 +648,58 @@ impl InMemoryBroker {
         wake.notify_waiters();
     }
 
+    fn sticky_poller_available(inner: &BrokerState, task: &DispatchableWorkflowTask) -> bool {
+        let Some(worker) = task.sticky_preferred.as_ref() else {
+            return false;
+        };
+        Self::sticky_worker_available(inner, &task.queue, worker)
+    }
+
+    fn sticky_worker_available(
+        inner: &BrokerState,
+        queue: &QueueKey,
+        worker: &WorkerIdentity,
+    ) -> bool {
+        if inner.denied_workers.contains(&(
+            queue.namespace_id,
+            queue.task_queue.clone(),
+            worker.clone(),
+        )) {
+            return false;
+        }
+        let active = inner.workflow_waiters.get(queue).is_some_and(|waiters| {
+            waiters
+                .iter()
+                .any(|waiter| waiter.worker == *worker && !waiter.response_tx.is_closed())
+        });
+        active
+            || inner
+                .poller_observations
+                .get(&(queue.clone(), worker.clone()))
+                .is_some_and(|observed_at| {
+                    observed_at.elapsed() <= STICKY_POLLER_AVAILABILITY_WINDOW
+                })
+    }
+
+    async fn record_workflow_poller(&self, queue: &QueueKey, worker: &WorkerIdentity) -> bool {
+        let mut inner = self.inner.lock().await;
+        if inner.denied_workers.contains(&(
+            queue.namespace_id,
+            queue.task_queue.clone(),
+            worker.clone(),
+        )) {
+            return false;
+        }
+        let now = Instant::now();
+        inner.poller_observations.retain(|_, observed_at| {
+            now.duration_since(*observed_at) <= STICKY_POLLER_AVAILABILITY_WINDOW
+        });
+        inner
+            .poller_observations
+            .insert((queue.clone(), worker.clone()), now);
+        true
+    }
+
     /// Stop future workflow-task deliveries for a worker on one sticky queue.
     ///
     /// The upstream shutdown API identifies a sticky workflow-task queue, not
@@ -666,7 +714,12 @@ impl InMemoryBroker {
         let mut inner = self.inner.lock().await;
         inner
             .denied_workers
-            .insert((namespace_id, task_queue, worker));
+            .insert((namespace_id, task_queue.clone(), worker.clone()));
+        inner.poller_observations.retain(|(queue, identity), _| {
+            queue.namespace_id != namespace_id
+                || queue.task_queue != task_queue
+                || identity != &worker
+        });
         // Deny carries only (namespace, task_queue, worker) — not a poller's full
         // QueueKey — and is a rare shutdown path, so wake every queue's waiters;
         // each re-checks `is_denied` on wake and the denied one returns empty.
@@ -680,9 +733,9 @@ impl InMemoryBroker {
     /// Long-poll for a workflow task on `queue`.
     ///
     /// Returns immediately if a task is available, otherwise
-    /// blocks up to `wait_for`. Sticky tasks matching `worker`
-    /// are preferred; expired sticky hints are promoted to the
-    /// general tier.
+    /// blocks up to `wait_for`. Sticky tasks on this queue are delivered only
+    /// to their preferred worker; unavailable affinity was already redirected
+    /// atomically when the task was published.
     pub async fn poll_workflow_task(
         &self,
         queue: &QueueKey,
@@ -913,55 +966,12 @@ impl InMemoryBroker {
         )) {
             return Ok(None);
         }
-        let now = OffsetDateTime::now_utc();
-        let mut promote_to_general = Vec::new();
-        let mut matched = None;
-
-        if let Some(sticky) = inner.sticky_ready.get_mut(queue) {
-            let mut idx = 0;
-            while idx < sticky.len() {
-                let action = match sticky.get(idx) {
-                    Some(task) if task.task.sticky_preferred.as_ref() == Some(worker) => {
-                        StickyAction::Take
-                    }
-                    Some(task)
-                        if task
-                            .task
-                            .sticky_expires_at
-                            .is_some_and(|expires_at| expires_at <= now) =>
-                    {
-                        StickyAction::Promote
-                    }
-                    Some(task) if task.task.sticky_preferred.is_none() => StickyAction::Promote,
-                    Some(_) => StickyAction::Keep,
-                    None => break,
-                };
-
-                match action {
-                    StickyAction::Take => {
-                        matched = sticky.remove(idx);
-                        break;
-                    }
-                    StickyAction::Promote => {
-                        if let Some(mut task) = sticky.remove(idx) {
-                            task.task.sticky_preferred = None;
-                            task.task.sticky_expires_at = None;
-                            promote_to_general.push(task);
-                        }
-                    }
-                    StickyAction::Keep => {
-                        idx += 1;
-                    }
-                }
-            }
-        }
-
-        if !promote_to_general.is_empty() {
-            let general = inner.general_ready.entry(queue.clone()).or_default();
-            for task in promote_to_general {
-                general.push_back(task);
-            }
-        }
+        let matched = inner.sticky_ready.get_mut(queue).and_then(|sticky| {
+            let index = sticky
+                .iter()
+                .position(|task| task.task.sticky_preferred.as_ref() == Some(worker))?;
+            sticky.remove(index)
+        });
 
         if let Some(task) = matched {
             inner
@@ -1562,15 +1572,6 @@ impl InMemoryActivityBroker {
     }
 }
 
-/// Per-entry decision while scanning the sticky tier on a poll: hand the task to
-/// the polling worker (`Take`), demote a stale/unowned sticky task to the
-/// general tier (`Promote`), or leave it for its preferred worker (`Keep`).
-enum StickyAction {
-    Keep,
-    Promote,
-    Take,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,7 +1626,68 @@ mod tests {
             queue,
             logical_seq: LogicalTaskSeq::ONE,
             sticky_preferred: None,
-            sticky_expires_at: None,
+            normal_queue: None,
+            sticky_deadline: None,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn sticky_availability_matches_recent_active_and_denied_model(
+            recent_observation in any::<bool>(),
+            active_waiter in any::<bool>(),
+            closed_waiter in any::<bool>(),
+            denied in any::<bool>(),
+        ) {
+            // Feature: api-conformance-client-misc, Property 5: sticky availability and immediate fallback
+            let queue = workflow_queue("sticky", None, None);
+            let worker = WorkerIdentity("sticky-worker".into());
+            let mut state = BrokerState::default();
+            let observed_age = if recent_observation {
+                Duration::from_secs(9)
+            } else {
+                Duration::from_secs(11)
+            };
+            state.poller_observations.insert(
+                (queue.clone(), worker.clone()),
+                Instant::now() - observed_age,
+            );
+
+            let mut live_receiver = None;
+            if active_waiter {
+                let (response_tx, response_rx) = oneshot::channel();
+                if closed_waiter {
+                    drop(response_rx);
+                } else {
+                    live_receiver = Some(response_rx);
+                }
+                state
+                    .workflow_waiters
+                    .entry(queue.clone())
+                    .or_default()
+                    .push_back(WorkflowWaiter {
+                        id: 1,
+                        worker: worker.clone(),
+                        response_tx,
+                    });
+            }
+            if denied {
+                state.denied_workers.insert((
+                    queue.namespace_id,
+                    queue.task_queue.clone(),
+                    worker.clone(),
+                ));
+            }
+
+            let expected = !denied
+                && (recent_observation || (active_waiter && !closed_waiter));
+            prop_assert_eq!(
+                InMemoryBroker::sticky_worker_available(&state, &queue, &worker),
+                expected
+            );
+            drop(live_receiver);
         }
     }
 
@@ -2054,37 +2116,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sticky_promotion_preserves_original_entry_timestamp() {
+    async fn sticky_publication_falls_back_when_worker_is_unavailable() {
         let broker = InMemoryBroker::default();
-        let queue = workflow_queue("queue-a", None, None);
+        let sticky_queue = workflow_queue("sticky", None, None);
+        let normal_queue = QueueKey {
+            task_queue: TaskQueueName("normal".into()),
+            ..sticky_queue.clone()
+        };
         let task = DispatchableWorkflowTask {
             sticky_preferred: Some(WorkerIdentity("worker-a".to_string())),
-            sticky_expires_at: Some(OffsetDateTime::UNIX_EPOCH),
-            ..workflow_task(queue.clone())
+            normal_queue: Some(normal_queue.clone()),
+            sticky_deadline: Some(OffsetDateTime::UNIX_EPOCH),
+            ..workflow_task(sticky_queue)
         };
 
         broker.publish_workflow_task(task.clone(), None).await;
-        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-        {
-            let mut inner = broker.inner.lock().await;
-            let sticky = inner.sticky_ready.get_mut(&queue).unwrap();
-            let mut entry = sticky.pop_front().unwrap();
-            entry.task.sticky_preferred = None;
-            entry.task.sticky_expires_at = None;
-            inner
-                .general_ready
-                .entry(queue.clone())
-                .or_default()
-                .push_back(entry);
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-        let expired = broker
-            .take_expired(std::time::Duration::from_millis(5))
+        let delivered = broker
+            .poll_workflow_task(
+                &normal_queue,
+                &WorkerIdentity("worker-b".into()),
+                std::time::Duration::ZERO,
+            )
             .await;
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].task.run_key, task.run_key);
-        assert_eq!(expired[0].task.logical_seq, task.logical_seq);
+        let delivered = delivered
+            .unwrap()
+            .expect("normal fallback is immediately ready")
+            .into_queued()
+            .expect("workflow task");
+        assert_eq!(delivered.0.queue, normal_queue);
+        assert_eq!(delivered.0.sticky_preferred, None);
+        assert_eq!(delivered.0.sticky_deadline, None);
     }
 
     #[tokio::test]
@@ -2155,6 +2216,8 @@ mod tests {
     async fn query_poll_prefers_matching_sticky_worker() {
         let broker = InMemoryBroker::default();
         let queue = workflow_queue("queue-a", None, None);
+        let sticky_worker = WorkerIdentity("worker-a".into());
+        assert!(broker.record_workflow_poller(&queue, &sticky_worker).await);
         let (sticky_tx, _sticky_rx) = oneshot::channel();
         broker
             .publish_query_task(QueryTask {
@@ -2162,7 +2225,7 @@ mod tests {
                 query_type: "sticky".into(),
                 query_args: Payloads::default(),
                 queue: queue.clone(),
-                sticky_preferred: Some(WorkerIdentity("worker-a".into())),
+                sticky_preferred: Some(sticky_worker.clone()),
                 sticky_queue: None,
                 sticky_deadline: None,
                 response_tx: sticky_tx,
@@ -2191,11 +2254,7 @@ mod tests {
             .await
             .expect("general query should still deliver");
         let sticky_worker = broker
-            .poll_query_task(
-                &queue,
-                &WorkerIdentity("worker-a".into()),
-                std::time::Duration::from_millis(5),
-            )
+            .poll_query_task(&queue, &sticky_worker, std::time::Duration::from_millis(5))
             .await
             .expect("sticky query should deliver to matching worker");
 
@@ -2213,6 +2272,7 @@ mod tests {
             ..normal_queue.clone()
         };
         let worker = WorkerIdentity("worker-a".into());
+        assert!(broker.record_workflow_poller(&sticky_queue, &worker).await);
         let (tx, _rx) = oneshot::channel();
         broker
             .publish_query_task(QueryTask {
@@ -2322,6 +2382,8 @@ mod tests {
     async fn workflow_poll_falls_back_when_sticky_query_deadline_elapses() {
         let broker = InMemoryBroker::default();
         let queue = workflow_queue("queue-a", None, None);
+        let sticky_worker = WorkerIdentity("worker-a".into());
+        assert!(broker.record_workflow_poller(&queue, &sticky_worker).await);
         let (tx, _rx) = oneshot::channel();
         broker
             .publish_query_task(QueryTask {
@@ -2329,7 +2391,7 @@ mod tests {
                 query_type: "sticky-waits".into(),
                 query_args: Payloads::default(),
                 queue: queue.clone(),
-                sticky_preferred: Some(WorkerIdentity("worker-a".into())),
+                sticky_preferred: Some(sticky_worker),
                 sticky_queue: None,
                 sticky_deadline: Some(OffsetDateTime::now_utc() + TimeDuration::milliseconds(1)),
                 response_tx: tx,
@@ -2353,6 +2415,42 @@ mod tests {
             }
             other => panic!("unexpected workflow poll result: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn unavailable_sticky_query_falls_back_without_waiting_for_its_deadline() {
+        let broker = InMemoryBroker::default();
+        let normal_queue = workflow_queue("normal", None, None);
+        let (tx, _rx) = oneshot::channel();
+        broker
+            .publish_query_task(QueryTask {
+                run_key: RunKey::new(),
+                query_type: "fallback-now".into(),
+                query_args: Payloads::default(),
+                queue: normal_queue.clone(),
+                sticky_preferred: Some(WorkerIdentity("departed-worker".into())),
+                sticky_queue: Some(TaskQueueName("sticky".into())),
+                sticky_deadline: Some(OffsetDateTime::now_utc() + TimeDuration::seconds(5)),
+                response_tx: tx,
+            })
+            .await;
+
+        let task = broker
+            .poll_workflow_activation(
+                &normal_queue,
+                &WorkerIdentity("replacement-worker".into()),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap()
+            .expect("unavailable sticky target must route to the normal poller");
+        let WorkflowPollResult::Query(task) = task else {
+            panic!("expected a query task");
+        };
+        assert_eq!(task.query_type, "fallback-now");
+        assert_eq!(task.sticky_preferred, None);
+        assert_eq!(task.sticky_queue, None);
+        assert_eq!(task.sticky_deadline, None);
     }
 
     proptest! {
@@ -2530,51 +2628,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn property_sticky_promotion_preserves_original_timestamp() {
+    async fn active_sticky_poller_keeps_preferred_offer() {
         let broker = InMemoryBroker::default();
-        let queue = workflow_queue("queue-a", None, None);
+        let sticky_queue = workflow_queue("sticky", None, None);
+        let normal_queue = QueueKey {
+            task_queue: TaskQueueName("normal".into()),
+            ..sticky_queue.clone()
+        };
+        let worker = WorkerIdentity("worker-a".into());
         let task = DispatchableWorkflowTask {
-            sticky_preferred: Some(WorkerIdentity("worker-a".into())),
-            sticky_expires_at: Some(OffsetDateTime::UNIX_EPOCH),
-            ..workflow_task(queue.clone())
+            sticky_preferred: Some(worker.clone()),
+            normal_queue: Some(normal_queue),
+            sticky_deadline: Some(OffsetDateTime::UNIX_EPOCH),
+            ..workflow_task(sticky_queue.clone())
         };
 
-        broker.publish_workflow_task(task, None).await;
-
-        let original = {
-            let inner = broker.inner.lock().await;
-            inner
-                .sticky_ready
-                .get(&queue)
-                .and_then(|q| q.front())
-                .map(|entry| entry.entered_at)
-                .unwrap()
+        let poll = {
+            let broker = broker.clone();
+            let queue = sticky_queue.clone();
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                broker
+                    .poll_workflow_task(&queue, &worker, std::time::Duration::from_secs(1))
+                    .await
+            })
         };
+        await_workflow_waiter(&broker, &sticky_queue).await;
+        broker.publish_workflow_task(task.clone(), None).await;
 
-        {
-            let mut inner = broker.inner.lock().await;
-            let sticky = inner.sticky_ready.get_mut(&queue).unwrap();
-            let mut entry = sticky.pop_front().unwrap();
-            entry.task.sticky_preferred = None;
-            entry.task.sticky_expires_at = None;
-            inner
-                .general_ready
-                .entry(queue.clone())
-                .or_default()
-                .push_back(entry);
-        }
-
-        let after = {
-            let inner = broker.inner.lock().await;
-            inner
-                .general_ready
-                .get(&queue)
-                .and_then(|q| q.front())
-                .map(|entry| entry.entered_at)
-                .unwrap()
-        };
-
-        assert_eq!(after, original);
+        let delivered = poll
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("sticky poll receives task")
+            .into_queued()
+            .expect("workflow task");
+        assert_eq!(delivered.0, task);
     }
 
     proptest! {

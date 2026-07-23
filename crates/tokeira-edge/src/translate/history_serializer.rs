@@ -2015,6 +2015,16 @@ fn wft_failed_cause_i32(c: &WorkflowTaskFailedCause) -> i32 {
             C::BadStartChildExecutionAttributes
         }
         WorkflowTaskFailedCause::BadSearchAttributes => C::BadSearchAttributes,
+        WorkflowTaskFailedCause::PendingChildWorkflowsLimitExceeded => {
+            C::PendingChildWorkflowsLimitExceeded
+        }
+        WorkflowTaskFailedCause::PendingActivitiesLimitExceeded => {
+            C::PendingActivitiesLimitExceeded
+        }
+        WorkflowTaskFailedCause::PendingSignalsLimitExceeded => C::PendingSignalsLimitExceeded,
+        WorkflowTaskFailedCause::PendingRequestCancelLimitExceeded => {
+            C::PendingRequestCancelLimitExceeded
+        }
     }) as i32
 }
 
@@ -4152,7 +4162,7 @@ mod tests {
                         deployment_transition_revision_number: None,
                         target_version_changed_enabled: notification_enabled,
                         target_deployment_version: routing_target,
-                        sticky_ttl: None,
+                        polled_task_queue: TaskQueueName("queue".into()),
                         now: happened_at,
                     }),
                 )

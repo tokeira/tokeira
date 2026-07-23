@@ -1069,6 +1069,7 @@ where
                     original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
                     versioning_info: state.versioning_info.clone(),
                     worker_deployment_name: state.worker_deployment_name.clone(),
+                    auto_reset_points: state.auto_reset_points.clone(),
                     most_recent_worker_version_stamp: state
                         .versioning_info
                         .as_ref()

@@ -218,6 +218,31 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
+    // WFT completion admission resolves these namespace-scoped policy values
+    // in the runtime immediately before invoking the pure kernel. v1.31.0
+    // defaults every limit to 2000; non-positive values disable that limit
+    // (`common/dynamicconfig/constants.go` and
+    // `respondworkflowtaskcompleted/workflow_size_checker.go @ v1.31.0`).
+    KeySpec {
+        key: "limit.numPendingChildExecutions.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.numPendingActivities.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.numPendingSignals.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "limit.numPendingCancelRequests.error",
+        value_type: ValueType::Int,
+        disposition: Disposition::Wired,
+    },
     // Schedule starts are paced at a live runtime consult site. v1.31.0 owns
     // this as a namespace-scoped scheduler-worker rate
     // (`service/worker/scheduler/fx.go:116-133 @ v1.31.0`).
@@ -571,6 +596,12 @@ mod tests {
         ),
         ("history.enableVersionReactivationSignals", ValueType::Bool),
     ];
+    const PENDING_COMMAND_LIMIT_KEYS: &[&str] = &[
+        "limit.numPendingChildExecutions.error",
+        "limit.numPendingActivities.error",
+        "limit.numPendingSignals.error",
+        "limit.numPendingCancelRequests.error",
+    ];
 
     /// The classification table is internally consistent: keys are unique, and
     /// the reported-problems threshold — the proving wired consumer — is present
@@ -773,6 +804,33 @@ mod tests {
             overrides.set(REPORTED_PROBLEMS_KEY, OverrideValue::Int(first)).unwrap();
             overrides.reset();
             prop_assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
+        }
+
+        #[test]
+        fn pending_command_limit_keys_share_live_registry_lifecycle(
+            first in any::<i64>(),
+            second in any::<i64>(),
+        ) {
+            // Feature: api-conformance-client-misc, Property 1: live completion-limit resolution
+            let overrides = ConformanceOverrides::default();
+            for key in PENDING_COMMAND_LIMIT_KEYS {
+                let classified = classification(key).expect("pending limit key classified");
+                prop_assert_eq!(classified.disposition, Disposition::Wired);
+                prop_assert_eq!(classified.value_type, ValueType::Int);
+                overrides.set(key, OverrideValue::Int(first)).unwrap();
+                prop_assert_eq!(overrides.get_i64(key), Some(first));
+                overrides.set(key, OverrideValue::Int(second)).unwrap();
+                prop_assert_eq!(overrides.get_i64(key), Some(second));
+                overrides.clear(key);
+                prop_assert_eq!(overrides.get_i64(key), None);
+            }
+            for key in PENDING_COMMAND_LIMIT_KEYS {
+                overrides.set(key, OverrideValue::Int(first)).unwrap();
+            }
+            overrides.reset();
+            for key in PENDING_COMMAND_LIMIT_KEYS {
+                prop_assert_eq!(overrides.get_i64(key), None);
+            }
         }
 
         // Feature: conformance-config-override, Property 3: value-type fidelity.

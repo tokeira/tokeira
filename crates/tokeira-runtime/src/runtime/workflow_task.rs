@@ -17,7 +17,8 @@ use super::*;
 use prost::Message as _;
 use tokeira_kernel::{
     ContinueAsNewVersioningBehavior, RetryContinuation, RetryState, VersioningBehavior,
-    VersioningOverride, WorkerDeploymentVersionRef, WorkflowVersioningInfo,
+    VersioningOverride, WorkerDeploymentVersionRef, WorkflowTaskCompletionLimits,
+    WorkflowVersioningInfo,
 };
 use tokeira_observability::OutcomeLabel;
 use tokeira_proto::failure::{Failure, failure::FailureInfo};
@@ -63,6 +64,32 @@ fn target_version_changed_enabled() -> bool {
     tokeira_conformance::overrides()
         .get_bool("system.enableSendTargetVersionChanged")
         .unwrap_or(true)
+}
+
+const DEFAULT_PENDING_COMMAND_LIMIT: usize = 2_000;
+
+fn normalize_pending_command_limit(configured: Option<i64>) -> Option<usize> {
+    let configured = configured.unwrap_or(DEFAULT_PENDING_COMMAND_LIMIT as i64);
+    usize::try_from(configured).ok().filter(|limit| *limit > 0)
+}
+
+#[cfg(not(feature = "conformance"))]
+fn pending_command_limit(_key: &str) -> Option<usize> {
+    normalize_pending_command_limit(None)
+}
+
+#[cfg(feature = "conformance")]
+fn pending_command_limit(key: &str) -> Option<usize> {
+    normalize_pending_command_limit(tokeira_conformance::overrides().get_i64(key))
+}
+
+fn workflow_task_completion_limits() -> WorkflowTaskCompletionLimits {
+    WorkflowTaskCompletionLimits {
+        pending_child_workflows: pending_command_limit("limit.numPendingChildExecutions.error"),
+        pending_activities: pending_command_limit("limit.numPendingActivities.error"),
+        pending_signals: pending_command_limit("limit.numPendingSignals.error"),
+        pending_cancel_requests: pending_command_limit("limit.numPendingCancelRequests.error"),
+    }
 }
 
 /// Resolve the deployment version a polled workflow task should target.
@@ -1041,6 +1068,10 @@ where
         // the same authenticated worker call. Preserve its edge-derived
         // principal before moving the request into the first kernel attempt.
         let failure_request = req.request.clone();
+        // Mutable policy is resolved exactly once at the runtime boundary.
+        // The pure kernel receives concrete transition input and never reads
+        // the conformance registry or retains configuration.
+        req.limits = workflow_task_completion_limits();
         let command = match (retry_continuation, cron_continuation) {
             (Some(retry_continuation), _) => Command::WorkflowTaskCompletedWithRetry {
                 request: req,
@@ -1640,7 +1671,7 @@ where
                 .map(|_| target.resolved.revision_number),
             target_version_changed_enabled: target_version_changed_enabled(),
             target_deployment_version: target.routing_target,
-            sticky_ttl: Some(Duration::seconds(30)),
+            polled_task_queue: offered.queue.task_queue.clone(),
             now,
         };
         let result = match self
@@ -2167,6 +2198,24 @@ pub(crate) mod tests {
     };
 
     use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn completion_limit_resolution_matches_v1_31_policy(
+            configured in prop::option::of(any::<i64>()),
+        ) {
+            // Feature: api-conformance-client-misc, Property 1: live completion-limit resolution
+            let expected = match configured {
+                None => Some(DEFAULT_PENDING_COMMAND_LIMIT),
+                Some(value) if value <= 0 => None,
+                Some(value) => usize::try_from(value).ok(),
+            };
+
+            prop_assert_eq!(normalize_pending_command_limit(configured), expected);
+        }
+    }
 
     fn app_failure(error_type: &str, non_retryable: bool) -> Payload {
         use prost::Message as _;
@@ -2828,6 +2877,7 @@ pub(crate) mod tests {
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
             buffered_events: Vec::new(),
+            auto_reset_points: Vec::new(),
         }
     }
 
@@ -3368,7 +3418,7 @@ pub(crate) mod tests {
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: notification_enabled,
                 target_deployment_version: notification_target,
-                sticky_ttl: None,
+                polled_task_queue: TaskQueueName("queue".into()),
                 now,
             });
             let first_wft = BasicKernel

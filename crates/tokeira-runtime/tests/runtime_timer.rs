@@ -200,6 +200,7 @@ async fn complete_with_commands(
             sticky: None,
             commands,
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),

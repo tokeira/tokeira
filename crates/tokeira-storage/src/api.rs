@@ -904,8 +904,63 @@ pub struct DispatchableWorkflowTask {
     pub logical_seq: tokeira_types::LogicalTaskSeq,
     /// Worker that holds sticky cache affinity, if any.
     pub sticky_preferred: Option<WorkerIdentity>,
-    /// When the sticky affinity expires.
-    pub sticky_expires_at: Option<OffsetDateTime>,
+    /// Fully resolved normal destination used when the sticky worker is absent.
+    pub normal_queue: Option<QueueKey>,
+    /// Schedule-to-start deadline of this pending sticky task.
+    ///
+    /// This derives from `PendingWorkflowTask`, not from the run's affinity.
+    pub sticky_deadline: Option<OffsetDateTime>,
+}
+
+/// Derive one workflow-task delivery envelope from committed run state.
+///
+/// The preferred sticky queue and normal fallback are disposable delivery
+/// choices only. The pending task's own deadline is surfaced for timeout
+/// fencing; no read mutates or expires the run's durable sticky affinity.
+pub(crate) fn dispatchable_workflow_task(
+    state: &WorkflowState,
+) -> Option<DispatchableWorkflowTask> {
+    if state.status != ExecutionStatus::Running {
+        return None;
+    }
+    let pending = state.pending_workflow_task.as_ref()?;
+    if pending.started_event_id.is_some() {
+        return None;
+    }
+
+    let normal_queue = QueueKey {
+        namespace_id: state.namespace_id,
+        task_queue: state.task_queue.clone(),
+        task_kind: TaskKind::Workflow,
+        deployment: state.deployment.clone(),
+        build_id: state.build_id.clone(),
+    };
+    let real_sticky = state
+        .sticky
+        .as_ref()
+        .filter(|sticky| !sticky.sticky_queue.0.is_empty());
+    let (queue, fallback, sticky_preferred, sticky_deadline) = if let Some(sticky) = real_sticky {
+        (
+            QueueKey {
+                task_queue: sticky.sticky_queue.clone(),
+                ..normal_queue.clone()
+            },
+            Some(normal_queue),
+            Some(sticky.worker_identity.clone()),
+            pending.schedule_to_start_deadline,
+        )
+    } else {
+        (normal_queue, None, None, None)
+    };
+
+    Some(DispatchableWorkflowTask {
+        run_key: state.run_key,
+        queue,
+        logical_seq: pending.logical_seq,
+        sticky_preferred,
+        normal_queue: fallback,
+        sticky_deadline,
+    })
 }
 
 /// An activity task that is ready for dispatch to a

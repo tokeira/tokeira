@@ -3100,18 +3100,10 @@ impl WorkflowService {
                     workflow_id: workflow_ref.workflow_id.clone(),
                 });
             };
-            if state
-                .build_id
-                .as_ref()
-                .is_none_or(|value| value.0 != *build_id)
-            {
-                return Err(EdgeError::BadRequest(format!(
-                    "workflow was not processed by build id `{build_id}`"
-                )));
-            }
-            return resolve_reset_target_from_history(
-                &history,
-                &BatchResetTarget::FirstWorkflowTask,
+            return resolve_build_id_reset_point(
+                &state.auto_reset_points,
+                build_id,
+                OffsetDateTime::now_utc(),
             );
         }
         resolve_reset_target_from_history(&history, target)
@@ -3532,7 +3524,7 @@ impl WorkflowService {
     /// When a run has no in-flight workflow task, there is no poll response
     /// to piggyback queries onto. Instead we publish each query as a
     /// standalone `QueryTask` through the broker, which will route it to a
-    /// poller (preferring the sticky worker if the affinity hasn't expired).
+    /// poller (preferring the sticky worker when real affinity is present).
     /// This avoids the query sitting in the buffer indefinitely when no
     /// further mutations are expected.
     async fn dispatch_queries_direct(
@@ -3542,22 +3534,16 @@ impl WorkflowService {
         barrier: i64,
     ) {
         let now = OffsetDateTime::now_utc();
-        let sticky_preferred = state.sticky.as_ref().and_then(|affinity| {
-            (affinity.expires_at > now).then_some(affinity.worker_identity.clone())
-        });
-        let sticky_queue = state.sticky.as_ref().and_then(|affinity| {
-            (affinity.expires_at > now && !affinity.sticky_queue.0.is_empty())
-                .then_some(affinity.sticky_queue.clone())
-        });
-        let sticky_deadline = state
+        let sticky_affinity = state
             .sticky
             .as_ref()
-            // The kernel stores the SDK sticky
-            // `schedule_to_start_timeout` as the affinity expiry. Buffered
-            // queries released after WFT completion use that same concrete
-            // deadline for sticky-first direct query fallback
-            // (`service/history/api/queryworkflow/api.go:350-410 @ v1.31.0`).
-            .and_then(|affinity| (affinity.expires_at > now).then_some(affinity.expires_at));
+            .filter(|affinity| !affinity.sticky_queue.0.is_empty());
+        let sticky_preferred = sticky_affinity.map(|affinity| affinity.worker_identity.clone());
+        let sticky_queue = sticky_affinity.map(|affinity| affinity.sticky_queue.clone());
+        // The release time is the enqueue time for this direct query, so every
+        // query receives a fresh sticky-first window.
+        let sticky_deadline =
+            sticky_affinity.map(|affinity| now + affinity.schedule_to_start_timeout);
         let queue = QueueKey {
             namespace_id: state.namespace_id,
             task_queue: state.task_queue.clone(),
@@ -7762,6 +7748,31 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
     }
 }
 
+fn resolve_build_id_reset_point(
+    points: &[tokeira_kernel::state::AutoResetPoint],
+    build_id: &str,
+    now: OffsetDateTime,
+) -> EdgeResult<i64> {
+    let point = points
+        .iter()
+        .find(|point| point.build_id == build_id)
+        .ok_or_else(|| EdgeError::BadRequest(format!("Can't find reset point for {build_id}")))?;
+    if !point.resettable {
+        return Err(EdgeError::BadRequest(format!(
+            "Reset point for {build_id} is not resettable"
+        )));
+    }
+    if point
+        .expire_time
+        .is_some_and(|expire_time| expire_time < now)
+    {
+        return Err(EdgeError::BadRequest(format!(
+            "Reset point for {build_id} is expired"
+        )));
+    }
+    Ok(point.first_workflow_task_completed_id)
+}
+
 /// Append the unpersisted transient-WFT suffix to a final-page history read
 /// (spec transient-wft Req B.7). A transient (attempt>1) pending task's
 /// Scheduled/Started events exist only virtually (`GetTransientWorkflowTaskInfo`
@@ -8326,8 +8337,9 @@ mod tests {
         EmptyVisibilityApi, ExecutionResolver, WorkflowService,
         activity_offer_requires_rule_evaluation, apply_matrix_capability_field,
         build_update_activity_options_command, collect_eager_activity_specs,
-        cross_namespace_authorization_targets, system_capabilities_with_matrix_overlay,
-        worker_identity_from_request, workflow_rule_crud_admitted,
+        cross_namespace_authorization_targets, resolve_build_id_reset_point,
+        system_capabilities_with_matrix_overlay, worker_identity_from_request,
+        workflow_rule_crud_admitted,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -8363,6 +8375,115 @@ mod tests {
             UpdateActivityOptionsRequest, UpdateWaitPolicyDto, UpdateWorkflowExecutionRequest,
         },
     };
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn batch_build_id_resolution_matches_retained_point_model(
+            raw_points in prop::collection::vec(
+                (
+                    "[a-z]{0,6}",
+                    1i64..10_000,
+                    any::<bool>(),
+                    prop::option::of(-10i64..=10),
+                ),
+                0..20,
+            ),
+            requested_build_id in "[a-z]{0,6}",
+            _current_state_build_id in "[a-z]{0,6}",
+        ) {
+            // Feature: api-conformance-client-misc, Property 10: batch build-ID resolution
+            let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+            let points: Vec<tokeira_kernel::state::AutoResetPoint> = raw_points
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, (build_id, event_id, resettable, expiry_offset))| {
+                        tokeira_kernel::state::AutoResetPoint {
+                            binary_checksum: format!("checksum-{index}"),
+                            build_id: build_id.clone(),
+                            run_id: RunId::new(),
+                            first_workflow_task_completed_id: *event_id,
+                            create_time: OffsetDateTime::UNIX_EPOCH,
+                            expire_time: expiry_offset
+                                .map(|offset| now + Duration::seconds(offset)),
+                            resettable: *resettable,
+                        }
+                    },
+                )
+                .collect();
+
+            let expected = match points
+                .iter()
+                .find(|point| point.build_id == requested_build_id)
+            {
+                None => Err(format!("Can't find reset point for {requested_build_id}")),
+                Some(point) if !point.resettable => {
+                    Err(format!("Reset point for {requested_build_id} is not resettable"))
+                }
+                Some(point) if point.expire_time.is_some_and(|expiry| expiry < now) => {
+                    Err(format!("Reset point for {requested_build_id} is expired"))
+                }
+                Some(point) => Ok(point.first_workflow_task_completed_id),
+            };
+            let actual = resolve_build_id_reset_point(
+                &points,
+                &requested_build_id,
+                now,
+            )
+            .map_err(|error| match error {
+                EdgeError::BadRequest(message) => message,
+                other => format!("unexpected error: {other}"),
+            });
+
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn batch_build_id_resolution_covers_absent_unresettable_expired_and_valid_points() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+        let point = |build_id: &str,
+                     event_id: i64,
+                     resettable: bool,
+                     expire_time: Option<OffsetDateTime>| {
+            tokeira_kernel::state::AutoResetPoint {
+                binary_checksum: format!("checksum-{build_id}"),
+                build_id: build_id.to_owned(),
+                run_id: RunId::new(),
+                first_workflow_task_completed_id: event_id,
+                create_time: OffsetDateTime::UNIX_EPOCH,
+                expire_time,
+                resettable,
+            }
+        };
+        let points = vec![
+            point("unresettable", 11, false, None),
+            point("expired", 22, true, Some(now - Duration::NANOSECOND)),
+            point("valid", 33, true, Some(now)),
+        ];
+        let resolve = |build_id| {
+            resolve_build_id_reset_point(&points, build_id, now).map_err(|error| match error {
+                EdgeError::BadRequest(message) => message,
+                other => format!("unexpected error: {other}"),
+            })
+        };
+
+        assert_eq!(
+            resolve("absent"),
+            Err("Can't find reset point for absent".to_owned())
+        );
+        assert_eq!(
+            resolve("unresettable"),
+            Err("Reset point for unresettable is not resettable".to_owned())
+        );
+        assert_eq!(
+            resolve("expired"),
+            Err("Reset point for expired is expired".to_owned())
+        );
+        assert_eq!(resolve("valid"), Ok(33));
+    }
 
     #[test]
     fn cross_namespace_targets_skip_local_and_deduplicate_by_api() {

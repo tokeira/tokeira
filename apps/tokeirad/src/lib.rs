@@ -28,7 +28,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use clap::Parser;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Bytes, Incoming},
@@ -80,6 +80,7 @@ use tokeira_edge::{
         runtime_adapter::RuntimeAdapter, workflow_service::WorkflowServiceGrpc,
     },
     handle_nexus_callback,
+    nexus_http::MAX_NEXUS_PAYLOAD_BYTES,
     operator_service::{ClusterInfo, OperatorApi, SearchAttributeDefinition},
     run_routing_subscription,
     translate::to_internal::namespace_id_for,
@@ -1455,6 +1456,35 @@ fn spawn_nexus_callback_server(
     });
 }
 
+/// Outcome of reading a request body under a byte cap (see [`collect_bounded_body`]).
+#[derive(Debug)]
+enum BoundedBody {
+    /// The body fit within the cap and was fully buffered.
+    Collected(Bytes),
+    /// The body exceeded the cap; collection stopped early. Maps to `413`.
+    TooLarge,
+    /// The underlying stream errored before completing. Maps to `400`.
+    ReadFailed(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Buffer `body` into memory, refusing to accumulate more than `limit` bytes.
+///
+/// [`Limited`] stops polling once the running total would exceed `limit` and surfaces a
+/// downcastable [`LengthLimitError`], letting the caller reject an oversized body with
+/// `413` *before* it is fully read — the bound that keeps the network-exposed
+/// `/nexus/callback` listener from being an unauthenticated memory-exhaustion vector.
+async fn collect_bounded_body<B>(body: B, limit: usize) -> BoundedBody
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    match Limited::new(body, limit).collect().await {
+        Ok(collected) => BoundedBody::Collected(collected.to_bytes()),
+        Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => BoundedBody::TooLarge,
+        Err(error) => BoundedBody::ReadFailed(error),
+    }
+}
+
 /// Adapt a hyper request to the transport-agnostic edge handler. Non-`POST` requests and
 /// any path other than `/nexus/callback` are 404; the handler owns all other status
 /// mapping (decode failures → 400, accepted → 200, not-found/stale → 404, internal → 503).
@@ -1479,9 +1509,25 @@ async fn nexus_callback_response(
     let state = header(NEXUS_OPERATION_STATE_HEADER);
     let content_type = header(hyper::header::CONTENT_TYPE.as_str());
 
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(error) => {
+    // Bound the body before buffering it. This listener is network-exposed (default
+    // bind is loopback, but operators may widen it) and reads the whole body *before*
+    // `handle_nexus_callback` validates the callback token, so an unbounded `collect()`
+    // is an unauthenticated memory-exhaustion vector — and the process runs
+    // `panic = "abort"`, so an OOM abort drops every in-flight workflow on the node.
+    // Mirror the cap the caller-facing Nexus transport already enforces.
+    let body_bytes = match collect_bounded_body(body, MAX_NEXUS_PAYLOAD_BYTES).await {
+        BoundedBody::Collected(bytes) => bytes,
+        BoundedBody::TooLarge => {
+            tracing::debug!(
+                limit = MAX_NEXUS_PAYLOAD_BYTES,
+                "nexus callback body too large"
+            );
+            return nexus_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Some(b"request body too large".to_vec()),
+            );
+        }
+        BoundedBody::ReadFailed(error) => {
             tracing::debug!(?error, "failed to read nexus callback request body");
             return nexus_response(
                 StatusCode::BAD_REQUEST,
@@ -2060,6 +2106,23 @@ mod tests {
     // Endpoint target/config types are referenced only by the Nexus endpoint store
     // tests below; importing them here (not at crate scope) keeps the lib build clean.
     use tokeira_runtime::{EndpointTarget, NexusEndpointConfig};
+
+    // Security F1 (apps scope): the network-exposed `/nexus/callback` listener must cap
+    // its request body before buffering, so an unauthenticated caller cannot exhaust
+    // memory and abort the `panic = "abort"` process.
+    #[tokio::test]
+    async fn bounded_body_caps_oversized_payload() {
+        // Within the cap: fully collected.
+        match collect_bounded_body(Full::new(Bytes::from(vec![0u8; 8])), 16).await {
+            BoundedBody::Collected(bytes) => assert_eq!(bytes.len(), 8),
+            other => panic!("expected Collected, got {other:?}"),
+        }
+        // Over the cap: rejected before the whole body is buffered.
+        assert!(matches!(
+            collect_bounded_body(Full::new(Bytes::from(vec![0u8; 17])), 16).await,
+            BoundedBody::TooLarge
+        ));
+    }
 
     #[test]
     fn with_loopback_port_rewrites_or_appends_port() {

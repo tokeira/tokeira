@@ -497,6 +497,9 @@ fn parse_positive_duration(value: &str) -> Option<std::time::Duration> {
 /// Async Nexus operation completion-callback delivery (`nexus-async-completion` spec).
 ///
 /// `http_addr` is the bind address of the inbound `POST /nexus/callback` HTTP listener;
+/// it defaults to loopback (`127.0.0.1:7253`) because the only intended client is this
+/// node's own firing runtime (see `system_callback_url`). Operators terminating
+/// callbacks across hosts must widen it deliberately.
 /// `system_callback_url` is the base URL the runtime POSTs to when firing a
 /// `temporal://system` callback — the loopback v1.31.0 performs by routing the system
 /// callback to the cluster's own frontend (`routeSystemCallbackRequest @ v1.31.0`); the
@@ -541,7 +544,14 @@ impl Default for NexusCompletionConfig {
 }
 
 fn default_nexus_completion_http_addr() -> String {
-    "0.0.0.0:7253".to_string()
+    // Bind loopback by default: the only intended client is this node's own firing
+    // runtime, which POSTs to `system_callback_url` (`http://127.0.0.1:7253`). The
+    // listener reads the request body before validating the callback token, so
+    // narrowing the default keeps it off untrusted networks unless an operator widens
+    // it deliberately. Not a Temporal key — v1.31.0 routes system callbacks to its own
+    // frontend and has no separate `/nexus/callback` listener, so this default carries
+    // no conformance obligation.
+    "127.0.0.1:7253".to_string()
 }
 fn default_nexus_completion_system_callback_url() -> String {
     "http://127.0.0.1:7253".to_string()
@@ -1509,7 +1519,10 @@ mod tests {
     #[test]
     fn nexus_completion_defaults_match_v1_31_0_and_validate() {
         let cfg = NexusCompletionConfig::default();
-        assert_eq!(cfg.http_addr, "0.0.0.0:7253");
+        // Loopback by default — the listener's only intended client is this node's own
+        // firing runtime (posts to `system_callback_url`); widening it is an operator
+        // choice. Not a Temporal key, so no v1.31.0 conformance obligation on the bind.
+        assert_eq!(cfg.http_addr, "127.0.0.1:7253");
         assert_eq!(cfg.system_callback_url, "http://127.0.0.1:7253");
         assert_eq!(cfg.retry_initial_interval_ms, 1_000);
         assert_eq!(cfg.retry_max_interval_ms, 3_600_000);

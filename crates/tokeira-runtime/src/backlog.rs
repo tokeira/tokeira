@@ -192,7 +192,8 @@ pub(crate) async fn drain_once<R>(
                                         queue: entry.queue,
                                         logical_seq,
                                         sticky_preferred: None,
-                                        sticky_expires_at: None,
+                                        normal_queue: None,
+                                        sticky_deadline: None,
                                     },
                                     Some(metrics),
                                 )
@@ -589,7 +590,8 @@ mod tests {
                     queue: workflow_queue(),
                     logical_seq: LogicalTaskSeq::ONE,
                     sticky_preferred: None,
-                    sticky_expires_at: None,
+                    normal_queue: None,
+                    sticky_deadline: None,
                 },
                 None,
             )
@@ -750,7 +752,8 @@ mod tests {
                     queue: queue.clone(),
                     logical_seq: LogicalTaskSeq(logical_seq),
                     sticky_preferred: None,
-                    sticky_expires_at: None,
+                    normal_queue: None,
+                    sticky_deadline: None,
                 };
 
                 broker.publish_workflow_task(task.clone(), None).await;
@@ -797,7 +800,8 @@ mod tests {
                     queue: queue.clone(),
                     logical_seq: LogicalTaskSeq(logical_seq),
                     sticky_preferred: None,
-                    sticky_expires_at: None,
+                    normal_queue: None,
+                    sticky_deadline: None,
                 };
 
                 broker.publish_workflow_task(task.clone(), None).await;
@@ -1047,7 +1051,8 @@ mod tests {
             queue: queue.clone(),
             logical_seq: LogicalTaskSeq(1),
             sticky_preferred: None,
-            sticky_expires_at: None,
+            normal_queue: None,
+            sticky_deadline: None,
         };
         broker.publish_workflow_task(task_a.clone(), None).await;
 
@@ -1060,7 +1065,8 @@ mod tests {
             queue: queue.clone(),
             logical_seq: LogicalTaskSeq(2),
             sticky_preferred: None,
-            sticky_expires_at: None,
+            normal_queue: None,
+            sticky_deadline: None,
         };
         broker.publish_workflow_task(task_b.clone(), None).await;
 
@@ -1069,7 +1075,8 @@ mod tests {
             queue: queue.clone(),
             logical_seq: LogicalTaskSeq(3),
             sticky_preferred: None,
-            sticky_expires_at: None,
+            normal_queue: None,
+            sticky_deadline: None,
         };
         broker.publish_workflow_task(task_c.clone(), None).await;
 

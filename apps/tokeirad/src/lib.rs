@@ -2035,6 +2035,7 @@ where
                     versioning_info: versioning_info
                         .filter(|info| info.has_execution_versioning_info()),
                     worker_deployment_name: state.worker_deployment_name.clone(),
+                    auto_reset_points: state.auto_reset_points.clone(),
                     most_recent_worker_version_stamp,
                     request_id_infos: state.request_id_infos.clone(),
                     external_payload_count,

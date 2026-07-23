@@ -997,6 +997,7 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                 first_run_id: Some(RunId(Uuid::from_u128(run_id))),
                 memo,
                 search_attributes,
+                auto_reset_points: Vec::new(),
                 pending_activities,
                 pending_children,
                 pending_workflow_task,

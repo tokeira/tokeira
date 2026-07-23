@@ -70,6 +70,7 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
             sticky: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
@@ -346,6 +347,7 @@ async fn cron_terminal_completion_authors_delayed_successor_run() -> Result<()> 
                 result: Payloads::default(),
             }],
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time,
@@ -501,6 +503,7 @@ async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Res
                 result: Payloads::default(),
             }],
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time + Duration::seconds(31),
@@ -561,6 +564,7 @@ async fn restart_preserves_cron_state_before_terminal_successor() -> Result<()> 
                 result: Payloads::default(),
             }],
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time,
@@ -655,11 +659,12 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
             }),
             worker_deployment_name: Some(deployment.clone()),
             sticky: Some(tokeira_kernel::StickySpec {
-                queue: tokeira_types::TaskQueueName(String::new()),
+                queue: tokeira_types::TaskQueueName("sticky-worker-a".to_owned()),
                 schedule_to_start_timeout: Duration::seconds(60),
             }),
             commands: Vec::new(),
             force_new_workflow_task: true,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: start_time,
@@ -689,30 +694,21 @@ async fn restart_preserves_wft_completion_routing_metadata() -> Result<()> {
     let runtime_after_restart = recovering_runtime_with_store(store.clone());
     runtime_after_restart.acquire_shard(ShardId(0)).await?;
 
-    let wrong_worker = runtime_after_restart
+    let recovered_task = runtime_after_restart
         .poll_workflow_task(
             queue(namespace_id, queue_name),
             WorkerIdentity("worker-b".to_string()),
             tokio::time::Duration::ZERO,
         )
-        .await?;
-    assert!(wrong_worker.is_none());
-
-    let sticky_task = runtime_after_restart
-        .poll_workflow_task(
-            queue(namespace_id, queue_name),
-            WorkerIdentity("worker-a".to_string()),
-            tokio::time::Duration::from_millis(5),
-        )
         .await?
-        .expect("recovered pending WFT should retain sticky and versioned routing metadata");
-    assert_eq!(sticky_task.run_key, started.run_key);
-    // The empty-queue sticky spec is an identity-only delivery hint: worker-a
-    // is preferred (asserted above), but the task dispatches on the NORMAL
-    // queue, so it is NOT a sticky match — partial-history attach requires
-    // sticky-QUEUE dispatch (`setHistoryForRecordWfTaskStartedResp`,
+        .expect("recovered pending WFT should retain durable affinity and versioned routing");
+    assert_eq!(recovered_task.run_key, started.run_key);
+    // Broker liveness is intentionally volatile. After restart there is no
+    // observation for the durable sticky queue, so recovery falls back to the
+    // normal versioned queue without clearing affinity. Partial-history attach
+    // requires actual sticky-queue dispatch (`setHistoryForRecordWfTaskStartedResp`,
     // recordworkflowtaskstarted/api.go:272-278 @ v1.31.0).
-    assert!(!sticky_task.is_sticky_match);
+    assert!(!recovered_task.is_sticky_match);
 
     Ok(())
 }
@@ -871,6 +867,7 @@ async fn retryable_failure_starts_attempt_two_successor() -> Result<()> {
                 failure: retryable_app_failure("BoomError"),
             }],
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),
@@ -968,6 +965,7 @@ async fn non_retryable_failure_is_terminal_without_successor() -> Result<()> {
                 failure: retryable_app_failure("FatalError"),
             }],
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),

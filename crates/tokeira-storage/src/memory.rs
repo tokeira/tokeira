@@ -37,7 +37,7 @@ use crate::{
         ProjectionRecord, RequestRecord, RunRepository, StoredWorkerDeployment,
         TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentRepository,
         WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
-        WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
+        WorkflowTimeoutSweepEntry, deleted_workflow_projection_context, dispatchable_workflow_task,
         workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
     },
     metrics as storage_metrics,
@@ -251,12 +251,9 @@ impl RunRepository for InMemoryStore {
     #[tracing::instrument(name = "storage.load_run", skip(self), fields(run_key = %run_key.0))]
     async fn load_run(&self, run_key: RunKey) -> Result<LoadedRun> {
         let started = Instant::now();
-        let mut store = self.inner.lock().await;
-        let result = Ok(match store.runs.get_mut(&run_key) {
-            Some(state) => {
-                clear_expired_sticky_if_needed(state, OffsetDateTime::now_utc());
-                LoadedRun::Existing(state.clone())
-            }
+        let store = self.inner.lock().await;
+        let result = Ok(match store.runs.get(&run_key) {
+            Some(state) => LoadedRun::Existing(state.clone()),
             None => LoadedRun::Absent,
         });
         storage_metrics::record_load_run_duration(started.elapsed());
@@ -1089,37 +1086,17 @@ impl RunRepository for InMemoryStore {
         queue: &QueueKey,
         limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>> {
-        let mut store = self.inner.lock().await;
-        let now = OffsetDateTime::now_utc();
+        let store = self.inner.lock().await;
         let mut out = Vec::new();
-        for state in store.runs.values_mut() {
-            clear_expired_sticky_if_needed(state, now);
-
-            let Some(pending) = &state.pending_workflow_task else {
+        for state in store.runs.values() {
+            let Some(task) = dispatchable_workflow_task(state) else {
                 continue;
             };
-            if pending.started_event_id.is_some() {
+            let scan_queue = task.normal_queue.as_ref().unwrap_or(&task.queue);
+            if scan_queue != queue {
                 continue;
             }
-
-            let candidate = QueueKey {
-                namespace_id: state.namespace_id,
-                task_queue: state.task_queue.clone(),
-                task_kind: tokeira_types::TaskKind::Workflow,
-                deployment: None,
-                build_id: None,
-            };
-            if &candidate != queue {
-                continue;
-            }
-
-            out.push(DispatchableWorkflowTask {
-                run_key: state.run_key,
-                queue: candidate,
-                logical_seq: pending.logical_seq,
-                sticky_preferred: state.sticky.as_ref().map(|s| s.worker_identity.clone()),
-                sticky_expires_at: state.sticky.as_ref().map(|s| s.expires_at),
-            });
+            out.push(task);
             if out.len() >= limit {
                 break;
             }
@@ -1192,8 +1169,7 @@ impl RunRepository for InMemoryStore {
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<DispatchableWorkflowTask>> {
-        let mut store = self.inner.lock().await;
-        let now = OffsetDateTime::now_utc();
+        let store = self.inner.lock().await;
 
         // Collect matching run keys first so we can do the
         // mutable sticky cleanup without cloning the shard map.
@@ -1206,29 +1182,13 @@ impl RunRepository for InMemoryStore {
 
         let mut out = Vec::new();
         for run_key in candidates {
-            let Some(state) = store.runs.get_mut(&run_key) else {
+            let Some(state) = store.runs.get(&run_key) else {
                 continue;
             };
-            clear_expired_sticky_if_needed(state, now);
-            let Some(pending) = &state.pending_workflow_task else {
+            let Some(task) = dispatchable_workflow_task(state) else {
                 continue;
             };
-            if pending.started_event_id.is_some() {
-                continue;
-            }
-            out.push(DispatchableWorkflowTask {
-                run_key: state.run_key,
-                queue: QueueKey {
-                    namespace_id: state.namespace_id,
-                    task_queue: state.task_queue.clone(),
-                    task_kind: tokeira_types::TaskKind::Workflow,
-                    deployment: None,
-                    build_id: None,
-                },
-                logical_seq: pending.logical_seq,
-                sticky_preferred: state.sticky.as_ref().map(|s| s.worker_identity.clone()),
-                sticky_expires_at: state.sticky.as_ref().map(|s| s.expires_at),
-            });
+            out.push(task);
             if out.len() >= limit {
                 break;
             }
@@ -1737,16 +1697,6 @@ impl ConnectionDirector for InMemoryStore {
 
     async fn acquire(&self, class: DbClass) -> Result<DbPermit> {
         Ok(DbPermit { class })
-    }
-}
-
-fn clear_expired_sticky_if_needed(state: &mut WorkflowState, now: OffsetDateTime) {
-    if state
-        .sticky
-        .as_ref()
-        .is_some_and(|sticky| sticky.expires_at <= now)
-    {
-        state.sticky = None;
     }
 }
 
@@ -2298,6 +2248,7 @@ mod tests {
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
             buffered_events: Vec::new(),
+            auto_reset_points: Vec::new(),
         }
     }
 

@@ -386,18 +386,36 @@ mod tests {
         // Completing with sticky attrs keeps worker "w" as the query affinity target.
         // The query should carry that sticky hint.
         let broker = runtime.broker();
-        let q = queue_for(ns);
+        let q = QueueKey {
+            task_queue: TaskQueueName("sticky-q".into()),
+            ..queue_for(ns)
+        };
+        assert!(
+            broker
+                .poll_workflow_activation(
+                    &q,
+                    &WorkerIdentity("w".into()),
+                    std::time::Duration::ZERO,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
         let b1 = broker.clone();
         let q1 = q.clone();
         let worker = tokio::spawn(async move {
-            let task = b1
-                .poll_query_task(
+            let activation = b1
+                .poll_workflow_activation(
                     &q1,
                     &WorkerIdentity("w".into()),
                     std::time::Duration::from_millis(50),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .expect("sticky poll should receive the query");
+            let crate::WorkflowPollResult::Query(task) = activation else {
+                panic!("expected a query activation");
+            };
             assert_eq!(task.sticky_preferred, Some(WorkerIdentity("w".into())));
             let _ = task.response_tx.send(QueryResult::Completed {
                 result: Payloads::default(),
@@ -664,11 +682,12 @@ mod tests {
                 deployment_version: None,
                 worker_deployment_name: None,
                 sticky: Some(tokeira_kernel::StickySpec {
-                    queue: tokeira_types::TaskQueueName(String::new()),
+                    queue: tokeira_types::TaskQueueName("sticky-q".into()),
                     schedule_to_start_timeout: time::Duration::seconds(30),
                 }),
                 commands: Vec::new(),
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,

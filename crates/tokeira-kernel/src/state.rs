@@ -99,8 +99,11 @@ pub struct WorkflowState {
     /// attempt-1 cause. Cleared on WFT completion.
     #[serde(default)]
     pub last_workflow_task_problem: Option<WorkflowTaskProblem>,
-    /// Sticky execution affinity recorded when a worker
-    /// provides a `sticky_ttl`.
+    /// Sticky execution metadata reported by a successful WFT completion.
+    ///
+    /// This summary has no expiry. Each pending sticky WFT owns its concrete
+    /// schedule-to-start deadline; worker availability is disposable runtime
+    /// state (`matching_engine.go:568-581 @ v1.31.0`).
     pub sticky: Option<StickyAffinity>,
     /// Pause metadata when the workflow is paused.
     pub pause_info: Option<PauseInfo>,
@@ -230,6 +233,39 @@ pub struct WorkflowState {
     /// (spec: `kernel-event-buffering`). Always empty for closed runs.
     #[serde(default)]
     pub buffered_events: Vec<BufferedEvent>,
+    /// First successful WFT completion observed for each worker-build pair.
+    ///
+    /// This durable summary is reconstructed from committed WFT-completion
+    /// events. The stateless kernel receives and returns `WorkflowState`; it
+    /// retains nothing between calls.
+    #[serde(default)]
+    pub auto_reset_points: Vec<AutoResetPoint>,
+}
+
+/// v1.31.0 default maximum number of retained auto-reset points.
+pub const DEFAULT_HISTORY_MAX_AUTO_RESET_POINTS: usize = 20;
+
+/// Replay-derived first-completion boundary for one worker-build pair.
+///
+/// Fields mirror `temporal.api.workflow.v1.ResetPointInfo`; newly observed
+/// points have no expiry, matching `addResetPointFromCompletion`
+/// (`mutable_state_impl.go:3347-3372 @ v1.31.0`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoResetPoint {
+    /// Deprecated worker binary checksum.
+    pub binary_checksum: String,
+    /// Worker build identifier.
+    pub build_id: String,
+    /// Run containing the first matching completion.
+    pub run_id: RunId,
+    /// Event ID of the first matching `WorkflowTaskCompleted`.
+    pub first_workflow_task_completed_id: i64,
+    /// Time of that completion.
+    pub create_time: OffsetDateTime,
+    /// Retention-derived expiry when known; new points use `None`.
+    pub expire_time: Option<OffsetDateTime>,
+    /// Whether reset is safe at the recorded boundary.
+    pub resettable: bool,
 }
 
 /// A history event admitted while a workflow task was started, held durably on
@@ -679,8 +715,11 @@ pub struct ActivityState {
     /// When the activity was started by a worker, if it
     /// has started.
     pub started_at: Option<OffsetDateTime>,
-    /// Event ID of the `ActivityTaskStarted` event, if the
-    /// activity has been started.
+    /// Event ID of the `ActivityTaskStarted` event, if the activity has
+    /// started. Retry-policy activities use
+    /// `TRANSIENT_ACTIVITY_STARTED_EVENT_ID` until terminal resolution
+    /// materializes that event; an event buffered behind a running workflow
+    /// task uses `BUFFERED_EVENT_ID`.
     pub started_event_id: Option<i64>,
     /// Failure from the previous attempt, surfaced on the next
     /// `ActivityTaskStarted` event when the activity retries.
@@ -1349,6 +1388,7 @@ mod tests {
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
             buffered_events: Vec::new(),
+            auto_reset_points: Vec::new(),
         }
     }
 
@@ -1473,7 +1513,6 @@ mod tests {
             worker_identity: WorkerIdentity("sticky-worker".into()),
             sticky_queue: TaskQueueName("queue-sticky".into()),
             schedule_to_start_timeout: Duration::seconds(5),
-            expires_at: now() + Duration::seconds(30),
         });
         state.pending_workflow_task = Some(PendingWorkflowTask {
             task_type: WorkflowTaskType::Normal,

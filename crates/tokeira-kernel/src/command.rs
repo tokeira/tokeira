@@ -303,6 +303,19 @@ pub enum WorkflowTaskFailedCause {
     /// `RespondWorkflowTaskCompleted` carried an unknown or otherwise invalid
     /// search attribute. Appended to preserve postcard discriminants.
     BadSearchAttributes,
+    /// The completion would exceed the configured pending-child-workflow
+    /// limit. Appended to preserve every existing postcard discriminant.
+    PendingChildWorkflowsLimitExceeded,
+    /// The completion would exceed the configured pending-activity limit.
+    /// Appended to preserve every existing postcard discriminant.
+    PendingActivitiesLimitExceeded,
+    /// The completion would exceed the configured pending-external-signal
+    /// limit. Appended to preserve every existing postcard discriminant.
+    PendingSignalsLimitExceeded,
+    /// The completion would exceed the configured pending external-cancel
+    /// request limit. Appended to preserve every existing postcard
+    /// discriminant.
+    PendingRequestCancelLimitExceeded,
 }
 
 impl WorkflowTaskFailedCause {
@@ -336,6 +349,10 @@ impl WorkflowTaskFailedCause {
             Self::BadStartChildExecutionAttributes => "BadStartChildExecutionAttributes",
             Self::BadContinueAsNewAttributes => "BadContinueAsNewAttributes",
             Self::BadSearchAttributes => "BadSearchAttributes",
+            Self::PendingChildWorkflowsLimitExceeded => "PendingChildWorkflowsLimitExceeded",
+            Self::PendingActivitiesLimitExceeded => "PendingActivitiesLimitExceeded",
+            Self::PendingSignalsLimitExceeded => "PendingSignalsLimitExceeded",
+            Self::PendingRequestCancelLimitExceeded => "PendingRequestCancelLimitExceeded",
         }
     }
 }
@@ -1058,9 +1075,11 @@ pub struct StartWorkflowTaskRequest {
     pub deployment_transition: Option<WorkerDeploymentVersionRef>,
     /// Routing revision attached to the deployment transition decision.
     pub deployment_transition_revision_number: Option<i64>,
-    /// If set, the worker requests sticky execution affinity
-    /// for this duration.
-    pub sticky_ttl: Option<Duration>,
+    /// Queue from which the runtime delivered this task.
+    ///
+    /// A task starting outside the recorded sticky queue clears sticky
+    /// affinity (`recordworkflowtaskstarted/api.go:115-149 @ v1.31.0`).
+    pub polled_task_queue: TaskQueueName,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
     /// Whether target-change notification is enabled for this namespace.
@@ -1190,6 +1209,34 @@ pub struct WorkflowTaskWorkerVersion {
     pub stamp: Option<WorkerVersionStamp>,
 }
 
+/// Concrete pending-command limits for one workflow-task completion.
+///
+/// The runtime resolves policy before invoking the pure kernel. These values
+/// are command input only and are never retained in workflow state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTaskCompletionLimits {
+    /// Maximum pending child executions, or `None` when disabled.
+    pub pending_child_workflows: Option<usize>,
+    /// Maximum pending activities, or `None` when disabled.
+    pub pending_activities: Option<usize>,
+    /// Maximum pending external signals, or `None` when disabled.
+    pub pending_signals: Option<usize>,
+    /// Maximum pending external cancellation requests, or `None` when disabled.
+    pub pending_cancel_requests: Option<usize>,
+}
+
+impl Default for WorkflowTaskCompletionLimits {
+    fn default() -> Self {
+        const DEFAULT_PENDING_COMMAND_LIMIT: usize = 2_000;
+        Self {
+            pending_child_workflows: Some(DEFAULT_PENDING_COMMAND_LIMIT),
+            pending_activities: Some(DEFAULT_PENDING_COMMAND_LIMIT),
+            pending_signals: Some(DEFAULT_PENDING_COMMAND_LIMIT),
+            pending_cancel_requests: Some(DEFAULT_PENDING_COMMAND_LIMIT),
+        }
+    }
+}
+
 /// Request from a worker that has finished processing a
 /// workflow task and is returning a batch of commands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1238,6 +1285,9 @@ pub struct WorkflowTaskCompletedRequest {
     /// If true, the kernel schedules a new WFT even when no
     /// commands require one.
     pub force_new_workflow_task: bool,
+    /// Runtime-resolved pending-command policy for this completion.
+    #[serde(default)]
+    pub limits: WorkflowTaskCompletionLimits,
     /// Update ids the runtime DELIVERED to the worker on this task (Sent, not
     /// yet accepted), stamped by the runtime from its update registry. After
     /// processing the worker's accept/reject commands, any of these still in

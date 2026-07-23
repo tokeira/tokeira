@@ -189,7 +189,7 @@ fn workflow_timeout_to_time(value: Option<&prost_types::Duration>) -> Option<tim
 /// `Some(ZERO)` had the activity-timeout scanner reaping every activity as an
 /// immediately-due ScheduleToClose.
 fn activity_timeout_to_time(value: Option<&prost_types::Duration>) -> Option<time::Duration> {
-    proto_duration_to_time(value).filter(|duration| !duration.is_zero())
+    proto_duration_to_time(value).filter(|duration| duration.is_positive())
 }
 
 /// Translate the **workflow-task** timeout with the same "zero means unset"
@@ -203,42 +203,6 @@ fn activity_timeout_to_time(value: Option<&prost_types::Duration>) -> Option<tim
 /// force-created workflow tasks.
 fn workflow_task_timeout_to_time(value: Option<&prost_types::Duration>) -> Option<time::Duration> {
     proto_duration_to_time(value).filter(|duration| duration.is_positive())
-}
-
-/// Normalized activity timeouts per v1.31.0 `validateAndNormalizeTimeouts`
-/// (`chasm/lib/activity/validator.go:142-206`): with ScheduleToClose set,
-/// ScheduleToStart/StartToClose default to it (and are capped by it);
-/// HeartbeatTimeout never exceeds StartToClose. The run-timeout-derived
-/// ScheduleToClose fill (validator.go:178-181) needs workflow state and is
-/// intentionally not applied at this stateless boundary.
-fn normalized_activity_timeouts(
-    schedule_to_close: Option<&prost_types::Duration>,
-    schedule_to_start: Option<&prost_types::Duration>,
-    start_to_close: Option<&prost_types::Duration>,
-    heartbeat: Option<&prost_types::Duration>,
-) -> (
-    Option<time::Duration>,
-    Option<time::Duration>,
-    Option<time::Duration>,
-    Option<time::Duration>,
-) {
-    let schedule_to_close = activity_timeout_to_time(schedule_to_close);
-    let mut schedule_to_start = activity_timeout_to_time(schedule_to_start);
-    let mut start_to_close = activity_timeout_to_time(start_to_close);
-    let mut heartbeat = activity_timeout_to_time(heartbeat);
-    if let Some(s2c) = schedule_to_close {
-        schedule_to_start = Some(schedule_to_start.map_or(s2c, |s2s| s2s.min(s2c)));
-        start_to_close = Some(start_to_close.map_or(s2c, |stc| stc.min(s2c)));
-    }
-    if let (Some(hb), Some(stc)) = (heartbeat, start_to_close) {
-        heartbeat = Some(hb.min(stc));
-    }
-    (
-        schedule_to_close,
-        schedule_to_start,
-        start_to_close,
-        heartbeat,
-    )
 }
 
 fn valid_non_negative_duration(
@@ -1114,6 +1078,10 @@ pub fn wft_failed_cause_from_proto(value: i32) -> tokeira_kernel::WorkflowTaskFa
         // `WORKFLOW_TASK_FAILED_CAUSE_BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE
         // = 30` (failed_cause.proto; spec speculative-wft K5).
         Ok(P::BadUpdateWorkflowExecutionMessage) => K::BadUpdateWorkflowExecutionMessage,
+        Ok(P::PendingChildWorkflowsLimitExceeded) => K::PendingChildWorkflowsLimitExceeded,
+        Ok(P::PendingActivitiesLimitExceeded) => K::PendingActivitiesLimitExceeded,
+        Ok(P::PendingSignalsLimitExceeded) => K::PendingSignalsLimitExceeded,
+        Ok(P::PendingRequestCancelLimitExceeded) => K::PendingRequestCancelLimitExceeded,
         _ => K::WorkflowWorkerUnhandledFailure,
     }
 }
@@ -4762,19 +4730,6 @@ pub fn proto_command_to_workflow_command(
 
     match cmd.attributes {
         Some(Attributes::ScheduleActivityTaskCommandAttributes(attrs)) => {
-            let task_queue =
-                attrs
-                    .task_queue
-                    .as_ref()
-                    .ok_or(ProtoConversionError::MissingField(
-                        "ScheduleActivityCommandAttributes.task_queue",
-                    ))?;
-            let activity_timeouts = normalized_activity_timeouts(
-                attrs.schedule_to_close_timeout.as_ref(),
-                attrs.schedule_to_start_timeout.as_ref(),
-                attrs.start_to_close_timeout.as_ref(),
-                attrs.heartbeat_timeout.as_ref(),
-            );
             Ok(WorkflowCommand::ScheduleActivity {
                 activity_id: attrs.activity_id,
                 activity_type: attrs
@@ -4782,7 +4737,16 @@ pub fn proto_command_to_workflow_command(
                     .as_ref()
                     .map(|activity_type| activity_type.name.clone())
                     .unwrap_or_default(),
-                task_queue: task_queue_to_domain(task_queue),
+                // An omitted/empty activity queue inherits the workflow's
+                // normal queue. Preserve the wire value here because that
+                // default depends on authoritative run state and therefore
+                // belongs in the pure kernel
+                // (`ValidateActivityScheduleAttributes @ v1.31.0`).
+                task_queue: attrs
+                    .task_queue
+                    .as_ref()
+                    .map(task_queue_to_domain)
+                    .unwrap_or_default(),
                 input: attrs
                     .input
                     .as_ref()
@@ -4796,10 +4760,16 @@ pub fn proto_command_to_workflow_command(
                 )),
                 deployment: None,
                 build_id: None,
-                schedule_to_close_timeout: activity_timeouts.0,
-                schedule_to_start_timeout: activity_timeouts.1,
-                start_to_close_timeout: activity_timeouts.2,
-                heartbeat_timeout: activity_timeouts.3,
+                schedule_to_close_timeout: activity_timeout_to_time(
+                    attrs.schedule_to_close_timeout.as_ref(),
+                ),
+                schedule_to_start_timeout: activity_timeout_to_time(
+                    attrs.schedule_to_start_timeout.as_ref(),
+                ),
+                start_to_close_timeout: activity_timeout_to_time(
+                    attrs.start_to_close_timeout.as_ref(),
+                ),
+                heartbeat_timeout: activity_timeout_to_time(attrs.heartbeat_timeout.as_ref()),
             })
         }
         Some(Attributes::StartTimerCommandAttributes(attrs)) => {
@@ -5469,6 +5439,7 @@ fn workflow_execution_info_from_description(
             .unwrap_or_default(),
         memo: Some(memo_from_domain(&value.memo)),
         search_attributes: Some(search_attributes_from_domain(&value.search_attributes)),
+        auto_reset_points: reset_points_to_proto(&value.auto_reset_points),
         most_recent_worker_version_stamp: value.most_recent_worker_version_stamp.as_ref().map(
             |stamp| proto_common::WorkerVersionStamp {
                 build_id: stamp.build_id.clone(),
@@ -5486,6 +5457,25 @@ fn workflow_execution_info_from_description(
         external_payload_size_bytes: value.external_payload_size_bytes,
         ..Default::default()
     }
+}
+
+fn reset_points_to_proto(
+    points: &[tokeira_kernel::state::AutoResetPoint],
+) -> Option<workflow::ResetPoints> {
+    (!points.is_empty()).then(|| workflow::ResetPoints {
+        points: points
+            .iter()
+            .map(|point| workflow::ResetPointInfo {
+                build_id: point.build_id.clone(),
+                binary_checksum: point.binary_checksum.clone(),
+                run_id: point.run_id.0.to_string(),
+                first_workflow_task_completed_id: point.first_workflow_task_completed_id,
+                create_time: Some(to_proto_timestamp(point.create_time)),
+                expire_time: point.expire_time.map(to_proto_timestamp),
+                resettable: point.resettable,
+            })
+            .collect(),
+    })
 }
 
 fn workflow_extended_info_to_proto(
@@ -6848,6 +6838,80 @@ mod tests {
     #[cfg(feature = "conformance")]
     static VISIBILITY_PAGE_SIZE_OVERRIDE_TEST_LOCK: std::sync::Mutex<()> =
         std::sync::Mutex::new(());
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn reset_point_describe_translation_preserves_every_field_and_order(
+            raw_points in prop::collection::vec(
+                (
+                    "[a-z]{0,8}",
+                    "[a-z]{0,8}",
+                    any::<u128>(),
+                    1i64..10_000,
+                    0i64..10_000,
+                    prop::option::of(10_001i64..20_000),
+                    any::<bool>(),
+                ),
+                0..20,
+            ),
+        ) {
+            // Feature: api-conformance-client-misc, Property 9: reset-point Describe translation
+            let points: Vec<tokeira_kernel::state::AutoResetPoint> = raw_points
+                .iter()
+                .map(
+                    |(
+                        binary_checksum,
+                        build_id,
+                        run_id,
+                        completed_event_id,
+                        create_seconds,
+                        expire_seconds,
+                        resettable,
+                    )| tokeira_kernel::state::AutoResetPoint {
+                        binary_checksum: binary_checksum.clone(),
+                        build_id: build_id.clone(),
+                        run_id: RunId(Uuid::from_u128(*run_id)),
+                        first_workflow_task_completed_id: *completed_event_id,
+                        create_time: OffsetDateTime::from_unix_timestamp(*create_seconds)
+                            .expect("generated timestamp"),
+                        expire_time: expire_seconds.map(|seconds| {
+                            OffsetDateTime::from_unix_timestamp(seconds)
+                                .expect("generated timestamp")
+                        }),
+                        resettable: *resettable,
+                    },
+                )
+                .collect();
+
+            let translated = reset_points_to_proto(&points);
+            prop_assert_eq!(translated.is_some(), !points.is_empty());
+            if let Some(translated) = translated {
+                prop_assert_eq!(translated.points.len(), points.len());
+                for (actual, expected) in translated.points.iter().zip(&points) {
+                    prop_assert_eq!(&actual.binary_checksum, &expected.binary_checksum);
+                    prop_assert_eq!(&actual.build_id, &expected.build_id);
+                    prop_assert_eq!(&actual.run_id, &expected.run_id.0.to_string());
+                    prop_assert_eq!(
+                        actual.first_workflow_task_completed_id,
+                        expected.first_workflow_task_completed_id
+                    );
+                    prop_assert_eq!(
+                        actual.create_time.as_ref(),
+                        Some(&to_proto_timestamp(expected.create_time))
+                    );
+                    let expected_expire_time =
+                        expected.expire_time.map(to_proto_timestamp);
+                    prop_assert_eq!(
+                        actual.expire_time.as_ref(),
+                        expected_expire_time.as_ref()
+                    );
+                    prop_assert_eq!(actual.resettable, expected.resettable);
+                }
+            }
+        }
+    }
 
     #[test]
     fn describe_task_queue_projects_single_default_priority_band() {
@@ -8642,6 +8706,7 @@ mod tests {
             original_start_time: OffsetDateTime::UNIX_EPOCH,
             versioning_info: case.versioning_info.clone(),
             worker_deployment_name: case.worker_deployment_name.clone(),
+            auto_reset_points: Vec::new(),
             most_recent_worker_version_stamp: None,
             request_id_infos: std::collections::BTreeMap::new(),
             external_payload_count: 0,

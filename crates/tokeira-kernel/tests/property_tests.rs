@@ -22,10 +22,11 @@ use tokeira_kernel::{
     TimerDueRequest, TimerOp, TimerState, Transition, UnpauseActivityRequest,
     UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
     UpdateProtocolBody, UpdateRequest, UserMetadata, VersionTarget, VersioningBehavior,
-    VersioningOverride, VersioningOverrideChange, WorkerDeploymentVersionRef, WorkflowCommand,
-    WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskFailedCause, WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest,
-    WorkflowTaskTimeoutType, WorkflowTimeoutType, WorkflowVersioningInfo,
+    VersioningOverride, VersioningOverrideChange, WorkerDeploymentVersionRef, WorkerVersionStamp,
+    WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowTaskCompletionLimits, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
+    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
+    WorkflowVersioningInfo,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
 };
@@ -191,6 +192,7 @@ fn make_open_state(now: OffsetDateTime) -> WorkflowState {
         close_failure: None,
         request_id_infos: std::collections::BTreeMap::new(),
         buffered_events: Vec::new(),
+        auto_reset_points: Vec::new(),
     }
 }
 
@@ -217,16 +219,115 @@ fn with_pending_wft(
     state
 }
 
+fn completion_request(
+    state: &WorkflowState,
+    commands: Vec<WorkflowCommand>,
+    limits: WorkflowTaskCompletionLimits,
+    worker_version: Option<tokeira_kernel::WorkflowTaskWorkerVersion>,
+    deployment_version: Option<WorkerDeploymentVersionRef>,
+    force_new_workflow_task: bool,
+    now: OffsetDateTime,
+) -> WorkflowTaskCompletedRequest {
+    let pending = state
+        .pending_workflow_task
+        .as_ref()
+        .expect("completion requires a pending workflow task");
+    WorkflowTaskCompletedRequest {
+        client_discards_speculative_with_events: false,
+        token: WorkflowTaskToken {
+            run_key: state.run_key,
+            logical_seq: pending.logical_seq,
+            started_event_id: pending
+                .started_event_id
+                .expect("completion requires a started workflow task"),
+            attempt: pending.attempt,
+            shard_epoch: ShardEpoch::ZERO,
+        },
+        identity: WorkerIdentity("worker".into()),
+        sdk_metadata: None,
+        metering_metadata: None,
+        worker_version,
+        versioning_behavior: VersioningBehavior::Unspecified,
+        deployment_version,
+        worker_deployment_name: None,
+        sticky: None,
+        commands,
+        force_new_workflow_task,
+        limits,
+        delivered_update_ids: Vec::new(),
+        request: RequestContext::unattributed(OffsetDateTime::UNIX_EPOCH),
+        now,
+    }
+}
+
+fn bounded_workflow_command(
+    resource: u8,
+    index: usize,
+    namespace_id: NamespaceId,
+) -> WorkflowCommand {
+    match resource {
+        0 => WorkflowCommand::StartChildWorkflow {
+            child_workflow_id: WorkflowId(format!("child-{index}")),
+            namespace_id,
+            namespace: None,
+            workflow_type: WorkflowType("child-type".into()),
+            task_queue: TaskQueueName("queue".into()),
+            input: Payloads::default(),
+            header: None,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: Duration::seconds(10),
+            retry_policy: None,
+            cron_schedule: None,
+            parent_close_policy: ParentClosePolicy::Terminate,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+        },
+        1 => WorkflowCommand::ScheduleActivity {
+            activity_id: format!("activity-{index}"),
+            activity_type: "activity-type".into(),
+            task_queue: TaskQueueName("queue".into()),
+            input: Payloads::default(),
+            header: None,
+            request_eager_execution: false,
+            retry_policy: None,
+            deployment: None,
+            build_id: None,
+            schedule_to_close_timeout: Some(Duration::seconds(30)),
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+        },
+        2 => WorkflowCommand::SignalExternalWorkflowExecution {
+            target_namespace_id: namespace_id,
+            target_namespace: None,
+            target_workflow_id: WorkflowId(format!("signal-target-{index}")),
+            target_run_id: None,
+            signal_name: "signal".into(),
+            input: Payloads::default(),
+            header: None,
+            control: format!("signal-{index}"),
+        },
+        _ => WorkflowCommand::RequestCancelExternalWorkflowExecution {
+            target_namespace_id: namespace_id,
+            target_namespace: None,
+            target_workflow_id: WorkflowId(format!("cancel-target-{index}")),
+            target_run_id: None,
+            control: format!("cancel-{index}"),
+        },
+    }
+}
+
 fn with_sticky(
     mut state: WorkflowState,
     worker_identity: &str,
-    now: OffsetDateTime,
+    _now: OffsetDateTime,
 ) -> WorkflowState {
     state.sticky = Some(StickyAffinity {
         sticky_queue: tokeira_types::TaskQueueName(String::new()),
         schedule_to_start_timeout: time::Duration::ZERO,
         worker_identity: WorkerIdentity(worker_identity.into()),
-        expires_at: now + Duration::seconds(30),
     });
     state
 }
@@ -981,7 +1082,7 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
         arb_small_string(),
         arb_small_string(),
         arb_payloads(),
-        prop::option::of(arb_duration()),
+        arb_duration(),
         prop::option::of(arb_duration()),
         prop::option::of(arb_duration()),
         prop::option::of(arb_duration()),
@@ -1005,7 +1106,7 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
                 retry_policy: None,
                 deployment: None,
                 build_id: None,
-                schedule_to_close_timeout,
+                schedule_to_close_timeout: Some(schedule_to_close_timeout),
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
@@ -1377,7 +1478,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
                 target_deployment_version: None,
-                sticky_ttl: Some(Duration::seconds(30)),
+                polled_task_queue: TaskQueueName("queue".into()),
                 now,
             };
             (
@@ -1472,6 +1573,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 sticky: None,
                 commands,
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -1563,6 +1665,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                 sticky: None,
                 commands: vec![WorkflowCommand::CancelWorkflow { details: None }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -1601,6 +1704,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     scheduled_event_id: cancel_scheduled_event_id,
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -1639,6 +1743,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     timer_id: "timer-1".into(),
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -1676,6 +1781,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                     scheduled_event_id: 12,
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -2052,10 +2158,168 @@ proptest! {
     }
 
     #[test]
-    fn property_3_schedule_activity_timeout_pass_through(cmd in arb_schedule_activity_command()) {
+    fn pending_command_limits_reject_at_the_provisional_boundary_atomically(
+        resource in 0u8..4,
+        limit in 1usize..6,
+        batch_size in 0usize..9,
+        enabled in any::<bool>(),
+    ) {
+        // Feature: api-conformance-client-misc, Property 2: pending-command boundary and atomicity
         let now = fixed_now();
         let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
-        let transition = kernel().apply(
+        let commands = (0..batch_size)
+            .map(|index| bounded_workflow_command(resource, index, state.namespace_id))
+            .collect();
+        let selected_limit = enabled.then_some(limit);
+        let mut limits = WorkflowTaskCompletionLimits {
+            pending_child_workflows: None,
+            pending_activities: None,
+            pending_signals: None,
+            pending_cancel_requests: None,
+        };
+        match resource {
+            0 => limits.pending_child_workflows = selected_limit,
+            1 => limits.pending_activities = selected_limit,
+            2 => limits.pending_signals = selected_limit,
+            _ => limits.pending_cancel_requests = selected_limit,
+        }
+
+        let result = kernel().apply(
+            LoadedRun::Existing(state.clone()),
+            Command::WorkflowTaskCompleted(completion_request(
+                &state,
+                commands,
+                limits,
+                None,
+                None,
+                false,
+                now,
+            )),
+        );
+
+        if enabled && batch_size > limit {
+            let (cause, resource_name) = match resource {
+                0 => (
+                    WorkflowTaskFailedCause::PendingChildWorkflowsLimitExceeded,
+                    "child workflow executions",
+                ),
+                1 => (
+                    WorkflowTaskFailedCause::PendingActivitiesLimitExceeded,
+                    "activities",
+                ),
+                2 => (
+                    WorkflowTaskFailedCause::PendingSignalsLimitExceeded,
+                    "signals to external workflows",
+                ),
+                _ => (
+                    WorkflowTaskFailedCause::PendingRequestCancelLimitExceeded,
+                    "requests to cancel external workflows",
+                ),
+            };
+            prop_assert_eq!(
+                result,
+                Err(Reject::InvalidCommandAttributes {
+                    cause,
+                    message: Some(format!(
+                        "the number of pending {resource_name}, {limit}, has reached the \
+                         per-workflow limit of {limit}"
+                    )),
+                })
+            );
+        } else {
+            let transition = result.expect("batch within the supplied limit");
+            let retained_count = match resource {
+                0 => transition.next_state.children.len(),
+                1 => transition.next_state.activities.len(),
+                2 => transition.next_state.pending_external_signals.len(),
+                _ => transition.next_state.pending_external_cancels.len(),
+            };
+            prop_assert_eq!(retained_count, batch_size);
+        }
+    }
+
+    #[test]
+    fn sticky_lifecycle_depends_on_the_queue_that_starts_the_task(
+        sticky_deadline_delta in -3_600i64..3_600,
+        elapsed_after_deadline in 0i64..3_600,
+        starts_on_sticky_queue in any::<bool>(),
+    ) {
+        // Feature: api-conformance-client-misc, Property 4: sticky lifecycle is queue-start driven
+        let now = fixed_now();
+        let sticky = StickyAffinity {
+            sticky_queue: TaskQueueName("sticky".into()),
+            schedule_to_start_timeout: Duration::seconds(5),
+            worker_identity: WorkerIdentity("sticky-worker".into()),
+        };
+        let mut state = with_pending_wft(make_open_state(now), 30, None, 1);
+        state.sticky = Some(sticky.clone());
+        state
+            .pending_workflow_task
+            .as_mut()
+            .expect("pending workflow task")
+            .schedule_to_start_deadline =
+            Some(now + Duration::seconds(sticky_deadline_delta));
+        let start_time = now + Duration::seconds(sticky_deadline_delta + elapsed_after_deadline);
+        let polled_task_queue = if starts_on_sticky_queue {
+            sticky.sticky_queue.clone()
+        } else {
+            state.task_queue.clone()
+        };
+
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                    logical_seq: LogicalTaskSeq(30),
+                    worker_identity: WorkerIdentity("worker".into()),
+                    request_id: "sticky-start".into(),
+                    history_size_bytes: 0,
+                    suggest_continue_as_new: false,
+                    deployment_transition: None,
+                    deployment_transition_revision_number: None,
+                    polled_task_queue,
+                    now: start_time,
+                    target_version_changed_enabled: false,
+                    target_deployment_version: None,
+                }),
+            )
+            .expect("workflow-task start");
+
+        prop_assert_eq!(
+            transition.next_state.sticky,
+            starts_on_sticky_queue.then_some(sticky)
+        );
+    }
+
+    #[test]
+    fn property_3_schedule_activity_timeout_normalization(
+        activity_id in arb_small_string(),
+        task_queue in prop_oneof![Just(String::new()), arb_small_string()],
+        schedule_to_close_secs in prop::option::of(1i64..120),
+        schedule_to_start_secs in prop::option::of(1i64..120),
+        start_to_close_secs in prop::option::of(1i64..120),
+        heartbeat_secs in prop::option::of(1i64..120),
+    ) {
+        // Feature: api-conformance-client-misc, Property 3: activity timeout normalization
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 30, Some(13), 1);
+        let duration = |seconds: Option<i64>| seconds.map(Duration::seconds);
+        let command = WorkflowCommand::ScheduleActivity {
+            activity_id: activity_id.clone(),
+            activity_type: "activity-type".into(),
+            task_queue: TaskQueueName(task_queue.clone()),
+            input: Payloads::default(),
+            header: None,
+            request_eager_execution: false,
+            retry_policy: None,
+            deployment: None,
+            build_id: None,
+            schedule_to_close_timeout: duration(schedule_to_close_secs),
+            schedule_to_start_timeout: duration(schedule_to_start_secs),
+            start_to_close_timeout: duration(start_to_close_secs),
+            heartbeat_timeout: duration(heartbeat_secs),
+        };
+        let result = kernel().apply(
             LoadedRun::Existing(state.clone()),
             Command::WorkflowTaskCompleted(WorkflowTaskCompletedRequest {
                 client_discards_speculative_with_events: false,
@@ -2074,23 +2338,64 @@ proptest! {
                 deployment_version: None,
                 worker_deployment_name: None,
                 sticky: None,
-                commands: vec![cmd.clone()],
+                commands: vec![command],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
                 ),
                 now,
             }),
-        ).unwrap();
+        );
 
-        let (expected_id, expected_s2c, expected_s2s, expected_stc, expected_hb) = match cmd {
-            WorkflowCommand::ScheduleActivity {
-                activity_id, schedule_to_close_timeout, schedule_to_start_timeout,
-                start_to_close_timeout, heartbeat_timeout, ..
-            } => (activity_id, schedule_to_close_timeout, schedule_to_start_timeout, start_to_close_timeout, heartbeat_timeout),
-            _ => unreachable!(),
+        if schedule_to_close_secs.is_none() && start_to_close_secs.is_none() {
+            prop_assert_eq!(
+                result,
+                Err(Reject::InvalidCommandAttributes {
+                    cause: WorkflowTaskFailedCause::BadScheduleActivityAttributes,
+                    message: Some(format!(
+                        "a valid StartToClose or ScheduleToCloseTimeout is not set on \
+                         ScheduleActivityTaskCommand. ActivityId={activity_id} \
+                         ActivityType=activity-type"
+                    )),
+                })
+            );
+            return Ok(());
+        }
+
+        let transition = result.unwrap();
+        let run_timeout = 60;
+        let expected_s2c_secs = schedule_to_close_secs
+            .or(Some(run_timeout).filter(|_| start_to_close_secs.is_some()))
+            .map(|seconds| seconds.min(run_timeout));
+        let expected_s2s_secs = match schedule_to_close_secs {
+            Some(schedule_to_close) => Some(
+                schedule_to_start_secs
+                    .unwrap_or(schedule_to_close)
+                    .min(schedule_to_close)
+                    .min(run_timeout),
+            ),
+            None => schedule_to_start_secs.or(Some(run_timeout)).map(|seconds| seconds.min(run_timeout)),
         };
+        let expected_stc_secs = match schedule_to_close_secs {
+            Some(schedule_to_close) => Some(
+                start_to_close_secs
+                    .unwrap_or(schedule_to_close)
+                    .min(schedule_to_close)
+                    .min(run_timeout),
+            ),
+            None => start_to_close_secs.map(|seconds| seconds.min(run_timeout)),
+        };
+        let expected_hb_secs = heartbeat_secs.map(|seconds| {
+            expected_stc_secs.map_or(seconds.min(run_timeout), |start_to_close| {
+                seconds.min(run_timeout).min(start_to_close)
+            })
+        });
+        let expected_s2c = duration(expected_s2c_secs);
+        let expected_s2s = duration(expected_s2s_secs);
+        let expected_stc = duration(expected_stc_secs);
+        let expected_hb = duration(expected_hb_secs);
 
         let scheduled = transition.history_events.iter().find_map(|event| match &event.kind {
             HistoryEventKind::ActivityTaskScheduled {
@@ -2099,7 +2404,7 @@ proptest! {
             } => Some((activity_id.clone(), *schedule_to_close_timeout, *schedule_to_start_timeout, *start_to_close_timeout, *heartbeat_timeout)),
             _ => None,
         }).unwrap();
-        let activity = transition.next_state.activities.get(&expected_id).unwrap();
+        let activity = transition.next_state.activities.get(&activity_id).unwrap();
         let dispatch = transition.dispatch_ops.iter().find_map(|op| match op {
             DispatchOp::EnqueueActivityTask {
                 activity_id, schedule_to_close_timeout, schedule_to_start_timeout,
@@ -2108,7 +2413,7 @@ proptest! {
             _ => None,
         }).unwrap();
 
-        prop_assert_eq!(scheduled.0, expected_id.clone());
+        prop_assert_eq!(scheduled.0, activity_id.clone());
         prop_assert_eq!(scheduled.1, expected_s2c);
         prop_assert_eq!(scheduled.2, expected_s2s);
         prop_assert_eq!(scheduled.3, expected_stc);
@@ -2117,7 +2422,7 @@ proptest! {
         prop_assert_eq!(activity.schedule_to_start_timeout, expected_s2s);
         prop_assert_eq!(activity.start_to_close_timeout, expected_stc);
         prop_assert_eq!(activity.heartbeat_timeout, expected_hb);
-        prop_assert_eq!(dispatch.0, expected_id);
+        prop_assert_eq!(dispatch.0, activity_id);
         prop_assert_eq!(dispatch.1, expected_s2c);
         prop_assert_eq!(dispatch.2, expected_s2s);
         prop_assert_eq!(dispatch.3, expected_stc);
@@ -2125,7 +2430,256 @@ proptest! {
     }
 
     #[test]
-    fn property_wft_completion_preserves_metering_metadata_and_sticky_ttl(
+    fn auto_reset_points_match_first_observation_tail_reference_model(
+        existing_ids in prop::collection::vec(0u8..40, 0..30),
+        duplicate_new_pair in any::<bool>(),
+        binary_checksum in "[a-z]{0,6}",
+        legacy_build_id in "[a-z]{0,6}",
+        deployment_build_id in prop::option::of("[a-z]{0,6}"),
+        has_child in any::<bool>(),
+        has_signal in any::<bool>(),
+        has_cancel in any::<bool>(),
+    ) {
+        // Feature: api-conformance-client-misc, Property 7: auto-reset-point reference model
+        let now = fixed_now();
+        let mut state = make_open_state(now);
+        let expected_build_id = deployment_build_id
+            .clone()
+            .unwrap_or_else(|| legacy_build_id.clone());
+        let mut reference = Vec::new();
+        for id in existing_ids {
+            let point = tokeira_kernel::AutoResetPoint {
+                binary_checksum: format!("checksum-{id}"),
+                build_id: format!("build-{id}"),
+                run_id: state.run_id,
+                first_workflow_task_completed_id: i64::from(id) + 1,
+                create_time: OffsetDateTime::UNIX_EPOCH + Duration::seconds(i64::from(id)),
+                expire_time: None,
+                resettable: id % 2 == 0,
+            };
+            if !reference.iter().any(|existing: &tokeira_kernel::AutoResetPoint| {
+                existing.binary_checksum == point.binary_checksum
+                    && existing.build_id == point.build_id
+            }) {
+                reference.push(point);
+            }
+        }
+        if duplicate_new_pair {
+            reference.push(tokeira_kernel::AutoResetPoint {
+                binary_checksum: binary_checksum.clone(),
+                build_id: expected_build_id.clone(),
+                run_id: state.run_id,
+                first_workflow_task_completed_id: 7,
+                create_time: OffsetDateTime::UNIX_EPOCH,
+                expire_time: None,
+                resettable: false,
+            });
+        }
+        let overflow = reference
+            .len()
+            .saturating_sub(tokeira_kernel::DEFAULT_HISTORY_MAX_AUTO_RESET_POINTS);
+        reference.drain(..overflow);
+        state.auto_reset_points = reference.clone();
+        if has_child {
+            state = with_child(state, "child", 4, ParentClosePolicy::Terminate, false);
+        }
+        if has_signal {
+            state = with_pending_external_signal(state, 5);
+        }
+        if has_cancel {
+            state = with_pending_external_cancel(state, 6);
+        }
+        state = with_pending_wft(state, 30, Some(13), 1);
+        let worker_version = Some(tokeira_kernel::WorkflowTaskWorkerVersion {
+            binary_checksum: binary_checksum.clone(),
+            stamp: Some(WorkerVersionStamp {
+                build_id: legacy_build_id,
+                use_versioning: false,
+            }),
+        });
+        let deployment_version =
+            deployment_build_id.map(|build_id| WorkerDeploymentVersionRef {
+                deployment_name: "deployment".into(),
+                build_id,
+            });
+
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state.clone()),
+                Command::WorkflowTaskCompleted(completion_request(
+                    &state,
+                    Vec::new(),
+                    WorkflowTaskCompletionLimits::default(),
+                    worker_version,
+                    deployment_version,
+                    false,
+                    now,
+                )),
+            )
+            .expect("successful completion");
+        let completed_event_id = transition
+            .history_events
+            .iter()
+            .find_map(|event| {
+                matches!(
+                    event.kind,
+                    HistoryEventKind::WorkflowTaskCompleted { .. }
+                )
+                .then_some(event.event_id)
+            })
+            .expect("completed event");
+
+        if !reference.iter().any(|point| {
+            point.binary_checksum == binary_checksum && point.build_id == expected_build_id
+        }) {
+            reference.push(tokeira_kernel::AutoResetPoint {
+                binary_checksum,
+                build_id: expected_build_id,
+                run_id: state.run_id,
+                first_workflow_task_completed_id: completed_event_id,
+                create_time: now,
+                expire_time: None,
+                resettable: !has_child && !has_signal && !has_cancel,
+            });
+            let overflow = reference
+                .len()
+                .saturating_sub(tokeira_kernel::DEFAULT_HISTORY_MAX_AUTO_RESET_POINTS);
+            reference.drain(..overflow);
+        }
+
+        prop_assert_eq!(transition.next_state.auto_reset_points, reference);
+    }
+
+    #[test]
+    fn auto_reset_points_replay_to_the_hot_transition_summary(
+        mut start in arb_start_request(),
+        versions in prop::collection::vec(
+            (
+                "[a-z]{0,6}",
+                "[a-z]{0,6}",
+                prop::option::of("[a-z]{0,6}"),
+            ),
+            1..6,
+        ),
+        introduce_child in any::<bool>(),
+        introduce_signal in any::<bool>(),
+        introduce_cancel in any::<bool>(),
+    ) {
+        // Feature: api-conformance-client-misc, Property 8: reset-point replay equivalence
+        let kernel = kernel();
+        start.workflow_start_delay = None;
+        start.reserved_poller_identity = Some(WorkerIdentity("worker".into()));
+        let replay_context = ReplayContext {
+            run_key: start.run_key,
+            namespace_id: start.namespace_id,
+            workflow_id: start.workflow_id.clone(),
+            run_id: start.run_id,
+            deployment: start.deployment.clone(),
+            build_id: start.build_id.clone(),
+            parent_run_key: start.parent_run_key,
+            parent_workflow_id: start.parent_workflow_id.clone(),
+            first_run_started_at: start.first_run_started_at,
+        };
+        let started = kernel
+            .apply(LoadedRun::Absent, Command::Start(start))
+            .expect("workflow start");
+        let mut hot_state = started.next_state;
+        let mut history = started.history_events;
+        let version_count = versions.len();
+
+        for (index, (binary_checksum, legacy_build_id, deployment_build_id)) in
+            versions.into_iter().enumerate()
+        {
+            let mut commands = Vec::new();
+            if index == 0 {
+                if introduce_child {
+                    commands.push(bounded_workflow_command(
+                        0,
+                        index,
+                        hot_state.namespace_id,
+                    ));
+                }
+                if introduce_signal {
+                    commands.push(bounded_workflow_command(
+                        2,
+                        index,
+                        hot_state.namespace_id,
+                    ));
+                }
+                if introduce_cancel {
+                    commands.push(bounded_workflow_command(
+                        3,
+                        index,
+                        hot_state.namespace_id,
+                    ));
+                }
+            }
+            let worker_version = Some(tokeira_kernel::WorkflowTaskWorkerVersion {
+                binary_checksum,
+                stamp: Some(WorkerVersionStamp {
+                    build_id: legacy_build_id,
+                    use_versioning: false,
+                }),
+            });
+            let deployment_version =
+                deployment_build_id.map(|build_id| WorkerDeploymentVersionRef {
+                    deployment_name: "deployment".into(),
+                    build_id,
+                });
+            let force_new = index + 1 < version_count;
+            let completed = kernel
+                .apply(
+                    LoadedRun::Existing(hot_state.clone()),
+                    Command::WorkflowTaskCompleted(completion_request(
+                        &hot_state,
+                        commands,
+                        WorkflowTaskCompletionLimits::default(),
+                        worker_version,
+                        deployment_version,
+                        force_new,
+                        fixed_now() + Duration::seconds(index as i64 + 1),
+                    )),
+                )
+                .expect("workflow-task completion");
+            hot_state = completed.next_state;
+            history.extend(completed.history_events);
+
+            if force_new {
+                let pending = hot_state
+                    .pending_workflow_task
+                    .as_ref()
+                    .expect("forced workflow task");
+                let started = kernel
+                    .apply(
+                        LoadedRun::Existing(hot_state.clone()),
+                        Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                            logical_seq: pending.logical_seq,
+                            worker_identity: WorkerIdentity("worker".into()),
+                            request_id: format!("start-{index}"),
+                            history_size_bytes: 0,
+                            suggest_continue_as_new: false,
+                            deployment_transition: None,
+                            deployment_transition_revision_number: None,
+                            polled_task_queue: hot_state.task_queue.clone(),
+                            now: fixed_now() + Duration::seconds(index as i64 + 1),
+                            target_version_changed_enabled: false,
+                            target_deployment_version: None,
+                        }),
+                    )
+                    .expect("workflow-task start");
+                hot_state = started.next_state;
+                history.extend(started.history_events);
+            }
+        }
+
+        let replayed = kernel
+            .replay_history_prefix(replay_context, &history)
+            .expect("history replay");
+        prop_assert_eq!(replayed.auto_reset_points, hot_state.auto_reset_points);
+    }
+
+    #[test]
+    fn property_wft_completion_preserves_metering_metadata_and_sticky_timeout(
         metering_metadata in prop::collection::vec(any::<u8>(), 0..32),
         sticky_ttl_secs in 1i64..120,
     ) {
@@ -2154,9 +2708,13 @@ proptest! {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 deployment_version: None,
                 worker_deployment_name: None,
-                sticky: Some(tokeira_kernel::StickySpec { queue: tokeira_types::TaskQueueName(String::new()), schedule_to_start_timeout: sticky_ttl }),
+                sticky: Some(tokeira_kernel::StickySpec {
+                    queue: tokeira_types::TaskQueueName("sticky-q".into()),
+                    schedule_to_start_timeout: sticky_ttl,
+                }),
                 commands: Vec::new(),
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -2175,7 +2733,7 @@ proptest! {
 
         let sticky = transition.next_state.sticky.as_ref().expect("sticky affinity");
         prop_assert_eq!(sticky.worker_identity.0.as_str(), "worker");
-        prop_assert_eq!(sticky.expires_at, now + sticky_ttl);
+        prop_assert_eq!(sticky.schedule_to_start_timeout, sticky_ttl);
     }
 
     #[test]
@@ -2246,12 +2804,13 @@ proptest! {
                     retry_policy: None,
                     deployment: activity_deployment.clone(),
                     build_id: activity_build_id.clone(),
-                    schedule_to_close_timeout: None,
+                    schedule_to_close_timeout: Some(Duration::minutes(1)),
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -2522,6 +3081,7 @@ proptest! {
                 sticky: None,
                     commands: vec![],
                     force_new_workflow_task: false,
+                    limits: Default::default(),
                     delivered_update_ids: Vec::new(),
                     request: tokeira_types::RequestContext::unattributed(
                         time::OffsetDateTime::UNIX_EPOCH,
@@ -3051,6 +3611,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -3090,6 +3651,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -3168,6 +3730,7 @@ proptest! {
                 sticky: None,
                     commands: vec![cmd, WorkflowCommand::RequestNewWorkflowTask],
                     force_new_workflow_task: false,
+                    limits: Default::default(),
                     delivered_update_ids: Vec::new(),
                     request: tokeira_types::RequestContext::unattributed(
                         time::OffsetDateTime::UNIX_EPOCH,
@@ -3298,6 +3861,7 @@ proptest! {
                     failure: payload("failed"),
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -3764,6 +4328,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -3862,6 +4427,7 @@ fn property_23_request_cancel_activity_preserves_activity() {
                 sticky: None,
                 commands: vec![WorkflowCommand::RequestCancelActivity { scheduled_event_id }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -3916,6 +4482,7 @@ fn property_24_cancel_timer_removes_timer() {
                     timer_id: "timer-1".into(),
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -3982,6 +4549,7 @@ proptest! {
                     reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -4062,6 +4630,7 @@ proptest! {
                     control: "ctl".into(),
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -4200,6 +4769,7 @@ fn property_42_parent_close_policy_all_paths() {
                         sticky: None,
                         commands: vec![command],
                         force_new_workflow_task: false,
+                        limits: Default::default(),
                         delivered_update_ids: Vec::new(),
                         request: tokeira_types::RequestContext::unattributed(
                             time::OffsetDateTime::UNIX_EPOCH,
@@ -4354,6 +4924,7 @@ proptest! {
                 sticky: None,
                 commands: vec![completed_cmd],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -4383,6 +4954,7 @@ proptest! {
                 sticky: None,
                 commands: vec![rejected_cmd],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -4430,6 +5002,7 @@ proptest! {
                     },
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -4468,6 +5041,7 @@ proptest! {
                     },
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -4505,6 +5079,7 @@ proptest! {
                     },
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -4557,6 +5132,7 @@ fn property_57_close_clears_pending_updates() {
                     sticky: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
+                    limits: Default::default(),
                     delivered_update_ids: Vec::new(),
                     request: tokeira_types::RequestContext::unattributed(
                         time::OffsetDateTime::UNIX_EPOCH,
@@ -4639,6 +5215,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -4690,6 +5267,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -4962,6 +5540,7 @@ fn property_63_close_preserves_execution_options() {
                     sticky: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
+                    limits: Default::default(),
                     delivered_update_ids: Vec::new(),
                     request: tokeira_types::RequestContext::unattributed(
                         time::OffsetDateTime::UNIX_EPOCH,
@@ -5128,6 +5707,7 @@ fn drive_close(kind: &CloseKind, now: OffsetDateTime) -> Transition {
             sticky: None,
             commands,
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now,
@@ -5264,6 +5844,7 @@ proptest! {
                         successor_versioning_info: None,
                     }],
                     force_new_workflow_task: false,
+                    limits: Default::default(),
                     delivered_update_ids: Vec::new(),
                     request: tokeira_types::RequestContext::unattributed(
                         time::OffsetDateTime::UNIX_EPOCH,
@@ -5343,6 +5924,7 @@ proptest! {
                     result: payloads("done"),
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -5520,6 +6102,7 @@ proptest! {
                 sticky: None,
                 commands: vec![cmd.clone()],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -5578,6 +6161,7 @@ proptest! {
                     start_to_close_timeout: None,
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -5621,6 +6205,7 @@ proptest! {
                     scheduled_event_id: 12,
                 }],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -5773,6 +6358,7 @@ fn property_70_close_clears_pending_nexus_operations_without_dispatch_ops() {
                     sticky: None,
                     commands: vec![command],
                     force_new_workflow_task: false,
+                    limits: Default::default(),
                     delivered_update_ids: Vec::new(),
                     request: tokeira_types::RequestContext::unattributed(
                         time::OffsetDateTime::UNIX_EPOCH,
@@ -5964,6 +6550,7 @@ proptest! {
             sticky: None,
             commands: Vec::new(),
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(
                 time::OffsetDateTime::UNIX_EPOCH,
@@ -6060,6 +6647,7 @@ proptest! {
                     sticky: None,
                     commands: Vec::new(),
                     force_new_workflow_task: false,
+                    limits: Default::default(),
                     delivered_update_ids: Vec::new(),
                     request: RequestContext {
                         request_id: RequestId("attribution-completion".into()),
@@ -6189,6 +6777,7 @@ proptest! {
                         result: payloads("done"),
                     }],
                     force_new_workflow_task: false,
+                    limits: Default::default(),
                     delivered_update_ids: Vec::new(),
                     request: tokeira_types::RequestContext::unattributed(
                         time::OffsetDateTime::UNIX_EPOCH,
@@ -6294,6 +6883,7 @@ fn fail_workflow_completion_request(state: &WorkflowState) -> WorkflowTaskComple
             failure: payload("boom"),
         }],
         force_new_workflow_task: false,
+        limits: Default::default(),
         delivered_update_ids: Vec::new(),
         request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
         now: fixed_now(),
@@ -6604,7 +7194,7 @@ proptest! {
             deployment_transition_revision_number: None,
             target_version_changed_enabled: enabled,
             target_deployment_version: routing_target.clone(),
-            sticky_ttl: None,
+            polled_task_queue: TaskQueueName("queue".into()),
             now,
         });
 

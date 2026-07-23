@@ -20,6 +20,13 @@ use super::*;
 use crate::errors::UpdateLifecycleError;
 use tokeira_observability::{QueryDispatchOutcomeLabel, QueryDispatchPathLabel};
 
+fn query_sticky_deadline(
+    enqueued_at: OffsetDateTime,
+    schedule_to_start_timeout: Duration,
+) -> OffsetDateTime {
+    enqueued_at + schedule_to_start_timeout
+}
+
 impl<R> TokeiraRuntime<R>
 where
     R: RunRepository + 'static,
@@ -205,27 +212,18 @@ where
         // queue (`TestUnpinnedQuery_Sticky`, versioning_3_test.go @ v1.31.0).
         let sticky_route_eligible = state.versioning_info.is_none()
             || routed_version.as_ref() == state.effective_deployment();
-        let sticky_preferred = state.sticky.as_ref().and_then(|affinity| {
-            (sticky_route_eligible && affinity.expires_at > now)
-                .then_some(affinity.worker_identity.clone())
-        });
-        let sticky_queue = state.sticky.as_ref().and_then(|affinity| {
-            (sticky_route_eligible
-                && affinity.expires_at > now
-                && !affinity.sticky_queue.0.is_empty())
-            .then_some(affinity.sticky_queue.clone())
-        });
-        let sticky_deadline = state
+        let sticky_affinity = state
             .sticky
             .as_ref()
-            // Tokeira stores Temporal's sticky
-            // `schedule_to_start_timeout` as the run's sticky expiry when a
-            // worker completes a WFT with sticky attributes. Direct queries
-            // reuse that same deadline for sticky-first fallback
-            // (`service/history/api/queryworkflow/api.go:350-410 @ v1.31.0`).
-            .and_then(|affinity| {
-                (sticky_route_eligible && affinity.expires_at > now).then_some(affinity.expires_at)
-            });
+            .filter(|affinity| sticky_route_eligible && !affinity.sticky_queue.0.is_empty());
+        let sticky_preferred = sticky_affinity.map(|affinity| affinity.worker_identity.clone());
+        let sticky_queue = sticky_affinity.map(|affinity| affinity.sticky_queue.clone());
+        // Each direct query gets a fresh sticky attempt window. Affinity
+        // itself has no expiry; v1.31.0 derives this request deadline from
+        // StickyTaskQueueScheduleToStartTimeout when the query is enqueued
+        // (`service/history/api/queryworkflow/api.go:350-410 @ v1.31.0`).
+        let sticky_deadline = sticky_affinity
+            .map(|affinity| query_sticky_deadline(now, affinity.schedule_to_start_timeout));
         let required_barrier = state.last_event_id;
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -866,4 +864,39 @@ fn is_duplicate_update_reject(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::KernelRejected>()
         .is_some_and(|rejected| matches!(rejected.0, tokeira_kernel::Reject::DuplicateUpdateId(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+    use time::{Duration, OffsetDateTime};
+
+    use super::query_sticky_deadline;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn query_deadline_is_derived_from_enqueue_time(
+            completion_age_seconds in 0i64..86_400,
+            enqueue_seconds in 0i64..86_400,
+            timeout_seconds in 1i64..600,
+        ) {
+            // Feature: api-conformance-client-misc, Property 6: derived dispatch and query deadlines
+            let completion_time =
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(enqueue_seconds - completion_age_seconds);
+            let enqueued_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(enqueue_seconds);
+            let deadline =
+                query_sticky_deadline(enqueued_at, Duration::seconds(timeout_seconds));
+
+            prop_assert_eq!(
+                deadline,
+                enqueued_at + Duration::seconds(timeout_seconds)
+            );
+            prop_assert_eq!(
+                deadline - completion_time,
+                Duration::seconds(timeout_seconds + completion_age_seconds)
+            );
+        }
+    }
 }

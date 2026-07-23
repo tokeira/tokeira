@@ -254,19 +254,18 @@ where
         &self,
         run_key: RunKey,
         mut queue: QueueKey,
-    ) -> Result<QueueKey> {
-        if queue.deployment.is_some() && queue.build_id.is_some() {
-            return Ok(queue);
-        }
+    ) -> Result<(QueueKey, Option<OffsetDateTime>)> {
         let LoadedRun::Existing(state) = self.repo.load_run(run_key).await? else {
-            return Ok(queue);
+            return Ok((queue, None));
         };
         // Sticky affinity is established by a completed WFT, so the run's
         // effective Version identifies the cache-owning worker when an older
         // dispatch envelope omitted deployment coordinates. Resolving this
         // queue through Current would erase the old-vs-new comparison that
         // determines whether the sticky coordinate is stale.
-        if let Some(version) = state.effective_deployment() {
+        if (queue.deployment.is_none() || queue.build_id.is_none())
+            && let Some(version) = state.effective_deployment()
+        {
             queue.deployment.get_or_insert_with(|| {
                 tokeira_types::DeploymentId(version.deployment_name.clone())
             });
@@ -274,7 +273,13 @@ where
                 .build_id
                 .get_or_insert_with(|| tokeira_types::BuildId(version.build_id.clone()));
         }
-        Ok(queue)
+        Ok((
+            queue,
+            state
+                .pending_workflow_task
+                .as_ref()
+                .and_then(|pending| pending.schedule_to_start_deadline),
+        ))
     }
 
     async fn route_activity_task_queue(
@@ -367,20 +372,6 @@ where
             .as_ref()?
             .name_for_id(namespace_id)
             .await
-    }
-
-    /// Whether a live workflow poller is currently parked on `queue`. Used to
-    /// decide the speculative-task sticky→normal fallback (R.1): a sticky queue
-    /// with no waiter means the sticky worker is gone, so the task is published
-    /// on the normal queue instead of waiting out the schedule-to-start timeout.
-    async fn has_workflow_poller(&self, queue: &QueueKey) -> bool {
-        self.broker
-            .workflow_waiter_counts()
-            .await
-            .get(queue)
-            .copied()
-            .unwrap_or(0)
-            > 0
     }
 
     /// Resolve the child's CURRENT execution for a parent-close-policy op
@@ -2010,55 +2001,56 @@ where
                     logical_seq,
                     sticky_preferred,
                     normal_task_queue,
-                    speculative,
+                    speculative: _,
                 } => {
                     let workflow_queue = queue.clone();
                     let sticky_normal = sticky_preferred
                         .as_ref()
                         .zip(normal_task_queue.as_ref())
                         .filter(|(_, normal_name)| **normal_name != queue.task_queue);
-                    let (final_queue, final_sticky) = if let Some((_, normal_name)) = sticky_normal
-                    {
-                        let sticky_queue = self
-                            .hydrate_sticky_workflow_task_target(run_key, workflow_queue)
-                            .await?;
-                        // Re-resolve the normal queue without the sticky
-                        // offer's deployment fields. A Current change makes the
-                        // old versioned sticky partition unavailable in
-                        // v1.31.0, and history retries on the newly routed normal
-                        // queue (`task_queue_partition_manager.go:1918-1930` and
-                        // `mutable_state_impl.go:9084-9093 @ v1.31.0`). Tokeira
-                        // performs the equivalent derived-routing decision here;
-                        // no queue observation becomes authoritative state.
-                        let normal = QueueKey {
-                            task_queue: normal_name.clone(),
-                            deployment: None,
-                            build_id: None,
-                            ..queue.clone()
-                        };
-                        let routed_normal = self.route_workflow_task_queue(run_key, normal).await?;
-                        let sticky_target_changed = self.worker_deployment_routing_enabled()
-                            && (sticky_queue.deployment != routed_normal.deployment
-                                || sticky_queue.build_id != routed_normal.build_id);
-                        // R.1: a SPECULATIVE sticky offer also falls back
-                        // immediately when no sticky poller is waiting, rather
-                        // than waiting out schedule-to-start
-                        // (`StickyWorkerUnavailable`, updateworkflow/api.go:
-                        // 224-233 @ v1.31.0).
-                        let sticky_unavailable =
-                            *speculative && !self.has_workflow_poller(&sticky_queue).await;
-                        if sticky_target_changed || sticky_unavailable {
-                            (routed_normal, None)
+                    let (final_queue, final_sticky, normal_queue, sticky_deadline) =
+                        if let Some((_, normal_name)) = sticky_normal {
+                            let (sticky_queue, sticky_deadline) = self
+                                .hydrate_sticky_workflow_task_target(run_key, workflow_queue)
+                                .await?;
+                            // Re-resolve the normal queue without the sticky
+                            // offer's deployment fields. A Current change makes the
+                            // old versioned sticky partition unavailable in
+                            // v1.31.0, and history retries on the newly routed normal
+                            // queue (`task_queue_partition_manager.go:1918-1930` and
+                            // `mutable_state_impl.go:9084-9093 @ v1.31.0`). Tokeira
+                            // performs the equivalent derived-routing decision here;
+                            // no queue observation becomes authoritative state.
+                            let normal = QueueKey {
+                                task_queue: normal_name.clone(),
+                                deployment: None,
+                                build_id: None,
+                                ..queue.clone()
+                            };
+                            let routed_normal =
+                                self.route_workflow_task_queue(run_key, normal).await?;
+                            let sticky_target_changed = self.worker_deployment_routing_enabled()
+                                && (sticky_queue.deployment != routed_normal.deployment
+                                    || sticky_queue.build_id != routed_normal.build_id);
+                            if sticky_target_changed {
+                                (routed_normal, None, None, None)
+                            } else {
+                                (
+                                    sticky_queue,
+                                    sticky_preferred.clone(),
+                                    Some(routed_normal),
+                                    sticky_deadline,
+                                )
+                            }
                         } else {
-                            (sticky_queue, sticky_preferred.clone())
-                        }
-                    } else {
-                        (
-                            self.route_workflow_task_queue(run_key, workflow_queue)
-                                .await?,
-                            sticky_preferred.clone(),
-                        )
-                    };
+                            (
+                                self.route_workflow_task_queue(run_key, workflow_queue)
+                                    .await?,
+                                None,
+                                None,
+                                None,
+                            )
+                        };
                     self.broker
                         .publish_workflow_task(
                             DispatchableWorkflowTask {
@@ -2066,7 +2058,8 @@ where
                                 queue: final_queue,
                                 logical_seq: *logical_seq,
                                 sticky_preferred: final_sticky,
-                                sticky_expires_at: None,
+                                normal_queue,
+                                sticky_deadline,
                             },
                             Some(&self.delivery_metrics),
                         )

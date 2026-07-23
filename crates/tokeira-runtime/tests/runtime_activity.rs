@@ -105,6 +105,14 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
         .await?
         .expect("first attempt should be pollable");
     assert_eq!(first.attempt, 1);
+    assert!(
+        store
+            .read_history(first.run_key, 0, 64)
+            .await?
+            .iter()
+            .all(|event| !matches!(event.kind, HistoryEventKind::ActivityTaskStarted { .. })),
+        "a retry-policy activity start remains transient until terminal resolution"
+    );
 
     runtime
         .fail_activity_task(
@@ -130,6 +138,18 @@ async fn retryable_activity_failure_redispatches_next_attempt() -> Result<()> {
         .expect("retried activity should be pollable");
     assert_eq!(second.attempt, 2);
     assert_eq!(second.activity_id, "activity-1");
+    assert!(
+        store
+            .read_history(second.run_key, 0, 64)
+            .await?
+            .iter()
+            .all(|event| !matches!(
+                event.kind,
+                HistoryEventKind::ActivityTaskStarted { .. }
+                    | HistoryEventKind::ActivityTaskFailed { .. }
+            )),
+        "a retryable attempt writes neither Started nor Failed history"
+    );
     Ok(())
 }
 
@@ -275,11 +295,39 @@ async fn non_retryable_activity_failure_submits_failed_resolution() -> Result<()
         .await?;
 
     let history = store.read_history(run_key, 0, 64).await?;
-    assert!(history.iter().any(|event| matches!(
-        &event.kind,
-        HistoryEventKind::ActivityTaskFailed { activity_id, failure, .. }
-            if activity_id == "activity-1" && failure.data == b"boom"
-    )));
+    let terminal = history
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                HistoryEventKind::ActivityTaskStarted { .. }
+                    | HistoryEventKind::ActivityTaskFailed { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal.len(), 2);
+    let HistoryEventKind::ActivityTaskStarted {
+        activity_id,
+        identity,
+        ..
+    } = &terminal[0].kind
+    else {
+        panic!("transient start must materialize before terminal failure");
+    };
+    assert_eq!(activity_id, "activity-1");
+    assert_eq!(identity.0, "worker-a");
+    let HistoryEventKind::ActivityTaskFailed {
+        activity_id,
+        started_event_id,
+        failure,
+        ..
+    } = &terminal[1].kind
+    else {
+        panic!("terminal failure must follow the materialized start");
+    };
+    assert_eq!(activity_id, "activity-1");
+    assert_eq!(*started_event_id, terminal[0].event_id);
+    assert_eq!(failure.data, b"boom");
     Ok(())
 }
 
@@ -618,6 +666,7 @@ async fn start_and_schedule_activity_with_version(
                 heartbeat_timeout: Some(Duration::seconds(20)),
             }],
             force_new_workflow_task: false,
+            limits: Default::default(),
             delivered_update_ids: Vec::new(),
             request: tokeira_types::RequestContext::unattributed(time::OffsetDateTime::UNIX_EPOCH),
             now: OffsetDateTime::now_utc(),

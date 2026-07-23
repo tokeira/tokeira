@@ -99,6 +99,7 @@ fn open_state() -> WorkflowState {
         close_failure: None,
         request_id_infos: BTreeMap::new(),
         buffered_events: Vec::new(),
+        auto_reset_points: Vec::new(),
     }
 }
 
@@ -142,7 +143,6 @@ fn with_started_attempt2_virtual(mut state: WorkflowState) -> WorkflowState {
 fn real_sticky() -> StickyAffinity {
     StickyAffinity {
         worker_identity: WorkerIdentity("sticky-worker".into()),
-        expires_at: now() + Duration::seconds(30),
         sticky_queue: TaskQueueName("queue:sticky".into()),
         schedule_to_start_timeout: Duration::seconds(5),
     }
@@ -441,6 +441,7 @@ fn completion_clears_count_and_recorded_problem() {
                 sticky: None,
                 commands: vec![],
                 force_new_workflow_task: false,
+                limits: Default::default(),
                 delivered_update_ids: Vec::new(),
                 request: tokeira_types::RequestContext::unattributed(
                     time::OffsetDateTime::UNIX_EPOCH,
@@ -463,7 +464,7 @@ fn completion_clears_count_and_recorded_problem() {
 }
 
 #[test]
-fn poll_hint_does_not_clobber_real_sticky_affinity() {
+fn sticky_queue_start_preserves_real_sticky_affinity() {
     let mut state = open_state();
     state.sticky = Some(real_sticky());
     state.pending_workflow_task = Some(PendingWorkflowTask {
@@ -492,15 +493,14 @@ fn poll_hint_does_not_clobber_real_sticky_affinity() {
                 deployment_transition_revision_number: None,
                 target_version_changed_enabled: false,
                 target_deployment_version: None,
-                sticky_ttl: Some(Duration::seconds(30)),
+                polled_task_queue: TaskQueueName("queue:sticky".into()),
                 now: now(),
             }),
         )
         .unwrap();
 
-    // The poll-side hint (empty queue name) must not erase the real (S1)
-    // sticky queue: v1.31.0's RecordWorkflowTaskStarted never touches it, and
-    // the failure path's sticky rule reads it at fail time (raise S4).
+    // v1.31.0 preserves affinity when the task starts on the recorded sticky
+    // queue; only an actual normal-queue fallback start clears it.
     let sticky = transition.next_state.sticky.expect("sticky retained");
     assert_eq!(sticky.sticky_queue, TaskQueueName("queue:sticky".into()));
 }

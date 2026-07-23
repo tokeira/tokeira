@@ -116,6 +116,7 @@ mod tests {
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
             buffered_events: Vec::new(),
+            auto_reset_points: Vec::new(),
         }
     }
 

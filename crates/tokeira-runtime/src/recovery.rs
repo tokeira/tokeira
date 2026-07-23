@@ -143,23 +143,13 @@ where
     let mut result = SweepResult::default();
     let now = OffsetDateTime::now_utc();
 
-    for mut task in repo
+    for task in repo
         .list_dispatchable_workflow_tasks_for_shard(shard_id, usize::MAX)
         .await?
     {
-        // A sticky claim points at a specific worker on the previous owner. If it
-        // has already expired by sweep time, clear it so the task republishes to
-        // the general queue instead of waiting on a worker this node has no
-        // affinity with — otherwise recovery would strand the task until the dead
-        // claim lapsed again.
-        if task
-            .sticky_preferred
-            .as_ref()
-            .is_some_and(|_| task.sticky_expires_at.is_some_and(|expiry| expiry <= now))
-        {
-            task.sticky_preferred = None;
-            result.expired_sticky_claims_cleared += 1;
-        }
+        // Recovery republishes the same derived envelope as the hot path. The
+        // fresh broker has no poller observations, so it safely selects the
+        // supplied normal fallback without mutating durable affinity.
         broker.publish_workflow_task(task, None).await;
         result.workflow_tasks_republished += 1;
     }
@@ -483,6 +473,7 @@ mod tests {
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
             buffered_events: Vec::new(),
+            auto_reset_points: Vec::new(),
         }
     }
 
@@ -920,15 +911,15 @@ mod tests {
         }
     }
 
-    // ── Property 8: Expired sticky claims republished
-    //    without sticky preference ───────────────────
+    // ── Property 8: cold recovery safely falls back without
+    //    mutating durable sticky affinity ─────────────
     // Feature: runtime-sweeper-recovery
     // **Validates: Requirements 7.1, 7.2**
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
         #[test]
-        fn expired_sticky_claims_republished_without_sticky(
+        fn cold_recovery_republishes_sticky_work_on_normal_queue(
             _seed in 0u32..100,
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -942,21 +933,22 @@ mod tests {
 
                 let mut t = start_transition(run_key);
                 t.next_state.namespace_id = ns;
-                // Set sticky with a future expiry so the
-                // store does NOT clear it on read — the
-                // sweep itself must detect and clear it.
                 let far_past =
                     fixed_now() - Duration::seconds(1);
                 t.next_state.sticky = Some(
                     tokeira_types::StickyAffinity {
-                        sticky_queue: tokeira_types::TaskQueueName(String::new()),
-                        schedule_to_start_timeout: time::Duration::ZERO,
+                        sticky_queue: TaskQueueName("sticky".into()),
+                        schedule_to_start_timeout: Duration::seconds(5),
                         worker_identity: WorkerIdentity(
                             "old-worker".into(),
                         ),
-                        expires_at: far_past,
                     },
                 );
+                t.next_state
+                    .pending_workflow_task
+                    .as_mut()
+                    .expect("start transition has pending workflow task")
+                    .schedule_to_start_deadline = Some(far_past);
                 let result = store
                     .commit_transition(
                         run_key,
@@ -1006,10 +998,8 @@ mod tests {
                     1,
                 );
 
-                // After sweep, the task in the broker should
-                // have no sticky preference — either the
-                // store cleared it on read or the sweep
-                // cleared it.
+                // A new broker has no recent/active sticky poller, so
+                // publication atomically selects the normal fallback.
                 let queue = QueueKey {
                     namespace_id: ns,
                     task_queue: TaskQueueName("q".into()),
@@ -1038,6 +1028,10 @@ mod tests {
                     task.sticky_preferred,
                     None,
                 );
+                let LoadedRun::Existing(stored) = store.load_run(run_key).await.unwrap() else {
+                    unreachable!("committed run exists");
+                };
+                prop_assert!(stored.sticky.is_some());
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }

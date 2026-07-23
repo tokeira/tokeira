@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::{Duration, OffsetDateTime};
+use time::Duration;
 
 use crate::{NamespaceId, QueuePartition};
 
@@ -143,9 +143,6 @@ pub struct QueuePartitionKey {
 /// dispatched to the same worker. This avoids a full history
 /// replay because the worker still holds the cached state.
 ///
-/// The affinity expires at `expires_at`; after that the
-/// runtime falls back to normal (non-sticky) dispatch.
-///
 /// See `docs/architecture/040-delivery-broker.md` for the
 /// sticky-queue protocol.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,8 +152,8 @@ pub struct StickyAffinity {
     /// The sticky task queue name the worker polls (v1.31.0
     /// `executionInfo.StickyTaskQueue`; sticky raise S1). While set, the next
     /// WFT is dispatched onto THIS queue, not the workflow's normal queue. An
-    /// empty name (pre-S1 encodings via the serde default) disables sticky
-    /// dispatch — the affinity degrades to a sync-match hint.
+    /// empty name means no affinity. Volatile synchronous-match preference
+    /// belongs to the runtime broker, never this durable summary.
     #[serde(default)]
     pub sticky_queue: TaskQueueName,
     /// Per-dispatch schedule-to-start deadline for sticky WFTs
@@ -167,6 +164,4 @@ pub struct StickyAffinity {
     /// normal queue.
     #[serde(default)]
     pub schedule_to_start_timeout: Duration,
-    /// Wall-clock deadline after which the affinity is stale.
-    pub expires_at: OffsetDateTime,
 }

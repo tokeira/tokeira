@@ -707,7 +707,8 @@ mod tests {
                                     sticky_preferred: Some(
                                         w.clone(),
                                     ),
-                                    sticky_expires_at: None,
+                                    normal_queue: None,
+                                    sticky_deadline: None,
                                 },
                                 None,
                             )
@@ -721,7 +722,8 @@ mod tests {
                                     queue: q.clone(),
                                     logical_seq: general_seq,
                                     sticky_preferred: None,
-                                    sticky_expires_at: None,
+                                    normal_queue: None,
+                                    sticky_deadline: None,
                                 },
                                 None,
                             )

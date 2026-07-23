@@ -200,59 +200,24 @@ pub(super) fn collect_dispatchable_workflow_tasks(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let now = OffsetDateTime::now_utc();
     let mut tasks = Vec::new();
     for (run_key, state_data) in rows {
         // Workflow task dispatch is derived from the hot state snapshot. There
         // is no separate workflow-task queue table to repair; replaying history
         // can rebuild this materialization.
         let state = codec::decode_workflow_state(&state_data)?;
-        if state.status != ExecutionStatus::Running {
-            continue;
-        }
-        let Some(task) = state.pending_workflow_task.as_ref() else {
+        let Some(task) = dispatchable_workflow_task(&state) else {
             continue;
         };
-        if task.started_event_id.is_some() {
+        let scan_queue = task.normal_queue.as_ref().unwrap_or(&task.queue);
+        if queue_filter.is_some_and(|filter| filter != scan_queue) {
             continue;
         }
-        let queue = QueueKey {
-            namespace_id: state.namespace_id,
-            task_queue: state.task_queue.clone(),
-            task_kind: TaskKind::Workflow,
-            deployment: state.deployment.clone(),
-            build_id: state.build_id.clone(),
-        };
-        if queue_filter.is_some_and(|filter| filter != &queue) {
-            continue;
-        }
-        let (sticky_preferred, sticky_expires_at) = sticky_fields(&state, now);
-        tasks.push(DispatchableWorkflowTask {
-            run_key: RunKey(run_key),
-            queue,
-            logical_seq: task.logical_seq,
-            sticky_preferred,
-            sticky_expires_at,
-        });
+        debug_assert_eq!(task.run_key, RunKey(run_key));
+        tasks.push(task);
         if tasks.len() == limit {
             break;
         }
     }
     Ok(tasks)
-}
-
-pub(super) fn sticky_fields(
-    state: &WorkflowState,
-    now: OffsetDateTime,
-) -> (Option<WorkerIdentity>, Option<OffsetDateTime>) {
-    let Some(sticky) = &state.sticky else {
-        return (None, None);
-    };
-    if sticky.expires_at <= now {
-        return (None, None);
-    }
-    (
-        Some(sticky.worker_identity.clone()),
-        Some(sticky.expires_at),
-    )
 }

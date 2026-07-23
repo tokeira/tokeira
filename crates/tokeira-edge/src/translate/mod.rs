@@ -418,6 +418,8 @@ pub struct WorkflowExecutionDescription {
     pub original_start_time: OffsetDateTime,
     pub versioning_info: Option<WorkflowVersioningInfo>,
     pub worker_deployment_name: Option<String>,
+    /// First successful WFT boundary observed for each worker-build pair.
+    pub auto_reset_points: Vec<tokeira_kernel::state::AutoResetPoint>,
     /// Most recent structured worker-version stamp from a completed WFT.
     pub most_recent_worker_version_stamp: Option<tokeira_kernel::WorkerVersionStamp>,
     /// Per-request → authoring-event map for `WorkflowExtendedInfo.request_id_infos`

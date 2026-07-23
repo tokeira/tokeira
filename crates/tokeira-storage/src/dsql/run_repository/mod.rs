@@ -19,7 +19,7 @@ use tokeira_kernel::{
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads, QueueKey,
     RequestId, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName, TransitionSeq,
-    WorkerIdentity, WorkflowId, WorkflowRuleRecord, dsql_spread_uuid,
+    WorkflowId, WorkflowRuleRecord, dsql_spread_uuid,
 };
 use tracing::{Instrument, instrument};
 use uuid::Uuid;
@@ -30,8 +30,8 @@ use crate::{
     DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
     ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
     WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
-    WorkflowTimeoutSweepEntry, deleted_workflow_projection_context, metrics,
-    workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
+    WorkflowTimeoutSweepEntry, deleted_workflow_projection_context, dispatchable_workflow_task,
+    metrics, workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -97,7 +97,7 @@ mod workflow_rules;
 #[cfg(test)]
 use activity::{ActivityDispatchRow, activity_dispatch_from_row, collect_activity_sweep_entries};
 #[cfg(test)]
-use dispatch::{collect_dispatchable_workflow_tasks, sticky_fields};
+use dispatch::collect_dispatchable_workflow_tasks;
 #[cfg(test)]
 use leases::{RenewDecision, decide_renew, interpret_acquire};
 #[cfg(test)]
@@ -728,9 +728,9 @@ mod tests {
         RenewDecision, activity_dispatch_from_row, classify_connection_error, classify_outcome,
         collect_activity_sweep_entries, collect_dispatchable_workflow_tasks,
         collect_nexus_sweep_entries, collect_started_workflow_task_entries,
-        collect_workflow_timeout_entries, decide_renew, effective_history_limit, epoch_from_sql,
-        epoch_to_sql, extract_sqlstate, interpret_acquire, partition_for, should_check_epoch,
-        sticky_fields,
+        collect_workflow_timeout_entries, decide_renew, dispatchable_workflow_task,
+        effective_history_limit, epoch_from_sql, epoch_to_sql, extract_sqlstate, interpret_acquire,
+        partition_for, should_check_epoch,
     };
     use crate::{
         CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository, ProjectionContext,
@@ -928,24 +928,32 @@ mod tests {
         }
 
         #[test]
-        fn sticky_affinity_expiry_clearing(delta_seconds in -100i64..100i64) {
+        fn sticky_dispatch_uses_pending_deadline_without_expiring_affinity(
+            delta_seconds in -100i64..100i64
+        ) {
+            // Feature: api-conformance-client-misc, Property 6: derived dispatch and query deadlines
             let now = fixed_now();
             let mut state = sample_state(RunKey::new());
             state.sticky = Some(StickyAffinity {
-                sticky_queue: tokeira_types::TaskQueueName(String::new()),
-                schedule_to_start_timeout: time::Duration::ZERO,
+                sticky_queue: TaskQueueName("sticky".into()),
+                schedule_to_start_timeout: Duration::seconds(5),
                 worker_identity: WorkerIdentity("sticky-worker".to_owned()),
-                expires_at: now + Duration::seconds(delta_seconds),
             });
+            let deadline = now + Duration::seconds(delta_seconds);
+            state
+                .pending_workflow_task
+                .as_mut()
+                .expect("sample has a pending workflow task")
+                .schedule_to_start_deadline = Some(deadline);
 
-            let (worker, expires_at) = sticky_fields(&state, now);
-            if delta_seconds > 0 {
-                prop_assert_eq!(worker, Some(WorkerIdentity("sticky-worker".to_owned())));
-                prop_assert_eq!(expires_at, Some(now + Duration::seconds(delta_seconds)));
-            } else {
-                prop_assert_eq!(worker, None);
-                prop_assert_eq!(expires_at, None);
-            }
+            let task = dispatchable_workflow_task(&state).expect("task is dispatchable");
+            prop_assert_eq!(
+                task.sticky_preferred,
+                Some(WorkerIdentity("sticky-worker".to_owned()))
+            );
+            prop_assert_eq!(task.sticky_deadline, Some(deadline));
+            prop_assert_eq!(task.queue.task_queue, TaskQueueName("sticky".into()));
+            prop_assert!(task.normal_queue.is_some());
         }
 
         #[test]
@@ -1177,36 +1185,34 @@ mod tests {
     }
 
     #[test]
-    fn sticky_fields_without_affinity_or_expired_affinity_returns_none() {
+    fn dispatch_envelope_preserves_sticky_affinity_and_pending_deadline() {
         let now = fixed_now();
         let mut state = sample_state(RunKey::new());
-
-        assert_eq!(sticky_fields(&state, now), (None, None));
-
+        let deadline = now - Duration::seconds(30);
         state.sticky = Some(StickyAffinity {
-            sticky_queue: tokeira_types::TaskQueueName(String::new()),
-            schedule_to_start_timeout: time::Duration::ZERO,
+            sticky_queue: TaskQueueName("sticky".into()),
+            schedule_to_start_timeout: Duration::seconds(5),
             worker_identity: WorkerIdentity("worker".to_owned()),
-            expires_at: now,
         });
-        assert_eq!(sticky_fields(&state, now), (None, None));
-    }
+        state
+            .pending_workflow_task
+            .as_mut()
+            .expect("sample has a pending workflow task")
+            .schedule_to_start_deadline = Some(deadline);
 
-    #[test]
-    fn sticky_fields_with_live_affinity_returns_values() {
-        let now = fixed_now();
-        let mut state = sample_state(RunKey::new());
-        let expires_at = now + Duration::seconds(30);
-        state.sticky = Some(StickyAffinity {
-            sticky_queue: tokeira_types::TaskQueueName(String::new()),
-            schedule_to_start_timeout: time::Duration::ZERO,
-            worker_identity: WorkerIdentity("worker".to_owned()),
-            expires_at,
-        });
-
+        let task = dispatchable_workflow_task(&state).expect("task is dispatchable");
         assert_eq!(
-            sticky_fields(&state, now),
-            (Some(WorkerIdentity("worker".to_owned())), Some(expires_at))
+            task.sticky_preferred,
+            Some(WorkerIdentity("worker".to_owned()))
+        );
+        assert_eq!(task.sticky_deadline, Some(deadline));
+        assert_eq!(task.queue.task_queue, TaskQueueName("sticky".into()));
+        assert_eq!(
+            task.normal_queue
+                .as_ref()
+                .expect("sticky delivery has fallback")
+                .task_queue,
+            state.task_queue
         );
     }
 
@@ -1707,6 +1713,7 @@ mod tests {
             close_failure: None,
             request_id_infos: std::collections::BTreeMap::new(),
             buffered_events: Vec::new(),
+            auto_reset_points: Vec::new(),
         }
     }
 

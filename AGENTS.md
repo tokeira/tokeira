@@ -329,19 +329,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 - PR body: what/why summary; validation commands actually run (name anything skipped,
   and why); base and head SHAs; dependency/lockfile notes; known risks. GitHub renders
   co-authors from the §11 trailers.
-- Harness gates apply (push is ask-gated for Claude and Kiro). Codex cannot push — it
-  finishes at a named branch and hands off (§12.2).
+- Networked git and GitHub mutations use each harness's approval/escalation gate (§12).
 
 #### §10.7 Approval + serial merge
 
-- The human integration seat processes PRs **one at a time**: inspect, let required
-  checks run green, merge server-side with a merge commit pinned to the reviewed head —
-  `gh pr merge --merge --match-head-commit <sha>` — then `git pull --ff-only` in the
-  main checkout. Merge commits preserve branch ancestry, which keeps ancestry-based
-  cleanup valid.
-- Agents never merge, never approve their own work, and never resolve another branch's
-  conflicts unless handed that task. Review feedback returns to the owning agent, in its
-  own worktree, as additional commits on the same branch.
+- The human integration seat processes PRs **one at a time**: inspect, await green
+  checks, and explicitly approve the exact head. On approval, the owning agent merges it
+  with `gh pr merge --merge --match-head-commit <sha>` and verifies the result. The
+  operator then runs `git pull --ff-only` in main. Merge commits preserve ancestry for
+  cleanup.
+- Agents never approve their own work. Agents merge on explicit human approval of the
+  exact head. They resolve another branch's conflicts only when handed that task. Review
+  feedback returns to the owning agent as commits on the same branch.
 
 #### §10.8 Cleanup
 
@@ -420,19 +419,15 @@ What differs per harness. Everything in §10 applies to all three agents.
 - You run inside an app-managed linked worktree of this repository
   (`$CODEX_HOME/worktrees/…`, detached HEAD, own `target/`). Work only there. **Local**
   (non-worktree) chats are research-only: read and answer; never edit from Local.
-- **Your sandbox has no network** (profile `tokeira` via the tracked
-  `.codex/config.toml`; defined user-level). Consequences: build
-  from the warm registry with `--locked`; no dependency changes unless the task
-  explicitly says so; no `git fetch`, no push, no `gh`. kache works invisibly underneath
-  cargo — never configure around it (§10.1).
-- **Your finishing move** (replaces §10.6): run the §10.4 bar and report any check not
-  run and why; present the diff; create the branch via **Create branch here** named
-  `agent/codex/<task-slug>`; commit through the app's git controls with §11 trailers.
-  Push and PR happen outside your sandbox,
-  from your named branch.
-- **Your half of §10.5:** you can see local refs. If local `main` has moved past your
-  base, say so (base SHA vs current `main`) and recommend; the rebase itself belongs to
-  the operator or Claude.
+- **Your sandbox restricts network by default.** Networked git and `gh` mutations
+  require harness escalation and explicit operator authorization. Build from the warm
+  registry with `--locked`; no dependency changes unless requested; never configure
+  around kache (§10.1).
+- **Your finishing move:** run the §10.4 bar; report omissions; present the diff; create
+  `agent/codex/<task-slug>` via **Create branch here**; commit with §11 trailers. When
+  authorized, complete rebase, push, PR, approved merge, and cleanup (§10.5–§10.8).
+- If `main` advanced, report both SHAs and rebase once onto `origin/main`. Resolve only
+  in-scope conflicts; return semantic or out-of-scope conflicts to the integration seat.
 - Final report: branch, head SHA, bar results, files touched, known risks, merge-order
   recommendation when relevant.
 - Operator guide: [codex-chatgpt-worktrees.md](docs/agents/codex-chatgpt-worktrees.md).

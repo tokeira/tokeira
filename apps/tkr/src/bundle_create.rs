@@ -134,8 +134,9 @@ pub(crate) async fn place_bundle_provisioner(
 }
 
 /// Walk up from `start` to the workspace root (`Cargo.lock` +
-/// `rust-toolchain.toml` together mark it).
-fn workspace_root_from(start: &std::path::Path) -> Result<PathBuf> {
+/// `rust-toolchain.toml` together mark it). Shared with the create-time
+/// Phase-0 build leg (`deployment_dir::place_provisioner`).
+pub(crate) fn workspace_root_from(start: &std::path::Path) -> Result<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         if dir.join("Cargo.lock").exists() && dir.join("rust-toolchain.toml").exists() {

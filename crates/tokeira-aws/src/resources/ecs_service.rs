@@ -230,7 +230,9 @@ impl Resource for TaskDefinitionResource {
                 return InternalChange::Update {
                     resource_id: self.resource_id(),
                     resource_type: self.resource_type(),
-                    details: format!("task definition manifest serialization failed: {error}"),
+                    details: vec![tokeira_iac::FieldDiff::observation(format!(
+                        "task definition manifest serialization failed: {error}"
+                    ))],
                 };
             }
         };
@@ -242,7 +244,9 @@ impl Resource for TaskDefinitionResource {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "task definition manifest changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "task definition manifest changed",
+                )],
             }
         }
     }
@@ -452,7 +456,9 @@ impl Resource for EcsServiceResource {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "service task definition revision changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "service task definition revision changed",
+                )],
             }
         } else if current.properties.get("task_definition_manifest")
             != Some(&self.task_definition_manifest)
@@ -460,7 +466,9 @@ impl Resource for EcsServiceResource {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "service task definition manifest changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "service task definition manifest changed",
+                )],
             }
         } else {
             InternalChange::NoChange {

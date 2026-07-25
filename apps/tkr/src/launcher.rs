@@ -46,18 +46,6 @@ pub(crate) enum LaunchClass {
     ReadOnly,
 }
 
-impl LaunchClass {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            LaunchClass::Bound => "bound",
-            LaunchClass::CandidateUpgrade => "candidate-upgrade",
-            LaunchClass::DevCandidate => "dev-candidate",
-            LaunchClass::Rollback => "rollback",
-            LaunchClass::ReadOnly => "read-only",
-        }
-    }
-}
-
 /// Resolve the launch class for a (possibly namespaced) `verb` — the token
 /// sequence forwarded to `tkp` (`["describe"]`, `["infra", "plan"]`, …) — from
 /// the deployment's recorded binding.
@@ -71,7 +59,7 @@ impl LaunchClass {
 /// to `init` is treated the same).
 pub(crate) fn resolve_class(verb: &[&str], envelope: &DeploymentStateEnvelope) -> LaunchClass {
     match verb {
-        ["describe"] | [_, "plan"] => LaunchClass::ReadOnly,
+        ["describe"] | ["definition", "check"] | [_, "plan"] => LaunchClass::ReadOnly,
         ["upgrade"] => LaunchClass::CandidateUpgrade,
         ["rollback"] => LaunchClass::Rollback,
         _ => match envelope.binding.as_ref().map(|b| b.build_mode) {
@@ -242,10 +230,11 @@ async fn launch_with_envs(
     args.push(deployment_dir.display().to_string());
     args.extend(extra_args.iter().cloned());
 
-    eprintln!(
-        "launcher: {} class → forwarding `{verb_label}` to tkp",
-        class.label()
-    );
+    // Operator narration: none. The forwarded verb's own report is the
+    // answer; *which binary executed it* is evidence, not answer — it joins
+    // the `--detail`/`--json` surface when mutating verbs migrate onto the
+    // output contract (docs/platforms/operator-output-contract.md). The
+    // launch-class taxonomy stays internal either way.
     let status = tokio::process::Command::new(&program)
         .args(&args)
         .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
@@ -370,14 +359,138 @@ async fn orchestrate_rollback(
         .context("rollback phase 2 (A reconcile) failed — re-run `rollback` to resume")
 }
 
+/// The upgrade orchestration — the sanctioned re-marry (an upgrade without a
+/// definition change is idempotent; the *binary* advances whenever the
+/// implementation changed):
+///
+/// 1. resolve the **candidate** from the Phase-0 source pool — never the
+///    married copy, which is definitionally the engine being upgraded FROM
+///    (resolving it as its own candidate is how `upgrade` was wedged: A
+///    evaluated `upgrade(A, A)` and refused forever);
+/// 2. byte-compare candidate vs bound — identical bytes mean nothing to
+///    upgrade: report and stop (idempotency lives here: the dev sentinel
+///    hash cannot see implementation changes, but the bytes can);
+/// 3. drive `tkp upgrade` **via the candidate binary** (it evaluates the
+///    advance, runs migrations, transfers ownership, applies, records the
+///    audit log);
+/// 4. on success, re-place `<deployment>/tkp` with the candidate's bytes —
+///    the physical half of the re-marry (the envelope re-bound inside the
+///    verb; the file must follow it).
+pub(crate) async fn launch_upgrade(deployment_dir: &Path) -> Result<()> {
+    // The resolution leg (`_how`: PATH / sibling / workspace build) is
+    // evidence for the detail surface once mutating verbs carry the output
+    // contract's flags — the summary transcript opens with the verb's own
+    // report instead.
+    let (candidate, _how) =
+        crate::deployment_dir::DeploymentResolver::resolve_provisioner_source()?;
+    let candidate_bytes = std::fs::read(&candidate)
+        .with_context(|| format!("failed to read the candidate at {}", candidate.display()))?;
+    let bound_path = deployment_dir.join(PROVISIONER_BIN);
+    let sha256 = tokeira_provisioner::sha256_hex(&candidate_bytes);
+    if let Ok(bound_bytes) = std::fs::read(&bound_path)
+        && bound_bytes == candidate_bytes
+    {
+        println!(
+            "upgrade: no changes to apply — the deployment's provisioner is already current (sha256 {}…)",
+            &sha256[..12]
+        );
+        return Ok(());
+    }
+
+    let status = tokio::process::Command::new(&candidate)
+        .args([
+            "upgrade",
+            "--deployment-dir",
+            &deployment_dir.display().to_string(),
+        ])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| format!("failed to launch the candidate `{}`", candidate.display()))?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    // The physical re-marry: the file follows the binding.
+    std::fs::write(&bound_path, &candidate_bytes)
+        .with_context(|| format!("failed to re-place {}", bound_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bound_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    println!("provisioner: `tkp` updated (sha256 {}…)", &sha256[..12]);
+    Ok(())
+}
+
+/// `tkr definition check --path <p>`: check a definition anywhere on disk —
+/// authoring mode, no deployment involved. The interpreter lives in `tkp`, so
+/// resolve one from the Phase-0 source pool (the same leg `create` and
+/// `upgrade` use) and hand it the file: a directory means its
+/// `definition.tkd`; a file is taken as given.
+pub(crate) async fn launch_definition_check_at_path(
+    path: &Path,
+    json: bool,
+    detail: bool,
+) -> Result<()> {
+    let (definition, dir) = if path.is_dir() {
+        (path.join("definition.tkd"), path.to_path_buf())
+    } else {
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        (path.to_path_buf(), dir)
+    };
+    if !definition.exists() {
+        bail!("no definition found at {}", definition.display());
+    }
+    let (candidate, _how) =
+        crate::deployment_dir::DeploymentResolver::resolve_provisioner_source()?;
+    let mut args = vec![
+        "definition".to_string(),
+        "check".to_string(),
+        "--deployment-dir".to_string(),
+        dir.display().to_string(),
+        "--definition".to_string(),
+        definition.display().to_string(),
+    ];
+    if json {
+        args.push("--json".to_string());
+    }
+    if detail {
+        args.push("--detail".to_string());
+    }
+    let status = tokio::process::Command::new(&candidate)
+        .args(&args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| format!("failed to launch `{}`", candidate.display()))?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
 /// Forward `infra apply`, first forwarding the internal `init` when the
 /// deployment has never been stamped — so `tkr deployment apply` is a coherent
 /// one-command flow.
-pub(crate) async fn launch_apply(deployment_dir: &Path) -> Result<()> {
+pub(crate) async fn launch_apply(deployment_dir: &Path, yes: bool) -> Result<()> {
     if load_envelope(deployment_dir).await?.binding.is_none() {
         launch(deployment_dir, &["init"], &[]).await?;
     }
-    launch(deployment_dir, &["infra", "apply"], &[]).await
+    let extra = if yes {
+        vec!["--yes".to_string()]
+    } else {
+        Vec::new()
+    };
+    launch(deployment_dir, &["infra", "apply"], &extra).await
 }
 
 #[cfg(test)]

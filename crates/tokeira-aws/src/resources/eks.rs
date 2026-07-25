@@ -709,10 +709,11 @@ impl Resource for EksClusterResource {
             return InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: format!(
-                    "K8s version changed from {} to {}",
-                    current_version, self.version
-                ),
+                details: vec![tokeira_iac::FieldDiff {
+                    field: "version".into(),
+                    before: Some(current_version.to_string()),
+                    after: Some(self.version.clone()),
+                }],
             };
         }
 

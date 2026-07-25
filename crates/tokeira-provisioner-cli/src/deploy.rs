@@ -27,6 +27,7 @@ use crate::{
 pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
+    mode: tokeira_report::Mode,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let (envelope, _) = envelope_store(deployment_dir)
@@ -35,28 +36,19 @@ pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
         .context("failed to load the deployment envelope")?;
 
     let verdict = check_binding(envelope.binding.as_ref(), &running);
-    println!("platform: {}", platform.label(deployment_dir));
-    println!(
-        "binding:  {verdict:?}{}",
-        if verdict.proceeds() {
-            " — apply would proceed"
-        } else {
-            " — apply would REFUSE"
-        }
-    );
-
     match platform.deploy_plan(deployment_dir).await? {
         Realization::NotApplicable { reason } => {
             anyhow::bail!("not applicable: {reason}");
         }
         Realization::Realized(changes) => {
-            println!("deploy plan: {} change(s)", changes.len());
-            for change in &changes {
-                println!(
-                    "  {:?} [{}] {}::{}",
-                    change.kind, change.resource_type, change.module, change.resource
-                );
-            }
+            let report = crate::render::PlanReport::new(
+                platform.label(deployment_dir).to_string(),
+                "deploy plan",
+                &envelope,
+                verdict,
+                changes,
+            );
+            print!("{}", tokeira_report::render(&report, mode)?);
         }
     }
     Ok(())
@@ -66,6 +58,7 @@ pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
 pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
+    yes: bool,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
@@ -83,18 +76,15 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
         GateOutcome::Refuse { verdict, reason } => {
             anyhow::bail!("binding gate refuses `deploy apply` ({verdict:?}): {reason}");
         }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: true,
-        } => {
-            println!("binding: {verdict:?} (authoritative) — proceeding");
-        }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: false,
-        } => {
-            eprintln!("warning: {verdict:?} — dev iteration, advisory (not authoritative)");
-        }
+        // Proceeding verdicts are silent: the gate regime is a standing fact
+        // of the deployment (describe's story), not news on every verb. Only
+        // a refusal earns narration — and it is the error above.
+        GateOutcome::Proceed { .. } => {}
+    }
+
+    // ── Destructive gate (§4): identical contract to `infra apply`. ──
+    if !yes && let Realization::Realized(planned) = platform.deploy_plan(deployment_dir).await? {
+        crate::apply::refuse_destructive_without_yes("deploy apply", &planned)?;
     }
 
     // ── Workload apply (realized by the injected platform) ──
@@ -108,9 +98,9 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
     // — the set the rollback B-delete pass consumes (task 19.3).
     envelope.record_post_checkpoint_changes(&applied);
     println!(
-        "[{}] deploy apply: {} change(s)",
+        "[{}] deploy apply: {}",
         platform.label(deployment_dir),
-        applied.len()
+        tokeira_report::counted(applied.len(), "change")
     );
 
     // ── Re-stamp: a workload apply advances the config revision like any apply ──
@@ -145,7 +135,7 @@ mod tests {
     #[tokio::test]
     async fn deploy_apply_refuses_an_unstamped_deployment() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = deploy_apply(&TestPlatform, tmp.path())
+        let err = deploy_apply(&TestPlatform, tmp.path(), false)
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(
@@ -166,7 +156,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        deploy_apply(&TestPlatform, tmp.path())
+        deploy_apply(&TestPlatform, tmp.path(), false)
             .await
             .expect("deploy apply proceeds under DevIterate");
 

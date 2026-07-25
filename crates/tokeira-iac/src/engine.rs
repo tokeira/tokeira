@@ -35,10 +35,10 @@ use std::{
 use tracing::{info, warn};
 
 use crate::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId,
+    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceRecovery,
     error::IacError,
     module::ModuleContext,
-    types::{Change, ChangeKind, FieldDiff, InfraComposition},
+    types::{Change, ChangeKind, InfraComposition},
 };
 
 /// Callback invoked after each mutating operation so the caller can
@@ -814,13 +814,25 @@ async fn apply_changes(
             let Some(current) = ctx.state.resources.get(rid).cloned() else {
                 continue;
             };
-            // Fail-closed: a Delete must have a known `Resource` to delete the live
-            // object with. Dropping the state entry without deleting would orphan
-            // the live resource (Property 10).
-            let Some(resource) = resource_map.get(rid) else {
-                return Err(IacError::UnknownResourceDelete {
-                    resource_id: rid.0.clone(),
-                });
+            // Fail-closed: a Delete must have a known `Resource` to delete the
+            // live object with — dropping the state entry without deleting
+            // would orphan the live resource (Property 10). A resource removed
+            // from the definition has no realizing module any more, so consult
+            // the platform's recovery seam before refusing.
+            let recovered: Option<Box<dyn Resource>> = match resource_map.get(rid) {
+                Some(_) => None,
+                None => ctx
+                    .extension::<ResourceRecovery>()
+                    .and_then(|recovery| recovery.recover(&current)),
+            };
+            let resource: &dyn Resource = match (resource_map.get(rid), recovered.as_deref()) {
+                (Some(known), _) => *known,
+                (None, Some(recovered)) => recovered,
+                (None, None) => {
+                    return Err(IacError::UnknownResourceDelete {
+                        resource_id: rid.0.clone(),
+                    });
+                }
             };
             operation_index += 1;
             ctx.emit_apply_progress(
@@ -880,11 +892,22 @@ async fn destroy_changes(
             continue;
         };
         // Fail-closed: a Delete must have a known `Resource` to delete the live
-        // object with (Property 10).
-        let Some(resource) = resource_map.get(rid) else {
-            return Err(IacError::UnknownResourceDelete {
-                resource_id: rid.0.clone(),
-            });
+        // object with (Property 10); the recovery seam covers resources whose
+        // realizing module was removed from the definition.
+        let recovered: Option<Box<dyn Resource>> = match resource_map.get(rid) {
+            Some(_) => None,
+            None => ctx
+                .extension::<ResourceRecovery>()
+                .and_then(|recovery| recovery.recover(&current)),
+        };
+        let resource: &dyn Resource = match (resource_map.get(rid), recovered.as_deref()) {
+            (Some(known), _) => *known,
+            (None, Some(recovered)) => recovered,
+            (None, None) => {
+                return Err(IacError::UnknownResourceDelete {
+                    resource_id: rid.0.clone(),
+                });
+            }
         };
         // Re-describe to get live state before deleting
         match resource.describe(ctx).await.map_err(|err| {
@@ -1148,11 +1171,7 @@ fn internal_change_to_flat(
             resource_type: rt.0.clone(),
             module: module.to_string(),
             resource: resource_id.0.clone(),
-            details: vec![FieldDiff {
-                field: "config".to_string(),
-                before: None,
-                after: Some(details.clone()),
-            }],
+            details: details.clone(),
         },
         InternalChange::Replace {
             resource_id,
@@ -1163,11 +1182,7 @@ fn internal_change_to_flat(
             resource_type: rt.0.clone(),
             module: module.to_string(),
             resource: resource_id.0.clone(),
-            details: vec![FieldDiff {
-                field: "immutable".to_string(),
-                before: None,
-                after: Some(details.clone()),
-            }],
+            details: details.clone(),
         },
         InternalChange::Delete {
             resource_id,
@@ -1365,7 +1380,7 @@ mod tests {
                 return InternalChange::Replace {
                     resource_id: self.resource_id(),
                     resource_type: self.resource_type(),
-                    details: "immutable field changed".to_string(),
+                    details: vec![crate::FieldDiff::observation("immutable field changed")],
                 };
             }
             InternalChange::NoChange {
@@ -1493,6 +1508,60 @@ mod tests {
                 .resources
                 .contains_key(&ResourceId("orphan".into())),
             "fail-closed must NOT drop the orphan from state"
+        );
+    }
+
+    // Property 10, recovery half: the platform's recovery seam turns an
+    // unknown-but-recorded resource back into a deletable one; the guard
+    // stays closed for types the recoverer does not claim.
+    #[tokio::test]
+    async fn recovery_seam_deletes_removed_resources_and_stays_closed_otherwise() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        ctx.state
+            .resources
+            .insert(ResourceId("removed".into()), stub_state("removed", "ghost"));
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&deletes);
+        ctx.set_extension(ResourceRecovery::new(move |state| {
+            (state.resource_type.0 == "Stub").then(|| {
+                let mut stub = StubResource::missing(&state.physical_id, "ghost");
+                stub.delete_counter = Some(Arc::clone(&counter));
+                Box::new(stub) as Box<dyn Resource>
+            })
+        }));
+
+        let none: Vec<Box<dyn Resource>> = boxed_resources(vec![]);
+        engine
+            .apply_with_known(&refs(&none), &refs(&none), &mut ctx, None)
+            .await
+            .expect("the recovered resource deletes");
+        assert_eq!(deletes.load(Ordering::SeqCst), 1, "live delete executed");
+        assert!(
+            !ctx.state
+                .resources
+                .contains_key(&ResourceId("removed".into())),
+            "state entry retired after the live delete"
+        );
+
+        // Unclaimed type: the recoverer declines, the guard refuses.
+        ctx.state.resources.insert(ResourceId("alien".into()), {
+            let mut s = stub_state("alien", "ghost");
+            s.resource_type = crate::ResourceType::new("not-a-stub");
+            s
+        });
+        let err = engine
+            .apply_with_known(&refs(&none), &refs(&none), &mut ctx, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IacError::UnknownResourceDelete { ref resource_id } if resource_id == "alien"),
+            "unclaimed types stay fail-closed, got {err:?}"
         );
     }
 

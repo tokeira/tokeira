@@ -156,30 +156,44 @@ impl DeploymentResolver {
     /// Phase 0 (native-cargo dev binding, Proposal 005): resolves the
     /// **per-platform source binary** (`tkp-compose`, a bin target of
     /// `platforms/compose-syn` — the platform ships its own provisioner) and
-    /// copies its bytes in as `tkp`. Resolution order: installed on PATH, then
-    /// the running `tkr`'s own directory (a dev `tkr` in `target/debug` finds
-    /// its sibling `tkp-compose` from the same build). The hermetic
+    /// copies its bytes in as `tkp`. Resolution order: installed on PATH,
+    /// then the running `tkr`'s own directory (a dev `tkr` in `target/debug`
+    /// finds its sibling from the same build), then — inside the workspace —
+    /// **`tkr` builds it from the platform crate** (15.5's "tkr compiles tkp
+    /// from `platforms/<platform>`", the create-time leg). The hermetic
     /// build/obtain + bundle verification supersede this (tasks 16-18).
-    pub(crate) fn place_provisioner(&self, name: &str) -> Result<()> {
-        let source = which::which(PROVISIONER_SOURCE_BIN)
+    /// Resolve the per-platform provisioner **source** binary from the
+    /// Phase-0 pool, labeled for provenance reporting: installed on PATH →
+    /// beside the running `tkr` → built from the workspace. The pool is
+    /// where fresh bytes come from — placement at create and the upgrade
+    /// re-marry both draw from it (the deployment's married copy is
+    /// definitionally the *old* engine and never a candidate).
+    pub(crate) fn resolve_provisioner_source() -> Result<(PathBuf, &'static str)> {
+        if let Ok(path) = which::which(PROVISIONER_SOURCE_BIN) {
+            return Ok((path, "installed on PATH"));
+        }
+        if let Some(sibling) = std::env::current_exe()
             .ok()
-            .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|exe| Some(exe.parent()?.join(PROVISIONER_SOURCE_BIN)))
-                    .filter(|sibling| sibling.is_file())
-            })
-            .ok_or_else(|| {
-                anyhow!(
-                    "cannot introduce the compose provisioner: no `{PROVISIONER_SOURCE_BIN}` on \
-                     PATH or beside this `tkr`. Build it (`cargo build -p tokeira-compose-syn \
-                     --bin {PROVISIONER_SOURCE_BIN}`) and re-run `tkr deployment create`."
-                )
-            })?;
+            .and_then(|exe| Some(exe.parent()?.join(PROVISIONER_SOURCE_BIN)))
+            .filter(|sibling| sibling.is_file())
+        {
+            return Ok((sibling, "beside this tkr"));
+        }
+        Ok((
+            Self::build_provisioner_from_workspace()?,
+            "built from the workspace",
+        ))
+    }
+
+    pub(crate) fn place_provisioner(&self, name: &str) -> Result<()> {
+        // Resolution is labeled: placement is a provenance event, and the
+        // operator report says which leg supplied the bytes and from where.
+        let (source, how) = Self::resolve_provisioner_source()?;
+        let bytes =
+            fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
+        let sha256 = tokeira_provisioner::sha256_hex(&bytes);
         let dest = self.path(name).join(PROVISIONER_BIN);
-        fs::copy(&source, &dest).with_context(|| {
-            format!("failed to copy {} -> {}", source.display(), dest.display())
-        })?;
+        fs::write(&dest, &bytes).with_context(|| format!("failed to place {}", dest.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -187,7 +201,61 @@ impl DeploymentResolver {
             perms.set_mode(0o755);
             fs::set_permissions(&dest, perms)?;
         }
+        println!(
+            "provisioner: placed `tkp` ({how}: {}, sha256 {}…)",
+            source.display(),
+            &sha256[..12]
+        );
         Ok(())
+    }
+
+    /// The create-time build leg (task 15.5): inside the workspace, `tkr`
+    /// compiles the platform's provisioner bin and returns the built
+    /// artifact — "tkr compiles tkp from `platforms/<platform>`", literally.
+    /// Outside a workspace (an installed `tkr` with no source tree),
+    /// resolution has honestly run out and the error names everything tried.
+    ///
+    /// (An associated function, not a method: the resolver's root plays no
+    /// part in where the provisioner is built from.)
+    fn build_provisioner_from_workspace() -> Result<PathBuf> {
+        let cwd = std::env::current_dir().context("cannot determine the current directory")?;
+        let Ok(workspace) = crate::bundle_create::workspace_root_from(&cwd) else {
+            bail!(
+                "cannot introduce the compose provisioner: no `{PROVISIONER_SOURCE_BIN}` on \
+                 PATH, none beside this `tkr`, and no tokeira workspace above {} to build one \
+                 from — install `{PROVISIONER_SOURCE_BIN}` or run from inside the workspace",
+                cwd.display()
+            );
+        };
+        eprintln!(
+            "provisioner: building `{PROVISIONER_SOURCE_BIN}` from the workspace (Phase 0 dev \
+             binding)…"
+        );
+        let status = std::process::Command::new("cargo")
+            .current_dir(&workspace)
+            .args([
+                "build",
+                "-p",
+                "tokeira-compose-syn",
+                "--bin",
+                PROVISIONER_SOURCE_BIN,
+            ])
+            .status()
+            .context("failed to run `cargo build` for the provisioner")?;
+        if !status.success() {
+            bail!(
+                "`cargo build -p tokeira-compose-syn --bin {PROVISIONER_SOURCE_BIN}` failed — \
+                 see the build output above"
+            );
+        }
+        let artifact = workspace.join("target/debug").join(PROVISIONER_SOURCE_BIN);
+        if !artifact.is_file() {
+            bail!(
+                "the provisioner build succeeded but {} is missing",
+                artifact.display()
+            );
+        }
+        Ok(artifact)
     }
 
     /// Create a fresh deployment: writes the two TOML files, the metadata
@@ -374,6 +442,19 @@ pub(crate) fn load_context(
     }
     let metadata = metadata::read(&path)?;
     let deployment_config_path = path.join(DEPLOYMENT_TOML);
+    // A forwarded (`.tkd`) deployment has no in-process platform config — its
+    // definition IS `definition.tkd`, interpreted by the married `tkp`. Every
+    // caller of this function speaks the in-process dialect, so refuse in
+    // domain terms: without this guard each caller surfaces a bare "no such
+    // file" for a file the deployment was never meant to have. (Which
+    // operational verbs the forwarded surface grows is a design decision, not
+    // this error's business — the message states the contract, not a roadmap.)
+    if !deployment_config_path.exists() && path.join(DEFINITION_TKD).exists() {
+        bail!(
+            "deployment '{name}' is defined by `{DEFINITION_TKD}` and operated through its bound \
+             `{PROVISIONER_BIN}`; this command drives in-process (`{DEPLOYMENT_TOML}`) platforms"
+        );
+    }
     let platform_config = match metadata.platform {
         PlatformKind::Local => {
             let config: LocalConfig = tokeira_config::load_config(&deployment_config_path, None)

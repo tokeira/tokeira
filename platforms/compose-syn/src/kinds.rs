@@ -312,6 +312,9 @@ impl Service {
             depends_on: self.needs.clone(),
             healthcheck: None,
             command: self.command.clone(),
+            // Wired by the builder from the typed `Vol::Config` anchors —
+            // the service realizer only shapes the container.
+            resource_dependencies: Vec::new(),
         }
     }
 }

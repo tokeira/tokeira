@@ -16,6 +16,7 @@ path = "src/bin/tkp.rs"
 
 [dependencies]
 tokeira-provisioner-cli = { workspace = true }
+tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokeira-compose = { path = "../../crates/tokeira-compose" }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }

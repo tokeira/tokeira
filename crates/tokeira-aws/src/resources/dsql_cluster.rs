@@ -124,7 +124,9 @@ impl Resource for DsqlCluster {
                     InternalChange::Update {
                         resource_id: self.resource_id(),
                         resource_type: self.resource_type(),
-                        details: "preexisting DSQL endpoint/ARN changed".into(),
+                        details: vec![tokeira_iac::FieldDiff::observation(
+                            "preexisting DSQL endpoint/ARN changed",
+                        )],
                     }
                 } else {
                     InternalChange::NoChange {

@@ -46,18 +46,10 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
         GateOutcome::Refuse { verdict, reason } => {
             anyhow::bail!("binding gate refuses `revert` ({verdict:?}): {reason}");
         }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: true,
-        } => {
-            println!("binding: {verdict:?} (authoritative) — proceeding");
-        }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: false,
-        } => {
-            eprintln!("warning: {verdict:?} — dev iteration, advisory (not authoritative)");
-        }
+        // Proceeding verdicts are silent: the gate regime is a standing fact
+        // of the deployment (describe's story), not news on every verb. Only
+        // a refusal earns narration — and it is the error above.
+        GateOutcome::Proceed { .. } => {}
     }
 
     // ── Target must be a prior, retained revision ──
@@ -89,9 +81,9 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
     // — the set the rollback B-delete pass consumes (task 19.3).
     envelope.record_post_checkpoint_changes(&applied);
     println!(
-        "[{}] revert reconcile: {} change(s)",
-        applied.len(),
-        platform.label(deployment_dir)
+        "[{}] revert reconcile: {}",
+        platform.label(deployment_dir),
+        tokeira_report::counted(applied.len(), "change")
     );
 
     // ── Re-stamp: a forward config revision whose content equals `to_revision` ──
@@ -174,7 +166,7 @@ mod tests {
             "project_name = \"one\"\n",
         )
         .unwrap();
-        crate::apply::apply(&TestPlatform, tmp.path())
+        crate::apply::apply(&TestPlatform, tmp.path(), false)
             .await
             .expect("apply rev 1");
 
@@ -184,7 +176,7 @@ mod tests {
             "project_name = \"two\"\n",
         )
         .unwrap();
-        crate::apply::apply(&TestPlatform, tmp.path())
+        crate::apply::apply(&TestPlatform, tmp.path(), false)
             .await
             .expect("apply rev 2");
 

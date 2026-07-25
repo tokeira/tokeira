@@ -20,6 +20,7 @@ members = [
     "crates/tokeira-state",
     "crates/tokeira-provisioner",
     "crates/tokeira-provisioner-cli",
+    "crates/tokeira-report",
     "crates/tokeira-iac",
     "crates/tokeira-deploy-engine",
     "crates/tokeira-config",
@@ -90,11 +91,23 @@ metrics-exporter-prometheus = "0.16"
 metrics-util = "0.19"
 mimalloc = { version = "0.1.48", default-features = false }
 opentelemetry = "0.31"
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 prost-reflect = { version = "0.12", features = ["serde"] }
 proptest = "1"
-reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+# default-features OFF is load-bearing: reqwest's `default-tls` drags
+# hyper-tls → native-tls, which is invisible on macOS (Security.framework)
+# but dynamically links libssl.so.3 on Linux — and the tokeirad runtime
+# image (chainguard glibc-dynamic) ships no OpenSSL. rustls everywhere,
+# for real this time; the other defaults are re-enabled explicitly.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+    "charset",
+    "http2",
+    "system-proxy",
+] }
 jsonwebtoken = "9"
 quick-xml = { version = "0.41", features = ["serialize"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -122,6 +135,7 @@ tokeira-state = { path = "crates/tokeira-state" }
 tokeira-provisioner = { path = "crates/tokeira-provisioner" }
 tokeira-provisioner-cli = { path = "crates/tokeira-provisioner-cli" }
 tokeira-iac = { path = "crates/tokeira-iac" }
+tokeira-report = { path = "crates/tokeira-report" }
 tokeira-deploy-engine = { path = "crates/tokeira-deploy-engine" }
 tokeira-config = { path = "crates/tokeira-config" }
 tokeira-aws = { path = "crates/tokeira-aws" }

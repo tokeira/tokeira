@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Dev { action } => commands::dev::run(action),
         Command::Deployment { action } => {
-            commands::deployment::run(action, &deployments, selected, cli.json).await
+            commands::deployment::run(action, &deployments, selected, cli.json, cli.detail).await
         }
         Command::Image(args) => {
             let deployment = match args.command {
@@ -105,13 +105,55 @@ async fn main() -> Result<()> {
             };
             commands::image::run(args.command, deployment, format).await
         }
+        Command::Definition { action } => {
+            let cli::DefinitionAction::Check { path } = action;
+            if let Some(path) = path {
+                // Authoring mode: the definition needs no deployment. One
+                // subject per check — a named path and a named deployment
+                // cannot both be it.
+                if selected.is_some() {
+                    anyhow::bail!("pass either `--path` or `--deployment`, not both");
+                }
+                launcher::launch_definition_check_at_path(&path, cli.json, cli.detail).await
+            } else if deployments.is_forwarded(selected)? {
+                let dir = deployments.resolve_dir(selected)?;
+                launcher::launch(
+                    &dir,
+                    &["definition", "check"],
+                    &output_flags(cli.json, cli.detail),
+                )
+                .await
+            } else {
+                // In-process platforms are configured, not defined: there is
+                // no interpreted definition to check.
+                let name = deployments.resolve_name(selected)?;
+                anyhow::bail!(
+                    "deployment '{name}' is configured by `deployment.toml`; there is no \
+                     interpreted definition to check"
+                );
+            }
+        }
         Command::Infra { action } => {
             // A `.tkd` deployment is forwarded to its bound `tkp`; only the legacy
             // in-process platforms run through `commands::infra`.
             if deployments.is_forwarded(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
-                let (verb, extra) = forwarded_infra_verb(&action);
-                launcher::launch(&dir, verb, &extra).await
+                // `infra apply` is the same coherent one-command flow as
+                // `deployment apply` (Req 6.5): a never-stamped deployment is
+                // initialized first, then applied — the operator's first
+                // apply works whichever spelling they reach for.
+                if let InfraAction::Apply { yes, .. } = &action {
+                    launcher::launch_apply(&dir, *yes).await
+                } else {
+                    let (verb, mut extra) = forwarded_infra_verb(&action);
+                    // The output contract's global flags travel with the
+                    // read-only verbs, so the operator cannot tell which
+                    // binary rendered the report.
+                    if matches!(action, InfraAction::Plan { .. } | InfraAction::Status) {
+                        extra.extend(output_flags(cli.json, cli.detail));
+                    }
+                    launcher::launch(&dir, verb, &extra).await
+                }
             } else {
                 let ctx = load_context(&deployments, selected)?;
                 let format = if cli.json {
@@ -125,7 +167,10 @@ async fn main() -> Result<()> {
         Command::Deploy { action } => {
             if deployments.is_forwarded(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
-                let (verb, extra) = forwarded_deploy_verb(&action);
+                let (verb, mut extra) = forwarded_deploy_verb(&action);
+                if matches!(action, DeployAction::Plan | DeployAction::Status) {
+                    extra.extend(output_flags(cli.json, cli.detail));
+                }
                 launcher::launch(&dir, verb, &extra).await
             } else {
                 let ctx = load_context(&deployments, selected)?;
@@ -141,7 +186,10 @@ async fn main() -> Result<()> {
                 let dir = deployments.resolve_dir(selected)?;
                 match forwarded_scale_verb(&action) {
                     Some(specs) => launcher::launch(&dir, &["scale"], &specs).await,
-                    None => launcher::launch(&dir, &["describe"], &[]).await,
+                    None => {
+                        launcher::launch(&dir, &["describe"], &output_flags(cli.json, cli.detail))
+                            .await
+                    }
                 }
             } else {
                 let ctx = load_context(&deployments, selected)?;
@@ -173,10 +221,7 @@ async fn main() -> Result<()> {
         }
         Command::Config {
             action: ConfigAction::Show,
-        } => {
-            let ctx = load_context(&deployments, selected)?;
-            commands::config::run_show(ctx)
-        }
+        } => commands::config::run_show(&deployments, selected),
         Command::Compat(args) => commands::compat::run(args.command, cli.json),
         Command::Ci(args) => commands::ci::run(args.command, cli.json).await,
         Command::Observability { action } => {
@@ -231,9 +276,9 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
         },
         Command::Deployment { action } => match action {
             DeploymentAction::Destroy { name, .. } => Some(Some(name.clone())),
-            DeploymentAction::Apply | DeploymentAction::Upgrade | DeploymentAction::Rollback => {
-                Some(selected())
-            }
+            DeploymentAction::Apply { .. }
+            | DeploymentAction::Upgrade
+            | DeploymentAction::Rollback => Some(selected()),
             _ => None,
         },
         _ => None,
@@ -273,6 +318,21 @@ fn forwarded_deploy_verb(action: &DeployAction) -> (&'static [&'static str], Vec
     }
 }
 
+/// The operator output contract's global flags (`--json`, `--detail`),
+/// re-spelled for a forwarded `tkp` invocation. Attached to read-only verbs so
+/// the report renders identically whichever binary produced it; mutating verbs
+/// join as their reports migrate onto the contract.
+fn output_flags(json: bool, detail: bool) -> Vec<String> {
+    let mut flags = Vec::new();
+    if json {
+        flags.push("--json".to_string());
+    }
+    if detail {
+        flags.push("--detail".to_string());
+    }
+    flags
+}
+
 /// Map a `tkr scale` action to the forwarded `tkp scale` specs. The spec grammar
 /// is platform-interpreted; both current platforms answer `NotApplicable`.
 fn forwarded_scale_verb(action: &ScaleAction) -> Option<Vec<String>> {
@@ -301,8 +361,8 @@ mod tests {
     use super::*;
     use crate::{
         cli::{
-            ConfigAction, DeployAction, DeploymentAction, DevAction, InfraAction,
-            ObservabilityAction, ScaleAction,
+            CliPlatformKind, CliStorageKind, ConfigAction, DeployAction, DeploymentAction,
+            DevAction, InfraAction, ObservabilityAction, ScaleAction,
         },
         deployment_dir::{DEPLOYMENT_TOML, METADATA_JSON, TOKEIRAD_TOML},
     };
@@ -331,6 +391,23 @@ mod tests {
                 action: DeploymentAction::Create { .. }
             }
         ));
+    }
+
+    // `tkr deployment create` alone must always work on a fresh machine: the
+    // platform/storage default to the zero-dependency dev pairing.
+    #[test]
+    fn create_defaults_to_local_platform_with_in_memory_storage() {
+        let cli = Cli::try_parse_from(["tkr", "deployment", "create", "--name", "dev"]).unwrap();
+        let Command::Deployment {
+            action: DeploymentAction::Create {
+                platform, storage, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected a create action");
+        };
+        assert!(matches!(platform, CliPlatformKind::Local));
+        assert!(matches!(storage, CliStorageKind::InMemory));
     }
 
     #[test]
@@ -394,7 +471,7 @@ mod tests {
             } if name == "dev"
         ));
         assert!(matches!(
-            Cli::try_parse_from(["tkr", "deployment", "destroy", "dev", "--yes"])
+            Cli::try_parse_from(["tkr", "deployment", "destroy", "--name", "dev", "--yes"])
                 .unwrap()
                 .command,
             Command::Deployment {
@@ -434,7 +511,10 @@ mod tests {
                 ["tkr", "deployment", "describe"],
                 DeploymentAction::Describe,
             ),
-            (["tkr", "deployment", "apply"], DeploymentAction::Apply),
+            (
+                ["tkr", "deployment", "apply"],
+                DeploymentAction::Apply { yes: false },
+            ),
             (["tkr", "deployment", "upgrade"], DeploymentAction::Upgrade),
             (
                 ["tkr", "deployment", "rollback"],
@@ -478,7 +558,7 @@ mod tests {
         // `deployment destroy` guards its explicit positional target.
         assert_eq!(
             mutation_target(
-                &parse(&["tkr", "deployment", "destroy", "staging", "--yes"]),
+                &parse(&["tkr", "deployment", "destroy", "--name", "staging", "--yes"]),
                 Some("prod")
             ),
             Some(Some("staging".to_string()))
@@ -587,6 +667,27 @@ mod tests {
                 }
             }
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "definition", "check"])
+                .unwrap()
+                .command,
+            Command::Definition {
+                action: cli::DefinitionAction::Check { .. }
+            }
+        ));
+        // Authoring mode: --path parses; global --deployment parses after the
+        // subcommand (Ian-grammar: flags where the operator's hands already are).
+        assert!(matches!(
+            Cli::try_parse_from(["tkr", "definition", "check", "--path", "defs/staging.tkd"])
+                .unwrap()
+                .command,
+            Command::Definition {
+                action: cli::DefinitionAction::Check { path: Some(_) }
+            }
+        ));
+        let parsed =
+            Cli::try_parse_from(["tkr", "definition", "check", "--deployment", "prod"]).unwrap();
+        assert_eq!(parsed.deployment.as_deref(), Some("prod"));
         assert!(matches!(
             Cli::try_parse_from(["tkr", "scale", "down", "tokeirad", "2"])
                 .unwrap()
@@ -753,6 +854,28 @@ mod tests {
         let error = deployments.not_found_message("gamma").unwrap();
         assert!(error.contains("alpha"));
         assert!(error.contains("beta"));
+    }
+
+    // The in-process context loader refuses a forwarded deployment in domain
+    // terms — what the deployment is and what operates it — never as a raw
+    // missing-file error, and never as an implementation-status report.
+    #[test]
+    fn in_process_context_refuses_a_forwarded_deployment_in_domain_terms() {
+        let temp = tempfile::tempdir().unwrap();
+        let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
+        deployments
+            .create("fwd", PlatformKind::Compose, StorageKind::InMemory, None)
+            .unwrap();
+        let Err(err) = load_context(&deployments, Some("fwd")) else {
+            panic!("a forwarded deployment must refuse the in-process context");
+        };
+        let message = err.to_string();
+        assert!(message.contains("definition.tkd"), "unexpected: {message}");
+        assert!(message.contains("tkp"), "unexpected: {message}");
+        assert!(
+            !message.contains("No such file") && !message.contains("yet"),
+            "reads as ENOENT or a roadmap apology: {message}"
+        );
     }
 
     #[test]

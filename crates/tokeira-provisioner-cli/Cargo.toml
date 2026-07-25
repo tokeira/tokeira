@@ -18,6 +18,7 @@ tokeira-provisioner = { workspace = true }
 tokeira-state = { workspace = true }
 tokeira-build-info = { workspace = true }
 tokeira-iac = { workspace = true }
+tokeira-report = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

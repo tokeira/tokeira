@@ -111,7 +111,9 @@ impl Resource for S3Object {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "S3 object content changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "S3 object content changed",
+                )],
             }
         }
     }

@@ -5,7 +5,7 @@
 //!
 //! - **Operator view** (default): a tight summary answering "is this healthy and
 //!   safe to act on" — no checksums, no digests.
-//! - **Verification / debug view** (`--verbose` human; `--json` always emits the
+//! - **Verification / debug view** (`--detail` human; `--json` always emits the
 //!   full record): the complete auditable record — the per-artifact integrity
 //!   manifest (SHA-256), the retained-revision set, the operation marker and
 //!   lock holder. The `EngineIdentity` fields and source-snapshot ref join this
@@ -27,7 +27,7 @@ pub(crate) async fn describe<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
     json: bool,
-    verbose: bool,
+    detail: bool,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let (envelope, _version) = envelope_store(deployment_dir).load().await?;
@@ -47,7 +47,7 @@ pub(crate) async fn describe<P: ProvisionerPlatform>(
         // The JSON view is always the full verification record (stable,
         // machine-parseable).
         println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if verbose {
+    } else if detail {
         report.print_verification(deployment_dir);
     } else {
         report.print_operator();
@@ -295,7 +295,7 @@ impl DescribeReport {
                 None => "free".to_string(),
             }
         );
-        println!("\n(`--verbose` for the verification view: full manifest, revisions, heads)");
+        println!("\n(`--detail` for the verification view: full manifest, revisions, heads)");
     }
 
     /// The verification / debug view: the full auditable record, for verifying

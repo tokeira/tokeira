@@ -97,7 +97,7 @@ mod tests {
                 Some(detail) => InternalChange::Update {
                     resource_id: self.id.clone(),
                     resource_type: self.rtype.clone(),
-                    details: detail.clone(),
+                    details: vec![crate::FieldDiff::observation(detail.clone())],
                 },
                 None => InternalChange::NoChange {
                     resource_id: self.id.clone(),
@@ -172,7 +172,7 @@ mod tests {
         let changes = compute_changes(&desired, &state, &make_ctx());
         assert_eq!(changes.len(), 1);
         assert!(
-            matches!(&changes[0], InternalChange::Update { details, .. } if details == "rules changed")
+            matches!(&changes[0], InternalChange::Update { details, .. } if details[0].field == "rules changed")
         );
     }
 

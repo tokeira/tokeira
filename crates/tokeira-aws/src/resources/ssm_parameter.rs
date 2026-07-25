@@ -96,7 +96,9 @@ impl Resource for SsmParameterResource {
         InternalChange::Update {
             resource_id: self.resource_id(),
             resource_type: self.resource_type(),
-            details: "SSM parameter content is managed by generated config".into(),
+            details: vec![tokeira_iac::FieldDiff::observation(
+                "SSM parameter content is managed by generated config",
+            )],
         }
     }
 }

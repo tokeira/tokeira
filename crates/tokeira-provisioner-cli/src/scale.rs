@@ -42,18 +42,10 @@ pub(crate) async fn scale<P: ProvisionerPlatform>(
         GateOutcome::Refuse { verdict, reason } => {
             anyhow::bail!("binding gate refuses `scale` ({verdict:?}): {reason}");
         }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: true,
-        } => {
-            println!("binding: {verdict:?} (authoritative) — proceeding");
-        }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: false,
-        } => {
-            eprintln!("warning: {verdict:?} — dev iteration, advisory (not authoritative)");
-        }
+        // Proceeding verdicts are silent: the gate regime is a standing fact
+        // of the deployment (describe's story), not news on every verb. Only
+        // a refusal earns narration — and it is the error above.
+        GateOutcome::Proceed { .. } => {}
     }
 
     // ── Capacity change (realized by the injected platform) ──
@@ -64,9 +56,10 @@ pub(crate) async fn scale<P: ProvisionerPlatform>(
         Realization::Realized(count) => count,
     };
     println!(
-        "[{}] scale {}: {change_count} change(s)",
+        "[{}] scale {}: {}",
         platform.label(deployment_dir),
-        specs.join(" ")
+        specs.join(" "),
+        tokeira_report::counted(change_count, "change")
     );
 
     // ── Re-stamp: a capacity change is a config revision ──

@@ -26,6 +26,7 @@ pub(crate) async fn run(
     deployments: &DeploymentResolver,
     selected: Option<&str>,
     json: bool,
+    detail: bool,
 ) -> Result<()> {
     match action {
         DeploymentAction::Create {
@@ -58,8 +59,8 @@ pub(crate) async fn run(
                     )
                     .await?;
                 } else {
+                    // (place_provisioner reports the resolution leg + digest.)
                     deployments.place_provisioner(&metadata.name)?;
-                    println!("provisioner: placed `tkp` in the deployment");
                 }
             } else if bundle {
                 anyhow::bail!(
@@ -128,20 +129,27 @@ pub(crate) async fn run(
         }
         DeploymentAction::Describe => {
             let dir = deployments.resolve_dir(selected)?;
-            let extra = if json {
-                vec!["--json".to_string()]
-            } else {
-                Vec::new()
-            };
+            // The output contract's global flags travel with the forwarded
+            // verb (`--json` complete model; `--detail` verification view).
+            let mut extra = Vec::new();
+            if json {
+                extra.push("--json".to_string());
+            }
+            if detail {
+                extra.push("--detail".to_string());
+            }
             launcher::launch(&dir, &["describe"], &extra).await?;
         }
-        DeploymentAction::Apply => {
+        DeploymentAction::Apply { yes } => {
             let dir = deployments.resolve_dir(selected)?;
-            launcher::launch_apply(&dir).await?;
+            launcher::launch_apply(&dir, yes).await?;
         }
         DeploymentAction::Upgrade => {
             let dir = deployments.resolve_dir(selected)?;
-            launcher::launch(&dir, &["upgrade"], &[]).await?;
+            // The sanctioned re-marry: candidate from the source pool, byte
+            // idempotency, verb driven via the candidate, file re-placed on
+            // success (never resolves the married copy as its own candidate).
+            launcher::launch_upgrade(&dir).await?;
         }
         DeploymentAction::Rollback => {
             let dir = deployments.resolve_dir(selected)?;

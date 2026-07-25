@@ -24,17 +24,22 @@ use tokeira_orchestrator::{PlatformKind, StorageKind};
 
 #[derive(Parser)]
 #[command(name = "tkr")]
+#[command(version)]
 #[command(about = "Tokeira deployment and developer workflow CLI")]
 pub(crate) struct Cli {
     /// Selects which named deployment this invocation operates on.
     /// When absent, `DeploymentResolver` falls back to the `.latest`
     /// sentinel written by `tkr deployment use`.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub deployment: Option<String>,
     /// Switches human output (tabular text, spinners) for newline-delimited
     /// JSON events. Machine consumers and CI integrations should pass this.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub json: bool,
+    /// Show the evidence behind the summary — per-resource lines, field
+    /// diffs, digests, provenance. Forwarded to the deployment's bound `tkp`.
+    #[arg(long, global = true)]
+    pub detail: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -48,6 +53,10 @@ pub(crate) enum Command {
     Deployment {
         #[command(subcommand)]
         action: DeploymentAction,
+    },
+    Definition {
+        #[command(subcommand)]
+        action: DefinitionAction,
     },
     Image(ImageArgs),
     Infra {
@@ -137,13 +146,31 @@ pub(crate) enum DevAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum DefinitionAction {
+    /// Check a definition: parse + interpret it in memory — no providers
+    /// touched, nothing changes. Checks the selected deployment's
+    /// `definition.tkd` (or `--deployment <name>`'s); `--path` checks a
+    /// definition anywhere on disk instead — a `.tkd` file, or a directory
+    /// holding a `definition.tkd`.
+    Check {
+        /// Check the definition at this path instead of a deployment's:
+        /// authoring mode — the definition needs no deployment to exist yet.
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum DeploymentAction {
     Create {
         #[arg(long)]
         name: Option<String>,
-        #[arg(long)]
+        /// Defaults to the zero-dependency dev pairing: a `local` deployment
+        /// with `in-memory` storage — `tkr deployment create` alone always
+        /// works on a fresh machine.
+        #[arg(long, default_value = "local")]
         platform: CliPlatformKind,
-        #[arg(long)]
+        #[arg(long, default_value = "in-memory")]
         storage: CliStorageKind,
         #[arg(long)]
         region: Option<String>,
@@ -164,6 +191,10 @@ pub(crate) enum DeploymentAction {
         name: String,
     },
     Destroy {
+        /// The deployment to destroy. Deliberately required and deliberately
+        /// a flag (consistent with `create --name`): a destructive verb
+        /// never infers its target from the current selection.
+        #[arg(long)]
         name: String,
         #[arg(long)]
         yes: bool,
@@ -183,7 +214,11 @@ pub(crate) enum DeploymentAction {
     Describe,
     /// Apply the deployment via its bound provisioner (forwards to `tkp apply`,
     /// initializing it first if needed).
-    Apply,
+    Apply {
+        /// Confirm a destructive plan (deletes or replacements).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Upgrade the deployment's engine identity (forwards to `tkp upgrade`).
     Upgrade,
     /// Roll back the deployment to its retained prior revision (forwards to `tkp

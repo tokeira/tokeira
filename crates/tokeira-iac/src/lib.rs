@@ -138,10 +138,53 @@ pub enum DescribeResult {
 #[derive(Debug, Clone, Copy)]
 pub struct DestroyMode;
 
+/// Reconstruct a live-deletable [`Resource`] from its recorded state — the
+/// seam behind the fail-closed delete guard (Property 10).
+///
+/// A resource removed from the deployment definition is still in state and
+/// still live, but no module realizes it any more, so the known managed set
+/// cannot supply a `Resource` to delete it with. The platform registers a
+/// recoverer in the [`ProvisionContext`] extension bag (beside its provider
+/// handle); the delete passes consult it exactly where the guard would
+/// otherwise refuse. Recovery must yield a resource whose `delete()` acts on
+/// the live object; a recoverer that cannot claim the recorded type returns
+/// `None` and the guard refuses as before — recovery widens what is
+/// deletable, never what is droppable.
+pub struct ResourceRecovery(
+    #[allow(clippy::type_complexity)] // one seam, named once; an alias would just move the shape
+    Box<dyn Fn(&ResourceState) -> Option<Box<dyn Resource>> + Send + Sync>,
+);
+
+impl ResourceRecovery {
+    pub fn new(
+        recover: impl Fn(&ResourceState) -> Option<Box<dyn Resource>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Box::new(recover))
+    }
+
+    /// Attempt to reconstruct the recorded resource. `None` means this
+    /// recoverer does not claim the type — the caller stays fail-closed.
+    pub fn recover(&self, state: &ResourceState) -> Option<Box<dyn Resource>> {
+        (self.0)(state)
+    }
+}
+
+impl std::fmt::Debug for ResourceRecovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResourceRecovery(..)")
+    }
+}
+
 /// A change detected by the internal diff engine.
 ///
 /// Used by the low-level engine; the higher-level API uses
 /// [`types::Change`] (a flat struct) instead.
+///
+/// `details` is the field-level evidence behind an update/replace — the plan
+/// renderer's `field: before → after` lines. A resource that detects a change
+/// without holding the value pair reports a [`FieldDiff::observation`]
+/// (named, valueless); a bare count with no evidence is what blinded the
+/// compose phantom-drift hunt, so the evidence rides in the type.
 #[derive(Debug, Clone)]
 pub enum InternalChange {
     Create {
@@ -151,7 +194,7 @@ pub enum InternalChange {
     Update {
         resource_id: ResourceId,
         resource_type: ResourceType,
-        details: String,
+        details: Vec<FieldDiff>,
     },
     /// An immutable-field change that `update` cannot apply in place: the engine
     /// deletes the current resource and re-creates it. A resource returns this
@@ -160,7 +203,7 @@ pub enum InternalChange {
     Replace {
         resource_id: ResourceId,
         resource_type: ResourceType,
-        details: String,
+        details: Vec<FieldDiff>,
     },
     Delete {
         resource_id: ResourceId,

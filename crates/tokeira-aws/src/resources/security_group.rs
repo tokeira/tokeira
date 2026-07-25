@@ -513,7 +513,7 @@ impl Resource for SecurityGroup {
             return InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "ingress rules changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation("ingress rules changed")],
             };
         }
 
@@ -533,7 +533,7 @@ impl Resource for SecurityGroup {
             return InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "tags changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation("tags changed")],
             };
         }
 

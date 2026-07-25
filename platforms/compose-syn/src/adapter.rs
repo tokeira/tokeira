@@ -52,7 +52,7 @@ impl TkdDeployment {
     /// Interpret the config-revision source into the realized builder deployment.
     /// The `.tkd` is validated when the deployment is loaded, so this does not
     /// fail in the engine's hot path.
-    fn realize(cfg: &TkdConfig) -> TkdBuilt {
+    pub(crate) fn realize(cfg: &TkdConfig) -> TkdBuilt {
         interp::interpret(&cfg.source, &cfg.cx)
             .map(|(dep, _cfg)| dep)
             .expect("`.tkd` is interpreted/validated at load")

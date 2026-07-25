@@ -251,10 +251,41 @@ impl Deployment {
             .iter()
             .map(|r| r.kind.realize(cx))
             .collect();
+        // A service that bind-mounts config-anchored volumes (`Vol::Config`)
+        // depends on the resource that WRITES them. Without this edge the
+        // engine's creation order is free to start the container first —
+        // and Docker manufactures a missing bind source as a *directory*,
+        // poisoning the path the config writer then fails on (EISDIR).
+        // Wired automatically from the typed volume anchor whenever the
+        // definition declares the config-files resource; the edge is
+        // infra-graph-only and never leaks into the compose manifest.
+        let config_dep = self.declared_config_files_id(cx);
         for s in self.services.iter().filter(|s| s.module == name) {
-            resources.push(Box::new(s.svc.to_compose_service(&s.name, cx)));
+            let mut svc = s.svc.to_compose_service(&s.name, cx);
+            if let Some(dep) = &config_dep
+                && s.svc
+                    .volumes
+                    .iter()
+                    .any(|v| matches!(v, Vol::Config { .. }))
+            {
+                svc.resource_dependencies.push(dep.clone());
+            }
+            resources.push(Box::new(svc));
         }
         Some(resources)
+    }
+
+    /// The engine id of the definition's config-files resource, when declared
+    /// in any module (services elsewhere still mount its outputs).
+    fn declared_config_files_id(&self, cx: &Cx) -> Option<String> {
+        let target =
+            crate::observability_config::ObservabilityConfigFilesResource::resource_id_value();
+        self.modules
+            .iter()
+            .flat_map(|m| m.resources.iter())
+            .map(|r| r.kind.realize(cx).resource_id())
+            .find(|id| *id == target)
+            .map(|id| id.0)
     }
 
     /// The `(service name, replicas)` pairs declared in this deployment, in

@@ -150,19 +150,21 @@ impl Resource for S3Bucket {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "tags changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation("tags changed")],
             }
         } else if current_versioning != self.config.versioning {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "versioning changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation("versioning changed")],
             }
         } else if current_snapshot_policy != desired_snapshot_policy {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "remote state snapshot protection changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "remote state snapshot protection changed",
+                )],
             }
         } else {
             InternalChange::NoChange {

@@ -43,18 +43,10 @@ pub(crate) async fn destroy<P: ProvisionerPlatform>(
         GateOutcome::Refuse { verdict, reason } => {
             anyhow::bail!("binding gate refuses `destroy` ({verdict:?}): {reason}");
         }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: true,
-        } => {
-            println!("binding: {verdict:?} (authoritative) — proceeding");
-        }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: false,
-        } => {
-            eprintln!("warning: {verdict:?} — dev iteration, advisory (not authoritative)");
-        }
+        // Proceeding verdicts are silent: the gate regime is a standing fact
+        // of the deployment (describe's story), not news on every verb. Only
+        // a refusal earns narration — and it is the error above.
+        GateOutcome::Proceed { .. } => {}
     }
 
     // ── Irreversible → require explicit confirmation (after the gate) ──

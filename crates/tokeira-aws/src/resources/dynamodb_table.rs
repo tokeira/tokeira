@@ -280,13 +280,13 @@ impl Resource for DynamoDbTable {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "tags changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation("tags changed")],
             }
         } else if current_ttl_attribute != self.config.ttl_attribute {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "ttl attribute changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation("ttl attribute changed")],
             }
         } else {
             InternalChange::NoChange {

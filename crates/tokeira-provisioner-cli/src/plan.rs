@@ -6,12 +6,14 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::{ProvenanceStamp, check_binding};
+use tokeira_report::Mode;
 
-use crate::{ProvisionerPlatform, envelope_store};
+use crate::{ProvisionerPlatform, envelope_store, render::PlanReport};
 
 pub(crate) async fn plan<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
+    mode: Mode,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let (envelope, _) = envelope_store(deployment_dir)
@@ -20,23 +22,14 @@ pub(crate) async fn plan<P: ProvisionerPlatform>(
         .context("failed to load the deployment envelope")?;
 
     let verdict = check_binding(envelope.binding.as_ref(), &running);
-    println!("platform: {}", platform.label(deployment_dir));
-    println!(
-        "binding:  {verdict:?}{}",
-        if verdict.proceeds() {
-            " — apply would proceed"
-        } else {
-            " — apply would REFUSE"
-        }
-    );
-
     let changes = platform.infra_plan(deployment_dir).await?;
-    println!("infra plan: {} change(s)", changes.len());
-    for change in &changes {
-        println!(
-            "  {:?} [{}] {}::{}",
-            change.kind, change.resource_type, change.module, change.resource
-        );
-    }
+    let report = PlanReport::new(
+        platform.label(deployment_dir).to_string(),
+        "infra plan",
+        &envelope,
+        verdict,
+        changes,
+    );
+    print!("{}", tokeira_report::render(&report, mode)?);
     Ok(())
 }

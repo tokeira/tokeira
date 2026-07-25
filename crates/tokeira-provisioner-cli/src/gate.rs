@@ -58,7 +58,8 @@ pub(crate) fn evaluate_gate(
         },
         BindingVerdict::Unknown => GateOutcome::Refuse {
             verdict,
-            reason: "the deployment has no recorded provenance; identity cannot be verified"
+            reason: "the deployment was never initialized (no Day-0 stamp) — `tkr deployment \
+                     apply` initializes it on first run"
                 .to_string(),
         },
     }

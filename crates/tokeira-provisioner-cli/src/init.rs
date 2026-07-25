@@ -291,10 +291,10 @@ mod tests {
             .clone();
 
         // Two successive config applies (same binary → same engine).
-        crate::apply::apply(&TestPlatform, tmp.path())
+        crate::apply::apply(&TestPlatform, tmp.path(), false)
             .await
             .expect("apply 1");
-        crate::apply::apply(&TestPlatform, tmp.path())
+        crate::apply::apply(&TestPlatform, tmp.path(), false)
             .await
             .expect("apply 2");
 

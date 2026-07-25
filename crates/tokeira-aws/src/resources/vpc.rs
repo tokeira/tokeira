@@ -719,10 +719,11 @@ impl Resource for VpcResource {
             return InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: format!(
-                    "CIDR changed from {} to {} (requires replacement)",
-                    current_cidr, self.cidr
-                ),
+                details: vec![tokeira_iac::FieldDiff {
+                    field: "cidr".into(),
+                    before: Some(current_cidr.to_string()),
+                    after: Some(self.cidr.clone()),
+                }],
             };
         }
 
@@ -736,7 +737,9 @@ impl Resource for VpcResource {
             return InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "availability zones changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "availability zones changed",
+                )],
             };
         }
 

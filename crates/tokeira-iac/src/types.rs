@@ -38,7 +38,8 @@ pub struct InfraComposition {
 }
 
 /// The kind of change detected by the diff engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ChangeKind {
     Create,
     Update,
@@ -58,7 +59,7 @@ impl ChangeKind {
 }
 
 /// A flat change record suitable for display and reporting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Change {
     pub kind: ChangeKind,
     pub resource_type: String,
@@ -88,11 +89,25 @@ pub fn plan_is_destructive(changes: &[Change]) -> bool {
 }
 
 /// A single field-level difference within a resource change.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FieldDiff {
     pub field: String,
     pub before: Option<String>,
     pub after: Option<String>,
+}
+
+impl FieldDiff {
+    /// A named observation without captured values — the evidence shape for a
+    /// resource that detects a change but does not hold the before/after pair
+    /// (e.g. "tags changed"). Renders as a bare evidence line, never as
+    /// `(none) → (none)`.
+    pub fn observation(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            before: None,
+            after: None,
+        }
+    }
 }
 
 /// Result of diffing a single resource against its current state.

@@ -582,7 +582,7 @@ impl Resource for IamRole {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "tags changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation("tags changed")],
             }
         } else if !crate::iam_policy::inline_policies_equal(
             &current_inline_policies,
@@ -595,7 +595,9 @@ impl Resource for IamRole {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: format!("inline policies changed ({summary})"),
+                details: vec![tokeira_iac::FieldDiff::observation(format!(
+                    "inline policies changed ({summary})"
+                ))],
             }
         } else if normalize_sorted_strings(current_managed_policy_arns)
             != desired_managed_policy_arns
@@ -603,7 +605,9 @@ impl Resource for IamRole {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "managed policies changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "managed policies changed",
+                )],
             }
         } else {
             InternalChange::NoChange {

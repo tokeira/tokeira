@@ -13,8 +13,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::{
-    ProvisionerPlatform, apply, deploy, describe, destroy, init, lock, plan, revert, rollback,
-    scale, upgrade,
+    ProvisionerPlatform, apply, definition, deploy, describe, destroy, init, lock, plan, revert,
+    rollback, scale, upgrade,
 };
 
 #[derive(Parser)]
@@ -26,6 +26,14 @@ use crate::{
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Emit the complete structured result as JSON. Depth-blind: the model is
+    /// always whole, whatever `--detail` says (the contract's collapse rule).
+    #[arg(long, global = true)]
+    json: bool,
+    /// Show the evidence behind the summary — per-resource lines, field
+    /// diffs, digests, provenance.
+    #[arg(long, global = true)]
+    detail: bool,
 }
 
 #[derive(Subcommand)]
@@ -39,6 +47,9 @@ enum Command {
     /// Read-only report of identity, recorded provenance, binding verdict, and
     /// state facts. Never gates.
     Describe(DescribeArgs),
+    /// The deployment definition — the interpreted `.tkd`.
+    #[command(subcommand)]
+    Definition(DefinitionCommand),
     /// Substrate — the infrastructure the deployment stands on. Namespaced to
     /// mirror `tkr` so forwarding is a transparent pass-through (Req 7.3).
     #[command(subcommand)]
@@ -73,11 +84,30 @@ struct RollbackArgs {
 }
 
 #[derive(Subcommand)]
+enum DefinitionCommand {
+    /// Parse + interpret the definition in memory — no providers touched,
+    /// nothing changes. Read-only; never gates.
+    Check(CheckArgs),
+}
+
+#[derive(Args)]
+struct CheckArgs {
+    /// Deployment directory holding the definition (and naming the check's
+    /// deployment context).
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Check this definition file instead of the deployment's own — authoring
+    /// mode: the report carries no deployment context, only the path.
+    #[arg(long)]
+    definition: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
 enum InfraCommand {
     /// Show the binding verdict + the infrastructure plan. Read-only; never gates.
     Plan(LifecycleArgs),
     /// Reconcile infrastructure to desired, gated on the binding.
-    Apply(LifecycleArgs),
+    Apply(ApplyArgs),
     /// Tear down the deployment's infrastructure, gated on the binding. Irreversible.
     Destroy(DestroyArgs),
 }
@@ -87,7 +117,18 @@ enum DeployCommand {
     /// Show the binding verdict + the workload plan. Read-only; never gates.
     Plan(LifecycleArgs),
     /// Reconcile the workload to desired, gated on the binding.
-    Apply(LifecycleArgs),
+    Apply(ApplyArgs),
+}
+
+#[derive(Args)]
+struct ApplyArgs {
+    /// Deployment directory holding the state envelope.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Confirm a destructive plan (deletes or replacements). An apply whose
+    /// plan is destructive refuses without it (review before action, §4).
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Args)]
@@ -105,14 +146,6 @@ struct DescribeArgs {
     /// Deployment directory holding the state envelope.
     #[arg(long)]
     deployment_dir: PathBuf,
-    /// Emit the full verification record as JSON (stable, machine-parseable).
-    #[arg(long)]
-    json: bool,
-    /// Human-readable verification/debug view: the complete per-artifact
-    /// manifest, retained revisions, state heads. Default is the short operator
-    /// view.
-    #[arg(long, conflicts_with = "json")]
-    verbose: bool,
 }
 
 #[derive(Args)]
@@ -145,16 +178,29 @@ struct RevertArgs {
 /// Parse the CLI and run the selected verb with `platform` supplying the
 /// resource realization. This is the per-platform binary's entire `main`.
 pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    // One resolution of the output contract's global flags; the collapse rule
+    // (`--json` is depth-blind) is enforced inside `Mode::resolve`.
+    let mode = tokeira_report::Mode::resolve(cli.json, cli.detail);
+    match cli.command {
         // Read-only: never gates, never locks.
         Command::Describe(args) => {
-            describe::describe(&platform, &args.deployment_dir, args.json, args.verbose).await
+            describe::describe(&platform, &args.deployment_dir, cli.json, cli.detail).await
+        }
+        Command::Definition(DefinitionCommand::Check(args)) => {
+            definition::check(
+                &platform,
+                &args.deployment_dir,
+                args.definition.as_deref(),
+                mode,
+            )
+            .await
         }
         Command::Infra(InfraCommand::Plan(args)) => {
-            plan::plan(&platform, &args.deployment_dir).await
+            plan::plan(&platform, &args.deployment_dir, mode).await
         }
         Command::Deploy(DeployCommand::Plan(args)) => {
-            deploy::deploy_plan(&platform, &args.deployment_dir).await
+            deploy::deploy_plan(&platform, &args.deployment_dir, mode).await
         }
         // Mutating verbs run under the deployment's operation lock (Req 11).
         // `rollback` holds one continuous lock across its whole sequence (12.2).
@@ -164,7 +210,8 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
         }
         Command::Infra(InfraCommand::Apply(args)) => {
             let dir = args.deployment_dir;
-            lock::with_operation_lock(&dir, "apply", || apply::apply(&platform, &dir)).await
+            let yes = args.yes;
+            lock::with_operation_lock(&dir, "apply", || apply::apply(&platform, &dir, yes)).await
         }
         Command::Infra(InfraCommand::Destroy(args)) => {
             let dir = args.deployment_dir;
@@ -174,8 +221,9 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
         }
         Command::Deploy(DeployCommand::Apply(args)) => {
             let dir = args.deployment_dir;
+            let yes = args.yes;
             lock::with_operation_lock(&dir, "deploy-apply", || {
-                deploy::deploy_apply(&platform, &dir)
+                deploy::deploy_apply(&platform, &dir, yes)
             })
             .await
         }

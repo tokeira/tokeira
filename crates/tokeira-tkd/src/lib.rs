@@ -32,7 +32,7 @@ pub fn interpret<B: HostBridge>(
     bridge: &B,
     cx: &B::Cx,
 ) -> Result<(B::Output, Value<B::Host>), EvalError> {
-    let file = syn::parse_file(src).map_err(|e| EvalError::new(format!("parse error: {e}")))?;
+    let file = syn::parse_file(src).map_err(|e| EvalError::new(located_parse_error(&e)))?;
     let (types, fns) = schema::collect(&file)?;
     subset::check(&file, bridge, &types).map_err(|d| {
         EvalError::new(format!(
@@ -64,9 +64,21 @@ pub fn interpret<B: HostBridge>(
 /// Validate a `.tkd` against the interpreted subset, returning all violation
 /// messages (no parse/eval). The allow-list is reject-by-default.
 pub fn validate<B: HostBridge>(src: &str, bridge: &B) -> Result<(), Vec<String>> {
-    let file = syn::parse_file(src).map_err(|e| vec![format!("parse error: {e}")])?;
+    let file = syn::parse_file(src).map_err(|e| vec![located_parse_error(&e)])?;
     let (types, _fns) = schema::collect(&file).map_err(|e| vec![e.msg])?;
     subset::check(&file, bridge, &types).map_err(Diagnostics::into_messages)
+}
+
+/// Locate a parse failure for the operator: syn's message alone ("expected
+/// `,`") is useless in a definition of any size; the span carries the line.
+/// proc-macro2 columns are 0-based — report 1-based, matching every editor.
+fn located_parse_error(e: &syn::Error) -> String {
+    let start = e.span().start();
+    format!(
+        "parse error at line {}, column {}: {e}",
+        start.line,
+        start.column + 1
+    )
 }
 
 /// Check whether moving from `old` config to `new` config is a *retarget* — i.e.
@@ -74,7 +86,7 @@ pub fn validate<B: HostBridge>(src: &str, bridge: &B) -> Result<(), Vec<String>>
 /// calls this against the recorded config before reconciling. Config values are
 /// host-free, so this is independent of the platform host type.
 pub fn retarget_check<H>(src: &str, old: &Value<H>, new: &Value<H>) -> Result<(), Vec<String>> {
-    let file = syn::parse_file(src).map_err(|e| vec![format!("parse error: {e}")])?;
+    let file = syn::parse_file(src).map_err(|e| vec![located_parse_error(&e)])?;
     let adm = admission::extract(&file);
     admission::check_retarget(&adm, old, new).map_err(|e| vec![e.msg])
 }

@@ -22,6 +22,7 @@ use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 mod apply;
 mod cli;
 mod config_history;
+mod definition;
 mod deploy;
 mod describe;
 mod destroy;
@@ -30,6 +31,7 @@ mod init;
 mod lock;
 mod marker;
 mod plan;
+mod render;
 mod revert;
 mod rollback;
 mod scale;
@@ -97,6 +99,23 @@ pub trait ProvisionerPlatform {
         deployment_dir: &Path,
         ids: &[String],
     ) -> Result<Vec<ChangeLogEntry>>;
+
+    /// Check a definition: parse + interpret in memory — no provider calls,
+    /// no state writes (`definition check`; read-only, never gates). `source`
+    /// overrides the deployment's own definition file (authoring mode). `Err`
+    /// is the located verdict ("parse error at line 112, …"), which the shell
+    /// renders as a report rather than a crash. The default serves platforms
+    /// with no interpreted definition.
+    async fn definition_check(
+        &self,
+        deployment_dir: &Path,
+        source: Option<&Path>,
+    ) -> Result<Realization<()>> {
+        let _ = (deployment_dir, source);
+        Ok(Realization::NotApplicable {
+            reason: "this platform has no interpreted definition",
+        })
+    }
 
     /// Preview the workload Delta (read-only). A platform whose workload rides
     /// the infra universe (compose-syn models its containers as infra

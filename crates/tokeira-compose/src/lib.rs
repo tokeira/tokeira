@@ -14,10 +14,11 @@
 //! image, ports, volumes, environment, and healthcheck — drift in any of
 //! these fields triggers an update on the next plan/apply.
 //!
-//! `depends_on` is a compose-file concept with no Docker runtime equivalent
-//! and cannot be reconstructed from inspect. If the desired config changes
-//! `depends_on`, `diff()` detects the change because the desired manifest
-//! includes it and the live manifest does not.
+//! `depends_on` is a compose-file concept with no Docker runtime equivalent —
+//! it round-trips through the compose-conventional
+//! `com.docker.compose.depends_on` label written at create and read back by
+//! `describe`, so ordering drift is real drift (a container created without
+//! it), never a reconstruction artifact.
 //!
 //! A deployment that uses this crate must register a [`ComposePlatform`] on the
 //! infrastructure [`tokeira_iac::ProvisionContext`] before applying modules that
@@ -108,6 +109,15 @@ pub struct ComposeService {
     pub healthcheck: Option<Healthcheck>,
     /// Command to run in the container (overrides image CMD).
     pub command: Vec<String>,
+    /// Infra-graph-only dependencies (full engine `ResourceId` strings) —
+    /// resources that must exist **before this container is created**, e.g.
+    /// the config-files resource whose outputs this service bind-mounts
+    /// (Docker manufactures a missing bind source as a *directory*, so
+    /// creating the container first poisons the config path). Distinct from
+    /// [`depends_on`](Self::depends_on), which is compose *container start*
+    /// ordering and must stay pure service names; excluded from the manifest.
+    #[serde(skip)]
+    pub resource_dependencies: Vec<String>,
 }
 
 impl ComposeService {
@@ -136,6 +146,11 @@ impl iac::Resource for ComposeService {
         self.depends_on
             .iter()
             .map(|dep| iac::ResourceId(format!("compose/{dep}")))
+            .chain(
+                self.resource_dependencies
+                    .iter()
+                    .map(|dep| iac::ResourceId(dep.clone())),
+            )
             .collect()
     }
 
@@ -233,10 +248,14 @@ impl iac::Resource for ComposeService {
         current: &iac::ResourceState,
         _ctx: &iac::ProvisionContext,
     ) -> iac::InternalChange {
-        // Compare desired config against persisted properties
-        let current_manifest = &current.properties;
-        let desired_manifest = self.to_manifest();
-        if current_manifest == &desired_manifest {
+        // Compare canonicalized manifests: `ports`/`volumes`/`depends_on` are
+        // sets semantically, but the live reconstruction assembles them from
+        // Docker maps whose iteration order is unstable — ordered comparison
+        // manufactured flapping phantom updates for every multi-port service.
+        let current_manifest = canonicalize_manifest(current.properties.clone());
+        let desired_manifest = canonicalize_manifest(self.to_manifest());
+        let details = manifest_field_diffs(&current_manifest, &desired_manifest);
+        if details.is_empty() {
             iac::InternalChange::NoChange {
                 resource_id: self.resource_id(),
             }
@@ -244,10 +263,57 @@ impl iac::Resource for ComposeService {
             iac::InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "service configuration changed".into(),
+                details,
             }
         }
     }
+}
+
+/// Sort the set-valued manifest arrays so equality means set equality. The
+/// desired side is authored order; the live side is Docker-map iteration
+/// order — only the canonical form is comparable.
+fn canonicalize_manifest(mut manifest: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = manifest.as_object_mut() {
+        for key in ["ports", "volumes", "depends_on"] {
+            if let Some(array) = object.get_mut(key).and_then(|v| v.as_array_mut()) {
+                array.sort_by_cached_key(std::string::ToString::to_string);
+            }
+        }
+    }
+    manifest
+}
+
+/// Field-level evidence for the plan report: one [`iac::FieldDiff`] per
+/// differing top-level manifest key, values rendered compactly. This is what
+/// `--detail` prints — a bare "configuration changed" is what let the
+/// depends_on/port-order phantoms hide for a day.
+fn manifest_field_diffs(
+    current: &serde_json::Value,
+    desired: &serde_json::Value,
+) -> Vec<iac::FieldDiff> {
+    let render = |value: Option<&serde_json::Value>| -> Option<String> {
+        value.map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+    };
+    let empty = serde_json::Map::new();
+    let (current_map, desired_map) = (
+        current.as_object().unwrap_or(&empty),
+        desired.as_object().unwrap_or(&empty),
+    );
+    let mut fields: Vec<&String> = current_map.keys().chain(desired_map.keys()).collect();
+    fields.sort();
+    fields.dedup();
+    fields
+        .into_iter()
+        .filter(|field| current_map.get(*field) != desired_map.get(*field))
+        .map(|field| iac::FieldDiff {
+            field: field.clone(),
+            before: render(current_map.get(field)),
+            after: render(desired_map.get(field)),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -560,7 +626,21 @@ impl ComposePlatform {
                 container: service.to_string(),
                 source: anyhow::anyhow!(error),
             })?;
-        Ok(Some(service_from_inspect(service, &inspect)))
+        let mut live = service_from_inspect(service, &inspect);
+        // A container's inspect env is the MERGE of image-baked vars and what
+        // we injected — every image bakes at least PATH, so comparing the
+        // merge against the declared env makes every service drift forever.
+        // Subtract the image's own env (exact KEY=VALUE matches only, so an
+        // operator override of an image var still surfaces as real drift):
+        // what remains is what this platform injected — the comparable set.
+        if let Some(image_id) = inspect.image.as_deref()
+            && let Ok(image) = self.docker.inspect_image(image_id).await
+        {
+            let baked: Vec<String> = image.config.and_then(|c| c.env).unwrap_or_default();
+            live.environment
+                .retain(|key, value| !baked.iter().any(|entry| entry == &format!("{key}={value}")));
+        }
+        Ok(Some(live))
     }
 
     /// Return recent logs from the service container.
@@ -821,13 +901,29 @@ fn container_config(service: &ComposeService, project_name: &str) -> ContainerCo
         }
         Some(bindings)
     };
-    let labels = Some(HashMap::from([
+    let mut label_map = HashMap::from([
         ("com.docker.compose.service".into(), service.name.clone()),
         (
             "com.docker.compose.project".into(),
             project_name.to_string(),
         ),
-    ]));
+    ]);
+    // Start-order is a compose concept Docker does not model — record it as
+    // the compose-conventional label (`dep:condition:restart` triplets) so
+    // `describe` can reconstruct `depends_on` instead of reporting eternal
+    // drift against a fact the container cannot remember.
+    if !service.depends_on.is_empty() {
+        label_map.insert(
+            "com.docker.compose.depends_on".into(),
+            service
+                .depends_on
+                .iter()
+                .map(|dep| format!("{dep}:service_started:false"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    let labels = Some(label_map);
 
     ContainerConfig {
         image: Some(service.image.clone()),
@@ -886,7 +982,13 @@ fn service_from_inspect(name: &str, inspect: &ContainerInspectResponse) -> Compo
                             })
                         })
                 })
-                .collect()
+                .collect::<Vec<_>>()
+        })
+        .map(|mut ports: Vec<String>| {
+            // Docker hands back a map; its iteration order is not a fact
+            // about the service. Sort so records are stable run-to-run.
+            ports.sort();
+            ports
         })
         .unwrap_or_default();
 
@@ -915,11 +1017,26 @@ fn service_from_inspect(name: &str, inspect: &ContainerInspectResponse) -> Compo
             .and_then(|host| host.binds.clone())
             .unwrap_or_default(),
         environment,
-        // depends_on is a compose-file concept, not a Docker runtime concept.
-        // It cannot be reconstructed from inspect. Drift in depends_on will
-        // be detected because the desired side includes it and the live side
-        // does not, causing diff() to report an update.
-        depends_on: Vec::new(),
+        // Start-order round-trips through the compose-conventional label
+        // written at create (`dep:condition:restart` triplets) — a container
+        // created without it (or by hand) reads as no ordering, which is now
+        // honest drift rather than a permanent phantom.
+        depends_on: inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .and_then(|labels| labels.get("com.docker.compose.depends_on"))
+            .map(|raw| {
+                raw.split(',')
+                    .filter(|entry| !entry.is_empty())
+                    .map(|entry| entry.split(':').next().unwrap_or(entry).to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // Infra-graph edges are desired-side declarations, not container
+        // facts — same reasoning as depends_on above (and serde-skipped, so
+        // they never participate in the manifest diff either).
+        resource_dependencies: Vec::new(),
         healthcheck: inspect
             .config
             .as_ref()
@@ -966,6 +1083,73 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    // The two compose phantom-drift classes, pinned:
+    //
+    // 1. Set-order roulette: the live reconstruction assembles ports/volumes
+    //    from Docker maps with unstable iteration order — ordered comparison
+    //    made every multi-port service flap between clean and "updated".
+    #[test]
+    fn diff_treats_set_valued_fields_as_sets() {
+        let desired = serde_json::json!({
+            "name": "tokeirad",
+            "ports": ["7233:7233", "9090:9090"],
+            "volumes": ["/a:/a", "/b:/b"],
+            "depends_on": ["mimir", "loki"],
+        });
+        let live = serde_json::json!({
+            "name": "tokeirad",
+            "ports": ["9090:9090", "7233:7233"],
+            "volumes": ["/b:/b", "/a:/a"],
+            "depends_on": ["loki", "mimir"],
+        });
+        let diffs = manifest_field_diffs(
+            &canonicalize_manifest(live),
+            &canonicalize_manifest(desired),
+        );
+        assert!(diffs.is_empty(), "order is not drift: {diffs:?}");
+    }
+
+    // 2. Real differences name their field with both values — the evidence
+    //    `--detail` prints. A bare "configuration changed" hid the
+    //    depends_on phantom for a day.
+    #[test]
+    fn diff_names_the_differing_field_with_evidence() {
+        let desired = serde_json::json!({ "depends_on": ["mimir", "loki"] });
+        let live = serde_json::json!({ "depends_on": [] });
+        let diffs = manifest_field_diffs(
+            &canonicalize_manifest(live),
+            &canonicalize_manifest(desired),
+        );
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].field, "depends_on");
+        assert_eq!(diffs[0].before.as_deref(), Some("[]"));
+        assert_eq!(diffs[0].after.as_deref(), Some(r#"["loki","mimir"]"#));
+    }
+
+    // Start-order round-trips through the compose-conventional label: written
+    // as `dep:condition:restart` triplets at create, read back to plain names
+    // by the reconstruction.
+    #[test]
+    fn depends_on_round_trips_through_the_container_label() {
+        let inspect = ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                labels: Some(HashMap::from([(
+                    "com.docker.compose.depends_on".to_string(),
+                    "mimir:service_started:false,loki:service_started:false".to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let service = service_from_inspect("grafana", &inspect);
+        assert_eq!(service.depends_on, vec!["mimir", "loki"]);
+
+        // And a container without the label reads as no ordering — honest
+        // drift for hand-made containers, not a crash.
+        let bare = ContainerInspectResponse::default();
+        assert!(service_from_inspect("grafana", &bare).depends_on.is_empty());
+    }
+
     fn arb_identifier() -> impl Strategy<Value = String> {
         "[a-z][a-z0-9_-]{0,7}".prop_map(|s| s.to_string())
     }
@@ -998,6 +1182,7 @@ mod tests {
                     command,
                 )| {
                     ComposeService {
+                        resource_dependencies: Vec::new(),
                         image: format!("example/{name}:{image_tag}"),
                         name: name.clone(),
                         ports: ports
@@ -1086,6 +1271,7 @@ mod tests {
     #[test]
     fn serializes_compose_yaml_with_all_fields() {
         let service = ComposeService {
+            resource_dependencies: Vec::new(),
             name: "grafana".into(),
             image: "grafana/grafana-oss:12.4.3".into(),
             ports: vec!["3000:3000".into()],

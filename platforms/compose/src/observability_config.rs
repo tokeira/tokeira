@@ -530,7 +530,9 @@ impl iac::Resource for ObservabilityConfigFilesResource {
                 return iac::InternalChange::Update {
                     resource_id: self.resource_id(),
                     resource_type: self.resource_type(),
-                    details: format!("failed to render desired config: {error}"),
+                    details: vec![iac::FieldDiff::observation(format!(
+                        "failed to render desired config: {error}"
+                    ))],
                 };
             }
         };
@@ -542,13 +544,64 @@ impl iac::Resource for ObservabilityConfigFilesResource {
                 resource_id: self.resource_id(),
             }
         } else {
+            // Per-file evidence: which rendered file drifted (checksums
+            // abbreviated), and which are missing on disk entirely.
+            let to_strings = |value: Option<serde_json::Value>| {
+                value
+                    .and_then(|v| {
+                        serde_json::from_value::<std::collections::BTreeMap<String, String>>(v).ok()
+                    })
+                    .unwrap_or_default()
+            };
+            let current_map = to_strings(current_files.cloned());
+            let desired_map = to_strings(serde_json::to_value(&desired).ok());
+            let mut details: Vec<iac::FieldDiff> = Vec::new();
+            let mut names: Vec<&String> = current_map.keys().chain(desired_map.keys()).collect();
+            names.sort();
+            names.dedup();
+            let short = |sum: Option<&String>| sum.map(|s| s.chars().take(12).collect::<String>());
+            for name in names {
+                let (before, after) = (current_map.get(name), desired_map.get(name));
+                if before != after {
+                    details.push(iac::FieldDiff {
+                        field: name.clone(),
+                        before: short(before),
+                        after: short(after),
+                    });
+                }
+            }
+            if let Some(missing) = current_missing
+                .and_then(|v| v.as_array())
+                .filter(|list| !list.is_empty())
+            {
+                details.push(iac::FieldDiff::observation(format!(
+                    "{} missing on disk",
+                    tokeira_report_free_join(missing)
+                )));
+            }
+            if details.is_empty() {
+                // Same checksums but a differing shape (legacy record):
+                // still an update, named as such.
+                details.push(iac::FieldDiff::observation(
+                    "config file record format changed",
+                ));
+            }
             iac::InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "observability config files changed".into(),
+                details,
             }
         }
     }
+}
+
+/// Join a JSON string array for the one-line missing-files observation.
+fn tokeira_report_free_join(values: &[serde_json::Value]) -> String {
+    values
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn validate_non_empty(field: &str, value: &str) -> Result<(), ConfigGenError> {

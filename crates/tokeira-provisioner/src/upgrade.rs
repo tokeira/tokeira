@@ -18,6 +18,14 @@ pub enum UpgradeDecision {
     VersionedAdvance,
     /// The recorded `A` is a `dev` deployment being promoted to a versioned `B`.
     Promotion,
+    /// A dev deployment re-marrying a fresh dev build — the sanctioned
+    /// dev-loop binary refresh. Never authoritative; the dev sentinel hash
+    /// cannot see implementation changes, so the *bytes* are the truth: the
+    /// caller (`tkr`) compares candidate vs bound bytes and skips the whole
+    /// ceremony when they are identical (upgrade without change is
+    /// idempotent). The refresh's real effect is the re-recorded integrity
+    /// manifest — the envelope describes the new binary — plus the file swap.
+    DevRefresh,
     /// The upgrade is refused, with operator-facing guidance.
     Refuse(String),
 }
@@ -25,16 +33,16 @@ pub enum UpgradeDecision {
 /// Decide whether upgrading from `recorded` (`A`) to `running` (`B`) is allowed.
 pub fn evaluate_upgrade(recorded: &ProvenanceStamp, running: &ProvenanceStamp) -> UpgradeDecision {
     match running.build_mode {
-        // Upgrading *to* a dev binary is never an authoritative advance.
+        // Upgrading *to* a dev binary is never an authoritative advance —
+        // but a dev deployment refreshing its dev binary is the dev loop's
+        // legitimate re-marry (`DevRefresh`).
         BuildMode::Dev => {
             if recorded.build_mode == BuildMode::Versioned {
                 UpgradeDecision::Refuse(
                     "cannot re-stamp a versioned deployment back to `dev`".to_string(),
                 )
             } else {
-                UpgradeDecision::Refuse(
-                    "dev → dev is not an upgrade; use `apply` (the DevIterate loop)".to_string(),
-                )
+                UpgradeDecision::DevRefresh
             }
         }
         BuildMode::Versioned => match recorded.build_mode {
@@ -136,5 +144,15 @@ mod tests {
             evaluate_upgrade(&a, &b),
             UpgradeDecision::Refuse(_)
         ));
+    }
+
+    // The dev loop's sanctioned re-marry: dev → dev proceeds as a refresh
+    // (byte-level idempotency is the caller's check — the sentinel hash
+    // cannot distinguish dev builds).
+    #[test]
+    fn dev_to_dev_is_a_refresh() {
+        let a = stamp(BuildMode::Dev, "0.1.0", "0000");
+        let b = stamp(BuildMode::Dev, "0.1.0", "0000");
+        assert_eq!(evaluate_upgrade(&a, &b), UpgradeDecision::DevRefresh);
     }
 }

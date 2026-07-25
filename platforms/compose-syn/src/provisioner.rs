@@ -50,6 +50,20 @@ impl ProvisionerPlatform for ComposeSynPlatform {
         Ok(project_name(deployment_dir))
     }
 
+    async fn definition_check(
+        &self,
+        deployment_dir: &Path,
+        source: Option<&Path>,
+    ) -> Result<Realization<()>> {
+        // The whole check IS the load: parse + subset + interpret, in memory —
+        // the loader touches no provider and writes no state. `source` is
+        // authoring mode: any `.tkd` on disk, no deployment required.
+        let definition = source
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| deployment_dir.join(TKD_FILE));
+        load_tkd_config_from(deployment_dir, &definition).map(|_| Realization::Realized(()))
+    }
+
     async fn infra_plan(&self, deployment_dir: &Path) -> Result<Vec<Change>> {
         let config = load_tkd_config(deployment_dir)?;
         let mut engine = open_engine(config, deployment_dir, false).await?;
@@ -142,16 +156,26 @@ fn project_name(deployment_dir: &Path) -> String {
 /// (`Storage::Dsql { region }`), which the definition reads directly, so
 /// `cx.region` is unused by compose.
 pub fn load_tkd_config(deployment_dir: &Path) -> Result<TkdConfig> {
-    let path = deployment_dir.join(TKD_FILE);
-    let source = std::fs::read_to_string(&path)
+    load_tkd_config_from(deployment_dir, &deployment_dir.join(TKD_FILE))
+}
+
+/// [`load_tkd_config`] with an explicit definition file — the `definition
+/// check --definition` authoring path; the deployment dir still seeds the
+/// interpretation context (project name, state anchors).
+fn load_tkd_config_from(deployment_dir: &Path, path: &Path) -> Result<TkdConfig> {
+    let source = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let cx = Cx {
         project_name: project_name(deployment_dir),
         region: None,
         deployment_dir: deployment_dir.to_path_buf(),
     };
-    // Validate at load so the engine hot-path `realize()` cannot panic.
-    crate::interp::interpret(&source, &cx).map_err(|e| anyhow::anyhow!("invalid `.tkd`: {e}"))?;
+    // Validate at load so the engine hot-path `realize()` cannot panic. The
+    // wording is the operator verdict every verb inherits ("the definition
+    // does not verify: parse error at line 112, …"); `definition check`
+    // renders the same interpreter error as its report payload.
+    crate::interp::interpret(&source, &cx)
+        .map_err(|e| anyhow::anyhow!("the definition does not verify: {e}"))?;
     Ok(TkdConfig { source, cx })
 }
 
@@ -194,6 +218,21 @@ async fn open_engine(
     if let Some(platform) = platform {
         engine.provision_context_mut().set_extension(platform);
     }
+    // The delete-recovery seam (Property 10): a service removed from the
+    // definition has no realizing module, so the engine reconstructs it from
+    // its recorded manifest to delete the live container — the recovered
+    // `ComposeService::delete` reads the `ComposePlatform` handle registered
+    // above. Unrecoverable types stay fail-closed.
+    engine
+        .provision_context_mut()
+        .set_extension(tokeira_iac::ResourceRecovery::new(|state| {
+            if state.resource_type.0 != "compose_service" {
+                return None;
+            }
+            tokeira_compose::service_from_manifest(state.properties.clone())
+                .ok()
+                .map(|service| Box::new(service) as Box<dyn tokeira_iac::Resource>)
+        }));
     Ok(engine)
 }
 
@@ -216,6 +255,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(TKD_FILE), crate::DEFAULT_TKD).unwrap();
         tmp
+    }
+
+    // The demon of 2026-07-21: services bind-mounting config files carried no
+    // infra-graph edge to the config resource, and the engine's lexicographic
+    // tie-break created containers first — Docker then manufactured DIRECTORY
+    // stubs at the missing bind sources and the config writer died on EISDIR.
+    // The edge is wired automatically from the typed `Vol::Config` anchors.
+    #[tokio::test]
+    async fn config_mounting_services_depend_on_the_config_files_resource() {
+        let tmp = reference_tkd_dir();
+        let config = crate::provisioner::load_tkd_config(tmp.path()).expect("load");
+        let realized = crate::adapter::TkdDeployment::realize(&config)
+            .realize_module("observability", &config.cx)
+            .expect("observability module realizes");
+
+        let config_id =
+            crate::observability_config::ObservabilityConfigFilesResource::resource_id_value();
+        let mimir = realized
+            .iter()
+            .find(|r| r.resource_id().0 == "compose/mimir")
+            .expect("mimir service resource");
+        assert!(
+            mimir.dependencies().contains(&config_id),
+            "a config-mounting service depends on the config-files resource; got {:?}",
+            mimir.dependencies()
+        );
     }
 
     #[tokio::test]

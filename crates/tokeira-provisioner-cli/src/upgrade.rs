@@ -39,13 +39,12 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     // happened, the binding already names B, so the decision gate below
     // (which would now see B == B and refuse) is exactly what resume skips.
     // An open ROLLBACK marker refuses: it is finished by `rollback`.
-    if let crate::marker::MarkerDisposition::Resume(operation) =
+    if let crate::marker::MarkerDisposition::Resume(_) =
         crate::marker::check_marker(&envelope, "upgrade", Some(OperationKind::UpgradeInFlight))?
     {
-        println!(
-            "resuming interrupted upgrade {} from phase '{}'",
-            operation.operation_id, operation.phase
-        );
+        // The marker's phase and operation id are evidence, not answer —
+        // detail-tier once mutating verbs carry the output contract's flags.
+        println!("upgrade: finishing an upgrade interrupted earlier");
         // The binding must name the engine resuming it — a DIFFERENT binary
         // than the one that transferred ownership must not finish its upgrade.
         let bound = envelope
@@ -65,9 +64,10 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         check_baseline_drift(&envelope)?;
         let applied = platform.infra_apply(deployment_dir).await?;
         println!(
-            "infra apply under the new engine: {} change(s)",
-            applied.len()
+            "infra apply: {}",
+            tokeira_report::counted(applied.len(), "change")
         );
+        crate::render::print_applied(&applied);
         // B's creations join keys(S_B) − keys(S_A) — the rollback delete-set
         // (task 19.3) — in the same save as the audit log.
         envelope.record_post_checkpoint_changes(&applied);
@@ -78,10 +78,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
             .save(&envelope, &version)
             .await
             .context("failed to close the operation marker")?;
-        println!(
-            "upgrade complete (resumed) — bound to version {}",
-            running.version
-        );
+        println!("upgrade complete — the deployment runs the new provisioner");
         return Ok(());
     }
 
@@ -96,13 +93,22 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     match evaluate_upgrade(&recorded, &running) {
         UpgradeDecision::Refuse(reason) => anyhow::bail!("`upgrade` refused: {reason}"),
         UpgradeDecision::VersionedAdvance => println!(
-            "upgrade: versioned advance {} → {}",
+            "upgrade: advancing the deployment's provisioner {} → {}",
             recorded.version, running.version
         ),
         UpgradeDecision::Promotion => println!(
-            "upgrade: dev → versioned promotion (now version {})",
+            "upgrade: promoting the deployment's provisioner from dev to version {}",
             running.version
         ),
+        // The dev-loop refresh: same ceremony (transfer, migrations, apply,
+        // audit), advisory stamp; the re-recorded integrity manifest is what
+        // actually changes — the envelope describes the new binary. The
+        // caller (`tkr`) has already established the bytes differ. The gate
+        // regime (advisory vs authoritative) is describe's story, not this
+        // line's.
+        UpgradeDecision::DevRefresh => {
+            println!("upgrade: replacing the deployment's provisioner with the current dev build")
+        }
     }
 
     // ── State-schema migration boundary (before any mutation) ──
@@ -134,7 +140,10 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to commit the atomic ownership transfer")?;
-    println!("ownership transferred — [A final] checkpoint captured, operation marker open");
+    // Silent at summary depth: the checkpoint + open marker are crash-safety
+    // evidence ("an interrupted upgrade resumes by running `upgrade` again"),
+    // surfaced on the detail/JSON surface when `upgrade` migrates onto the
+    // output contract — not narrated mid-ceremony.
 
     // ── Advisory baseline gate (Req 4.7, task 19.2): the envelope heads must
     // still be exactly [A final]'s — drift between the transfer and B's apply
@@ -146,9 +155,10 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     // ── Apply B's plan (realized by the injected platform) ──
     let applied = platform.infra_apply(deployment_dir).await?;
     println!(
-        "infra apply under the new engine: {} change(s)",
-        applied.len()
+        "infra apply: {}",
+        tokeira_report::counted(applied.len(), "change")
     );
+    crate::render::print_applied(&applied);
 
     // ── Record the ids-only audit change log in the open marker (19.2) and
     // fold B's creations into the rollback delete-set (19.3), persisted
@@ -163,10 +173,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to close the operation marker")?;
-    println!(
-        "upgrade complete — now bound to version {}",
-        running.version
-    );
+    println!("upgrade complete — the deployment runs the new provisioner");
     Ok(())
 }
 
@@ -356,12 +363,16 @@ mod tests {
             after.checkpoint.is_some(),
             "[A final] stays retained — the rollback window survives the resume"
         );
-        // Idempotent: a second re-run refuses cleanly (nothing in flight,
-        // B == B is not an upgrade).
-        let err = upgrade(&TestPlatform, tmp.path())
+        // A second run — nothing in flight, dev binding, dev binary — now
+        // proceeds as a DEV REFRESH (the sanctioned dev-loop re-marry): the
+        // tkp-side ceremony is unconditional; byte-level idempotency is the
+        // launcher's gate (`tkr` compares candidate vs bound bytes and skips
+        // the ceremony entirely when they match).
+        upgrade(&TestPlatform, tmp.path())
             .await
-            .expect_err("nothing to resume");
-        assert!(err.to_string().contains("refused"), "unexpected: {err}");
+            .expect("dev → dev proceeds as a refresh");
+        let (after_refresh, _) = store.load().await.unwrap();
+        assert!(after_refresh.operation.is_none(), "refresh closed cleanly");
     }
 
     // Task 19.2: the audit save between apply and close — the marker carries

@@ -175,7 +175,9 @@ impl iac::Resource for K8sManifestResource {
             InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "kubernetes manifests changed".to_string(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "kubernetes manifests changed",
+                )],
             }
         }
     }

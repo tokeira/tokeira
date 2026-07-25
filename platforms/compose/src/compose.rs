@@ -85,6 +85,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
 
     vec![
         ComposeService {
+            resource_dependencies: Vec::new(),
             name: "mimir".into(),
             image: config.observability.mimir_image.clone(),
             ports: vec!["9009:9009".into()],
@@ -95,6 +96,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
             command: vec!["--config.file=/etc/mimir/mimir.yaml".into()],
         },
         ComposeService {
+            resource_dependencies: Vec::new(),
             name: "loki".into(),
             image: config.observability.loki_image.clone(),
             ports: vec!["3100:3100".into()],
@@ -105,6 +107,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
             command: vec!["--config.file=/etc/loki/loki.yaml".into()],
         },
         ComposeService {
+            resource_dependencies: Vec::new(),
             name: "tokeirad".into(),
             image: config.tokeirad.image.clone(),
             ports: vec![
@@ -124,6 +127,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
             command: Vec::new(),
         },
         ComposeService {
+            resource_dependencies: Vec::new(),
             name: "grafana".into(),
             image: config.observability.grafana_image.clone(),
             ports: vec![format!(
@@ -145,6 +149,7 @@ pub fn compose_services(config: &ComposeConfig) -> Vec<ComposeService> {
             command: Vec::new(),
         },
         ComposeService {
+            resource_dependencies: Vec::new(),
             name: "alloy".into(),
             image: config.observability.alloy_image.clone(),
             ports: vec!["4317:4317".into(), "4318:4318".into()],

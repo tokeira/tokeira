@@ -11,7 +11,8 @@
 use crate::{BuildMode, ProvenanceStamp, version::is_older};
 
 /// The outcome of comparing recorded vs running provenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum BindingVerdict {
     /// Recorded and running are the same versioned engine (`source_tree_hash`
     /// matches). The only authoritative proceed.

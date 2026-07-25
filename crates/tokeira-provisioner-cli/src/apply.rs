@@ -19,6 +19,7 @@ use crate::{
 pub(crate) async fn apply<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
+    yes: bool,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
@@ -36,18 +37,18 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         GateOutcome::Refuse { verdict, reason } => {
             anyhow::bail!("binding gate refuses `apply` ({verdict:?}): {reason}");
         }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: true,
-        } => {
-            println!("binding: {verdict:?} (authoritative) — proceeding");
-        }
-        GateOutcome::Proceed {
-            verdict,
-            authoritative: false,
-        } => {
-            eprintln!("warning: {verdict:?} — dev iteration, advisory (not authoritative)");
-        }
+        // Proceeding verdicts are silent: the gate regime is a standing fact
+        // of the deployment (describe's story), not news on every verb. Only
+        // a refusal earns narration — and it is the error above.
+        GateOutcome::Proceed { .. } => {}
+    }
+
+    // ── Destructive gate (§4, Proposal 002): the engine classifies, the
+    // shell confirms. Skipped under `--yes` — the operator has already
+    // reviewed — so the confirmed path pays no extra plan pass. ──
+    if !yes {
+        let planned = platform.infra_plan(deployment_dir).await?;
+        refuse_destructive_without_yes("infra apply", &planned)?;
     }
 
     // ── Engine apply (realized by the injected platform) ──
@@ -58,10 +59,11 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     // — the set the rollback B-delete pass consumes (task 19.3).
     envelope.record_post_checkpoint_changes(&applied);
     println!(
-        "[{}] infra apply: {} change(s)",
-        applied.len(),
-        platform.label(deployment_dir)
+        "[{}] infra apply: {}",
+        platform.label(deployment_dir),
+        tokeira_report::counted(applied.len(), "change")
     );
+    crate::render::print_applied(&applied);
 
     // ── Re-stamp the envelope ──
     // A config apply keeps the engine identity and advances the config revision
@@ -89,6 +91,33 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
             .unwrap_or("default")
     );
     Ok(())
+}
+
+/// Refuse a destructive plan without `--yes`: name the destructive changes
+/// (the evidence) and the remedy. Shared by `infra apply` and `deploy apply`.
+pub(crate) fn refuse_destructive_without_yes(
+    verb: &str,
+    planned: &[tokeira_iac::Change],
+) -> Result<()> {
+    let destructive = tokeira_iac::destructive_changes(planned);
+    if destructive.is_empty() {
+        return Ok(());
+    }
+    let mut lines = String::new();
+    for change in &destructive {
+        let glyph = match change.kind {
+            tokeira_iac::ChangeKind::Replace => tokeira_report::symbol::REPLACE,
+            _ => tokeira_report::symbol::DELETE,
+        };
+        lines.push_str(&format!(
+            "\n  {glyph} {}::{}  ({})",
+            change.module, change.resource, change.resource_type
+        ));
+    }
+    anyhow::bail!(
+        "{verb}: refusing — the plan is destructive: {}{lines}\nre-run with `--yes` to proceed",
+        tokeira_report::counted(destructive.len(), "destructive change"),
+    );
 }
 
 /// Advance the envelope to a new applied config revision: re-stamp the binding,
@@ -156,10 +185,42 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = apply(&TestPlatform, tmp.path())
+        let err = apply(&TestPlatform, tmp.path(), false)
             .await
             .expect_err("the open marker gates apply");
         assert!(err.to_string().contains("in flight"), "unexpected: {err}");
+    }
+
+    // §4/Proposal 002: the engine classifies destructive changes; the shell
+    // refuses them without `--yes`, naming the evidence and the remedy.
+    #[test]
+    fn destructive_plans_refuse_without_yes() {
+        let destructive = vec![tokeira_iac::Change {
+            kind: tokeira_iac::ChangeKind::Delete,
+            resource_type: "compose_service".into(),
+            module: "grafana".into(),
+            resource: "compose/grafana".into(),
+            details: Vec::new(),
+        }];
+        let err = refuse_destructive_without_yes("infra apply", &destructive)
+            .expect_err("destructive without --yes refuses");
+        let message = err.to_string();
+        assert!(
+            message.contains("1 destructive change"),
+            "counted: {message}"
+        );
+        assert!(message.contains("compose/grafana"), "evidence: {message}");
+        assert!(message.contains("--yes"), "remedy: {message}");
+
+        let benign = vec![tokeira_iac::Change {
+            kind: tokeira_iac::ChangeKind::Update,
+            resource_type: "compose_service".into(),
+            module: "tokeirad".into(),
+            resource: "compose/tokeirad".into(),
+            details: Vec::new(),
+        }];
+        refuse_destructive_without_yes("infra apply", &benign)
+            .expect("a non-destructive plan needs no confirmation");
     }
 
     #[tokio::test]
@@ -168,7 +229,7 @@ mod tests {
         // stamping happens at `create`, so an unstamped deployment at apply time
         // is unverifiable).
         let tmp = tempfile::tempdir().unwrap();
-        let err = apply(&TestPlatform, tmp.path())
+        let err = apply(&TestPlatform, tmp.path(), false)
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(
@@ -193,7 +254,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        apply(&TestPlatform, tmp.path())
+        apply(&TestPlatform, tmp.path(), false)
             .await
             .expect("apply proceeds under DevIterate");
 

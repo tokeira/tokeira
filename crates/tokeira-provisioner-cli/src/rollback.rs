@@ -98,8 +98,8 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
         );
         let applied = platform.infra_apply(deployment_dir).await?;
         println!(
-            "A reconcile (re-apply retained revision): {} change(s)",
-            applied.len()
+            "A reconcile (re-apply retained revision): {}",
+            tokeira_report::counted(applied.len(), "change")
         );
         envelope.complete_rollback();
         envelope.stamp_current_schema();
@@ -210,8 +210,8 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
     // ── A forward-reconciles toward its retained prior configuration revision ──
     let applied = platform.infra_apply(deployment_dir).await?;
     println!(
-        "A reconcile (re-apply retained revision): {} change(s)",
-        applied.len()
+        "A reconcile (re-apply retained revision): {}",
+        tokeira_report::counted(applied.len(), "change")
     );
 
     // ── Complete: clear the marker and consume the checkpoint ──

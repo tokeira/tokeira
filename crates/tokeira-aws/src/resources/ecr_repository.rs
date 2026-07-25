@@ -163,7 +163,7 @@ impl Resource for EcrRepository {
             return InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "tags changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation("tags changed")],
             };
         }
 
@@ -178,7 +178,9 @@ impl Resource for EcrRepository {
             return InternalChange::Update {
                 resource_id: self.resource_id(),
                 resource_type: self.resource_type(),
-                details: "lifecycle policy changed".into(),
+                details: vec![tokeira_iac::FieldDiff::observation(
+                    "lifecycle policy changed",
+                )],
             };
         }
 

@@ -22,13 +22,15 @@ pub(crate) async fn plan<P: ProvisionerPlatform>(
         .context("failed to load the deployment envelope")?;
 
     let verdict = check_binding(envelope.binding.as_ref(), &running);
-    let changes = platform.infra_plan(deployment_dir).await?;
+    // Coverage rides the outcome; the report consumes it in the uncertainty
+    // phases of the evidence-model spec — this slice is behaviour-preserving.
+    let outcome = platform.infra_plan(deployment_dir).await?;
     let report = PlanReport::new(
         platform.label(deployment_dir).to_string(),
         "infra plan",
         &envelope,
         verdict,
-        changes,
+        outcome.changes,
     );
     print!("{}", tokeira_report::render(&report, mode)?);
     Ok(())

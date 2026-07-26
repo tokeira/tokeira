@@ -26,7 +26,7 @@
 //! crash-safety without coupling the engine to a specific store type.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     time::Instant,
@@ -83,7 +83,7 @@ impl Engine {
         &self,
         composition: &InfraComposition,
         ctx: &mut ProvisionContext,
-    ) -> Result<Vec<Change>, IacError> {
+    ) -> Result<PlanOutcome, IacError> {
         validate_composition(composition, ctx)?;
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
@@ -98,10 +98,17 @@ impl Engine {
         desired: &[&dyn Resource],
         known: &[&dyn Resource],
         ctx: &mut ProvisionContext,
-    ) -> Result<Vec<Change>, IacError> {
+    ) -> Result<PlanOutcome, IacError> {
         let refreshed = refresh_state(known, desired, ctx, None).await?;
         ctx.state = refreshed.state;
-        Ok(compute_changes(desired, &ctx.state, ctx))
+        let changes = compute_changes(desired, &ctx.state, ctx);
+        Ok(PlanOutcome {
+            changes,
+            refresh: RefreshCoverage {
+                status_by_id: refreshed.status_by_id,
+                examined: true,
+            },
+        })
     }
 
     /// Plan restricted to the provided modules.
@@ -109,7 +116,7 @@ impl Engine {
         &self,
         composition: &InfraComposition,
         ctx: &mut ProvisionContext,
-    ) -> Result<Vec<Change>, IacError> {
+    ) -> Result<PlanOutcome, IacError> {
         validate_composition(composition, ctx)?;
         let desired = collect_resources_from(&composition.desired_modules, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
@@ -123,7 +130,16 @@ impl Engine {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        Ok(filter_changes_by_modules(&changes, &ctx.state, &active))
+        Ok(PlanOutcome {
+            changes: filter_changes_by_modules(&changes, &ctx.state, &active),
+            // Coverage is carried unfiltered: a resource filtered out of this
+            // plan's changes was still examined, and saying so is correct
+            // (evidence-model Requirement 5).
+            refresh: RefreshCoverage {
+                status_by_id: refreshed.status_by_id,
+                examined: true,
+            },
+        })
     }
 
     /// Apply changes: create/update desired resources, delete removed resources.
@@ -202,14 +218,21 @@ impl Engine {
         &self,
         composition: &InfraComposition,
         ctx: &mut ProvisionContext,
-    ) -> Result<Vec<Change>, IacError> {
+    ) -> Result<PlanOutcome, IacError> {
         validate_composition(composition, ctx)?;
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         let desired: [&dyn Resource; 0] = [];
         let refreshed = refresh_state(&known_refs, &desired, ctx, None).await?;
         ctx.state = refreshed.state;
-        Ok(compute_changes(&desired, &ctx.state, ctx))
+        let changes = compute_changes(&desired, &ctx.state, ctx);
+        Ok(PlanOutcome {
+            changes,
+            refresh: RefreshCoverage {
+                status_by_id: refreshed.status_by_id,
+                examined: true,
+            },
+        })
     }
 
     /// Compute the destroy change set restricted to the active modules.
@@ -217,14 +240,17 @@ impl Engine {
         &self,
         composition: &InfraComposition,
         ctx: &mut ProvisionContext,
-    ) -> Result<Vec<Change>, IacError> {
-        let changes = self.plan_destroy(composition, ctx).await?;
+    ) -> Result<PlanOutcome, IacError> {
+        let outcome = self.plan_destroy(composition, ctx).await?;
         let active: Vec<&str> = composition
             .active_modules
             .iter()
             .map(|s| s.as_str())
             .collect();
-        Ok(filter_changes_by_modules(&changes, &ctx.state, &active))
+        Ok(PlanOutcome {
+            changes: filter_changes_by_modules(&outcome.changes, &ctx.state, &active),
+            refresh: outcome.refresh,
+        })
     }
 
     /// Destroy using a known-managed resource set.
@@ -409,32 +435,64 @@ fn topological_sort_modules(modules: &[Box<dyn crate::Module>]) -> Result<Vec<St
 
 // ── Live state refresh ────────────────────────────────────────────────
 
-/// Per-resource refresh outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefreshStatus {
-    /// Resource is desired and exists in the provider.
+/// Per-resource refresh outcome — what the engine could confirm about live
+/// state while planning.
+///
+/// Public because it is explanation-grade evidence (the evidence-model spec):
+/// a consumer reading these can conclude, per resource, whether the plan's
+/// claims rest on a confirmed live read. `Unknown` is the honesty-critical
+/// variant — a plan over an `Unknown` resource is asserting desired state
+/// against live state it could not see, and the explanation layer surfaces
+/// that as uncertainty rather than letting the plan sound confident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RefreshStatus {
+    /// Resource is desired and exists in the provider: the diff below it
+    /// compares desired against a confirmed live read.
     DesiredLive,
-    /// Resource is desired but absent from the provider.
+    /// Resource is desired but confirmed absent from the provider: a create
+    /// (or recreate) is grounded in a real observation, not a guess.
     DesiredMissing,
-    /// Resource is known-managed (not desired) and exists in the provider.
+    /// Resource is known-managed (not desired) and exists in the provider:
+    /// its pending delete acts on a confirmed live object.
     ManagedLive,
-    /// Resource is known-managed (not desired) and absent from the provider.
-    /// State should be pruned.
+    /// Resource is known-managed (not desired) and confirmed absent from the
+    /// provider. State should be pruned.
     ManagedMissing,
     /// `describe` could not determine the resource's existence
     /// ([`DescribeResult::Unsupported`]). State is left untouched — never
-    /// pruned on an unconfirmed describe.
+    /// pruned on an unconfirmed describe — and no claim about this resource's
+    /// live state is grounded.
     Unknown,
 }
 
+/// Per-resource confirmation status from a refresh pass, and whether a
+/// refresh happened at all.
+///
+/// `examined == false` means the verb performed no live-state check — a
+/// materially different statement from "everything was confirmed", and one
+/// the explanation layer must be able to make (evidence-model Requirement
+/// 5.5). `BTreeMap` is required, not preferred: serialization order must be
+/// a function of the keys so explanation construction is deterministic
+/// (evidence-model Property 2).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RefreshCoverage {
+    pub status_by_id: BTreeMap<ResourceId, RefreshStatus>,
+    pub examined: bool,
+}
+
+/// What a plan produced: the changes, and what the engine could confirm
+/// about live state while producing them.
+#[derive(Debug, Clone, Default)]
+pub struct PlanOutcome {
+    pub changes: Vec<Change>,
+    pub refresh: RefreshCoverage,
+}
+
 #[derive(Debug)]
-#[allow(dead_code)] // status_by_id retained for diagnostic reporting
 struct RefreshReport {
     state: crate::document::InfraState,
-    status_by_id: HashMap<ResourceId, RefreshStatus>,
-    /// True if any managed-but-not-desired resource was absent from the
-    /// provider, indicating stale state entries should be pruned.
-    has_managed_missing: bool,
+    status_by_id: BTreeMap<ResourceId, RefreshStatus>,
 }
 
 /// Refresh persisted state against live provider state for all known resources.
@@ -495,8 +553,7 @@ async fn refresh_state(
         known.iter().map(|r| (r.resource_id(), *r)).collect();
 
     let mut refreshed = ctx.state.clone();
-    let mut status_by_id = HashMap::new();
-    let mut has_managed_missing = false;
+    let mut status_by_id = BTreeMap::new();
 
     for resource_id in sorted {
         let resource = resource_map.get(&resource_id).ok_or_else(|| {
@@ -532,7 +589,6 @@ async fn refresh_state(
                 let status = if is_desired {
                     RefreshStatus::DesiredMissing
                 } else {
-                    has_managed_missing = true;
                     info!(
                         ?resource_id,
                         "managed resource absent from provider, pruning from state"
@@ -556,7 +612,6 @@ async fn refresh_state(
     Ok(RefreshReport {
         state: refreshed,
         status_by_id,
-        has_managed_missing,
     })
 }
 
@@ -1399,6 +1454,142 @@ mod tests {
             updated_at: "now".to_string(),
             module: module.to_string(),
         }
+    }
+
+    /// The pre-widening plan computation, retained verbatim as the Property 7
+    /// oracle (evidence-model spec): the widened surface must return exactly
+    /// these changes and leave exactly this state — the coverage it adds is
+    /// additive, never behaviour-changing.
+    async fn legacy_plan_changes(
+        desired: &[&dyn Resource],
+        known: &[&dyn Resource],
+        ctx: &mut ProvisionContext,
+    ) -> Result<Vec<Change>, IacError> {
+        let refreshed = refresh_state(known, desired, ctx, None).await?;
+        ctx.state = refreshed.state;
+        Ok(compute_changes(desired, &ctx.state, ctx))
+    }
+
+    /// One generated resource's world: membership, live-describe behaviour,
+    /// prior state presence, and diff temperament.
+    #[derive(Debug, Clone)]
+    struct PlannedWorld {
+        desired: bool,
+        in_state: bool,
+        describe: u8, // 0 = live (Present), 1 = absent, 2 = unsupported
+        diff_replace: bool,
+    }
+
+    fn planned_world() -> impl Strategy<Value = Vec<PlannedWorld>> {
+        proptest::collection::vec(
+            (any::<bool>(), any::<bool>(), 0u8..3, any::<bool>()).prop_map(
+                |(desired, in_state, describe, diff_replace)| PlannedWorld {
+                    desired,
+                    in_state,
+                    describe,
+                    diff_replace,
+                },
+            ),
+            1..8,
+        )
+    }
+
+    fn build_world(worlds: &[PlannedWorld]) -> (Vec<StubResource>, ProvisionContext) {
+        let mut ctx = ProvisionContext::default();
+        let mut stubs = Vec::new();
+        for (index, world) in worlds.iter().enumerate() {
+            let id = format!("r{index}");
+            let mut stub = match world.describe {
+                0 => StubResource::live(&id, "m"),
+                1 => StubResource::missing(&id, "m"),
+                _ => {
+                    let mut s = StubResource::missing(&id, "m");
+                    s.describe_unsupported = true;
+                    s
+                }
+            };
+            stub.diff_replace = world.diff_replace;
+            if world.in_state {
+                ctx.state
+                    .resources
+                    .insert(ResourceId(id.clone()), stub_state(&id, "m"));
+            }
+            stubs.push(stub);
+        }
+        (stubs, ctx)
+    }
+
+    // Property 7 (evidence-model): widening preserves planning. For any
+    // generated world, `plan_with_known` returns exactly the changes the
+    // legacy computation produces, in order, leaving identical state — and
+    // its coverage covers exactly the refreshed resources with `examined`.
+    #[test]
+    fn property_widening_preserves_planning() {
+        let mut runner = proptest::test_runner::TestRunner::default();
+        runner
+            .run(&planned_world(), |worlds| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async {
+                    let engine = Engine::new();
+
+                    // Two independent, identical worlds: the oracle must not
+                    // share state with the subject.
+                    let (stubs_a, mut ctx_a) = build_world(&worlds);
+                    let (stubs_b, mut ctx_b) = build_world(&worlds);
+
+                    let split = |stubs: Vec<StubResource>, worlds: &[PlannedWorld]| {
+                        let boxed = boxed_resources(stubs);
+                        let desired_idx: Vec<usize> = worlds
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, w)| w.desired)
+                            .map(|(i, _)| i)
+                            .collect();
+                        (boxed, desired_idx)
+                    };
+                    let (known_a, desired_idx) = split(stubs_a, &worlds);
+                    let (known_b, _) = split(stubs_b, &worlds);
+
+                    let desired_refs_a: Vec<&dyn Resource> =
+                        desired_idx.iter().map(|&i| known_a[i].as_ref()).collect();
+                    let desired_refs_b: Vec<&dyn Resource> =
+                        desired_idx.iter().map(|&i| known_b[i].as_ref()).collect();
+
+                    let legacy = legacy_plan_changes(&desired_refs_a, &refs(&known_a), &mut ctx_a)
+                        .await
+                        .expect("legacy plan");
+                    let outcome = engine
+                        .plan_with_known(&desired_refs_b, &refs(&known_b), &mut ctx_b)
+                        .await
+                        .expect("widened plan");
+
+                    // The changes are identical, in order and content.
+                    assert_eq!(
+                        format!("{legacy:?}"),
+                        format!("{:?}", outcome.changes),
+                        "widening changed the plan"
+                    );
+                    // The resulting state is identical.
+                    assert_eq!(
+                        serde_json::to_string(&ctx_a.state).unwrap(),
+                        serde_json::to_string(&ctx_b.state).unwrap(),
+                        "widening changed the refreshed state"
+                    );
+                    // Coverage is additive: examined, and keyed only by
+                    // resources this plan actually touched.
+                    assert!(outcome.refresh.examined);
+                    for id in outcome.refresh.status_by_id.keys() {
+                        assert!(
+                            id.0.starts_with('r'),
+                            "coverage names an unknown resource: {id:?}"
+                        );
+                    }
+                });
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn boxed_resources(resources: Vec<StubResource>) -> Vec<Box<dyn Resource>> {

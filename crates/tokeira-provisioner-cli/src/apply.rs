@@ -48,7 +48,7 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     // reviewed — so the confirmed path pays no extra plan pass. ──
     if !yes {
         let planned = platform.infra_plan(deployment_dir).await?;
-        refuse_destructive_without_yes("infra apply", &planned)?;
+        refuse_destructive_without_yes("infra apply", &planned.changes)?;
     }
 
     // ── Engine apply (realized by the injected platform) ──

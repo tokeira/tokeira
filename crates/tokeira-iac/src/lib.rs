@@ -32,7 +32,7 @@ pub use document::{
     ImageSource, ImageState, InfraState, InfraStateStore, RuntimeState, RuntimeStateStore,
     ServiceState,
 };
-pub use engine::{Engine, StateSaver};
+pub use engine::{Engine, PlanOutcome, RefreshCoverage, RefreshStatus, StateSaver};
 pub use error::IacError;
 pub use module::{Module, ModuleContext};
 pub use types::{

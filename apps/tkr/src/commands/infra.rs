@@ -116,9 +116,9 @@ where
             let tui = ActionTuiHandle::new(format);
             tui.install(engine.provision_context_mut());
             let result = engine.plan(&composition, selection).await;
-            if let Ok(changes) = &result {
-                finish_progress(&tui, changes);
-                print_plan(changes);
+            if let Ok(outcome) = &result {
+                finish_progress(&tui, &outcome.changes);
+                print_plan(&outcome.changes);
             } else {
                 tui.print_summary();
             }

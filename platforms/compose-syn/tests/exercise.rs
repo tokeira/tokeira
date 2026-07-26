@@ -48,10 +48,11 @@ async fn exercise_compose_syn_end_to_end() {
         .iter()
         .map(|m| m.name())
         .collect();
-    let changes = infra
+    let outcome = infra
         .plan(&composition, ModuleSelection::All)
         .await
         .unwrap();
+    let changes = &outcome.changes;
 
     // From an empty state, every desired resource plans as a Create.
     assert!(!changes.is_empty(), "infra plan should propose creates");
@@ -59,6 +60,7 @@ async fn exercise_compose_syn_end_to_end() {
         changes.iter().all(|c| c.kind == ChangeKind::Create),
         "from empty state every change is a Create"
     );
+    assert!(outcome.refresh.examined, "plan refreshed live state");
     println!(
         "infra plan: {} resource(s) to create across modules {:?}",
         changes.len(),

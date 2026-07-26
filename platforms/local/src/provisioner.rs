@@ -9,7 +9,7 @@
 use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
-use tokeira_iac::{Change, ModuleSelection, ResourceId};
+use tokeira_iac::{ModuleSelection, PlanOutcome, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_provisioner_cli::{
     ChangeLogEntry, ProvisionerPlatform, Realization, change_log_entries,
@@ -34,7 +34,7 @@ impl ProvisionerPlatform for LocalPlatform {
         Ok(load_local_config(deployment_dir)?.project_name)
     }
 
-    async fn infra_plan(&self, deployment_dir: &Path) -> Result<Vec<Change>> {
+    async fn infra_plan(&self, deployment_dir: &Path) -> Result<PlanOutcome> {
         let mut engine = open_engine(deployment_dir).await?;
         let composition = engine.compose(ModuleSelection::All)?;
         engine
@@ -78,7 +78,7 @@ impl ProvisionerPlatform for LocalPlatform {
         Ok(change_log_entries(&deleted))
     }
 
-    async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<Vec<Change>>> {
+    async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<PlanOutcome>> {
         // Local has no separate workload notion; the workload rides the
         // infra universe.
         Ok(Realization::Realized(
@@ -132,9 +132,14 @@ mod tests {
         // shell's Day-0/dev-loop substrate.
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(LocalPlatform.deployment_id(tmp.path()).unwrap(), "tokeira");
-        let changes = LocalPlatform.infra_plan(tmp.path()).await.expect("plan");
-        assert_eq!(changes.len(), 1, "local plans the state-dir resource");
-        assert_eq!(changes[0].resource_type, "local_state_dir");
+        let outcome = LocalPlatform.infra_plan(tmp.path()).await.expect("plan");
+        assert_eq!(
+            outcome.changes.len(),
+            1,
+            "local plans the state-dir resource"
+        );
+        assert_eq!(outcome.changes[0].resource_type, "local_state_dir");
+        assert!(outcome.refresh.examined, "the plan performed a refresh");
     }
 
     #[tokio::test]

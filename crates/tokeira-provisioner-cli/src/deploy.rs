@@ -40,13 +40,13 @@ pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
         Realization::NotApplicable { reason } => {
             anyhow::bail!("not applicable: {reason}");
         }
-        Realization::Realized(changes) => {
+        Realization::Realized(outcome) => {
             let report = crate::render::PlanReport::new(
                 platform.label(deployment_dir).to_string(),
                 "deploy plan",
                 &envelope,
                 verdict,
-                changes,
+                outcome.changes,
             );
             print!("{}", tokeira_report::render(&report, mode)?);
         }
@@ -84,7 +84,7 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
 
     // ── Destructive gate (§4): identical contract to `infra apply`. ──
     if !yes && let Realization::Realized(planned) = platform.deploy_plan(deployment_dir).await? {
-        crate::apply::refuse_destructive_without_yes("deploy apply", &planned)?;
+        crate::apply::refuse_destructive_without_yes("deploy apply", &planned.changes)?;
     }
 
     // ── Workload apply (realized by the injected platform) ──

@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use tokeira_iac::{Change, ChangeKind};
+use tokeira_iac::{Change, ChangeKind, PlanOutcome};
 use tokeira_provisioner::DeploymentStateEnvelope;
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
@@ -75,10 +75,11 @@ pub trait ProvisionerPlatform {
     /// The deployment identity recorded at Day-0 stamp time.
     fn deployment_id(&self, deployment_dir: &Path) -> Result<String>;
 
-    /// Preview the infrastructure Delta (read-only, no mutation). The infra
-    /// verbs are universal — every provisioner provisions infrastructure — so
-    /// they are unconditional, unlike the workload verbs below.
-    async fn infra_plan(&self, deployment_dir: &Path) -> Result<Vec<Change>>;
+    /// Preview the infrastructure plan (read-only, no mutation): the changes
+    /// plus the refresh coverage behind them. The infra verbs are universal —
+    /// every provisioner provisions infrastructure — so they are
+    /// unconditional, unlike the workload verbs below.
+    async fn infra_plan(&self, deployment_dir: &Path) -> Result<PlanOutcome>;
 
     /// Reconcile infrastructure to desired. Returns the **identities** of the
     /// changes committed (ids-only — never before-images, Proposal 002): the
@@ -120,7 +121,7 @@ pub trait ProvisionerPlatform {
     /// Preview the workload Delta (read-only). A platform whose workload rides
     /// the infra universe (compose-syn models its containers as infra
     /// resources) realizes this as the infra plan.
-    async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<Vec<Change>>>;
+    async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<PlanOutcome>>;
 
     /// Reconcile the workload to desired. Returns the committed change
     /// identities, like [`infra_apply`](Self::infra_apply).
@@ -194,8 +195,8 @@ impl ProvisionerPlatform for TestPlatform {
         Ok("tokeira".to_string())
     }
 
-    async fn infra_plan(&self, _deployment_dir: &Path) -> Result<Vec<Change>> {
-        Ok(Vec::new())
+    async fn infra_plan(&self, _deployment_dir: &Path) -> Result<PlanOutcome> {
+        Ok(PlanOutcome::default())
     }
 
     async fn infra_apply(&self, _deployment_dir: &Path) -> Result<Vec<ChangeLogEntry>> {
@@ -222,8 +223,8 @@ impl ProvisionerPlatform for TestPlatform {
             .collect())
     }
 
-    async fn deploy_plan(&self, _deployment_dir: &Path) -> Result<Realization<Vec<Change>>> {
-        Ok(Realization::Realized(Vec::new()))
+    async fn deploy_plan(&self, _deployment_dir: &Path) -> Result<Realization<PlanOutcome>> {
+        Ok(Realization::Realized(PlanOutcome::default()))
     }
 
     async fn deploy_apply(

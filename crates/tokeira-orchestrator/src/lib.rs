@@ -314,10 +314,10 @@ impl<D: Deployment> InfraEngine<D> {
         &mut self,
         composition: &iac::InfraComposition,
         selection: iac::ModuleSelection,
-    ) -> Result<Vec<iac::Change>> {
+    ) -> Result<iac::PlanOutcome> {
         let (state, _) = self.state_store.load().await?;
         self.ctx.state = state;
-        let changes = match selection {
+        let outcome = match selection {
             iac::ModuleSelection::All => self.engine.plan(composition, &mut self.ctx).await,
             iac::ModuleSelection::Only(_) | iac::ModuleSelection::Except(_) => {
                 self.engine
@@ -325,7 +325,7 @@ impl<D: Deployment> InfraEngine<D> {
                     .await
             }
         }?;
-        Ok(changes)
+        Ok(outcome)
     }
 
     /// Plan infrastructure destruction without mutating provider state.
@@ -333,7 +333,7 @@ impl<D: Deployment> InfraEngine<D> {
         &mut self,
         composition: &iac::InfraComposition,
         selection: iac::ModuleSelection,
-    ) -> Result<Vec<iac::Change>> {
+    ) -> Result<iac::PlanOutcome> {
         let (state, _) = self.state_store.load().await?;
         self.ctx.state = state;
         self.ctx.set_extension(iac::DestroyMode);

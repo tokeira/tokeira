@@ -16,7 +16,7 @@ use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
 use tokeira_compose::{ComposeError, ComposePlatform};
-use tokeira_iac::{Change, ModuleSelection, ResourceId};
+use tokeira_iac::{ModuleSelection, PlanOutcome, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_provisioner_cli::{
     ChangeLogEntry, ProvisionerPlatform, Realization, change_log_entries,
@@ -64,7 +64,7 @@ impl ProvisionerPlatform for ComposeSynPlatform {
         load_tkd_config_from(deployment_dir, &definition).map(|_| Realization::Realized(()))
     }
 
-    async fn infra_plan(&self, deployment_dir: &Path) -> Result<Vec<Change>> {
+    async fn infra_plan(&self, deployment_dir: &Path) -> Result<PlanOutcome> {
         let config = load_tkd_config(deployment_dir)?;
         let mut engine = open_engine(config, deployment_dir, false).await?;
         let composition = engine.compose(ModuleSelection::All)?;
@@ -113,7 +113,7 @@ impl ProvisionerPlatform for ComposeSynPlatform {
         Ok(change_log_entries(&deleted))
     }
 
-    async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<Vec<Change>>> {
+    async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<PlanOutcome>> {
         // The workload rides the infra universe: the tokeirad containers are
         // compose_service infra resources of the interpreted `.tkd`.
         Ok(Realization::Realized(
@@ -289,18 +289,30 @@ mod tests {
         // resources. No Docker: container `describe` returns Unsupported, so a
         // fresh deployment still plans (all Creates).
         let tmp = reference_tkd_dir();
-        let changes = ComposeSynPlatform
+        let outcome = ComposeSynPlatform
             .infra_plan(tmp.path())
             .await
             .expect("plan");
         assert!(
-            changes.len() >= 6,
+            outcome.changes.len() >= 6,
             "compose-syn plan produced only {} changes",
-            changes.len()
+            outcome.changes.len()
         );
         assert!(
-            changes.iter().any(|c| c.resource_type == "compose_service"),
+            outcome
+                .changes
+                .iter()
+                .any(|c| c.resource_type == "compose_service"),
             "plan includes compose_service container resources"
+        );
+        // Refresh examines every known resource. Whether a given container
+        // describe confirms, denies, or cannot determine existence depends on
+        // the environment (a dev machine's Docker answers; CI's may not), so
+        // the assertion is coverage totality, never a specific status.
+        assert!(outcome.refresh.examined);
+        assert!(
+            !outcome.refresh.status_by_id.is_empty(),
+            "refresh covered the known resources"
         );
     }
 

@@ -25,7 +25,9 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    lane::LaneHandle, metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
+    DispatchEligibility, DispatchRateLimits, EffectivePriority, InMemoryTaskQueueConfigStore,
+    TaskQueueConfigKey, TaskQueueConfigKind, TaskQueueConfigStore, lane::LaneHandle,
+    metrics as runtime_metrics, scanner::pick_lane_for_run_key, shard::ShardOwner,
 };
 
 /// Currently-supported completion-callback token envelope version. Mirrors
@@ -1008,12 +1010,30 @@ pub struct NexusTask {
     pub request: NexusTaskRequest,
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Clone)]
 pub struct NexusTaskBroker {
     inner: Arc<AsyncMutex<NexusBrokerState>>,
+    config_store: Arc<RwLock<Arc<dyn TaskQueueConfigStore>>>,
 }
 
-#[derive(Default, Debug)]
+impl std::fmt::Debug for NexusTaskBroker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NexusTaskBroker").finish_non_exhaustive()
+    }
+}
+
+impl Default for NexusTaskBroker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(AsyncMutex::new(NexusBrokerState::default())),
+            config_store: Arc::new(RwLock::new(Arc::new(
+                InMemoryTaskQueueConfigStore::default(),
+            ))),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct NexusBrokerState {
     ready: HashMap<(NamespaceId, TaskQueueName), VecDeque<NexusTask>>,
     /// Private result routes keyed by the UUID carried in the protobuf token.
@@ -1023,9 +1043,46 @@ struct NexusBrokerState {
     /// Per-queue wake handles (see `tokeira-runtime::broker`'s per-queue wake
     /// pattern): a publish wakes only pollers on that namespace+task-queue.
     wakes: HashMap<(NamespaceId, TaskQueueName), Arc<Notify>>,
+    rate_origin: tokio::time::Instant,
+    rate_limits: DispatchRateLimits,
+}
+
+impl Default for NexusBrokerState {
+    fn default() -> Self {
+        Self {
+            ready: HashMap::new(),
+            outstanding: HashMap::new(),
+            wakes: HashMap::new(),
+            rate_origin: tokio::time::Instant::now(),
+            rate_limits: DispatchRateLimits::default(),
+        }
+    }
+}
+
+enum NexusTakeOutcome {
+    Ready(NexusTask),
+    WaitUntil(tokio::time::Instant),
+    Blocked,
+    Empty,
+}
+
+fn nexus_config_key(namespace_id: NamespaceId, task_queue: &TaskQueueName) -> TaskQueueConfigKey {
+    TaskQueueConfigKey {
+        namespace_id,
+        task_queue: task_queue.clone(),
+        kind: TaskQueueConfigKind::Nexus,
+    }
 }
 
 impl NexusTaskBroker {
+    /// Share the live volatile task-queue configuration store.
+    pub fn set_task_queue_config_store(&self, store: Arc<dyn TaskQueueConfigStore>) {
+        *self
+            .config_store
+            .write()
+            .expect("Nexus task queue config lock poisoned") = store;
+    }
+
     /// Publish an already-authored task without a completion route.
     ///
     /// This remains for poll-only tests and one-way fixtures. Production
@@ -1164,30 +1221,48 @@ impl NexusTaskBroker {
         task_queue: TaskQueueName,
         wait_for: tokio::time::Duration,
     ) -> Option<NexusTask> {
-        if let Some(task) = self.try_take(namespace_id, &task_queue).await {
-            return Some(task);
+        match self.try_take(namespace_id, &task_queue).await {
+            NexusTakeOutcome::Ready(task) => return Some(task),
+            NexusTakeOutcome::WaitUntil(_)
+            | NexusTakeOutcome::Blocked
+            | NexusTakeOutcome::Empty => {}
         }
 
         // Per-queue wake + deadline loop: a publish on another nexus queue must
         // not end this poll, and a wake is a hint to re-check, not a result (we
         // wait until the deadline if there is still nothing for this queue).
         let wake = self.queue_wake(namespace_id, &task_queue).await;
+        let config_key = nexus_config_key(namespace_id, &task_queue);
+        let config_store = self
+            .config_store
+            .read()
+            .expect("Nexus task queue config lock poisoned")
+            .clone();
+        let config_changed = config_store.changed(&config_key);
         let deadline = tokio::time::Instant::now() + wait_for;
         loop {
             let notified = wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            let changed = config_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
 
-            if let Some(task) = self.try_take(namespace_id, &task_queue).await {
-                return Some(task);
-            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return None;
             }
+            let rate_wait = match self.try_take(namespace_id, &task_queue).await {
+                NexusTakeOutcome::Ready(task) => return Some(task),
+                NexusTakeOutcome::WaitUntil(eligible_at) => {
+                    eligible_at.saturating_duration_since(tokio::time::Instant::now())
+                }
+                NexusTakeOutcome::Blocked | NexusTakeOutcome::Empty => remaining,
+            };
             tokio::select! {
                 _ = notified.as_mut() => {}
-                _ = tokio::time::sleep(remaining) => {}
+                _ = changed.as_mut() => {}
+                _ = tokio::time::sleep(rate_wait.min(remaining)) => {}
             }
         }
     }
@@ -1228,12 +1303,47 @@ impl NexusTaskBroker {
         &self,
         namespace_id: NamespaceId,
         task_queue: &TaskQueueName,
-    ) -> Option<NexusTask> {
+    ) -> NexusTakeOutcome {
+        let config_key = nexus_config_key(namespace_id, task_queue);
+        let config = self
+            .config_store
+            .read()
+            .expect("Nexus task queue config lock poisoned")
+            .get(&config_key);
         let mut inner = self.inner.lock().await;
-        inner
+        if inner
+            .ready
+            .get(&(namespace_id, task_queue.clone()))
+            .is_none_or(VecDeque::is_empty)
+        {
+            return NexusTakeOutcome::Empty;
+        }
+        let effective = EffectivePriority {
+            priority_key: 3,
+            fairness_key: String::new(),
+            fairness_weight: 1.0,
+        };
+        let now = inner.rate_origin.elapsed();
+        match inner
+            .rate_limits
+            .inspect(&config_key, &effective, config.as_ref(), now)
+        {
+            DispatchEligibility::Blocked => return NexusTakeOutcome::Blocked,
+            DispatchEligibility::At(offset) => {
+                return NexusTakeOutcome::WaitUntil(inner.rate_origin + offset);
+            }
+            DispatchEligibility::Ready => {}
+        }
+        let task = inner
             .ready
             .get_mut(&(namespace_id, task_queue.clone()))
-            .and_then(VecDeque::pop_front)
+            .and_then(VecDeque::pop_front);
+        if task.is_some() {
+            inner
+                .rate_limits
+                .consume(&config_key, &effective, config.as_ref(), now);
+        }
+        task.map_or(NexusTakeOutcome::Empty, NexusTakeOutcome::Ready)
     }
 
     /// Remove all not-yet-delivered Nexus tasks owned by a deleted run.
@@ -1884,10 +1994,85 @@ pub(crate) async fn run_nexus_timeout_scanner<R>(
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
+    use time::OffsetDateTime;
     use tokio::runtime::Runtime;
     use uuid::Uuid;
 
     use super::*;
+
+    #[tokio::test]
+    async fn nexus_zero_rate_blocks_and_live_unset_releases_ready_work() {
+        let broker = NexusTaskBroker::default();
+        let store = Arc::new(InMemoryTaskQueueConfigStore::default());
+        broker.set_task_queue_config_store(store.clone());
+        let namespace_id = NamespaceId::new();
+        let task_queue = TaskQueueName("rate-limited".to_string());
+        let key = nexus_config_key(namespace_id, &task_queue);
+        let metadata = crate::TaskQueueConfigMetadata {
+            reason: "test".to_string(),
+            update_identity: "test".to_string(),
+            update_time: OffsetDateTime::UNIX_EPOCH,
+        };
+        store
+            .apply(
+                key.clone(),
+                crate::TaskQueueConfigPatch {
+                    queue_rate_limit: crate::TaskQueueConfigFieldPatch::Set((
+                        Some(0.0),
+                        metadata.clone(),
+                    )),
+                    ..crate::TaskQueueConfigPatch::default()
+                },
+                1_000,
+            )
+            .expect("zero is a valid blocking rate");
+        broker
+            .publish(
+                namespace_id,
+                task_queue.clone(),
+                NexusTask {
+                    token: NexusTaskToken {
+                        namespace_id: namespace_id.0.to_string(),
+                        task_queue: task_queue.0.clone(),
+                        task_id: "task".to_string(),
+                    },
+                    request: NexusTaskRequest::CancelOperation {
+                        service: "service".to_string(),
+                        operation: "operation".to_string(),
+                        operation_id: "operation-id".to_string(),
+                        operation_token: "operation-token".to_string(),
+                    },
+                },
+            )
+            .await;
+
+        assert!(
+            broker
+                .poll(
+                    namespace_id,
+                    task_queue.clone(),
+                    tokio::time::Duration::ZERO
+                )
+                .await
+                .is_none()
+        );
+        store
+            .apply(
+                key,
+                crate::TaskQueueConfigPatch {
+                    queue_rate_limit: crate::TaskQueueConfigFieldPatch::Set((None, metadata)),
+                    ..crate::TaskQueueConfigPatch::default()
+                },
+                1_000,
+            )
+            .expect("unset is valid");
+        assert!(
+            broker
+                .poll(namespace_id, task_queue, tokio::time::Duration::ZERO)
+                .await
+                .is_some()
+        );
+    }
 
     // Feature: edge-nexus-task-transport, Property 1: Task token round-trip
     proptest! {

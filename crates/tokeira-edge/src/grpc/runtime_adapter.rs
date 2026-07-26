@@ -173,11 +173,12 @@ where
     async fn poll_workflow_activation(
         &self,
         queue: tokeira_types::QueueKey,
+        normal_queue: Option<tokeira_types::QueueKey>,
         worker_identity: tokeira_types::WorkerIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<tokeira_runtime::WorkflowActivation>> {
         self.runtime
-            .poll_workflow_activation(queue, worker_identity, timeout)
+            .poll_workflow_activation(queue, normal_queue, worker_identity, timeout)
             .await
     }
 
@@ -276,6 +277,24 @@ where
             }
             tokeira_types::TaskKind::Workflow => self.runtime.broker().backlog_stats(queue).await,
         }
+    }
+
+    async fn task_queue_backlog_stats_by_priority(
+        &self,
+        queue: &tokeira_types::QueueKey,
+    ) -> tokeira_runtime::PriorityBacklogStats {
+        self.runtime
+            .task_queue_backlog_stats_by_priority(queue)
+            .await
+    }
+
+    async fn sticky_task_queue_backlog_stats_by_priority(
+        &self,
+        queue: &tokeira_types::QueueKey,
+    ) -> tokeira_runtime::PriorityBacklogStats {
+        self.runtime
+            .sticky_task_queue_backlog_stats_by_priority(queue)
+            .await
     }
 
     async fn absorb_unversioned_backlog(&self, queue: &tokeira_types::QueueKey) {
@@ -487,12 +506,13 @@ where
         &self,
         run_key: tokeira_types::RunKey,
         versioning_override: tokeira_kernel::VersioningOverrideChange,
+        priority: tokeira_kernel::FieldChange<tokeira_kernel::Priority>,
         request: tokeira_types::RequestContext,
     ) -> Result<WorkflowMutationOutcome> {
         let execution = execution_for_run(self.runtime.as_ref(), run_key).await?;
         let result = self
             .runtime
-            .update_workflow_execution_options(execution, versioning_override, request)
+            .update_workflow_execution_options(execution, versioning_override, priority, request)
             .await?;
         commit_result_to_outcome(result)
     }
@@ -759,12 +779,10 @@ where
                     deployment: Some(DeploymentId(view.deployment_name.0.clone())),
                     build_id: Some(BuildId(view.build_id.0.clone())),
                 };
-                let mut stats = match task_kind {
-                    TaskKind::Workflow => self.runtime.broker().backlog_stats(&queue).await,
-                    TaskKind::Activity => {
-                        self.runtime.activity_broker().backlog_stats(&queue).await
-                    }
-                };
+                let mut stats_by_priority_key = self
+                    .runtime
+                    .task_queue_backlog_stats_by_priority(&queue)
+                    .await;
                 if matches!(
                     view.record.status,
                     WorkerDeploymentVersionStatus::Current | WorkerDeploymentVersionStatus::Ramping
@@ -774,21 +792,30 @@ where
                         build_id: None,
                         ..queue.clone()
                     };
-                    let absorbed = match task_kind {
-                        TaskKind::Workflow => {
-                            self.runtime.broker().backlog_stats(&unversioned).await
-                        }
-                        TaskKind::Activity => {
-                            self.runtime
-                                .activity_broker()
-                                .backlog_stats(&unversioned)
-                                .await
-                        }
-                    };
-                    stats.count += absorbed.count;
-                    stats.oldest_age = stats.oldest_age.max(absorbed.oldest_age);
+                    let absorbed = self
+                        .runtime
+                        .task_queue_backlog_stats_by_priority(&unversioned)
+                        .await;
+                    for (priority_key, band) in absorbed {
+                        stats_by_priority_key
+                            .entry(priority_key)
+                            .and_modify(|current| {
+                                current.count += band.count;
+                                current.oldest_age = current.oldest_age.max(band.oldest_age);
+                            })
+                            .or_insert(band);
+                    }
                 }
+                let stats = stats_by_priority_key.values().fold(
+                    tokeira_runtime::BrokerBacklogStats::default(),
+                    |mut aggregate, band| {
+                        aggregate.count += band.count;
+                        aggregate.oldest_age = aggregate.oldest_age.max(band.oldest_age);
+                        aggregate
+                    },
+                );
                 membership.stats = Some(stats);
+                membership.stats_by_priority_key = Some(stats_by_priority_key);
             }
         }
         Ok(view)

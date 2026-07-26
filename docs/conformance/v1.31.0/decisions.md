@@ -10,6 +10,16 @@
 
 ## Resolved decisions
 
+- **Task Queue Priority and User Fairness** — resolved 2026-07-24: in-surface. Priority-aware task
+  delivery uses the v1.31.0 stock defaults (`matching.useNewMatcher=true`, five levels, default key 3).
+  Weighted User Fairness is supported but retains the stock-default disabled posture
+  (`matching.enableFairness=false`, `matching.autoEnableV2=false`); the conformance-only override bridge
+  exercises enabled and auto-enable modes. Tokeira realizes the behavior in its runtime delivery
+  broker and durable backlog rather than introducing Temporal matching/history service objects, and
+  the pure kernel retains no scheduler state. `UpdateTaskQueueConfig` is live, atomic, and
+  kind-isolated; its current store remains volatile while the broader production configuration and
+  durability proposal is under owner review. Owning record:
+  [`.kiro/specs/task-queue-priority-fairness/`](../../../.kiro/specs/task-queue-priority-fairness/).
 - **Authentication and authorization** — resolved 2026-07-16: in-surface, in two layers. The
   stock-default layer (no-op claim mapper + no-op authorizer: every call allowed, no principal on
   events) is conformant by construction today and is the release gate. The configured layer —

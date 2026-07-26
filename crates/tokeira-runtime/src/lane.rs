@@ -823,6 +823,8 @@ where
                                                     versioning_override,
                                                     completion_callbacks:
                                                         tokeira_kernel::FieldChange::Unchanged,
+                                                    priority:
+                                                        tokeira_kernel::FieldChange::Unchanged,
                                                     attached_completion_callbacks: Vec::new(),
                                                     attached_links: Vec::new(),
                                                     attached_request_id: None,
@@ -2826,6 +2828,7 @@ mod tests {
             },
             logical_seq: LogicalTaskSeq::ONE,
             sticky_preferred: Some(WorkerIdentity("worker-a".to_string())),
+            priority: None,
         }]
     }
 

@@ -363,7 +363,7 @@ mod tests {
     use time::Duration;
     use tokeira_kernel::{
         ActivityOp, ActivityState, BasicKernel, DispatchOp, PendingNexusOperation,
-        PendingWorkflowTask, TimerOp, TimerState, Transition, WorkflowState,
+        PendingWorkflowTask, Priority, TimerOp, TimerState, Transition, WorkflowState,
     };
     use tokeira_storage::{CommitResult, InMemoryStore};
     use tokeira_types::{
@@ -739,6 +739,7 @@ mod tests {
                             schedule_to_start_timeout: None,
                             start_to_close_timeout: None,
                             heartbeat_timeout: None,
+                            priority: None,
                         },
                     );
                     let result = store
@@ -812,6 +813,144 @@ mod tests {
                     expected_runs.clone();
                 expected_sorted.sort_by_key(|rk| rk.0);
                 prop_assert_eq!(polled, expected_sorted);
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+    }
+
+    // Feature: task-queue-priority-fairness, Property 10
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn recovery_reconstructs_priority_and_logical_fences_without_policy_state(
+            workflow_priority in prop::option::of(
+                (0i32..100, "[a-z]{0,8}", 0.0f32..10.0).prop_map(
+                    |(priority_key, fairness_key, fairness_weight)| Priority {
+                        priority_key,
+                        fairness_key,
+                        fairness_weight,
+                    },
+                ),
+            ),
+            activity_priority in prop::option::of(
+                (0i32..100, "[a-z]{0,8}", 0.0f32..10.0).prop_map(
+                    |(priority_key, fairness_key, fairness_weight)| Priority {
+                        priority_key,
+                        fairness_key,
+                        fairness_weight,
+                    },
+                ),
+            ),
+            logical_seq in 1u64..1_000,
+            activity_stamp in 0u64..1_000,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store = InMemoryStore::with_shard_count(1);
+                let shard_id = ShardId(0);
+                let namespace_id = NamespaceId::new();
+                let run_key = RunKey::new();
+                let mut transition = start_transition(run_key);
+                transition.next_state.namespace_id = namespace_id;
+                transition.next_state.priority = workflow_priority.clone();
+                transition
+                    .next_state
+                    .pending_workflow_task
+                    .as_mut()
+                    .expect("fixture pending workflow task")
+                    .logical_seq = LogicalTaskSeq(logical_seq);
+                transition.dispatch_ops.push(DispatchOp::EnqueueActivityTask {
+                    queue: QueueKey {
+                        namespace_id,
+                        task_queue: TaskQueueName("q".into()),
+                        task_kind: TaskKind::Activity,
+                        deployment: None,
+                        build_id: None,
+                    },
+                    activity_id: "activity".into(),
+                    input: Payloads::default(),
+                    schedule_event_id: 7,
+                    attempt: 2,
+                    dispatch_revision: 11,
+                    stamp: activity_stamp,
+                    dispatch_at: OffsetDateTime::UNIX_EPOCH,
+                    schedule_to_close_timeout: None,
+                    schedule_to_start_timeout: None,
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                    priority: activity_priority.clone(),
+                });
+                store
+                    .commit_transition(run_key, transition, ShardEpoch::ZERO)
+                    .await
+                    .unwrap();
+
+                let recover = || async {
+                    let workflow_broker = InMemoryBroker::default();
+                    let activity_broker = InMemoryActivityBroker::default();
+                    let (lanes, lane_count) = make_lanes(&store);
+                    sweep_shard(
+                        shard_id,
+                        &store,
+                        &workflow_broker,
+                        &activity_broker,
+                        &lanes,
+                        lane_count,
+                        &WorkflowTimeoutTrackingState::default(),
+                        &WftTimeoutTrackingState::default(),
+                        &ActivityTrackingState::default(),
+                        &NexusTimeoutTrackingState::default(),
+                        &CompletionCallbackTrackingState::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let workflow = workflow_broker
+                        .poll_workflow_task(
+                            &QueueKey {
+                                namespace_id,
+                                task_queue: TaskQueueName("q".into()),
+                                task_kind: TaskKind::Workflow,
+                                deployment: None,
+                                build_id: None,
+                            },
+                            &WorkerIdentity("worker".into()),
+                            std::time::Duration::ZERO,
+                        )
+                        .await
+                        .unwrap()
+                        .and_then(|result| result.into_queued().map(|queued| queued.0))
+                        .expect("recovered workflow task");
+                    let activity = activity_broker
+                        .poll_activity_task(
+                            &QueueKey {
+                                namespace_id,
+                                task_queue: TaskQueueName("q".into()),
+                                task_kind: TaskKind::Activity,
+                                deployment: None,
+                                build_id: None,
+                            },
+                            std::time::Duration::ZERO,
+                        )
+                        .await
+                        .unwrap()
+                        .expect("recovered activity task")
+                        .0;
+                    (workflow, activity)
+                };
+
+                let (first_workflow, first_activity) = recover().await;
+                let (second_workflow, second_activity) = recover().await;
+                prop_assert_eq!(first_workflow.logical_seq, LogicalTaskSeq(logical_seq));
+                prop_assert_eq!(&first_workflow.priority, &workflow_priority);
+                prop_assert_eq!(first_activity.stamp, activity_stamp);
+                prop_assert_eq!(&first_activity.priority, &activity_priority);
+                prop_assert_eq!(second_workflow.logical_seq, first_workflow.logical_seq);
+                prop_assert_eq!(second_workflow.priority, first_workflow.priority);
+                prop_assert_eq!(second_activity.activity_id, first_activity.activity_id);
+                prop_assert_eq!(second_activity.attempt, first_activity.attempt);
+                prop_assert_eq!(second_activity.stamp, first_activity.stamp);
+                prop_assert_eq!(second_activity.priority, first_activity.priority);
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
@@ -1096,6 +1235,7 @@ mod tests {
                     started_event_id: None,
                     pause_info: None,
                     stamp: 0,
+                    priority: None,
                 };
                 t.activity_ops.push(ActivityOp::Upsert(
                     act.clone(),

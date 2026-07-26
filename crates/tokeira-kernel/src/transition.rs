@@ -10,7 +10,7 @@ use tokeira_types::{
 use crate::{
     command::WorkflowIdReusePolicy,
     event::HistoryEvent,
-    state::{ActivityState, CompletionCallback, TimerState, WorkflowState},
+    state::{ActivityState, CompletionCallback, Priority, TimerState, WorkflowState},
 };
 
 /// The full result of one authoritative transition.
@@ -126,6 +126,8 @@ pub enum DispatchOp {
         /// Delivery loss recovers via the in-memory schedule-to-start timer,
         /// never via a backlog row.
         speculative: bool,
+        /// Workflow Priority metadata for runtime delivery policy.
+        priority: Option<Priority>,
     },
     /// Observability side-effect: a speculative workflow task completion
     /// resolved as a COMMIT (materialized into history) or a ROLLBACK
@@ -188,6 +190,8 @@ pub enum DispatchOp {
         schedule_to_start_timeout: Option<Duration>,
         start_to_close_timeout: Option<Duration>,
         heartbeat_timeout: Option<Duration>,
+        /// Effective activity Priority after field-wise workflow inheritance.
+        priority: Option<Priority>,
     },
     /// Initiate a child workflow execution.
     StartChildWorkflow {
@@ -217,6 +221,8 @@ pub enum DispatchOp {
         retry_policy: Option<RetryPolicy>,
         cron_schedule: Option<String>,
         reuse_policy: WorkflowIdReusePolicy,
+        /// Effective child Priority after field-wise parent inheritance.
+        priority: Option<Priority>,
     },
     /// Forcibly terminate a child workflow (parent close
     /// policy).

@@ -85,6 +85,7 @@ struct StartChildDispatch {
     retry_policy: Option<tokeira_types::RetryPolicy>,
     cron_schedule: Option<String>,
     reuse_policy: tokeira_kernel::WorkflowIdReusePolicy,
+    priority: Option<tokeira_kernel::Priority>,
 }
 
 /// [`DispatchPublisher`] that forwards dispatch ops to
@@ -501,6 +502,7 @@ where
             retry_policy,
             cron_schedule,
             reuse_policy,
+            priority,
         } = spec;
         let child_run_id = RunId::new();
         let child_run_key = RunKey::derive(namespace_id, &child_workflow_id, child_run_id);
@@ -560,7 +562,7 @@ where
             user_metadata: None,
             links: Vec::new(),
             on_conflict_options: None,
-            priority: None,
+            priority,
             input,
             header,
             memo,
@@ -2002,6 +2004,7 @@ where
                     sticky_preferred,
                     normal_task_queue,
                     speculative: _,
+                    priority,
                 } => {
                     let workflow_queue = queue.clone();
                     let sticky_normal = sticky_preferred
@@ -2060,6 +2063,8 @@ where
                                 sticky_preferred: final_sticky,
                                 normal_queue,
                                 sticky_deadline,
+                                priority: priority.clone(),
+                                order: None,
                             },
                             Some(&self.delivery_metrics),
                         )
@@ -2102,6 +2107,7 @@ where
                         dispatch_revision,
                         stamp,
                         dispatch_at,
+                        priority,
                         ..
                     } = op
                     {
@@ -2117,6 +2123,8 @@ where
                             attempt: *attempt,
                             dispatch_revision,
                             stamp: *stamp,
+                            priority: priority.clone(),
+                            order: None,
                         };
                         let now = OffsetDateTime::now_utc();
                         let delay = *dispatch_at - now;
@@ -2191,6 +2199,7 @@ where
                     retry_policy,
                     cron_schedule,
                     reuse_policy,
+                    priority,
                 } => {
                     let publisher = RuntimeDispatchPublisher::clone(self);
                     let spec = StartChildDispatch {
@@ -2215,6 +2224,7 @@ where
                         retry_policy: retry_policy.clone(),
                         cron_schedule: cron_schedule.clone(),
                         reuse_policy: *reuse_policy,
+                        priority: priority.clone(),
                     };
                     tokio::spawn(async move {
                         publisher.handle_start_child_workflow(spec).await;

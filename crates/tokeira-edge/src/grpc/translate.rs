@@ -35,8 +35,9 @@ use tokeira_kernel::{
         CallbackSpec as KernelCallbackSpec, CallbackState as KernelCallbackState,
         CallbackTrigger as KernelCallbackTrigger, CompletionCallback as KernelCompletionCallback,
         ContinueAsNewVersioningBehavior, Link as KernelLink,
-        LinkWorkflowEventReference as KernelLinkWorkflowEventReference, VersioningBehavior,
-        VersioningOverride as KernelVersioningOverride, WorkerDeploymentVersionRef,
+        LinkWorkflowEventReference as KernelLinkWorkflowEventReference, Priority as KernelPriority,
+        VersioningBehavior, VersioningOverride as KernelVersioningOverride,
+        WorkerDeploymentVersionRef,
     },
 };
 use tokeira_proto::{
@@ -99,7 +100,8 @@ use crate::translate::{
     ListWorkflowExecutionsRequest, ListWorkflowExecutionsResponse, MultiOperationFailure,
     NamespaceDescription, NamespaceStateUpdate, OnConflictOptions as EdgeOnConflictOptions,
     PollWorkflowTaskQueueRequest, PollWorkflowTaskQueueResponse, Priority as EdgePriority,
-    ProtocolMessageDto, QueryResultDto, RegisterNamespaceRequest as EdgeRegisterNamespaceRequest,
+    PriorityChange, ProtocolMessageDto, QueryResultDto,
+    RegisterNamespaceRequest as EdgeRegisterNamespaceRequest,
     ResetWorkflowExecutionRequest as EdgeResetWorkflowExecutionRequest,
     ResetWorkflowExecutionResponse as EdgeResetWorkflowExecutionResponse,
     RespondWorkflowTaskCompletedRequest, RespondWorkflowTaskCompletedResponse,
@@ -634,12 +636,50 @@ fn callbacks_to_edge(
     callbacks.iter().map(callback_to_edge).collect()
 }
 
-fn priority_to_edge(priority: Option<&proto_common::Priority>) -> Option<EdgePriority> {
-    priority.map(|priority| EdgePriority {
+fn priority_to_edge(
+    priority: Option<&proto_common::Priority>,
+) -> Result<Option<EdgePriority>, ProtoConversionError> {
+    let Some(priority) = priority else {
+        return Ok(None);
+    };
+    if priority.priority_key < 0 {
+        return Err(ProtoConversionError::InvalidArgument(
+            "priority key can't be negative".to_string(),
+        ));
+    }
+    if priority.fairness_key.len() > 64 {
+        return Err(ProtoConversionError::InvalidArgument(
+            "fairness key length exceeds limit".to_string(),
+        ));
+    }
+    if priority.fairness_weight < 0.0 {
+        return Err(ProtoConversionError::InvalidArgument(
+            "must be greater than zero".to_string(),
+        ));
+    }
+    Ok(Some(EdgePriority {
         priority_key: priority.priority_key,
         fairness_key: priority.fairness_key.clone(),
         fairness_weight: priority.fairness_weight,
-    })
+    }))
+}
+
+fn priority_to_kernel(
+    priority: Option<&proto_common::Priority>,
+) -> Result<Option<KernelPriority>, ProtoConversionError> {
+    Ok(priority_to_edge(priority)?.map(|priority| KernelPriority {
+        priority_key: priority.priority_key,
+        fairness_key: priority.fairness_key,
+        fairness_weight: priority.fairness_weight,
+    }))
+}
+
+fn priority_from_kernel(priority: &KernelPriority) -> proto_common::Priority {
+    proto_common::Priority {
+        priority_key: priority.priority_key,
+        fairness_key: priority.fairness_key.clone(),
+        fairness_weight: priority.fairness_weight,
+    }
 }
 
 fn on_conflict_options_to_edge(
@@ -943,15 +983,12 @@ fn versioning_override_to_edge(
     }
 }
 
-/// Validate + reduce an `UpdateWorkflowExecutionOptions` request to the supported change.
+/// Validate and reduce an `UpdateWorkflowExecutionOptions` field mask.
 ///
-/// tokeira persists exactly one mutable execution option, `versioning_override`. The
-/// `update_mask` selects which options to apply (`mergeWorkflowExecutionOptions`,
-/// `service/history/api/updateworkflowoptions/api.go @ v1.31.0`); we recognize
-/// `versioning_override` and its deprecated `versioning_override.{behavior,deployment}`
-/// sub-paths (which v1.31.0 requires be masked together). An empty mask is a
-/// successful no-op; unsupported named options are rejected rather than silently
-/// dropped (`mergeWorkflowExecutionOptions`, updateworkflowoptions/api.go @ v1.31.0).
+/// Whole Priority replacement and nested field merging mirror
+/// `mergeWorkflowExecutionOptions` (`service/history/api/updateworkflowoptions/api.go
+/// @ v1.31.0`). Nested merging is represented explicitly here and applied only
+/// after the current authoritative run is loaded.
 pub fn update_workflow_execution_options_request_to_edge(
     req: workflowservice::UpdateWorkflowExecutionOptionsRequest,
 ) -> Result<EdgeUpdateWorkflowExecutionOptionsRequest, ProtoConversionError> {
@@ -973,16 +1010,34 @@ pub fn update_workflow_execution_options_request_to_edge(
             workflow_id: execution.workflow_id,
             run_id: (!execution.run_id.is_empty()).then_some(execution.run_id),
             versioning_override: VersioningOverrideChange::Unchanged,
+            priority: PriorityChange::Unchanged,
             identity: req.identity,
         });
     }
     let (mut behavior_masked, mut deployment_masked) = (false, false);
+    let mut versioning_masked = false;
+    let mut whole_priority_masked = false;
+    let mut priority_key_masked = false;
+    let mut fairness_key_masked = false;
+    let mut fairness_weight_masked = false;
     for path in &paths {
         match path.as_str() {
             // The whole field, or both deprecated sub-fields together.
-            "versioning_override" => {}
-            "versioning_override.behavior" => behavior_masked = true,
-            "versioning_override.deployment" => deployment_masked = true,
+            "versioning_override" => versioning_masked = true,
+            "versioning_override.behavior" => {
+                behavior_masked = true;
+                versioning_masked = true;
+            }
+            "versioning_override.deployment" => {
+                deployment_masked = true;
+                versioning_masked = true;
+            }
+            "priority" => whole_priority_masked = true,
+            "priority.priority_key" | "priority.priorityKey" => priority_key_masked = true,
+            "priority.fairness_key" | "priority.fairnessKey" => fairness_key_masked = true,
+            "priority.fairness_weight" | "priority.fairnessWeight" => {
+                fairness_weight_masked = true;
+            }
             other => {
                 return Err(ProtoConversionError::InvalidArgument(format!(
                     "unsupported update_mask path: {other}"
@@ -997,34 +1052,45 @@ pub fn update_workflow_execution_options_request_to_edge(
         ));
     }
 
-    // The mask is guaranteed to touch `versioning_override`, so the change is Set-or-Clear:
-    // a recognized override present in the options is Set; an absent (or unrepresentable)
-    // override clears it (`mergedOpts.GetVersioningOverride() == nil → unset` @ v1.31.0).
     let options = req.workflow_execution_options.unwrap_or_default();
-    if options
-        .versioning_override
-        .as_ref()
-        .is_some_and(|override_| {
-            matches!(
-                override_.r#override.as_ref(),
-                Some(workflow::versioning_override::Override::Pinned(pinned))
-                    if pinned.behavior
-                        == workflow::versioning_override::PinnedOverrideBehavior::Pinned as i32
-                        && pinned.version.is_none()
-            )
-        })
-    {
-        return Ok(EdgeUpdateWorkflowExecutionOptionsRequest {
-            namespace: req.namespace,
-            workflow_id: execution.workflow_id,
-            run_id: (!execution.run_id.is_empty()).then_some(execution.run_id),
-            versioning_override: VersioningOverrideChange::SetImpliedPinned,
-            identity: req.identity,
+    let implied_pinned = versioning_masked
+        && options
+            .versioning_override
+            .as_ref()
+            .is_some_and(|override_| {
+                matches!(
+                    override_.r#override.as_ref(),
+                    Some(workflow::versioning_override::Override::Pinned(pinned))
+                        if pinned.behavior
+                            == workflow::versioning_override::PinnedOverrideBehavior::Pinned as i32
+                            && pinned.version.is_none()
+                )
+            });
+    let versioning_override = if !versioning_masked {
+        VersioningOverrideChange::Unchanged
+    } else if implied_pinned {
+        VersioningOverrideChange::SetImpliedPinned
+    } else {
+        match versioning_override_to_edge(options.versioning_override)? {
+            Some(override_) => VersioningOverrideChange::Set(override_),
+            None => VersioningOverrideChange::Clear,
+        }
+    };
+    let priority = if whole_priority_masked {
+        PriorityChange::Replace(priority_to_edge(options.priority.as_ref())?)
+    } else if priority_key_masked || fairness_key_masked || fairness_weight_masked {
+        let value = priority_to_edge(options.priority.as_ref())?.unwrap_or(EdgePriority {
+            priority_key: 0,
+            fairness_key: String::new(),
+            fairness_weight: 0.0,
         });
-    }
-    let versioning_override = match versioning_override_to_edge(options.versioning_override)? {
-        Some(override_) => VersioningOverrideChange::Set(override_),
-        None => VersioningOverrideChange::Clear,
+        PriorityChange::Patch {
+            priority_key: priority_key_masked.then_some(value.priority_key),
+            fairness_key: fairness_key_masked.then_some(value.fairness_key),
+            fairness_weight: fairness_weight_masked.then_some(value.fairness_weight),
+        }
+    } else {
+        PriorityChange::Unchanged
     };
 
     Ok(EdgeUpdateWorkflowExecutionOptionsRequest {
@@ -1032,6 +1098,7 @@ pub fn update_workflow_execution_options_request_to_edge(
         workflow_id: execution.workflow_id,
         run_id: (!execution.run_id.is_empty()).then_some(execution.run_id),
         versioning_override,
+        priority,
         identity: req.identity,
     })
 }
@@ -1044,6 +1111,11 @@ pub fn update_workflow_execution_options_response_to_proto(
         workflow_execution_options: Some(workflow::WorkflowExecutionOptions {
             versioning_override: resp.versioning_override.map(|override_| {
                 versioning_override_from_edge(&versioning_override_to_kernel(&override_))
+            }),
+            priority: resp.priority.map(|priority| proto_common::Priority {
+                priority_key: priority.priority_key,
+                fairness_key: priority.fairness_key,
+                fairness_weight: priority.fairness_weight,
             }),
             ..Default::default()
         }),
@@ -1196,7 +1268,7 @@ pub fn start_request_to_edge(
         header: req.header.as_ref().map(headers_to_domain),
         versioning_override: versioning_override_to_edge(req.versioning_override)?,
         on_conflict_options: on_conflict_options_to_edge(req.on_conflict_options.as_ref())?,
-        priority: priority_to_edge(req.priority.as_ref()),
+        priority: priority_to_edge(req.priority.as_ref())?,
         cron_schedule,
         run_key: None,
         run_id: None,
@@ -1308,6 +1380,10 @@ pub fn poll_request_to_edge(
     Ok(PollWorkflowTaskQueueRequest {
         namespace: req.namespace,
         task_queue: task_queue.name.clone(),
+        normal_task_queue: (enums::TaskQueueKind::try_from(task_queue.kind).ok()
+            == Some(enums::TaskQueueKind::Sticky))
+        .then(|| task_queue.normal_name.clone())
+        .filter(|name| !name.is_empty()),
         worker_identity: req.identity,
         worker_instance_key: req.worker_instance_key,
         deployment,
@@ -2310,14 +2386,15 @@ fn compute_config_summary_from_edge(config: &ComputeConfig) -> compute_proto::Co
 fn version_task_queue_from_edge(
     view: &tokeira_runtime::VersionTaskQueueView,
 ) -> workflowservice::describe_worker_deployment_version_response::VersionTaskQueue {
-    // Tokeira's delivery backlog currently has one priority band. v1.31.0's
-    // backlog manager exposes that band under DefaultPriorityKey = 3 even when
-    // its count is zero (`service/matching/{config,backlog_manager}.go @
-    // v1.31.0`). Mirror the aggregate into that key until multi-band scheduling
-    // is implemented; do not fabricate additional priority keys.
     let stats_by_priority_key = view
-        .stats
-        .map(|stats| BTreeMap::from([(3, broker_backlog_stats_to_proto(stats))]))
+        .stats_by_priority_key
+        .as_ref()
+        .map(|stats| {
+            stats
+                .iter()
+                .map(|(priority_key, stats)| (*priority_key, broker_backlog_stats_to_proto(*stats)))
+                .collect()
+        })
         .unwrap_or_default();
     workflowservice::describe_worker_deployment_version_response::VersionTaskQueue {
         name: view.task_queue.name.clone(),
@@ -4166,6 +4243,8 @@ pub fn describe_task_queue_request_to_edge(
         namespace: req.namespace,
         task_queue: task_queue.name.clone(),
         task_kind,
+        sticky: enums::TaskQueueKind::try_from(task_queue.kind).ok()
+            == Some(enums::TaskQueueKind::Sticky),
         include_status: req.include_task_queue_status,
         report_stats: req.report_stats,
         enhanced: req.api_mode == enums::DescribeTaskQueueMode::Enhanced as i32,
@@ -4247,13 +4326,11 @@ pub fn describe_task_queue_response_to_proto(
     let versioning_info = resp
         .versioning_info
         .map(task_queue_versioning_info_to_proto);
-    // v1.31.0 always returns the actively-used default backlog band at key 3
-    // when stats are requested. Tokeira currently supports exactly that single
-    // band, so its aggregate and per-priority views are identical.
     let stats_by_priority_key = resp
-        .stats
-        .map(|stats| BTreeMap::from([(3, task_queue_stats_to_proto(stats))]))
-        .unwrap_or_default();
+        .stats_by_priority_key
+        .into_iter()
+        .map(|(priority_key, stats)| (priority_key, task_queue_stats_to_proto(stats)))
+        .collect();
     let stats = resp.stats.map(task_queue_stats_to_proto);
     let mut versions_info = std::collections::BTreeMap::new();
     if resp.workflow_stats.is_some() || resp.activity_stats.is_some() {
@@ -4642,7 +4719,7 @@ pub fn signal_with_start_request_to_edge(
         user_metadata: user_metadata_to_edge(req.user_metadata.as_ref()),
         links: links_to_edge(&req.links)?,
         versioning_override: versioning_override_to_edge(req.versioning_override)?,
-        priority: priority_to_edge(req.priority.as_ref()),
+        priority: priority_to_edge(req.priority.as_ref())?,
         cron_schedule,
         signal_name: req.signal_name,
         signal_input: req
@@ -4770,6 +4847,7 @@ pub fn proto_command_to_workflow_command(
                     attrs.start_to_close_timeout.as_ref(),
                 ),
                 heartbeat_timeout: activity_timeout_to_time(attrs.heartbeat_timeout.as_ref()),
+                priority: priority_to_kernel(attrs.priority.as_ref())?,
             })
         }
         Some(Attributes::StartTimerCommandAttributes(attrs)) => {
@@ -4967,6 +5045,7 @@ pub fn proto_command_to_workflow_command(
                 cron_schedule: non_empty(attrs.cron_schedule),
                 parent_close_policy: parent_close_policy_to_domain(attrs.parent_close_policy),
                 reuse_policy: extract_reuse_policy(attrs.workflow_id_reuse_policy),
+                priority: priority_to_kernel(attrs.priority.as_ref())?,
             })
         }
         Some(Attributes::SignalExternalWorkflowExecutionCommandAttributes(attrs)) => {
@@ -5107,6 +5186,7 @@ pub fn workflow_command_to_proto(
             schedule_to_start_timeout,
             start_to_close_timeout,
             heartbeat_timeout,
+            priority,
             ..
         } => Some(Attributes::ScheduleActivityTaskCommandAttributes(
             command::ScheduleActivityTaskCommandAttributes {
@@ -5125,6 +5205,7 @@ pub fn workflow_command_to_proto(
                 start_to_close_timeout: start_to_close_timeout.map(to_proto_duration),
                 heartbeat_timeout: heartbeat_timeout.map(to_proto_duration),
                 retry_policy: retry_policy.as_ref().map(retry_policy_from_domain),
+                priority: priority.as_ref().map(priority_from_kernel),
                 ..Default::default()
             },
         )),
@@ -5270,6 +5351,7 @@ pub fn workflow_command_to_proto(
             cron_schedule,
             parent_close_policy,
             reuse_policy: _,
+            priority,
         } => Some(Attributes::StartChildWorkflowExecutionCommandAttributes(
             command::StartChildWorkflowExecutionCommandAttributes {
                 namespace: namespace
@@ -5292,6 +5374,7 @@ pub fn workflow_command_to_proto(
                 retry_policy: retry_policy.as_ref().map(retry_policy_from_domain),
                 cron_schedule: cron_schedule.clone().unwrap_or_default(),
                 parent_close_policy: parent_close_policy_from_domain(*parent_close_policy),
+                priority: priority.as_ref().map(priority_from_kernel),
                 ..Default::default()
             },
         )),
@@ -5451,6 +5534,14 @@ fn workflow_execution_info_from_description(
             .as_ref()
             .map(workflow_versioning_info_from_edge),
         worker_deployment_name: value.worker_deployment_name.clone().unwrap_or_default(),
+        priority: value
+            .priority
+            .as_ref()
+            .map(|priority| proto_common::Priority {
+                priority_key: priority.priority_key,
+                fairness_key: priority.fairness_key.clone(),
+                fairness_weight: priority.fairness_weight,
+            }),
         // External-payload statistics accumulated over the run's history
         // (describeworkflow/api.go:166 @ v1.31.0).
         external_payload_count: value.external_payload_count,
@@ -5998,15 +6089,16 @@ pub fn record_activity_heartbeat_by_id_to_proto(
 
 pub(crate) fn activity_options_to_edge(
     value: &activity_proto::ActivityOptions,
-) -> crate::translate::ActivityOptions {
-    crate::translate::ActivityOptions {
+) -> Result<crate::translate::ActivityOptions, ProtoConversionError> {
+    Ok(crate::translate::ActivityOptions {
         task_queue: value.task_queue.as_ref().map(|queue| queue.name.clone()),
         schedule_to_close_timeout: proto_duration_to_time(value.schedule_to_close_timeout.as_ref()),
         schedule_to_start_timeout: proto_duration_to_time(value.schedule_to_start_timeout.as_ref()),
         start_to_close_timeout: proto_duration_to_time(value.start_to_close_timeout.as_ref()),
         heartbeat_timeout: proto_duration_to_time(value.heartbeat_timeout.as_ref()),
         retry_policy: value.retry_policy.as_ref().map(retry_policy_to_domain),
-    }
+        priority: priority_to_edge(value.priority.as_ref())?,
+    })
 }
 
 fn activity_options_to_proto(
@@ -6023,7 +6115,14 @@ fn activity_options_to_proto(
         start_to_close_timeout: value.start_to_close_timeout.map(to_proto_duration),
         heartbeat_timeout: value.heartbeat_timeout.map(to_proto_duration),
         retry_policy: value.retry_policy.as_ref().map(retry_policy_from_domain),
-        priority: None,
+        priority: value
+            .priority
+            .as_ref()
+            .map(|priority| proto_common::Priority {
+                priority_key: priority.priority_key,
+                fairness_key: priority.fairness_key.clone(),
+                fairness_weight: priority.fairness_weight,
+            }),
     }
 }
 
@@ -6041,12 +6140,17 @@ pub fn update_activity_options_to_edge(
         Activity::Type(activity_type) => crate::translate::ActivityTarget::Type(activity_type),
         Activity::MatchAll(_) => crate::translate::ActivityTarget::MatchAll,
     };
+    let activity_options = req
+        .activity_options
+        .as_ref()
+        .map(activity_options_to_edge)
+        .transpose()?;
     Ok(crate::translate::UpdateActivityOptionsRequest {
         namespace: req.namespace,
         workflow_id: execution.workflow_id,
         run_id: non_empty(execution.run_id),
         identity: req.identity,
-        activity_options: req.activity_options.as_ref().map(activity_options_to_edge),
+        activity_options,
         update_mask: req.update_mask.map(|mask| mask.paths).unwrap_or_default(),
         target,
         restore_original: req.restore_original,
@@ -6924,6 +7028,13 @@ mod tests {
                 approximate_backlog_count: 7,
                 approximate_backlog_age: std::time::Duration::from_secs(2),
             }),
+            stats_by_priority_key: BTreeMap::from([(
+                3,
+                crate::translate::TaskQueueStatsDto {
+                    approximate_backlog_count: 7,
+                    approximate_backlog_age: std::time::Duration::from_secs(2),
+                },
+            )]),
             workflow_stats: None,
             activity_stats: None,
         });
@@ -7169,11 +7280,9 @@ mod tests {
         );
     }
 
-    /// api-conformance-workflow-options: the `update_mask` is validated + reduced to the
-    /// supported `versioning_override` change (Property 1 / 3). An empty mask is a no-op;
-    /// an unsupported option (`priority`), a half-masked deprecated sub-field, and a missing
-    /// execution reject; a masked Pinned override is `Set`, and a masked-but-absent override
-    /// is `Clear`.
+    /// api-conformance-workflow-options: the `update_mask` is validated and reduced to
+    /// independent versioning and Priority changes. An empty mask is a no-op; a
+    /// half-masked deprecated versioning sub-field and a missing execution reject.
     #[test]
     fn update_workflow_execution_options_request_validation() {
         use tokeira_proto::public::temporal::api::{
@@ -7198,7 +7307,7 @@ mod tests {
             }
         }
 
-        // Missing execution, unsupported option, and half-masked sub-field → reject.
+        // Missing execution and a half-masked deprecated sub-field reject.
         assert!(
             update_workflow_execution_options_request_to_edge(req(
                 None,
@@ -7224,10 +7333,51 @@ mod tests {
             no_op.versioning_override,
             VersioningOverrideChange::Unchanged
         ));
-        assert!(
+        let priority_clear =
             update_workflow_execution_options_request_to_edge(req(None, &["priority"], "w"))
-                .is_err(),
-            "an unsupported option field is rejected"
+                .expect("whole Priority may be cleared");
+        assert_eq!(priority_clear.priority, PriorityChange::Replace(None));
+        let priority_set = update_workflow_execution_options_request_to_edge(req(
+            Some(workflow::WorkflowExecutionOptions {
+                priority: Some(common::Priority {
+                    priority_key: 1,
+                    fairness_key: "tenant".to_string(),
+                    fairness_weight: 2.0,
+                }),
+                ..Default::default()
+            }),
+            &["priority"],
+            "w",
+        ))
+        .expect("whole Priority may be replaced");
+        assert_eq!(
+            priority_set.priority,
+            PriorityChange::Replace(Some(EdgePriority {
+                priority_key: 1,
+                fairness_key: "tenant".to_string(),
+                fairness_weight: 2.0,
+            }))
+        );
+        let nested = update_workflow_execution_options_request_to_edge(req(
+            Some(workflow::WorkflowExecutionOptions {
+                priority: Some(common::Priority {
+                    priority_key: 2,
+                    fairness_key: "ignored".to_string(),
+                    fairness_weight: 4.0,
+                }),
+                ..Default::default()
+            }),
+            &["priority.priority_key", "priority.fairness_weight"],
+            "w",
+        ))
+        .expect("Priority sub-fields merge independently");
+        assert_eq!(
+            nested.priority,
+            PriorityChange::Patch {
+                priority_key: Some(2),
+                fairness_key: None,
+                fairness_weight: Some(4.0),
+            }
         );
         assert!(
             update_workflow_execution_options_request_to_edge(req(
@@ -7276,6 +7426,7 @@ mod tests {
         let proto = update_workflow_execution_options_response_to_proto(
             EdgeUpdateWorkflowExecutionOptionsResponse {
                 versioning_override: Some(VersioningOverride::AutoUpgrade),
+                priority: None,
             },
         );
         assert!(
@@ -8706,6 +8857,7 @@ mod tests {
             original_start_time: OffsetDateTime::UNIX_EPOCH,
             versioning_info: case.versioning_info.clone(),
             worker_deployment_name: case.worker_deployment_name.clone(),
+            priority: None,
             auto_reset_points: Vec::new(),
             most_recent_worker_version_stamp: None,
             request_id_infos: std::collections::BTreeMap::new(),

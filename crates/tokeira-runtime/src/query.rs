@@ -339,6 +339,7 @@ mod tests {
             match worker_runtime
                 .poll_workflow_activation(
                     queue,
+                    None,
                     WorkerIdentity("w".into()),
                     std::time::Duration::from_millis(100),
                 )
@@ -394,6 +395,7 @@ mod tests {
             broker
                 .poll_workflow_activation(
                     &q,
+                    None,
                     &WorkerIdentity("w".into()),
                     std::time::Duration::ZERO,
                 )
@@ -407,6 +409,7 @@ mod tests {
             let activation = b1
                 .poll_workflow_activation(
                     &q1,
+                    None,
                     &WorkerIdentity("w".into()),
                     std::time::Duration::from_millis(50),
                 )

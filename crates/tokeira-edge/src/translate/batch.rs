@@ -186,11 +186,35 @@ pub fn start_batch_request_to_edge(
                     tokeira_kernel::VersioningOverrideChange::SetImpliedPinned
                 }
             };
+            let priority = match update.priority {
+                crate::translate::PriorityChange::Unchanged => {
+                    tokeira_runtime::BatchPriorityChange::Unchanged
+                }
+                crate::translate::PriorityChange::Replace(priority) => {
+                    tokeira_runtime::BatchPriorityChange::Replace(priority.map(|priority| {
+                        tokeira_kernel::Priority {
+                            priority_key: priority.priority_key,
+                            fairness_key: priority.fairness_key,
+                            fairness_weight: priority.fairness_weight,
+                        }
+                    }))
+                }
+                crate::translate::PriorityChange::Patch {
+                    priority_key,
+                    fairness_key,
+                    fairness_weight,
+                } => tokeira_runtime::BatchPriorityChange::Patch {
+                    priority_key,
+                    fairness_key,
+                    fairness_weight,
+                },
+            };
             (
                 BatchOperationType::UpdateWorkflowExecutionOptions,
                 BatchOperationParams::UpdateWorkflowExecutionOptions {
                     identity: op.identity,
                     versioning_override,
+                    priority,
                 },
             )
         }
@@ -255,7 +279,9 @@ pub fn start_batch_request_to_edge(
             let options = op
                 .activity_options
                 .as_ref()
-                .map(crate::grpc::translate::activity_options_to_edge);
+                .map(crate::grpc::translate::activity_options_to_edge)
+                .transpose()
+                .map_err(|error| BatchTranslateError::InvalidArgument(error.to_string()))?;
             let update_mask = op.update_mask.map(|mask| mask.paths).unwrap_or_default();
             let patch = crate::workflow_service::build_activity_options_patch(
                 target,

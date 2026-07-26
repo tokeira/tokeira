@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 use tokeira_kernel::{
     ActivityOp, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, RequestIdInfo, TimerOp,
     Transition, WorkflowState,
-    state::{VersioningBehavior, VersioningOverride},
+    state::{Priority, VersioningBehavior, VersioningOverride},
 };
 use tokeira_types::{
     ArchetypeId, BuildId as RuntimeBuildId, DeploymentId, EventPrincipal, ExecutionRef,
@@ -807,9 +807,17 @@ pub trait RunRepository: Send + Sync {
     /// backlog for later retry.
     async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()>;
 
-    /// Remove and return up to `limit` backlog entries
-    /// for the given queue (FIFO order).
+    /// Remove and return up to `limit` backlog entries for the given queue in
+    /// ascending [`DeliveryOrder`].
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>>;
+
+    /// Snapshot durable backlog counts and oldest schedule time by priority band.
+    async fn backlog_stats_by_priority(
+        &self,
+        _queue: &QueueKey,
+    ) -> Result<BTreeMap<i16, BacklogBandStats>> {
+        Ok(BTreeMap::new())
+    }
 
     /// Return timers whose `fire_at` is at or before
     /// `now`, up to `limit`.
@@ -893,7 +901,7 @@ pub trait RunRepository: Send + Sync {
 
 /// A workflow task that is ready for dispatch to a
 /// worker. Produced by [`RunRepository::list_dispatchable_workflow_tasks`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DispatchableWorkflowTask {
     /// Durable storage key for the owning run.
     pub run_key: RunKey,
@@ -910,6 +918,26 @@ pub struct DispatchableWorkflowTask {
     ///
     /// This derives from `PendingWorkflowTask`, not from the run's affinity.
     pub sticky_deadline: Option<OffsetDateTime>,
+    /// Workflow Priority metadata used by runtime delivery policy.
+    pub priority: Option<Priority>,
+    /// Runtime-assigned delivery order, preserved across durable backlog parking.
+    ///
+    /// `None` means this is a fresh or recovery-derived publication and the
+    /// receiving broker must assign an order.
+    pub order: Option<DeliveryOrder>,
+}
+
+impl PartialEq for DispatchableWorkflowTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.run_key == other.run_key
+            && self.queue == other.queue
+            && self.logical_seq == other.logical_seq
+            && self.sticky_preferred == other.sticky_preferred
+            && self.normal_queue == other.normal_queue
+            && self.sticky_deadline == other.sticky_deadline
+            && self.priority == other.priority
+        // Delivery order is disposable queue policy, not logical task identity.
+    }
 }
 
 /// Derive one workflow-task delivery envelope from committed run state.
@@ -960,12 +988,14 @@ pub(crate) fn dispatchable_workflow_task(
         sticky_preferred,
         normal_queue: fallback,
         sticky_deadline,
+        priority: state.priority.clone(),
+        order: None,
     })
 }
 
 /// An activity task that is ready for dispatch to a
 /// worker. Produced by [`RunRepository::list_dispatchable_activity_tasks`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DispatchableActivityTask {
     /// Durable storage key for the owning run.
     pub run_key: RunKey,
@@ -991,6 +1021,25 @@ pub struct DispatchableActivityTask {
     /// activity stamp, fencing an offer that a later pause/unpause/reset/options
     /// update has superseded.
     pub stamp: u64,
+    /// Effective Priority after field-wise workflow/activity inheritance.
+    pub priority: Option<Priority>,
+    /// Runtime-assigned delivery order, preserved across durable backlog parking.
+    pub order: Option<DeliveryOrder>,
+}
+
+impl PartialEq for DispatchableActivityTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.run_key == other.run_key
+            && self.queue == other.queue
+            && self.activity_id == other.activity_id
+            && self.input == other.input
+            && self.schedule_event_id == other.schedule_event_id
+            && self.attempt == other.attempt
+            && self.dispatch_revision == other.dispatch_revision
+            && self.stamp == other.stamp
+            && self.priority == other.priority
+        // Delivery order is disposable queue policy, not logical task identity.
+    }
 }
 
 /// Durable payload stored for one backlog task.
@@ -1027,6 +1076,30 @@ pub enum BacklogPayload {
     },
 }
 
+/// Reconstructible ordering assigned to one dispatch before it enters a broker.
+///
+/// This value is delivery policy, not workflow authority. Storage preserves and
+/// indexes it but never chooses a priority band or advances a fairness frontier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DeliveryOrder {
+    /// Effective priority band, where a lower value is served first.
+    pub priority_key: i16,
+    /// Weighted-fair scheduling pass within the priority band.
+    pub fair_pass: i64,
+    /// Stable FIFO tie assigned by the queue-home runtime.
+    pub insertion_tie: u64,
+}
+
+impl Default for DeliveryOrder {
+    fn default() -> Self {
+        Self {
+            priority_key: 3,
+            fair_pass: 0,
+            insertion_tie: 0,
+        }
+    }
+}
+
 /// A single entry in the durable dispatch backlog.
 ///
 /// Tasks land here when no worker is immediately
@@ -1040,10 +1113,21 @@ pub struct BacklogEntry {
     pub queue: QueueKey,
     /// Serialized task payload.
     pub payload: BacklogPayload,
+    /// Effective task priority retained across broker demotion and rehydration.
+    pub priority: Option<Priority>,
     /// Original broker publish time used for backlog age.
     pub scheduled_at: OffsetDateTime,
-    /// Monotonic insertion order within the backlog.
-    pub insertion_seq: u64,
+    /// Runtime-assigned delivery ordering retained by storage without reinterpretation.
+    pub order: DeliveryOrder,
+}
+
+/// Durable backlog observation for one effective priority band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BacklogBandStats {
+    /// Number of rows in the band.
+    pub count: usize,
+    /// Oldest original broker schedule time in the band.
+    pub oldest_scheduled_at: OffsetDateTime,
 }
 
 /// Policy for handling a start-workflow request when
@@ -1945,6 +2029,13 @@ where
 
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
         (**self).drain_backlog(queue, limit).await
+    }
+
+    async fn backlog_stats_by_priority(
+        &self,
+        queue: &QueueKey,
+    ) -> Result<BTreeMap<i16, BacklogBandStats>> {
+        (**self).backlog_stats_by_priority(queue).await
     }
 
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {

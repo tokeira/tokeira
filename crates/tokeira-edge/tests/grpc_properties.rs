@@ -787,6 +787,7 @@ fn arb_poll_request() -> impl Strategy<Value = PollWorkflowTaskQueueRequest> {
             sticky_run: None,
             timeout: Duration::from_secs(60),
             sticky_ttl: Duration::from_secs(30),
+            normal_task_queue: None,
         },
     )
 }
@@ -1012,6 +1013,7 @@ fn arb_description() -> impl Strategy<Value = WorkflowExecutionDescription> {
                     .unwrap_or(OffsetDateTime::UNIX_EPOCH),
                 versioning_info: None,
                 worker_deployment_name: None,
+                priority: None,
                 most_recent_worker_version_stamp: None,
                 request_id_infos: std::collections::BTreeMap::new(),
                 external_payload_count: 0,
@@ -1204,6 +1206,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
+                priority: None,
             }
         ),
         arb_memo().prop_map(WorkflowCommand::UpsertMemo),
@@ -1287,6 +1290,7 @@ fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
                     cron_schedule: None,
                     parent_close_policy: tokeira_kernel::ParentClosePolicy::Terminate,
                     reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+                    priority: None,
                 }
             }),
         (arb_small_string(), arb_payloads(),).prop_map(|(target_workflow_id, input)| {
@@ -1391,6 +1395,7 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
+                    priority: None,
                 }
             },
         )

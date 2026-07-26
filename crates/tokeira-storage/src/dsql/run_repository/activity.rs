@@ -13,6 +13,7 @@ pub(super) type ActivityDispatchRow = (
     i64,
     i64,
     Vec<u8>,
+    Option<Vec<u8>>,
 );
 
 impl DsqlRunRepository {
@@ -33,7 +34,8 @@ impl DsqlRunRepository {
             let build_id = queue.build_id.as_ref().map(|value| value.0.as_str());
             let rows = sqlx::query_as::<_, ActivityDispatchRow>(
                 "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
-                    deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp, input_data
+                    deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
+                    input_data, priority_data
              FROM activity_dispatch
              WHERE queue_namespace = $1
                AND queue_name = $2
@@ -76,7 +78,8 @@ impl DsqlRunRepository {
                 let mut permit = self.director.acquire(DbClass::Read).await?;
                 let rows = sqlx::query_as::<_, ActivityDispatchRow>(
                     "SELECT run_key, activity_id, queue_namespace, queue_name, task_kind,
-                    deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp, input_data
+                    deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp,
+                    input_data, priority_data
              FROM activity_dispatch
              WHERE shard_id = $1
              ORDER BY created_at ASC
@@ -142,6 +145,7 @@ pub(super) fn activity_dispatch_from_row(
         dispatch_revision,
         stamp,
         input_data,
+        priority_data,
     ) = row;
     Ok(DispatchableActivityTask {
         run_key: RunKey(run_key),
@@ -158,6 +162,11 @@ pub(super) fn activity_dispatch_from_row(
         attempt: convert::u32_from_i32(attempt, "activity_dispatch.attempt")?,
         dispatch_revision,
         stamp: u64::try_from(stamp).unwrap_or_default(),
+        priority: priority_data
+            .as_deref()
+            .map(codec::decode_priority)
+            .transpose()?,
+        order: None,
     })
 }
 

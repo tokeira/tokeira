@@ -407,6 +407,7 @@ where
         let update = UpdateExecutionOptionsRequest {
             versioning_override: VersioningOverrideChange::Unchanged,
             completion_callbacks: FieldChange::Unchanged,
+            priority: FieldChange::Unchanged,
             attached_completion_callbacks,
             attached_links,
             attached_request_id,
@@ -1020,6 +1021,7 @@ where
         &self,
         execution: ExecutionRef,
         versioning_override: VersioningOverrideChange,
+        priority: FieldChange<tokeira_kernel::Priority>,
         request: RequestContext,
     ) -> Result<CommitResult> {
         let run_key = self
@@ -1030,6 +1032,7 @@ where
         let update = UpdateExecutionOptionsRequest {
             versioning_override,
             completion_callbacks: FieldChange::Unchanged,
+            priority,
             attached_completion_callbacks: Vec::new(),
             attached_links: Vec::new(),
             attached_request_id: None,
@@ -1171,6 +1174,7 @@ where
                     start_to_close_timeout: request.start_to_close_timeout,
                     heartbeat_timeout: request.heartbeat_timeout,
                     retry_policy: request.retry_policy,
+                    priority: request.priority,
                     original_options,
                     restore_original_options: request.restore_original_options,
                     reschedule_at: reschedule_at.clone(),
@@ -1217,6 +1221,11 @@ where
                     // The options update bumped the activity stamp; the republish
                     // carries the new stamp so any pre-update offer is fenced.
                     stamp: activity.stamp,
+                    priority: merge_priority(
+                        new_state.priority.as_ref(),
+                        activity.priority.as_ref(),
+                    ),
+                    order: None,
                 };
                 let delay = dispatch_at - OffsetDateTime::now_utc();
                 if delay.is_positive() {
@@ -1327,6 +1336,7 @@ where
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
+                priority,
                 ..
             } = &scheduled.kind
             else {
@@ -1341,6 +1351,7 @@ where
                     start_to_close_timeout: *start_to_close_timeout,
                     heartbeat_timeout: *heartbeat_timeout,
                     retry_policy: retry_policy.clone(),
+                    priority: priority.clone(),
                 },
             );
         }

@@ -1023,6 +1023,13 @@ where
                                     start_to_close_timeout: activity.start_to_close_timeout,
                                     heartbeat_timeout: activity.heartbeat_timeout,
                                     retry_policy: activity.retry_policy.clone(),
+                                    priority: activity.priority.as_ref().map(|priority| {
+                                        tokeira_edge::translate::Priority {
+                                            priority_key: priority.priority_key,
+                                            fairness_key: priority.fairness_key.clone(),
+                                            fairness_weight: priority.fairness_weight,
+                                        }
+                                    }),
                                 },
                             },
                         )
@@ -1069,6 +1076,13 @@ where
                     original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
                     versioning_info: state.versioning_info.clone(),
                     worker_deployment_name: state.worker_deployment_name.clone(),
+                    priority: state.priority.as_ref().map(|priority| {
+                        tokeira_edge::translate::Priority {
+                            priority_key: priority.priority_key,
+                            fairness_key: priority.fairness_key.clone(),
+                            fairness_weight: priority.fairness_weight,
+                        }
+                    }),
                     auto_reset_points: state.auto_reset_points.clone(),
                     most_recent_worker_version_stamp: state
                         .versioning_info

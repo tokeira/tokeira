@@ -712,6 +712,7 @@ where
     pub async fn poll_workflow_activation(
         &self,
         queue: QueueKey,
+        normal_queue: Option<QueueKey>,
         worker_identity: WorkerIdentity,
         timeout_after: tokio::time::Duration,
     ) -> Result<Option<WorkflowActivation>> {
@@ -720,7 +721,12 @@ where
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let polled = match self
                 .broker
-                .poll_workflow_activation(&queue, &worker_identity, remaining)
+                .poll_workflow_activation(
+                    &queue,
+                    normal_queue.as_ref(),
+                    &worker_identity,
+                    remaining,
+                )
                 .await?
             {
                 Some(polled) => {

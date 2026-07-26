@@ -847,6 +847,67 @@ pub struct UpdateActivityOptionsRequest {
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
+    /// Raw activity Priority patch selected by the request field mask.
+    #[serde(default)]
+    pub priority: ActivityPriorityPatch,
+}
+
+/// Field-mask intent for raw per-activity Priority.
+///
+/// Nested fields remain unresolved until the kernel applies one atomic
+/// type/all-target transition. This is required because matching activities
+/// may hold different raw Priority values; collapsing the patch at the edge
+/// would merge against only one stale snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum ActivityPriorityPatch {
+    /// No Priority path was selected.
+    #[default]
+    Unchanged,
+    /// Replace the complete Priority; `None` clears it.
+    Replace(Option<Priority>),
+    /// Merge only selected fields into each activity's current raw Priority.
+    Patch {
+        /// Selected priority key value.
+        priority_key: Option<i32>,
+        /// Selected fairness key value.
+        fairness_key: Option<String>,
+        /// Selected fairness weight value.
+        fairness_weight: Option<f32>,
+    },
+}
+
+impl ActivityPriorityPatch {
+    /// Apply the transport field-mask intent to one activity's raw Priority.
+    ///
+    /// A nested update against an absent Priority begins from the proto's
+    /// zero-valued message, matching `mergeActivityOptions`
+    /// (`service/history/api/updateactivityoptions/api.go @ v1.31.0`).
+    pub fn apply_to(&self, priority: &mut Option<Priority>) {
+        match self {
+            Self::Unchanged => {}
+            Self::Replace(replacement) => priority.clone_from(replacement),
+            Self::Patch {
+                priority_key,
+                fairness_key,
+                fairness_weight,
+            } => {
+                let priority = priority.get_or_insert_with(|| Priority {
+                    priority_key: 0,
+                    fairness_key: String::new(),
+                    fairness_weight: 0.0,
+                });
+                if let Some(value) = priority_key {
+                    priority.priority_key = *value;
+                }
+                if let Some(value) = fairness_key {
+                    priority.fairness_key.clone_from(value);
+                }
+                if let Some(value) = fairness_weight {
+                    priority.fairness_weight = *value;
+                }
+            }
+        }
+    }
 }
 
 /// Field-mask patch for one activity retry policy.
@@ -975,6 +1036,9 @@ pub struct ActivityOriginalOptions {
     pub heartbeat_timeout: Option<Duration>,
     /// Original retry policy.
     pub retry_policy: Option<RetryPolicy>,
+    /// Original raw Priority override from the schedule event.
+    #[serde(default)]
+    pub priority: Option<Priority>,
 }
 
 /// Request to pause one or more matching activities. Paused activities are not
@@ -1055,6 +1119,9 @@ pub struct UpdateExecutionOptionsRequest {
     pub request: RequestContext,
     /// Wall-clock time the command was accepted.
     pub now: OffsetDateTime,
+    /// Workflow Priority patch selected by the request field mask.
+    #[serde(default)]
+    pub priority: FieldChange<Priority>,
 }
 
 /// Request from the runtime indicating a worker has picked
@@ -1742,6 +1809,9 @@ pub enum WorkflowCommand {
         schedule_to_start_timeout: Option<Duration>,
         start_to_close_timeout: Option<Duration>,
         heartbeat_timeout: Option<Duration>,
+        /// Raw activity-level Priority override.
+        #[serde(default)]
+        priority: Option<Priority>,
     },
     /// Start a durable timer that fires at the given time.
     StartTimer {
@@ -1831,6 +1901,9 @@ pub enum WorkflowCommand {
         /// the child start (workflow_id_dedup.go:251-262 @ v1.31.0).
         #[serde(default)]
         reuse_policy: WorkflowIdReusePolicy,
+        /// Raw child-level Priority override.
+        #[serde(default)]
+        priority: Option<Priority>,
     },
     /// Send a signal to an external workflow.
     SignalExternalWorkflowExecution {

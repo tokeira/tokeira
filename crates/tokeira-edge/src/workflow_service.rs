@@ -14,7 +14,7 @@
 //! surfaced to workers as `ProtocolMessage` entries on the poll response.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -50,13 +50,14 @@ use tokeira_runtime::{
     QueryResult, RegisterPolledDeployment, ResetWorkflowResult, ScheduleActionResult,
     SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome,
     SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
-    StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigStore, TaskQueueVersioningView,
-    UpdateActivitiesOptionsRequest, UpdateComputeConfig, UpdateLifecycleError,
-    UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
-    ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistrationKey, WorkerRegistry,
-    WorkerVersionMetadata, WorkflowActivation, WorkflowDeletion, WorkflowDeletionNotFound,
-    WorkflowExecution, WorkflowExecutionStatus, compute_matching_times, decide_overlap,
-    nexus_operation_next_attempt_at, schedule_workflow_id, scheduled_workflow_search_attributes,
+    StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigKey, TaskQueueConfigKind,
+    TaskQueueConfigStore, TaskQueueVersioningView, UpdateActivitiesOptionsRequest,
+    UpdateComputeConfig, UpdateLifecycleError, UpdateLifecycleSnapshot, UpdateMetadata,
+    UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView,
+    VersionView, WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata, WorkflowActivation,
+    WorkflowDeletion, WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus,
+    compute_matching_times, decide_overlap, nexus_operation_next_attempt_at, schedule_workflow_id,
+    scheduled_workflow_search_attributes,
 };
 use tokeira_storage::{
     AttributedHistoryEvent, ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType,
@@ -95,8 +96,8 @@ use crate::{
         NamespaceCapabilities, NamespaceDescription, NamespaceStateUpdate, PauseActivityRequest,
         PauseActivityResponse, PauseWorkflowExecutionRequest, PauseWorkflowExecutionResponse,
         PollActivityTaskQueueRequest, PollActivityTaskQueueResponse, PollWorkflowTaskQueueRequest,
-        PollWorkflowTaskQueueResponse, ProtocolMessageDto, QueryResultDto, QueryWorkflowRequest,
-        QueryWorkflowResponse, RecordActivityTaskHeartbeatByIdRequest,
+        PollWorkflowTaskQueueResponse, PriorityChange, ProtocolMessageDto, QueryResultDto,
+        QueryWorkflowRequest, QueryWorkflowResponse, RecordActivityTaskHeartbeatByIdRequest,
         RecordActivityTaskHeartbeatByIdResponse, RecordActivityTaskHeartbeatRequest,
         RecordActivityTaskHeartbeatResponse, RegisterNamespaceRequest,
         RequestCancelWorkflowExecutionRequest, RequestCancelWorkflowExecutionResponse,
@@ -270,6 +271,7 @@ fn build_update_activity_options_command(
         start_to_close_timeout: patch.start_to_close_timeout,
         heartbeat_timeout: patch.heartbeat_timeout,
         retry_policy: patch.retry_policy,
+        priority: patch.priority,
         restore_original_options: patch.restore_original_options,
         request: RequestContext {
             request_id: RequestId(ctx.request_id.as_str().to_string()),
@@ -307,6 +309,7 @@ pub(crate) fn build_activity_options_patch(
             start_to_close_timeout: FieldChange::Unchanged,
             heartbeat_timeout: FieldChange::Unchanged,
             retry_policy: ActivityRetryPolicyPatch::default(),
+            priority: tokeira_kernel::ActivityPriorityPatch::Unchanged,
             restore_original_options: true,
         });
     }
@@ -319,6 +322,17 @@ pub(crate) fn build_activity_options_patch(
         option_field_selected(update_mask, "schedule_to_start_timeout");
     let start_to_close_selected = option_field_selected(update_mask, "start_to_close_timeout");
     let heartbeat_selected = option_field_selected(update_mask, "heartbeat_timeout");
+    let whole_priority_selected = option_field_exact_selected(update_mask, "priority");
+    let priority_key_selected = option_field_selected(update_mask, "priority.priority_key");
+    let fairness_key_selected = option_field_selected(update_mask, "priority.fairness_key");
+    let fairness_weight_selected = option_field_selected(update_mask, "priority.fairness_weight");
+    let nested_priority_selected =
+        priority_key_selected || fairness_key_selected || fairness_weight_selected;
+    if nested_priority_selected && options.priority.is_none() {
+        return Err(EdgeError::BadRequest(
+            "Priority is not provided".to_string(),
+        ));
+    }
 
     let task_queue = if task_queue_selected {
         match options.task_queue.as_ref() {
@@ -334,6 +348,27 @@ pub(crate) fn build_activity_options_patch(
     };
 
     let retry_policy = build_activity_retry_policy_patch(update_mask, options)?;
+    let priority = if whole_priority_selected {
+        tokeira_kernel::ActivityPriorityPatch::Replace(options.priority.as_ref().map(|priority| {
+            tokeira_kernel::Priority {
+                priority_key: priority.priority_key,
+                fairness_key: priority.fairness_key.clone(),
+                fairness_weight: priority.fairness_weight,
+            }
+        }))
+    } else if nested_priority_selected {
+        let priority = options
+            .priority
+            .as_ref()
+            .expect("nested Priority source validated above");
+        tokeira_kernel::ActivityPriorityPatch::Patch {
+            priority_key: priority_key_selected.then_some(priority.priority_key),
+            fairness_key: fairness_key_selected.then(|| priority.fairness_key.clone()),
+            fairness_weight: fairness_weight_selected.then_some(priority.fairness_weight),
+        }
+    } else {
+        tokeira_kernel::ActivityPriorityPatch::Unchanged
+    };
     let patch = BatchActivityOptionsPatch {
         target: activity_control_target(target)?,
         task_queue,
@@ -351,6 +386,7 @@ pub(crate) fn build_activity_options_patch(
         ),
         heartbeat_timeout: optional_duration_change(heartbeat_selected, options.heartbeat_timeout),
         retry_policy,
+        priority,
         restore_original_options: false,
     };
     if matches!(patch.task_queue, FieldChange::Unchanged)
@@ -358,6 +394,10 @@ pub(crate) fn build_activity_options_patch(
         && matches!(patch.schedule_to_start_timeout, FieldChange::Unchanged)
         && matches!(patch.start_to_close_timeout, FieldChange::Unchanged)
         && matches!(patch.heartbeat_timeout, FieldChange::Unchanged)
+        && matches!(
+            patch.priority,
+            tokeira_kernel::ActivityPriorityPatch::Unchanged
+        )
         && patch.retry_policy == ActivityRetryPolicyPatch::default()
     {
         return Err(EdgeError::BadRequest(
@@ -371,7 +411,7 @@ fn build_activity_retry_policy_patch(
     update_mask: &[String],
     options: &crate::translate::ActivityOptions,
 ) -> EdgeResult<ActivityRetryPolicyPatch> {
-    let replacement_selected = option_field_selected(update_mask, "retry_policy");
+    let replacement_selected = option_field_exact_selected(update_mask, "retry_policy");
     let nested_selected = [
         "retry_policy.initial_interval",
         "retry_policy.backoff_coefficient",
@@ -466,6 +506,35 @@ fn option_field_selected(update_mask: &[String], field: &str) -> bool {
     })
 }
 
+fn option_field_exact_selected(update_mask: &[String], field: &str) -> bool {
+    if update_mask.is_empty() {
+        return false;
+    }
+    let camel = field
+        .split('_')
+        .enumerate()
+        .map(|(index, segment)| {
+            if index == 0 {
+                segment.to_string()
+            } else {
+                let mut chars = segment.chars();
+                chars
+                    .next()
+                    .map(|value| value.to_ascii_uppercase())
+                    .into_iter()
+                    .chain(chars)
+                    .collect::<String>()
+            }
+        })
+        .collect::<String>();
+    update_mask.iter().any(|path| {
+        path == field
+            || path == &camel
+            || path == &format!("activity_options.{field}")
+            || path == &format!("activityOptions.{camel}")
+    })
+}
+
 /// Classify a worker-reported Nexus cancellation failure using the same runtime
 /// policy and schedule-to-close cap as External-endpoint delivery. The edge sees
 /// the worker's public `Failure`; the kernel receives only the durable outcome and
@@ -547,9 +616,11 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
     async fn poll_workflow_activation(
         &self,
         queue: tokeira_types::QueueKey,
+        normal_queue: Option<tokeira_types::QueueKey>,
         worker_identity: tokeira_types::WorkerIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<WorkflowActivation>> {
+        let _ = normal_queue;
         self.poll_workflow_task(queue, worker_identity, timeout)
             .await
             .map(|task| task.map(WorkflowActivation::WorkflowTask))
@@ -667,6 +738,27 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         _queue: &tokeira_types::QueueKey,
     ) -> tokeira_runtime::BrokerBacklogStats {
         tokeira_runtime::BrokerBacklogStats::default()
+    }
+
+    /// Snapshot one physical queue's live and durable backlog by priority band.
+    async fn task_queue_backlog_stats_by_priority(
+        &self,
+        queue: &tokeira_types::QueueKey,
+    ) -> tokeira_runtime::PriorityBacklogStats {
+        let aggregate = self.task_queue_backlog_stats(queue).await;
+        if aggregate.count == 0 {
+            std::collections::BTreeMap::new()
+        } else {
+            std::collections::BTreeMap::from([(3, aggregate)])
+        }
+    }
+
+    /// Snapshot a directly addressed sticky workflow queue by priority band.
+    async fn sticky_task_queue_backlog_stats_by_priority(
+        &self,
+        queue: &tokeira_types::QueueKey,
+    ) -> tokeira_runtime::PriorityBacklogStats {
+        self.task_queue_backlog_stats_by_priority(queue).await
     }
 
     /// Absorb already-unversioned ready work into a promoted deployment queue.
@@ -818,9 +910,10 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         &self,
         run_key: RunKey,
         versioning_override: tokeira_kernel::VersioningOverrideChange,
+        priority: FieldChange<tokeira_kernel::Priority>,
         request: RequestContext,
     ) -> Result<WorkflowMutationOutcome> {
-        let _ = (run_key, versioning_override, request);
+        let _ = (run_key, versioning_override, priority, request);
         Err(anyhow!(
             "update_workflow_execution_options is not implemented"
         ))
@@ -2983,11 +3076,13 @@ impl WorkflowService {
         ctx: &BatchDispatchContext,
         workflow_ref: &tokeira_runtime::WorkflowExecutionRef,
         versioning_override: tokeira_kernel::VersioningOverrideChange,
+        priority: tokeira_runtime::BatchPriorityChange,
     ) -> EdgeResult<()> {
         if matches!(
             &versioning_override,
             tokeira_kernel::VersioningOverrideChange::Unchanged
-        ) {
+        ) && matches!(priority, tokeira_runtime::BatchPriorityChange::Unchanged)
+        {
             return Ok(());
         }
         ensure_local(
@@ -3005,6 +3100,7 @@ impl WorkflowService {
                 });
             }
         };
+        let priority = resolve_batch_priority_change(state.priority.as_ref(), priority);
         let pinned = self
             .validate_pinned_override(
                 state.namespace_id,
@@ -3022,6 +3118,7 @@ impl WorkflowService {
             .update_workflow_execution_options(
                 run_key,
                 versioning_override,
+                priority,
                 batch_request_context(ctx),
             )
             .await
@@ -3068,6 +3165,7 @@ impl WorkflowService {
                     start_to_close_timeout: patch.start_to_close_timeout,
                     heartbeat_timeout: patch.heartbeat_timeout,
                     retry_policy: patch.retry_policy,
+                    priority: patch.priority,
                     restore_original_options: patch.restore_original_options,
                     request: batch_request_context(ctx),
                     now,
@@ -4018,6 +4116,7 @@ impl WorkflowService {
                     .runtime
                     .poll_workflow_activation(
                         internal.queue,
+                        internal.normal_queue,
                         internal.worker_identity.clone(),
                         internal.timeout,
                     )
@@ -5052,7 +5151,14 @@ impl WorkflowService {
                 let task_queue = TaskQueueName(req.task_queue.clone());
                 let config = self
                     .task_queue_config_store
-                    .get(&namespace_id, &task_queue)
+                    .get(&TaskQueueConfigKey {
+                        namespace_id,
+                        task_queue,
+                        kind: match req.task_kind {
+                            TaskKind::Workflow => TaskQueueConfigKind::Workflow,
+                            TaskKind::Activity => TaskQueueConfigKind::Activity,
+                        },
+                    })
                     .map(task_queue_config_to_edge)
                     .unwrap_or_default();
 
@@ -5089,9 +5195,20 @@ impl WorkflowService {
                     stats_deployment,
                     stats_build_id,
                 );
-                let (workflow_stats, activity_stats) = if req.report_stats {
-                    let mut workflow = self.runtime.task_queue_backlog_stats(&workflow_queue).await;
-                    let mut activity = self.runtime.task_queue_backlog_stats(&activity_queue).await;
+                let (workflow_stats, activity_stats, stats_by_priority_key) = if req.report_stats {
+                    let mut workflow = if req.sticky {
+                        self.runtime
+                            .sticky_task_queue_backlog_stats_by_priority(&workflow_queue)
+                            .await
+                    } else {
+                        self.runtime
+                            .task_queue_backlog_stats_by_priority(&workflow_queue)
+                            .await
+                    };
+                    let mut activity = self
+                        .runtime
+                        .task_queue_backlog_stats_by_priority(&activity_queue)
+                        .await;
                     // Current and 100%-ramping versions absorb work that was
                     // queued while the family was still unversioned. Matching's
                     // adjusted stats include both physical queues
@@ -5100,7 +5217,7 @@ impl WorkflowService {
                     if stats_version.is_some() {
                         let unversioned_workflow = self
                             .runtime
-                            .task_queue_backlog_stats(&queue_key_for_poll(
+                            .task_queue_backlog_stats_by_priority(&queue_key_for_poll(
                                 &req.namespace,
                                 &req.task_queue,
                                 TaskKind::Workflow,
@@ -5108,12 +5225,10 @@ impl WorkflowService {
                                 None,
                             ))
                             .await;
-                        workflow.count += unversioned_workflow.count;
-                        workflow.oldest_age =
-                            workflow.oldest_age.max(unversioned_workflow.oldest_age);
+                        merge_priority_backlog_stats(&mut workflow, unversioned_workflow);
                         let unversioned_activity = self
                             .runtime
-                            .task_queue_backlog_stats(&queue_key_for_poll(
+                            .task_queue_backlog_stats_by_priority(&queue_key_for_poll(
                                 &req.namespace,
                                 &req.task_queue,
                                 TaskKind::Activity,
@@ -5121,22 +5236,19 @@ impl WorkflowService {
                                 None,
                             ))
                             .await;
-                        activity.count += unversioned_activity.count;
-                        activity.oldest_age =
-                            activity.oldest_age.max(unversioned_activity.oldest_age);
+                        merge_priority_backlog_stats(&mut activity, unversioned_activity);
                     }
+                    let selected = match req.task_kind {
+                        TaskKind::Activity => &activity,
+                        TaskKind::Workflow => &workflow,
+                    };
                     (
-                        Some(crate::translate::TaskQueueStatsDto {
-                            approximate_backlog_count: workflow.count as i64,
-                            approximate_backlog_age: workflow.oldest_age,
-                        }),
-                        Some(crate::translate::TaskQueueStatsDto {
-                            approximate_backlog_count: activity.count as i64,
-                            approximate_backlog_age: activity.oldest_age,
-                        }),
+                        Some(aggregate_priority_backlog_stats(&workflow)),
+                        Some(aggregate_priority_backlog_stats(&activity)),
+                        priority_backlog_stats_to_edge(selected),
                     )
                 } else {
-                    (None, None)
+                    (None, None, BTreeMap::new())
                 };
                 let stats = match req.task_kind {
                     TaskKind::Activity => activity_stats,
@@ -5163,6 +5275,7 @@ impl WorkflowService {
                     config,
                     versioning_info,
                     stats,
+                    stats_by_priority_key,
                     workflow_stats: if req.enhanced { workflow_stats } else { None },
                     activity_stats: if req.enhanced { activity_stats } else { None },
                 })
@@ -5266,6 +5379,7 @@ impl WorkflowService {
 
                 let versioning_override =
                     resolve_versioning_override_change(&req.versioning_override);
+                let priority = resolve_priority_change(state.priority.as_ref(), &req.priority);
                 let pinned = self
                     .validate_pinned_override(
                         state.namespace_id,
@@ -5283,11 +5397,13 @@ impl WorkflowService {
                 if matches!(
                     versioning_override,
                     tokeira_kernel::VersioningOverrideChange::Unchanged
-                ) {
+                ) && matches!(priority, FieldChange::Unchanged)
+                {
                     return Ok(UpdateWorkflowExecutionOptionsResponse {
                         versioning_override: state
                             .versioning_override()
                             .map(kernel_versioning_override_to_edge),
+                        priority: state.priority.as_ref().map(kernel_priority_to_edge),
                     });
                 }
                 let request = RequestContext {
@@ -5298,7 +5414,12 @@ impl WorkflowService {
                 };
 
                 self.runtime
-                    .update_workflow_execution_options(run_key, versioning_override, request)
+                    .update_workflow_execution_options(
+                        run_key,
+                        versioning_override,
+                        priority,
+                        request,
+                    )
                     .await
                     .map_err(EdgeError::from)?;
                 let post_state = match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
@@ -5323,6 +5444,7 @@ impl WorkflowService {
                     versioning_override: post_state
                         .versioning_override()
                         .map(kernel_versioning_override_to_edge),
+                    priority: post_state.priority.as_ref().map(kernel_priority_to_edge),
                 })
             },
         )
@@ -5846,13 +5968,11 @@ impl WorkflowService {
                         .absorb_unversioned_backlog(&internal.queue)
                         .await;
                 }
-                let configured_rate = self
-                    .task_queue_config_store
-                    .get(&internal.queue.namespace_id, &internal.queue.task_queue)
-                    .and_then(|config| config.queue_rate_limit)
-                    .map(f64::from);
-                let effective_rate = configured_rate.or(internal.worker_rate_limit);
-                if let Some(rate) = effective_rate
+                // Worker-advertised capacity is a poller-side ceiling. The
+                // UpdateTaskQueueConfig queue/per-key limits are enforced by
+                // the broker at candidate handout so they can observe the
+                // candidate fairness key and react live to config changes.
+                if let Some(rate) = internal.worker_rate_limit
                     && !self
                         .task_queue_rate_limiter
                         .acquire(
@@ -7481,6 +7601,14 @@ impl WorkflowService {
             start_to_close_timeout: activity.start_to_close_timeout,
             heartbeat_timeout: activity.heartbeat_timeout,
             retry_policy: activity.retry_policy.clone(),
+            priority: activity
+                .priority
+                .as_ref()
+                .map(|priority| crate::translate::Priority {
+                    priority_key: priority.priority_key,
+                    fairness_key: priority.fairness_key.clone(),
+                    fairness_weight: priority.fairness_weight,
+                }),
         })
     }
 
@@ -7980,6 +8108,90 @@ fn resolve_versioning_override_change(
     }
 }
 
+fn resolve_priority_change(
+    current: Option<&tokeira_kernel::Priority>,
+    change: &PriorityChange,
+) -> FieldChange<tokeira_kernel::Priority> {
+    match change {
+        PriorityChange::Unchanged => FieldChange::Unchanged,
+        PriorityChange::Replace(Some(priority)) => FieldChange::Set(tokeira_kernel::Priority {
+            priority_key: priority.priority_key,
+            fairness_key: priority.fairness_key.clone(),
+            fairness_weight: priority.fairness_weight,
+        }),
+        PriorityChange::Replace(None) => FieldChange::Clear,
+        PriorityChange::Patch {
+            priority_key,
+            fairness_key,
+            fairness_weight,
+        } => {
+            let mut merged = current.cloned().unwrap_or_else(empty_kernel_priority);
+            if let Some(priority_key) = priority_key {
+                merged.priority_key = *priority_key;
+            }
+            if let Some(fairness_key) = fairness_key {
+                merged.fairness_key = fairness_key.clone();
+            }
+            if let Some(fairness_weight) = fairness_weight {
+                merged.fairness_weight = *fairness_weight;
+            }
+            if current == Some(&merged) {
+                FieldChange::Unchanged
+            } else {
+                FieldChange::Set(merged)
+            }
+        }
+    }
+}
+
+fn resolve_batch_priority_change(
+    current: Option<&tokeira_kernel::Priority>,
+    change: tokeira_runtime::BatchPriorityChange,
+) -> FieldChange<tokeira_kernel::Priority> {
+    match change {
+        tokeira_runtime::BatchPriorityChange::Unchanged => FieldChange::Unchanged,
+        tokeira_runtime::BatchPriorityChange::Replace(Some(priority)) => FieldChange::Set(priority),
+        tokeira_runtime::BatchPriorityChange::Replace(None) => FieldChange::Clear,
+        tokeira_runtime::BatchPriorityChange::Patch {
+            priority_key,
+            fairness_key,
+            fairness_weight,
+        } => {
+            let mut merged = current.cloned().unwrap_or_else(empty_kernel_priority);
+            if let Some(priority_key) = priority_key {
+                merged.priority_key = priority_key;
+            }
+            if let Some(fairness_key) = fairness_key {
+                merged.fairness_key = fairness_key;
+            }
+            if let Some(fairness_weight) = fairness_weight {
+                merged.fairness_weight = fairness_weight;
+            }
+            if current == Some(&merged) {
+                FieldChange::Unchanged
+            } else {
+                FieldChange::Set(merged)
+            }
+        }
+    }
+}
+
+fn empty_kernel_priority() -> tokeira_kernel::Priority {
+    tokeira_kernel::Priority {
+        priority_key: 0,
+        fairness_key: String::new(),
+        fairness_weight: 0.0,
+    }
+}
+
+fn kernel_priority_to_edge(priority: &tokeira_kernel::Priority) -> crate::translate::Priority {
+    crate::translate::Priority {
+        priority_key: priority.priority_key,
+        fairness_key: priority.fairness_key.clone(),
+        fairness_weight: priority.fairness_weight,
+    }
+}
+
 fn kernel_versioning_override_to_edge(
     override_: &tokeira_kernel::VersioningOverride,
 ) -> VersioningOverride {
@@ -8246,7 +8458,56 @@ fn active_poller_to_edge(poller: ActivePoller) -> crate::translate::PollerInfo {
     }
 }
 
-fn task_queue_config_to_edge(entry: TaskQueueConfigEntry) -> TaskQueueConfig {
+fn merge_priority_backlog_stats(
+    target: &mut tokeira_runtime::PriorityBacklogStats,
+    source: tokeira_runtime::PriorityBacklogStats,
+) {
+    for (priority_key, band) in source {
+        target
+            .entry(priority_key)
+            .and_modify(|current| {
+                current.count += band.count;
+                current.oldest_age = current.oldest_age.max(band.oldest_age);
+            })
+            .or_insert(band);
+    }
+}
+
+fn aggregate_priority_backlog_stats(
+    stats: &tokeira_runtime::PriorityBacklogStats,
+) -> crate::translate::TaskQueueStatsDto {
+    let aggregate = stats.values().fold(
+        tokeira_runtime::BrokerBacklogStats::default(),
+        |mut aggregate, band| {
+            aggregate.count += band.count;
+            aggregate.oldest_age = aggregate.oldest_age.max(band.oldest_age);
+            aggregate
+        },
+    );
+    crate::translate::TaskQueueStatsDto {
+        approximate_backlog_count: aggregate.count as i64,
+        approximate_backlog_age: aggregate.oldest_age,
+    }
+}
+
+fn priority_backlog_stats_to_edge(
+    stats: &tokeira_runtime::PriorityBacklogStats,
+) -> BTreeMap<i32, crate::translate::TaskQueueStatsDto> {
+    stats
+        .iter()
+        .map(|(priority_key, band)| {
+            (
+                *priority_key,
+                crate::translate::TaskQueueStatsDto {
+                    approximate_backlog_count: band.count as i64,
+                    approximate_backlog_age: band.oldest_age,
+                },
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn task_queue_config_to_edge(entry: TaskQueueConfigEntry) -> TaskQueueConfig {
     TaskQueueConfig {
         queue_rate_limit: entry.queue_rate_limit,
         queue_rate_limit_metadata: entry
@@ -8264,16 +8525,6 @@ pub(crate) fn task_queue_config_metadata_to_edge(
     metadata: tokeira_runtime::TaskQueueConfigMetadata,
 ) -> crate::translate::TaskQueueConfigMetadata {
     crate::translate::TaskQueueConfigMetadata {
-        reason: metadata.reason,
-        update_identity: metadata.update_identity,
-        update_time: metadata.update_time,
-    }
-}
-
-pub(crate) fn task_queue_config_metadata_to_runtime(
-    metadata: crate::translate::TaskQueueConfigMetadata,
-) -> tokeira_runtime::TaskQueueConfigMetadata {
-    tokeira_runtime::TaskQueueConfigMetadata {
         reason: metadata.reason,
         update_identity: metadata.update_identity,
         update_time: metadata.update_time,
@@ -8347,7 +8598,9 @@ mod tests {
     use proptest::prelude::*;
     use time::{Duration, OffsetDateTime};
     use tokeira_compatibility::FeatureState;
-    use tokeira_kernel::{FieldChange, ParentClosePolicy, StartRequest, WorkflowCommand};
+    use tokeira_kernel::{
+        ActivityPriorityPatch, FieldChange, ParentClosePolicy, StartRequest, WorkflowCommand,
+    };
     use tokeira_runtime::{
         BacklogConfig, InMemoryBroker, LaneConfig, TimerScannerConfig, TokeiraRuntime,
         UpdateLifecycleStage, UpdateWaitPolicy, WorkerRegistrationKey,
@@ -8371,7 +8624,7 @@ mod tests {
         routing::LocalOnlyRouter,
         to_internal::namespace_id_for,
         translate::{
-            ActivityOptions, SignalWorkflowExecutionRequest, SystemCapabilities,
+            ActivityOptions, Priority, SignalWorkflowExecutionRequest, SystemCapabilities,
             UpdateActivityOptionsRequest, UpdateWaitPolicyDto, UpdateWorkflowExecutionRequest,
         },
     };
@@ -8515,6 +8768,7 @@ mod tests {
             cron_schedule: None,
             parent_close_policy: ParentClosePolicy::Terminate,
             reuse_policy: Default::default(),
+            priority: None,
         };
         let local_cancel = WorkflowCommand::RequestCancelExternalWorkflowExecution {
             target_namespace_id: NamespaceId::new(),
@@ -8615,6 +8869,7 @@ mod tests {
                         schedule_to_start_timeout: None,
                         start_to_close_timeout: None,
                         heartbeat_timeout: None,
+                        priority: None,
                     }
                 }
             ),
@@ -9295,6 +9550,7 @@ mod tests {
                     start_to_close_timeout: Some(time::Duration::seconds(30)),
                     heartbeat_timeout: None,
                     retry_policy: None,
+                    priority: None,
                 }),
                 update_mask: update_mask.clone(),
                 restore_original: false,
@@ -9325,5 +9581,97 @@ mod tests {
                 mask_bits & 0b10000 != 0
             );
         }
+
+        // Feature: task-queue-priority-fairness, Property 12
+        #[test]
+        fn activity_priority_nested_mask_retains_field_intent(mask_bits in 1u8..8u8) {
+            let mut update_mask = Vec::new();
+            if mask_bits & 0b001 != 0 {
+                update_mask.push("priority.priority_key".to_string());
+            }
+            if mask_bits & 0b010 != 0 {
+                update_mask.push("priority.fairnessKey".to_string());
+            }
+            if mask_bits & 0b100 != 0 {
+                update_mask.push("activity_options.priority.fairness_weight".to_string());
+            }
+            let req = UpdateActivityOptionsRequest {
+                namespace: "default".to_string(),
+                workflow_id: "workflow".to_string(),
+                run_id: None,
+                identity: "operator".to_string(),
+                target: crate::translate::ActivityTarget::Id("activity-1".to_string()),
+                activity_options: Some(ActivityOptions {
+                    priority: Some(Priority {
+                        priority_key: 1,
+                        fairness_key: "tenant".to_string(),
+                        fairness_weight: 2.0,
+                    }),
+                    ..ActivityOptions::default()
+                }),
+                update_mask,
+                restore_original: false,
+                activity_type: None,
+            };
+
+            let command = build_update_activity_options_command(&test_edge_context(), &req)
+                .expect("nested Priority source is present");
+            prop_assert_eq!(
+                command.priority,
+                ActivityPriorityPatch::Patch {
+                    priority_key: (mask_bits & 0b001 != 0).then_some(1),
+                    fairness_key: (mask_bits & 0b010 != 0).then(|| "tenant".to_string()),
+                    fairness_weight: (mask_bits & 0b100 != 0).then_some(2.0),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn activity_priority_whole_mask_replaces_and_nested_requires_source() {
+        let request =
+            |activity_options: Option<Priority>, update_mask: &str| UpdateActivityOptionsRequest {
+                namespace: "default".to_string(),
+                workflow_id: "workflow".to_string(),
+                run_id: None,
+                identity: "operator".to_string(),
+                target: crate::translate::ActivityTarget::Id("activity-1".to_string()),
+                activity_options: Some(ActivityOptions {
+                    priority: activity_options,
+                    ..ActivityOptions::default()
+                }),
+                update_mask: vec![update_mask.to_string()],
+                restore_original: false,
+                activity_type: None,
+            };
+        let whole = build_update_activity_options_command(
+            &test_edge_context(),
+            &request(
+                Some(Priority {
+                    priority_key: 5,
+                    fairness_key: "tenant".to_string(),
+                    fairness_weight: 3.0,
+                }),
+                "priority",
+            ),
+        )
+        .expect("whole Priority replacement");
+        assert!(matches!(
+            whole.priority,
+            ActivityPriorityPatch::Replace(Some(tokeira_kernel::Priority {
+                priority_key: 5,
+                ..
+            }))
+        ));
+
+        let error = build_update_activity_options_command(
+            &test_edge_context(),
+            &request(None, "priority.priority_key"),
+        )
+        .expect_err("nested Priority masks require a source message");
+        assert!(matches!(
+            error,
+            EdgeError::BadRequest(message) if message == "Priority is not provided"
+        ));
     }
 }

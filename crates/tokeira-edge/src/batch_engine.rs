@@ -181,6 +181,7 @@ async fn apply_operation(
         }
         BatchOperationParams::UpdateWorkflowExecutionOptions {
             versioning_override,
+            priority,
             ..
         } => {
             service
@@ -188,6 +189,7 @@ async fn apply_operation(
                     ctx,
                     workflow_ref,
                     versioning_override.clone(),
+                    priority.clone(),
                 )
                 .await
         }

@@ -21,7 +21,7 @@ use tokeira_kernel::{
     RetryState, SignalRequest, SignalWithStartRequest, StartRequest, StartWorkflowTaskRequest,
     TerminateRequest, Transition, UnpauseWorkflowRequest, UpdateExecutionOptionsRequest,
     UpdateRequest, VersioningOverrideChange, WorkflowCommand, WorkflowIdConflictPolicy,
-    WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest,
+    WorkflowIdReusePolicy, WorkflowState, WorkflowTaskCompletedRequest, merge_priority,
 };
 use tokeira_storage::{
     CommitResult, DeleteRunRequest, DeleteRunResult, DispatchableActivityTask,
@@ -944,6 +944,20 @@ where
         self
     }
 
+    /// Share the edge-owned volatile task-queue configuration store with both
+    /// delivery brokers.
+    ///
+    /// The store remains outside authoritative workflow state. Broker clones
+    /// held by publishers observe this construction-time wiring through their
+    /// shared policy handles.
+    pub fn with_task_queue_config_store(self, store: Arc<dyn crate::TaskQueueConfigStore>) -> Self {
+        self.broker.set_task_queue_config_store(store.clone());
+        self.activity_broker
+            .set_task_queue_config_store(store.clone());
+        self.nexus_task_broker.set_task_queue_config_store(store);
+        self
+    }
+
     /// Return a clone of the workflow-task broker.
     pub fn broker(&self) -> InMemoryBroker {
         self.broker.clone()
@@ -952,6 +966,65 @@ where
     /// Return a clone of the activity-task broker.
     pub fn activity_broker(&self) -> InMemoryActivityBroker {
         self.activity_broker.clone()
+    }
+
+    /// Snapshot live and durable backlog once, grouped by effective priority.
+    pub async fn task_queue_backlog_stats_by_priority(
+        &self,
+        queue: &QueueKey,
+    ) -> crate::PriorityBacklogStats {
+        let mut stats = match queue.task_kind {
+            TaskKind::Workflow => self.broker.backlog_stats_by_priority(queue).await,
+            TaskKind::Activity => self.activity_broker.backlog_stats_by_priority(queue).await,
+        };
+        self.merge_durable_backlog_stats(queue, &mut stats).await;
+        stats
+    }
+
+    /// Snapshot a directly addressed sticky workflow queue by priority band.
+    ///
+    /// This is a read-only matching observation. It does not make sticky work part
+    /// of the normal queue's public scaling statistic.
+    pub async fn sticky_task_queue_backlog_stats_by_priority(
+        &self,
+        queue: &QueueKey,
+    ) -> crate::PriorityBacklogStats {
+        let mut stats = self.broker.sticky_backlog_stats_by_priority(queue).await;
+        self.merge_durable_backlog_stats(queue, &mut stats).await;
+        stats
+    }
+
+    async fn merge_durable_backlog_stats(
+        &self,
+        queue: &QueueKey,
+        stats: &mut crate::PriorityBacklogStats,
+    ) {
+        match self.repo.backlog_stats_by_priority(queue).await {
+            Ok(durable) => {
+                let now = OffsetDateTime::now_utc();
+                let mut durable_stats = crate::PriorityBacklogStats::new();
+                for (priority_key, band) in durable {
+                    let age = (now - band.oldest_scheduled_at)
+                        .try_into()
+                        .unwrap_or(std::time::Duration::ZERO);
+                    durable_stats.insert(
+                        i32::from(priority_key),
+                        crate::BrokerBacklogStats {
+                            count: band.count,
+                            oldest_age: age,
+                        },
+                    );
+                }
+                crate::broker::merge_priority_stats(stats, durable_stats);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    ?queue,
+                    "failed to read durable priority backlog stats"
+                );
+            }
+        }
     }
 
     /// Cancel outstanding workflow polls and reject subsequent polls for a
@@ -1526,6 +1599,9 @@ pub struct UpdateActivitiesOptionsRequest {
     pub heartbeat_timeout: FieldChange<Option<Duration>>,
     /// Retry-policy field-mask patch.
     pub retry_policy: ActivityRetryPolicyPatch,
+    /// Per-activity Priority field-mask intent, resolved by the kernel against
+    /// each activity in the atomic target set.
+    pub priority: tokeira_kernel::ActivityPriorityPatch,
     /// Whether every selected activity restores its first-schedule options.
     pub restore_original_options: bool,
     /// Caller context used for request dedupe.
@@ -2256,6 +2332,8 @@ mod tests {
                     sticky_preferred: None,
                     normal_queue: None,
                     sticky_deadline: None,
+                    priority: None,
+                    order: None,
                 };
 
                 broker.publish_workflow_task(task.clone(), None).await;
@@ -2396,6 +2474,7 @@ mod tests {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
+                    priority: None,
                 }],
             )
             .await
@@ -2537,6 +2616,7 @@ mod tests {
                     sticky_preferred: Some(WorkerIdentity("worker-v1".to_string())),
                     normal_task_queue: Some(normal_task_queue.clone()),
                     speculative: false,
+                    priority: None,
                 }],
             )
             .await
@@ -2577,6 +2657,7 @@ mod tests {
                     sticky_preferred: Some(WorkerIdentity("worker-v1".to_string())),
                     normal_task_queue: Some(normal_task_queue.clone()),
                     speculative: false,
+                    priority: None,
                 }],
             )
             .await

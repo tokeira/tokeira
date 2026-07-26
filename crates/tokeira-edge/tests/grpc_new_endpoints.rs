@@ -17,7 +17,7 @@ use tokeira_edge::{
 };
 use tokeira_kernel::LoadedRun;
 use tokeira_proto::{
-    common::WorkerVersionCapabilities,
+    common::{Priority, WorkerVersionCapabilities},
     enums,
     public::temporal::api::deployment::v1::{WorkerDeploymentOptions, WorkerDeploymentVersion},
     workflowservice::{
@@ -170,6 +170,13 @@ impl StoreExecutionResolver {
                                     start_to_close_timeout: activity.start_to_close_timeout,
                                     heartbeat_timeout: activity.heartbeat_timeout,
                                     retry_policy: activity.retry_policy.clone(),
+                                    priority: activity.priority.as_ref().map(|priority| {
+                                        tokeira_edge::translate::Priority {
+                                            priority_key: priority.priority_key,
+                                            fairness_key: priority.fairness_key.clone(),
+                                            fairness_weight: priority.fairness_weight,
+                                        }
+                                    }),
                                 },
                             },
                         )
@@ -216,6 +223,13 @@ impl StoreExecutionResolver {
                     original_start_time: state.first_run_started_at.unwrap_or(state.started_at),
                     versioning_info: state.versioning_info.clone(),
                     worker_deployment_name: state.worker_deployment_name.clone(),
+                    priority: state.priority.as_ref().map(|priority| {
+                        tokeira_edge::translate::Priority {
+                            priority_key: priority.priority_key,
+                            fairness_key: priority.fairness_key.clone(),
+                            fairness_weight: priority.fairness_weight,
+                        }
+                    }),
                     most_recent_worker_version_stamp: state
                         .versioning_info
                         .as_ref()
@@ -345,6 +359,113 @@ async fn respond_workflow_task_completed_returns_new_started_wft_after_durable_s
             .as_ref()
             .is_some_and(|history| !history.events.is_empty())
     );
+}
+
+#[tokio::test]
+async fn priority_orders_workflow_polls_and_projects_real_band_stats_via_grpc() {
+    let store = Arc::new(InMemoryStore::default());
+    let grpc = build_grpc(store).await;
+    let queue = "priority-wire";
+
+    for (workflow_id, priority_key) in [("low", 5), ("high", 1)] {
+        grpc.start_workflow_execution(Request::new(
+            workflowservice::StartWorkflowExecutionRequest {
+                namespace: "default".to_string(),
+                workflow_id: workflow_id.to_string(),
+                workflow_type: Some(tokeira_proto::common::WorkflowType {
+                    name: "priority-workflow".to_string(),
+                }),
+                task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                    name: queue.to_string(),
+                    ..Default::default()
+                }),
+                request_id: format!("start-{workflow_id}"),
+                priority: Some(Priority {
+                    priority_key,
+                    fairness_key: format!("key-{workflow_id}"),
+                    fairness_weight: 1.0,
+                }),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("start prioritized workflow");
+    }
+
+    let description = grpc
+        .describe_task_queue(Request::new(workflowservice::DescribeTaskQueueRequest {
+            namespace: "default".to_string(),
+            task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                name: queue.to_string(),
+                ..Default::default()
+            }),
+            task_queue_type: enums::TaskQueueType::Workflow as i32,
+            report_stats: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("describe priority bands")
+        .into_inner();
+    assert_eq!(
+        description
+            .stats
+            .as_ref()
+            .map(|stats| stats.approximate_backlog_count),
+        Some(2)
+    );
+    assert_eq!(
+        description
+            .stats_by_priority_key
+            .get(&1)
+            .map(|stats| stats.approximate_backlog_count),
+        Some(1)
+    );
+    assert_eq!(
+        description
+            .stats_by_priority_key
+            .get(&5)
+            .map(|stats| stats.approximate_backlog_count),
+        Some(1)
+    );
+
+    for (expected_workflow_id, expected_priority_key) in [("high", 1), ("low", 5)] {
+        let task = grpc
+            .poll_workflow_task_queue(Request::new(PollWorkflowTaskQueueRequest {
+                namespace: "default".to_string(),
+                task_queue: Some(tokeira_proto::taskqueue::TaskQueue {
+                    name: queue.to_string(),
+                    ..Default::default()
+                }),
+                identity: "priority-worker".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect("poll prioritized workflow task")
+            .into_inner();
+        assert_eq!(
+            task.workflow_execution
+                .as_ref()
+                .map(|execution| execution.workflow_id.as_str()),
+            Some(expected_workflow_id)
+        );
+        let described = grpc
+            .describe_workflow_execution(Request::new(
+                workflowservice::DescribeWorkflowExecutionRequest {
+                    namespace: "default".to_string(),
+                    execution: task.workflow_execution.clone(),
+                },
+            ))
+            .await
+            .expect("describe prioritized workflow")
+            .into_inner();
+        assert_eq!(
+            described
+                .workflow_execution_info
+                .and_then(|info| info.priority)
+                .map(|priority| priority.priority_key),
+            Some(expected_priority_key)
+        );
+    }
 }
 
 #[tokio::test]

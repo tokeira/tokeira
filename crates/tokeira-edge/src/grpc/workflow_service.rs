@@ -15,7 +15,7 @@ use tracing::debug;
 use time::OffsetDateTime;
 use tokeira_projection::{STANDARD_SEARCH_ATTRIBUTES, SearchAttrType};
 use tokeira_proto::{
-    enums::IndexedValueType,
+    enums::{IndexedValueType, TaskQueueType},
     workflowservice::{
         self,
         workflow_service_server::{
@@ -24,7 +24,8 @@ use tokeira_proto::{
     },
 };
 use tokeira_runtime::{
-    ScheduleError, TaskQueueConfigEntry, compute_matching_times, compute_next_times,
+    ScheduleError, TaskQueueConfigFieldPatch, TaskQueueConfigKey, TaskQueueConfigKind,
+    TaskQueueConfigMetadata, TaskQueueConfigPatch, compute_matching_times, compute_next_times,
 };
 use tokeira_types::{NamespaceId, TaskQueueName, WorkerIdentity};
 
@@ -42,9 +43,7 @@ use crate::{
         translate,
     },
     translate::{batch, nexus, schedule, to_internal, worker_heartbeat},
-    workflow_service::{
-        WorkflowService, task_queue_config_metadata_to_edge, task_queue_config_metadata_to_runtime,
-    },
+    workflow_service::WorkflowService,
 };
 
 const DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED: &str =
@@ -2826,55 +2825,65 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .resolve_namespace_id(&req.namespace)
             .await
             .map_err(namespace_resolution_status)?;
-        let task_queue = TaskQueueName(req.task_queue.clone());
-        let existing = self
+        let kind = match TaskQueueType::try_from(req.task_queue_type)
+            .unwrap_or(TaskQueueType::Unspecified)
+        {
+            TaskQueueType::Workflow => TaskQueueConfigKind::Workflow,
+            TaskQueueType::Activity => TaskQueueConfigKind::Activity,
+            TaskQueueType::Nexus => TaskQueueConfigKind::Nexus,
+            TaskQueueType::Unspecified => {
+                return Err(Status::invalid_argument("task queue type is required"));
+            }
+        };
+        let now = OffsetDateTime::now_utc();
+        let metadata = |reason: String| TaskQueueConfigMetadata {
+            reason,
+            update_identity: req.identity.clone(),
+            update_time: now,
+        };
+        let queue_rate_limit = req.update_queue_rate_limit.as_ref().map_or(
+            TaskQueueConfigFieldPatch::Unchanged,
+            |update| {
+                TaskQueueConfigFieldPatch::Set((
+                    update
+                        .rate_limit
+                        .as_ref()
+                        .map(|rate| rate.requests_per_second),
+                    metadata(update.reason.clone()),
+                ))
+            },
+        );
+        let fairness_key_rate_limit_default = req
+            .update_fairness_key_rate_limit_default
+            .as_ref()
+            .map_or(TaskQueueConfigFieldPatch::Unchanged, |update| {
+                TaskQueueConfigFieldPatch::Set((
+                    update
+                        .rate_limit
+                        .as_ref()
+                        .map(|rate| rate.requests_per_second),
+                    metadata(update.reason.clone()),
+                ))
+            });
+        let updated = self
             .inner
             .task_queue_config_store()
-            .get(&namespace_id, &task_queue);
-        let mut config = translate::task_queue_config_from_update_request(&req);
-        if let Some(existing) = existing {
-            if req.update_queue_rate_limit.is_none() {
-                config.queue_rate_limit = existing.queue_rate_limit;
-                config.queue_rate_limit_metadata = existing
-                    .queue_rate_limit_metadata
-                    .map(task_queue_config_metadata_to_edge);
-            }
-            if req.update_fairness_key_rate_limit_default.is_none() {
-                config.fairness_key_rate_limit_default = existing.fairness_key_rate_limit_default;
-                config.fairness_key_rate_limit_metadata = existing
-                    .fairness_key_rate_limit_metadata
-                    .map(task_queue_config_metadata_to_edge);
-            }
-            let mut merged = existing.fairness_weight_overrides;
-            for key in &req.unset_fairness_weight_overrides {
-                merged.remove(key);
-            }
-            merged.extend(req.set_fairness_weight_overrides.clone());
-            config.fairness_weight_overrides = merged;
-        }
-        if config.fairness_weight_overrides.len() > tokeira_runtime::max_fairness_weight_overrides()
-        {
-            return Err(Status::invalid_argument(
-                "fairness weight overrides update rejected: maximum number of overrides exceeded",
-            ));
-        }
-        self.inner
-            .task_queue_config_store()
-            .set(TaskQueueConfigEntry {
-                namespace_id,
-                task_queue,
-                queue_rate_limit: config.queue_rate_limit,
-                queue_rate_limit_metadata: config
-                    .queue_rate_limit_metadata
-                    .clone()
-                    .map(task_queue_config_metadata_to_runtime),
-                fairness_key_rate_limit_default: config.fairness_key_rate_limit_default,
-                fairness_key_rate_limit_metadata: config
-                    .fairness_key_rate_limit_metadata
-                    .clone()
-                    .map(task_queue_config_metadata_to_runtime),
-                fairness_weight_overrides: config.fairness_weight_overrides.clone(),
-            });
+            .apply(
+                TaskQueueConfigKey {
+                    namespace_id,
+                    task_queue: TaskQueueName(req.task_queue),
+                    kind,
+                },
+                TaskQueueConfigPatch {
+                    queue_rate_limit,
+                    fairness_key_rate_limit_default,
+                    set_fairness_weight_overrides: req.set_fairness_weight_overrides,
+                    unset_fairness_weight_overrides: req.unset_fairness_weight_overrides,
+                },
+                tokeira_runtime::max_fairness_weight_overrides(),
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let config = crate::workflow_service::task_queue_config_to_edge(updated);
         Ok(Response::new(
             workflowservice::UpdateTaskQueueConfigResponse {
                 config: Some(translate::task_queue_config_to_proto(config)),
@@ -5114,6 +5123,8 @@ mod tests {
                     sticky_preferred: None,
                     normal_queue: None,
                     sticky_deadline: None,
+                    priority: None,
+                    order: None,
                 },
                 None,
             )

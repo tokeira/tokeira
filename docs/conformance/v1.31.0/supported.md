@@ -58,7 +58,7 @@ v1.31.0 (release notes / proto). Areas Temporal labels experimental or pre-relea
 | Search attributes (operator) | OperatorService Add/List/RemoveSearchAttributes | GA |
 | Namespaces | Register/Describe/List/Update/DeprecateNamespace; OperatorService DeleteNamespace | GA |
 | Batch operations | Start/Stop/Describe/ListBatchOperations | GA |
-| Task queues | DescribeTaskQueue, ListTaskQueuePartitions, UpdateTaskQueueConfig | GA |
+| Task queues, Priority & User Fairness | DescribeTaskQueue, ListTaskQueuePartitions, UpdateTaskQueueConfig; Priority fields on workflow/activity/child starts and option updates | GA |
 | Cluster / system metadata | GetClusterInfo, GetSystemInfo | GA |
 | Remote-cluster registry | OperatorService AddOrUpdateRemoteCluster/RemoveRemoteCluster/ListClusters (metadata CRUD only; replication behaviour is in [`excluded.md`](./excluded.md)) | GA |
 | Worker inventory | RecordWorkerHeartbeat, ShutdownWorker, ListWorkers, DescribeWorker, Fetch/UpdateWorkerConfig | GA |
@@ -67,6 +67,26 @@ v1.31.0 (release notes / proto). Areas Temporal labels experimental or pre-relea
 | **Worker Deployments** | Describe/Delete/ListWorkerDeployment, SetWorkerDeploymentManager, Describe/Delete/Set{Current,Ramping}/UpdateMetadata Version | **GA** — see [below](#worker-deployments) |
 | **Standalone Activities** | StartActivityExecution, Describe/Poll/List/Count/RequestCancel/Terminate/DeleteActivityExecution | **Public Preview** — see [below](#standalone-activities) |
 | **Authentication / authorization** | (no RPCs — a config-gated interceptor surface plus `HistoryEvent.principal`) | GA, default off — see [below](#authentication-and-authorization) |
+
+## Task Queue Priority and User Fairness
+
+Temporal v1.31.0's priority-capable matcher is stock-default on
+(`matching.useNewMatcher=true`). Priority key 1 is highest, key 5 lowest, and an absent or zero key
+uses computed default 3. Higher bands are preferred before lower bands; work remains FIFO within an
+equal `(priority, fairness-key)` group. Workflow Priority is durable history metadata, activities and
+children inherit it unless explicitly overridden, and priority option updates fence stale offers.
+
+Weighted User Fairness is a separate, optional within-band policy. Its stock default is disabled
+(`matching.enableFairness=false`, `matching.autoEnableV2=false`). When enabled, non-sticky tasks with
+the same priority share handout in proportion to their effective fairness weights; sticky queues stay
+fairness-disabled. Task-queue weight overrides take precedence over positive task-carried weights,
+which take precedence over 1.0.
+
+`UpdateTaskQueueConfig` carries queue-wide handout rate, the activity/Nexus per-fairness-key default
+rate, and fairness-weight override updates. `DescribeTaskQueue` echoes the effective stored config and
+reports real `stats_by_priority_key`; absent bands are omitted and aggregate backlog is the sum of the
+same band data. Ordering and fairness are best-effort delivery tendencies: already handed-out and
+speculative tasks are not retroactively reordered.
 
 ## Nexus
 

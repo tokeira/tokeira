@@ -279,6 +279,9 @@ pub enum HistoryEventKind {
         schedule_to_start_timeout: Option<Duration>,
         start_to_close_timeout: Option<Duration>,
         heartbeat_timeout: Option<Duration>,
+        /// Raw activity-level Priority override.
+        #[serde(default)]
+        priority: Option<Priority>,
     },
     /// A worker picked up the activity task and began
     /// processing it.
@@ -383,6 +386,9 @@ pub enum HistoryEventKind {
         retry_policy: Option<RetryPolicy>,
         cron_schedule: Option<String>,
         parent_close_policy: ParentClosePolicy,
+        /// Raw child-level Priority override.
+        #[serde(default)]
+        priority: Option<Priority>,
     },
     /// The child workflow was successfully started and
     /// assigned a run ID.
@@ -651,6 +657,9 @@ pub enum HistoryEventKind {
         attached_completion_callbacks: Vec<CompletionCallback>,
         attached_links: Vec<Link>,
         attached_request_id: Option<String>,
+        /// Workflow Priority mutation applied by this event.
+        #[serde(default)]
+        priority: FieldChange<Priority>,
     },
     /// The workflow returned a successful result.
     WorkflowExecutionCompleted {

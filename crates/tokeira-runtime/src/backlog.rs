@@ -194,6 +194,8 @@ pub(crate) async fn drain_once<R>(
                                         sticky_preferred: None,
                                         normal_queue: None,
                                         sticky_deadline: None,
+                                        priority: entry.priority,
+                                        order: Some(entry.order),
                                     },
                                     Some(metrics),
                                 )
@@ -254,6 +256,8 @@ pub(crate) async fn drain_once<R>(
                                         attempt,
                                         dispatch_revision,
                                         stamp,
+                                        priority: entry.priority,
+                                        order: Some(entry.order),
                                     },
                                     Some(metrics),
                                 )
@@ -318,10 +322,12 @@ fn workflow_to_backlog_entry(task: &crate::broker::TimestampedWorkflowTask) -> B
         payload: BacklogPayload::Workflow {
             logical_seq: task.task.logical_seq,
         },
+        priority: task.task.priority.clone(),
         scheduled_at: task.scheduled_at,
-        // Placeholder: storage assigns the authoritative monotonic insertion
-        // sequence on persist; the value supplied here is ignored.
-        insertion_seq: 0,
+        order: task
+            .task
+            .order
+            .expect("broker publication always assigns workflow delivery order"),
     }
 }
 
@@ -337,8 +343,12 @@ fn activity_to_backlog_entry(task: &crate::broker::TimestampedActivityTask) -> B
             dispatch_revision: task.task.dispatch_revision,
             stamp: task.task.stamp,
         },
+        priority: task.task.priority.clone(),
         scheduled_at: task.scheduled_at,
-        insertion_seq: 0,
+        order: task
+            .task
+            .order
+            .expect("broker publication always assigns activity delivery order"),
     }
 }
 
@@ -354,8 +364,9 @@ mod tests {
     use proptest::prelude::*;
     use tokeira_kernel::{LoadedRun, Transition};
     use tokeira_storage::{
-        ActivitySweepEntry, CommitResult, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
-        RequestRecord, RunRepository, TransitionAuditRecord, WorkflowTimeoutSweepEntry,
+        ActivitySweepEntry, CommitResult, DeliveryOrder, DispatchableWorkflowTask, DueTimer,
+        NexusSweepEntry, RequestRecord, RunRepository, TransitionAuditRecord,
+        WorkflowTimeoutSweepEntry,
     };
     use tokeira_types::{
         ExecutionRef, LogicalTaskSeq, NamespaceId, QueueKey, RequestId, RunKey, ShardEpoch,
@@ -592,6 +603,8 @@ mod tests {
                     sticky_preferred: None,
                     normal_queue: None,
                     sticky_deadline: None,
+                    priority: None,
+                    order: None,
                 },
                 None,
             )
@@ -634,8 +647,9 @@ mod tests {
                 payload: BacklogPayload::Workflow {
                     logical_seq: LogicalTaskSeq::ONE,
                 },
+                priority: None,
                 scheduled_at: OffsetDateTime::now_utc(),
-                insertion_seq: 0,
+                order: DeliveryOrder::default(),
             }]),
         );
 
@@ -702,8 +716,9 @@ mod tests {
                 payload: BacklogPayload::Workflow {
                     logical_seq: LogicalTaskSeq::ONE,
                 },
+                priority: None,
                 scheduled_at: OffsetDateTime::now_utc(),
-                insertion_seq: 0,
+                order: DeliveryOrder::default(),
             }]),
         );
 
@@ -754,6 +769,8 @@ mod tests {
                     sticky_preferred: None,
                     normal_queue: None,
                     sticky_deadline: None,
+                    priority: None,
+                    order: None,
                 };
 
                 broker.publish_workflow_task(task.clone(), None).await;
@@ -802,6 +819,8 @@ mod tests {
                     sticky_preferred: None,
                     normal_queue: None,
                     sticky_deadline: None,
+                    priority: None,
+                    order: None,
                 };
 
                 broker.publish_workflow_task(task.clone(), None).await;
@@ -854,8 +873,9 @@ mod tests {
                         payload: BacklogPayload::Workflow {
                             logical_seq: LogicalTaskSeq(logical_seq),
                         },
+                        priority: None,
                         scheduled_at: OffsetDateTime::now_utc(),
-                        insertion_seq: 0,
+                        order: DeliveryOrder::default(),
                     }]),
                 );
                 repo.drained.lock().expect("drained lock poisoned").insert(
@@ -871,8 +891,13 @@ mod tests {
                             dispatch_revision: 0,
                             stamp: 0,
                         },
+                        priority: None,
                         scheduled_at: OffsetDateTime::now_utc(),
-                        insertion_seq: 1,
+                        order: DeliveryOrder {
+                            priority_key: 3,
+                            fair_pass: 0,
+                            insertion_tie: 1,
+                        },
                     }]),
                 );
 
@@ -943,8 +968,14 @@ mod tests {
     }
 
     proptest! {
+        // Feature: task-queue-priority-fairness, Property 8
         #[test]
-        fn property_fifo_order_preserved_through_drain(logical_seqs in proptest::collection::vec(1u64..32u64, 1..6)) {
+        fn property_delivery_order_and_priority_are_preserved_through_drain(
+            task_specs in proptest::collection::vec(
+                (1u64..32, 1i16..=5, 0i64..10_000, 0i32..100, "[a-z]{0,8}", 0.0f32..10.0),
+                1..11,
+            ),
+        ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let repo = MockBacklogRepo::default();
@@ -954,19 +985,38 @@ mod tests {
                 let metrics = DeliveryMetrics::new();
                 let queue = workflow_queue();
 
-                let entries: Vec<_> = logical_seqs
+                let mut entries: Vec<_> = task_specs
                     .iter()
                     .enumerate()
-                    .map(|(idx, seq)| BacklogEntry {
+                    .map(|(idx, (seq, priority_key, fair_pass, raw_key, fairness_key, weight))| BacklogEntry {
                         run_key: RunKey::new(),
                         queue: queue.clone(),
                         payload: BacklogPayload::Workflow {
                             logical_seq: LogicalTaskSeq(*seq),
                         },
+                        priority: Some(tokeira_kernel::Priority {
+                            priority_key: *raw_key,
+                            fairness_key: fairness_key.clone(),
+                            fairness_weight: *weight,
+                        }),
                         scheduled_at: OffsetDateTime::now_utc(),
-                        insertion_seq: idx as u64,
+                        order: DeliveryOrder {
+                            priority_key: *priority_key,
+                            fair_pass: *fair_pass,
+                            insertion_tie: idx as u64,
+                        },
                     })
                     .collect();
+                entries.sort_by_key(|entry| entry.order);
+                let expected = entries
+                    .iter()
+                    .map(|entry| {
+                        let BacklogPayload::Workflow { logical_seq } = &entry.payload else {
+                            unreachable!("workflow fixture");
+                        };
+                        (*logical_seq, entry.priority.clone(), entry.order)
+                    })
+                    .collect::<Vec<_>>();
                 repo.drained
                     .lock()
                     .expect("drained lock poisoned")
@@ -1006,9 +1056,9 @@ mod tests {
                     prop_assert!(false, "expected queued workflow task");
                     return Ok::<(), proptest::test_runner::TestCaseError>(());
                 };
-                seen.push(task.logical_seq.0);
+                seen.push((task.logical_seq, task.priority.clone(), task.order.unwrap()));
 
-                for _ in 1..logical_seqs.len() {
+                for _ in 1..task_specs.len() {
                     let Some(task) = broker
                         .poll_workflow_task(
                             &queue,
@@ -1025,10 +1075,10 @@ mod tests {
                         prop_assert!(false, "expected queued workflow task");
                         return Ok::<(), proptest::test_runner::TestCaseError>(());
                     };
-                    seen.push(task.logical_seq.0);
+                    seen.push((task.logical_seq, task.priority.clone(), task.order.unwrap()));
                 }
 
-                prop_assert_eq!(seen, logical_seqs);
+                prop_assert_eq!(seen, expected);
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
@@ -1053,6 +1103,8 @@ mod tests {
             sticky_preferred: None,
             normal_queue: None,
             sticky_deadline: None,
+            priority: None,
+            order: None,
         };
         broker.publish_workflow_task(task_a.clone(), None).await;
 
@@ -1067,6 +1119,8 @@ mod tests {
             sticky_preferred: None,
             normal_queue: None,
             sticky_deadline: None,
+            priority: None,
+            order: None,
         };
         broker.publish_workflow_task(task_b.clone(), None).await;
 
@@ -1077,6 +1131,8 @@ mod tests {
             sticky_preferred: None,
             normal_queue: None,
             sticky_deadline: None,
+            priority: None,
+            order: None,
         };
         broker.publish_workflow_task(task_c.clone(), None).await;
 

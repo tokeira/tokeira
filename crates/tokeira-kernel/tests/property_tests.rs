@@ -6,29 +6,30 @@ use proptest::prelude::*;
 use prost::Message;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityControlTarget, ActivityOp, ActivityPauseInfo, ActivityResolution,
-    ActivityResolvedRequest, ActivityState, BasicKernel, CallbackAttemptOutcome,
-    CallbackCompletionOutcome, CallbackSpec, CallbackState, CallbackTrigger, CancelRequest,
-    ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult,
-    ChildWorkflowState, Command, CompletionCallback, CompletionCallbackAttemptedRequest,
-    ContinueAsNewVersioningBehavior, DispatchOp, ExternalCancelResolvedRequest,
-    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, FieldChange, Link, LoadedRun, NexusOperationCancellationState,
-    NexusOperationResolvedRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
-    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
-    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, Priority,
-    Reject, ReplayContext, RequestDedupeOp, ResetActivityRequest, ResetRequest, RetryContinuation,
-    RetryState, SignalRequest, StartRequest, StartWorkflowTaskRequest, TerminateRequest,
-    TimerDueRequest, TimerOp, TimerState, Transition, UnpauseActivityRequest,
-    UnpauseWorkflowRequest, UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest,
-    UpdateProtocolBody, UpdateRequest, UserMetadata, VersionTarget, VersioningBehavior,
-    VersioningOverride, VersioningOverrideChange, WorkerDeploymentVersionRef, WorkerVersionStamp,
-    WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState, WorkflowTaskCompletedRequest,
-    WorkflowTaskCompletionLimits, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
-    WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTimeoutType,
-    WorkflowVersioningInfo,
+    ActivityControlTarget, ActivityOp, ActivityPauseInfo, ActivityPriorityPatch,
+    ActivityResolution, ActivityResolvedRequest, ActivityState, BasicKernel,
+    CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState,
+    CallbackTrigger, CancelRequest, ChildResolution, ChildResolvedRequest,
+    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
+    CompletionCallbackAttemptedRequest, ContinueAsNewVersioningBehavior, DispatchOp,
+    ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
+    ExternalSignalResult, ExternalWorkflowExecution, FieldChange, Link, LoadedRun,
+    NexusOperationCancellationState, NexusOperationResolvedRequest, NexusResolution,
+    NexusTimeoutType, ParentClosePolicy, PauseActivityRequest, PauseInfo, PauseWorkflowRequest,
+    PendingExternalCancel, PendingExternalSignal, PendingNexusOperation, PendingUpdate,
+    PendingWorkflowTask, Priority, Reject, ReplayContext, RequestDedupeOp, ResetActivityRequest,
+    ResetRequest, RetryContinuation, RetryState, SignalRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateRequest, TimerDueRequest, TimerOp, TimerState, Transition,
+    UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
+    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, UserMetadata, VersionTarget,
+    VersioningBehavior, VersioningOverride, VersioningOverrideChange, WorkerDeploymentVersionRef,
+    WorkerVersionStamp, WorkflowCommand, WorkflowExecutionTimedOutRequest, WorkflowState,
+    WorkflowTaskCompletedRequest, WorkflowTaskCompletionLimits, WorkflowTaskFailedCause,
+    WorkflowTaskFailedRequest, WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType,
+    WorkflowTimeoutType, WorkflowVersioningInfo,
     event::{HistoryEvent, HistoryEventKind},
     kernel::Kernel,
+    merge_priority,
 };
 use tokeira_types::{
     BuildId, DeploymentId, EventPrincipal, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId,
@@ -283,6 +284,7 @@ fn bounded_workflow_command(
             cron_schedule: None,
             parent_close_policy: ParentClosePolicy::Terminate,
             reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            priority: None,
         },
         1 => WorkflowCommand::ScheduleActivity {
             activity_id: format!("activity-{index}"),
@@ -298,6 +300,7 @@ fn bounded_workflow_command(
             schedule_to_start_timeout: None,
             start_to_close_timeout: None,
             heartbeat_timeout: None,
+            priority: None,
         },
         2 => WorkflowCommand::SignalExternalWorkflowExecution {
             target_namespace_id: namespace_id,
@@ -379,6 +382,7 @@ fn with_activity(mut state: WorkflowState, activity_id: &str) -> WorkflowState {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         },
     );
     state
@@ -641,6 +645,7 @@ fn arb_update_activity_options_request(
                 reschedule_at: BTreeMap::new(),
                 request: request_context(&request_id, now),
                 now,
+                priority: ActivityPriorityPatch::Unchanged,
             }
         })
 }
@@ -825,6 +830,7 @@ fn arb_update_execution_options_request(
                     attached_request_id,
                     request: request_context(&request_id, now),
                     now,
+                    priority: FieldChange::Unchanged,
                 }
             },
         )
@@ -999,13 +1005,17 @@ fn arb_links() -> impl Strategy<Value = Vec<Link>> {
 }
 
 fn arb_priority() -> impl Strategy<Value = Option<Priority>> {
-    prop::option::of((0i32..100, arb_small_string(), 0.1f32..10.0).prop_map(
+    prop::option::of(arb_priority_value())
+}
+
+fn arb_priority_value() -> impl Strategy<Value = Priority> {
+    (0i32..100, arb_small_string(), 0.1f32..10.0).prop_map(
         |(priority_key, fairness_key, fairness_weight)| Priority {
             priority_key,
             fairness_key,
             fairness_weight,
         },
-    ))
+    )
 }
 
 fn arb_workflow_versioning_info() -> impl Strategy<Value = WorkflowVersioningInfo> {
@@ -1110,6 +1120,7 @@ fn arb_schedule_activity_command() -> impl Strategy<Value = WorkflowCommand> {
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
+                priority: None,
             },
         )
 }
@@ -1521,6 +1532,7 @@ fn arb_valid_pair() -> impl Strategy<Value = (LoadedRun, Command)> {
                             cron_schedule: None,
                             parent_close_policy,
                             reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+                            priority: None,
                         }]
                     }
                 ),
@@ -2318,6 +2330,7 @@ proptest! {
             schedule_to_start_timeout: duration(schedule_to_start_secs),
             start_to_close_timeout: duration(start_to_close_secs),
             heartbeat_timeout: duration(heartbeat_secs),
+            priority: None,
         };
         let result = kernel().apply(
             LoadedRun::Existing(state.clone()),
@@ -2808,6 +2821,7 @@ proptest! {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
+                    priority: None,
                 }],
                 force_new_workflow_task: false,
                 limits: Default::default(),
@@ -3568,6 +3582,7 @@ proptest! {
                 started_event_id: None,
                 pause_info: None,
                 stamp: 0,
+                priority: None,
             },
         );
         state = with_timer(state, "timer-1", now);
@@ -3794,6 +3809,7 @@ proptest! {
                 started_event_id: None,
                 pause_info: None,
                 stamp: 0,
+                priority: None,
             },
         );
         state = with_timer(state, "timer-1", now);
@@ -4357,6 +4373,485 @@ proptest! {
     }
 }
 
+fn workflow_priority_update(priority: Priority, now: OffsetDateTime) -> Command {
+    Command::UpdateExecutionOptions(UpdateExecutionOptionsRequest {
+        versioning_override: VersioningOverrideChange::Unchanged,
+        completion_callbacks: FieldChange::Unchanged,
+        attached_completion_callbacks: Vec::new(),
+        attached_links: Vec::new(),
+        attached_request_id: None,
+        request: request_context("priority-update", now),
+        now,
+        priority: FieldChange::Set(priority),
+    })
+}
+
+proptest! {
+    // Feature: task-queue-priority-fairness, Property 2
+    #[test]
+    fn property_priority_survives_workflow_task_rescheduling(priority in arb_priority_value()) {
+        let now = fixed_now();
+        let mut state = with_pending_wft(make_open_state(now), 120, Some(12), 1);
+        state.priority = Some(priority.clone());
+        let request = completion_request(
+            &state,
+            Vec::new(),
+            WorkflowTaskCompletionLimits::default(),
+            None,
+            None,
+            true,
+            now,
+        );
+
+        let transition = kernel()
+            .apply(LoadedRun::Existing(state), Command::WorkflowTaskCompleted(request))
+            .unwrap();
+        let dispatched = transition.dispatch_ops.iter().find_map(|op| match op {
+            DispatchOp::EnqueueWorkflowTask { priority, .. } => priority.as_ref(),
+            _ => None,
+        });
+
+        prop_assert_eq!(transition.next_state.priority.as_ref(), Some(&priority));
+        prop_assert_eq!(dispatched, Some(&priority));
+    }
+
+    // Feature: task-queue-priority-fairness, Property 3
+    #[test]
+    fn property_activity_and_child_priority_inherit_field_by_field(
+        base in arb_priority(),
+        override_ in arb_priority(),
+    ) {
+        let now = fixed_now();
+        let mut initial = with_pending_wft(make_open_state(now), 121, Some(13), 1);
+        initial.priority = base.clone();
+        let expected = merge_priority(base.as_ref(), override_.as_ref());
+
+        let activity_request = completion_request(
+            &initial,
+            vec![WorkflowCommand::ScheduleActivity {
+                activity_id: "priority-activity".into(),
+                activity_type: "activity-type".into(),
+                task_queue: TaskQueueName("activity-q".into()),
+                input: Payloads::default(),
+                header: None,
+                request_eager_execution: false,
+                retry_policy: None,
+                deployment: None,
+                build_id: None,
+                schedule_to_close_timeout: Some(Duration::minutes(1)),
+                schedule_to_start_timeout: None,
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                priority: override_.clone(),
+            }],
+            WorkflowTaskCompletionLimits::default(),
+            None,
+            None,
+            false,
+            now,
+        );
+        let activity_transition = kernel()
+            .apply(
+                LoadedRun::Existing(initial.clone()),
+                Command::WorkflowTaskCompleted(activity_request),
+            )
+            .unwrap();
+        let activity = activity_transition
+            .next_state
+            .activities
+            .get("priority-activity")
+            .expect("scheduled activity");
+        prop_assert_eq!(&activity.priority, &override_);
+        let activity_event_priority = activity_transition.history_events.iter().find_map(|event| {
+            match &event.kind {
+                HistoryEventKind::ActivityTaskScheduled { priority, .. } => Some(priority),
+                _ => None,
+            }
+        });
+        prop_assert_eq!(activity_event_priority, Some(&override_));
+        let activity_dispatch_priority =
+            activity_transition.dispatch_ops.iter().find_map(|op| match op {
+                DispatchOp::EnqueueActivityTask { priority, .. } => Some(priority),
+                _ => None,
+            });
+        prop_assert_eq!(activity_dispatch_priority, Some(&expected));
+
+        let child_request = completion_request(
+            &initial,
+            vec![WorkflowCommand::StartChildWorkflow {
+                child_workflow_id: WorkflowId("priority-child".into()),
+                namespace_id: initial.namespace_id,
+                namespace: None,
+                workflow_type: WorkflowType("child-type".into()),
+                task_queue: TaskQueueName("child-q".into()),
+                input: Payloads::default(),
+                header: None,
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout: Duration::seconds(10),
+                retry_policy: None,
+                cron_schedule: None,
+                parent_close_policy: ParentClosePolicy::Terminate,
+                reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+                priority: override_.clone(),
+            }],
+            WorkflowTaskCompletionLimits::default(),
+            None,
+            None,
+            false,
+            now,
+        );
+        let child_transition = kernel()
+            .apply(
+                LoadedRun::Existing(initial),
+                Command::WorkflowTaskCompleted(child_request),
+            )
+            .unwrap();
+        let child_event_priority = child_transition.history_events.iter().find_map(|event| {
+            match &event.kind {
+                HistoryEventKind::StartChildWorkflowExecutionInitiated { priority, .. } => {
+                    Some(priority)
+                }
+                _ => None,
+            }
+        });
+        prop_assert_eq!(child_event_priority, Some(&override_));
+        let child_dispatch_priority = child_transition.dispatch_ops.iter().find_map(|op| match op {
+            DispatchOp::StartChildWorkflow { priority, .. } => Some(priority),
+            _ => None,
+        });
+        prop_assert_eq!(child_dispatch_priority, Some(&expected));
+    }
+
+    // Feature: task-queue-priority-fairness, Property 11
+    #[test]
+    fn property_workflow_priority_update_fences_only_real_changes(
+        current_key in 1i32..5,
+        same in any::<bool>(),
+    ) {
+        let now = fixed_now();
+        let current = Priority {
+            priority_key: current_key,
+            fairness_key: "tenant".into(),
+            fairness_weight: 1.0,
+        };
+        let requested = if same {
+            current.clone()
+        } else {
+            Priority {
+                priority_key: current_key + 1,
+                ..current.clone()
+            }
+        };
+        let mut state = with_pending_wft(make_open_state(now), 122, None, 1);
+        state.priority = Some(current.clone());
+        let old_seq = state.pending_workflow_task.as_ref().unwrap().logical_seq;
+        let before = state.clone();
+
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                workflow_priority_update(requested.clone(), now),
+            )
+            .unwrap();
+
+        if same {
+            prop_assert!(transition.is_noop());
+            prop_assert_eq!(transition.next_state, before);
+        } else {
+            prop_assert_eq!(transition.history_events.len(), 1);
+            prop_assert!(matches!(
+                &transition.history_events[0].kind,
+                HistoryEventKind::WorkflowExecutionOptionsUpdated {
+                    priority: FieldChange::Set(value),
+                    ..
+                } if value == &requested
+            ), "changed Priority must be recorded");
+            let pending = transition.next_state.pending_workflow_task.as_ref().unwrap();
+            prop_assert_ne!(pending.logical_seq, old_seq);
+            prop_assert_eq!(transition.dispatch_ops.len(), 1);
+            prop_assert!(matches!(
+                &transition.dispatch_ops[0],
+                DispatchOp::EnqueueWorkflowTask {
+                    logical_seq,
+                    priority: Some(value),
+                    ..
+                } if logical_seq == &pending.logical_seq && value == &requested
+            ), "replacement dispatch must carry the new Priority");
+            let reject = kernel()
+                .apply(
+                    LoadedRun::Existing(transition.next_state.clone()),
+                    Command::WorkflowTaskStarted(StartWorkflowTaskRequest {
+                        logical_seq: old_seq,
+                        worker_identity: WorkerIdentity("stale-worker".into()),
+                        request_id: "stale-priority-task".into(),
+                        history_size_bytes: 0,
+                        suggest_continue_as_new: false,
+                        deployment_transition: None,
+                        deployment_transition_revision_number: None,
+                        polled_task_queue: TaskQueueName("queue".into()),
+                        now,
+                        target_version_changed_enabled: false,
+                        target_deployment_version: None,
+                    }),
+                )
+                .unwrap_err();
+            prop_assert!(
+                matches!(reject, Reject::WorkflowTaskSeqMismatch { .. }),
+                "old logical sequence must be stale"
+            );
+        }
+    }
+
+    // Feature: task-queue-priority-fairness, Property 12
+    #[test]
+    fn property_activity_priority_update_fences_and_restores(
+        workflow_priority in arb_priority(),
+        original in arb_priority(),
+        replacement in arb_priority_value(),
+    ) {
+        let now = fixed_now();
+        let mut state = with_activity(make_open_state(now), "priority-activity");
+        state.priority = workflow_priority.clone();
+        let activity = state
+            .activities
+            .get_mut("priority-activity")
+            .expect("fixture activity");
+        activity.priority = original.clone();
+        let old_stamp = activity.stamp;
+
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::UpdateActivityOptions(UpdateActivityOptionsRequest {
+                    target: ActivityControlTarget::Id("priority-activity".into()),
+                    task_queue: FieldChange::Unchanged,
+                    schedule_to_close_timeout: FieldChange::Unchanged,
+                    schedule_to_start_timeout: FieldChange::Unchanged,
+                    start_to_close_timeout: FieldChange::Unchanged,
+                    heartbeat_timeout: FieldChange::Unchanged,
+                    retry_policy: Default::default(),
+                    original_options: BTreeMap::new(),
+                    restore_original_options: false,
+                    reschedule_at: BTreeMap::from([("priority-activity".into(), now)]),
+                    request: request_context("activity-priority-update", now),
+                    now,
+                    priority: ActivityPriorityPatch::Replace(Some(replacement.clone())),
+                }),
+            )
+            .unwrap();
+        let updated = transition
+            .next_state
+            .activities
+            .get("priority-activity")
+            .expect("updated activity");
+        prop_assert_eq!(updated.priority.as_ref(), Some(&replacement));
+        prop_assert_eq!(updated.stamp, old_stamp + 1);
+        let expected = merge_priority(workflow_priority.as_ref(), Some(&replacement));
+        prop_assert!(matches!(
+            transition.dispatch_ops.as_slice(),
+            [DispatchOp::EnqueueActivityTask {
+                stamp,
+                priority,
+                ..
+            }] if *stamp == old_stamp + 1 && priority == &expected
+        ), "replacement activity dispatch must carry the new stamp and Priority");
+
+        let restore = kernel()
+            .apply(
+                LoadedRun::Existing(transition.next_state),
+                Command::UpdateActivityOptions(UpdateActivityOptionsRequest {
+                    target: ActivityControlTarget::Id("priority-activity".into()),
+                    task_queue: FieldChange::Unchanged,
+                    schedule_to_close_timeout: FieldChange::Unchanged,
+                    schedule_to_start_timeout: FieldChange::Unchanged,
+                    start_to_close_timeout: FieldChange::Unchanged,
+                    heartbeat_timeout: FieldChange::Unchanged,
+                    retry_policy: Default::default(),
+                    original_options: BTreeMap::from([(
+                        "priority-activity".into(),
+                        tokeira_kernel::ActivityOriginalOptions {
+                            task_queue: TaskQueueName("activity-q".into()),
+                            schedule_to_close_timeout: Some(Duration::minutes(2)),
+                            schedule_to_start_timeout: Some(Duration::seconds(30)),
+                            start_to_close_timeout: Some(Duration::minutes(1)),
+                            heartbeat_timeout: Some(Duration::seconds(20)),
+                            retry_policy: None,
+                            priority: original.clone(),
+                        },
+                    )]),
+                    restore_original_options: true,
+                    reschedule_at: BTreeMap::from([("priority-activity".into(), now)]),
+                    request: request_context("activity-priority-restore", now),
+                    now,
+                    priority: ActivityPriorityPatch::Unchanged,
+                }),
+            )
+            .unwrap();
+        prop_assert_eq!(
+            &restore
+                .next_state
+                .activities
+                .get("priority-activity")
+                .expect("restored activity")
+                .priority,
+            &original
+        );
+    }
+
+    // Feature: task-queue-priority-fairness, Property 12
+    #[test]
+    fn property_activity_nested_priority_merges_per_match_and_always_fences(
+        first in arb_priority(),
+        second in arb_priority(),
+        selected_field in 0u8..3,
+        replacement_key in 0i32..100,
+        replacement_fairness_key in arb_small_string(),
+        replacement_weight in 0.1f32..10.0,
+    ) {
+        let now = fixed_now();
+        let mut state = with_activity(
+            with_activity(make_open_state(now), "priority-a"),
+            "priority-b",
+        );
+        state.activities.get_mut("priority-a").unwrap().priority = first.clone();
+        state.activities.get_mut("priority-b").unwrap().priority = second.clone();
+        let patch = ActivityPriorityPatch::Patch {
+            priority_key: (selected_field == 0).then_some(replacement_key),
+            fairness_key: (selected_field == 1).then(|| replacement_fairness_key.clone()),
+            fairness_weight: (selected_field == 2).then_some(replacement_weight),
+        };
+        let mut expected_first = first;
+        let mut expected_second = second;
+        patch.apply_to(&mut expected_first);
+        patch.apply_to(&mut expected_second);
+
+        let transition = kernel()
+            .apply(
+                LoadedRun::Existing(state),
+                Command::UpdateActivityOptions(UpdateActivityOptionsRequest {
+                    target: ActivityControlTarget::Type("activity-type".into()),
+                    task_queue: FieldChange::Unchanged,
+                    schedule_to_close_timeout: FieldChange::Unchanged,
+                    schedule_to_start_timeout: FieldChange::Unchanged,
+                    start_to_close_timeout: FieldChange::Unchanged,
+                    heartbeat_timeout: FieldChange::Unchanged,
+                    retry_policy: Default::default(),
+                    original_options: BTreeMap::new(),
+                    restore_original_options: false,
+                    reschedule_at: BTreeMap::from([
+                        ("priority-a".into(), now),
+                        ("priority-b".into(), now),
+                    ]),
+                    request: request_context("activity-priority-nested", now),
+                    now,
+                    priority: patch,
+                }),
+            )
+            .unwrap();
+        let first_after = transition.next_state.activities.get("priority-a").unwrap();
+        let second_after = transition.next_state.activities.get("priority-b").unwrap();
+        prop_assert_eq!(&first_after.priority, &expected_first);
+        prop_assert_eq!(&second_after.priority, &expected_second);
+        prop_assert_eq!(first_after.stamp, 1);
+        prop_assert_eq!(second_after.stamp, 1);
+        prop_assert_eq!(transition.dispatch_ops.len(), 2);
+
+        let equivalent = match selected_field {
+            0 => ActivityPriorityPatch::Patch {
+                priority_key: Some(
+                    first_after
+                        .priority
+                        .as_ref()
+                        .map_or(0, |priority| priority.priority_key),
+                ),
+                fairness_key: None,
+                fairness_weight: None,
+            },
+            1 => ActivityPriorityPatch::Patch {
+                priority_key: None,
+                fairness_key: Some(
+                    first_after
+                        .priority
+                        .as_ref()
+                        .map_or_else(String::new, |priority| priority.fairness_key.clone()),
+                ),
+                fairness_weight: None,
+            },
+            _ => ActivityPriorityPatch::Patch {
+                priority_key: None,
+                fairness_key: None,
+                fairness_weight: Some(
+                    first_after
+                        .priority
+                        .as_ref()
+                        .map_or(0.0, |priority| priority.fairness_weight),
+                ),
+            },
+        };
+        let equivalent_transition = kernel()
+            .apply(
+                LoadedRun::Existing(transition.next_state),
+                Command::UpdateActivityOptions(UpdateActivityOptionsRequest {
+                    target: ActivityControlTarget::Id("priority-a".into()),
+                    task_queue: FieldChange::Unchanged,
+                    schedule_to_close_timeout: FieldChange::Unchanged,
+                    schedule_to_start_timeout: FieldChange::Unchanged,
+                    start_to_close_timeout: FieldChange::Unchanged,
+                    heartbeat_timeout: FieldChange::Unchanged,
+                    retry_policy: Default::default(),
+                    original_options: BTreeMap::new(),
+                    restore_original_options: false,
+                    reschedule_at: BTreeMap::from([("priority-a".into(), now)]),
+                    request: request_context("activity-priority-equivalent", now),
+                    now,
+                    priority: equivalent,
+                }),
+            )
+            .unwrap();
+        prop_assert_eq!(
+            equivalent_transition
+                .next_state
+                .activities
+                .get("priority-a")
+                .unwrap()
+                .stamp,
+            2
+        );
+        prop_assert_eq!(equivalent_transition.dispatch_ops.len(), 1);
+    }
+
+    // Feature: task-queue-priority-fairness, Property 17
+    #[test]
+    fn property_priority_transition_is_deterministic_and_does_not_move_the_run(
+        priority in arb_priority_value(),
+    ) {
+        let now = fixed_now();
+        let state = with_pending_wft(make_open_state(now), 123, None, 1);
+        let command = workflow_priority_update(priority, now);
+
+        let first = kernel()
+            .apply(LoadedRun::Existing(state.clone()), command.clone())
+            .unwrap();
+        let second = kernel()
+            .apply(LoadedRun::Existing(state.clone()), command)
+            .unwrap();
+
+        prop_assert_eq!(&first, &second);
+        prop_assert_eq!(first.next_state.run_key, state.run_key);
+        prop_assert_eq!(&first.next_state.task_queue, &state.task_queue);
+        prop_assert!(first.dispatch_ops.iter().all(|op| match op {
+            DispatchOp::EnqueueWorkflowTask { queue, .. } => {
+                queue.namespace_id == state.namespace_id
+                    && queue.task_queue == state.task_queue
+            }
+            _ => true,
+        }), "Priority must not change task-queue placement");
+    }
+}
+
 // Properties 15, 23, and 24 are deterministic single-case checks, so they live
 // outside the proptest! block.
 #[test]
@@ -4547,6 +5042,7 @@ proptest! {
                     cron_schedule: None,
                     parent_close_policy,
                     reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+                    priority: None,
                 }],
                 force_new_workflow_task: false,
                 limits: Default::default(),
@@ -5323,6 +5819,7 @@ proptest! {
                 attached_completion_callbacks,
                 attached_links,
                 attached_request_id,
+                priority,
             } => {
                 prop_assert_eq!(identity, req.request.caller_identity.as_deref().unwrap_or_default());
                 let expected_versioning_override = match &req.versioning_override {
@@ -5342,6 +5839,7 @@ proptest! {
                 );
                 prop_assert_eq!(attached_links, &req.attached_links);
                 prop_assert_eq!(attached_request_id, &req.attached_request_id);
+                prop_assert_eq!(priority, &FieldChange::Unchanged);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -5431,6 +5929,7 @@ proptest! {
             attached_request_id: None,
             request: request_context("implied", now),
             now,
+            priority: FieldChange::Unchanged,
         });
 
         if pinned_before_update {
@@ -5486,6 +5985,7 @@ proptest! {
                     attached_request_id: None,
                     request: request_context("noop", now),
                     now,
+                    priority: FieldChange::Unchanged,
                 }),
             )
             .unwrap();

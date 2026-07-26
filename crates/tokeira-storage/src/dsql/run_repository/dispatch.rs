@@ -1,6 +1,59 @@
 use super::*;
 
+const BACKLOG_STATS_BY_PRIORITY_SQL: &str = "
+    SELECT priority_key, COUNT(*), MIN(scheduled_at)
+    FROM dispatch_backlog
+    WHERE queue_namespace = $1
+      AND queue_name = $2
+      AND task_kind = $3
+      AND deployment IS NOT DISTINCT FROM $4
+      AND build_id IS NOT DISTINCT FROM $5
+    GROUP BY priority_key";
+
+const DRAIN_BACKLOG_SQL: &str = "
+    SELECT key, run_key, payload_data, scheduled_at, priority_key, fair_pass,
+           insertion_tie, task_kind, deployment, build_id
+    FROM dispatch_backlog
+    WHERE queue_namespace = $1
+      AND queue_name = $2
+      AND task_kind = $3
+      AND deployment IS NOT DISTINCT FROM $4
+      AND build_id IS NOT DISTINCT FROM $5
+    ORDER BY priority_key ASC, fair_pass ASC, insertion_tie ASC
+    LIMIT $6";
+
 impl DsqlRunRepository {
+    pub(super) async fn do_backlog_stats_by_priority(
+        &self,
+        queue: &QueueKey,
+    ) -> Result<std::collections::BTreeMap<i16, crate::BacklogBandStats>> {
+        record_dsql_operation!(self, "backlog_stats_by_priority", None, {
+            let mut permit = self.director.acquire(DbClass::Read).await?;
+            let deployment = queue.deployment.as_ref().map(|value| value.0.as_str());
+            let build_id = queue.build_id.as_ref().map(|value| value.0.as_str());
+            let rows =
+                sqlx::query_as::<_, (i16, i64, OffsetDateTime)>(BACKLOG_STATS_BY_PRIORITY_SQL)
+                    .bind(queue.namespace_id.0)
+                    .bind(&queue.task_queue.0)
+                    .bind(queue.task_kind.to_db_smallint())
+                    .bind(deployment)
+                    .bind(build_id)
+                    .fetch_all(permit.connection()?)
+                    .await?;
+            rows.into_iter()
+                .map(|(priority_key, count, oldest_scheduled_at)| {
+                    Ok((
+                        priority_key,
+                        crate::BacklogBandStats {
+                            count: usize::try_from(count)?,
+                            oldest_scheduled_at,
+                        },
+                    ))
+                })
+                .collect()
+        })
+    }
+
     #[instrument(name = "dsql.list_dispatchable_workflow_tasks", skip(self), fields(namespace_id = %queue.namespace_id.0, task_queue = %queue.task_queue.0, limit))]
     pub(super) async fn do_list_dispatchable_workflow_tasks(
         &self,
@@ -53,12 +106,13 @@ impl DsqlRunRepository {
                     entry.queue.task_kind,
                     deployment,
                     build_id,
-                    entry.insertion_seq,
+                    entry.run_key,
+                    &entry.payload,
                 );
                 sqlx::query(
                 "INSERT INTO dispatch_backlog
-                 (key, partition_id, queue_namespace, queue_name, task_kind, deployment, build_id, insertion_seq, run_key, payload_data, scheduled_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 (key, partition_id, queue_namespace, queue_name, task_kind, deployment, build_id, priority_key, fair_pass, insertion_tie, run_key, payload_data, scheduled_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             )
             .bind(key)
             .bind(i32::try_from(partition_id)?)
@@ -67,9 +121,17 @@ impl DsqlRunRepository {
             .bind(entry.queue.task_kind.to_db_smallint())
             .bind(deployment)
             .bind(build_id)
-            .bind(convert::i64_from_u64(entry.insertion_seq, "dispatch_backlog.insertion_seq")?)
+            .bind(entry.order.priority_key)
+            .bind(entry.order.fair_pass)
+            .bind(convert::i64_from_u64(
+                entry.order.insertion_tie,
+                "dispatch_backlog.insertion_tie",
+            )?)
             .bind(entry.run_key.0)
-            .bind(codec::encode_backlog_payload(&entry.payload)?)
+            .bind(codec::encode_backlog_payload(
+                &entry.payload,
+                entry.priority.as_ref(),
+            )?)
             .bind(entry.scheduled_at)
             .execute(&mut *tx)
             .await?;
@@ -96,25 +158,29 @@ impl DsqlRunRepository {
             let mut tx = permit.connection()?.begin().await?;
             let deployment = queue.deployment.as_ref().map(|value| value.0.as_str());
             let build_id = queue.build_id.as_ref().map(|value| value.0.as_str());
-            let rows = sqlx::query_as::<_, (Uuid, Uuid, Vec<u8>, OffsetDateTime, i64, i16, Option<String>, Option<String>)>(
-            "SELECT key, run_key, payload_data, scheduled_at, insertion_seq, task_kind, deployment, build_id
-             FROM dispatch_backlog
-             WHERE queue_namespace = $1
-               AND queue_name = $2
-               AND task_kind = $3
-               AND deployment IS NOT DISTINCT FROM $4
-               AND build_id IS NOT DISTINCT FROM $5
-             ORDER BY insertion_seq ASC
-             LIMIT $6",
-        )
-        .bind(queue.namespace_id.0)
-        .bind(&queue.task_queue.0)
-        .bind(queue.task_kind.to_db_smallint())
-        .bind(deployment)
-        .bind(build_id)
-        .bind(i64::try_from(limit)?)
-        .fetch_all(&mut *tx)
-        .await?;
+            let rows = sqlx::query_as::<
+                _,
+                (
+                    Uuid,
+                    Uuid,
+                    Vec<u8>,
+                    OffsetDateTime,
+                    i16,
+                    i64,
+                    i64,
+                    i16,
+                    Option<String>,
+                    Option<String>,
+                ),
+            >(DRAIN_BACKLOG_SQL)
+            .bind(queue.namespace_id.0)
+            .bind(&queue.task_queue.0)
+            .bind(queue.task_kind.to_db_smallint())
+            .bind(deployment)
+            .bind(build_id)
+            .bind(i64::try_from(limit)?)
+            .fetch_all(&mut *tx)
+            .await?;
             metrics::record_dsql_rows_read("drain_backlog", rows.len());
 
             let mut drained = Vec::with_capacity(rows.len());
@@ -123,7 +189,9 @@ impl DsqlRunRepository {
                 run_key,
                 payload_data,
                 scheduled_at,
-                insertion_seq,
+                priority_key,
+                fair_pass,
+                insertion_tie,
                 task_kind_raw,
                 stored_deployment,
                 stored_build_id,
@@ -133,6 +201,7 @@ impl DsqlRunRepository {
                     .bind(key)
                     .execute(&mut *tx)
                     .await?;
+                let decoded = codec::decode_backlog_payload(&payload_data)?;
                 drained.push(BacklogEntry {
                     run_key: RunKey(run_key),
                     queue: QueueKey {
@@ -142,12 +211,17 @@ impl DsqlRunRepository {
                         deployment: stored_deployment.map(DeploymentId),
                         build_id: stored_build_id.map(BuildId),
                     },
-                    payload: codec::decode_backlog_payload(&payload_data)?,
+                    payload: decoded.0,
+                    priority: decoded.1,
                     scheduled_at,
-                    insertion_seq: convert::u64_from_i64(
-                        insertion_seq,
-                        "dispatch_backlog.insertion_seq",
-                    )?,
+                    order: DeliveryOrder {
+                        priority_key,
+                        fair_pass,
+                        insertion_tie: convert::u64_from_i64(
+                            insertion_tie,
+                            "dispatch_backlog.insertion_tie",
+                        )?,
+                    },
                 });
             }
             tx.commit().await?;
@@ -220,4 +294,18 @@ pub(super) fn collect_dispatchable_workflow_tasks(
         }
     }
     Ok(tasks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BACKLOG_STATS_BY_PRIORITY_SQL, DRAIN_BACKLOG_SQL};
+
+    #[test]
+    fn priority_backlog_queries_keep_grouping_and_order_shape() {
+        assert!(BACKLOG_STATS_BY_PRIORITY_SQL.contains("GROUP BY priority_key"));
+        assert!(
+            DRAIN_BACKLOG_SQL
+                .contains("ORDER BY priority_key ASC, fair_pass ASC, insertion_tie ASC")
+        );
+    }
 }

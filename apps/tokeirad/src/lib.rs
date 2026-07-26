@@ -965,7 +965,8 @@ where
     // The edge always exposes Worker Deployment v2 RPCs. Wiring the
     // repository here keeps their registry durable for both in-memory and
     // DSQL backends instead of falling back to a detached test registry.
-    .with_worker_deployment_repository(worker_deployment_repository);
+    .with_worker_deployment_repository(worker_deployment_repository)
+    .with_task_queue_config_store(task_queue_config_store.clone());
     let runtime = Arc::new(runtime);
 
     if dsql_endpoint.is_some()
@@ -2034,6 +2035,13 @@ where
                                     start_to_close_timeout: activity.start_to_close_timeout,
                                     heartbeat_timeout: activity.heartbeat_timeout,
                                     retry_policy: activity.retry_policy.clone(),
+                                    priority: activity.priority.as_ref().map(|priority| {
+                                        tokeira_edge::translate::Priority {
+                                            priority_key: priority.priority_key,
+                                            fairness_key: priority.fairness_key.clone(),
+                                            fairness_weight: priority.fairness_weight,
+                                        }
+                                    }),
                                 },
                             },
                         )
@@ -2081,6 +2089,13 @@ where
                     versioning_info: versioning_info
                         .filter(|info| info.has_execution_versioning_info()),
                     worker_deployment_name: state.worker_deployment_name.clone(),
+                    priority: state.priority.as_ref().map(|priority| {
+                        tokeira_edge::translate::Priority {
+                            priority_key: priority.priority_key,
+                            fairness_key: priority.fairness_key.clone(),
+                            fairness_weight: priority.fairness_weight,
+                        }
+                    }),
                     auto_reset_points: state.auto_reset_points.clone(),
                     most_recent_worker_version_stamp,
                     request_id_infos: state.request_id_infos.clone(),

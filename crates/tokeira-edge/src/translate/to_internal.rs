@@ -26,6 +26,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct PollInternalRequest {
     pub queue: QueueKey,
+    pub normal_queue: Option<QueueKey>,
     pub worker_identity: WorkerIdentity,
     /// Worker-advertised matching ceiling, superseded by API queue config.
     pub worker_rate_limit: Option<f64>,
@@ -385,14 +386,23 @@ pub fn signal_request(req: SignalWorkflowExecutionRequest, context: &EdgeContext
 }
 
 pub fn poll_request(req: PollWorkflowTaskQueueRequest) -> PollInternalRequest {
+    let namespace_id = namespace_id_for(&req.namespace);
+    let normal_queue = req.normal_task_queue.map(|task_queue| QueueKey {
+        namespace_id,
+        task_queue: TaskQueueName(task_queue),
+        task_kind: TaskKind::Workflow,
+        deployment: req.deployment.clone(),
+        build_id: req.build_id.clone(),
+    });
     PollInternalRequest {
         queue: QueueKey {
-            namespace_id: namespace_id_for(&req.namespace),
+            namespace_id,
             task_queue: TaskQueueName(req.task_queue),
             task_kind: TaskKind::Workflow,
             deployment: req.deployment,
             build_id: req.build_id,
         },
+        normal_queue,
         worker_identity: WorkerIdentity(req.worker_identity),
         worker_rate_limit: None,
         timeout: req.timeout,
@@ -447,6 +457,7 @@ pub fn poll_activity_request(
         worker_identity: WorkerIdentity(req.worker_identity),
         worker_rate_limit: req.worker_rate_limit,
         timeout: req.timeout,
+        normal_queue: None,
     }
 }
 

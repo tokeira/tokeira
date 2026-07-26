@@ -378,6 +378,7 @@ async fn write_transition(
             attempt,
             dispatch_revision,
             stamp,
+            priority,
             ..
         } = op
         {
@@ -394,6 +395,7 @@ async fn write_transition(
                 *attempt,
                 *dispatch_revision,
                 *stamp,
+                priority.as_ref(),
             )
             .await?;
         }
@@ -569,6 +571,7 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     attempt: u32,
     dispatch_revision: i64,
     stamp: u64,
+    priority: Option<&tokeira_kernel::Priority>,
 ) -> Result<()> {
     let key = DsqlRunRepository::activity_dispatch_key(run_key, activity_id);
     let deployment = queue.deployment.as_ref().map(|value| value.0.as_str());
@@ -576,8 +579,9 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     sqlx::query(
         "INSERT INTO activity_dispatch
          (key, run_key, activity_id, shard_id, queue_namespace, queue_name, task_kind,
-          deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp, input_data, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now())
+          deployment, build_id, schedule_event_id, attempt, dispatch_revision, stamp, input_data,
+          priority_data, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
          ON CONFLICT (key) DO UPDATE SET
              shard_id = EXCLUDED.shard_id,
              queue_namespace = EXCLUDED.queue_namespace,
@@ -589,7 +593,8 @@ async fn upsert_activity_dispatch_from_dispatch_op(
              attempt = EXCLUDED.attempt,
              dispatch_revision = EXCLUDED.dispatch_revision,
              stamp = EXCLUDED.stamp,
-             input_data = EXCLUDED.input_data",
+             input_data = EXCLUDED.input_data,
+             priority_data = EXCLUDED.priority_data",
     )
     .bind(key)
     .bind(run_key.0)
@@ -605,6 +610,7 @@ async fn upsert_activity_dispatch_from_dispatch_op(
     .bind(dispatch_revision)
     .bind(i64::try_from(stamp).unwrap_or(i64::MAX))
     .bind(codec::encode_payloads(input)?)
+    .bind(priority.map(codec::encode_priority).transpose()?)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -634,7 +640,8 @@ async fn update_existing_activity_dispatch(
              attempt = $9,
              dispatch_revision = $10,
              stamp = $11,
-             input_data = $12
+             input_data = $12,
+             priority_data = $13
          WHERE key = $1",
     )
     .bind(key)
@@ -658,6 +665,12 @@ async fn update_existing_activity_dispatch(
     // spuriously fenced at start.
     .bind(i64::try_from(activity.stamp).unwrap_or(i64::MAX))
     .bind(codec::encode_payloads(&activity.input)?)
+    .bind(
+        merge_priority(state.priority.as_ref(), activity.priority.as_ref())
+            .as_ref()
+            .map(codec::encode_priority)
+            .transpose()?,
+    )
     .execute(&mut **tx)
     .await?;
     Ok(())

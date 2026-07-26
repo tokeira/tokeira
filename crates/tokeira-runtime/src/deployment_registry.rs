@@ -2356,6 +2356,8 @@ pub struct VersionTaskQueueView {
     /// Live matching backlog, present only when the Describe request asked for
     /// task-queue stats.
     pub stats: Option<crate::broker::BrokerBacklogStats>,
+    /// The same backlog snapshot grouped by effective priority band.
+    pub stats_by_priority_key: Option<crate::PriorityBacklogStats>,
 }
 
 /// Page of Worker Deployment summaries.
@@ -2465,6 +2467,7 @@ pub fn version_view_with_stats(
                 task_queue,
                 poller_count: report_task_queue_stats.then_some(0),
                 stats: report_task_queue_stats.then_some(Default::default()),
+                stats_by_priority_key: report_task_queue_stats.then_some(Default::default()),
             })
             .collect(),
     }

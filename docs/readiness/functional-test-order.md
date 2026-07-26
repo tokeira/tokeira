@@ -113,13 +113,17 @@ dependency then cost.
 | 43 | `TestHttpApiTestSuite` | HTTP/gRPC-gateway surface. **CLEAN twice: 11 pass / 0 fail / 0 skip.** |
 | 44 | `TestClientMiscTestSuite`, `TestClientDataConverterTestSuite` | Client-visible misc + data-converter passthrough. |
 
+### Tier 10 — Task-queue delivery policy
+
+| # | Suite | Exercises |
+|---|-------|-----------|
+| 45 | `TestPrioritySuite`, `TestFairnessSuite`, `TestFairnessAutoEnableSuite` | Task Queue Priority, sticky/normal ordering, opt-in User Fairness, auto-enable behavior, and backlog migration observations. |
+
 ## Deferred — in v1.31.0 but blocked on a decision/research
 
-Do not run as conformance gates until the owning decision lands.
-
-| Suite | Blocked on |
-|-------|-----------|
-| `TestPrioritySuite`, `TestFairnessSuite`, `TestFairnessAutoEnableSuite` | Task Queue Priority & Fairness — architecture research (`delivery.md`). |
+No public v1.31.0 functional suite is currently deferred on a surface decision. Task Queue Priority
+and Fairness moved into Tier 10 after the delivery-plane decision; its internal matcher-topology
+leaves are classified individually rather than deferring the public ordering surface.
 
 `TestVersioningFunctionalSuite` (406 tests) is no longer deferred — it is **out of surface** by the
 resolved V1/V2 decision (`docs/conformance/v1.31.0/worker-versioning.md`): the suite only passes

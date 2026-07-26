@@ -936,6 +936,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             heartbeat_timeout,
             header,
             retry_policy,
+            priority,
         } => Attributes::ActivityTaskScheduledEventAttributes(
             history::ActivityTaskScheduledEventAttributes {
                 activity_id: activity_id.clone(),
@@ -951,6 +952,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 heartbeat_timeout: to_opt_proto_duration(*heartbeat_timeout),
                 retry_policy: retry_policy.as_ref().map(retry_policy_to_proto),
                 workflow_task_completed_event_id: *workflow_task_completed_event_id,
+                priority: priority.as_ref().map(priority_to_proto),
                 ..Default::default()
             },
         ),
@@ -1150,6 +1152,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             retry_policy,
             cron_schedule,
             parent_close_policy,
+            priority,
         } => Attributes::StartChildWorkflowExecutionInitiatedEventAttributes(
             history::StartChildWorkflowExecutionInitiatedEventAttributes {
                 namespace: namespace.clone().unwrap_or_default(),
@@ -1170,6 +1173,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 cron_schedule: cron_schedule.clone().unwrap_or_default(),
                 workflow_task_completed_event_id: *workflow_task_completed_event_id,
                 parent_close_policy: parent_close_policy_i32(parent_close_policy),
+                priority: priority.as_ref().map(priority_to_proto),
                 ..Default::default()
             },
         ),
@@ -1806,6 +1810,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
             attached_completion_callbacks,
             attached_links,
             attached_request_id,
+            priority,
         } => {
             // Serialize the versioning override — the option `UpdateWorkflowExecutionOptions`
             // mutates. `Set` carries the value; `Clear` records `unset_versioning_override`
@@ -1814,6 +1819,14 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                 FieldChange::Set(value) => (Some(versioning_override_from_kernel(value)), false),
                 FieldChange::Clear => (None, true),
                 FieldChange::Unchanged => (None, false),
+            };
+            // v1.31.0 records the fully merged Priority value on every priority
+            // mutation. A whole-field clear is represented by an absent value,
+            // while nested clears remain an explicit zero/empty field in the
+            // merged Priority (`updateworkflowoptions.MergeAndApply @ v1.31.0`).
+            let priority = match priority {
+                FieldChange::Set(value) => Some(priority_to_proto(value)),
+                FieldChange::Clear | FieldChange::Unchanged => None,
             };
             // The on-conflict attachment fields land IN the attributes:
             // `CreateWorkflowExecutionOptionsUpdatedEvent` puts AttachedRequestId
@@ -1836,6 +1849,7 @@ fn attributes_for_kind(event: &HistoryEvent) -> Attributes {
                         .iter()
                         .map(completion_callback_to_proto)
                         .collect(),
+                    priority,
                     ..Default::default()
                 },
             )
@@ -2373,6 +2387,7 @@ mod tests {
                         schedule_to_start_timeout: s2s,
                         start_to_close_timeout: stc,
                         heartbeat_timeout: hb,
+                        priority: None,
                     }
                 },),
             ("[a-z]{1,6}", arb_payloads()).prop_map(|(aid, result)| {
@@ -2680,6 +2695,7 @@ mod tests {
                 attached_completion_callbacks: Vec::new(),
                 attached_links: Vec::new(),
                 attached_request_id: Some("req-attach".to_string()),
+                priority: tokeira_kernel::command::FieldChange::Unchanged,
             },
         };
 
@@ -2725,6 +2741,7 @@ mod tests {
                 attached_completion_callbacks: vec![callback],
                 attached_links: vec![link],
                 attached_request_id: Some("req-attach".to_string()),
+                priority: tokeira_kernel::command::FieldChange::Unchanged,
             },
         };
 
@@ -2755,6 +2772,7 @@ mod tests {
                 attached_completion_callbacks: Vec::new(),
                 attached_links: Vec::new(),
                 attached_request_id: None,
+                priority: tokeira_kernel::command::FieldChange::Unchanged,
             },
         };
         let bare_proto = history_event_to_proto(&bare);
@@ -3152,6 +3170,7 @@ mod tests {
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
+                priority: None,
             },
         };
         let proto = history_event_to_proto(&event);
@@ -3216,6 +3235,7 @@ mod tests {
                 retry_policy: None,
                 cron_schedule: None,
                 parent_close_policy: ParentClosePolicy::Terminate,
+                priority: None,
             },
         };
         let proto = history_event_to_proto(&event);
@@ -4006,6 +4026,7 @@ mod tests {
                     schedule_to_start_timeout: s2s,
                     start_to_close_timeout: stc,
                     heartbeat_timeout: hb,
+                    priority: None,
                 },
             };
             let proto = history_event_to_proto(&event);

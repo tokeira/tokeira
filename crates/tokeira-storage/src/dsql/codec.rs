@@ -9,10 +9,21 @@
 
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
-use tokeira_kernel::{ActivityState, HistoryEvent, ProjectionOp, TimerState, WorkflowState};
+use tokeira_kernel::{
+    ActivityState, HistoryEvent, ProjectionOp, TimerState, WorkflowState, state::Priority,
+};
 use tokeira_types::{EventPrincipal, Payloads, ProjectionCursor, WorkflowRuleRecord};
 
 use crate::{BacklogPayload, ProjectionContext, StoredWorkerDeployment};
+
+const BACKLOG_ENVELOPE_VERSION: u32 = 0x544B_4251;
+
+#[derive(Serialize, serde::Deserialize)]
+struct BacklogEnvelope {
+    version: u32,
+    payload: BacklogPayload,
+    priority: Option<Priority>,
+}
 
 /// Encode a persisted value with postcard.
 ///
@@ -84,14 +95,31 @@ pub fn decode_timer_state(bytes: &[u8]) -> Result<TimerState> {
     decode(bytes)
 }
 
-/// Serialize backlog payloads for the generic dispatch backlog table.
-pub fn encode_backlog_payload(payload: &BacklogPayload) -> Result<Vec<u8>> {
-    encode(payload)
+/// Serialize backlog payload and public delivery metadata for the generic backlog table.
+pub fn encode_backlog_payload(
+    payload: &BacklogPayload,
+    priority: Option<&Priority>,
+) -> Result<Vec<u8>> {
+    encode(&BacklogEnvelope {
+        version: BACKLOG_ENVELOPE_VERSION,
+        payload: payload.clone(),
+        priority: priority.cloned(),
+    })
 }
 
-/// Deserialize backlog payloads after a queue drain.
-pub fn decode_backlog_payload(bytes: &[u8]) -> Result<BacklogPayload> {
-    decode(bytes)
+/// Deserialize backlog payload and delivery metadata after a queue drain.
+///
+/// Before the schema baseline, rows contained a bare [`BacklogPayload`]. The
+/// explicit envelope marker prevents an old enum discriminant from being
+/// mistaken for the new shape, while the fallback keeps a real old byte fixture
+/// readable with default Priority.
+pub fn decode_backlog_payload(bytes: &[u8]) -> Result<(BacklogPayload, Option<Priority>)> {
+    if let Ok(envelope) = decode::<BacklogEnvelope>(bytes)
+        && envelope.version == BACKLOG_ENVELOPE_VERSION
+    {
+        return Ok((envelope.payload, envelope.priority));
+    }
+    decode(bytes).map(|payload| (payload, None))
 }
 
 /// Serialize activity input payloads for `activity_dispatch.input_data`.
@@ -105,6 +133,16 @@ pub fn encode_payloads(payloads: &Payloads) -> Result<Vec<u8>> {
 
 /// Deserialize activity input payloads from `activity_dispatch.input_data`.
 pub fn decode_payloads(bytes: &[u8]) -> Result<Payloads> {
+    decode(bytes)
+}
+
+/// Serialize effective activity dispatch Priority.
+pub fn encode_priority(priority: &Priority) -> Result<Vec<u8>> {
+    encode(priority)
+}
+
+/// Deserialize effective activity dispatch Priority.
+pub fn decode_priority(bytes: &[u8]) -> Result<Priority> {
     decode(bytes)
 }
 
@@ -338,14 +376,26 @@ mod tests {
             prop_assert_eq!(decoded, memo);
         }
 
+        // Feature: task-queue-priority-fairness, Property 8
         #[test]
-        fn backlog_payload_round_trips(logical_seq in 1u64..1_000_000) {
+        fn backlog_payload_round_trips(
+            logical_seq in 1u64..1_000_000,
+            priority in prop::option::of(
+                (0i32..100, "[a-z]{0,12}", 0.0f32..1000.0).prop_map(
+                    |(priority_key, fairness_key, fairness_weight)| Priority {
+                        priority_key,
+                        fairness_key,
+                        fairness_weight,
+                    },
+                ),
+            ),
+        ) {
             let payload = BacklogPayload::Workflow {
                 logical_seq: LogicalTaskSeq(logical_seq),
             };
-            let encoded = encode_backlog_payload(&payload).unwrap();
+            let encoded = encode_backlog_payload(&payload, priority.as_ref()).unwrap();
             let decoded = decode_backlog_payload(&encoded).unwrap();
-            prop_assert_eq!(decoded, payload);
+            prop_assert_eq!(decoded, (payload, priority));
         }
 
         #[test]
@@ -355,6 +405,16 @@ mod tests {
             let decoded = decode_payloads(&encoded).unwrap();
             prop_assert_eq!(decoded, payloads);
         }
+    }
+
+    #[test]
+    fn pre_priority_backlog_payload_bytes_decode_with_absent_priority() {
+        let payload = BacklogPayload::Workflow {
+            logical_seq: LogicalTaskSeq(17),
+        };
+        let old_bytes = encode(&payload).unwrap();
+
+        assert_eq!(decode_backlog_payload(&old_bytes).unwrap(), (payload, None));
     }
 
     prop_compose! {

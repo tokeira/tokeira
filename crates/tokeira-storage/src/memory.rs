@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokeira_kernel::{
     ActivityOp, BasicKernel, CallbackState, DispatchOp, LoadedRun, ReplayContext, TimerOp,
-    Transition, WorkflowState,
+    Transition, WorkflowState, merge_priority,
 };
 use tokeira_types::{
     ExecutionRef, ExecutionStatus, GenerationCounter, NamespaceId, ProjectionCursor, QueueKey,
@@ -26,6 +26,8 @@ use tokeira_types::{
 };
 use tokio::sync::Mutex;
 
+#[cfg(test)]
+use crate::DeliveryOrder;
 use crate::{
     api::{
         ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BudgetAllocationResult,
@@ -124,10 +126,8 @@ struct StoreState {
     /// paused, or workflow-paused activities can still have durable activity
     /// state while being intentionally absent from this map.
     activity_dispatch: HashMap<(RunKey, String), ActivityDispatchEntry>,
-    /// FIFO backlog for tasks that could not be immediately handed to a worker.
+    /// Ordered backlog for tasks that could not be immediately handed to a worker.
     dispatch_backlog: VecDeque<BacklogEntry>,
-    /// Monotonic insertion sequence assigned by `persist_to_backlog`.
-    backlog_next_seq: u64,
     /// Test hook for injecting OCC conflicts.
     conflict_injections: HashMap<RunKey, usize>,
     /// Current workflow-id conflict behavior for start transitions.
@@ -676,6 +676,8 @@ impl RunRepository for InMemoryStore {
                         // so a recovery-reconstructed task is never spuriously
                         // fenced at start.
                         entry.task.stamp = activity.stamp;
+                        entry.task.priority =
+                            merge_priority(state.priority.as_ref(), activity.priority.as_ref());
                         entry.schedule_to_close_timeout = activity.schedule_to_close_timeout;
                         entry.schedule_to_start_timeout = activity.schedule_to_start_timeout;
                         entry.start_to_close_timeout = activity.start_to_close_timeout;
@@ -721,6 +723,7 @@ impl RunRepository for InMemoryStore {
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
+                priority,
             } = op
             {
                 // Enqueue is the only state transition effect that creates an
@@ -738,6 +741,8 @@ impl RunRepository for InMemoryStore {
                             attempt: *attempt,
                             dispatch_revision: *dispatch_revision,
                             stamp: *stamp,
+                            priority: priority.clone(),
+                            order: None,
                         },
                         schedule_to_close_timeout: *schedule_to_close_timeout,
                         schedule_to_start_timeout: *schedule_to_start_timeout,
@@ -1121,30 +1126,52 @@ impl RunRepository for InMemoryStore {
 
     async fn persist_to_backlog(&self, entries: Vec<BacklogEntry>) -> Result<()> {
         let mut store = self.inner.lock().await;
-        for entry in entries {
-            let insertion_seq = store.backlog_next_seq;
-            store.backlog_next_seq += 1;
-            store.dispatch_backlog.push_back(BacklogEntry {
-                insertion_seq,
-                ..entry
-            });
-        }
+        store.dispatch_backlog.extend(entries);
         Ok(())
     }
 
     async fn drain_backlog(&self, queue: &QueueKey, limit: usize) -> Result<Vec<BacklogEntry>> {
         let mut store = self.inner.lock().await;
-        let mut drained = Vec::new();
+        let mut matching = Vec::new();
         let mut kept = VecDeque::new();
         while let Some(entry) = store.dispatch_backlog.pop_front() {
-            if drained.len() < limit && &entry.queue == queue {
-                drained.push(entry);
+            if &entry.queue == queue {
+                matching.push(entry);
             } else {
                 kept.push_back(entry);
             }
         }
+        matching.sort_by_key(|entry| entry.order);
+        let remaining = matching.split_off(limit.min(matching.len()));
+        let drained = matching;
+        kept.extend(remaining);
         store.dispatch_backlog = kept;
         Ok(drained)
+    }
+
+    async fn backlog_stats_by_priority(
+        &self,
+        queue: &QueueKey,
+    ) -> Result<std::collections::BTreeMap<i16, crate::BacklogBandStats>> {
+        let store = self.inner.lock().await;
+        let mut stats = std::collections::BTreeMap::<i16, crate::BacklogBandStats>::new();
+        for entry in store
+            .dispatch_backlog
+            .iter()
+            .filter(|entry| &entry.queue == queue)
+        {
+            stats
+                .entry(entry.order.priority_key)
+                .and_modify(|band| {
+                    band.count += 1;
+                    band.oldest_scheduled_at = band.oldest_scheduled_at.min(entry.scheduled_at);
+                })
+                .or_insert(crate::BacklogBandStats {
+                    count: 1,
+                    oldest_scheduled_at: entry.scheduled_at,
+                });
+        }
+        Ok(stats)
     }
 
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
@@ -2475,6 +2502,7 @@ mod tests {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         }
     }
 
@@ -2508,6 +2536,7 @@ mod tests {
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
+                priority: None,
             });
         store
             .commit_transition(run_key, transition, ShardEpoch::ZERO)
@@ -2566,6 +2595,7 @@ mod tests {
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
+                priority: None,
             });
         store
             .commit_transition(run_key, transition, ShardEpoch::ZERO)
@@ -2636,6 +2666,7 @@ mod tests {
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
+                priority: None,
             });
         store
             .commit_transition(run_key, transition, ShardEpoch::ZERO)
@@ -2699,6 +2730,7 @@ mod tests {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
+                    priority: None,
                 });
         }
         store
@@ -2776,6 +2808,7 @@ mod tests {
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
+                priority: None,
             });
         store
             .commit_transition(run_key, unpause_transition, ShardEpoch::ZERO)
@@ -2864,6 +2897,7 @@ mod tests {
                     schedule_to_start_timeout: Some(Duration::seconds(10)),
                     start_to_close_timeout: Some(Duration::seconds(20)),
                     heartbeat_timeout: Some(Duration::seconds(5)),
+                    priority: None,
                 });
 
                 let result = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
@@ -2909,6 +2943,7 @@ mod tests {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
+                    priority: None,
                 });
                 transition.activity_ops.push(ActivityOp::Upsert(activity_state(&activity_id)));
                 let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
@@ -2964,6 +2999,7 @@ mod tests {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
+                    priority: None,
                 });
                 first.activity_ops.push(ActivityOp::Upsert(activity_state(&activity_id)));
                 let _ = store.commit_transition(run_key, first, ShardEpoch::ZERO).await.unwrap();
@@ -2996,6 +3032,7 @@ mod tests {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
+                    priority: None,
                 });
                 let result = store.commit_transition(run_key, conflict, ShardEpoch::ZERO).await.unwrap();
                 assert!(matches!(result, CommitResult::Conflict { .. }));
@@ -3028,9 +3065,10 @@ mod tests {
                         dispatch_at: OffsetDateTime::UNIX_EPOCH,
                         schedule_to_close_timeout: None,
                         schedule_to_start_timeout: None,
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                    });
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                    priority: None,
+                });
                     let _ = store.commit_transition(run_key, transition, ShardEpoch::ZERO).await.unwrap();
                 }
 
@@ -3040,40 +3078,103 @@ mod tests {
             });
         }
 
+        // Feature: task-queue-priority-fairness, Property 9
         #[test]
-        fn property_backlog_insertion_and_drain_order(limit in 1usize..4usize) {
+        fn property_backlog_delivery_order_matches_reference(
+            orders in proptest::collection::vec((1i16..=5, 0i64..10_000, any::<u64>()), 0..32),
+            limit in 0usize..40,
+        ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let store = InMemoryStore::default();
                 let queue = sample_queue(TaskKind::Workflow);
-                let entries: Vec<_> = (0..5)
-                    .map(|idx| BacklogEntry {
+                let entries: Vec<_> = orders
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &(priority_key, fair_pass, insertion_tie))| BacklogEntry {
                         run_key: RunKey::new(),
                         queue: queue.clone(),
-                        payload: if idx % 2 == 0 {
-                            crate::api::BacklogPayload::Workflow {
-                                logical_seq: LogicalTaskSeq(idx as u64 + 1),
-                            }
-                        } else {
-                            crate::api::BacklogPayload::Activity {
-                                activity_id: format!("a{idx}"),
-                                input: tokeira_types::Payloads::default(),
-                                schedule_event_id: idx as i64,
-                                attempt: 1,
-                                dispatch_revision: 0,
-                                stamp: 0,
-                            }
+                        payload: crate::api::BacklogPayload::Workflow {
+                            logical_seq: LogicalTaskSeq(idx as u64 + 1),
                         },
+                        priority: None,
                         scheduled_at: fixed_now(),
-                        insertion_seq: 999,
+                        order: DeliveryOrder {
+                            priority_key,
+                            fair_pass,
+                            insertion_tie,
+                        },
                     })
                     .collect();
                 store.persist_to_backlog(entries).await.unwrap();
                 let drained = store.drain_backlog(&queue, limit).await.unwrap();
-                assert!(drained.len() <= limit);
-                for pair in drained.windows(2) {
-                    assert!(pair[0].insertion_seq < pair[1].insertion_seq);
-                }
+                let mut expected = orders
+                    .into_iter()
+                    .map(|(priority_key, fair_pass, insertion_tie)| DeliveryOrder {
+                        priority_key,
+                        fair_pass,
+                        insertion_tie,
+                    })
+                    .collect::<Vec<_>>();
+                expected.sort();
+                expected.truncate(limit);
+                let actual = drained.into_iter().map(|entry| entry.order).collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            });
+        }
+
+        // Feature: task-queue-priority-fairness, Property 15
+        #[test]
+        fn property_backlog_stats_group_exactly_once_by_priority(
+            priority_keys in proptest::collection::vec(1i16..=5, 0..64),
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let store = InMemoryStore::default();
+                let queue = sample_queue(TaskKind::Workflow);
+                let mut expected = std::collections::BTreeMap::<
+                    i16,
+                    (usize, OffsetDateTime),
+                >::new();
+                let entries = priority_keys
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, priority_key)| {
+                        let scheduled_at =
+                            fixed_now() + time::Duration::seconds(idx as i64);
+                        expected
+                            .entry(*priority_key)
+                            .and_modify(|band| {
+                                band.0 += 1;
+                                band.1 = band.1.min(scheduled_at);
+                            })
+                            .or_insert((1, scheduled_at));
+                        BacklogEntry {
+                            run_key: RunKey::new(),
+                            queue: queue.clone(),
+                            payload: crate::api::BacklogPayload::Workflow {
+                                logical_seq: LogicalTaskSeq(idx as u64 + 1),
+                            },
+                            priority: None,
+                            scheduled_at,
+                            order: DeliveryOrder {
+                                priority_key: *priority_key,
+                                fair_pass: idx as i64,
+                                insertion_tie: idx as u64,
+                            },
+                        }
+                    })
+                    .collect();
+                store.persist_to_backlog(entries).await.unwrap();
+
+                let actual = store.backlog_stats_by_priority(&queue).await.unwrap();
+                assert_eq!(
+                    actual
+                        .into_iter()
+                        .map(|(key, band)| (key, (band.count, band.oldest_scheduled_at)))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    expected
+                );
             });
         }
 
@@ -3294,8 +3395,9 @@ mod tests {
                             payload: crate::api::BacklogPayload::Workflow {
                                 logical_seq: LogicalTaskSeq::ONE,
                             },
+                            priority: None,
                             scheduled_at: fixed_now(),
-                            insertion_seq: 123,
+                            order: DeliveryOrder::default(),
                         })
                         .collect::<Vec<_>>()
                 };
@@ -3445,7 +3547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backlog_insertion_order_matches_input_order() {
+    async fn backlog_delivery_order_overrides_input_order() {
         let store = InMemoryStore::default();
         let queue = sample_queue(TaskKind::Workflow);
         store
@@ -3456,8 +3558,13 @@ mod tests {
                     payload: crate::api::BacklogPayload::Workflow {
                         logical_seq: LogicalTaskSeq::ONE,
                     },
+                    priority: None,
                     scheduled_at: fixed_now(),
-                    insertion_seq: 999,
+                    order: DeliveryOrder {
+                        priority_key: 3,
+                        fair_pass: 0,
+                        insertion_tie: 1,
+                    },
                 },
                 BacklogEntry {
                     run_key: RunKey::new(),
@@ -3470,16 +3577,27 @@ mod tests {
                         dispatch_revision: 0,
                         stamp: 0,
                     },
+                    priority: None,
                     scheduled_at: fixed_now(),
-                    insertion_seq: 999,
+                    order: DeliveryOrder {
+                        priority_key: 3,
+                        fair_pass: 0,
+                        insertion_tie: 0,
+                    },
                 },
             ])
             .await
             .unwrap();
         let drained = store.drain_backlog(&queue, 10).await.unwrap();
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].insertion_seq, 0);
-        assert_eq!(drained[1].insertion_seq, 1);
+        assert!(matches!(
+            drained[0].payload,
+            crate::api::BacklogPayload::Activity { .. }
+        ));
+        assert!(matches!(
+            drained[1].payload,
+            crate::api::BacklogPayload::Workflow { .. }
+        ));
     }
 
     #[tokio::test]
@@ -3495,6 +3613,7 @@ mod tests {
                 logical_seq: LogicalTaskSeq(1),
                 sticky_preferred: None,
                 normal_task_queue: None,
+                priority: None,
             });
         transition
             .dispatch_ops
@@ -3511,6 +3630,7 @@ mod tests {
                 schedule_to_start_timeout: None,
                 start_to_close_timeout: None,
                 heartbeat_timeout: None,
+                priority: None,
             });
         let _ = store
             .commit_transition(run_key, transition, ShardEpoch::ZERO)
@@ -3557,6 +3677,7 @@ mod tests {
             schedule_to_start_timeout: None,
             start_to_close_timeout: None,
             heartbeat_timeout: None,
+            priority: None,
         });
         first
             .activity_ops
@@ -3719,6 +3840,7 @@ mod tests {
                     schedule_to_start_timeout: Some(Duration::seconds(10)),
                     start_to_close_timeout: Some(Duration::seconds(20)),
                     heartbeat_timeout: Some(Duration::seconds(5)),
+                    priority: None,
                 },
             ),
             history_event(
@@ -4205,6 +4327,7 @@ mod tests {
                         started_event_id: None,
                         pause_info: None,
                         stamp: 0,
+                        priority: None,
                     };
                     t.activity_ops.push(
                         tokeira_kernel::ActivityOp::Upsert(
@@ -4255,6 +4378,7 @@ mod tests {
                             schedule_to_start_timeout: None,
                             start_to_close_timeout: None,
                             heartbeat_timeout: None,
+                            priority: None,
                         },
                     );
 
@@ -4488,6 +4612,7 @@ mod tests {
                         schedule_to_start_timeout: None,
                         start_to_close_timeout: None,
                         heartbeat_timeout: None,
+                        priority: None,
                     });
                 }
                 let commit = store
@@ -4513,8 +4638,13 @@ mod tests {
                                     dispatch_revision: 0,
                                     stamp: 0,
                                 },
+                                priority: None,
                                 scheduled_at: fixed_now(),
-                                insertion_seq: index as u64,
+                                order: DeliveryOrder {
+                                    priority_key: 3,
+                                    fair_pass: 0,
+                                    insertion_tie: index as u64,
+                                },
                             })
                             .collect(),
                     )

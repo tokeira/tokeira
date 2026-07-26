@@ -62,24 +62,40 @@ pub enum VersioningOverrideChange {
     Clear,
 }
 
-/// Edge request for `UpdateWorkflowExecutionOptions`. Only the `versioning_override`
-/// option is modeled (the one mutable execution option tokeira persists, per
-/// `api-conformance-workflow-options`); the mask is validated and reduced to a
-/// [`VersioningOverrideChange`] at the gRPC boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Priority mutation selected by an execution-options field mask.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PriorityChange {
+    /// No Priority path was selected.
+    Unchanged,
+    /// Replace the whole Priority; `None` clears it.
+    Replace(Option<Priority>),
+    /// Merge only the named nested fields into the current Priority.
+    Patch {
+        priority_key: Option<i32>,
+        fairness_key: Option<String>,
+        fairness_weight: Option<f32>,
+    },
+}
+
+/// Edge request for `UpdateWorkflowExecutionOptions`.
+///
+/// The transport mask is reduced here, while nested Priority merging remains
+/// deferred until the edge has loaded the authoritative current run.
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateWorkflowExecutionOptionsRequest {
     pub namespace: String,
     pub workflow_id: String,
     pub run_id: Option<String>,
     pub versioning_override: VersioningOverrideChange,
+    pub priority: PriorityChange,
     pub identity: String,
 }
 
-/// The post-update execution options echoed back to the caller. `versioning_override` is
-/// `Some` after a Set and `None` after a Clear.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The post-update execution options echoed back to the caller.
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateWorkflowExecutionOptionsResponse {
     pub versioning_override: Option<VersioningOverride>,
+    pub priority: Option<Priority>,
 }
 
 /// User-facing summary/details metadata authored when a workflow starts.
@@ -245,6 +261,8 @@ pub struct SignalWorkflowExecutionResponse {
 pub struct PollWorkflowTaskQueueRequest {
     pub namespace: String,
     pub task_queue: String,
+    /// Declared normal queue for a sticky poll; absent for normal queues.
+    pub normal_task_queue: Option<String>,
     pub worker_identity: String,
     /// Stable SDK worker-process key used by matching shutdown cancellation.
     pub worker_instance_key: String,
@@ -418,6 +436,8 @@ pub struct WorkflowExecutionDescription {
     pub original_start_time: OffsetDateTime,
     pub versioning_info: Option<WorkflowVersioningInfo>,
     pub worker_deployment_name: Option<String>,
+    /// Current raw workflow Priority returned by DescribeWorkflowExecution.
+    pub priority: Option<Priority>,
     /// First successful WFT boundary observed for each worker-build pair.
     pub auto_reset_points: Vec<tokeira_kernel::state::AutoResetPoint>,
     /// Most recent structured worker-version stamp from a completed WFT.
@@ -1136,6 +1156,8 @@ pub struct DescribeTaskQueueRequest {
     pub namespace: String,
     pub task_queue: String,
     pub task_kind: TaskKind,
+    /// Whether the request addresses a sticky workflow-task queue directly.
+    pub sticky: bool,
     pub include_status: bool,
     /// Whether live matching backlog statistics were requested.
     pub report_stats: bool,
@@ -1197,6 +1219,8 @@ pub struct DescribeTaskQueueResponse {
     pub versioning_info: Option<TaskQueueVersioningInfo>,
     /// Statistics for the task kind requested through the basic response shape.
     pub stats: Option<TaskQueueStatsDto>,
+    /// Real populated priority bands for the requested task kind.
+    pub stats_by_priority_key: BTreeMap<i32, TaskQueueStatsDto>,
     /// Workflow statistics included by enhanced mode.
     pub workflow_stats: Option<TaskQueueStatsDto>,
     /// Activity statistics included by enhanced mode.
@@ -1339,6 +1363,8 @@ pub struct ActivityOptions {
     pub start_to_close_timeout: Option<time::Duration>,
     pub heartbeat_timeout: Option<time::Duration>,
     pub retry_policy: Option<RetryPolicy>,
+    /// Raw per-activity Priority override.
+    pub priority: Option<Priority>,
 }
 
 /// Edge DTO for `temporal.api.common.v1.ActivityType`.

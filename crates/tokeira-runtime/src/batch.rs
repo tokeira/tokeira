@@ -71,6 +71,8 @@ pub enum BatchOperationParams {
         identity: String,
         /// Validated versioning-override change selected by the update mask.
         versioning_override: VersioningOverrideChange,
+        /// Validated Priority mutation selected by the update mask.
+        priority: BatchPriorityChange,
     },
     /// Workflow-scoped activity-unpause parameters carried by a batch.
     UnpauseActivity {
@@ -91,6 +93,24 @@ pub enum BatchOperationParams {
         identity: String,
         /// Fully validated patch, without per-run request context.
         patch: BatchActivityOptionsPatch,
+    },
+}
+
+/// Priority mask intent retained by a process-local batch operation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BatchPriorityChange {
+    /// No Priority path was selected.
+    Unchanged,
+    /// Whole-field replacement; `None` clears Priority.
+    Replace(Option<tokeira_kernel::Priority>),
+    /// Nested fields to merge into each target's current Priority.
+    Patch {
+        /// Selected priority key.
+        priority_key: Option<i32>,
+        /// Selected fairness key.
+        fairness_key: Option<String>,
+        /// Selected fairness weight.
+        fairness_weight: Option<f32>,
     },
 }
 
@@ -130,6 +150,8 @@ pub struct BatchActivityOptionsPatch {
     pub heartbeat_timeout: FieldChange<Option<Duration>>,
     /// Retry-policy field-mask patch.
     pub retry_policy: ActivityRetryPolicyPatch,
+    /// Raw per-activity Priority field-mask intent.
+    pub priority: tokeira_kernel::ActivityPriorityPatch,
     /// Whether every selected activity restores its first-schedule options.
     pub restore_original_options: bool,
 }

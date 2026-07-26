@@ -293,14 +293,54 @@ const SEARCH_ATTRIBUTE_RPCS: &[&str] = &[
     "WorkflowService.GetSearchAttributes",
 ];
 
-const TASK_QUEUE_MANAGEMENT_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
-    kind: CompatibilitySurfaceKind::Rpc,
-    identifier: "WorkflowService.TaskQueueManagement",
-}];
+const TASK_QUEUE_MANAGEMENT_SURFACES: &[CompatibilitySurface] = &[
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::Rpc,
+        identifier: "WorkflowService.TaskQueueManagement",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::RequestField,
+        identifier: "StartWorkflowExecutionRequest.priority",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::CommandAttribute,
+        identifier: "ScheduleActivityTaskCommandAttributes.priority",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::CommandAttribute,
+        identifier: "StartChildWorkflowExecutionCommandAttributes.priority",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::HistoryEvent,
+        identifier: "WorkflowExecutionStartedEventAttributes.priority",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::ResponseField,
+        identifier: "DescribeTaskQueueResponse.stats_by_priority_key",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::BehaviouralInvariant,
+        identifier: "TaskQueuePriorityAndUserFairnessHandout",
+    },
+];
 const TASK_QUEUE_MANAGEMENT_RPCS: &[&str] = &[
     "WorkflowService.DescribeTaskQueue",
     "WorkflowService.ListTaskQueuePartitions",
     "WorkflowService.UpdateTaskQueueConfig",
+];
+const TASK_QUEUE_MANAGEMENT_EVIDENCE: &[CompatibilityEvidence] = &[
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-edge/tests/grpc_new_endpoints.rs::priority_orders_workflow_polls_and_projects_real_band_stats_via_grpc",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "crates/tokeira-runtime/src/task_ordering.rs property tests",
+    },
+    CompatibilityEvidence {
+        kind: crate::CompatibilityEvidenceKind::Test,
+        reference: "Temporal functional corpus TestPrioritySuite, TestFairnessSuite, and TestFairnessAutoEnableSuite @ v1.31.0",
+    },
 ];
 
 const VISIBILITY_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
@@ -643,14 +683,14 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
     },
     FeatureEntry {
         id: "task-queue-management",
-        name: "Task queue management",
+        name: "Task queue management, priority, and fairness",
         state: FeatureState::Partial,
         surfaces: TASK_QUEUE_MANAGEMENT_SURFACES,
         capability_field: None,
         dynamic_config_key: None,
         rpcs: TASK_QUEUE_MANAGEMENT_RPCS,
-        notes: "Task queue diagnostics and configuration APIs are present with partial compatibility coverage.",
-        evidence: &[],
+        notes: "Priority-aware workflow, activity, child, sticky, and durable-backlog handout follows the v1.31.0 stock defaults. Optional User Fairness, auto-enable, queue/per-key rate shaping, atomic kind-isolated task-queue config updates, and real per-priority statistics are implemented in Tokeira's delivery runtime without matching/history service objects. State remains partial only because the public TaskQueueConfig store is volatile pending the separate production configuration/durability decision.",
+        evidence: TASK_QUEUE_MANAGEMENT_EVIDENCE,
     },
     FeatureEntry {
         id: "visibility",

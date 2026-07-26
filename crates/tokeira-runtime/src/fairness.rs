@@ -709,6 +709,8 @@ mod tests {
                                     ),
                                     normal_queue: None,
                                     sticky_deadline: None,
+                                    priority: None,
+                                    order: None,
                                 },
                                 None,
                             )
@@ -724,6 +726,8 @@ mod tests {
                                     sticky_preferred: None,
                                     normal_queue: None,
                                     sticky_deadline: None,
+                                    priority: None,
+                                    order: None,
                                 },
                                 None,
                             )

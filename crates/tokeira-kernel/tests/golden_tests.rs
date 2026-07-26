@@ -4,25 +4,25 @@ use std::collections::BTreeMap;
 
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
-    ActivityControlTarget, ActivityOp, ActivityPauseInfo, ActivityResolvedRequest, ActivityState,
-    BasicKernel, CallbackAttemptOutcome, CallbackCompletionOutcome, CallbackSpec, CallbackState,
-    CallbackTrigger, CancelRequest, ChildResolution, ChildResolvedRequest,
-    ChildStartConfirmedRequest, ChildStartResult, ChildWorkflowState, Command, CompletionCallback,
-    CompletionCallbackAttemptedRequest, DispatchOp, ExternalCancelResolvedRequest,
-    ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
-    ExternalWorkflowExecution, FieldChange, LoadedRun, MemoPatch, NexusCancellationAttemptOutcome,
-    NexusCancellationAttemptedRequest, NexusCancellationRetryRequest,
-    NexusOperationCancellationState, NexusOperationResolvedRequest, NexusOperationRetryRequest,
-    NexusResolution, NexusTimeoutType, ParentClosePolicy, PauseActivityRequest, PauseInfo,
-    PauseWorkflowRequest, PendingExternalCancel, PendingExternalSignal, PendingNexusOperation,
-    PendingUpdate, PendingWorkflowTask, ProjectionOp, Reject, ReplayContext, ResetActivityRequest,
-    ResetRequest, RetryState, SearchAttributesPatch, SignalRequest, SignalWithStartRequest,
-    StartDeploymentTransitionRequest, StartRequest, StartWorkflowTaskRequest,
-    TerminateOnWorkflowTaskFailedRequest, TerminateRequest, TimerDueRequest, TimerState,
-    Transition, UnpauseActivityRequest, UnpauseWorkflowRequest, UpdateActivityOptionsRequest,
-    UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest, VersioningBehavior,
-    VersioningOverride, VersioningOverrideChange, WORKFLOW_START_DELAY_TIMER_ID,
-    WorkerDeploymentVersionRef, WorkerVersionStamp, WorkflowCommand,
+    ActivityControlTarget, ActivityOp, ActivityPauseInfo, ActivityPriorityPatch,
+    ActivityResolvedRequest, ActivityState, BasicKernel, CallbackAttemptOutcome,
+    CallbackCompletionOutcome, CallbackSpec, CallbackState, CallbackTrigger, CancelRequest,
+    ChildResolution, ChildResolvedRequest, ChildStartConfirmedRequest, ChildStartResult,
+    ChildWorkflowState, Command, CompletionCallback, CompletionCallbackAttemptedRequest,
+    DispatchOp, ExternalCancelResolvedRequest, ExternalCancelResult, ExternalSignalResolvedRequest,
+    ExternalSignalResult, ExternalWorkflowExecution, FieldChange, LoadedRun, MemoPatch,
+    NexusCancellationAttemptOutcome, NexusCancellationAttemptedRequest,
+    NexusCancellationRetryRequest, NexusOperationCancellationState, NexusOperationResolvedRequest,
+    NexusOperationRetryRequest, NexusResolution, NexusTimeoutType, ParentClosePolicy,
+    PauseActivityRequest, PauseInfo, PauseWorkflowRequest, PendingExternalCancel,
+    PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask, ProjectionOp,
+    Reject, ReplayContext, ResetActivityRequest, ResetRequest, RetryState, SearchAttributesPatch,
+    SignalRequest, SignalWithStartRequest, StartDeploymentTransitionRequest, StartRequest,
+    StartWorkflowTaskRequest, TerminateOnWorkflowTaskFailedRequest, TerminateRequest,
+    TimerDueRequest, TimerState, Transition, UnpauseActivityRequest, UnpauseWorkflowRequest,
+    UpdateActivityOptionsRequest, UpdateExecutionOptionsRequest, UpdateProtocolBody, UpdateRequest,
+    VersioningBehavior, VersioningOverride, VersioningOverrideChange,
+    WORKFLOW_START_DELAY_TIMER_ID, WorkerDeploymentVersionRef, WorkerVersionStamp, WorkflowCommand,
     WorkflowExecutionTimedOutRequest, WorkflowStartDelayElapsedRequest, WorkflowState,
     WorkflowTaskCompletedRequest, WorkflowTaskFailedCause, WorkflowTaskFailedRequest,
     WorkflowTaskTimedOutRequest, WorkflowTaskTimeoutType, WorkflowTaskWorkerVersion,
@@ -483,6 +483,7 @@ fn replay_history_reconstructs_activity_and_timer_state() {
                 schedule_to_start_timeout: Some(Duration::seconds(30)),
                 start_to_close_timeout: Some(Duration::minutes(1)),
                 heartbeat_timeout: Some(Duration::seconds(20)),
+                priority: None,
             },
         ),
         history_event(
@@ -574,6 +575,7 @@ fn replay_history_reconstructs_historical_execution_options_and_pause() {
                 attached_completion_callbacks: Vec::new(),
                 attached_links: Vec::new(),
                 attached_request_id: Some("options-req".into()),
+                priority: FieldChange::Unchanged,
             },
         ),
         history_event(
@@ -716,6 +718,7 @@ fn make_paused_state_with_activity(id: &str) -> WorkflowState {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         },
     );
     state
@@ -753,6 +756,7 @@ fn make_open_state_with_activity(id: &str) -> WorkflowState {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         },
     );
     state
@@ -846,6 +850,7 @@ fn make_update_activity_options_request(activity_id: &str) -> UpdateActivityOpti
         reschedule_at: BTreeMap::new(),
         request: request_context("update-activity-req"),
         now: now(),
+        priority: ActivityPriorityPatch::Unchanged,
     }
 }
 
@@ -1796,6 +1801,7 @@ fn terminate_with_activities_and_timers() {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         },
     );
     state.timers.insert(
@@ -1969,6 +1975,7 @@ fn reset_cleans_up_activities_and_timers() {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         },
     );
     state.timers.insert(
@@ -2143,6 +2150,7 @@ fn pause_workflow_happy_path() {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         },
     );
 
@@ -2276,6 +2284,7 @@ fn unpause_workflow_happy_path() {
             started_event_id: None,
             pause_info: None,
             stamp: 1,
+            priority: None,
         },
     );
     let transition = kernel()
@@ -3153,6 +3162,7 @@ fn workflow_task_completed_with_activity_and_timer() {
                         schedule_to_start_timeout: Some(Duration::seconds(30)),
                         start_to_close_timeout: Some(Duration::minutes(1)),
                         heartbeat_timeout: Some(Duration::seconds(20)),
+                        priority: None,
                     },
                     WorkflowCommand::StartTimer {
                         timer_id: "timer-1".into(),
@@ -3529,6 +3539,7 @@ fn workflow_execution_timed_out_with_entities() {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         },
     );
     state.timers.insert(
@@ -4396,6 +4407,7 @@ fn reject_duplicate_activity_id() {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         },
     );
     assert_eq!(
@@ -4432,6 +4444,7 @@ fn reject_duplicate_activity_id() {
                     schedule_to_start_timeout: None,
                     start_to_close_timeout: None,
                     heartbeat_timeout: None,
+                    priority: None,
                 }],
                 force_new_workflow_task: false,
                 limits: Default::default(),
@@ -5810,6 +5823,7 @@ fn with_pending_activity_started_wft() -> WorkflowState {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         },
     );
     state
@@ -5955,6 +5969,7 @@ fn start_child_workflow_happy_path() {
                     cron_schedule: None,
                     parent_close_policy: ParentClosePolicy::Terminate,
                     reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+                    priority: None,
                 }],
                 force_new_workflow_task: false,
                 limits: Default::default(),
@@ -6944,6 +6959,7 @@ fn update_execution_options_happy_path() {
         attached_request_id: Some("attached-1".into()),
         request: request_context("options-req"),
         now: now(),
+        priority: FieldChange::Unchanged,
     };
     let transition = kernel()
         .apply(
@@ -6965,12 +6981,14 @@ fn update_execution_options_happy_path() {
             attached_completion_callbacks,
             attached_links,
             attached_request_id,
+            priority,
         } if identity == "tester"
             && versioning_override == &FieldChange::Set(VersioningOverride::AutoUpgrade)
             && completion_callbacks == &FieldChange::Set(expected_callbacks.clone())
             && attached_completion_callbacks == &req.attached_completion_callbacks
             && attached_links == &req.attached_links
             && attached_request_id == &req.attached_request_id
+            && priority == &FieldChange::Unchanged
     ));
     assert_eq!(
         transition.next_state.versioning_override().cloned(),
@@ -7011,6 +7029,7 @@ fn update_execution_options_clear_versioning() {
                 attached_request_id: None,
                 request: request_context("options-clear"),
                 now: now(),
+                priority: FieldChange::Unchanged,
             }),
         )
         .unwrap();
@@ -7047,6 +7066,7 @@ fn update_execution_options_resolves_implied_pin_in_authoritative_state() {
                 attached_request_id: None,
                 request: request_context("options-implied"),
                 now: now(),
+                priority: FieldChange::Unchanged,
             }),
         )
         .unwrap();
@@ -7084,6 +7104,7 @@ fn update_execution_options_rejects_implied_pin_before_run_is_pinned() {
                 attached_request_id: None,
                 request: request_context("options-implied-error"),
                 now: now(),
+                priority: FieldChange::Unchanged,
             }),
         )
         .unwrap_err();
@@ -7112,6 +7133,7 @@ fn update_execution_options_equal_value_is_an_explicit_noop() {
                 attached_request_id: None,
                 request: request_context("options-same"),
                 now: now(),
+                priority: FieldChange::Unchanged,
             }),
         )
         .unwrap();
@@ -7133,6 +7155,7 @@ fn update_execution_options_missing_run() {
                 attached_request_id: None,
                 request: request_context("options-missing"),
                 now: now(),
+                priority: FieldChange::Unchanged,
             }),
         )
         .unwrap_err();
@@ -7153,6 +7176,7 @@ fn update_execution_options_closed_run() {
                 attached_request_id: None,
                 request: request_context("options-closed"),
                 now: now(),
+                priority: FieldChange::Unchanged,
             }),
         )
         .unwrap_err();
@@ -9530,6 +9554,74 @@ fn worker_deployment_appended_postcard_fields_require_a_fresh_pre_baseline_store
         },
         2,
     );
+}
+
+#[test]
+fn priority_appended_postcard_fields_require_a_fresh_pre_baseline_store() {
+    // Feature: task-queue-priority-fairness. Postcard encodes struct and enum
+    // payload fields positionally. Serde defaults do not make a missing
+    // trailing element readable, so the authorized pre-baseline store boundary
+    // is the compatibility posture for these kernel shapes.
+    fn assert_old_shape_rejected<T>(value: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+    {
+        let mut bytes = postcard::to_allocvec(value).expect("encode current positional shape");
+        assert_eq!(bytes.pop(), Some(0), "appended default must encode as zero");
+        let error = postcard::from_bytes::<T>(&bytes)
+            .expect_err("postcard cannot default a missing trailing sequence element");
+        assert!(matches!(error, postcard::Error::DeserializeUnexpectedEnd));
+    }
+
+    let state = make_open_state_with_activity("priority-fixture");
+    assert_old_shape_rejected(
+        state
+            .activities
+            .get("priority-fixture")
+            .expect("fixture activity"),
+    );
+    assert_old_shape_rejected(&HistoryEventKind::ActivityTaskScheduled {
+        workflow_task_completed_event_id: 2,
+        activity_id: "activity".into(),
+        activity_type: "activity-type".into(),
+        task_queue: TaskQueueName("activity-q".into()),
+        input: Payloads::default(),
+        header: None,
+        retry_policy: None,
+        schedule_to_close_timeout: None,
+        schedule_to_start_timeout: None,
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        priority: None,
+    });
+    assert_old_shape_rejected(&HistoryEventKind::StartChildWorkflowExecutionInitiated {
+        workflow_task_completed_event_id: 2,
+        child_workflow_id: WorkflowId("child".into()),
+        workflow_type: WorkflowType("child-type".into()),
+        task_queue: TaskQueueName("child-q".into()),
+        input: Payloads::default(),
+        namespace_id: NamespaceId::new(),
+        namespace: None,
+        header: None,
+        memo: Memo::default(),
+        search_attributes: SearchAttributes::default(),
+        workflow_execution_timeout: None,
+        workflow_run_timeout: None,
+        workflow_task_timeout: Duration::seconds(10),
+        retry_policy: None,
+        cron_schedule: None,
+        parent_close_policy: ParentClosePolicy::Terminate,
+        priority: None,
+    });
+    assert_old_shape_rejected(&HistoryEventKind::WorkflowExecutionOptionsUpdated {
+        identity: String::new(),
+        versioning_override: FieldChange::Unchanged,
+        completion_callbacks: FieldChange::Unchanged,
+        attached_completion_callbacks: Vec::new(),
+        attached_links: Vec::new(),
+        attached_request_id: None,
+        priority: FieldChange::Unchanged,
+    });
 }
 
 #[test]

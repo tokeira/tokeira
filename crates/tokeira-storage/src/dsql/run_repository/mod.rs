@@ -14,7 +14,7 @@ use sqlx::Connection;
 use time::{Duration, OffsetDateTime};
 use tokeira_kernel::{
     ActivityOp, BasicKernel, CallbackState, DispatchOp, HistoryEvent, LoadedRun, ReplayContext,
-    TimerOp, Transition, WorkflowState,
+    TimerOp, Transition, WorkflowState, merge_priority,
 };
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionRef, ExecutionStatus, NamespaceId, Payloads, QueueKey,
@@ -25,13 +25,14 @@ use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::{
-    ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, CommitResult,
+    ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BacklogPayload, CommitResult,
     CompletionCallbackSweepEntry, CurrentExecutionConflictPolicy, DbClass, DeleteRunRequest,
-    DeleteRunResult, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, NexusSweepEntry,
-    ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-    WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
-    WorkflowTimeoutSweepEntry, deleted_workflow_projection_context, dispatchable_workflow_task,
-    metrics, workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
+    DeleteRunResult, DeliveryOrder, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
+    NexusSweepEntry, ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord,
+    WftTimeoutSweepEntry, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
+    WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
+    dispatchable_workflow_task, metrics, workflow_is_open_and_pinned_to_version,
+    workflow_projection_context_with_previous,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -254,23 +255,48 @@ impl DsqlRunRepository {
         task_kind: TaskKind,
         deployment: Option<&str>,
         build_id: Option<&str>,
-        insertion_seq: u64,
+        run_key: RunKey,
+        payload: &BacklogPayload,
     ) -> Uuid {
-        // Include optional deployment/build identity in the key input so
-        // versioned and unversioned queue entries cannot collide.
         let deployment = option_key_part(deployment);
         let build_id = option_key_part(build_id);
         let task_kind = (task_kind.to_db_smallint() as u16).to_le_bytes();
-        dsql_spread_uuid(&[
-            b"dispatch-backlog",
-            &partition_id.to_le_bytes(),
-            queue_namespace.0.as_bytes(),
-            queue_name.as_bytes(),
-            &task_kind,
-            &deployment,
-            &build_id,
-            &insertion_seq.to_be_bytes(),
-        ])
+        // Delivery order resets with a queue-home broker and therefore cannot
+        // identify durable work. Logical task identity makes the same publish
+        // idempotent without colliding distinct work after a restart.
+        match payload {
+            BacklogPayload::Workflow { logical_seq } => dsql_spread_uuid(&[
+                b"dispatch-backlog",
+                &partition_id.to_le_bytes(),
+                queue_namespace.0.as_bytes(),
+                queue_name.as_bytes(),
+                &task_kind,
+                &deployment,
+                &build_id,
+                run_key.0.as_bytes(),
+                b"workflow",
+                &logical_seq.0.to_be_bytes(),
+            ]),
+            BacklogPayload::Activity {
+                activity_id,
+                attempt,
+                stamp,
+                ..
+            } => dsql_spread_uuid(&[
+                b"dispatch-backlog",
+                &partition_id.to_le_bytes(),
+                queue_namespace.0.as_bytes(),
+                queue_name.as_bytes(),
+                &task_kind,
+                &deployment,
+                &build_id,
+                run_key.0.as_bytes(),
+                b"activity",
+                activity_id.as_bytes(),
+                &attempt.to_be_bytes(),
+                &stamp.to_be_bytes(),
+            ]),
+        }
     }
 
     pub(crate) fn activity_dispatch_key(run_key: RunKey, activity_id: &str) -> Uuid {
@@ -576,6 +602,13 @@ impl RunRepository for DsqlRunRepository {
         self.do_drain_backlog(queue, limit).await
     }
 
+    async fn backlog_stats_by_priority(
+        &self,
+        queue: &QueueKey,
+    ) -> Result<std::collections::BTreeMap<i16, crate::BacklogBandStats>> {
+        self.do_backlog_stats_by_priority(queue).await
+    }
+
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
         self.do_list_due_timers(now, limit).await
     }
@@ -733,8 +766,8 @@ mod tests {
         partition_for, should_check_epoch,
     };
     use crate::{
-        CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository, ProjectionContext,
-        RunRepository,
+        BacklogPayload, CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository,
+        ProjectionContext, RunRepository,
         dsql::{DsqlPermit, codec},
     };
 
@@ -790,6 +823,10 @@ mod tests {
             let namespace_id = NamespaceId(uuid::Uuid::from_u128(seed));
             let workflow_id = WorkflowId(format!("workflow-{seed}"));
             let request_id = RequestId(format!("request-{seed}"));
+            let run_key = RunKey(uuid::Uuid::from_u128(seed));
+            let payload = BacklogPayload::Workflow {
+                logical_seq: tokeira_types::LogicalTaskSeq(seq),
+            };
 
             prop_assert_eq!(
                 DsqlRunRepository::current_execution_key(namespace_id, &workflow_id),
@@ -807,7 +844,8 @@ mod tests {
                     TaskKind::Workflow,
                     Some("deployment"),
                     Some("build"),
-                    seq,
+                    run_key,
+                    &payload,
                 ),
                 DsqlRunRepository::dispatch_backlog_key(
                     7,
@@ -816,7 +854,8 @@ mod tests {
                     TaskKind::Workflow,
                     Some("deployment"),
                     Some("build"),
-                    seq,
+                    run_key,
+                    &payload,
                 )
             );
             prop_assert_eq!(
@@ -831,6 +870,10 @@ mod tests {
             seq in any::<u64>(),
         ) {
             let namespace_id = NamespaceId(uuid::Uuid::from_u128(namespace));
+            let run_key = RunKey(uuid::Uuid::from_u128(namespace));
+            let payload = BacklogPayload::Workflow {
+                logical_seq: tokeira_types::LogicalTaskSeq(seq),
+            };
             let base = DsqlRunRepository::dispatch_backlog_key(
                 1,
                 namespace_id,
@@ -838,7 +881,8 @@ mod tests {
                 TaskKind::Workflow,
                 None,
                 None,
-                seq,
+                run_key,
+                &payload,
             );
 
             prop_assert_ne!(
@@ -850,7 +894,8 @@ mod tests {
                     TaskKind::Activity,
                     None,
                     None,
-                    seq,
+                    run_key,
+                    &payload,
                 )
             );
             prop_assert_ne!(
@@ -862,7 +907,8 @@ mod tests {
                     TaskKind::Workflow,
                     Some("deployment"),
                     None,
-                    seq,
+                    run_key,
+                    &payload,
                 )
             );
             prop_assert_ne!(
@@ -874,7 +920,49 @@ mod tests {
                     TaskKind::Workflow,
                     None,
                     Some("build"),
-                    seq,
+                    run_key,
+                    &payload,
+                )
+            );
+        }
+
+        // Feature: task-queue-priority-fairness, Property 9
+        #[test]
+        fn backlog_key_uses_logical_task_identity(
+            seed in any::<u128>(),
+            first_seq in any::<u64>(),
+            second_seq in any::<u64>(),
+        ) {
+            prop_assume!(first_seq != second_seq);
+            let namespace_id = NamespaceId(uuid::Uuid::from_u128(seed));
+            let run_key = RunKey(uuid::Uuid::from_u128(seed));
+            let first = BacklogPayload::Workflow {
+                logical_seq: tokeira_types::LogicalTaskSeq(first_seq),
+            };
+            let second = BacklogPayload::Workflow {
+                logical_seq: tokeira_types::LogicalTaskSeq(second_seq),
+            };
+
+            prop_assert_ne!(
+                DsqlRunRepository::dispatch_backlog_key(
+                    1,
+                    namespace_id,
+                    "queue",
+                    TaskKind::Workflow,
+                    None,
+                    None,
+                    run_key,
+                    &first,
+                ),
+                DsqlRunRepository::dispatch_backlog_key(
+                    1,
+                    namespace_id,
+                    "queue",
+                    TaskKind::Workflow,
+                    None,
+                    None,
+                    run_key,
+                    &second,
                 )
             );
         }
@@ -1339,6 +1427,7 @@ mod tests {
             17,
             5,
             codec::encode_payloads(&payloads).unwrap(),
+            None,
         );
 
         let task = activity_dispatch_from_row(row).unwrap();
@@ -1745,6 +1834,7 @@ mod tests {
             task_queue: TaskQueueName("activity-queue".to_owned()),
             deployment: None,
             build_id: None,
+            priority: None,
             input: Payloads::default(),
             header: None,
             last_failure: None,

@@ -46,7 +46,7 @@ use crate::{
         NexusOperationCancellationState, ParentClosePolicy, PauseInfo, PendingExternalCancel,
         PendingExternalSignal, PendingNexusOperation, PendingUpdate, PendingWorkflowTask,
         RequestIdInfo, TimerState, VersioningBehavior, VersioningOverride, WorkflowState,
-        WorkflowTaskProblem, WorkflowTaskType, WorkflowVersioningInfo,
+        WorkflowTaskProblem, WorkflowTaskType, WorkflowVersioningInfo, merge_priority,
     },
     transition::{
         ActivityOp, CallbackCompletionOutcome, DispatchOp, ProjectionOp, RequestDedupeOp, TimerOp,
@@ -1198,6 +1198,7 @@ impl BasicKernel {
                 activity.start_to_close_timeout = original.start_to_close_timeout;
                 activity.heartbeat_timeout = original.heartbeat_timeout;
                 activity.retry_policy = original.retry_policy.clone();
+                activity.priority = original.priority.clone();
             } else {
                 match &req.task_queue {
                     FieldChange::Set(task_queue) => activity.task_queue = task_queue.clone(),
@@ -1222,6 +1223,7 @@ impl BasicKernel {
                 req.retry_policy
                     .apply_to(&mut activity.retry_policy)
                     .map_err(|reason| Reject::InvalidActivityOptions(reason.to_string()))?;
+                req.priority.apply_to(&mut activity.priority);
             }
             activity.stamp += 1;
             if activity.started_at.is_none()
@@ -1232,6 +1234,13 @@ impl BasicKernel {
             builder
                 .activity_ops
                 .push(ActivityOp::Upsert(activity.clone()));
+            let redispatch = activity.started_at.is_none()
+                && activity.pause_info.is_none()
+                && builder.state.status != ExecutionStatus::Paused;
+            let activity = activity.clone();
+            if redispatch {
+                enqueue_activity_dispatch(&mut builder, &activity);
+            }
         }
         Ok(builder.finish())
     }
@@ -1538,6 +1547,8 @@ impl BasicKernel {
         let state = expect_open(loaded)?;
         let versioning_override =
             resolve_versioning_override_change(&state, req.versioning_override)?;
+        let priority = resolve_priority_change(&state, req.priority);
+        let priority_changed = !matches!(priority, FieldChange::Unchanged);
         let mut completion_callbacks = req.completion_callbacks;
         if let FieldChange::Set(callbacks) = &mut completion_callbacks {
             stamp_callback_registration_times(callbacks, req.now);
@@ -1550,6 +1561,7 @@ impl BasicKernel {
         // v1.31.0`). Attached conflict-policy data shares this command, so the
         // fast path is valid only when every other mutation channel is empty.
         if matches!(versioning_override, FieldChange::Unchanged)
+            && matches!(priority, FieldChange::Unchanged)
             && matches!(completion_callbacks, FieldChange::Unchanged)
             && attached_completion_callbacks.is_empty()
             && req.attached_links.is_empty()
@@ -1577,6 +1589,7 @@ impl BasicKernel {
                 attached_completion_callbacks: attached_completion_callbacks.clone(),
                 attached_links: req.attached_links.clone(),
                 attached_request_id: req.attached_request_id,
+                priority: priority.clone(),
             });
         if let Some(attached_request_id) = attached_request_id_for_map {
             let buffered = options_event_id == BUFFERED_EVENT_ID;
@@ -1600,6 +1613,14 @@ impl BasicKernel {
                 builder.state.set_versioning_override(None);
             }
             FieldChange::Unchanged => {}
+        }
+        match priority {
+            FieldChange::Set(priority) => builder.state.priority = Some(priority),
+            FieldChange::Clear => builder.state.priority = None,
+            FieldChange::Unchanged => {}
+        }
+        if priority_changed {
+            builder.redispatch_pending_workflow_task_for_priority();
         }
 
         match completion_callbacks {
@@ -3239,6 +3260,7 @@ impl BasicKernel {
                         attached_completion_callbacks,
                         attached_links,
                         attached_request_id: _,
+                        priority,
                     } => {
                         match versioning_override {
                             FieldChange::Set(value) => {
@@ -3246,6 +3268,15 @@ impl BasicKernel {
                             }
                             FieldChange::Clear => {
                                 builder.state.set_versioning_override(None);
+                            }
+                            FieldChange::Unchanged => {}
+                        }
+                        match priority {
+                            FieldChange::Set(value) => {
+                                builder.state.priority = Some(value.clone());
+                            }
+                            FieldChange::Clear => {
+                                builder.state.priority = None;
                             }
                             FieldChange::Unchanged => {}
                         }
@@ -3403,6 +3434,7 @@ impl BasicKernel {
                     logical_seq: pending.logical_seq,
                     sticky_preferred,
                     normal_task_queue: Some(builder.state.task_queue.clone()),
+                    priority: builder.state.priority.clone(),
                 });
             }
         }
@@ -4066,6 +4098,7 @@ impl BasicKernel {
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
+                priority,
                 ..
             } => {
                 state.activities.insert(
@@ -4098,6 +4131,7 @@ impl BasicKernel {
                         heartbeat_details: None,
                         pause_info: None,
                         stamp: 0,
+                        priority: priority.clone(),
                     },
                 );
             }
@@ -4421,6 +4455,7 @@ impl BasicKernel {
                 attached_completion_callbacks,
                 attached_links,
                 attached_request_id,
+                priority,
             } => {
                 if let Some(attached_request_id) = attached_request_id {
                     // Reconstruct the attached request id → options-updated mapping
@@ -4442,6 +4477,11 @@ impl BasicKernel {
                     FieldChange::Clear => {
                         state.set_versioning_override(None);
                     }
+                    FieldChange::Unchanged => {}
+                }
+                match priority {
+                    FieldChange::Set(value) => state.priority = Some(value.clone()),
+                    FieldChange::Clear => state.priority = None,
                     FieldChange::Unchanged => {}
                 }
                 match completion_callbacks {
@@ -4630,6 +4670,7 @@ fn enqueue_activity_dispatch(builder: &mut TransitionBuilder, activity: &Activit
         schedule_to_start_timeout: activity.schedule_to_start_timeout,
         start_to_close_timeout: activity.start_to_close_timeout,
         heartbeat_timeout: activity.heartbeat_timeout,
+        priority: merge_priority(builder.state.priority.as_ref(), activity.priority.as_ref()),
     });
 }
 
@@ -4854,6 +4895,7 @@ fn apply_workflow_command(
             schedule_to_start_timeout,
             start_to_close_timeout,
             heartbeat_timeout,
+            priority,
         } => {
             if builder.state.activities.contains_key(&activity_id) {
                 return Err(Reject::DuplicateActivityId(activity_id));
@@ -4873,6 +4915,8 @@ fn apply_workflow_command(
             let schedule_to_start_timeout = normalized.schedule_to_start_timeout;
             let start_to_close_timeout = normalized.start_to_close_timeout;
             let heartbeat_timeout = normalized.heartbeat_timeout;
+            let effective_priority =
+                merge_priority(builder.state.priority.as_ref(), priority.as_ref());
             reject_if_pending_limit_reached(
                 limits.pending_activities,
                 builder.state.activities.len(),
@@ -4892,6 +4936,7 @@ fn apply_workflow_command(
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
+                priority: priority.clone(),
             });
 
             let activity = ActivityState {
@@ -4924,6 +4969,7 @@ fn apply_workflow_command(
                 heartbeat_details: None,
                 pause_info: None,
                 stamp: 0,
+                priority,
             };
             builder
                 .state
@@ -4959,6 +5005,7 @@ fn apply_workflow_command(
                 schedule_to_start_timeout,
                 start_to_close_timeout,
                 heartbeat_timeout,
+                priority: effective_priority,
             });
             Ok(false)
         }
@@ -5442,6 +5489,7 @@ fn apply_workflow_command(
             cron_schedule,
             parent_close_policy,
             reuse_policy,
+            priority,
         } => {
             if builder.state.children.contains_key(&child_workflow_id) {
                 return Err(Reject::DuplicateChildWorkflowId(child_workflow_id));
@@ -5488,6 +5536,8 @@ fn apply_workflow_command(
             let dispatch_search_attributes = search_attributes.clone();
             let dispatch_retry_policy = retry_policy.clone();
             let dispatch_cron_schedule = cron_schedule.clone();
+            let dispatch_priority =
+                merge_priority(builder.state.priority.as_ref(), priority.as_ref());
             let initiated_event_id =
                 builder.emit(HistoryEventKind::StartChildWorkflowExecutionInitiated {
                     workflow_task_completed_event_id,
@@ -5506,6 +5556,7 @@ fn apply_workflow_command(
                     retry_policy,
                     cron_schedule,
                     parent_close_policy,
+                    priority,
                 });
             builder.state.children.insert(
                 child_workflow_id.clone(),
@@ -5543,6 +5594,7 @@ fn apply_workflow_command(
                 retry_policy: dispatch_retry_policy,
                 cron_schedule: dispatch_cron_schedule,
                 reuse_policy,
+                priority: dispatch_priority,
             });
             Ok(false)
         }
@@ -6708,6 +6760,52 @@ impl TransitionBuilder {
             sticky_preferred: None,
             normal_task_queue: Some(self.state.task_queue.clone()),
             speculative: false,
+            priority: self.state.priority.clone(),
+        });
+    }
+
+    /// Fence and regenerate an unstarted WFT after workflow Priority changes.
+    ///
+    /// v1.31.0 advances `WorkflowTaskStamp` and generates another matching task
+    /// for the same scheduled event, while leaving started and speculative
+    /// tasks alone (`MutableStateImpl.reschedulePendingWorkflowTask`,
+    /// mutable_state_impl.go:9178-9212 @ v1.31.0). Tokeira advances the
+    /// equivalent logical delivery identity and emits only a declarative
+    /// post-commit dispatch.
+    fn redispatch_pending_workflow_task_for_priority(&mut self) {
+        let Some(mut pending) = self.state.pending_workflow_task.clone() else {
+            return;
+        };
+        if pending.started_event_id.is_some() || pending.task_type == WorkflowTaskType::Speculative
+        {
+            return;
+        }
+
+        let logical_seq = self.state.next_workflow_task_seq;
+        self.state.next_workflow_task_seq = logical_seq.next();
+        self.state.wft_stamp = self.state.wft_stamp.saturating_add(1);
+        pending.logical_seq = logical_seq;
+        self.state.pending_workflow_task = Some(pending);
+
+        let sticky = self.state.sticky.as_ref().filter(|sticky| {
+            self.state.workflow_task_attempt == 1 && !sticky.sticky_queue.0.is_empty()
+        });
+        let task_queue = sticky
+            .map(|sticky| sticky.sticky_queue.clone())
+            .unwrap_or_else(|| self.state.task_queue.clone());
+        self.dispatch_ops.push(DispatchOp::EnqueueWorkflowTask {
+            queue: QueueKey {
+                namespace_id: self.state.namespace_id,
+                task_queue,
+                task_kind: tokeira_types::TaskKind::Workflow,
+                deployment: self.state.deployment.clone(),
+                build_id: self.state.build_id.clone(),
+            },
+            logical_seq,
+            sticky_preferred: sticky.map(|sticky| sticky.worker_identity.clone()),
+            normal_task_queue: Some(self.state.task_queue.clone()),
+            speculative: false,
+            priority: self.state.priority.clone(),
         });
     }
 
@@ -6811,6 +6909,7 @@ impl TransitionBuilder {
                 .map(|s| s.worker_identity.clone()),
             normal_task_queue: Some(self.state.task_queue.clone()),
             speculative: task_type == WorkflowTaskType::Speculative,
+            priority: self.state.priority.clone(),
         });
     }
 
@@ -6988,6 +7087,24 @@ impl TransitionBuilder {
             dispatch_ops: self.dispatch_ops,
             projection_ops: self.projection_ops,
         }
+    }
+}
+
+/// Reduce a value-equivalent workflow Priority patch to an event-free no-op.
+///
+/// `MergeAndApply` in v1.31.0 authors no options-updated event when the merged
+/// value equals mutable state
+/// (`service/history/api/updateworkflowoptions/api.go @ v1.31.0`).
+fn resolve_priority_change(
+    state: &WorkflowState,
+    change: FieldChange<crate::state::Priority>,
+) -> FieldChange<crate::state::Priority> {
+    match change {
+        FieldChange::Set(value) if state.priority.as_ref() == Some(&value) => {
+            FieldChange::Unchanged
+        }
+        FieldChange::Clear if state.priority.is_none() => FieldChange::Unchanged,
+        other => other,
     }
 }
 

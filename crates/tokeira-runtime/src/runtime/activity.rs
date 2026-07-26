@@ -179,6 +179,8 @@ where
                     attempt,
                     dispatch_revision,
                     stamp,
+                    priority: entry.priority.clone(),
+                    order: None,
                 };
                 if let Err(error) = self
                     .activity_broker
@@ -1476,6 +1478,8 @@ where
                 .map(|info| info.revision_number)
                 .unwrap_or_default(),
             stamp: next_activity.stamp,
+            priority: merge_priority(state.priority.as_ref(), next_activity.priority.as_ref()),
+            order: None,
         });
         let dispatch_ops = if paused {
             // A retryable failure advances and clears the running attempt, but
@@ -1503,6 +1507,7 @@ where
                 schedule_to_start_timeout: next_activity.schedule_to_start_timeout,
                 start_to_close_timeout: next_activity.start_to_close_timeout,
                 heartbeat_timeout: next_activity.heartbeat_timeout,
+                priority: merge_priority(state.priority.as_ref(), next_activity.priority.as_ref()),
             }]
         };
         let transition = Transition {
@@ -2025,6 +2030,7 @@ mod tests {
             heartbeat_details: details,
             pause_info: None,
             stamp: 0,
+            priority: None,
         };
         state
             .activities
@@ -2121,6 +2127,7 @@ mod tests {
             heartbeat_details: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         };
         state
             .activities
@@ -2141,6 +2148,8 @@ mod tests {
             attempt: activity.attempt,
             dispatch_revision: 0,
             stamp: activity.stamp,
+            priority: None,
+            order: None,
         };
         let transition = Transition {
             expected_seq: TransitionSeq::ZERO,
@@ -2574,6 +2583,8 @@ mod tests {
             attempt: activity.attempt,
             dispatch_revision: 0,
             stamp: activity.stamp,
+            priority: None,
+            order: None,
         };
         assert_eq!(
             repo.list_dispatchable_activity_tasks(&queue, 10)

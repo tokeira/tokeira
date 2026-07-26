@@ -4,8 +4,8 @@ use anyhow::Result;
 use time::{Duration, OffsetDateTime};
 
 use tokeira_kernel::{
-    Command, FieldChange, HistoryEventKind, LoadedRun, StartRequest, UpdateActivityOptionsRequest,
-    WorkflowCommand, WorkflowTaskCompletedRequest,
+    ActivityPriorityPatch, Command, FieldChange, HistoryEventKind, LoadedRun, StartRequest,
+    UpdateActivityOptionsRequest, WorkflowCommand, WorkflowTaskCompletedRequest,
 };
 use tokeira_runtime::{
     ActivityTokenResolutionError, BacklogConfig, LaneConfig, TimerScannerConfig, TokeiraRuntime,
@@ -554,6 +554,7 @@ async fn update_activity_options_applies_field_changes_to_scheduled_activity() -
                 start_to_close_timeout: FieldChange::Set(Some(Duration::minutes(2))),
                 heartbeat_timeout: FieldChange::Clear,
                 retry_policy: tokeira_kernel::ActivityRetryPolicyPatch::default(),
+                priority: ActivityPriorityPatch::Unchanged,
                 original_options: std::collections::BTreeMap::new(),
                 restore_original_options: false,
                 reschedule_at: std::collections::BTreeMap::new(),
@@ -664,6 +665,7 @@ async fn start_and_schedule_activity_with_version(
                 schedule_to_start_timeout: Some(Duration::seconds(30)),
                 start_to_close_timeout: Some(Duration::minutes(1)),
                 heartbeat_timeout: Some(Duration::seconds(20)),
+                priority: None,
             }],
             force_new_workflow_task: false,
             limits: Default::default(),

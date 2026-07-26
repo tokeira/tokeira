@@ -741,6 +741,7 @@ mod tests {
             started_event_id: None,
             pause_info: None,
             stamp: 0,
+            priority: None,
         }
     }
 

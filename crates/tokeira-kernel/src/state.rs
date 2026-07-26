@@ -773,6 +773,14 @@ pub struct ActivityState {
     /// v1.31.0`).
     #[serde(default)]
     pub reset_heartbeats: bool,
+    /// Raw activity-level Priority override from the schedule command.
+    ///
+    /// Effective dispatch Priority is derived field by field against the
+    /// workflow Priority. Keeping the raw value matches `ActivityInfo.Priority`
+    /// and preserves restore-original behavior
+    /// (`service/history/api/updateactivityoptions/api.go @ v1.31.0`).
+    #[serde(default)]
+    pub priority: Option<Priority>,
 }
 
 /// Metadata recorded when a workflow is paused.
@@ -1278,6 +1286,46 @@ pub struct Priority {
     pub fairness_key: String,
     /// Relative fairness weight for `fairness_key`.
     pub fairness_weight: f32,
+}
+
+/// Merge a raw task override with inherited workflow Priority field by field.
+///
+/// Temporal treats zero/empty fields as unspecified during inheritance
+/// (`common/priorities/priority_util.go @ v1.31.0`). Band clipping and
+/// task-queue weight overrides are delivery policy and intentionally remain
+/// outside the kernel.
+#[must_use]
+pub fn merge_priority(base: Option<&Priority>, override_: Option<&Priority>) -> Option<Priority> {
+    if base.is_none() && override_.is_none() {
+        return None;
+    }
+    let base = base.cloned().unwrap_or(Priority {
+        priority_key: 0,
+        fairness_key: String::new(),
+        fairness_weight: 0.0,
+    });
+    let override_ = override_.cloned().unwrap_or(Priority {
+        priority_key: 0,
+        fairness_key: String::new(),
+        fairness_weight: 0.0,
+    });
+    Some(Priority {
+        priority_key: if override_.priority_key == 0 {
+            base.priority_key
+        } else {
+            override_.priority_key
+        },
+        fairness_key: if override_.fairness_key.is_empty() {
+            base.fairness_key
+        } else {
+            override_.fairness_key
+        },
+        fairness_weight: if override_.fairness_weight == 0.0 {
+            base.fairness_weight
+        } else {
+            override_.fairness_weight
+        },
+    })
 }
 
 /// Options to apply when a start targets an existing running workflow.

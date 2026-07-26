@@ -7,7 +7,7 @@
 >
 > For the at-a-glance **countdown checklist**, see [`checklist.md`](./checklist.md).
 
-**Last updated:** 2026-06-22 · **Maintained by:** Kiro (single contributor for status)
+**Last updated:** 2026-07-25 · **Maintained by:** Kiro, Claude, Codex
 
 ## What "delivery" covers
 
@@ -40,14 +40,15 @@ Headline: the core public API surface, admission validation, visibility, worker-
 Nexus endpoint admin + synchronous task transport are in place; versioning suites, much of Nexus
 operation execution, and a panic-truncated set of tests remain unmeasured. See `conformance.md`.
 
-### Research efforts ahead of delivery
+### Resolved pre-delivery research
 
-- **Task Queue Priority & Fairness.** Temporal v1.31.0 makes task-queue priority and fairness GA — a new
-  matcher component enabled by default, priority keys respected by default, and per-queue/namespace/
-  cluster fairness via `matching.enableFairness`. We need to understand what this means for the tokeira
-  architecture (the runtime broker / lane model and how priority and fairness map onto it) before
-  deciding how it enters the conformance surface. Tracked here as a pre-delivery research effort, not yet
-  a decision in [`../conformance/v1.31.0/decisions.md`](../conformance/v1.31.0/decisions.md).
+- **Task Queue Priority & Fairness.** The surface is included in v1.31.0 conformance and implemented as
+  delivery-plane policy. The pure kernel copies already-captured Priority metadata into dispatch intent
+  but retains no scheduler state; runtime broker/backlog ordering, rate shaping, and public task-queue
+  statistics own the behavior. Temporal's stock defaults remain visible: priority-aware delivery is on,
+  User Fairness and auto-enable are off, and conformance overrides exercise the optional modes without
+  creating a production dynamic-config surface. The owning implementation record is
+  [`.kiro/specs/task-queue-priority-fairness/`](../../.kiro/specs/task-queue-priority-fairness/).
 
 ## 2. Release / Infrastructure
 

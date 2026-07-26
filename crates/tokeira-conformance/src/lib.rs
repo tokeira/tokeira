@@ -36,7 +36,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{LazyLock, RwLock},
+    sync::{
+        LazyLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -263,6 +266,24 @@ pub static KEY_CLASSIFICATION: &[KeySpec] = &[
         value_type: ValueType::Int,
         disposition: Disposition::Wired,
     },
+    // These three switches are read live by the runtime delivery-mode provider.
+    // Production remains pinned to v1.31.0's defaults; only conformance builds
+    // link this registry.
+    KeySpec {
+        key: "matching.useNewMatcher",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "matching.enableFairness",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
+    KeySpec {
+        key: "matching.autoEnableV2",
+        value_type: ValueType::Bool,
+        disposition: Disposition::Wired,
+    },
     // Worker Deployment admission and drainage are runtime-registry policy. The
     // v1.31.0 corpus overrides these limits/intervals to exercise boundary and
     // lifecycle behavior without changing the production defaults
@@ -432,6 +453,7 @@ pub enum OverrideError {
 #[derive(Debug, Default)]
 pub struct ConformanceOverrides {
     inner: RwLock<HashMap<&'static str, OverrideValue>>,
+    scope_generation: AtomicU64,
 }
 
 impl ConformanceOverrides {
@@ -488,6 +510,19 @@ impl ConformanceOverrides {
             .write()
             .expect("conformance overrides poisoned")
             .clear();
+        // Reset is the harness's test-scope boundary. Delivery policy keeps
+        // process-local auto-enable state, so publish this boundary separately
+        // from the live key map and let that disposable state reset lazily.
+        self.scope_generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Monotonic conformance test-scope generation.
+    ///
+    /// Consumers use this only to discard process-local policy state. It is
+    /// deliberately not a production configuration surface.
+    #[must_use]
+    pub fn scope_generation(&self) -> u64 {
+        self.scope_generation.load(Ordering::Acquire)
     }
 
     fn get(&self, key: &str) -> Option<OverrideValue> {
@@ -640,6 +675,7 @@ mod tests {
     #[test]
     fn lifecycle_set_clear_reset() {
         let overrides = ConformanceOverrides::default();
+        assert_eq!(overrides.scope_generation(), 0);
         assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
 
         overrides
@@ -653,12 +689,14 @@ mod tests {
         assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), Some(0));
 
         overrides.clear(REPORTED_PROBLEMS_KEY);
+        assert_eq!(overrides.scope_generation(), 0);
         assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
 
         overrides
             .set(REPORTED_PROBLEMS_KEY, OverrideValue::Int(2))
             .expect("wired set");
         overrides.reset();
+        assert_eq!(overrides.scope_generation(), 1);
         assert_eq!(overrides.get_i64(REPORTED_PROBLEMS_KEY), None);
     }
 

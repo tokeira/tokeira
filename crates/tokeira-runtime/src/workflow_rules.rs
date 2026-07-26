@@ -428,6 +428,7 @@ mod tests {
             cancel_requested: false,
             pause_info: None,
             stamp: 0,
+            priority: None,
             activity_reset: false,
             reset_heartbeats: false,
         }

@@ -133,6 +133,25 @@ pub trait ProvisionerPlatform {
     async fn scale(&self, deployment_dir: &Path, specs: &[String]) -> Result<Realization<usize>>;
 }
 
+/// The explanation's deployment context, assembled from what the envelope
+/// records and the platform knows (evidence-model field policy). Read-only
+/// verbs pass no proposed revision — the plan proposes nothing by itself.
+pub(crate) fn explain_context<P: ProvisionerPlatform>(
+    platform: &P,
+    deployment_dir: &Path,
+    envelope: &DeploymentStateEnvelope,
+    operation: &str,
+) -> tokeira_explain::DeploymentContext {
+    tokeira_explain::DeploymentContext {
+        deployment: crate::apply::deployment_identity(&envelope.deployment_id),
+        platform: platform.label(deployment_dir).to_string(),
+        operation: operation.to_string(),
+        current_revision: envelope.config_revision,
+        proposed_revision: None,
+        definition_ref: envelope.effective_config_ref.clone(),
+    }
+}
+
 /// Map an applied engine Delta to the ids-only audit entries (task 19.2).
 ///
 /// The id is the engine's **`ResourceId`** (`Change::resource`) — the exact

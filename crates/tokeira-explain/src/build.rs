@@ -202,7 +202,7 @@ fn derive_refresh_uncertainties(explanation: &mut DeploymentExplanation, outcome
             "live state could not be confirmed for this resource; the plan compares \
              desired state against records, not observations"
                 .to_string(),
-            Some("make the resource's provider reachable and re-run the plan".to_string()),
+            Some("make the platform reachable and re-run the plan".to_string()),
         );
     }
 }

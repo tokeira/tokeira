@@ -41,13 +41,14 @@ pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
             anyhow::bail!("not applicable: {reason}");
         }
         Realization::Realized(outcome) => {
-            let report = crate::render::PlanReport::new(
-                platform.label(deployment_dir).to_string(),
-                "deploy plan",
-                &envelope,
-                verdict,
-                outcome.changes,
-            );
+            let report = crate::render::ExplanationReport {
+                initialized: envelope.binding.is_some(),
+                binding: verdict,
+                explanation: tokeira_explain::explain_plan(
+                    crate::explain_context(platform, deployment_dir, &envelope, "deploy plan"),
+                    &outcome,
+                ),
+            };
             print!("{}", tokeira_report::render(&report, mode)?);
         }
     }

@@ -26,6 +26,7 @@ pub mod projection_log;
 pub mod reservoir;
 pub mod run_repository;
 pub mod slot_block_manager;
+pub mod task_queue_config;
 pub mod validation;
 pub mod worker_deployment_repository;
 
@@ -40,6 +41,7 @@ pub use projection_log::*;
 pub use reservoir::*;
 pub use run_repository::*;
 pub use slot_block_manager::*;
+pub use task_queue_config::*;
 pub use validation::*;
 pub use worker_deployment_repository::*;
 
@@ -208,6 +210,15 @@ impl DsqlStore {
         &self,
     ) -> &worker_deployment_repository::DsqlWorkerDeploymentRepository {
         &self.worker_deployment_repository
+    }
+
+    /// Construct a task-queue policy repository over the shared director.
+    ///
+    /// Like the CHASM node repository, this facade is stateless beyond the
+    /// director handle and therefore does not need another owned `DsqlStore`
+    /// field or a wider `into_parts` tuple.
+    pub fn task_queue_config_repository(&self) -> task_queue_config::DsqlTaskQueueConfigRepository {
+        task_queue_config::DsqlTaskQueueConfigRepository::new(Arc::clone(&self.director))
     }
 
     /// Decompose the facade into owned backend components.

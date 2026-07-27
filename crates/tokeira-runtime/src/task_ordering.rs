@@ -161,16 +161,37 @@ pub trait DeliveryModeProvider: Send + Sync + 'static {
     }
 }
 
-/// Stock v1.31.0 mode provider.
+/// Typed startup policy for queue-local delivery.
 ///
-/// Production contains no new configuration knob. Conformance builds read the
-/// three scoped Temporal keys at this live delivery decision point.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StockDeliveryModeProvider;
+/// Priority remains part of the pinned v1.31.0 baseline, so production
+/// construction supplies only the separately gated User Fairness choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StaticDeliveryPolicy {
+    /// Enable weighted User Fairness for non-sticky task queues.
+    pub enable_fairness: bool,
+}
 
-impl DeliveryModeProvider for StockDeliveryModeProvider {
+/// Delivery-mode provider backed by typed startup configuration.
+///
+/// Raw Temporal dynamic-config keys are deliberately absent from this public
+/// boundary. A conformance build applies its allow-listed overlay internally at
+/// the live consult site without changing the typed production policy.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConfiguredDeliveryModeProvider {
+    policy: StaticDeliveryPolicy,
+}
+
+impl ConfiguredDeliveryModeProvider {
+    /// Construct a provider from already-validated startup policy.
+    #[must_use]
+    pub const fn new(policy: StaticDeliveryPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl DeliveryModeProvider for ConfiguredDeliveryModeProvider {
     fn mode_for(&self, _queue: &QueueKey) -> DeliveryMode {
-        delivery_mode()
+        delivery_mode(self.policy)
     }
 
     #[cfg(feature = "conformance")]
@@ -179,25 +200,40 @@ impl DeliveryModeProvider for StockDeliveryModeProvider {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DeliveryModeOverlay {
+    priority_enabled: Option<bool>,
+    fairness_enabled: Option<bool>,
+    auto_enable: Option<bool>,
+}
+
+fn resolve_delivery_mode(
+    policy: StaticDeliveryPolicy,
+    overlay: DeliveryModeOverlay,
+) -> DeliveryMode {
+    DeliveryMode {
+        priority_enabled: overlay.priority_enabled.unwrap_or(true),
+        fairness_enabled: overlay.fairness_enabled.unwrap_or(policy.enable_fairness),
+        auto_enable: overlay.auto_enable.unwrap_or(false),
+    }
+    .coherent()
+}
+
 #[cfg(not(feature = "conformance"))]
-fn delivery_mode() -> DeliveryMode {
-    DeliveryMode::default()
+fn delivery_mode(policy: StaticDeliveryPolicy) -> DeliveryMode {
+    resolve_delivery_mode(policy, DeliveryModeOverlay::default())
 }
 
 #[cfg(feature = "conformance")]
-fn delivery_mode() -> DeliveryMode {
-    DeliveryMode {
-        priority_enabled: tokeira_conformance::overrides()
-            .get_bool("matching.useNewMatcher")
-            .unwrap_or(true),
-        fairness_enabled: tokeira_conformance::overrides()
-            .get_bool("matching.enableFairness")
-            .unwrap_or(false),
-        auto_enable: tokeira_conformance::overrides()
-            .get_bool("matching.autoEnableV2")
-            .unwrap_or(false),
-    }
-    .coherent()
+fn delivery_mode(policy: StaticDeliveryPolicy) -> DeliveryMode {
+    resolve_delivery_mode(
+        policy,
+        DeliveryModeOverlay {
+            priority_enabled: tokeira_conformance::overrides().get_bool("matching.useNewMatcher"),
+            fairness_enabled: tokeira_conformance::overrides().get_bool("matching.enableFairness"),
+            auto_enable: tokeira_conformance::overrides().get_bool("matching.autoEnableV2"),
+        },
+    )
 }
 
 /// Queue-local, process-lifetime assignment state.
@@ -357,6 +393,99 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: configuration-policy, Property 1: effective-policy precedence
+        #[test]
+        fn effective_policy_precedence_matches_reference(
+            configured_fairness in any::<bool>(),
+            priority_overlay in prop::option::of(any::<bool>()),
+            fairness_overlay in prop::option::of(any::<bool>()),
+            auto_overlay in prop::option::of(any::<bool>()),
+        ) {
+            let policy = StaticDeliveryPolicy {
+                enable_fairness: configured_fairness,
+            };
+            let resolved = resolve_delivery_mode(
+                policy,
+                DeliveryModeOverlay {
+                    priority_enabled: priority_overlay,
+                    fairness_enabled: fairness_overlay,
+                    auto_enable: auto_overlay,
+                },
+            );
+            let expected_fairness = fairness_overlay.unwrap_or(configured_fairness);
+            prop_assert_eq!(resolved.fairness_enabled, expected_fairness);
+            prop_assert_eq!(
+                resolved.priority_enabled,
+                priority_overlay.unwrap_or(true) || expected_fairness
+            );
+            prop_assert_eq!(resolved.auto_enable, auto_overlay.unwrap_or(false));
+        }
+
+        // Feature: configuration-policy, Property 12: delivery-mode composition
+        #[test]
+        fn delivery_mode_composition_matches_reference(
+            configured_fairness in any::<bool>(),
+            priority_overlay in prop::option::of(any::<bool>()),
+            fairness_overlay in prop::option::of(any::<bool>()),
+            auto_overlay in prop::option::of(any::<bool>()),
+            sticky in any::<bool>(),
+            workflow_queue in any::<bool>(),
+            priority_key in 0i32..=PRIORITY_LEVELS,
+            fairness_key in "[a-z]{0,8}",
+            fairness_weight in 0.001f32..10.0,
+        ) {
+            let queue = QueueKey {
+                namespace_id: NamespaceId::new(),
+                task_queue: TaskQueueName("composition".to_owned()),
+                task_kind: if workflow_queue {
+                    TaskKind::Workflow
+                } else {
+                    TaskKind::Activity
+                },
+                deployment: None,
+                build_id: None,
+            };
+            let overlay = DeliveryModeOverlay {
+                priority_enabled: priority_overlay,
+                fairness_enabled: fairness_overlay,
+                auto_enable: auto_overlay,
+            };
+            let mode = resolve_delivery_mode(
+                StaticDeliveryPolicy {
+                    enable_fairness: configured_fairness,
+                },
+                overlay,
+            );
+            let raw = Priority {
+                priority_key,
+                fairness_key: fairness_key.clone(),
+                fairness_weight,
+            };
+            let mut ordering = DeliveryOrdering::default();
+            let order = ordering.assign(&queue, Some(&raw), sticky, None, mode);
+
+            let qualifies_for_auto = !sticky
+                && mode.auto_enable
+                && (!fairness_key.is_empty()
+                    || (priority_key != 0 && !mode.priority_enabled));
+            let fairness_active =
+                !sticky && (mode.fairness_enabled || qualifies_for_auto);
+            let priority_active = mode.priority_enabled || qualifies_for_auto;
+            let expected_priority = if priority_active {
+                if priority_key == 0 {
+                    DEFAULT_PRIORITY_KEY as i16
+                } else {
+                    priority_key as i16
+                }
+            } else {
+                DEFAULT_PRIORITY_KEY as i16
+            };
+
+            prop_assert_eq!(order.priority_key, expected_priority);
+            prop_assert_eq!(order.fair_pass > 0, fairness_active);
+            prop_assert_eq!(order.insertion_tie, 0);
+        }
 
         // Feature: task-queue-priority-fairness, Property 1
         #[test]
@@ -576,6 +705,33 @@ mod tests {
 
             ordering.enter_scope(1);
             prop_assert!(!ordering.is_auto_enabled(&normal_queue));
+        }
+    }
+
+    #[test]
+    fn kernel_and_lane_remain_independent_from_delivery_policy() {
+        let kernel_manifest = include_str!("../../tokeira-kernel/Cargo.toml");
+        for forbidden_dependency in ["tokeira-config", "tokeira-conformance", "tokeira-runtime"] {
+            assert!(
+                !kernel_manifest.contains(forbidden_dependency),
+                "kernel manifest must not depend on {forbidden_dependency}"
+            );
+        }
+
+        // Lane selection is run-key locality, not task-queue delivery policy.
+        // Keep this structural tripwire beside the policy provider so a future
+        // import cannot silently move policy into the correctness scheduler.
+        let lane_source = include_str!("lane.rs");
+        for forbidden_policy in [
+            "DeliveryMode",
+            "StaticDeliveryPolicy",
+            "effective_priority",
+            "fairness_key",
+        ] {
+            assert!(
+                !lane_source.contains(forbidden_policy),
+                "lane router must not consult {forbidden_policy}"
+            );
         }
     }
 

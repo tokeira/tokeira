@@ -3,7 +3,7 @@
 ## Overview
 
 This design delivers the configured auth layer decided in
-[`docs/conformance/v1.31.0/authorization.md`](../../../docs/conformance/v1.31.0/authorization.md):
+[`reference/v1.31.0-conformance-decision.md`](./reference/v1.31.0-conformance-decision.md):
 a `tokeira-auth` crate holding the Claims/Role model, the multi-issuer JWT authenticator
 (JWKS-backed, `iss`-routed), the AWS IAM authenticator (presigned STS `GetCallerIdentity`
 bearer), and the default authorizer; the `[policy.authorization]` config section (presence-

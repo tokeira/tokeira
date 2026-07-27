@@ -1,4 +1,6 @@
+pub mod documentation;
 pub mod loader;
+pub use documentation::{CONFIG_FIELD_CATALOG, ConfigFieldClass, ConfigFieldDocumentation};
 pub use loader::{ConfigLoaderError, load_config, write_config_toml};
 
 use std::{
@@ -222,6 +224,9 @@ pub struct PolicyConfig {
     pub quotas: QuotasConfig,
     #[serde(default)]
     pub compatibility: CompatibilityConfig,
+    /// Startup-static task-queue delivery policy.
+    #[serde(default)]
+    pub task_queues: TaskQueuePolicyConfig,
     #[serde(default)]
     pub nexus_endpoint_limits: NexusEndpointLimitsConfig,
     #[serde(default)]
@@ -233,6 +238,21 @@ pub struct PolicyConfig {
     /// the stock permissive server.
     #[serde(default)]
     pub authorization: Option<AuthorizationConfig>,
+}
+
+/// Startup-static task-queue delivery policy.
+///
+/// Temporal v1.31.0 enables priority-aware delivery but leaves User Fairness
+/// disabled by default (`matching.useNewMatcher` and `matching.enableFairness`
+/// in `common/dynamicconfig/constants.go @ v1.31.0`). Tokeira exposes only the
+/// latter choice because the five-band priority matcher remains baseline
+/// behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskQueuePolicyConfig {
+    /// Opt in to weighted User Fairness for non-sticky task queues.
+    #[serde(default)]
+    pub enable_fairness: bool,
 }
 
 /// Static policy for Temporal's public HTTP/JSON compatibility gateway.
@@ -810,6 +830,7 @@ impl Default for PolicyConfig {
             namespace_creation: NamespaceCreationPolicy::Open,
             quotas: QuotasConfig::default(),
             compatibility: CompatibilityConfig::default(),
+            task_queues: TaskQueuePolicyConfig::default(),
             nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
             nexus_completion: NexusCompletionConfig::default(),
             http_api: HttpApiPolicyConfig::default(),
@@ -1867,11 +1888,33 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
+        // Feature: configuration-policy, Property 2: configuration defaulting and round-trip preservation
         #[test]
         fn property_toml_round_trip(config in arb_valid_config()) {
             let encoded = config.to_toml().unwrap();
             let decoded: TokeiraConfig = toml::from_str(&encoded).unwrap();
             prop_assert_eq!(decoded, config);
+        }
+
+        // Feature: configuration-policy, Property 2: configuration defaulting and round-trip preservation
+        #[test]
+        fn property_old_shape_defaults_fairness_without_changing_other_values(
+            config in arb_valid_config(),
+        ) {
+            let encoded = config.to_toml().unwrap();
+            let mut old_shape: toml::Value = toml::from_str(&encoded).unwrap();
+            old_shape
+                .get_mut("policy")
+                .and_then(toml::Value::as_table_mut)
+                .unwrap()
+                .remove("task_queues");
+            let old_shape = toml::to_string(&old_shape).unwrap();
+            let decoded: TokeiraConfig = toml::from_str(&old_shape).unwrap();
+
+            let mut expected = config;
+            expected.policy.task_queues = TaskQueuePolicyConfig::default();
+            prop_assert!(!decoded.policy.task_queues.enable_fairness);
+            prop_assert_eq!(decoded, expected);
         }
 
         #[test]
@@ -2006,6 +2049,7 @@ mod tests {
             1u32..=36_500,
             1u32..=100_000,
             1u32..=10_000,
+            any::<bool>(),
         )
             .prop_map(
                 |(
@@ -2019,6 +2063,7 @@ mod tests {
                     default_retention_days,
                     target_workflow_starts_per_second,
                     target_p99_wft_latency_ms,
+                    enable_fairness,
                 )| TokeiraConfig {
                     infrastructure: InfrastructureConfig {
                         storage: ConfigStorageKind::InMemory,
@@ -2043,6 +2088,7 @@ mod tests {
                         namespace_creation: NamespaceCreationPolicy::Open,
                         quotas: QuotasConfig::default(),
                         compatibility: CompatibilityConfig::default(),
+                        task_queues: TaskQueuePolicyConfig { enable_fairness },
                         nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
                         nexus_completion: NexusCompletionConfig::default(),
                         http_api: HttpApiPolicyConfig::default(),

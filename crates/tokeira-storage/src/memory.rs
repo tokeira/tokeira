@@ -36,11 +36,13 @@ use crate::{
         DeleteRunResult, DeploymentCasResult, DeploymentKey, DeploymentName,
         DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult,
         LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch, ProjectionLog,
-        ProjectionRecord, RequestRecord, RunRepository, StoredWorkerDeployment,
-        TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentRepository,
-        WorkerDeploymentVersionKey, WorkflowRuleCreateResult, WorkflowRuleDeleteResult,
-        WorkflowTimeoutSweepEntry, deleted_workflow_projection_context, dispatchable_workflow_task,
-        workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
+        ProjectionRecord, RequestRecord, RunRepository, StoredTaskQueueConfig,
+        StoredTaskQueueConfigKey, StoredWorkerDeployment, TaskQueueConfigCasResult,
+        TaskQueueConfigRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
+        WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
+        WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
+        dispatchable_workflow_task, workflow_is_open_and_pinned_to_version,
+        workflow_projection_context_with_previous,
     },
     metrics as storage_metrics,
 };
@@ -93,6 +95,8 @@ struct StoreState {
     worker_deployments: HashMap<DeploymentKey, StoredWorkerDeployment>,
     /// Durable namespace Workflow Rules in deterministic id order.
     workflow_rules: HashMap<NamespaceId, BTreeMap<String, WorkflowRuleRecord>>,
+    /// Public task-queue delivery policy, independent from workflow history.
+    task_queue_configs: HashMap<StoredTaskQueueConfigKey, StoredTaskQueueConfig>,
     /// Per-deployment conflict-token high-water-mark.
     ///
     /// The conflict token must increase monotonically across the entire
@@ -1523,6 +1527,59 @@ impl WorkerDeploymentRepository for InMemoryStore {
 }
 
 #[async_trait]
+impl TaskQueueConfigRepository for InMemoryStore {
+    async fn load_task_queue_config(
+        &self,
+        key: &StoredTaskQueueConfigKey,
+    ) -> Result<Option<StoredTaskQueueConfig>> {
+        Ok(self.inner.lock().await.task_queue_configs.get(key).cloned())
+    }
+
+    async fn compare_and_swap_task_queue_config(
+        &self,
+        mut record: StoredTaskQueueConfig,
+        expected_revision: Option<u64>,
+    ) -> Result<TaskQueueConfigCasResult> {
+        let mut store = self.inner.lock().await;
+        let key = record.key();
+        let current_revision = store
+            .task_queue_configs
+            .get(&key)
+            .map(|current| current.revision);
+        if current_revision != expected_revision {
+            return Ok(TaskQueueConfigCasResult::Conflict);
+        }
+        let revision = expected_revision
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("task-queue configuration revision overflow"))?;
+        record.revision = revision;
+        store.task_queue_configs.insert(key, record);
+        Ok(TaskQueueConfigCasResult::Applied { revision })
+    }
+
+    async fn list_all_task_queue_configs(&self) -> Result<Vec<StoredTaskQueueConfig>> {
+        let mut records = self
+            .inner
+            .lock()
+            .await
+            .task_queue_configs
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.namespace_id
+                .0
+                .as_bytes()
+                .cmp(right.namespace_id.0.as_bytes())
+                .then_with(|| left.task_queue.0.cmp(&right.task_queue.0))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        Ok(records)
+    }
+}
+
+#[async_trait]
 impl ProjectionLog for InMemoryStore {
     async fn read_from(&self, cursor: &ProjectionCursor, limit: usize) -> Result<ProjectionBatch> {
         let store = self.inner.lock().await;
@@ -1769,7 +1826,9 @@ mod tests {
     };
 
     use crate::api::{
-        RoutingConfigUpdateState, RunRepository, StoredRoutingConfig, WorkerDeploymentRepository,
+        RoutingConfigUpdateState, RunRepository, StoredRoutingConfig, StoredTaskQueueConfig,
+        StoredTaskQueueConfigKind, TaskQueueConfigCasResult, TaskQueueConfigRepository,
+        WorkerDeploymentRepository,
     };
 
     use super::*;
@@ -4917,5 +4976,105 @@ mod tests {
 
         let names = buffer.0.lock().unwrap().clone();
         assert!(names.iter().any(|name| name == "storage.load_run"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: configuration-policy, Property 9: task-queue CAS concurrency
+        #[test]
+        fn task_queue_cas_admits_one_successor_and_retry_preserves_both_updates(
+            namespace in any::<u128>(),
+            first_weight in 0.001f32..1000.0,
+            second_weight in 0.001f32..1000.0,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let store = Arc::new(InMemoryStore::default());
+                let base = StoredTaskQueueConfig {
+                    namespace_id: NamespaceId(uuid::Uuid::from_u128(namespace)),
+                    task_queue: TaskQueueName("cas-queue".to_owned()),
+                    kind: StoredTaskQueueConfigKind::Activity,
+                    revision: 999,
+                    queue_rate_limit: None,
+                    queue_rate_limit_metadata: None,
+                    fairness_key_rate_limit_default: None,
+                    fairness_key_rate_limit_metadata: None,
+                    fairness_weight_overrides: BTreeMap::new(),
+                };
+                prop_assert_eq!(
+                    store
+                        .compare_and_swap_task_queue_config(base.clone(), None)
+                        .await
+                        .unwrap(),
+                    TaskQueueConfigCasResult::Applied { revision: 1 }
+                );
+
+                let mut first = base.clone();
+                first
+                    .fairness_weight_overrides
+                    .insert("first".to_owned(), first_weight);
+                let mut second = base;
+                second
+                    .fairness_weight_overrides
+                    .insert("second".to_owned(), second_weight);
+                let (first_result, second_result) = tokio::join!(
+                    store.compare_and_swap_task_queue_config(first.clone(), Some(1)),
+                    store.compare_and_swap_task_queue_config(second.clone(), Some(1)),
+                );
+                let first_result = first_result.unwrap();
+                let second_result = second_result.unwrap();
+                prop_assert_eq!(
+                    [first_result, second_result]
+                        .into_iter()
+                        .filter(|result| matches!(
+                            result,
+                            TaskQueueConfigCasResult::Applied { revision: 2 }
+                        ))
+                        .count(),
+                    1
+                );
+                prop_assert_eq!(
+                    [first_result, second_result]
+                        .into_iter()
+                        .filter(|result| matches!(result, TaskQueueConfigCasResult::Conflict))
+                        .count(),
+                    1
+                );
+
+                let key = first.key();
+                let durable = store
+                    .load_task_queue_config(&key)
+                    .await
+                    .unwrap()
+                    .expect("winning record");
+                prop_assert_eq!(durable.revision, 2);
+                let retry = if first_result == TaskQueueConfigCasResult::Conflict {
+                    first
+                } else {
+                    second
+                };
+                prop_assert_eq!(
+                    store
+                        .compare_and_swap_task_queue_config(retry, Some(2))
+                        .await
+                        .unwrap(),
+                    TaskQueueConfigCasResult::Applied { revision: 3 }
+                );
+                prop_assert_eq!(
+                    store
+                        .load_task_queue_config(&key)
+                        .await
+                        .unwrap()
+                        .expect("retried record")
+                        .revision,
+                    3
+                );
+                Ok(())
+            })?;
+        }
     }
 }

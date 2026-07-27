@@ -2066,7 +2066,8 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     // `frontend.workerVersioningRuleAPIs`) default to off, so a stock server
     // refuses all five RPCs before any namespace or field validation. tokeira
     // has no dynamic config: the gates are permanently off and the rejection
-    // is the whole surface (docs/conformance/v1.31.0/worker-versioning.md).
+    // is the whole surface
+    // (.kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md).
     async fn update_worker_build_id_compatibility(
         &self,
         _request: Request<workflowservice::UpdateWorkerBuildIdCompatibilityRequest>,
@@ -2882,7 +2883,16 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 },
                 tokeira_runtime::max_fairness_weight_overrides(),
             )
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            .await
+            .map_err(|error| match error {
+                tokeira_runtime::TaskQueueConfigStoreError::Validation(error) => {
+                    Status::invalid_argument(error.to_string())
+                }
+                tokeira_runtime::TaskQueueConfigStoreError::Storage { .. }
+                | tokeira_runtime::TaskQueueConfigStoreError::ConflictExhausted => {
+                    Status::unavailable(error.to_string())
+                }
+            })?;
         let config = crate::workflow_service::task_queue_config_to_edge(updated);
         Ok(Response::new(
             workflowservice::UpdateTaskQueueConfigResponse {
@@ -3487,7 +3497,10 @@ mod tests {
     // RespondNexusTaskFailed error); exercising them is required for v1.31.0.
     #![allow(deprecated)]
 
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -3519,7 +3532,7 @@ mod tests {
     };
     use tokeira_runtime::{
         NexusHttpTaskRequest, NexusHttpTaskRequestVariant, NexusTask, NexusTaskBroker,
-        NexusTaskRequest, NexusTaskToken, WorkerRegistry,
+        NexusTaskRequest, NexusTaskToken, TaskQueueConfigStore as _, WorkerRegistry,
     };
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
     use tokeira_types::{
@@ -4446,6 +4459,149 @@ mod tests {
                 Arc::new(tokeira_runtime::BatchOperationStore::default()),
             );
         WorkflowServiceGrpc::new(service)
+    }
+
+    fn task_queue_config_test_service(
+        store: Arc<dyn tokeira_runtime::TaskQueueConfigStore>,
+    ) -> WorkflowServiceGrpc {
+        let cache: Arc<dyn NamespaceCache> = Arc::new(StaticNamespaceCache);
+        let operator_api = Arc::new(InMemoryOperatorApi::new("tokeira-local"));
+        let service =
+            WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
+                Arc::new(PollNoneRuntime),
+                Arc::new(NoopResolver),
+                Arc::new(EmptyVisibilityApi),
+                Arc::new(tokeira_storage::InMemoryStore::default()),
+                operator_api,
+                cache.clone(),
+                Arc::new(EdgeInterceptors::permissive(cache)),
+                PollerRegistry::default(),
+                crate::PendingQueryStore::default(),
+                tokeira_runtime::BufferedQueryRegistry::default(),
+                tokeira_runtime::InMemoryBroker::default(),
+                tokeira_runtime::NexusTaskBroker::default(),
+                LongPollGate::new(LongPollConfig::default()),
+                Arc::new(LocalOnlyRouter),
+                HistoryWaitRegistry::default(),
+                WorkerRegistry::default(),
+                Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default()),
+                Arc::new(tokeira_runtime::ScheduleStore::default()),
+                store,
+                Arc::new(tokeira_runtime::BatchOperationStore::default()),
+            );
+        WorkflowServiceGrpc::new(service)
+    }
+
+    #[derive(Debug, Default)]
+    struct UnavailableTaskQueueConfigStore;
+
+    #[async_trait]
+    impl tokeira_runtime::TaskQueueConfigStore for UnavailableTaskQueueConfigStore {
+        async fn get(
+            &self,
+            _key: &tokeira_runtime::TaskQueueConfigKey,
+        ) -> Result<
+            Option<tokeira_runtime::TaskQueueConfigEntry>,
+            tokeira_runtime::TaskQueueConfigStoreError,
+        > {
+            Err(tokeira_runtime::TaskQueueConfigStoreError::Storage {
+                message: "injected failure".to_owned(),
+            })
+        }
+
+        async fn apply(
+            &self,
+            _key: tokeira_runtime::TaskQueueConfigKey,
+            _patch: tokeira_runtime::TaskQueueConfigPatch,
+            _max_overrides: usize,
+        ) -> Result<tokeira_runtime::TaskQueueConfigEntry, tokeira_runtime::TaskQueueConfigStoreError>
+        {
+            Err(tokeira_runtime::TaskQueueConfigStoreError::Storage {
+                message: "injected failure".to_owned(),
+            })
+        }
+
+        async fn list(
+            &self,
+            _namespace_id: &NamespaceId,
+        ) -> Result<
+            Vec<tokeira_runtime::TaskQueueConfigEntry>,
+            tokeira_runtime::TaskQueueConfigStoreError,
+        > {
+            Err(tokeira_runtime::TaskQueueConfigStoreError::Storage {
+                message: "injected failure".to_owned(),
+            })
+        }
+
+        fn changed(&self, _key: &tokeira_runtime::TaskQueueConfigKey) -> Arc<Notify> {
+            Arc::new(Notify::new())
+        }
+    }
+
+    fn task_queue_config_request(
+        weights: BTreeMap<String, f32>,
+    ) -> workflowservice::UpdateTaskQueueConfigRequest {
+        workflowservice::UpdateTaskQueueConfigRequest {
+            namespace: "default".to_owned(),
+            identity: "operator".to_owned(),
+            task_queue: "queue".to_owned(),
+            task_queue_type: TaskQueueType::Activity as i32,
+            set_fairness_weight_overrides: weights,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn update_task_queue_config_returns_only_committed_state_and_preserves_on_rejection() {
+        let store = Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default());
+        let grpc = task_queue_config_test_service(store.clone());
+        let response =
+            grpc.update_task_queue_config(Request::new(task_queue_config_request(BTreeMap::from(
+                [("tenant".to_owned(), 2.0)],
+            ))))
+            .await
+            .expect("valid update")
+            .into_inner();
+        assert_eq!(
+            response
+                .config
+                .as_ref()
+                .expect("committed config")
+                .fairness_weight_overrides
+                .get("tenant"),
+            Some(&2.0)
+        );
+
+        let rejected =
+            grpc.update_task_queue_config(Request::new(task_queue_config_request(BTreeMap::from(
+                [("tenant".to_owned(), -1.0)],
+            ))))
+            .await
+            .expect_err("invalid weight");
+        assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
+        let stored = store
+            .get(&tokeira_runtime::TaskQueueConfigKey {
+                namespace_id: namespace_id_for("default"),
+                task_queue: TaskQueueName("queue".to_owned()),
+                kind: tokeira_runtime::TaskQueueConfigKind::Activity,
+            })
+            .await
+            .expect("store read")
+            .expect("committed record");
+        assert_eq!(stored.fairness_weight_overrides.get("tenant"), Some(&2.0));
+    }
+
+    #[tokio::test]
+    async fn update_task_queue_config_maps_storage_failure_to_unavailable() {
+        let grpc = task_queue_config_test_service(Arc::new(UnavailableTaskQueueConfigStore));
+        let error =
+            grpc.update_task_queue_config(Request::new(task_queue_config_request(BTreeMap::from(
+                [("tenant".to_owned(), 2.0)],
+            ))))
+            .await
+            .expect_err("storage failure");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("injected failure"));
     }
 
     /// api-conformance-task-queue Property 1 (Single-Partition Compatibility): with

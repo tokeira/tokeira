@@ -958,6 +958,19 @@ where
         self
     }
 
+    /// Share one typed startup delivery policy with workflow and activity brokers.
+    ///
+    /// Nexus task transport has no public `Priority` metadata in the v1.31.0
+    /// surface, so it continues to consume only its live task-queue rate policy.
+    pub fn with_delivery_mode_provider(
+        self,
+        provider: Arc<dyn crate::DeliveryModeProvider>,
+    ) -> Self {
+        self.broker.set_delivery_mode_provider(provider.clone());
+        self.activity_broker.set_delivery_mode_provider(provider);
+        self
+    }
+
     /// Return a clone of the workflow-task broker.
     pub fn broker(&self) -> InMemoryBroker {
         self.broker.clone()

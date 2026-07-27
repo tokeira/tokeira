@@ -42,10 +42,35 @@ The surface is defined across three companion pages, partitioned by Temporal's o
 - **[`excluded.md`](./excluded.md)** — what is outside the surface, with factual reasons: features
   Temporal labels **experimental / pre-release**, **internal** (non-public) surfaces, and RPCs **absent
   from v1.31.0** (the `v1.62.11`-only Nexus operation-execution RPCs).
-- **[`decisions.md`](./decisions.md)** — surfaces present in v1.31.0 but **still under decision**
-  (none currently open). Authentication/authorization is resolved — see
-  [`authorization.md`](./authorization.md); the deprecated worker-versioning V1/V2 surface is
-  resolved — see [`worker-versioning.md`](./worker-versioning.md).
+- **[`tokeira-configuration.md`](./tokeira-configuration.md)** — the current Feature Catalog,
+  empty-configuration defaults, exact enablement actions, and every accepted production field.
+
+No conformance-surface decision is currently open. Resolved deliberation lives with
+the owning feature specs, while this folder retains the concise authoritative outcome.
+
+## Empty Configuration guarantee
+
+An empty `tokeirad` TOML document is valid. It selects the documented safe compatibility
+posture: priority remains active, User Fairness and Standalone Activities remain disabled,
+authorization is a stock-compatible no-op until an identity source is configured, and no
+emergency restriction is active. Tokeira accepts typed product policy, not Temporal's raw
+dynamic-config key namespace. The complete operator contract and canonical example are in
+[`tokeira-configuration.md`](./tokeira-configuration.md) and
+[`../../../config.example.toml`](../../../config.example.toml).
+
+## Resolved policy outcomes
+
+- **Task Queue Priority and User Fairness:** in-surface. Priority uses the v1.31.0
+  stock defaults. Weighted User Fairness is available through
+  `[policy.task_queues] enable_fairness = true` and remains disabled under Empty
+  Configuration. `UpdateTaskQueueConfig` policy is durable and kind-isolated.
+- **Authentication and authorization:** in-surface as stock-default no-op parity plus
+  configured bearer authentication, authorization, and Principal Attribution. TLS
+  terminates upstream; AWS IAM bearer authorization is a Tokeira-native extension.
+  [Decision record](../../../.kiro/specs/authorization-foundation/reference/v1.31.0-conformance-decision.md).
+- **Worker Versioning V1/V2:** the five deprecated RPCs conform only as their exact
+  stock-default rejections; GA Worker Deployments are the supported replacement.
+  [Decision record](../../../.kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md).
 
 ## How the contract is established (ground truth)
 
@@ -66,16 +91,10 @@ v1.31.0 would return for the same execution lineage?"
   in Temporal's terms.
 - [`excluded.md`](./excluded.md) — what is outside the surface (experimental/pre-release, internal,
   absent from v1.31.0), with reasons.
-- [`decisions.md`](./decisions.md) — surfaces present in v1.31.0 that are still under decision
-  (none currently open).
-- [`authorization.md`](./authorization.md) — the resolved authentication/authorization decision:
-  in-surface in two layers (stock-default no-op parity; configured JWT + Principal Attribution);
-  bearer-only at the edge, TLS terminated upstream; plus the tokeira-native AWS IAM bearer
-  extension.
-- [`worker-versioning.md`](./worker-versioning.md) — the resolved Worker Versioning V1/V2 decision:
-  GA Worker Deployments only; the five deprecated RPCs conform as stock-default rejections.
-- [`configuration.md`](./configuration.md) — the complete v1.31.0 configuration surface (564 dynamic-config
-  keys + the static YAML sections), captured as the denominator for triaging what tokeira must support.
+- [`temporal-configuration.md`](./temporal-configuration.md) — the verified complete
+  v1.31.0 denominator: 613 source-aware dynamic declarations plus the relevant static groups.
+- [`tokeira-configuration.md`](./tokeira-configuration.md) — Tokeira feature availability,
+  defaults, enablement, live policy, and every strict production configuration field.
 
 A **functional conformance report** — the measured outcome of replaying Temporal's functional suites
 against this surface — will join this folder once it exists. It is not present yet; until then, measured

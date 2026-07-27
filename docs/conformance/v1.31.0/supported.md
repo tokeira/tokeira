@@ -7,8 +7,8 @@
 > Measured progress is tracked separately in [`../../readiness/conformance.md`](../../readiness/conformance.md).
 >
 > Features Temporal labels **experimental / pre-release**, internal surfaces, and RPCs absent from
-> v1.31.0 are in [`excluded.md`](./excluded.md). Surfaces still under decision would be in
-> [`decisions.md`](./decisions.md) (none currently open).
+> v1.31.0 are in [`excluded.md`](./excluded.md). No conformance-surface decision is currently open;
+> future deliberation belongs to the owning feature spec.
 
 ## What "conforming at the API level" means
 
@@ -39,8 +39,7 @@ v1.31.0 ships) these total **121 RPCs**:
 
 Each area below is part of the v1.31.0 surface. The maturity column quotes Temporal's own designation for
 v1.31.0 (release notes / proto). Areas Temporal labels experimental or pre-release are **not** here — see
-[`excluded.md`](./excluded.md); any area under decision would be in [`decisions.md`](./decisions.md)
-(none currently open).
+[`excluded.md`](./excluded.md). No area is currently under decision.
 
 | Feature area | Representative RPCs | v1.31.0 maturity (Temporal) |
 |--------------|---------------------|-----------------------------|
@@ -83,10 +82,12 @@ fairness-disabled. Task-queue weight overrides take precedence over positive tas
 which take precedence over 1.0.
 
 `UpdateTaskQueueConfig` carries queue-wide handout rate, the activity/Nexus per-fairness-key default
-rate, and fairness-weight override updates. `DescribeTaskQueue` echoes the effective stored config and
-reports real `stats_by_priority_key`; absent bands are omitted and aggregate backlog is the sum of the
-same band data. Ordering and fairness are best-effort delivery tendencies: already handed-out and
-speculative tasks are not retroactively reordered.
+rate, and fairness-weight override updates. These kind-isolated records commit through a dedicated
+CAS repository before success is returned, survive process replacement, and hydrate into each
+server's disposable delivery cache before traffic. `DescribeTaskQueue` echoes the effective stored
+config and reports real `stats_by_priority_key`; absent bands are omitted and aggregate backlog is
+the sum of the same band data. Ordering and fairness are best-effort delivery tendencies: already
+handed-out and speculative tasks are not retroactively reordered.
 
 ## Nexus
 
@@ -128,7 +129,7 @@ are in [`excluded.md`](./excluded.md). The shared field machinery that stock ser
 (`WorkerVersionStamp`/`binary_checksum` echo, `worker_version_capabilities` poller validation,
 `GetSystemInfo`'s `BuildIdBasedVersioning: true`, degenerate ENHANCED `DescribeTaskQueue`)
 remains part of the field-fidelity bar of the areas above. Decision record:
-[`worker-versioning.md`](./worker-versioning.md).
+[`.kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md`](../../../.kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md).
 
 ## Standalone Activities
 
@@ -145,7 +146,9 @@ The RPC surface is `StartActivityExecution`, `DescribeActivityExecution`, `PollA
 
 ## Authentication and authorization
 
-Resolved 2026-07-16 — decision record: [`authorization.md`](./authorization.md). This surface has
+Resolved 2026-07-16 —
+[decision record](../../../.kiro/specs/authorization-foundation/reference/v1.31.0-conformance-decision.md).
+This surface has
 **no gRPC service**: it is a server interceptor pair (a `ClaimMapper` and an `Authorizer`) selected
 by configuration, plus **Principal Attribution** — v1.31.0's server-computed
 `HistoryEvent.principal` (field 303). Conformance targets it in two layers:
@@ -182,7 +185,7 @@ otherwise responds.
 
 - [`excluded.md`](./excluded.md) — experimental/pre-release features, internal surfaces, and RPCs absent
   from v1.31.0, each with Temporal's own designation as the reason.
-- [`decisions.md`](./decisions.md) — the decisions ledger (none currently open).
-- [`authorization.md`](./authorization.md) — the resolved authentication/authorization decision record.
+- [`tokeira-configuration.md`](./tokeira-configuration.md) — current feature
+  availability, defaults, enablement, and production configuration.
 - [`../../readiness/conformance.md`](../../readiness/conformance.md) — measured progress toward this
   surface.

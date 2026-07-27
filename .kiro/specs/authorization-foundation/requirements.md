@@ -3,7 +3,7 @@
 ## Introduction
 
 This spec delivers the **configured layer** of the authentication/authorization conformance
-decision ([`docs/conformance/v1.31.0/authorization.md`](../../../docs/conformance/v1.31.0/authorization.md)):
+decision ([`reference/v1.31.0-conformance-decision.md`](./reference/v1.31.0-conformance-decision.md)):
 a real JWT authenticator (claim mapper + default authorizer + role model), the
 `[policy.authorization]` static-config section (curated to the close-to-zero-configuration claim
 of `docs/readiness/configuration.md`), the four related dynamic-config keys wired through the

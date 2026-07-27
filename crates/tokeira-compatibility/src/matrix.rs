@@ -1,11 +1,297 @@
 use crate::{
-    CompatibilityEvidence, CompatibilitySurface, CompatibilitySurfaceKind, FeatureEntry,
-    FeatureState,
+    CompatibilityEvidence, CompatibilitySurface, CompatibilitySurfaceKind, ConformanceDisposition,
+    DefaultPosture, EnablementKind, FeatureCatalogMetadata, FeatureEnablement, FeatureEntry,
+    FeatureOrigin, FeatureState, PolicyMutability, PolicyScope, TemporalMaturity,
 };
+
+const NO_PREREQUISITES: &[&str] = &[];
+const NO_POLICY_SCOPE: &[PolicyScope] = &[PolicyScope::NotApplicable];
+const CLUSTER_SCOPE: &[PolicyScope] = &[PolicyScope::Cluster];
+const NAMESPACE_SCOPE: &[PolicyScope] = &[PolicyScope::Namespace];
+const TASK_QUEUE_SCOPE: &[PolicyScope] = &[PolicyScope::TaskQueue];
+
+const TEMPORAL_GA_ENABLED: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::InSurface,
+    temporal_maturity: TemporalMaturity::GeneralAvailability,
+    temporal_default: DefaultPosture::Enabled,
+    tokeira_default: DefaultPosture::Enabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::None,
+        reference: None,
+    },
+    scopes: NO_POLICY_SCOPE,
+    mutability: PolicyMutability::Immutable,
+    guidance: "Enabled with an empty production configuration.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const TEMPORAL_GA_UNAVAILABLE: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::InSurface,
+    temporal_maturity: TemporalMaturity::GeneralAvailability,
+    temporal_default: DefaultPosture::Enabled,
+    tokeira_default: DefaultPosture::Unavailable,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Unavailable,
+        reference: None,
+    },
+    scopes: NO_POLICY_SCOPE,
+    mutability: PolicyMutability::NotApplicable,
+    guidance: "Unavailable in Tokeira; no production enablement mechanism exists.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const TEMPORAL_EXPERIMENTAL_EXCLUDED: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::OutOfSurface,
+    temporal_maturity: TemporalMaturity::Experimental,
+    temporal_default: DefaultPosture::Conditional,
+    tokeira_default: DefaultPosture::Unavailable,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Unavailable,
+        reference: None,
+    },
+    scopes: NO_POLICY_SCOPE,
+    mutability: PolicyMutability::NotApplicable,
+    guidance: "Excluded because Temporal v1.31.0 labels this surface experimental.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const TEMPORAL_DEPRECATED_EXCLUDED: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::OutOfSurface,
+    temporal_maturity: TemporalMaturity::Deprecated,
+    temporal_default: DefaultPosture::Conditional,
+    tokeira_default: DefaultPosture::Unavailable,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Unavailable,
+        reference: None,
+    },
+    scopes: NO_POLICY_SCOPE,
+    mutability: PolicyMutability::NotApplicable,
+    guidance: "Excluded because Temporal v1.31.0 marks this surface deprecated and provides a GA replacement.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const TEMPORAL_EXPERIMENTAL_EXCLUDED_AVAILABLE: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::OutOfSurface,
+    temporal_maturity: TemporalMaturity::Experimental,
+    temporal_default: DefaultPosture::Conditional,
+    tokeira_default: DefaultPosture::Enabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::None,
+        reference: None,
+    },
+    scopes: NO_POLICY_SCOPE,
+    mutability: PolicyMutability::Immutable,
+    guidance: "Implemented as an experimental Tokeira surface but excluded from the v1.31.0 compatibility claim.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const STANDALONE_ACTIVITIES_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::InSurface,
+    temporal_maturity: TemporalMaturity::PublicPreview,
+    temporal_default: DefaultPosture::Disabled,
+    tokeira_default: DefaultPosture::Disabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Toml,
+        reference: Some("policy.compatibility.enable_standalone_activities = true"),
+    },
+    scopes: NAMESPACE_SCOPE,
+    mutability: PolicyMutability::StartupStatic,
+    guidance: "Set [policy.compatibility].enable_standalone_activities = true and restart tokeirad.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const DEFAULT_REJECTION_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::InSurface,
+    temporal_maturity: TemporalMaturity::Deprecated,
+    temporal_default: DefaultPosture::Disabled,
+    tokeira_default: DefaultPosture::Disabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Unavailable,
+        reference: None,
+    },
+    scopes: CLUSTER_SCOPE,
+    mutability: PolicyMutability::Immutable,
+    guidance: "Only v1.31.0 stock-default rejection behavior is supported; the deprecated enabled path is excluded.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const NEWER_WIRE_UNAVAILABLE: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::NewerVendoredWire,
+    conformance: ConformanceDisposition::OutOfSurface,
+    temporal_maturity: TemporalMaturity::Absent,
+    temporal_default: DefaultPosture::NotApplicable,
+    tokeira_default: DefaultPosture::Unavailable,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Unavailable,
+        reference: None,
+    },
+    scopes: NO_POLICY_SCOPE,
+    mutability: PolicyMutability::NotApplicable,
+    guidance: "Absent from Temporal v1.31.0/API v1.62.8 and outside this compatibility claim.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const WORKFLOW_RULES_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::InSurface,
+    temporal_maturity: TemporalMaturity::GeneralAvailability,
+    temporal_default: DefaultPosture::Disabled,
+    tokeira_default: DefaultPosture::Unavailable,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::ConformanceOnly,
+        reference: Some("frontend.workflowRulesAPIsEnabled"),
+    },
+    scopes: NAMESPACE_SCOPE,
+    mutability: PolicyMutability::ConformanceOnly,
+    guidance: "The configured enabled path is currently available only to the conformance harness; production exposes no activation setting.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const AUTHORIZATION_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::InSurface,
+    temporal_maturity: TemporalMaturity::GeneralAvailability,
+    temporal_default: DefaultPosture::Disabled,
+    tokeira_default: DefaultPosture::Disabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Toml,
+        reference: Some("policy.authorization"),
+    },
+    scopes: CLUSTER_SCOPE,
+    mutability: PolicyMutability::StartupStatic,
+    guidance: "Configure [policy.authorization] with at least one identity source and grant, then restart tokeirad.",
+    prerequisites: &["Configured JWT issuer or AWS IAM verifier"],
+};
+
+const AWS_IAM_AUTHORIZATION_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TokeiraNative,
+    conformance: ConformanceDisposition::NotApplicable,
+    temporal_maturity: TemporalMaturity::NotApplicable,
+    temporal_default: DefaultPosture::NotApplicable,
+    tokeira_default: DefaultPosture::Disabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Toml,
+        reference: Some("policy.authorization.aws_iam"),
+    },
+    scopes: CLUSTER_SCOPE,
+    mutability: PolicyMutability::StartupStatic,
+    guidance: "Configure [policy.authorization.aws_iam] grants together with authorization, then restart tokeirad.",
+    prerequisites: &["AWS identity verification and configured authorization grants"],
+};
+
+const COMPATIBILITY_METADATA_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TokeiraNative,
+    conformance: ConformanceDisposition::NotApplicable,
+    temporal_maturity: TemporalMaturity::NotApplicable,
+    temporal_default: DefaultPosture::NotApplicable,
+    tokeira_default: DefaultPosture::Enabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::None,
+        reference: None,
+    },
+    scopes: CLUSTER_SCOPE,
+    mutability: PolicyMutability::Immutable,
+    guidance: "Enabled as a Tokeira metadata extension; clients may ignore the separate service.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const TASK_QUEUE_MANAGEMENT_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::InSurface,
+    temporal_maturity: TemporalMaturity::GeneralAvailability,
+    temporal_default: DefaultPosture::Enabled,
+    tokeira_default: DefaultPosture::Enabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::PublicApi,
+        reference: Some("WorkflowService.UpdateTaskQueueConfig"),
+    },
+    scopes: TASK_QUEUE_SCOPE,
+    mutability: PolicyMutability::DurableLiveApi,
+    guidance: "Use UpdateTaskQueueConfig for queue/per-key rates and fairness-weight overrides; priority delivery needs no activation.",
+    prerequisites: NO_PREREQUISITES,
+};
+
+const USER_FAIRNESS_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::InSurface,
+    temporal_maturity: TemporalMaturity::GeneralAvailability,
+    temporal_default: DefaultPosture::Disabled,
+    tokeira_default: DefaultPosture::Disabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Toml,
+        reference: Some("policy.task_queues.enable_fairness = true"),
+    },
+    scopes: &[PolicyScope::Cluster, PolicyScope::TaskQueue],
+    mutability: PolicyMutability::StartupStatic,
+    guidance: "Set [policy.task_queues].enable_fairness = true and restart tokeirad; use UpdateTaskQueueConfig for per-key weights and rates.",
+    prerequisites: &["Priority-aware delivery (enabled by default)"],
+};
+
+const AUTHORIZATION_SURFACES: &[CompatibilitySurface] = &[
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::BehaviouralInvariant,
+        identifier: "TemporalAuthorizationInterceptors",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::HistoryEvent,
+        identifier: "HistoryEvent.principal",
+    },
+];
+
+const AWS_IAM_AUTHORIZATION_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
+    kind: CompatibilitySurfaceKind::BehaviouralInvariant,
+    identifier: "TokeiraAwsIamBearerAuthorization",
+}];
+
+const COMPATIBILITY_METADATA_SURFACES: &[CompatibilitySurface] = &[
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::Rpc,
+        identifier: "CompatibilityService.GetCompatibility",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::Rpc,
+        identifier: "CompatibilityService.ListCompatibilitySurfaces",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::Rpc,
+        identifier: "CompatibilityService.GetFeature",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::Rpc,
+        identifier: "CompatibilityService.GetSdkCompatibility",
+    },
+];
+
+const USER_FAIRNESS_SURFACES: &[CompatibilitySurface] = &[
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::BehaviouralInvariant,
+        identifier: "TaskQueueUserFairnessHandout",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::RequestField,
+        identifier: "Priority.fairness_key",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::RequestField,
+        identifier: "Priority.fairness_weight",
+    },
+];
 
 const START_EVIDENCE: &[CompatibilityEvidence] = &[CompatibilityEvidence {
     kind: crate::CompatibilityEvidenceKind::Test,
     reference: "apps/tokeirad/tests/grpc_roundtrip.rs",
+}];
+
+const MATRIX_AUDIT_EVIDENCE: &[CompatibilityEvidence] = &[CompatibilityEvidence {
+    kind: crate::CompatibilityEvidenceKind::ManualReview,
+    reference: "docs/conformance/v1.31.0/{supported.md,excluded.md}; docs/readiness/conformance.md",
 }];
 
 const WORKER_DEPLOYMENT_EVIDENCE: &[CompatibilityEvidence] = &[
@@ -166,12 +452,7 @@ const LEGACY_VISIBILITY_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurfa
     kind: CompatibilitySurfaceKind::Rpc,
     identifier: "WorkflowService.LegacyVisibility",
 }];
-const LEGACY_VISIBILITY_RPCS: &[&str] = &[
-    "WorkflowService.ListArchivedWorkflowExecutions",
-    "WorkflowService.ListClosedWorkflowExecutions",
-    "WorkflowService.ListOpenWorkflowExecutions",
-    "WorkflowService.ScanWorkflowExecutions",
-];
+const LEGACY_VISIBILITY_RPCS: &[&str] = &["WorkflowService.ScanWorkflowExecutions"];
 
 const MULTI_OPERATION_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
     kind: CompatibilitySurfaceKind::Rpc,
@@ -223,15 +504,23 @@ const NEXUS_TASK_TRANSPORT_SURFACES: &[CompatibilitySurface] = &[CompatibilitySu
     identifier: "WorkflowService.NexusTaskTransport",
 }];
 const NEXUS_TASK_TRANSPORT_RPCS: &[&str] = &[
+    "WorkflowService.PollNexusTaskQueue",
+    "WorkflowService.RespondNexusTaskCompleted",
+    "WorkflowService.RespondNexusTaskFailed",
+];
+
+const NEXUS_OPERATION_EXECUTION_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
+    kind: CompatibilitySurfaceKind::Rpc,
+    identifier: "WorkflowService.NexusOperationExecution",
+}];
+/// RPCs present in vendored API v1.62.11 but absent from v1.31.0's API v1.62.8.
+pub const NEWER_VENDORED_WIRE_RPCS: &[&str] = &[
     "WorkflowService.CountNexusOperationExecutions",
     "WorkflowService.DeleteNexusOperationExecution",
     "WorkflowService.DescribeNexusOperationExecution",
     "WorkflowService.ListNexusOperationExecutions",
     "WorkflowService.PollNexusOperationExecution",
-    "WorkflowService.PollNexusTaskQueue",
     "WorkflowService.RequestCancelNexusOperationExecution",
-    "WorkflowService.RespondNexusTaskCompleted",
-    "WorkflowService.RespondNexusTaskFailed",
     "WorkflowService.StartNexusOperationExecution",
     "WorkflowService.TerminateNexusOperationExecution",
 ];
@@ -350,6 +639,9 @@ const VISIBILITY_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
 const VISIBILITY_RPCS: &[&str] = &[
     "WorkflowService.CountWorkflowExecutions",
     "WorkflowService.DescribeWorkflowExecution",
+    "WorkflowService.ListArchivedWorkflowExecutions",
+    "WorkflowService.ListClosedWorkflowExecutions",
+    "WorkflowService.ListOpenWorkflowExecutions",
     "WorkflowService.ListWorkflowExecutions",
 ];
 
@@ -366,25 +658,37 @@ const WORKER_DEPLOYMENT_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurfa
     kind: CompatibilitySurfaceKind::Rpc,
     identifier: "WorkflowService.WorkerDeployments",
 }];
+const WORKER_DEPLOYMENT_PRE_RELEASE_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
+    kind: CompatibilitySurfaceKind::Rpc,
+    identifier: "WorkflowService.WorkerDeploymentsPreRelease",
+}];
+const DEPLOYMENT_V0_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
+    kind: CompatibilitySurfaceKind::Rpc,
+    identifier: "WorkflowService.DeploymentV0",
+}];
 const WORKER_DEPLOYMENT_RPCS: &[&str] = &[
-    "WorkflowService.CreateWorkerDeployment",
-    "WorkflowService.CreateWorkerDeploymentVersion",
     "WorkflowService.DeleteWorkerDeployment",
     "WorkflowService.DeleteWorkerDeploymentVersion",
-    "WorkflowService.DescribeDeployment",
     "WorkflowService.DescribeWorkerDeployment",
     "WorkflowService.DescribeWorkerDeploymentVersion",
-    "WorkflowService.GetCurrentDeployment",
-    "WorkflowService.GetDeploymentReachability",
-    "WorkflowService.ListDeployments",
     "WorkflowService.ListWorkerDeployments",
-    "WorkflowService.SetCurrentDeployment",
     "WorkflowService.SetWorkerDeploymentCurrentVersion",
     "WorkflowService.SetWorkerDeploymentManager",
     "WorkflowService.SetWorkerDeploymentRampingVersion",
-    "WorkflowService.UpdateWorkerDeploymentVersionComputeConfig",
     "WorkflowService.UpdateWorkerDeploymentVersionMetadata",
+];
+const WORKER_DEPLOYMENT_PRE_RELEASE_RPCS: &[&str] = &[
+    "WorkflowService.CreateWorkerDeployment",
+    "WorkflowService.CreateWorkerDeploymentVersion",
+    "WorkflowService.UpdateWorkerDeploymentVersionComputeConfig",
     "WorkflowService.ValidateWorkerDeploymentVersionComputeConfig",
+];
+const DEPLOYMENT_V0_RPCS: &[&str] = &[
+    "WorkflowService.DescribeDeployment",
+    "WorkflowService.GetCurrentDeployment",
+    "WorkflowService.GetDeploymentReachability",
+    "WorkflowService.ListDeployments",
+    "WorkflowService.SetCurrentDeployment",
 ];
 
 const WORKER_HEARTBEAT_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
@@ -503,6 +807,7 @@ const WORKFLOW_UPDATE_RPCS: &[&str] = &[
 
 pub const FEATURE_MATRIX: &[FeatureEntry] = &[
     FeatureEntry {
+        catalog: STANDALONE_ACTIVITIES_CATALOG,
         id: "activity-executions",
         name: "Activity execution management",
         state: FeatureState::Experimental,
@@ -517,6 +822,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         }],
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "activity-management",
         name: "Workflow-scoped activity management",
         state: FeatureState::Implemented,
@@ -528,6 +834,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: ACTIVITY_MANAGEMENT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "activity-task-lifecycle",
         name: "Activity task lifecycle",
         state: FeatureState::Partial,
@@ -536,9 +843,40 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: None,
         rpcs: ACTIVITY_TASK_LIFECYCLE_RPCS,
         notes: "Activity polling, heartbeats, and terminal responses exist, but strict Temporal conformance remains partial until SDK matrix coverage is complete.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: AUTHORIZATION_CATALOG,
+        id: "authorization",
+        name: "Authentication, authorization, and principal attribution",
+        state: FeatureState::Implemented,
+        surfaces: AUTHORIZATION_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: EMPTY_RPCS,
+        notes: "Presence-enabled JWT authentication, authorization, namespace/task-queue access classification, and durable principal attribution match the configured v1.31.0 behavior.",
+        evidence: &[CompatibilityEvidence {
+            kind: crate::CompatibilityEvidenceKind::Test,
+            reference: "Temporal functional corpus TestAuthorizationTestSuite @ v1.31.0: Tier 7.36",
+        }],
+    },
+    FeatureEntry {
+        catalog: AWS_IAM_AUTHORIZATION_CATALOG,
+        id: "aws-iam-bearer-authorization",
+        name: "AWS IAM bearer authorization",
+        state: FeatureState::Implemented,
+        surfaces: AWS_IAM_AUTHORIZATION_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: EMPTY_RPCS,
+        notes: "Tokeira-native AWS IAM bearer verification composes with the same typed grant and authorization model and is outside the Temporal compatibility claim.",
+        evidence: &[CompatibilityEvidence {
+            kind: crate::CompatibilityEvidenceKind::ManualReview,
+            reference: ".kiro/specs/authorization-foundation",
+        }],
+    },
+    FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "batch-operations",
         name: "Batch operations",
         state: FeatureState::Experimental,
@@ -547,9 +885,10 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: Some("compat.batch_operations"),
         rpcs: BATCH_OPERATION_RPCS,
         notes: "Batch APIs are visible but remain an experimental operator surface pending compatibility evidence.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "cluster-info",
         name: "Cluster and system metadata",
         state: FeatureState::Partial,
@@ -561,6 +900,34 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: START_EVIDENCE,
     },
     FeatureEntry {
+        catalog: COMPATIBILITY_METADATA_CATALOG,
+        id: "compatibility-metadata",
+        name: "Tokeira compatibility metadata service",
+        state: FeatureState::Implemented,
+        surfaces: COMPATIBILITY_METADATA_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: EMPTY_RPCS,
+        notes: "Tokeira's separate compatibility service publishes build pins, feature ownership, SDK evidence, and stable digests without altering Temporal services.",
+        evidence: &[CompatibilityEvidence {
+            kind: crate::CompatibilityEvidenceKind::Test,
+            reference: "crates/tokeira-compatibility-service/src/lib.rs::compatibility_response_contains_static_matrices",
+        }],
+    },
+    FeatureEntry {
+        catalog: TEMPORAL_DEPRECATED_EXCLUDED,
+        id: "deployment-v0",
+        name: "Deployment v0 (deprecated)",
+        state: FeatureState::Unsupported,
+        surfaces: DEPLOYMENT_V0_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: DEPLOYMENT_V0_RPCS,
+        notes: "Temporal v1.31.0 deprecates these five deployment-v0 RPCs in favor of GA Worker Deployments; Tokeira does not expose their enabled behavior.",
+        evidence: MATRIX_AUDIT_EVIDENCE,
+    },
+    FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "eager-workflow-start",
         name: "Eager workflow start",
         state: FeatureState::Implemented,
@@ -572,6 +939,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: EAGER_WORKFLOW_START_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "http-json-api",
         name: "Temporal HTTP/JSON API gateway",
         state: FeatureState::Implemented,
@@ -583,6 +951,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: HTTP_JSON_API_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_DEPRECATED_EXCLUDED,
         id: "legacy-visibility",
         name: "Legacy visibility",
         state: FeatureState::Unsupported,
@@ -590,10 +959,11 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         capability_field: None,
         dynamic_config_key: None,
         rpcs: LEGACY_VISIBILITY_RPCS,
-        notes: "Deprecated visibility scan/open/closed/archive APIs are not part of the current compatibility target.",
-        evidence: &[],
+        notes: "The deprecated ScanWorkflowExecutions RPC is excluded; the still-served ListOpen, ListClosed, and ListArchived RPCs belong to the ordinary visibility feature.",
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "multi-operation",
         name: "Multi-operation execution",
         state: FeatureState::Implemented,
@@ -605,6 +975,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: MULTI_OPERATION_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "namespace-management",
         name: "Namespace management",
         state: FeatureState::Partial,
@@ -613,31 +984,52 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: None,
         rpcs: NAMESPACE_MANAGEMENT_RPCS,
         notes: "Namespace APIs exist but remain partial because upstream namespace semantics are broader than the current implementation.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "nexus-admin",
         name: "Nexus endpoint administration",
-        state: FeatureState::Unsupported,
+        state: FeatureState::Implemented,
         surfaces: NEXUS_ADMIN_SURFACES,
         capability_field: None,
         dynamic_config_key: None,
         rpcs: NEXUS_ADMIN_RPCS,
-        notes: "Operator Nexus endpoint administration is not implemented by the current edge.",
-        evidence: &[],
+        notes: "Nexus endpoint CRUD, optimistic update, pagination, validation, and namespace-safe callback routing implement the v1.31.0 GA operator surface.",
+        evidence: &[CompatibilityEvidence {
+            kind: crate::CompatibilityEvidenceKind::Test,
+            reference: "Temporal functional corpus Nexus endpoint admin coverage: Tier 7.35",
+        }],
     },
     FeatureEntry {
+        catalog: NEWER_WIRE_UNAVAILABLE,
+        id: "nexus-operation-executions",
+        name: "Nexus operation executions",
+        state: FeatureState::Unsupported,
+        surfaces: NEXUS_OPERATION_EXECUTION_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: NEWER_VENDORED_WIRE_RPCS,
+        notes: "These eight RPCs exist only in vendored API v1.62.11 and are absent from the v1.31.0 server's API v1.62.8.",
+        evidence: MATRIX_AUDIT_EVIDENCE,
+    },
+    FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "nexus-task-transport",
         name: "Nexus task transport",
-        state: FeatureState::Experimental,
+        state: FeatureState::Implemented,
         surfaces: NEXUS_TASK_TRANSPORT_SURFACES,
         capability_field: Some("nexus"),
         dynamic_config_key: Some("compat.nexus_task_transport"),
         rpcs: NEXUS_TASK_TRANSPORT_RPCS,
-        notes: "Nexus transport and operation execution surfaces are experimental until endpoint administration and SDK behavior are verified together.",
-        evidence: &[],
+        notes: "The three v1.31.0 Nexus worker transport RPCs and workflow operation lifecycle are implemented; the eight newer operation-execution RPCs are classified separately.",
+        evidence: &[CompatibilityEvidence {
+            kind: crate::CompatibilityEvidenceKind::Test,
+            reference: "Temporal functional corpus TestNexusWorkflowTestSuite and TestNexusApiTestSuite @ v1.31.0: Tiers 7.37-7.38",
+        }],
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_UNAVAILABLE,
         id: "remote-cluster",
         name: "Remote cluster administration",
         state: FeatureState::Unsupported,
@@ -646,9 +1038,10 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: None,
         rpcs: REMOTE_CLUSTER_RPCS,
         notes: "Multi-cluster administration is outside the current deployment model.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "reported-problems-search-attribute",
         name: "Workflow task reported problems",
         state: FeatureState::Partial,
@@ -660,39 +1053,58 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: REPORTED_PROBLEMS_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "schedules",
         name: "Schedules",
-        state: FeatureState::Experimental,
+        state: FeatureState::Partial,
         surfaces: SCHEDULE_SURFACES,
         capability_field: Some("supports_schedules"),
         dynamic_config_key: Some("compat.schedules"),
         rpcs: SCHEDULE_RPCS,
-        notes: "Schedule RPCs are visible but are not yet backed by conformance evidence.",
-        evidence: &[],
+        notes: "The public v1.31.0 schedule behavior is conformance-tested; the native schedule store remains process-local, so restart durability is still open.",
+        evidence: &[CompatibilityEvidence {
+            kind: crate::CompatibilityEvidenceKind::Test,
+            reference: "Temporal functional corpus TestScheduleV1 @ v1.31.0: Tier 5.30",
+        }],
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "search-attributes",
         name: "Search attributes",
-        state: FeatureState::Experimental,
+        state: FeatureState::Partial,
         surfaces: SEARCH_ATTRIBUTE_SURFACES,
         capability_field: None,
         dynamic_config_key: Some("compat.search_attributes"),
         rpcs: SEARCH_ATTRIBUTE_RPCS,
         notes: "Search-attribute administration interacts with visibility projection and remains experimental.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TASK_QUEUE_MANAGEMENT_CATALOG,
         id: "task-queue-management",
         name: "Task queue management, priority, and fairness",
-        state: FeatureState::Partial,
+        state: FeatureState::Implemented,
         surfaces: TASK_QUEUE_MANAGEMENT_SURFACES,
         capability_field: None,
         dynamic_config_key: None,
         rpcs: TASK_QUEUE_MANAGEMENT_RPCS,
-        notes: "Priority-aware workflow, activity, child, sticky, and durable-backlog handout follows the v1.31.0 stock defaults. Optional User Fairness, auto-enable, queue/per-key rate shaping, atomic kind-isolated task-queue config updates, and real per-priority statistics are implemented in Tokeira's delivery runtime without matching/history service objects. State remains partial only because the public TaskQueueConfig store is volatile pending the separate production configuration/durability decision.",
+        notes: "Priority-aware workflow, activity, child, sticky, and durable-backlog handout follows the v1.31.0 stock defaults. Optional User Fairness, auto-enable, queue/per-key rate shaping, atomic kind-isolated task-queue config updates, and real per-priority statistics are implemented in Tokeira's delivery runtime without matching/history service objects. Public task-queue policy commits through a dedicated CAS repository, survives process replacement, and is hydrated before traffic without becoming workflow history or kernel state.",
         evidence: TASK_QUEUE_MANAGEMENT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: USER_FAIRNESS_CATALOG,
+        id: "user-fairness",
+        name: "Task queue User Fairness",
+        state: FeatureState::Implemented,
+        surfaces: USER_FAIRNESS_SURFACES,
+        capability_field: None,
+        dynamic_config_key: Some("matching.enableFairness"),
+        rpcs: EMPTY_RPCS,
+        notes: "Weighted within-priority handout is disabled by default, preserves metadata while disabled, excludes sticky queues, and composes queue overrides over task-carried weights.",
+        evidence: TASK_QUEUE_MANAGEMENT_EVIDENCE,
+    },
+    FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "visibility",
         name: "Workflow visibility",
         state: FeatureState::Partial,
@@ -701,9 +1113,10 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: None,
         rpcs: VISIBILITY_RPCS,
         notes: "Visibility list/count/describe APIs are backed by projection, but strict Temporal query compatibility remains partial.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_UNAVAILABLE,
         id: "worker-config",
         name: "Worker configuration",
         state: FeatureState::Unsupported,
@@ -712,9 +1125,10 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: None,
         rpcs: WORKER_CONFIG_RPCS,
         notes: "FetchWorkerConfig and UpdateWorkerConfig remain unsupported; live worker inventory belongs to worker-heartbeats.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "worker-deployments",
         name: "Worker deployments",
         state: FeatureState::Implemented,
@@ -722,10 +1136,23 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         capability_field: None,
         dynamic_config_key: None,
         rpcs: WORKER_DEPLOYMENT_RPCS,
-        notes: "The v2 worker-deployment RPCs are implemented. Deprecated deployment companions are counted conformant because Temporal v1.31.0 returns UNIMPLEMENTED with the worker-deployments replacement message.",
+        notes: "The nine GA Worker Deployment RPCs are implemented, including version membership, routing, drainage, limits, metadata, and manager/current/ramping transitions. Deprecated and pre-release companions are cataloged separately.",
         evidence: WORKER_DEPLOYMENT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_EXPERIMENTAL_EXCLUDED_AVAILABLE,
+        id: "worker-deployments-pre-release",
+        name: "Worker deployments pre-release additions",
+        state: FeatureState::Experimental,
+        surfaces: WORKER_DEPLOYMENT_PRE_RELEASE_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: WORKER_DEPLOYMENT_PRE_RELEASE_RPCS,
+        notes: "Temporal v1.31.0 labels these four Worker Deployment additions pre-release. Tokeira implements them through the same registry but excludes them from the compatibility claim.",
+        evidence: WORKER_DEPLOYMENT_EVIDENCE,
+    },
+    FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "worker-heartbeats",
         name: "Worker heartbeats and live inventory",
         state: FeatureState::Implemented,
@@ -737,6 +1164,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: WORKER_HEARTBEAT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: DEFAULT_REJECTION_CATALOG,
         id: "worker-versioning-v1-v2",
         name: "Worker versioning v1/v2 (deprecated)",
         state: FeatureState::Implemented,
@@ -744,10 +1172,11 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         capability_field: Some("build_id_based_versioning"),
         dynamic_config_key: None,
         rpcs: WORKER_VERSIONING_RPCS,
-        notes: "Conformant as stock-default rejections: a default-config Temporal v1.31.0 server refuses all five deprecated RPCs with PERMISSION_DENIED (the versioning gates default off), and tokeira reproduces those exact errors. The enabled-path semantics are out of surface (docs/conformance/v1.31.0/worker-versioning.md).",
-        evidence: &[],
+        notes: "Conformant as stock-default rejections: a default-config Temporal v1.31.0 server refuses all five deprecated RPCs with PERMISSION_DENIED (the versioning gates default off), and tokeira reproduces those exact errors. The enabled-path semantics are out of surface; the owning decision record is .kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md.",
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "workflow-cancel-terminate",
         name: "Workflow cancel and terminate",
         state: FeatureState::Partial,
@@ -759,6 +1188,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: WORKFLOW_DELETION_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "workflow-history",
         name: "Workflow history reads",
         state: FeatureState::Partial,
@@ -770,6 +1200,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: START_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_EXPERIMENTAL_EXCLUDED,
         id: "workflow-pause",
         name: "Workflow pause",
         state: FeatureState::Unsupported,
@@ -778,9 +1209,10 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: None,
         rpcs: WORKFLOW_PAUSE_RPCS,
         notes: "Pause/unpause workflow APIs are upstream surfaces without current compatibility support.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "workflow-query",
         name: "Workflow query",
         state: FeatureState::Partial,
@@ -789,9 +1221,10 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: None,
         rpcs: WORKFLOW_QUERY_RPCS,
         notes: "Query APIs are present but remain partial until ordering, consistency, and SDK behavior are covered.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "workflow-reset",
         name: "Workflow reset",
         state: FeatureState::Partial,
@@ -800,9 +1233,10 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: None,
         rpcs: WORKFLOW_RESET_RPCS,
         notes: "Reset has an edge surface but remains partial until full reset semantics are verified.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: WORKFLOW_RULES_CATALOG,
         id: "workflow-rules",
         name: "Workflow rules",
         state: FeatureState::Partial,
@@ -817,6 +1251,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         }],
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "workflow-signal",
         name: "Workflow signal",
         state: FeatureState::Partial,
@@ -825,9 +1260,10 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: None,
         rpcs: WORKFLOW_SIGNAL_RPCS,
         notes: "Signal delivery is part of the core workflow surface, but the audit classifies the broader compatibility state as partial.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "workflow-start",
         name: "Workflow start",
         state: FeatureState::Partial,
@@ -839,6 +1275,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: START_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "workflow-task-lifecycle",
         name: "Workflow task lifecycle",
         state: FeatureState::Partial,
@@ -850,6 +1287,7 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: START_EVIDENCE,
     },
     FeatureEntry {
+        catalog: TEMPORAL_GA_ENABLED,
         id: "workflow-update",
         name: "Workflow updates",
         state: FeatureState::Experimental,
@@ -858,13 +1296,14 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         dynamic_config_key: Some("compat.workflow_update"),
         rpcs: WORKFLOW_UPDATE_RPCS,
         notes: "Workflow updates are visible but remain experimental until protocol-level SDK conformance evidence is added.",
-        evidence: &[],
+        evidence: MATRIX_AUDIT_EVIDENCE,
     },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::BTreeSet;
 
     const WORKFLOW_SERVICE_PROTO: &str =
@@ -968,6 +1407,102 @@ mod tests {
             unknown.is_empty(),
             "unknown RPC classifications: {unknown:?}"
         );
+    }
+
+    #[test]
+    fn feature_catalog_is_coherent_and_preserves_the_target_partition() {
+        let upstream = upstream_rpcs("WorkflowService", WORKFLOW_SERVICE_PROTO)
+            .into_iter()
+            .chain(upstream_rpcs("OperatorService", OPERATOR_SERVICE_PROTO))
+            .collect::<Vec<_>>();
+        let verified =
+            crate::verify_feature_catalog(FEATURE_MATRIX, &upstream, NEWER_VENDORED_WIRE_RPCS)
+                .expect("canonical feature catalog");
+
+        assert_eq!(verified.target_rpc_count, 121);
+        assert_eq!(verified.newer_wire_rpc_count, 8);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: configuration-policy, Property 5: feature-catalog surface ownership
+        #[test]
+        fn feature_catalog_surface_ownership(
+            rotate in any::<usize>(),
+            mutation in 0_u8..5,
+        ) {
+            let upstream = upstream_rpcs("WorkflowService", WORKFLOW_SERVICE_PROTO)
+                .into_iter()
+                .chain(upstream_rpcs("OperatorService", OPERATOR_SERVICE_PROTO))
+                .collect::<Vec<_>>();
+            let mut entries = FEATURE_MATRIX.to_vec();
+            let length = entries.len();
+            entries.rotate_left(rotate % length);
+            match mutation {
+                0 => {}
+                1 => {
+                    let remove_at = entries
+                        .iter()
+                        .position(|entry| !entry.rpcs.is_empty())
+                        .expect("catalog owns RPCs");
+                    entries.remove(remove_at);
+                }
+                2 => entries.push(entries[0]),
+                3 => {
+                    let owner = entries
+                        .iter_mut()
+                        .find(|entry| !entry.rpcs.is_empty())
+                        .expect("catalog owns RPCs");
+                    owner.rpcs = &["WorkflowService.Invented"];
+                }
+                4 => {
+                    let owner = entries
+                        .iter_mut()
+                        .find(|entry| entry.id == "nexus-operation-executions")
+                        .expect("newer-wire feature");
+                    owner.catalog.origin = FeatureOrigin::TemporalV1_31;
+                }
+                _ => unreachable!(),
+            }
+
+            let result = crate::verify_feature_catalog(
+                &entries,
+                &upstream,
+                NEWER_VENDORED_WIRE_RPCS,
+            );
+            prop_assert_eq!(result.is_ok(), mutation == 0);
+            if let Ok(verified) = result {
+                prop_assert_eq!(verified.target_rpc_count, 121);
+                prop_assert_eq!(verified.newer_wire_rpc_count, 8);
+            }
+        }
+
+        // Feature: configuration-policy, Property 6: feature availability and guidance coherence
+        #[test]
+        fn feature_availability_and_guidance_coherence(mutation in 0_u8..8) {
+            let mut entry = FEATURE_MATRIX
+                .iter()
+                .find(|entry| entry.id == "activity-executions")
+                .copied()
+                .expect("standalone activity entry");
+            match mutation {
+                0 => {}
+                1 => entry.catalog.origin = FeatureOrigin::NewerVendoredWire,
+                2 => entry.catalog.guidance = "",
+                3 => entry.catalog.scopes = &[],
+                4 => {
+                    entry.catalog.enablement.kind = EnablementKind::None;
+                    entry.catalog.enablement.reference = Some("impossible");
+                }
+                5 => entry.state = FeatureState::Unsupported,
+                6 => entry.catalog.origin = FeatureOrigin::TokeiraNative,
+                7 => entry.evidence = &[],
+                _ => unreachable!(),
+            }
+            let result = crate::feature::validate_feature_metadata(&entry);
+            prop_assert_eq!(result.is_ok(), mutation == 0);
+        }
     }
 
     fn upstream_rpcs(service: &'static str, proto: &str) -> Vec<&'static str> {

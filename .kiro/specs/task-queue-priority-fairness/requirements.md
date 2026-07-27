@@ -112,8 +112,9 @@ This is a follow-on to:
 The following boundaries remain explicit:
 
 - The production configuration surface for enabling fairness is governed by
-  `docs/conformance/v1.31.0/configuration.md` and the still non-normative
-  `configuration-policy-proposal.md`. This feature preserves the v1.31.0
+  `docs/conformance/v1.31.0/temporal-configuration.md` and the approved
+  `.kiro/specs/configuration-policy/reference/configuration-policy-proposal.md`.
+  This feature preserves the v1.31.0
   stock-default disabled posture and wires only the already-sanctioned conformance
   overrides until that production decision is accepted.
 - `TaskQueueConfigStore` durability remains owned by the configuration-surface

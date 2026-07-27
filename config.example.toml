@@ -1,0 +1,205 @@
+# Canonical Tokeira production configuration example.
+# An empty document is valid; the active values below spell out the same safe defaults.
+# Priority remains enabled. User Fairness is disabled unless enable_fairness is true.
+# The Nexus callback URL must be reachable from Nexus workers; loopback assumes co-location.
+# JWT issuer routing requires issuer to exactly equal the token's signed iss value.
+# Optional JWT/AWS identity sources are shown commented and are not enabled by this file.
+
+# Complete accepted-field inventory. These generated markers occur once per strict schema leaf.
+# @field capacity.dsql.burst_capacity | capacity | default=1000 | DSQL connection-rate burst allowance.
+# @field capacity.dsql.connection_rate_per_second | capacity | default=100 | Fleet-wide DSQL connection establishment rate.
+# @field capacity.dsql.max_connections | capacity | default=10000 | Fleet-wide DSQL connection ceiling.
+# @field capacity.performance.target_p99_wft_latency_ms | capacity | default=50 | Capacity-planning workflow-task p99 latency target.
+# @field capacity.performance.target_workflow_starts_per_second | capacity | default=1000 | Capacity-planning workflow-start target.
+# @field emergency.cap_poll_admission | emergency | default=<unset> | Emergency-only cap on concurrent poll admission.
+# @field emergency.disable_stickiness | emergency | default=false | Emergency-only restriction that disables sticky execution.
+# @field emergency.freeze_projection | emergency | default=false | Emergency-only restriction that freezes projection advancement.
+# @field infrastructure.cluster_name | infrastructure | default="tokeira-local" | Stable cluster label used in operator output and telemetry.
+# @field infrastructure.dsql.admin_role_arn | infrastructure | default=<unset> | Provisioning identity for DSQL administrative operations.
+# @field infrastructure.dsql.conn_lease_table | infrastructure | default=<unset> | Provisioned DynamoDB table for distributed connection-slot leases.
+# @field infrastructure.dsql.endpoint | infrastructure | default=<unset> | Required when storage is dsql; normally written by the provisioner.
+# @field infrastructure.dsql.rate_limiter_table | infrastructure | default=<unset> | Provisioned DynamoDB table for distributed rate limiting.
+# @field infrastructure.dsql.readonly_role_arn | infrastructure | default=<unset> | Read-only identity for inspection tooling.
+# @field infrastructure.dsql.region | infrastructure | default=<unset> | Optional DSQL signing region; defaults to infrastructure.region.
+# @field infrastructure.dsql.runtime_role_arn | infrastructure | default=<unset> | Runtime identity for authoritative DSQL reads and writes.
+# @field infrastructure.network.grpc_addr | infrastructure | default="0.0.0.0:7233" | Temporal gRPC listener address.
+# @field infrastructure.network.metrics_addr | infrastructure | default="0.0.0.0:9090" | Prometheus metrics listener address.
+# @field infrastructure.observability.alert_thresholds.autoscaler_metric_staleness_seconds | infrastructure | default=30 | Autoscaler metric-staleness alert threshold.
+# @field infrastructure.observability.alert_thresholds.dsql_occ_conflict_rate_per_sec | infrastructure | default=10.0 | OCC-conflict alert rate.
+# @field infrastructure.observability.alert_thresholds.dsql_reservoir_exhaustion_ratio | infrastructure | default=0.9 | DSQL connection-reservoir alert ratio.
+# @field infrastructure.observability.alert_thresholds.projection_checkpoint_lag_seconds | infrastructure | default=60 | Projection checkpoint-lag alert threshold.
+# @field infrastructure.observability.dashboard_provisioning_enabled | infrastructure | default=true | Provision bundled observability dashboards.
+# @field infrastructure.observability.leak_detection_deadline_ms | infrastructure | default=30000 | Deadline used by task-leak detection.
+# @field infrastructure.observability.log_filter | infrastructure | default="info" | Tracing filter applied at process startup.
+# @field infrastructure.observability.log_format | infrastructure | default="text" | Structured json or human-readable text logs.
+# @field infrastructure.observability.metrics_enabled | infrastructure | default=true | Enable the Prometheus metrics endpoint.
+# @field infrastructure.observability.otlp_enabled | infrastructure | default=false | Enable OTLP trace export.
+# @field infrastructure.observability.otlp_endpoint | infrastructure | default="http://localhost:4317" | OTLP trace collector endpoint.
+# @field infrastructure.observability.otlp_metrics.enabled | infrastructure | default=false | Enable OTLP metrics export.
+# @field infrastructure.observability.otlp_metrics.endpoint | infrastructure | default=<unset> | Collector endpoint required when OTLP metrics are enabled.
+# @field infrastructure.observability.otlp_metrics.max_buffered_batches | infrastructure | default=1024 | Maximum metrics batches buffered before backpressure.
+# @field infrastructure.observability.otlp_metrics.protocol | infrastructure | default="grpc" | OTLP metrics transport protocol.
+# @field infrastructure.observability.otlp_protocol | infrastructure | default="grpc" | OTLP trace transport protocol.
+# @field infrastructure.observability.runbook_base_url | infrastructure | default="docs/runbooks/observability" | Base URL attached to operational alerts.
+# @field infrastructure.observability.smoke_test_timeout_ms | infrastructure | default=30000 | Observability smoke-test timeout.
+# @field infrastructure.observability.trace_sample_rate | infrastructure | default=1.0 | Base trace sampling ratio from zero through one.
+# @field infrastructure.placement.bundle_count | infrastructure | default=1 | Placement bundle count.
+# @field infrastructure.placement.controller_endpoint | infrastructure | default=<unset> | Placement-controller endpoint; absence selects the single-node path.
+# @field infrastructure.placement.hash_version | infrastructure | default=1 | Pinned placement hash algorithm version.
+# @field infrastructure.placement.heartbeat_interval_ms | infrastructure | default=5000 | Node membership heartbeat interval.
+# @field infrastructure.placement.node_host | infrastructure | default="127.0.0.1" | Advertised node host; TOKEIRA_NODE_HOST may supply a per-pod value.
+# @field infrastructure.placement.node_port | infrastructure | default=<unset> | Advertised node port; defaults to the gRPC listener port.
+# @field infrastructure.placement.partition_count | infrastructure | default=16 | Storage partition count; the DSQL profile promotes the legacy default to 4.
+# @field infrastructure.placement.reconnect_base_delay_ms | infrastructure | default=1000 | Initial controller reconnection delay.
+# @field infrastructure.placement.reconnect_max_delay_ms | infrastructure | default=30000 | Maximum controller reconnection delay.
+# @field infrastructure.placement.routing_max_retries | infrastructure | default=3 | Maximum retries after a stale placement route.
+# @field infrastructure.placement.shard_count | infrastructure | default=1 | Logical shard count; the DSQL profile promotes the legacy default to 32.
+# @field infrastructure.region | infrastructure | default="us-east-1" | AWS region used by regional infrastructure integrations.
+# @field infrastructure.storage | infrastructure | default="in-memory" | Select in-memory development storage or Aurora DSQL.
+# @field policy.authorization.aws_iam.grants[].grant | Tokeira native | default=[] | Temporal namespace:role grants for matching AWS identities.
+# @field policy.authorization.aws_iam.grants[].match_arn | Tokeira native | default="" | Full-string STS caller-ARN glob.
+# @field policy.authorization.expose_authorizer_errors | configured parity | default=false | Expose authorizer implementation failures instead of generic denial.
+# @field policy.authorization.jwt.issuers[].audience | configured parity | default="" | Optional exact audience; blank disables audience validation.
+# @field policy.authorization.jwt.issuers[].grants[].grant | configured parity | default=[] | Temporal namespace:role grants for matching JWT subjects.
+# @field policy.authorization.jwt.issuers[].grants[].match_sub | configured parity | default="" | Full-string subject glob for supplemental grants.
+# @field policy.authorization.jwt.issuers[].issuer | configured parity | default="" | Exact signed iss value; issuer routing is case-sensitive and exact.
+# @field policy.authorization.jwt.issuers[].jwks_uri | configured parity | default="" | JWKS document URI for this exact issuer.
+# @field policy.authorization.jwt.issuers[].name | configured parity | default="" | Stable operator label for one issuer profile.
+# @field policy.authorization.jwt.issuers[].permissions_claim | configured parity | default="permissions" | JWT array claim containing Temporal namespace:role grants.
+# @field policy.authorization.jwt.issuers[].refresh_interval | configured parity | default=<unset> | Optional positive JWKS refresh duration using ms, s, m, or h.
+# @field policy.authorization.principal_attribution | configured parity | default=false | Write the authenticated principal to server-authored history metadata.
+# @field policy.compatibility.enable_standalone_activities | configured parity | default=false | Enable the v1.31.0 preview standalone-activity surface.
+# @field policy.default_retention_days | stock parity | default=30 | Default workflow-history retention for newly created namespaces.
+# @field policy.http_api.additional_forwarded_headers | configured parity | default=[] | Additional exact or trailing-star header rules forwarded to gRPC.
+# @field policy.http_api.allowed_hosts | stock parity | default=["*"] | Case-sensitive host patterns admitted by the HTTP/JSON gateway.
+# @field policy.namespace_creation | configured parity | default="open" | Choose open or controlled namespace creation.
+# @field policy.nexus_completion.http_addr | Tokeira native | default="127.0.0.1:7253" | Inbound Nexus completion-callback listener.
+# @field policy.nexus_completion.retry_backoff_coefficient | stock parity | default=2.0 | Asynchronous Nexus completion retry multiplier.
+# @field policy.nexus_completion.retry_initial_interval_ms | stock parity | default=1000 | Initial asynchronous Nexus completion retry interval.
+# @field policy.nexus_completion.retry_max_attempts | Tokeira native | default=0 | Zero preserves v1.31.0's unbounded retry horizon; positive values impose a safety cap.
+# @field policy.nexus_completion.retry_max_interval_ms | stock parity | default=3600000 | Maximum asynchronous Nexus completion retry interval.
+# @field policy.nexus_completion.system_callback_url | Tokeira native | default="http://127.0.0.1:7253" | Callback URL that must be reachable from Nexus workers.
+# @field policy.nexus_endpoint_limits.description_max_size | stock parity | default=20000 | Maximum encoded Nexus endpoint description size.
+# @field policy.nexus_endpoint_limits.external_url_max_length | stock parity | default=4096 | Maximum external Nexus URL length.
+# @field policy.nexus_endpoint_limits.list_default_page_size | stock parity | default=100 | Default Nexus endpoint list page size.
+# @field policy.nexus_endpoint_limits.list_max_page_size | stock parity | default=1000 | Maximum Nexus endpoint list page size.
+# @field policy.nexus_endpoint_limits.name_max_length | stock parity | default=200 | Maximum Nexus endpoint name length.
+# @field policy.nexus_endpoint_limits.task_queue_max_length | stock parity | default=1000 | Maximum Nexus worker task-queue name length.
+# @field policy.quotas.max_signal_payload_bytes | configured parity | default=4194304 | Maximum admitted signal payload size.
+# @field policy.quotas.max_workflow_timeout_seconds | configured parity | default=315360000 | Maximum admitted workflow execution timeout.
+# @field policy.task_queues.enable_fairness | configured parity | default=false | Opt in to weighted User Fairness; priority remains enabled.
+
+[infrastructure]
+cluster_name = "tokeira-local"
+region = "us-east-1"
+storage = "in-memory"
+
+[infrastructure.dsql]
+
+[infrastructure.placement]
+heartbeat_interval_ms = 5000
+reconnect_base_delay_ms = 1000
+reconnect_max_delay_ms = 30000
+node_host = "127.0.0.1"
+shard_count = 1
+bundle_count = 1
+partition_count = 16
+hash_version = 1
+routing_max_retries = 3
+
+[infrastructure.network]
+grpc_addr = "0.0.0.0:7233"
+metrics_addr = "0.0.0.0:9090"
+
+[infrastructure.observability]
+metrics_enabled = true
+otlp_enabled = false
+otlp_endpoint = "http://localhost:4317"
+otlp_protocol = "grpc"
+trace_sample_rate = 1.0
+log_format = "text"
+log_filter = "info"
+leak_detection_deadline_ms = 30000
+dashboard_provisioning_enabled = true
+runbook_base_url = "docs/runbooks/observability"
+smoke_test_timeout_ms = 30000
+
+[infrastructure.observability.otlp_metrics]
+enabled = false
+protocol = "grpc"
+max_buffered_batches = 1024
+
+[infrastructure.observability.alert_thresholds]
+dsql_reservoir_exhaustion_ratio = 0.9
+dsql_occ_conflict_rate_per_sec = 10.0
+projection_checkpoint_lag_seconds = 60
+autoscaler_metric_staleness_seconds = 30
+
+[policy]
+default_retention_days = 30
+namespace_creation = "open"
+
+[policy.quotas]
+max_workflow_timeout_seconds = 315360000
+max_signal_payload_bytes = 4194304
+
+[policy.compatibility]
+enable_standalone_activities = false
+
+[policy.task_queues]
+enable_fairness = false
+
+[policy.nexus_endpoint_limits]
+name_max_length = 200
+external_url_max_length = 4096
+description_max_size = 20000
+task_queue_max_length = 1000
+list_default_page_size = 100
+list_max_page_size = 1000
+
+[policy.nexus_completion]
+http_addr = "127.0.0.1:7253"
+system_callback_url = "http://127.0.0.1:7253"
+retry_initial_interval_ms = 1000
+retry_max_interval_ms = 3600000
+retry_backoff_coefficient = 2.0
+retry_max_attempts = 0
+
+[policy.http_api]
+allowed_hosts = ["*"]
+additional_forwarded_headers = []
+
+[capacity.performance]
+target_workflow_starts_per_second = 1000
+target_p99_wft_latency_ms = 50
+
+[capacity.dsql]
+max_connections = 10000
+connection_rate_per_second = 100
+burst_capacity = 1000
+
+[emergency]
+disable_stickiness = false
+freeze_projection = false
+
+# Optional authorization example (leave commented to preserve no-op parity):
+# [policy.authorization]
+# principal_attribution = true
+# expose_authorizer_errors = false
+#
+# [[policy.authorization.jwt.issuers]]
+# name = "production-idp"
+# issuer = "https://issuer.example/tenant" # exact signed iss value
+# jwks_uri = "https://issuer.example/tenant/keys"
+# audience = "tokeira"
+# refresh_interval = "1m"
+# permissions_claim = "permissions"
+#
+# [[policy.authorization.jwt.issuers.grants]]
+# match_sub = "system:serviceaccount:workers:*"
+# grant = ["default:worker"]
+#
+# [policy.authorization.aws_iam]
+# [[policy.authorization.aws_iam.grants]]
+# match_arn = "arn:aws:sts::123456789012:assumed-role/tokeira-worker-*"
+# grant = ["default:worker"]

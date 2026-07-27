@@ -1,14 +1,18 @@
 # Configuration surface — proposal for owner review
 
-> **Status: proposal, not a conformance decision.** This document is the proposed resolution of
-> the triage deferred by [`configuration.md`](./configuration.md). It does not yet change
-> [`decisions.md`](./decisions.md), [`supported.md`](./supported.md), or
-> [`excluded.md`](./excluded.md). Owner approval is required before those normative records or
-> implementation specs are amended.
+> **Status: historical deliberation record.** The owner approved this proposal and
+> `.kiro/specs/configuration-policy/` implemented it. Its original 564-key estimate
+> is preserved as deliberation context; the source-aware audit corrected the
+> authoritative denominator to 613 declarations in
+> [`temporal-configuration.md`](../../../../docs/conformance/v1.31.0/temporal-configuration.md).
+> Current normative outcomes live in
+> [`README.md`](../../../../docs/conformance/v1.31.0/README.md),
+> [`supported.md`](../../../../docs/conformance/v1.31.0/supported.md), and
+> [`excluded.md`](../../../../docs/conformance/v1.31.0/excluded.md).
 >
 > **Behavioural target:** Temporal server `v1.31.0`. Temporal source references below are to that
 > tag. Tokeira conforms to observable behaviour, following
-> [`AGENTS.md §8`](../../../AGENTS.md); it does not port Temporal's service architecture or
+> [`AGENTS.md §8`](../../../../AGENTS.md); it does not port Temporal's service architecture or
 > implementation.
 
 ## Proposed decision
@@ -38,7 +42,7 @@ behavioural reason it exists.
 
 ## Why a decision is needed now
 
-[`configuration.md`](./configuration.md) completed the denominator: 564 Temporal dynamic-config
+The earlier `configuration.md` audit estimated the denominator at 564 Temporal dynamic-config
 keys plus the static YAML topology. Its promised classification step has not happened. In the
 meantime, individual conformance tiers made local decisions:
 
@@ -54,7 +58,7 @@ meantime, individual conformance tiers made local decisions:
 Those individual outcomes are mostly defensible, but the absence of a common doctrine has produced
 three problems:
 
-1. **Documentation overclaim.** [`supported.md`](./supported.md) lists
+1. **Documentation overclaim.** [`supported.md`](../../../../docs/conformance/v1.31.0/supported.md) lists
    `UpdateTaskQueueConfig` as GA without saying that Tokeira currently implements setter/read-back
    only. Rate limits and fairness weights do not affect dispatch.
 2. **Test policy is easy to mistake for product policy.** Raw Temporal key strings are read from
@@ -309,7 +313,7 @@ authoritative for workflow correctness.
 The production TOML SHALL NOT duplicate per-queue rates or weight overrides. Those values already
 have a public, appropriately scoped authoring API.
 
-Until this target lands, [`supported.md`](./supported.md) should identify
+Until this target lands, [`supported.md`](../../../../docs/conformance/v1.31.0/supported.md) should identify
 `UpdateTaskQueueConfig` as partial, or distinguish “RPC admitted and echoed” from “policy
 enforced.”
 
@@ -371,7 +375,7 @@ Temporal exposes one.
 
 ## Classification ledger deliverable
 
-[`configuration.md`](./configuration.md) SHOULD remain the human-readable denominator, but its
+The Temporal configuration reference SHOULD remain the human-readable denominator, but its
 “next step” must become a checked ledger rather than another prose promise.
 
 The owning spec should choose a machine-checkable source format and require:
@@ -393,7 +397,7 @@ testable. The manifest is documentation metadata, not a runtime dynamic-config r
 ## Documentation and operator surface
 
 This decision unblocks the existing readiness work in
-[`docs/readiness/configuration.md`](../../readiness/configuration.md):
+[`docs/readiness/configuration.md`](../../../../docs/readiness/configuration.md):
 
 - create one canonical annotated `config.example.toml`;
 - show the empty in-memory file and minimal DSQL configuration;
@@ -445,8 +449,9 @@ when an opt-in typed policy exists.
 ## Implementation sequence after approval
 
 1. **Record the decision.** Move this proposal into a resolved decision record; amend
-   [`decisions.md`](./decisions.md), [`supported.md`](./supported.md), and
-   [`excluded.md`](./excluded.md) as applicable.
+   the public [`README.md`](../../../../docs/conformance/v1.31.0/README.md),
+   [`supported.md`](../../../../docs/conformance/v1.31.0/supported.md), and
+   [`excluded.md`](../../../../docs/conformance/v1.31.0/excluded.md) as applicable.
 2. **Create the owning Kiro spec.** Define the classification manifest, effective-policy boundary,
    config validation, documentation generation/checking, and migration from scattered raw-key
    reads. This requires the explicit spec-edit authorization and snapshot prescribed by

@@ -1,7 +1,9 @@
 # Worker Versioning V1/V2 — decision record
 
-> Part of [the v1.31.0 conformance definition](./README.md). This page resolves
-> [`decisions.md`](./decisions.md) item 2: whether the **deprecated Worker Versioning V1
+> Historical decision record owned by the Worker Deployments spec. The
+> authoritative public outcome is summarized in
+> [`supported.md`](../../../../docs/conformance/v1.31.0/supported.md#worker-deployments).
+> This record resolves whether the **deprecated Worker Versioning V1
 > (build-ID version sets) and V2 (versioning rules)** surfaces are part of the conformance
 > surface, or whether conformance targets only the GA **Worker Deployment** APIs.
 > Decided **2026-07-12**. Every claim below was verified against ground truth — the v1.31.0
@@ -64,7 +66,8 @@ namespace errors before the gate; see "What this decision does NOT exclude".)
 **v0.2 error message** (`workflow_handler.go:5491-5493`). Field-level conformance reproduces
 this exactly.
 
-tokeira deliberately ships close-to-zero configuration ([`configuration.md`](./configuration.md)),
+tokeira deliberately ships close-to-zero configuration
+([`tokeira-configuration.md`](../../../../docs/conformance/v1.31.0/tokeira-configuration.md)),
 so "default dynamic config" is the only coherent behavioural baseline. The rejection **is** the
 conformant behaviour; implementing the enabled path would require adding configuration tokeira
 has chosen not to have.
@@ -117,7 +120,8 @@ runtime registry, entity-equivalent routing).
 ## What this decision does NOT exclude
 
 Excluding the five RPCs does not excuse four pieces of shared field machinery that a stock
-default-config v1.31.0 server serves regardless. These stay in [`supported.md`](./supported.md)
+default-config v1.31.0 server serves regardless. These stay in
+[`supported.md`](../../../../docs/conformance/v1.31.0/supported.md)
 under the field-fidelity bar:
 
 1. **`WorkerVersionStamp` / `binary_checksum` acceptance-and-echo** on WFT completion — feeds
@@ -151,7 +155,7 @@ under the field-fidelity bar:
   non-default dynamic config (`frontend.workerVersioningDataAPIs` /
   `frontend.workerVersioningRuleAPIs` = true) that tokeira, by design, does not expose. GA
   coverage continues via the Worker Deployment suites
-  ([`../../readiness/functional-test-order.md`](../../readiness/functional-test-order.md), Tier 8).
+  ([`functional-test-order.md`](../../../../docs/readiness/functional-test-order.md), Tier 8).
 
 ## The counter-case, weighed
 
@@ -166,8 +170,11 @@ by default.
 
 ## Related pages
 
-- [`supported.md`](./supported.md) — the in-surface set (GA Worker Deployments; shared field
+- [`supported.md`](../../../../docs/conformance/v1.31.0/supported.md) — the in-surface
+  set (GA Worker Deployments; shared field
   machinery above).
-- [`excluded.md`](./excluded.md) — the enabled-path V1/V2 semantics, recorded as a deprecated
+- [`excluded.md`](../../../../docs/conformance/v1.31.0/excluded.md) — the enabled-path
+  V1/V2 semantics, recorded as a deprecated
   exclusion.
-- [`decisions.md`](./decisions.md) — remaining open decisions.
+- [Public conformance definition](../../../../docs/conformance/v1.31.0/README.md) —
+  no conformance-surface decisions are currently open.

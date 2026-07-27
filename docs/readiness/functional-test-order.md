@@ -126,7 +126,7 @@ and Fairness moved into Tier 10 after the delivery-plane decision; its internal 
 leaves are classified individually rather than deferring the public ordering surface.
 
 `TestVersioningFunctionalSuite` (406 tests) is no longer deferred — it is **out of surface** by the
-resolved V1/V2 decision (`docs/conformance/v1.31.0/worker-versioning.md`): the suite only passes
+resolved V1/V2 decision (`.kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md`): the suite only passes
 against stock after flipping non-default dynamic config
 (`frontend.workerVersioningDataAPIs`/`frontend.workerVersioningRuleAPIs`), a surface a
 default-configuration v1.31.0 server refuses and tokeira, by design, does not expose. The five V1/V2

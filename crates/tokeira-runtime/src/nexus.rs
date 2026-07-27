@@ -1305,11 +1305,15 @@ impl NexusTaskBroker {
         task_queue: &TaskQueueName,
     ) -> NexusTakeOutcome {
         let config_key = nexus_config_key(namespace_id, task_queue);
-        let config = self
+        let config_store = self
             .config_store
             .read()
             .expect("Nexus task queue config lock poisoned")
-            .get(&config_key);
+            .clone();
+        let config = config_store
+            .get(&config_key)
+            .await
+            .expect("hydrated task-queue cache reads are infallible");
         let mut inner = self.inner.lock().await;
         if inner
             .ready
@@ -2003,7 +2007,9 @@ mod tests {
     #[tokio::test]
     async fn nexus_zero_rate_blocks_and_live_unset_releases_ready_work() {
         let broker = NexusTaskBroker::default();
-        let store = Arc::new(InMemoryTaskQueueConfigStore::default());
+        let repository = Arc::new(tokeira_storage::InMemoryStore::default());
+        let store = Arc::new(crate::RepositoryBackedTaskQueueConfigStore::new(repository));
+        store.hydrate().await.expect("hydrate durable policy");
         broker.set_task_queue_config_store(store.clone());
         let namespace_id = NamespaceId::new();
         let task_queue = TaskQueueName("rate-limited".to_string());
@@ -2025,6 +2031,7 @@ mod tests {
                 },
                 1_000,
             )
+            .await
             .expect("zero is a valid blocking rate");
         broker
             .publish(
@@ -2065,6 +2072,7 @@ mod tests {
                 },
                 1_000,
             )
+            .await
             .expect("unset is valid");
         assert!(
             broker

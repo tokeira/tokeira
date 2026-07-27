@@ -51,13 +51,13 @@ use tokeira_runtime::{
     SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome,
     SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
     StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigKey, TaskQueueConfigKind,
-    TaskQueueConfigStore, TaskQueueVersioningView, UpdateActivitiesOptionsRequest,
-    UpdateComputeConfig, UpdateLifecycleError, UpdateLifecycleSnapshot, UpdateMetadata,
-    UpdateTransportResolution, UpdateWaitPolicy, ValidateComputeConfig, VersionMetadataView,
-    VersionView, WorkerRegistrationKey, WorkerRegistry, WorkerVersionMetadata, WorkflowActivation,
-    WorkflowDeletion, WorkflowDeletionNotFound, WorkflowExecution, WorkflowExecutionStatus,
-    compute_matching_times, decide_overlap, nexus_operation_next_attempt_at, schedule_workflow_id,
-    scheduled_workflow_search_attributes,
+    TaskQueueConfigStore, TaskQueueConfigStoreError, TaskQueueVersioningView,
+    UpdateActivitiesOptionsRequest, UpdateComputeConfig, UpdateLifecycleError,
+    UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
+    ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistrationKey, WorkerRegistry,
+    WorkerVersionMetadata, WorkflowActivation, WorkflowDeletion, WorkflowDeletionNotFound,
+    WorkflowExecution, WorkflowExecutionStatus, compute_matching_times, decide_overlap,
+    nexus_operation_next_attempt_at, schedule_workflow_id, scheduled_workflow_search_attributes,
 };
 use tokeira_storage::{
     AttributedHistoryEvent, ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType,
@@ -5159,6 +5159,8 @@ impl WorkflowService {
                             TaskKind::Activity => TaskQueueConfigKind::Activity,
                         },
                     })
+                    .await
+                    .map_err(task_queue_config_store_error_to_edge)?
                     .map(task_queue_config_to_edge)
                     .unwrap_or_default();
 
@@ -7870,6 +7872,7 @@ fn grpc_error_code(error: &EdgeError) -> &'static str {
         EdgeError::TooManyLongPolls => "resource_exhausted",
         EdgeError::LongPollAdmissionTimeout => "deadline_exceeded",
         EdgeError::RemoteRouteUnsupported { .. } => "unavailable",
+        EdgeError::ServiceUnavailable(_) => "unavailable",
         EdgeError::NotShardOwner { .. } => "aborted",
         EdgeError::FailedPrecondition(_) => "failed_precondition",
         EdgeError::Internal(_) => "internal",
@@ -8518,6 +8521,16 @@ pub(crate) fn task_queue_config_to_edge(entry: TaskQueueConfigEntry) -> TaskQueu
             .fairness_key_rate_limit_metadata
             .map(task_queue_config_metadata_to_edge),
         fairness_weight_overrides: entry.fairness_weight_overrides,
+    }
+}
+
+fn task_queue_config_store_error_to_edge(error: TaskQueueConfigStoreError) -> EdgeError {
+    match error {
+        TaskQueueConfigStoreError::Validation(error) => EdgeError::BadRequest(error.to_string()),
+        TaskQueueConfigStoreError::Storage { .. }
+        | TaskQueueConfigStoreError::ConflictExhausted => {
+            EdgeError::ServiceUnavailable(error.to_string())
+        }
     }
 }
 

@@ -19,6 +19,8 @@
 //! crates — library crates stay free of a clap dependency even though they
 //! expose equivalent enum shapes.
 
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokeira_orchestrator::{PlatformKind, StorageKind};
 
@@ -330,12 +332,20 @@ pub(crate) enum InfraAction {
     Plan {
         #[arg(long)]
         module: Option<String>,
+        /// Also write the complete explanation model as JSON to this path.
+        /// Orthogonal to `--json`: the report still renders to stdout.
+        #[arg(long, value_name = "PATH")]
+        explanation: Option<PathBuf>,
     },
     Apply {
         #[arg(long)]
         yes: bool,
         #[arg(long)]
         module: Option<String>,
+        /// Also write the complete explanation model as JSON to this path.
+        /// Orthogonal to `--json`: the report still renders to stdout.
+        #[arg(long, value_name = "PATH")]
+        explanation: Option<PathBuf>,
     },
     Destroy {
         #[arg(long)]
@@ -348,7 +358,12 @@ pub(crate) enum InfraAction {
 
 #[derive(Subcommand)]
 pub(crate) enum DeployAction {
-    Plan,
+    Plan {
+        /// Also write the complete explanation model as JSON to this path.
+        /// Orthogonal to `--json`: the report still renders to stdout.
+        #[arg(long, value_name = "PATH")]
+        explanation: Option<PathBuf>,
+    },
     Apply {
         #[arg(long)]
         yes: bool,
@@ -356,6 +371,10 @@ pub(crate) enum DeployAction {
         /// Use after rebuilding a local image behind the same tag.
         #[arg(long)]
         force: bool,
+        /// Also write the complete explanation model as JSON to this path.
+        /// Orthogonal to `--json`: the report still renders to stdout.
+        #[arg(long, value_name = "PATH")]
+        explanation: Option<PathBuf>,
     },
     Status,
 }

@@ -28,6 +28,7 @@ pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
     mode: tokeira_report::Mode,
+    explanation_path: Option<&Path>,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let (envelope, _) = envelope_store(deployment_dir)
@@ -49,6 +50,11 @@ pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
                     &outcome,
                 ),
             };
+            // Artifact before report (Req 7.6): the verb fails before
+            // claiming anything if the requested artifact cannot be written.
+            if let Some(path) = explanation_path {
+                tokeira_explain::artifact::write(path, &report.explanation)?;
+            }
             print!("{}", tokeira_report::render(&report, mode)?);
         }
     }
@@ -60,6 +66,7 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
     yes: bool,
+    explanation_path: Option<&Path>,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
@@ -83,10 +90,20 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
         GateOutcome::Proceed { .. } => {}
     }
 
-    // ── Destructive gate (§4): identical contract to `infra apply`. ──
-    if !yes && let Realization::Realized(planned) = platform.deploy_plan(deployment_dir).await? {
-        crate::apply::refuse_destructive_without_yes("deploy apply", &planned.changes)?;
-    }
+    // ── Destructive gate (§4): identical contract to `infra apply`. The
+    // gate's plan doubles as the applied explanation's field evidence
+    // (Property 9: never invented, only reused). ──
+    let preceding = if yes {
+        None
+    } else {
+        match platform.deploy_plan(deployment_dir).await? {
+            Realization::Realized(planned) => {
+                crate::apply::refuse_destructive_without_yes("deploy apply", &planned.changes)?;
+                Some(planned)
+            }
+            Realization::NotApplicable { .. } => None,
+        }
+    };
 
     // ── Workload apply (realized by the injected platform) ──
     let applied = match platform.deploy_apply(deployment_dir).await? {
@@ -116,6 +133,17 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after deploy apply")?;
+    // Artifact after the state record is safe, before the verb claims
+    // success — same contract as `infra apply` (Req 7.6).
+    if let Some(path) = explanation_path {
+        let explanation = tokeira_explain::explain_applied(
+            crate::explain_context(platform, deployment_dir, &envelope, "deploy apply"),
+            &crate::committed_changes(&applied),
+            preceding.as_ref(),
+        );
+        tokeira_explain::artifact::write(path, &explanation)
+            .context("the apply is committed and recorded; only the explanation artifact failed")?;
+    }
     println!(
         "envelope: config_revision now {} (config {})",
         envelope.config_revision,
@@ -136,7 +164,7 @@ mod tests {
     #[tokio::test]
     async fn deploy_apply_refuses_an_unstamped_deployment() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = deploy_apply(&TestPlatform, tmp.path(), false)
+        let err = deploy_apply(&TestPlatform, tmp.path(), false, None)
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(
@@ -157,7 +185,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        deploy_apply(&TestPlatform, tmp.path(), false)
+        deploy_apply(&TestPlatform, tmp.path(), false, None)
             .await
             .expect("deploy apply proceeds under DevIterate");
 

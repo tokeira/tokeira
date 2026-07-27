@@ -14,6 +14,7 @@ pub(crate) async fn plan<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
     mode: Mode,
+    explanation_path: Option<&Path>,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let (envelope, _) = envelope_store(deployment_dir)
@@ -31,6 +32,63 @@ pub(crate) async fn plan<P: ProvisionerPlatform>(
             &outcome,
         ),
     };
+    // The artifact precedes the report: a verb that cannot deliver the
+    // requested artifact fails before claiming anything (Req 7.6). The error
+    // already names the path and the reason.
+    if let Some(path) = explanation_path {
+        tokeira_explain::artifact::write(path, &report.explanation)?;
+    }
     print!("{}", tokeira_report::render(&report, mode)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TestPlatform;
+
+    // Req 7.1/7.2: the requested artifact is the complete model — the same
+    // schema `--json` emits — parseable from the file alone.
+    #[tokio::test]
+    async fn plan_writes_the_explanation_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("explanation.json");
+        plan(
+            &TestPlatform,
+            tmp.path(),
+            Mode::resolve(false, false),
+            Some(&path),
+        )
+        .await
+        .expect("plan with a writable artifact path succeeds");
+
+        let model = tokeira_explain::artifact::read(&path).expect("artifact parses alone");
+        assert_eq!(
+            model.schema_version,
+            tokeira_explain::EXPLANATION_SCHEMA_VERSION
+        );
+        assert_eq!(model.operation, "infra plan");
+    }
+
+    // Req 7.6: an unwritable artifact path fails the verb, naming the path
+    // and the reason.
+    #[tokio::test]
+    async fn plan_fails_when_the_artifact_cannot_be_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("no-such-dir").join("explanation.json");
+        let err = plan(
+            &TestPlatform,
+            tmp.path(),
+            Mode::resolve(false, false),
+            Some(&path),
+        )
+        .await
+        .expect_err("an unwritable artifact path fails the verb");
+        let message = format!("{err:#}");
+        assert!(message.contains("no-such-dir"), "path named: {message}");
+        assert!(
+            message.contains("explanation artifact"),
+            "reason named: {message}"
+        );
+    }
 }

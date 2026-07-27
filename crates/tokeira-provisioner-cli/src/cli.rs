@@ -105,7 +105,7 @@ struct CheckArgs {
 #[derive(Subcommand)]
 enum InfraCommand {
     /// Show the binding verdict + the infrastructure plan. Read-only; never gates.
-    Plan(LifecycleArgs),
+    Plan(PlanArgs),
     /// Reconcile infrastructure to desired, gated on the binding.
     Apply(ApplyArgs),
     /// Tear down the deployment's infrastructure, gated on the binding. Irreversible.
@@ -115,9 +115,20 @@ enum InfraCommand {
 #[derive(Subcommand)]
 enum DeployCommand {
     /// Show the binding verdict + the workload plan. Read-only; never gates.
-    Plan(LifecycleArgs),
+    Plan(PlanArgs),
     /// Reconcile the workload to desired, gated on the binding.
     Apply(ApplyArgs),
+}
+
+#[derive(Args)]
+struct PlanArgs {
+    /// Deployment directory holding the state envelope.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+    /// Also write the complete explanation model as JSON to this path.
+    /// Orthogonal to `--json`: the report still renders to stdout.
+    #[arg(long, value_name = "PATH")]
+    explanation: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -129,6 +140,10 @@ struct ApplyArgs {
     /// plan is destructive refuses without it (review before action, §4).
     #[arg(long)]
     yes: bool,
+    /// Also write the complete explanation model as JSON to this path.
+    /// Orthogonal to `--json`: the report still renders to stdout.
+    #[arg(long, value_name = "PATH")]
+    explanation: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -197,10 +212,22 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
             .await
         }
         Command::Infra(InfraCommand::Plan(args)) => {
-            plan::plan(&platform, &args.deployment_dir, mode).await
+            plan::plan(
+                &platform,
+                &args.deployment_dir,
+                mode,
+                args.explanation.as_deref(),
+            )
+            .await
         }
         Command::Deploy(DeployCommand::Plan(args)) => {
-            deploy::deploy_plan(&platform, &args.deployment_dir, mode).await
+            deploy::deploy_plan(
+                &platform,
+                &args.deployment_dir,
+                mode,
+                args.explanation.as_deref(),
+            )
+            .await
         }
         // Mutating verbs run under the deployment's operation lock (Req 11).
         // `rollback` holds one continuous lock across its whole sequence (12.2).
@@ -211,7 +238,11 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
         Command::Infra(InfraCommand::Apply(args)) => {
             let dir = args.deployment_dir;
             let yes = args.yes;
-            lock::with_operation_lock(&dir, "apply", || apply::apply(&platform, &dir, yes)).await
+            let explanation = args.explanation;
+            lock::with_operation_lock(&dir, "apply", || {
+                apply::apply(&platform, &dir, yes, explanation.as_deref())
+            })
+            .await
         }
         Command::Infra(InfraCommand::Destroy(args)) => {
             let dir = args.deployment_dir;
@@ -222,8 +253,9 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
         Command::Deploy(DeployCommand::Apply(args)) => {
             let dir = args.deployment_dir;
             let yes = args.yes;
+            let explanation = args.explanation;
             lock::with_operation_lock(&dir, "deploy-apply", || {
-                deploy::deploy_apply(&platform, &dir, yes)
+                deploy::deploy_apply(&platform, &dir, yes, explanation.as_deref())
             })
             .await
         }

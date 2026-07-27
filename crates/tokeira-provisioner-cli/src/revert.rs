@@ -166,7 +166,7 @@ mod tests {
             "project_name = \"one\"\n",
         )
         .unwrap();
-        crate::apply::apply(&TestPlatform, tmp.path(), false)
+        crate::apply::apply(&TestPlatform, tmp.path(), false, None)
             .await
             .expect("apply rev 1");
 
@@ -176,7 +176,7 @@ mod tests {
             "project_name = \"two\"\n",
         )
         .unwrap();
-        crate::apply::apply(&TestPlatform, tmp.path(), false)
+        crate::apply::apply(&TestPlatform, tmp.path(), false, None)
             .await
             .expect("apply rev 2");
 

@@ -179,6 +179,27 @@ pub fn change_log_entries(changes: &[Change]) -> Vec<ChangeLogEntry> {
         .collect()
 }
 
+/// Map audit entries to the explanation's committed changes at the shell
+/// boundary (evidence-model C3): the model crate must not depend on
+/// `tokeira-provisioner` (Req 9.1), so the audit type crosses into the
+/// model's own vocabulary here — ids and operations only, exactly what the
+/// audit log records (Proposal 002).
+pub(crate) fn committed_changes(
+    entries: &[ChangeLogEntry],
+) -> Vec<tokeira_explain::CommittedChange> {
+    entries
+        .iter()
+        .map(|entry| tokeira_explain::CommittedChange {
+            id: entry.id.clone(),
+            op: match entry.op {
+                ChangeOp::Created => tokeira_explain::CommittedOp::Created,
+                ChangeOp::Updated => tokeira_explain::CommittedOp::Updated,
+                ChangeOp::Deleted => tokeira_explain::CommittedOp::Deleted,
+            },
+        })
+        .collect()
+}
+
 /// The deployment-level envelope store.
 ///
 /// For now a local CAS store under `{deployment_dir}/state/envelope`; cloud

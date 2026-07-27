@@ -17,10 +17,12 @@
 //! defaults, so Features 2–4 populate data without reshaping the schema
 //! (Requirement 8).
 
+pub mod artifact;
 pub mod build;
 pub mod evidence;
 pub mod model;
 
+pub use artifact::ExplainError;
 pub use build::{DeploymentContext, explain_applied, explain_plan};
 pub use evidence::{EvidenceId, EvidenceIndex, EvidenceKind};
 pub use model::{

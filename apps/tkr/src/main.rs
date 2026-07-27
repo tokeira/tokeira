@@ -142,8 +142,11 @@ async fn main() -> Result<()> {
                 // `deployment apply` (Req 6.5): a never-stamped deployment is
                 // initialized first, then applied — the operator's first
                 // apply works whichever spelling they reach for.
-                if let InfraAction::Apply { yes, .. } = &action {
-                    launcher::launch_apply(&dir, *yes).await
+                if let InfraAction::Apply {
+                    yes, explanation, ..
+                } = &action
+                {
+                    launcher::launch_apply(&dir, *yes, explanation.as_deref()).await
                 } else {
                     let (verb, mut extra) = forwarded_infra_verb(&action);
                     // The output contract's global flags travel with the
@@ -168,7 +171,7 @@ async fn main() -> Result<()> {
             if deployments.is_forwarded(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 let (verb, mut extra) = forwarded_deploy_verb(&action);
-                if matches!(action, DeployAction::Plan | DeployAction::Status) {
+                if matches!(action, DeployAction::Plan { .. } | DeployAction::Status) {
                     extra.extend(output_flags(cli.json, cli.detail));
                 }
                 launcher::launch(&dir, verb, &extra).await
@@ -293,7 +296,9 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
 /// so forwarding is a transparent pass-through (Req 7.3).
 fn forwarded_infra_verb(action: &InfraAction) -> (&'static [&'static str], Vec<String>) {
     match action {
-        InfraAction::Plan { .. } => (&["infra", "plan"], Vec::new()),
+        InfraAction::Plan { explanation, .. } => {
+            (&["infra", "plan"], explanation_flag(explanation.as_deref()))
+        }
         InfraAction::Apply { .. } => (&["infra", "apply"], Vec::new()),
         InfraAction::Destroy { yes, .. } => (
             &["infra", "destroy"],
@@ -312,10 +317,25 @@ fn forwarded_infra_verb(action: &InfraAction) -> (&'static [&'static str], Vec<S
 /// decides realization: compose-syn's workload rides its infra universe.
 fn forwarded_deploy_verb(action: &DeployAction) -> (&'static [&'static str], Vec<String>) {
     match action {
-        DeployAction::Plan => (&["deploy", "plan"], Vec::new()),
-        DeployAction::Apply { .. } => (&["deploy", "apply"], Vec::new()),
+        DeployAction::Plan { explanation } => (
+            &["deploy", "plan"],
+            explanation_flag(explanation.as_deref()),
+        ),
+        DeployAction::Apply { explanation, .. } => (
+            &["deploy", "apply"],
+            explanation_flag(explanation.as_deref()),
+        ),
         DeployAction::Status => (&["describe"], Vec::new()),
     }
+}
+
+/// Re-spell a requested explanation-artifact path for a forwarded `tkp`
+/// invocation. The path crosses as given: `tkp` owns the write and the
+/// failure report (evidence-model Req 7.6).
+fn explanation_flag(explanation: Option<&std::path::Path>) -> Vec<String> {
+    explanation
+        .map(|path| vec!["--explanation".to_string(), path.display().to_string()])
+        .unwrap_or_default()
 }
 
 /// The operator output contract's global flags (`--json`, `--detail`),
@@ -356,7 +376,7 @@ fn forwarded_scale_verb(action: &ScaleAction) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
     use super::*;
     use crate::{
@@ -586,6 +606,36 @@ mod tests {
         }
     }
 
+    // The explanation-artifact path crosses the forwarding boundary verbatim
+    // (evidence-model Req 7.1): `tkp` owns the write and the failure report,
+    // so the token mapping is the whole of `tkr`'s responsibility here.
+    #[test]
+    fn forwarding_carries_the_explanation_path() {
+        let plan = InfraAction::Plan {
+            module: None,
+            explanation: Some(PathBuf::from("/tmp/out.json")),
+        };
+        let (verb, extra) = forwarded_infra_verb(&plan);
+        assert_eq!(verb, &["infra", "plan"]);
+        assert_eq!(extra, vec!["--explanation", "/tmp/out.json"]);
+
+        let deploy = DeployAction::Apply {
+            yes: true,
+            force: false,
+            explanation: Some(PathBuf::from("/tmp/out.json")),
+        };
+        let (verb, extra) = forwarded_deploy_verb(&deploy);
+        assert_eq!(verb, &["deploy", "apply"]);
+        assert_eq!(extra, vec!["--explanation", "/tmp/out.json"]);
+
+        let bare = InfraAction::Plan {
+            module: None,
+            explanation: None,
+        };
+        let (_, extra) = forwarded_infra_verb(&bare);
+        assert!(extra.is_empty(), "no flag without a request");
+    }
+
     #[test]
     fn parses_infra_commands() {
         assert!(matches!(
@@ -593,7 +643,10 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Infra {
-                action: InfraAction::Plan { module: None }
+                action: InfraAction::Plan {
+                    module: None,
+                    explanation: None
+                }
             }
         ));
         assert!(matches!(
@@ -603,7 +656,8 @@ mod tests {
             Command::Infra {
                 action: InfraAction::Apply {
                     yes: true,
-                    module: Some(module)
+                    module: Some(module),
+                    explanation: None
                 }
             } if module == "mimir"
         ));
@@ -635,7 +689,7 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Deploy {
-                action: DeployAction::Plan
+                action: DeployAction::Plan { explanation: None }
             }
         ));
         assert!(matches!(

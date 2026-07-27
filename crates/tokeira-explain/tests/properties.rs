@@ -1,7 +1,8 @@
-//! The evidence-model correctness properties (Feature 1, Properties 1–4, 9):
-//! construction is total over changes, deterministic, closed over evidence,
-//! exhaustive over unconfirmed state, and incapable of inventing apply-side
-//! evidence.
+//! The evidence-model correctness properties (Feature 1, Properties 1–4, 9,
+//! 10): construction is total over changes, deterministic, closed over
+//! evidence, exhaustive over unconfirmed state, incapable of inventing
+//! apply-side evidence — and the written artifact stands alone within the
+//! field policy.
 
 use std::collections::BTreeMap;
 
@@ -226,4 +227,73 @@ proptest! {
             prop_assert_eq!(unavailable, committed.len());
         }
     }
+
+    // Property 10 — the artifact is self-contained and bounded: a written
+    // artifact parses back — from the file alone, no deployment directory —
+    // to an equal, evidence-closed model, and serializes no key outside the
+    // field policy (design §Data models). A field reaching the artifact
+    // unreviewed fails the subset check.
+    #[test]
+    fn property_10_artifact_is_self_contained_and_bounded(outcome in arb_outcome()) {
+        let explanation = explain_plan(context(), &outcome);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explanation.json");
+        tokeira_explain::artifact::write(&path, &explanation).unwrap();
+
+        let back = tokeira_explain::artifact::read(&path).unwrap();
+        prop_assert_eq!(&back, &explanation);
+        for change in &back.changes {
+            prop_assert!(back.evidence.resolve(&change.evidence_id).is_some());
+        }
+        for uncertainty in &back.uncertainties {
+            prop_assert!(back.evidence.resolve(&uncertainty.evidence_id).is_some());
+            prop_assert!(back.evidence.resolve(&uncertainty.subject).is_some());
+        }
+        for id in &back.destructive {
+            prop_assert!(back.evidence.resolve(id).is_some());
+        }
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        keys_within(&value, &[
+            "schema_version", "deployment", "platform", "operation",
+            "current_revision", "proposed_revision", "definition_ref",
+            "changes", "impacts", "destructive", "uncertainties", "evidence",
+        ])?;
+        for change in value["changes"].as_array().into_iter().flatten() {
+            keys_within(change, &[
+                "evidence_id", "resource_id", "module", "resource_type",
+                "kind", "field_diffs", "refresh_status", "semantics", "cause",
+                "dependants", "source",
+            ])?;
+            for diff in change["field_diffs"].as_array().into_iter().flatten() {
+                keys_within(diff, &["field", "before", "after"])?;
+            }
+        }
+        for uncertainty in value["uncertainties"].as_array().into_iter().flatten() {
+            keys_within(uncertainty, &[
+                "evidence_id", "subject", "reason", "consequence", "resolvable_by",
+            ])?;
+        }
+        for impact in value["impacts"].as_array().into_iter().flatten() {
+            keys_within(impact, &["evidence_id", "class", "subjects", "statement"])?;
+        }
+    }
+}
+
+/// Assert every key of a JSON object is in the field policy's allowed set.
+/// Slot interiors (`semantics`, `cause`) are deliberately unbounded here —
+/// their shape belongs to the change-semantics and causality specs.
+fn keys_within(
+    value: &serde_json::Value,
+    allowed: &[&str],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let object = value.as_object().expect("policy level is a JSON object");
+    for key in object.keys() {
+        prop_assert!(
+            allowed.contains(&key.as_str()),
+            "key {key:?} is outside the artifact field policy"
+        );
+    }
+    Ok(())
 }

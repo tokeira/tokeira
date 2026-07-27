@@ -8,7 +8,7 @@ property-based test task.
 
 ## Phase 1 — Apply the Feature 1 amendment
 
-- [ ] 1.1 Relocate the semantic vocabulary to `tokeira-iac`
+- [x] 1.1 Relocate the semantic vocabulary to `tokeira-iac`
   - Move `ChangeSemantics`, `Confidence<T>`, `LifecycleOperation`, `ReplacementPolicy`,
     `Disruption`, `DataEffect`, `Reversibility` from `tokeira-explain` into a new
     `crates/tokeira-iac/src/semantics.rs`
@@ -16,13 +16,20 @@ property-based test task.
   - Update `.kiro/specs/explanation-evidence-model/design.md` to record the corrected
     placement, so the two specs do not disagree
   - _Requirements: 1.1, 2.1_
+  - DONE — satisfied at Feature 1 Phase 3 (PR #31, f0b13f8b): the vocabulary was born in
+    `crates/tokeira-iac/src/semantics.rs` (never created in `tokeira-explain`, so nothing
+    moved); re-exported from `tokeira-explain`; F1 design.md records the placement.
 
-- [ ] 1.2 Add `Citation` with a compile-time non-empty guarantee
+- [x] 1.2 Add `Citation` with a compile-time non-empty guarantee
   - `const fn new(&'static str)` asserting non-empty; document that declarations are
     `const` items precisely so the assertion evaluates at compile time
   - Extend `Confidence` so `EngineFact` carries a citation alongside `ProviderGuarantee` —
     a claim about Tokeira's own behaviour is as citation-worthy as one about a provider's
   - _Requirements: 2.2, 2.3, 2.6_
+  - DONE — satisfied at Feature 1 Phase 3 (PR #31): `Citation::new` is `const fn` with a
+    non-empty assert; `Citation` stores `Cow<'static, str>` (recorded deviation:
+    `&'static str` alone cannot `Deserialize` for the JSON round-trip); `EngineFact` and
+    `ProviderGuarantee` both carry citations structurally.
 
 - [ ] 1.3 Extend `PlanOutcome` with `semantics_by_id`
   - `BTreeMap<ResourceId, ChangeSemantics>` beside the refresh coverage, populated empty

@@ -171,6 +171,12 @@ model crate does not depend on `tokeira-provisioner` (Requirement 9.1).
 Dependencies: `serde`, `serde_json`, `tokeira-iac`. Explicitly not `tokeira-report`, not
 `tokeira-provisioner`, not `tokeira-provisioner-cli` (Requirement 9.1–9.3).
 
+**Amendment (Feature 2, task 1.1 — applied at crate creation):** the semantic vocabulary
+(`ChangeSemantics`, `Confidence<T>`, `Citation`, and the axis enums) lives in
+`crates/tokeira-iac/src/semantics.rs`, beside the `Resource` trait that will declare it —
+not in this crate. `tokeira-explain` re-exports it, so explanation consumers see one
+surface.
+
 ```rust
 pub mod evidence;   // EvidenceId, EvidenceIndex
 pub mod model;      // DeploymentExplanation and members

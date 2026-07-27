@@ -37,21 +37,31 @@ pub(crate) async fn run(
     ctx: DeploymentContext,
 ) -> Result<()> {
     match action {
-        DeployAction::Plan => match &ctx.platform_config {
-            PlatformDeploymentConfig::Local(config) => {
-                let mut engine = DeployEngine::new(LocalDeployment, config, &ctx.path).await?;
-                print_plan(&engine.plan().await?);
+        DeployAction::Plan { explanation } => {
+            super::refuse_explanation(explanation.as_deref())?;
+            match &ctx.platform_config {
+                PlatformDeploymentConfig::Local(config) => {
+                    let mut engine = DeployEngine::new(LocalDeployment, config, &ctx.path).await?;
+                    print_plan(&engine.plan().await?);
+                }
+                PlatformDeploymentConfig::Compose(config) => {
+                    let mut engine =
+                        DeployEngine::new(ComposeDeployment, config, &ctx.path).await?;
+                    print_plan(&engine.plan().await?);
+                }
+                PlatformDeploymentConfig::Ecs(config) => {
+                    let mut engine =
+                        DeployEngine::new(EcsDeployment::new(), config, &ctx.path).await?;
+                    print_plan(&engine.plan().await?);
+                }
             }
-            PlatformDeploymentConfig::Compose(config) => {
-                let mut engine = DeployEngine::new(ComposeDeployment, config, &ctx.path).await?;
-                print_plan(&engine.plan().await?);
-            }
-            PlatformDeploymentConfig::Ecs(config) => {
-                let mut engine = DeployEngine::new(EcsDeployment::new(), config, &ctx.path).await?;
-                print_plan(&engine.plan().await?);
-            }
-        },
-        DeployAction::Apply { yes, force } => {
+        }
+        DeployAction::Apply {
+            yes,
+            force,
+            explanation,
+        } => {
+            super::refuse_explanation(explanation.as_deref())?;
             super::require_confirmation(yes, "deploy apply")?;
             match &ctx.platform_config {
                 PlatformDeploymentConfig::Local(_) => {

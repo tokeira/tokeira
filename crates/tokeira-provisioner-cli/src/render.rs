@@ -22,6 +22,13 @@ use tokeira_report::{Depth, Report, symbol};
 /// the manual `Serialize` delegates to it, so the artifact and the `--json`
 /// output are one schema. The binding verdict is verb framing, not model
 /// content — `describe` owns it.
+///
+/// C5 migration note (evidence-model design): if a consumer outside `tkp`
+/// ever needs to render an explanation — an artifact viewer, Feature 5's
+/// analysis bundles — this `Report` impl moves into `tokeira-explain` and
+/// that crate takes `tokeira-report` (a serde-only crate) as a dependency.
+/// The move is mechanical; recorded here so it is a decision, not a
+/// surprise.
 #[derive(Debug)]
 pub(crate) struct ExplanationReport {
     /// Whether the deployment carries a Day-0 binding stamp yet.

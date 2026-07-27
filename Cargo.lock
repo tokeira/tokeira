@@ -7854,6 +7854,7 @@ dependencies = [
  "tokeira-compose-deployment",
  "tokeira-config",
  "tokeira-deploy-engine",
+ "tokeira-explain",
  "tokeira-iac",
  "tokeira-orchestrator",
  "tokeira-provisioner-cli",

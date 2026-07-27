@@ -67,6 +67,60 @@ async fn exercise_compose_syn_end_to_end() {
         module_names
     );
 
+    // ── 1b. The explanation model over the real outcome (evidence-model 7.2):
+    // engine → orchestrator → model against the reference definition. The
+    // assertions are internal-consistency properties, never a specific
+    // refresh status — coverage answers differ between a machine with a
+    // Docker daemon and CI without one, and both are correct worlds.
+    let explanation = tokeira_explain::explain_plan(
+        tokeira_explain::DeploymentContext {
+            deployment: "demo".to_string(),
+            platform: "compose-syn".to_string(),
+            operation: "infra plan".to_string(),
+            current_revision: 0,
+            proposed_revision: None,
+            definition_ref: None,
+        },
+        &outcome,
+    );
+    assert_eq!(
+        explanation.changes.len(),
+        changes.len(),
+        "one explained change per engine change"
+    );
+    for (explained, engine) in explanation.changes.iter().zip(changes) {
+        assert_eq!(explained.resource_id, engine.resource);
+        assert_eq!(explained.kind, engine.kind);
+        assert!(
+            explanation
+                .evidence
+                .resolve(&explained.evidence_id)
+                .is_some(),
+            "evidence closure over changes"
+        );
+    }
+    for uncertainty in &explanation.uncertainties {
+        assert!(
+            explanation.evidence.resolve(&uncertainty.subject).is_some(),
+            "evidence closure over uncertainty subjects"
+        );
+    }
+    let unknown_planned = explanation
+        .changes
+        .iter()
+        .filter(|c| matches!(c.refresh_status, Some(tokeira_iac::RefreshStatus::Unknown)))
+        .count();
+    assert_eq!(
+        explanation.uncertainties.len(),
+        unknown_planned,
+        "uncertainty mirrors the refresh coverage exactly"
+    );
+    println!(
+        "explanation: {} changes, {} uncertainties, evidence closed",
+        explanation.changes.len(),
+        explanation.uncertainties.len()
+    );
+
     // ── 2. Render the observability stack to disk (no Docker) ────────────────
     // The config-files resource is the first in the observability module; the
     // remaining four (mimir/loki/grafana/alloy) are Docker services we skip.

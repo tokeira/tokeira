@@ -36,6 +36,8 @@ The operator's nouns. Reports use these words and no synonyms.
 | **binding** | The recorded pairing of deployment and provisioner identity. Spoken **only** when it blocks a verb (mismatch, downgrade, mode regression) or the deployment is not yet initialized. | provenance stamp, verdict (as prose), gate |
 | **retained** | Kept for return: retained revisions (`revert`), the retained prior provisioner (`rollback`). | checkpoint, snapshot (in prose) |
 | **uncertainty** | Something the engine could not determine, stated with its consequence and (where one exists) the action that resolves it. An empty set is itself stated: "live state: fully confirmed". | unknown status, refresh status (in prose) |
+| **live state** | What actually runs, as the engine examined it during a plan. Spoken with its coverage: "live state: fully confirmed" when every planned resource answered, "live state: unconfirmed" as per-resource evidence otherwise. | refresh, refreshed state (in prose) |
+| **impact** | An operational consequence of a change ("restarts grafana"), stated only with cited evidence — the engine speaks impacts it can substantiate, never speculation. Defined ahead of emission: reports carry impacts once change semantics land. | side effect, disruption (as a label) |
 
 The operator's verbs, with their one-line meanings:
 

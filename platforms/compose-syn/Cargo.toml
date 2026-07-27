@@ -41,6 +41,9 @@ tokeira-tkd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The exercise test asserts the explanation model over the real engine outcome
+# (evidence-model task 7.2).
+tokeira-explain = { workspace = true }
 # The engine compose platform — the fidelity oracle the tests compare against.
 tokeira-compose-deployment = { path = "../compose" }
 

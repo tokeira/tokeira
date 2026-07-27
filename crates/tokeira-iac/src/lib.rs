@@ -25,6 +25,7 @@ pub mod engine;
 pub mod error;
 pub mod module;
 pub mod resource_modes;
+pub mod semantics;
 pub mod types;
 pub mod writeback;
 
@@ -35,6 +36,10 @@ pub use document::{
 pub use engine::{Engine, PlanOutcome, RefreshCoverage, RefreshStatus, StateSaver};
 pub use error::IacError;
 pub use module::{Module, ModuleContext};
+pub use semantics::{
+    ChangeSemantics, Citation, Confidence, DataEffect, Disruption, LifecycleOperation,
+    ReplacementPolicy, Reversibility,
+};
 pub use types::{
     Change, ChangeKind, FieldDiff, InfraComposition, ModuleSelection, ResourceDiff,
     destructive_changes, plan_is_destructive,

@@ -89,7 +89,7 @@ pub fn plan_is_destructive(changes: &[Change]) -> bool {
 }
 
 /// A single field-level difference within a resource change.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FieldDiff {
     pub field: String,
     pub before: Option<String>,

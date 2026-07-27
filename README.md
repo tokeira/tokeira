@@ -138,7 +138,8 @@ Guide:
 
 Every process exposes `/metrics`, `/healthz`, and `/readyz`; the compose and
 ECS platforms provision a full stack — Alloy collection into Mimir (metrics)
-and Loki (logs), Grafana dashboards, and alert rules wired to runbooks —
+and Loki (logs), Grafana dashboards, and alert rules with bounded ownership and
+diagnostic annotations —
 validated by `tkr observability check`. Guide:
 [docs/platforms/observability.md](docs/platforms/observability.md).
 

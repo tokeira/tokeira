@@ -40,7 +40,6 @@
 # @field infrastructure.observability.otlp_metrics.max_buffered_batches | infrastructure | default=1024 | Maximum metrics batches buffered before backpressure.
 # @field infrastructure.observability.otlp_metrics.protocol | infrastructure | default="grpc" | OTLP metrics transport protocol.
 # @field infrastructure.observability.otlp_protocol | infrastructure | default="grpc" | OTLP trace transport protocol.
-# @field infrastructure.observability.runbook_base_url | infrastructure | default="docs/runbooks/observability" | Base URL attached to operational alerts.
 # @field infrastructure.observability.smoke_test_timeout_ms | infrastructure | default=30000 | Observability smoke-test timeout.
 # @field infrastructure.observability.trace_sample_rate | infrastructure | default=1.0 | Base trace sampling ratio from zero through one.
 # @field infrastructure.placement.bundle_count | infrastructure | default=1 | Placement bundle count.
@@ -121,7 +120,6 @@ log_format = "text"
 log_filter = "info"
 leak_detection_deadline_ms = 30000
 dashboard_provisioning_enabled = true
-runbook_base_url = "docs/runbooks/observability"
 smoke_test_timeout_ms = 30000
 
 [infrastructure.observability.otlp_metrics]

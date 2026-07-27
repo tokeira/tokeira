@@ -399,14 +399,6 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "Provision bundled observability dashboards."
     ),
     field!(
-        "infrastructure.observability.runbook_base_url",
-        Infrastructure,
-        "\"docs/runbooks/observability\"",
-        false,
-        None,
-        "Base URL attached to operational alerts."
-    ),
-    field!(
         "infrastructure.observability.smoke_test_timeout_ms",
         Infrastructure,
         "30000",
@@ -780,7 +772,6 @@ log_format = "text"
 log_filter = "info"
 leak_detection_deadline_ms = 30000
 dashboard_provisioning_enabled = true
-runbook_base_url = "docs/runbooks/observability"
 smoke_test_timeout_ms = 30000
 
 [infrastructure.observability.otlp_metrics]

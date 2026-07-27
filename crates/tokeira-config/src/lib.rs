@@ -165,8 +165,6 @@ pub struct ObservabilityConfig {
     pub alert_thresholds: AlertThresholdConfig,
     #[serde(default = "default_true")]
     pub dashboard_provisioning_enabled: bool,
-    #[serde(default = "default_runbook_base_url")]
-    pub runbook_base_url: String,
     #[serde(default = "default_smoke_test_timeout_ms")]
     pub smoke_test_timeout_ms: u64,
 }
@@ -795,7 +793,6 @@ impl Default for ObservabilityConfig {
             leak_detection_deadline_ms: default_leak_detection_deadline_ms(),
             alert_thresholds: AlertThresholdConfig::default(),
             dashboard_provisioning_enabled: true,
-            runbook_base_url: default_runbook_base_url(),
             smoke_test_timeout_ms: default_smoke_test_timeout_ms(),
         }
     }
@@ -1002,12 +999,6 @@ impl TokeiraConfig {
             errors.push(ValidationError::Field {
                 field: "infrastructure.observability.smoke_test_timeout_ms".to_string(),
                 message: "must be positive".to_string(),
-            });
-        }
-        if observability.runbook_base_url.trim().is_empty() {
-            errors.push(ValidationError::Field {
-                field: "infrastructure.observability.runbook_base_url".to_string(),
-                message: "must not be empty".to_string(),
             });
         }
         let alert_thresholds = &observability.alert_thresholds;
@@ -1342,10 +1333,6 @@ fn default_otlp_metrics_max_buffered_batches() -> usize {
 
 fn default_leak_detection_deadline_ms() -> u64 {
     30_000
-}
-
-fn default_runbook_base_url() -> String {
-    "docs/runbooks/observability".to_string()
 }
 
 fn default_smoke_test_timeout_ms() -> u64 {

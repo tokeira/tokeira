@@ -411,7 +411,6 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `infrastructure.observability.otlp_metrics.max_buffered_batches` | infrastructure | `1024` | no | yes | — | Maximum metrics batches buffered before backpressure. |
 | `infrastructure.observability.otlp_metrics.protocol` | infrastructure | `"grpc"` | no | yes | — | OTLP metrics transport protocol. |
 | `infrastructure.observability.otlp_protocol` | infrastructure | `"grpc"` | no | yes | — | OTLP trace transport protocol. |
-| `infrastructure.observability.runbook_base_url` | infrastructure | `"docs/runbooks/observability"` | no | yes | — | Base URL attached to operational alerts. |
 | `infrastructure.observability.smoke_test_timeout_ms` | infrastructure | `30000` | no | yes | — | Observability smoke-test timeout. |
 | `infrastructure.observability.trace_sample_rate` | infrastructure | `1.0` | no | yes | — | Base trace sampling ratio from zero through one. |
 | `infrastructure.placement.bundle_count` | infrastructure | `1` | no | yes | — | Placement bundle count. |

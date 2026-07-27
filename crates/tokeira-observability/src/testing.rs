@@ -220,9 +220,9 @@ impl DashboardValidator {
 
 /// Alert rule portability validator.
 ///
-/// Alert rules must carry bounded ownership metadata and point operators at a
-/// stable runbook target. The validator accepts either repository-relative
-/// runbooks or absolute HTTP(S) URLs.
+/// Alert rules must carry bounded ownership metadata and a human-readable
+/// summary. Response documentation is deliberately outside this artifact
+/// contract until the production-observability surface defines its home.
 #[derive(Debug, Default)]
 pub struct AlertRuleValidator;
 
@@ -273,7 +273,7 @@ impl AlertRuleValidator {
     pub fn validate_str(
         path: &Path,
         contents: &str,
-        repo_root: &Path,
+        _repo_root: &Path,
     ) -> Result<(), ArtifactValidationError> {
         let yaml: serde_yaml::Value = serde_yaml::from_str(contents).map_err(|error| {
             ArtifactValidationError::new(path, "yaml", format!("invalid alert YAML: {error}"))
@@ -290,17 +290,13 @@ impl AlertRuleValidator {
                     ArtifactValidationError::new(path, "groups.rules", "missing alert rules")
                 })?;
             for rule in rules {
-                Self::validate_rule(path, rule, repo_root)?;
+                Self::validate_rule(path, rule)?;
             }
         }
         Ok(())
     }
 
-    fn validate_rule(
-        path: &Path,
-        rule: &serde_yaml::Value,
-        repo_root: &Path,
-    ) -> Result<(), ArtifactValidationError> {
+    fn validate_rule(path: &Path, rule: &serde_yaml::Value) -> Result<(), ArtifactValidationError> {
         let alert = rule
             .get("alert")
             .and_then(serde_yaml::Value::as_str)
@@ -316,26 +312,14 @@ impl AlertRuleValidator {
                 ));
             }
         }
-        for field in ["summary", "runbook_url"] {
-            if yaml_string(annotations, field).is_none_or(str::is_empty) {
-                return Err(ArtifactValidationError::new(
-                    path,
-                    format!("alert[{alert}].annotations.{field}"),
-                    "alert must declare required annotation",
-                ));
-            }
-        }
-        let runbook_url = yaml_string(annotations, "runbook_url")
-            .expect("runbook_url presence validated with the required annotations above");
-        if is_stable_url(runbook_url) || repo_root.join(runbook_url).exists() {
-            Ok(())
-        } else {
-            Err(ArtifactValidationError::new(
+        if yaml_string(annotations, "summary").is_none_or(str::is_empty) {
+            return Err(ArtifactValidationError::new(
                 path,
-                format!("alert[{alert}].annotations.runbook_url"),
-                format!("runbook target does not exist: {runbook_url}"),
-            ))
+                format!("alert[{alert}].annotations.summary"),
+                "alert must declare required annotation",
+            ));
         }
+        Ok(())
     }
 }
 
@@ -350,10 +334,6 @@ fn is_yaml_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
-}
-
-fn is_stable_url(value: &str) -> bool {
-    value.starts_with("https://") || value.starts_with("http://")
 }
 
 #[cfg(test)]
@@ -423,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn alert_validator_requires_runbook_targets() {
+    fn alert_validator_requires_summary() {
         let alert = r#"
 groups:
   - name: tokeira
@@ -434,13 +414,12 @@ groups:
           severity: page
           service: tokeirad
         annotations:
-          summary: Reservoir exhausted
-          runbook_url: docs/runbooks/observability/missing.md
+          description: Reservoir exhausted
 "#;
 
         let error = AlertRuleValidator::validate_str(Path::new("alerts.yaml"), alert, &repo_root())
             .unwrap_err();
 
-        assert!(error.field.contains("runbook_url"));
+        assert!(error.field.contains("summary"));
     }
 }

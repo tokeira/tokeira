@@ -70,9 +70,9 @@ platforms/    local · compose · compose-syn · ecs · eks
 tools/        tkw (fleet worktrees) · proto-sync · simulation
 proto/        upstream/ — vendored Temporal protos (the authoritative wire shape)
 .kiro/specs/  feature specs                 spec/     TLA+/refinement stack
-scenarios/    end-to-end samples            spikes/   throwaway probes
-docs/         architecture · adr · platforms · conformance · readiness ·
-              runbooks · testing · crates · agents
+scenarios/    end-to-end samples
+docs/         architecture · adr · platforms · conformance · readiness · testing ·
+              crates · agents
 ```
 
 The workspace `Cargo.toml` member list is authoritative; this is orientation.

@@ -58,7 +58,6 @@ exclude = [
     "tools/simulation/engine",
     "tools/simulation/broker",
     "tools/simulation/placement",
-    "spikes/connect-buffa",
 ]
 
 [workspace.package]

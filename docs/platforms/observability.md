@@ -128,15 +128,12 @@ Dashboards must use declared metric names, smooth line interpolation, explicit
 units, descriptions, meaningful legends, and the `$datasource` template
 variable. Do not put high-cardinality labels in legends.
 
-## Alerts and Runbooks
+## Alerts
 
 Alert rules are stored in `platforms/compose/alerts/observability-alerts.yaml`.
-Each alert includes severity, service, summary, description, and a runbook URL.
-Runbooks live under `docs/runbooks/observability/` and cover first dashboard,
-first PromQL/log queries, safe remediation, escalation, and related alerts.
-
-When adding a new alert, add its runbook in the same change and update the alert
-validation tests.
+Each alert includes bounded severity and service labels plus a summary and
+description. Runbook URLs are intentionally not emitted until the
+production-observability surface defines a stable public documentation home.
 
 ## Implementer Notes
 
@@ -145,8 +142,6 @@ validation tests.
   metric labels.
 - Use typed label enums instead of ad-hoc strings on hot paths.
 - Use manual spans on hot or cancellable async paths.
-- Update dashboard, alert, and runbook validation tests when adding telemetry
-  artifacts.
+- Update dashboard and alert validation tests when adding telemetry artifacts.
 - Keep production defaults private-network friendly. Public observability
   endpoints are not required for Compose or ECS operation.
-

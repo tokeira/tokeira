@@ -542,9 +542,9 @@ platforms/  local · compose · compose-syn · ecs · eks
 tools/      tkw (fleet worktrees) · proto-sync · simulation (excluded)
 proto/      upstream/ — vendored Temporal protos (authoritative wire shape, §8)
 .kiro/specs/  feature specs        spec/  TLA+/refinement stack
-scenarios/  e2e samples (excluded)        spikes/  throwaway probes
+scenarios/  e2e samples (excluded)
 docs/       agents · adr · architecture · conformance · operations · platforms ·
-            readiness · runbooks · testing · crates · diagrams
+            readiness · testing · crates · diagrams
 ```
 
 ### Working agreements

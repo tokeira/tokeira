@@ -8,7 +8,7 @@ use chrono::Utc;
 use tokeira_provisioner::{ProvenanceStamp, check_binding};
 use tokeira_report::Mode;
 
-use crate::{ProvisionerPlatform, envelope_store, render::PlanReport};
+use crate::{ProvisionerPlatform, envelope_store, render::ExplanationReport};
 
 pub(crate) async fn plan<P: ProvisionerPlatform>(
     platform: &P,
@@ -22,16 +22,15 @@ pub(crate) async fn plan<P: ProvisionerPlatform>(
         .context("failed to load the deployment envelope")?;
 
     let verdict = check_binding(envelope.binding.as_ref(), &running);
-    // Coverage rides the outcome; the report consumes it in the uncertainty
-    // phases of the evidence-model spec — this slice is behaviour-preserving.
     let outcome = platform.infra_plan(deployment_dir).await?;
-    let report = PlanReport::new(
-        platform.label(deployment_dir).to_string(),
-        "infra plan",
-        &envelope,
-        verdict,
-        outcome.changes,
-    );
+    let report = ExplanationReport {
+        initialized: envelope.binding.is_some(),
+        binding: verdict,
+        explanation: tokeira_explain::explain_plan(
+            crate::explain_context(platform, deployment_dir, &envelope, "infra plan"),
+            &outcome,
+        ),
+    };
     print!("{}", tokeira_report::render(&report, mode)?);
     Ok(())
 }

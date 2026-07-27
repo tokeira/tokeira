@@ -98,6 +98,8 @@ pub mod symbol {
     pub const DELETE: &str = "-";
     /// A resource the operation leaves untouched (detail-depth evidence).
     pub const UNCHANGED: &str = "=";
+    /// Something the engine could not determine — an uncertainty line.
+    pub const UNCERTAIN: &str = "?";
 }
 
 /// A renderable operator report: a serializable model plus its narrative.

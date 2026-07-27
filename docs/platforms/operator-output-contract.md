@@ -53,7 +53,8 @@ Depth is a human affordance only, so the 2×2 matrix has three real cells.
 3. Errors state *what happened, why, and what to do next* — the contract as it stands,
    never implementation status. No roadmap apologies, no "not yet".
 4. The symbol vocabulary is fleet-wide for anything resembling a plan or delta:
-   `+` create · `~` update · `±` replace (destructive) · `-` delete · `=` unchanged.
+   `+` create · `~` update · `±` replace (destructive) · `-` delete · `=` unchanged ·
+   `?` uncertainty.
 5. Numbers always carry their noun ("3 services", never a bare "3").
 6. Counts never inflate: an unchanged resource is not a "change".
 7. stdout carries the report; stderr carries advisories (warnings, dev-iteration

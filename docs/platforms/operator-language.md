@@ -35,6 +35,7 @@ The operator's nouns. Reports use these words and no synonyms.
 | **verifies / does not verify** | The definition parses and interprets cleanly (`definition check`); failures carry a location. | valid/invalid, parse OK |
 | **binding** | The recorded pairing of deployment and provisioner identity. Spoken **only** when it blocks a verb (mismatch, downgrade, mode regression) or the deployment is not yet initialized. | provenance stamp, verdict (as prose), gate |
 | **retained** | Kept for return: retained revisions (`revert`), the retained prior provisioner (`rollback`). | checkpoint, snapshot (in prose) |
+| **uncertainty** | Something the engine could not determine, stated with its consequence and (where one exists) the action that resolves it. An empty set is itself stated: "live state: fully confirmed". | unknown status, refresh status (in prose) |
 
 The operator's verbs, with their one-line meanings:
 

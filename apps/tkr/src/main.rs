@@ -321,10 +321,21 @@ fn forwarded_deploy_verb(action: &DeployAction) -> (&'static [&'static str], Vec
             &["deploy", "plan"],
             explanation_flag(explanation.as_deref()),
         ),
-        DeployAction::Apply { explanation, .. } => (
-            &["deploy", "apply"],
-            explanation_flag(explanation.as_deref()),
-        ),
+        DeployAction::Apply {
+            yes, explanation, ..
+        } => {
+            // `--yes` crosses the forwarding boundary: the destructive gate
+            // lives in `tkp`, and the operator's confirmation must reach it —
+            // dropping the flag left destructive workload applies with a
+            // refusal and no remedy. `--force` stays in-process-only: `tkp`
+            // has no such flag.
+            let mut extra = Vec::new();
+            if *yes {
+                extra.push("--yes".to_string());
+            }
+            extra.extend(explanation_flag(explanation.as_deref()));
+            (&["deploy", "apply"], extra)
+        }
         DeployAction::Status => (&["describe"], Vec::new()),
     }
 }
@@ -620,7 +631,7 @@ mod tests {
         assert_eq!(extra, vec!["--explanation", "/tmp/out.json"]);
 
         let deploy = DeployAction::Apply {
-            yes: true,
+            yes: false,
             force: false,
             explanation: Some(PathBuf::from("/tmp/out.json")),
         };
@@ -634,6 +645,29 @@ mod tests {
         };
         let (_, extra) = forwarded_infra_verb(&bare);
         assert!(extra.is_empty(), "no flag without a request");
+    }
+
+    // The operator's confirmation crosses to the binary that gates on it:
+    // `tkp` refuses destructive plans without `--yes`, so a forwarded
+    // `deploy apply --yes` must carry the flag.
+    #[test]
+    fn forwarded_deploy_apply_carries_yes() {
+        let confirmed = DeployAction::Apply {
+            yes: true,
+            force: false,
+            explanation: None,
+        };
+        let (verb, extra) = forwarded_deploy_verb(&confirmed);
+        assert_eq!(verb, &["deploy", "apply"]);
+        assert_eq!(extra, vec!["--yes"]);
+
+        let unconfirmed = DeployAction::Apply {
+            yes: false,
+            force: false,
+            explanation: None,
+        };
+        let (_, extra) = forwarded_deploy_verb(&unconfirmed);
+        assert!(extra.is_empty(), "no confirmation is forwarded unasked");
     }
 
     #[test]

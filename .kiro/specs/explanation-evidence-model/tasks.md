@@ -228,28 +228,34 @@ from the design is a required property-based test task.
 
 ## Phase 7 — Lexicon and integration
 
-- [ ] 7.1 Lexicon additions
+- [x] 7.1 Lexicon additions
   - Add uncertainty, confirmation coverage, impact, and evidence to
     `docs/platforms/operator-language.md`, with the banned-word replacements they imply
   - _Requirements: 10.1, 10.2_
 
-- [ ] 7.2 End-to-end integration test
+- [x] 7.2 End-to-end integration test
   - `platforms/compose-syn/tests/exercise.rs`: a plan against the reference definition
     produces a model whose changes match the plan's, whose evidence closure holds, and
     whose uncertainties reflect the refresh coverage — exercising engine → orchestrator →
     platform → shell
   - _Requirements: 1.1, 4.1, 5.4_
 
-- [ ] 7.3 Crate and module documentation
+- [x] 7.3 Crate and module documentation
   - `tokeira-explain` module docs state the contract and the boundary; the `Report` impl
     records the C5 migration path (if a consumer outside `tkp` needs to render, the impl
     moves into the crate and takes `tokeira-report`)
   - _Requirements: 9.4, 9.5_
 
-- [ ] 7.4 **Final checkpoint** — the full bar: `cargo +nightly fmt --all`,
+- [x] 7.4 **Final checkpoint** — the full bar: `cargo +nightly fmt --all`,
   `cargo lint --locked` (zero warnings), `cargo check --workspace --locked`,
   `cargo test --workspace --locked`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
-  --no-deps --locked`.
+  --no-deps --locked`. DONE — Phase 7 slice: lexicon gains **live state** (coverage
+  statement) and **impact** (defined ahead of emission; uncertainty landed in Phase 5,
+  evidence predates F1); exercise.rs asserts the model over the real engine outcome
+  (coverage totality, closure, uncertainty==Unknown-status count — internal-consistency
+  form, never a specific status, so Docker-present and Docker-absent worlds both pass);
+  C5 migration note recorded on the `Report` impl. Full bar green. **Feature 1 is
+  complete.**
 
 ## Task Dependency Graph
 

@@ -109,7 +109,11 @@ where
     D: tokeira_orchestrator::Deployment,
 {
     match action {
-        InfraAction::Plan { module } => {
+        InfraAction::Plan {
+            module,
+            explanation,
+        } => {
+            super::refuse_explanation(explanation.as_deref())?;
             let mut engine = InfraEngine::new(deployment, config, &ctx.path).await?;
             let selection = module_selection(module);
             let composition = engine.compose(selection.clone())?;
@@ -124,7 +128,12 @@ where
             }
             result?;
         }
-        InfraAction::Apply { yes, module } => {
+        InfraAction::Apply {
+            yes,
+            module,
+            explanation,
+        } => {
+            super::refuse_explanation(explanation.as_deref())?;
             super::require_confirmation(yes, "infra apply")?;
             let mut engine = InfraEngine::new(deployment, config, &ctx.path).await?;
             let selection = module_selection(module);

@@ -145,3 +145,17 @@ pub(crate) fn require_confirmation(yes: bool, action: &str) -> Result<()> {
         bail!("refusing to run {action} without --yes")
     }
 }
+
+/// Refuse `--explanation` on the in-process platforms. The explanation
+/// artifact is produced by a deployment's own provisioner (evidence-model
+/// Req 7); a `deployment.toml`-configured deployment runs in-process and has
+/// no explanation model to write — stated as the contract, not a roadmap.
+pub(crate) fn refuse_explanation(explanation: Option<&std::path::Path>) -> Result<()> {
+    if explanation.is_some() {
+        bail!(
+            "`--explanation` is not available here: this deployment's platform does not \
+             produce an explanation model"
+        );
+    }
+    Ok(())
+}

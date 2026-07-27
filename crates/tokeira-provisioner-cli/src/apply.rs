@@ -20,6 +20,7 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
     yes: bool,
+    explanation_path: Option<&Path>,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
@@ -45,11 +46,17 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
 
     // ── Destructive gate (§4, Proposal 002): the engine classifies, the
     // shell confirms. Skipped under `--yes` — the operator has already
-    // reviewed — so the confirmed path pays no extra plan pass. ──
-    if !yes {
+    // reviewed — so the confirmed path pays no extra plan pass. The gate's
+    // plan doubles as the applied explanation's field evidence; under
+    // `--yes` there is none, and the explanation says so rather than
+    // inventing before-images (Property 9). ──
+    let preceding = if yes {
+        None
+    } else {
         let planned = platform.infra_plan(deployment_dir).await?;
         refuse_destructive_without_yes("infra apply", &planned.changes)?;
-    }
+        Some(planned)
+    };
 
     // ── Engine apply (realized by the injected platform) ──
     // The deployment identity seeds the platform context; it was set at `init`.
@@ -82,6 +89,19 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after apply")?;
+    // The artifact is written only after the state record is safe: a failed
+    // write must fail the verb (Req 7.6) without ever costing the envelope
+    // its revision advance. The context states the one fact the operator
+    // must not misread — the apply itself is committed and recorded.
+    if let Some(path) = explanation_path {
+        let explanation = tokeira_explain::explain_applied(
+            crate::explain_context(platform, deployment_dir, &envelope, "infra apply"),
+            &crate::committed_changes(&applied),
+            preceding.as_ref(),
+        );
+        tokeira_explain::artifact::write(path, &explanation)
+            .context("the apply is committed and recorded; only the explanation artifact failed")?;
+    }
     println!(
         "envelope: config_revision now {} (config {})",
         envelope.config_revision,
@@ -185,7 +205,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = apply(&TestPlatform, tmp.path(), false)
+        let err = apply(&TestPlatform, tmp.path(), false, None)
             .await
             .expect_err("the open marker gates apply");
         assert!(err.to_string().contains("in flight"), "unexpected: {err}");
@@ -229,12 +249,72 @@ mod tests {
         // stamping happens at `create`, so an unstamped deployment at apply time
         // is unverifiable).
         let tmp = tempfile::tempdir().unwrap();
-        let err = apply(&TestPlatform, tmp.path(), false)
+        let err = apply(&TestPlatform, tmp.path(), false, None)
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(
             err.to_string().contains("binding gate refuses"),
             "unexpected error: {err}"
+        );
+    }
+
+    // Req 7.1 on the apply side: the artifact is the applied explanation,
+    // revision already advanced, field evidence from the gate's own plan
+    // pass (never invented — Property 9).
+    #[tokio::test]
+    async fn apply_writes_the_applied_explanation_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        let env = DeploymentStateEnvelope {
+            binding: Some(ProvenanceStamp::current(Utc::now())),
+            config_revision: 4,
+            ..Default::default()
+        };
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        let path = tmp.path().join("explanation.json");
+        apply(&TestPlatform, tmp.path(), false, Some(&path))
+            .await
+            .expect("apply succeeds and writes the artifact");
+
+        let model = tokeira_explain::artifact::read(&path).expect("artifact parses alone");
+        assert_eq!(model.operation, "infra apply");
+        assert_eq!(
+            model.current_revision, 5,
+            "the artifact records the advanced revision"
+        );
+    }
+
+    // Req 7.6 without state damage: a failed artifact write fails the verb,
+    // but the apply's record — the revision advance — is already safe. The
+    // artifact must never cost the envelope its commit.
+    #[tokio::test]
+    async fn a_failed_artifact_write_fails_the_verb_but_keeps_the_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        let env = DeploymentStateEnvelope {
+            binding: Some(ProvenanceStamp::current(Utc::now())),
+            config_revision: 4,
+            ..Default::default()
+        };
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        let path = tmp.path().join("no-such-dir").join("explanation.json");
+        let err = apply(&TestPlatform, tmp.path(), false, Some(&path))
+            .await
+            .expect_err("an unwritable artifact path fails the verb");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("committed and recorded"),
+            "the operator is told the apply itself is safe: {message}"
+        );
+
+        let (after, _) = store.load().await.unwrap();
+        assert_eq!(
+            after.config_revision, 5,
+            "the artifact failure never costs the revision advance"
         );
     }
 
@@ -254,7 +334,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        apply(&TestPlatform, tmp.path(), false)
+        apply(&TestPlatform, tmp.path(), false, None)
             .await
             .expect("apply proceeds under DevIterate");
 

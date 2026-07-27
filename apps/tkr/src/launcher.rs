@@ -481,15 +481,22 @@ pub(crate) async fn launch_definition_check_at_path(
 /// Forward `infra apply`, first forwarding the internal `init` when the
 /// deployment has never been stamped — so `tkr deployment apply` is a coherent
 /// one-command flow.
-pub(crate) async fn launch_apply(deployment_dir: &Path, yes: bool) -> Result<()> {
+pub(crate) async fn launch_apply(
+    deployment_dir: &Path,
+    yes: bool,
+    explanation: Option<&Path>,
+) -> Result<()> {
     if load_envelope(deployment_dir).await?.binding.is_none() {
         launch(deployment_dir, &["init"], &[]).await?;
     }
-    let extra = if yes {
-        vec!["--yes".to_string()]
-    } else {
-        Vec::new()
-    };
+    let mut extra = Vec::new();
+    if yes {
+        extra.push("--yes".to_string());
+    }
+    if let Some(path) = explanation {
+        extra.push("--explanation".to_string());
+        extra.push(path.display().to_string());
+    }
     launch(deployment_dir, &["infra", "apply"], &extra).await
 }
 

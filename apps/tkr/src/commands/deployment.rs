@@ -142,7 +142,7 @@ pub(crate) async fn run(
         }
         DeploymentAction::Apply { yes } => {
             let dir = deployments.resolve_dir(selected)?;
-            launcher::launch_apply(&dir, yes).await?;
+            launcher::launch_apply(&dir, yes, None).await?;
         }
         DeploymentAction::Upgrade => {
             let dir = deployments.resolve_dir(selected)?;

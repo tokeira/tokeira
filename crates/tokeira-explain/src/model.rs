@@ -1,0 +1,197 @@
+//! The explanation model's types, mirroring the field policy in
+//! `.kiro/specs/explanation-evidence-model/requirements.md`: every field
+//! names its source of truth there, and its documented fallback when the
+//! source cannot supply it. No field is silently omitted — the policy is the
+//! schema's contract, and construction (`build`) honors it.
+
+use serde::{Deserialize, Serialize};
+use tokeira_iac::{ChangeKind, ChangeSemantics, Confidence, FieldDiff, RefreshStatus};
+
+use crate::evidence::{EvidenceId, EvidenceIndex};
+
+/// The artifact schema version. Bumped only for breaking shape changes;
+/// slot population (Features 2–4) is additive by design (Requirement 8.3).
+pub const EXPLANATION_SCHEMA_VERSION: u32 = 1;
+
+/// One operation's complete explanation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeploymentExplanation {
+    pub schema_version: u32,
+    /// The deployment's identity (envelope `deployment_id`).
+    pub deployment: String,
+    /// The platform label (e.g. `compose-syn`).
+    pub platform: String,
+    /// The verb this explains: `"infra plan"`, `"infra apply"`, ….
+    pub operation: String,
+    /// The last applied revision (`0` for a never-applied deployment).
+    pub current_revision: u64,
+    /// The revision a mutating verb would produce; absent for read-only verbs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed_revision: Option<u64>,
+    /// The effective definition digest (`None` renders as "default").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_ref: Option<String>,
+    /// Exactly one entry per engine change, `NoChange` included (Req 1.3).
+    pub changes: Vec<ExplainedChange>,
+    /// Derived from declared semantics — empty until Feature 2 supplies them.
+    pub impacts: Vec<OperationalImpact>,
+    /// References into `changes`, derived from the engine's own
+    /// classification (`ChangeKind::is_destructive`) — never from
+    /// declarations (Feature 2, Requirement 4).
+    pub destructive: Vec<EvidenceId>,
+    pub uncertainties: Vec<Uncertainty>,
+    pub evidence: EvidenceIndex,
+}
+
+/// One resource change, enriched with everything the layer knows about it.
+/// The `semantics`, `cause`, `dependants`, and `source` fields are slots:
+/// present from schema v1, populated by Features 2–4, rendered as nothing
+/// while not determined (Requirement 8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplainedChange {
+    pub evidence_id: EvidenceId,
+    pub resource_id: String,
+    pub module: String,
+    pub resource_type: String,
+    pub kind: ChangeKind,
+    pub field_diffs: Vec<FieldDiff>,
+    /// The refresh confirmation behind this change; `None` means the verb
+    /// performed no live-state examination at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_status: Option<RefreshStatus>,
+    #[serde(default)]
+    pub semantics: ChangeSemantics,
+    #[serde(default)]
+    pub cause: Confidence<Cause>,
+    #[serde(default)]
+    pub dependants: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceLocation>,
+}
+
+/// Why a change is present. Populated by Feature 3's classification algebra;
+/// until then every change's cause is `Confidence::Unknown` (the
+/// `Undetermined` variant the original design carried was removed by the
+/// Feature 3 amendment — it duplicated what `Confidence::Unknown` says).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Cause {
+    DefinitionEdit {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<SourceLocation>,
+    },
+    DependencyOutputChanged {
+        dependency: String,
+    },
+    ProviderDrift,
+    ReplacementCascade {
+        root: String,
+    },
+    EngineAdvance,
+}
+
+/// A definition location, in the working definition's coordinates.
+/// Feature 4 populates it; Feature 4's amendment adds the attribution basis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// An operational consequence of the plan as a whole, derived
+/// deterministically from declared semantics (Feature 2 owns the
+/// derivation; the type exists from v1 so the field does).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalImpact {
+    pub evidence_id: EvidenceId,
+    pub class: ImpactClass,
+    /// The changes that justify the impact.
+    pub subjects: Vec<EvidenceId>,
+    /// A deterministic template rendering — never free prose.
+    pub statement: String,
+}
+
+/// Impact classes, ordered most consequential first; the ordering is the
+/// rendering order (Feature 2, Requirement 5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImpactClass {
+    DataDestroyed,
+    Unavailability,
+    Replacement,
+    BriefInterruption,
+    RollingReplacement,
+}
+
+/// A modelled statement that something could not be determined — the
+/// feature that makes a quiet plan distinguishable from an uninformed one
+/// (Requirement 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Uncertainty {
+    pub evidence_id: EvidenceId,
+    /// What the uncertainty qualifies; always resolvable in the index
+    /// (Property 3).
+    pub subject: EvidenceId,
+    pub reason: UncertaintyReason,
+    /// What the operator cannot rely on as a result.
+    pub consequence: String,
+    /// The action that would resolve it, where one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolvable_by: Option<String>,
+}
+
+/// Why something could not be determined.
+///
+/// `SemanticsUndeclared` and `ProviderAssignedAtApply` are defined here and
+/// **not constructed by Feature 1**: with every semantics slot
+/// not-determined, the renderer states no semantics, so nothing is left
+/// unqualified — emitting them now would attach an uncertainty to every
+/// change in every plan and teach operators to skip the section. They
+/// activate with Feature 2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UncertaintyReason {
+    /// Refresh could not confirm live state (`RefreshStatus::Unknown`).
+    LiveStateUnconfirmed,
+    /// The verb performed no live-state check at all.
+    LiveStateNotExamined,
+    /// An apply with no preceding plan in the same invocation: committed ids
+    /// are known, field-level evidence is not (Proposal 002's ids-only
+    /// audit).
+    FieldEvidenceUnavailable,
+    /// Reserved for Feature 2.
+    SemanticsUndeclared { field: String },
+    /// Reserved for Feature 2.
+    ProviderAssignedAtApply { field: String },
+}
+
+impl UncertaintyReason {
+    /// The stable tag used in evidence ids.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            UncertaintyReason::LiveStateUnconfirmed => "live-state-unconfirmed",
+            UncertaintyReason::LiveStateNotExamined => "live-state-not-examined",
+            UncertaintyReason::FieldEvidenceUnavailable => "field-evidence-unavailable",
+            UncertaintyReason::SemanticsUndeclared { .. } => "semantics-undeclared",
+            UncertaintyReason::ProviderAssignedAtApply { .. } => "provider-assigned-at-apply",
+        }
+    }
+}
+
+/// One committed change from an apply — the model's own copy of the
+/// ids-only audit entry, so this crate does not depend on the provisioner
+/// domain crate (Requirement 9.1); the shell maps at its boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedChange {
+    pub id: String,
+    pub op: CommittedOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommittedOp {
+    Created,
+    Updated,
+    Deleted,
+}

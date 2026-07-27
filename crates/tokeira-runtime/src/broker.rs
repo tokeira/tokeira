@@ -59,9 +59,9 @@ use tokio::{
 };
 
 use crate::{
-    DeliveryMetrics, DeliveryModeProvider, DeliveryOrdering, DispatchEligibility,
-    DispatchRateLimits, InMemoryTaskQueueConfigStore, QueryResult, QueryTask, StartedWorkflowTask,
-    StockDeliveryModeProvider, TaskQueueConfigEntry, TaskQueueConfigKey, TaskQueueConfigKind,
+    ConfiguredDeliveryModeProvider, DeliveryMetrics, DeliveryModeProvider, DeliveryOrdering,
+    DispatchEligibility, DispatchRateLimits, InMemoryTaskQueueConfigStore, QueryResult, QueryTask,
+    StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigKey, TaskQueueConfigKind,
     TaskQueueConfigStore, effective_priority, metrics as runtime_metrics,
 };
 
@@ -218,26 +218,33 @@ impl Default for BrokerPolicy {
     fn default() -> Self {
         Self {
             config_store: StdRwLock::new(Arc::new(InMemoryTaskQueueConfigStore::default())),
-            mode_provider: StdRwLock::new(Arc::new(StockDeliveryModeProvider)),
+            mode_provider: StdRwLock::new(Arc::new(ConfiguredDeliveryModeProvider::default())),
         }
     }
 }
 
 impl BrokerPolicy {
-    fn delivery_inputs(
+    async fn delivery_inputs(
         &self,
         queue: &QueueKey,
     ) -> (crate::DeliveryMode, u64, Option<TaskQueueConfigEntry>) {
-        let provider = self
-            .mode_provider
-            .read()
-            .expect("delivery mode provider lock poisoned");
-        let mode = provider.mode_for(queue);
-        let scope_generation = provider.scope_generation();
-        let config = self
+        let (mode, scope_generation) = {
+            let provider = self
+                .mode_provider
+                .read()
+                .expect("delivery mode provider lock poisoned");
+            (provider.mode_for(queue), provider.scope_generation())
+        };
+        let store = self
             .config_store
             .read()
             .expect("task queue config store lock poisoned")
+            .clone();
+        // Store reads are async so repository-backed implementations can evolve
+        // without holding broker locks. Production reads the hydrated cache and
+        // therefore cannot fail; repository failures occur during hydrate,
+        // refresh, or mutation instead.
+        let config = store
             .get(&TaskQueueConfigKey {
                 namespace_id: queue.namespace_id,
                 task_queue: queue.task_queue.clone(),
@@ -245,7 +252,9 @@ impl BrokerPolicy {
                     tokeira_types::TaskKind::Workflow => TaskQueueConfigKind::Workflow,
                     tokeira_types::TaskKind::Activity => TaskQueueConfigKind::Activity,
                 },
-            });
+            })
+            .await
+            .expect("hydrated task-queue cache reads are infallible");
         (mode, scope_generation, config)
     }
 
@@ -254,6 +263,13 @@ impl BrokerPolicy {
             .config_store
             .write()
             .expect("task queue config store lock poisoned") = store;
+    }
+
+    fn set_mode_provider(&self, provider: Arc<dyn DeliveryModeProvider>) {
+        *self
+            .mode_provider
+            .write()
+            .expect("delivery mode provider lock poisoned") = provider;
     }
 
     fn config_store(&self) -> Arc<dyn TaskQueueConfigStore> {
@@ -506,6 +522,15 @@ impl InMemoryBroker {
     /// wiring updates the shared policy handle, not one broker facade.
     pub fn set_task_queue_config_store(&self, store: Arc<dyn TaskQueueConfigStore>) {
         self.policy.set_config_store(store);
+    }
+
+    /// Share the server's typed delivery-mode provider with this broker.
+    ///
+    /// Existing clones observe the replacement through the shared policy
+    /// handle; the provider remains disposable delivery policy rather than
+    /// authoritative workflow state.
+    pub fn set_delivery_mode_provider(&self, provider: Arc<dyn DeliveryModeProvider>) {
+        self.policy.set_mode_provider(provider);
     }
 
     fn emit_queue_depths(inner: &BrokerState, queue: &QueueKey) {
@@ -903,7 +928,7 @@ impl InMemoryBroker {
         mut task: DispatchableWorkflowTask,
         metrics: Option<&DeliveryMetrics>,
     ) {
-        let (mode, scope_generation, config) = self.policy.delivery_inputs(&task.queue);
+        let (mode, scope_generation, config) = self.policy.delivery_inputs(&task.queue).await;
         let mut inner = self.inner.lock().await;
         inner.ordering.enter_scope(scope_generation);
         if task.sticky_preferred.is_some()
@@ -1534,6 +1559,11 @@ impl InMemoryActivityBroker {
         self.policy.set_config_store(store);
     }
 
+    /// Share the server's typed delivery-mode provider with this broker.
+    pub fn set_delivery_mode_provider(&self, provider: Arc<dyn DeliveryModeProvider>) {
+        self.policy.set_mode_provider(provider);
+    }
+
     fn emit_queue_depth(inner: &ActivityBrokerState, queue: &QueueKey) {
         let depth = inner
             .ready
@@ -1740,7 +1770,7 @@ impl InMemoryActivityBroker {
     ) -> Result<()> {
         runtime_metrics::record_broker_publish(&task.queue);
         let queue = task.queue.clone();
-        let (mode, scope_generation, config) = self.policy.delivery_inputs(&task.queue);
+        let (mode, scope_generation, config) = self.policy.delivery_inputs(&task.queue).await;
         let mut inner = self.inner.lock().await;
         inner.ordering.enter_scope(scope_generation);
         let dedupe_key = (
@@ -1936,7 +1966,12 @@ impl InMemoryActivityBroker {
 
     async fn try_take(&self, queue: &QueueKey) -> Result<ActivityTakeOutcome> {
         let config_key = activity_config_key(queue);
-        let config = self.policy.config_store().get(&config_key);
+        let config = self
+            .policy
+            .config_store()
+            .get(&config_key)
+            .await
+            .expect("hydrated task-queue cache reads are infallible");
         let mut inner = self.inner.lock().await;
         let Some(candidate) = inner.ready.get(queue).and_then(OrderedReady::front) else {
             Self::emit_queue_depth(&inner, queue);
@@ -2367,6 +2402,77 @@ mod tests {
             remaining += 1;
         }
         assert_eq!(remaining, 30);
+    }
+
+    #[tokio::test]
+    async fn committed_weight_override_shapes_subsequent_delivery() {
+        let queue = activity_queue("durable-weight-override");
+        let repository = Arc::new(tokeira_storage::InMemoryStore::default());
+        let store = Arc::new(crate::RepositoryBackedTaskQueueConfigStore::new(repository));
+        store.hydrate().await.expect("hydrate durable policy");
+        store
+            .apply(
+                activity_config_key(&queue),
+                crate::TaskQueueConfigPatch {
+                    set_fairness_weight_overrides: BTreeMap::from([("heavy".to_string(), 2.0)]),
+                    ..crate::TaskQueueConfigPatch::default()
+                },
+                1_000,
+            )
+            .await
+            .expect("commit weight override");
+
+        let broker = InMemoryActivityBroker::default();
+        broker.set_task_queue_config_store(store);
+        set_activity_mode(
+            &broker,
+            DeliveryMode {
+                priority_enabled: true,
+                fairness_enabled: true,
+                auto_enable: false,
+            },
+        );
+        for index in 0..30 {
+            broker
+                .publish_activity_task(
+                    named_activity_task(
+                        &queue,
+                        format!("heavy-{index}"),
+                        priority(3, "heavy", 1.0),
+                    ),
+                    None,
+                )
+                .await
+                .expect("publish");
+            broker
+                .publish_activity_task(
+                    named_activity_task(
+                        &queue,
+                        format!("light-{index}"),
+                        priority(3, "light", 1.0),
+                    ),
+                    None,
+                )
+                .await
+                .expect("publish");
+        }
+
+        let mut delivered = (0, 0);
+        for _ in 0..30 {
+            let id = broker
+                .poll_activity_task(&queue, Duration::ZERO)
+                .await
+                .expect("poll")
+                .expect("ready task")
+                .0
+                .activity_id;
+            if id.starts_with("heavy-") {
+                delivered.0 += 1;
+            } else {
+                delivered.1 += 1;
+            }
+        }
+        assert_eq!(delivered, (20, 10));
     }
 
     proptest! {
@@ -2989,7 +3095,9 @@ mod tests {
 
     #[tokio::test]
     async fn zero_activity_rate_unblocks_on_live_config_change() {
-        let store = Arc::new(InMemoryTaskQueueConfigStore::default());
+        let repository = Arc::new(tokeira_storage::InMemoryStore::default());
+        let store = Arc::new(crate::RepositoryBackedTaskQueueConfigStore::new(repository));
+        store.hydrate().await.expect("hydrate durable policy");
         let broker = InMemoryActivityBroker::default();
         broker.set_task_queue_config_store(store.clone());
         let queue = activity_queue("rate-change");
@@ -3011,6 +3119,7 @@ mod tests {
                 },
                 1_000,
             )
+            .await
             .expect("zero is a valid blocking rate");
         broker
             .publish_activity_task(activity_task(queue.clone()), None)
@@ -3039,6 +3148,7 @@ mod tests {
                 },
                 1_000,
             )
+            .await
             .expect("unsetting the rate is valid");
 
         assert!(waiter.await.expect("poll task").is_some());

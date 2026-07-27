@@ -1,0 +1,4906 @@
+[
+  {
+    "key": "activity.enableStandalone",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "chasm/lib/activity/config.go:11"
+  },
+  {
+    "key": "activity.longPollBuffer",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "chasm/lib/activity/config.go:23"
+  },
+  {
+    "key": "activity.longPollTimeout",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "20 * time.Second",
+    "source": "chasm/lib/activity/config.go:17"
+  },
+  {
+    "key": "admin.enableListHistoryTasks",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:26"
+  },
+  {
+    "key": "admin.matchingNamespaceTaskqueueToPartitionDispatchRate",
+    "constructor": "NewTaskQueueFloatSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Float",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:36"
+  },
+  {
+    "key": "admin.matchingNamespaceToPartitionDispatchRate",
+    "constructor": "NewNamespaceFloatSetting",
+    "scope": "Namespace",
+    "value_kind": "Float",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:31"
+  },
+  {
+    "key": "callback.request.timeout",
+    "constructor": "NewDestinationDurationSetting",
+    "scope": "Destination",
+    "value_kind": "Duration",
+    "default_expression": "time.Second * 10",
+    "source": "chasm/lib/callback/config.go:17"
+  },
+  {
+    "key": "callback.retryPolicy.initialInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "chasm/lib/callback/config.go:23"
+  },
+  {
+    "key": "callback.retryPolicy.maxInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "chasm/lib/callback/config.go:29"
+  },
+  {
+    "key": "chasm.callback.allowedAddresses",
+    "constructor": "NewNamespaceTypedSettingWithConverter",
+    "scope": "Namespace",
+    "value_kind": "Typed",
+    "default_expression": "AddressMatchRules{}",
+    "source": "chasm/lib/callback/config.go:55"
+  },
+  {
+    "key": "component.callbacks.allowedAddresses",
+    "constructor": "NewNamespaceTypedSettingWithConverter",
+    "scope": "Namespace",
+    "value_kind": "Typed",
+    "default_expression": "AddressMatchRules{}",
+    "source": "components/callbacks/config.go:55"
+  },
+  {
+    "key": "component.callbacks.request.timeout",
+    "constructor": "NewDestinationDurationSetting",
+    "scope": "Destination",
+    "value_kind": "Duration",
+    "default_expression": "time.Second * 10",
+    "source": "components/callbacks/config.go:17"
+  },
+  {
+    "key": "component.callbacks.retryPolicy.initialInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "components/callbacks/config.go:23"
+  },
+  {
+    "key": "component.callbacks.retryPolicy.maxInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "components/callbacks/config.go:29"
+  },
+  {
+    "key": "component.nexusoperations.callback.endpoint.template",
+    "constructor": "NewGlobalStringSetting",
+    "scope": "Global",
+    "value_kind": "String",
+    "default_expression": "\"unset\"",
+    "source": "components/nexusoperations/config.go:126"
+  },
+  {
+    "key": "component.nexusoperations.disallowedHeaders",
+    "constructor": "NewGlobalTypedSettingWithConverter",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "[]string{\n\t\"request-timeout\",\n\tinterceptor.DCRedirectionApiHeaderName,\n\tinterceptor.DCRedirectionContextHeaderName,\n\theaders.CallerNameHeaderName,\n\theaders.CallerTypeHeaderName,\n\theaders.CallOriginHeaderName,\n\theaders.PrincipalTypeHeaderName,\n\theaders.PrincipalNameHeaderName,\n}",
+    "source": "components/nexusoperations/config.go:91"
+  },
+  {
+    "key": "component.nexusoperations.limit.dispatch.task.timeout.min",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "components/nexusoperations/config.go:28"
+  },
+  {
+    "key": "component.nexusoperations.limit.header.size",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "8192",
+    "source": "components/nexusoperations/config.go:70"
+  },
+  {
+    "key": "component.nexusoperations.limit.operation.concurrency",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "30",
+    "source": "components/nexusoperations/config.go:36"
+  },
+  {
+    "key": "component.nexusoperations.limit.operation.name.length",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "components/nexusoperations/config.go:53"
+  },
+  {
+    "key": "component.nexusoperations.limit.operation.token.length",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "4096",
+    "source": "components/nexusoperations/config.go:61"
+  },
+  {
+    "key": "component.nexusoperations.limit.request.timeout.min",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "time.Millisecond * 1500",
+    "source": "components/nexusoperations/config.go:21"
+  },
+  {
+    "key": "component.nexusoperations.limit.scheduleToCloseTimeout",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "0",
+    "source": "components/nexusoperations/config.go:118"
+  },
+  {
+    "key": "component.nexusoperations.limit.service.name.length",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "components/nexusoperations/config.go:45"
+  },
+  {
+    "key": "component.nexusoperations.metrics.tags",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "chasmnexus.NexusMetricTagConfig{}",
+    "source": "components/nexusoperations/config.go:146"
+  },
+  {
+    "key": "component.nexusoperations.recordCancelRequestCompletionEvents",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "components/nexusoperations/config.go:159"
+  },
+  {
+    "key": "component.nexusoperations.request.timeout",
+    "constructor": "NewDestinationDurationSetting",
+    "scope": "Destination",
+    "value_kind": "Duration",
+    "default_expression": "time.Second * 10",
+    "source": "components/nexusoperations/config.go:15"
+  },
+  {
+    "key": "component.nexusoperations.retryPolicy.initialInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "components/nexusoperations/config.go:134"
+  },
+  {
+    "key": "component.nexusoperations.retryPolicy.maxInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "components/nexusoperations/config.go:140"
+  },
+  {
+    "key": "component.nexusoperations.useSystemCallbackURL",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "components/nexusoperations/config.go:78"
+  },
+  {
+    "key": "dynamicconfig.subscriptionPollInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute",
+    "source": "common/dynamicconfig/constants.go:18"
+  },
+  {
+    "key": "frontend.ListWorkersEnabled",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3217"
+  },
+  {
+    "key": "frontend.MaxConcurrentAdminBatchOperationPerNamespace",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:1035"
+  },
+  {
+    "key": "frontend.MaxConcurrentBatchOperationPerNamespace",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:1020"
+  },
+  {
+    "key": "frontend.MaxExecutionCountBatchOperationPerNamespace",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:1025"
+  },
+  {
+    "key": "frontend.WorkerCommandsEnabled",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3223"
+  },
+  {
+    "key": "frontend.WorkerHeartbeatsEnabled",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3201"
+  },
+  {
+    "key": "frontend.WorkflowPauseEnabled",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3229"
+  },
+  {
+    "key": "frontend.allowDeleteNamespaceIfNexusEndpointTarget",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:936"
+  },
+  {
+    "key": "frontend.allowedExperiments",
+    "constructor": "NewNamespaceTypedSetting",
+    "scope": "Namespace",
+    "value_kind": "Typed",
+    "default_expression": "[]string(nil)",
+    "source": "common/dynamicconfig/constants.go:588"
+  },
+  {
+    "key": "frontend.callbackHeaderMaxLength",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "8 * 1024",
+    "source": "common/dynamicconfig/constants.go:993"
+  },
+  {
+    "key": "frontend.callbackURLMaxLength",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:988"
+  },
+  {
+    "key": "frontend.deleteNamespaceConcurrentDeleteExecutionsActivities",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "4",
+    "source": "common/dynamicconfig/constants.go:1089"
+  },
+  {
+    "key": "frontend.deleteNamespaceDeleteActivityRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:1070"
+  },
+  {
+    "key": "frontend.deleteNamespaceDeletePageSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:1077"
+  },
+  {
+    "key": "frontend.deleteNamespaceNamespaceDeleteDelay",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "0 * time.Hour",
+    "source": "common/dynamicconfig/constants.go:1096"
+  },
+  {
+    "key": "frontend.deleteNamespacePagesPerExecution",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "256",
+    "source": "common/dynamicconfig/constants.go:1083"
+  },
+  {
+    "key": "frontend.disableListVisibilityByFilter",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:837"
+  },
+  {
+    "key": "frontend.enableBatcher",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1030"
+  },
+  {
+    "key": "frontend.enableCancelWorkerPollsOnShutdown",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3207"
+  },
+  {
+    "key": "frontend.enablePrincipalPropagation",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:848"
+  },
+  {
+    "key": "frontend.enableSchedules",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:901"
+  },
+  {
+    "key": "frontend.enableServerVersionCheck",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "os.Getenv(\"TEMPORAL_VERSION_CHECK_DISABLED\") == \"\"",
+    "source": "common/dynamicconfig/constants.go:827"
+  },
+  {
+    "key": "frontend.enableTokenNamespaceEnforcement",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:832"
+  },
+  {
+    "key": "frontend.enableUpdateWorkflowExecution",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1041"
+  },
+  {
+    "key": "frontend.enableUpdateWorkflowExecutionAsyncAccepted",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1047"
+  },
+  {
+    "key": "frontend.exposeAuthorizerErrors",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:842"
+  },
+  {
+    "key": "frontend.globalNamespaceCount",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:683"
+  },
+  {
+    "key": "frontend.globalNamespaceRPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:729"
+  },
+  {
+    "key": "frontend.globalNamespaceRPS.namespaceReplicationInducingAPIs",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:750"
+  },
+  {
+    "key": "frontend.globalNamespaceRPS.visibility",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:742"
+  },
+  {
+    "key": "frontend.globalNamespaceWorkerDeploymentReadRPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "50",
+    "source": "common/dynamicconfig/constants.go:666"
+  },
+  {
+    "key": "frontend.globalRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:643"
+  },
+  {
+    "key": "frontend.historyHostErrorPercentage",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.5",
+    "source": "common/dynamicconfig/constants.go:792"
+  },
+  {
+    "key": "frontend.historyHostSelfErrorProportion",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.05",
+    "source": "common/dynamicconfig/constants.go:797"
+  },
+  {
+    "key": "frontend.historyMaxPageSize",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "primitives.GetHistoryMaxPageSize",
+    "source": "common/dynamicconfig/constants.go:633"
+  },
+  {
+    "key": "frontend.httpAllowedHosts",
+    "constructor": "NewGlobalTypedSettingWithConverter",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "MatchAnythingRE",
+    "source": "common/dynamicconfig/constants.go:593"
+  },
+  {
+    "key": "frontend.keepAliveMaxConnectionAge",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:874"
+  },
+  {
+    "key": "frontend.keepAliveMaxConnectionAgeGrace",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "70 * time.Second",
+    "source": "common/dynamicconfig/constants.go:882"
+  },
+  {
+    "key": "frontend.keepAliveMaxConnectionIdle",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "2 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:866"
+  },
+  {
+    "key": "frontend.keepAliveMinTime",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Second",
+    "source": "common/dynamicconfig/constants.go:854"
+  },
+  {
+    "key": "frontend.keepAlivePermitWithoutStream",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:859"
+  },
+  {
+    "key": "frontend.keepAliveTime",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:888"
+  },
+  {
+    "key": "frontend.keepAliveTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Second",
+    "source": "common/dynamicconfig/constants.go:895"
+  },
+  {
+    "key": "frontend.linkMaxSize",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "4000",
+    "source": "common/dynamicconfig/constants.go:1010"
+  },
+  {
+    "key": "frontend.maskInternalErrorDetails",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:787"
+  },
+  {
+    "key": "frontend.maxBadBinaries",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:782"
+  },
+  {
+    "key": "frontend.maxWorkflowRulesPerNamespace",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:3189"
+  },
+  {
+    "key": "frontend.maxlinksPerRequest",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:1015"
+  },
+  {
+    "key": "frontend.namespaceBurstRatio",
+    "constructor": "NewNamespaceFloatSetting",
+    "scope": "Namespace",
+    "value_kind": "Float",
+    "default_expression": "2",
+    "source": "common/dynamicconfig/constants.go:660"
+  },
+  {
+    "key": "frontend.namespaceBurstRatio.namespaceReplicationInducingAPIs",
+    "constructor": "NewNamespaceFloatSetting",
+    "scope": "Namespace",
+    "value_kind": "Float",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:720"
+  },
+  {
+    "key": "frontend.namespaceBurstRatio.visibility",
+    "constructor": "NewNamespaceFloatSetting",
+    "scope": "Namespace",
+    "value_kind": "Float",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:713"
+  },
+  {
+    "key": "frontend.namespaceCount",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1200",
+    "source": "common/dynamicconfig/constants.go:671"
+  },
+  {
+    "key": "frontend.namespaceRPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2400",
+    "source": "common/dynamicconfig/constants.go:655"
+  },
+  {
+    "key": "frontend.namespaceRPS.namespaceReplicationInducingAPIs",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:706"
+  },
+  {
+    "key": "frontend.namespaceRPS.visibility",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:700"
+  },
+  {
+    "key": "frontend.nexusForwardRequestUseEndpointDispatch",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:979"
+  },
+  {
+    "key": "frontend.nexusRequestHeadersBlacklist",
+    "constructor": "NewGlobalTypedSettingWithConverter",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "util.MustWildCardStringsToRegexp([]string{\n\t\"accept-encoding\",\n\t\"x-forwarded-for\",\n\t\"xdc-redirection\",\n\t\"xdc-redirection-api\",\n\t\"temporal-nexus-failure-support\",\n})",
+    "source": "common/dynamicconfig/constants.go:964"
+  },
+  {
+    "key": "frontend.persistenceDynamicRateLimitingParams",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "DefaultDynamicRateLimitingParams",
+    "source": "common/dynamicconfig/constants.go:621"
+  },
+  {
+    "key": "frontend.persistenceGlobalMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:606"
+  },
+  {
+    "key": "frontend.persistenceGlobalNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:616"
+  },
+  {
+    "key": "frontend.persistenceMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "common/dynamicconfig/constants.go:601"
+  },
+  {
+    "key": "frontend.persistenceNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:611"
+  },
+  {
+    "key": "frontend.pollWaitForNamespaceRateLimitToken",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:691"
+  },
+  {
+    "key": "frontend.reachabilityQuerySetDurationSinceDefault",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:526"
+  },
+  {
+    "key": "frontend.rps",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2400",
+    "source": "common/dynamicconfig/constants.go:638"
+  },
+  {
+    "key": "frontend.rps.namespaceReplicationInducingAPIs",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:648"
+  },
+  {
+    "key": "frontend.searchAttributesNumberOfKeysLimit",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:807"
+  },
+  {
+    "key": "frontend.searchAttributesSizeOfValueLimit",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2 * 1024",
+    "source": "common/dynamicconfig/constants.go:812"
+  },
+  {
+    "key": "frontend.searchAttributesTotalSizeLimit",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "40 * 1024",
+    "source": "common/dynamicconfig/constants.go:817"
+  },
+  {
+    "key": "frontend.sendRawWorkflowHistory",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:802"
+  },
+  {
+    "key": "frontend.shutdownDrainDuration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "0 * time.Second",
+    "source": "common/dynamicconfig/constants.go:772"
+  },
+  {
+    "key": "frontend.shutdownFailHealthCheckDuration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "0 * time.Second",
+    "source": "common/dynamicconfig/constants.go:777"
+  },
+  {
+    "key": "frontend.throttledLogRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:767"
+  },
+  {
+    "key": "frontend.visibilityArchivalQueryMaxPageSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:822"
+  },
+  {
+    "key": "frontend.visibilityMaxPageSize",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:628"
+  },
+  {
+    "key": "frontend.workerVersioningDataAPIs",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1054"
+  },
+  {
+    "key": "frontend.workerVersioningRuleAPIs",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1064"
+  },
+  {
+    "key": "frontend.workerVersioningWorkflowAPIs",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1059"
+  },
+  {
+    "key": "frontend.workflowRulesAPIsEnabled",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3183"
+  },
+  {
+    "key": "history.ChasmStandbyTaskDiscardDelay",
+    "constructor": "NewChasmTaskTypeDurationSetting",
+    "scope": "ChasmTaskType",
+    "value_kind": "Duration",
+    "default_expression": "24 * time.Hour",
+    "source": "common/dynamicconfig/constants.go:1759"
+  },
+  {
+    "key": "history.EnableHistoryReplicationRateLimiter",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2720"
+  },
+  {
+    "key": "history.EnableReplicationReceiverSlowSubmissionFlowControl",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2685"
+  },
+  {
+    "key": "history.EnableReplicationTaskBatching",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2645"
+  },
+  {
+    "key": "history.EnableReplicationTaskTieredProcessing",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2650"
+  },
+  {
+    "key": "history.MaxBufferedQueryCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:2477"
+  },
+  {
+    "key": "history.ReplicationEnableDLQMetrics",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2573"
+  },
+  {
+    "key": "history.ReplicationEnableRateLimit",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2725"
+  },
+  {
+    "key": "history.ReplicationEnableRateLimitShadowMode",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2730"
+  },
+  {
+    "key": "history.ReplicationEnableUpdateWithNewTaskMerge",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2578"
+  },
+  {
+    "key": "history.ReplicationExecutableTaskErrorRetryBackoffCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "1.2",
+    "source": "common/dynamicconfig/constants.go:2765"
+  },
+  {
+    "key": "history.ReplicationExecutableTaskErrorRetryExpiration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2780"
+  },
+  {
+    "key": "history.ReplicationExecutableTaskErrorRetryMaxAttempts",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "80",
+    "source": "common/dynamicconfig/constants.go:2775"
+  },
+  {
+    "key": "history.ReplicationExecutableTaskErrorRetryMaxInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2770"
+  },
+  {
+    "key": "history.ReplicationExecutableTaskErrorRetryWait",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2760"
+  },
+  {
+    "key": "history.ReplicationLowPriorityProcessorSchedulerWorkerCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "128",
+    "source": "common/dynamicconfig/constants.go:2634"
+  },
+  {
+    "key": "history.ReplicationLowPriorityTaskParallelism",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:2639"
+  },
+  {
+    "key": "history.ReplicationMultipleBatches",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2584"
+  },
+  {
+    "key": "history.ReplicationProcessorSchedulerQueueSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "128",
+    "source": "common/dynamicconfig/constants.go:2624"
+  },
+  {
+    "key": "history.ReplicationProcessorSchedulerWorkerCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "512",
+    "source": "common/dynamicconfig/constants.go:2629"
+  },
+  {
+    "key": "history.ReplicationProgressCacheMaxSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "128000",
+    "source": "common/dynamicconfig/constants.go:2695"
+  },
+  {
+    "key": "history.ReplicationProgressCacheTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "common/dynamicconfig/constants.go:2700"
+  },
+  {
+    "key": "history.ReplicationReceiverLivenessMultiplier",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "3",
+    "source": "common/dynamicconfig/constants.go:2710"
+  },
+  {
+    "key": "history.ReplicationReceiverMaxOutstandingTaskCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "500",
+    "source": "common/dynamicconfig/constants.go:2670"
+  },
+  {
+    "key": "history.ReplicationReceiverSlowSubmissionWindow",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2680"
+  },
+  {
+    "key": "history.ReplicationReceiverSubmissionLatencyThreshold",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2675"
+  },
+  {
+    "key": "history.ReplicationResendMaxBatchCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:2690"
+  },
+  {
+    "key": "history.ReplicationStreamEventLoopRetryMaxAttempts",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2665"
+  },
+  {
+    "key": "history.ReplicationStreamSendEmptyTaskDuration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute",
+    "source": "common/dynamicconfig/constants.go:2705"
+  },
+  {
+    "key": "history.ReplicationStreamSenderErrorRetryBackoffCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "1.2",
+    "source": "common/dynamicconfig/constants.go:2740"
+  },
+  {
+    "key": "history.ReplicationStreamSenderErrorRetryExpiration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "3 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2755"
+  },
+  {
+    "key": "history.ReplicationStreamSenderErrorRetryMaxAttempts",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "80",
+    "source": "common/dynamicconfig/constants.go:2750"
+  },
+  {
+    "key": "history.ReplicationStreamSenderErrorRetryMaxInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "3 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2745"
+  },
+  {
+    "key": "history.ReplicationStreamSenderErrorRetryWait",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2735"
+  },
+  {
+    "key": "history.ReplicationStreamSenderHighPriorityQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2655"
+  },
+  {
+    "key": "history.ReplicationStreamSenderLivenessMultiplier",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:2715"
+  },
+  {
+    "key": "history.ReplicationStreamSenderLowPriorityQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2660"
+  },
+  {
+    "key": "history.ReplicationStreamSyncStatusDuration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2619"
+  },
+  {
+    "key": "history.ReplicationTaskApplyTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "20 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2498"
+  },
+  {
+    "key": "history.ReplicationTaskFetcherAggregationInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "2 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2508"
+  },
+  {
+    "key": "history.ReplicationTaskFetcherErrorRetryWait",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "common/dynamicconfig/constants.go:2518"
+  },
+  {
+    "key": "history.ReplicationTaskFetcherParallelism",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "4",
+    "source": "common/dynamicconfig/constants.go:2503"
+  },
+  {
+    "key": "history.ReplicationTaskFetcherTimerJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2513"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorCleanupInterval",
+    "constructor": "NewShardIDDurationSetting",
+    "scope": "ShardID",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2553"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorCleanupJitterCoefficient",
+    "constructor": "NewShardIDFloatSetting",
+    "scope": "ShardID",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2558"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorErrorRetryBackoffCoefficient",
+    "constructor": "NewShardIDFloatSetting",
+    "scope": "ShardID",
+    "value_kind": "Float",
+    "default_expression": "1.2",
+    "source": "common/dynamicconfig/constants.go:2528"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorErrorRetryExpiration",
+    "constructor": "NewShardIDDurationSetting",
+    "scope": "ShardID",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2543"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorErrorRetryMaxAttempts",
+    "constructor": "NewShardIDIntSetting",
+    "scope": "ShardID",
+    "value_kind": "Int",
+    "default_expression": "80",
+    "source": "common/dynamicconfig/constants.go:2538"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorErrorRetryMaxInterval",
+    "constructor": "NewShardIDDurationSetting",
+    "scope": "ShardID",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2533"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorErrorRetryWait",
+    "constructor": "NewShardIDDurationSetting",
+    "scope": "ShardID",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2523"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorHostQPS",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "1500",
+    "source": "common/dynamicconfig/constants.go:2563"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorNoTaskInitialWait",
+    "constructor": "NewShardIDDurationSetting",
+    "scope": "ShardID",
+    "value_kind": "Duration",
+    "default_expression": "2 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2548"
+  },
+  {
+    "key": "history.ReplicationTaskProcessorShardQPS",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "30",
+    "source": "common/dynamicconfig/constants.go:2568"
+  },
+  {
+    "key": "history.SkipReapplicationByNamespaceID",
+    "constructor": "NewNamespaceIDBoolSetting",
+    "scope": "NamespaceID",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2467"
+  },
+  {
+    "key": "history.TaskDLQEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2589"
+  },
+  {
+    "key": "history.TaskDLQErrorPattern",
+    "constructor": "NewGlobalStringSetting",
+    "scope": "Global",
+    "value_kind": "String",
+    "default_expression": "\"\"",
+    "source": "common/dynamicconfig/constants.go:2606"
+  },
+  {
+    "key": "history.TaskDLQInternalErrors",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2600"
+  },
+  {
+    "key": "history.TaskDLQUnexpectedErrorAttempts",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "70",
+    "source": "common/dynamicconfig/constants.go:2595"
+  },
+  {
+    "key": "history.acquireShardConcurrency",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:1693"
+  },
+  {
+    "key": "history.acquireShardInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute",
+    "source": "common/dynamicconfig/constants.go:1688"
+  },
+  {
+    "key": "history.alignMembershipChange",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "0 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1652"
+  },
+  {
+    "key": "history.allowResetWithPendingChildren",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2396"
+  },
+  {
+    "key": "history.archivalBackendMaxRPS",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "10000.0",
+    "source": "common/dynamicconfig/constants.go:2278"
+  },
+  {
+    "key": "history.archivalProcessorArchiveDelay",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2273"
+  },
+  {
+    "key": "history.archivalProcessorMaxPollHostRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2236"
+  },
+  {
+    "key": "history.archivalProcessorMaxPollInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2247"
+  },
+  {
+    "key": "history.archivalProcessorMaxPollIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2252"
+  },
+  {
+    "key": "history.archivalProcessorMaxPollRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:2231"
+  },
+  {
+    "key": "history.archivalProcessorPollBackoffInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2267"
+  },
+  {
+    "key": "history.archivalProcessorSchedulerWorkerCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "512",
+    "source": "common/dynamicconfig/constants.go:2241"
+  },
+  {
+    "key": "history.archivalProcessorUpdateAckInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2257"
+  },
+  {
+    "key": "history.archivalProcessorUpdateAckIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2262"
+  },
+  {
+    "key": "history.archivalQueueMaxReaderCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2",
+    "source": "common/dynamicconfig/constants.go:2283"
+  },
+  {
+    "key": "history.archivalTaskBatchSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2226"
+  },
+  {
+    "key": "history.cacheBackgroundEvict",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "DefaultHistoryCacheBackgroundEvictSettings",
+    "source": "common/dynamicconfig/constants.go:1623"
+  },
+  {
+    "key": "history.cacheNonUserContextLockTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "500 * time.Millisecond",
+    "source": "common/dynamicconfig/constants.go:1605"
+  },
+  {
+    "key": "history.cacheSizeBasedLimit",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1593"
+  },
+  {
+    "key": "history.cacheTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "common/dynamicconfig/constants.go:1600"
+  },
+  {
+    "key": "history.chasmMaxInMemoryPureTasks",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "32",
+    "source": "common/dynamicconfig/constants.go:2837"
+  },
+  {
+    "key": "history.clientOwnershipCachingEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1718"
+  },
+  {
+    "key": "history.clientOwnershipCachingUnusedTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1726"
+  },
+  {
+    "key": "history.defaultActivityRetryPolicy",
+    "constructor": "NewNamespaceTypedSetting",
+    "scope": "Namespace",
+    "value_kind": "Typed",
+    "default_expression": "retrypolicy.DefaultDefaultRetrySettings",
+    "source": "common/dynamicconfig/constants.go:2384"
+  },
+  {
+    "key": "history.defaultWorkflowRetryPolicy",
+    "constructor": "NewNamespaceTypedSetting",
+    "scope": "Namespace",
+    "value_kind": "Typed",
+    "default_expression": "retrypolicy.DefaultDefaultRetrySettings",
+    "source": "common/dynamicconfig/constants.go:2390"
+  },
+  {
+    "key": "history.defaultWorkflowTaskTimeout",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "primitives.DefaultWorkflowTaskTimeout",
+    "source": "common/dynamicconfig/constants.go:2462"
+  },
+  {
+    "key": "history.disableFetchRelocatableAttributesFromVisibility",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2219"
+  },
+  {
+    "key": "history.discardSpeculativeWorkflowTaskMaximumEventsCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:2447"
+  },
+  {
+    "key": "history.emitShardLagLog",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2379"
+  },
+  {
+    "key": "history.enableBestEffortDeleteTasksOnWorkflowUpdate",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1582"
+  },
+  {
+    "key": "history.enableCHASMCallbacks",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2870"
+  },
+  {
+    "key": "history.enableCHASMSchedulerCreation",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2843"
+  },
+  {
+    "key": "history.enableCHASMSchedulerMigration",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2857"
+  },
+  {
+    "key": "history.enableCHASMSchedulerRouting",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2850"
+  },
+  {
+    "key": "history.enableCHASMSchedulerSentinels",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2864"
+  },
+  {
+    "key": "history.enableChasm",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2831"
+  },
+  {
+    "key": "history.enableDeleteWorkflowExecutionReplication",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1537"
+  },
+  {
+    "key": "history.enableDropRepeatedWorkflowTaskFailures",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2452"
+  },
+  {
+    "key": "history.enableHistoryReplicationDLQV2",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1530"
+  },
+  {
+    "key": "history.enableHostLevelEventsCache",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1683"
+  },
+  {
+    "key": "history.enableParentClosePolicy",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2406"
+  },
+  {
+    "key": "history.enableReplicationStream",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1520"
+  },
+  {
+    "key": "history.enableSeparateReplicationEnableFlag",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1525"
+  },
+  {
+    "key": "history.enableTransitionHistory",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1641"
+  },
+  {
+    "key": "history.enableUpdateWithStartRetryOnClosedWorkflowAbort",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2309"
+  },
+  {
+    "key": "history.enableUpdateWithStartRetryableErrorOnClosedWorkflowAbort",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2314"
+  },
+  {
+    "key": "history.enableUpdateWorkflowModeIgnoreCurrent",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1635"
+  },
+  {
+    "key": "history.enableVersionReactivationSignals",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2902"
+  },
+  {
+    "key": "history.enableWorkflowExecutionTimeoutTimer",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1629"
+  },
+  {
+    "key": "history.enableWorkflowIdReuseStartTimeValidation",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2790"
+  },
+  {
+    "key": "history.enableWorkflowTaskStampIncrementOnFailure",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2442"
+  },
+  {
+    "key": "history.eventsCacheMaxSizeBytes",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "512 * 1024",
+    "source": "common/dynamicconfig/constants.go:1668"
+  },
+  {
+    "key": "history.eventsCacheTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "common/dynamicconfig/constants.go:1678"
+  },
+  {
+    "key": "history.eventsHostLevelCacheMaxSizeBytes",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "512 * 512 * 1024",
+    "source": "common/dynamicconfig/constants.go:1673"
+  },
+  {
+    "key": "history.externalPayloadsEnabled",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2922"
+  },
+  {
+    "key": "history.healthPersistenceErrorRatio",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.90",
+    "source": "common/dynamicconfig/constants.go:2800"
+  },
+  {
+    "key": "history.healthPersistenceLatencyFailure",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "500",
+    "source": "common/dynamicconfig/constants.go:2795"
+  },
+  {
+    "key": "history.healthRPCErrorRatio",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.90",
+    "source": "common/dynamicconfig/constants.go:2810"
+  },
+  {
+    "key": "history.healthRPCLatencyFailure",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "500",
+    "source": "common/dynamicconfig/constants.go:2805"
+  },
+  {
+    "key": "history.historyMaxAutoResetPoints",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "primitives.DefaultHistoryMaxAutoResetPoints",
+    "source": "common/dynamicconfig/constants.go:2401"
+  },
+  {
+    "key": "history.hostLevelCacheMaxSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "128000",
+    "source": "common/dynamicconfig/constants.go:1611"
+  },
+  {
+    "key": "history.hostLevelCacheMaxSizeBytes",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "256000 * 4 * 1024",
+    "source": "common/dynamicconfig/constants.go:1617"
+  },
+  {
+    "key": "history.longPollExpirationInterval",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "time.Second * 20",
+    "source": "common/dynamicconfig/constants.go:1588"
+  },
+  {
+    "key": "history.maxInFlightUpdatePayloads",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "20 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:2294"
+  },
+  {
+    "key": "history.maxInFlightUpdates",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:2289"
+  },
+  {
+    "key": "history.maxLocalParentWorkflowVerificationDuration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2613"
+  },
+  {
+    "key": "history.maxTotalUpdates",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "common/dynamicconfig/constants.go:2299"
+  },
+  {
+    "key": "history.maxTotalUpdates.suggestContinueAsNewThreshold",
+    "constructor": "NewNamespaceFloatSetting",
+    "scope": "Namespace",
+    "value_kind": "Float",
+    "default_expression": "0.9",
+    "source": "common/dynamicconfig/constants.go:2304"
+  },
+  {
+    "key": "history.maximumBufferedEventsBatch",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2340"
+  },
+  {
+    "key": "history.maximumBufferedEventsSizeInBytes",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:2345"
+  },
+  {
+    "key": "history.maximumSignalsPerExecution",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:2351"
+  },
+  {
+    "key": "history.memoryTimerProcessorSchedulerWorkerCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "64",
+    "source": "common/dynamicconfig/constants.go:1960"
+  },
+  {
+    "key": "history.mutableStateChecksumGenProbability",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2482"
+  },
+  {
+    "key": "history.mutableStateChecksumInvalidateBefore",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2492"
+  },
+  {
+    "key": "history.mutableStateChecksumVerifyProbability",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2487"
+  },
+  {
+    "key": "history.numParentClosePolicySystemWorkflows",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:2417"
+  },
+  {
+    "key": "history.outboundProcessorMaxPollHostRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2066"
+  },
+  {
+    "key": "history.outboundProcessorMaxPollInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2071"
+  },
+  {
+    "key": "history.outboundProcessorMaxPollIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2076"
+  },
+  {
+    "key": "history.outboundProcessorMaxPollRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:2061"
+  },
+  {
+    "key": "history.outboundProcessorPollBackoffInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2091"
+  },
+  {
+    "key": "history.outboundProcessorUpdateAckInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2081"
+  },
+  {
+    "key": "history.outboundProcessorUpdateAckIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2086"
+  },
+  {
+    "key": "history.outboundQueue.circuitBreakerSettings",
+    "constructor": "NewDestinationTypedSetting",
+    "scope": "Destination",
+    "value_kind": "Typed",
+    "default_expression": "CircuitBreakerSettings{}",
+    "source": "common/dynamicconfig/constants.go:2116"
+  },
+  {
+    "key": "history.outboundQueue.groupLimiter.bufferSize",
+    "constructor": "NewDestinationIntSetting",
+    "scope": "Destination",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2101"
+  },
+  {
+    "key": "history.outboundQueue.groupLimiter.concurrency",
+    "constructor": "NewDestinationIntSetting",
+    "scope": "Destination",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2106"
+  },
+  {
+    "key": "history.outboundQueue.hostScheduler.maxTaskRPS",
+    "constructor": "NewDestinationFloatSetting",
+    "scope": "Destination",
+    "value_kind": "Float",
+    "default_expression": "100.0",
+    "source": "common/dynamicconfig/constants.go:2111"
+  },
+  {
+    "key": "history.outboundQueue.standbyTaskMissingEventsDestinationDownErr",
+    "constructor": "NewDestinationBoolSetting",
+    "scope": "Destination",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2133"
+  },
+  {
+    "key": "history.outboundQueue.standbyTaskMissingEventsDiscardDelay",
+    "constructor": "NewDestinationDurationSetting",
+    "scope": "Destination",
+    "value_kind": "Duration",
+    "default_expression": "time.Duration(math.MaxInt64)",
+    "source": "common/dynamicconfig/constants.go:2126"
+  },
+  {
+    "key": "history.outboundQueueMaxPredicateSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10 * 1024",
+    "source": "common/dynamicconfig/constants.go:2051"
+  },
+  {
+    "key": "history.outboundQueueMaxReaderCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "4",
+    "source": "common/dynamicconfig/constants.go:2096"
+  },
+  {
+    "key": "history.outboundQueuePendingTaskCriticalCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "9000",
+    "source": "common/dynamicconfig/constants.go:2046"
+  },
+  {
+    "key": "history.outboundQueuePendingTasksMaxCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:2037"
+  },
+  {
+    "key": "history.outboundTaskBatchSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2032"
+  },
+  {
+    "key": "history.parentClosePolicyThreshold",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:2411"
+  },
+  {
+    "key": "history.persistenceDynamicRateLimitingParams",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "DefaultDynamicRateLimitingParams",
+    "source": "common/dynamicconfig/constants.go:1575"
+  },
+  {
+    "key": "history.persistenceGlobalMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1554"
+  },
+  {
+    "key": "history.persistenceGlobalNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1565"
+  },
+  {
+    "key": "history.persistenceMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "9000",
+    "source": "common/dynamicconfig/constants.go:1549"
+  },
+  {
+    "key": "history.persistenceNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1559"
+  },
+  {
+    "key": "history.persistencePerShardNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1570"
+  },
+  {
+    "key": "history.queueCriticalSlicesCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "50",
+    "source": "common/dynamicconfig/constants.go:1781"
+  },
+  {
+    "key": "history.queueMaxPredicateSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10 * 1024",
+    "source": "common/dynamicconfig/constants.go:1797"
+  },
+  {
+    "key": "history.queueMoveGroupTaskCountBase",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "500",
+    "source": "common/dynamicconfig/constants.go:1806"
+  },
+  {
+    "key": "history.queueMoveGroupTaskCountMultiplier",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "3.0",
+    "source": "common/dynamicconfig/constants.go:1812"
+  },
+  {
+    "key": "history.queuePendingTaskCriticalCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "9000",
+    "source": "common/dynamicconfig/constants.go:1768"
+  },
+  {
+    "key": "history.queuePendingTasksMaxCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:1787"
+  },
+  {
+    "key": "history.queueReaderStuckCriticalAttempts",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "3",
+    "source": "common/dynamicconfig/constants.go:1774"
+  },
+  {
+    "key": "history.replicatorMaxSkipTaskCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "250",
+    "source": "common/dynamicconfig/constants.go:2325"
+  },
+  {
+    "key": "history.replicatorProcessorMaxPollInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2330"
+  },
+  {
+    "key": "history.replicatorProcessorMaxPollIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2335"
+  },
+  {
+    "key": "history.replicatorTaskBatchSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2320"
+  },
+  {
+    "key": "history.retentionTimerJitterDuration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1954"
+  },
+  {
+    "key": "history.routingInfoCacheMaxSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:2916"
+  },
+  {
+    "key": "history.routingInfoCacheTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2910"
+  },
+  {
+    "key": "history.rps",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "3000",
+    "source": "common/dynamicconfig/constants.go:1544"
+  },
+  {
+    "key": "history.sendRawHistoryBetweenInternalServices",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2815"
+  },
+  {
+    "key": "history.sendRawHistoryBytesToMatchingService",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2825"
+  },
+  {
+    "key": "history.sendTransientOrSpeculativeWorkflowTaskEvents",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2457"
+  },
+  {
+    "key": "history.shardFinalizerTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "2 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1712"
+  },
+  {
+    "key": "history.shardFirstUpdateInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2361"
+  },
+  {
+    "key": "history.shardIOConcurrency",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:1732"
+  },
+  {
+    "key": "history.shardIOTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second * debug.TimeoutMultiplier",
+    "source": "common/dynamicconfig/constants.go:1737"
+  },
+  {
+    "key": "history.shardLingerOwnershipCheckQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "4",
+    "source": "common/dynamicconfig/constants.go:1698"
+  },
+  {
+    "key": "history.shardLingerTimeLimit",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1704"
+  },
+  {
+    "key": "history.shardSyncMinInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2374"
+  },
+  {
+    "key": "history.shardUpdateMinInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2356"
+  },
+  {
+    "key": "history.shardUpdateMinTasksCompleted",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:2367"
+  },
+  {
+    "key": "history.shutdownDrainDuration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "0 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1658"
+  },
+  {
+    "key": "history.standbyClusterDelay",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1742"
+  },
+  {
+    "key": "history.standbyTaskMissingEventsDiscardDelay",
+    "constructor": "NewTaskTypeDurationSetting",
+    "scope": "TaskType",
+    "value_kind": "Duration",
+    "default_expression": "15 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1753"
+  },
+  {
+    "key": "history.standbyTaskMissingEventsResendDelay",
+    "constructor": "NewTaskTypeDurationSetting",
+    "scope": "TaskType",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1747"
+  },
+  {
+    "key": "history.standbyTaskReReplicationContextTimeout",
+    "constructor": "NewNamespaceIDDurationSetting",
+    "scope": "NamespaceID",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2472"
+  },
+  {
+    "key": "history.startupMembershipJoinDelay",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "0 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1646"
+  },
+  {
+    "key": "history.taskSchedulerEnableExecutionQueueScheduler",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1864"
+  },
+  {
+    "key": "history.taskSchedulerEnableRateLimiter",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1819"
+  },
+  {
+    "key": "history.taskSchedulerEnableRateLimiterShadowMode",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1824"
+  },
+  {
+    "key": "history.taskSchedulerExecutionQueueSchedulerMaxQueues",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "500",
+    "source": "common/dynamicconfig/constants.go:1870"
+  },
+  {
+    "key": "history.taskSchedulerExecutionQueueSchedulerQueueConcurrency",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2",
+    "source": "common/dynamicconfig/constants.go:1882"
+  },
+  {
+    "key": "history.taskSchedulerExecutionQueueSchedulerQueueTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1876"
+  },
+  {
+    "key": "history.taskSchedulerGlobalMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1835"
+  },
+  {
+    "key": "history.taskSchedulerGlobalNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1847"
+  },
+  {
+    "key": "history.taskSchedulerInactiveChannelDeletionDelay",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "common/dynamicconfig/constants.go:1859"
+  },
+  {
+    "key": "history.taskSchedulerMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1841"
+  },
+  {
+    "key": "history.taskSchedulerNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1853"
+  },
+  {
+    "key": "history.taskSchedulerRateLimiterStartupDelay",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1830"
+  },
+  {
+    "key": "history.throttledLogRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "4",
+    "source": "common/dynamicconfig/constants.go:2422"
+  },
+  {
+    "key": "history.timerProcessorMaxPollHostRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1924"
+  },
+  {
+    "key": "history.timerProcessorMaxPollInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1929"
+  },
+  {
+    "key": "history.timerProcessorMaxPollIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:1934"
+  },
+  {
+    "key": "history.timerProcessorMaxPollRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:1919"
+  },
+  {
+    "key": "history.timerProcessorMaxTimeShift",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1944"
+  },
+  {
+    "key": "history.timerProcessorPollBackoffInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1939"
+  },
+  {
+    "key": "history.timerProcessorSchedulerActiveRoundRobinWeights",
+    "constructor": "NewNamespaceMapSetting",
+    "scope": "Namespace",
+    "value_kind": "Map",
+    "default_expression": "nil",
+    "source": "common/dynamicconfig/constants.go:1899"
+  },
+  {
+    "key": "history.timerProcessorSchedulerStandbyRoundRobinWeights",
+    "constructor": "NewNamespaceMapSetting",
+    "scope": "Namespace",
+    "value_kind": "Map",
+    "default_expression": "nil",
+    "source": "common/dynamicconfig/constants.go:1904"
+  },
+  {
+    "key": "history.timerProcessorSchedulerWorkerCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "512",
+    "source": "common/dynamicconfig/constants.go:1894"
+  },
+  {
+    "key": "history.timerProcessorUpdateAckInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1909"
+  },
+  {
+    "key": "history.timerProcessorUpdateAckIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:1914"
+  },
+  {
+    "key": "history.timerQueueMaxReaderCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2",
+    "source": "common/dynamicconfig/constants.go:1949"
+  },
+  {
+    "key": "history.timerTaskBatchSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:1889"
+  },
+  {
+    "key": "history.transferProcessorEnsureCloseBeforeDelete",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:2021"
+  },
+  {
+    "key": "history.transferProcessorMaxPollHostRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1976"
+  },
+  {
+    "key": "history.transferProcessorMaxPollInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1996"
+  },
+  {
+    "key": "history.transferProcessorMaxPollIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2001"
+  },
+  {
+    "key": "history.transferProcessorMaxPollRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:1971"
+  },
+  {
+    "key": "history.transferProcessorPollBackoffInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2016"
+  },
+  {
+    "key": "history.transferProcessorSchedulerActiveRoundRobinWeights",
+    "constructor": "NewNamespaceMapSetting",
+    "scope": "Namespace",
+    "value_kind": "Map",
+    "default_expression": "nil",
+    "source": "common/dynamicconfig/constants.go:1986"
+  },
+  {
+    "key": "history.transferProcessorSchedulerStandbyRoundRobinWeights",
+    "constructor": "NewNamespaceMapSetting",
+    "scope": "Namespace",
+    "value_kind": "Map",
+    "default_expression": "nil",
+    "source": "common/dynamicconfig/constants.go:1991"
+  },
+  {
+    "key": "history.transferProcessorSchedulerWorkerCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "512",
+    "source": "common/dynamicconfig/constants.go:1981"
+  },
+  {
+    "key": "history.transferProcessorUpdateAckInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2006"
+  },
+  {
+    "key": "history.transferProcessorUpdateAckIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2011"
+  },
+  {
+    "key": "history.transferQueueMaxReaderCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2",
+    "source": "common/dynamicconfig/constants.go:2026"
+  },
+  {
+    "key": "history.transferTaskBatchSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:1966"
+  },
+  {
+    "key": "history.versionMembershipCacheMaxSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:2883"
+  },
+  {
+    "key": "history.versionMembershipCacheTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2877"
+  },
+  {
+    "key": "history.versionReactivationSignalCacheMaxSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10000",
+    "source": "common/dynamicconfig/constants.go:2896"
+  },
+  {
+    "key": "history.versionReactivationSignalCacheTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2889"
+  },
+  {
+    "key": "history.visibilityProcessorEnableCloseWorkflowCleanup",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2200"
+  },
+  {
+    "key": "history.visibilityProcessorEnsureCloseBeforeDelete",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:2195"
+  },
+  {
+    "key": "history.visibilityProcessorMaxPollHostRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2150"
+  },
+  {
+    "key": "history.visibilityProcessorMaxPollInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:2170"
+  },
+  {
+    "key": "history.visibilityProcessorMaxPollIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2175"
+  },
+  {
+    "key": "history.visibilityProcessorMaxPollRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:2145"
+  },
+  {
+    "key": "history.visibilityProcessorPollBackoffInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2190"
+  },
+  {
+    "key": "history.visibilityProcessorRelocateAttributesMinBlobSize",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2207"
+  },
+  {
+    "key": "history.visibilityProcessorSchedulerActiveRoundRobinWeights",
+    "constructor": "NewNamespaceMapSetting",
+    "scope": "Namespace",
+    "value_kind": "Map",
+    "default_expression": "nil",
+    "source": "common/dynamicconfig/constants.go:2160"
+  },
+  {
+    "key": "history.visibilityProcessorSchedulerStandbyRoundRobinWeights",
+    "constructor": "NewNamespaceMapSetting",
+    "scope": "Namespace",
+    "value_kind": "Map",
+    "default_expression": "nil",
+    "source": "common/dynamicconfig/constants.go:2165"
+  },
+  {
+    "key": "history.visibilityProcessorSchedulerWorkerCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "512",
+    "source": "common/dynamicconfig/constants.go:2155"
+  },
+  {
+    "key": "history.visibilityProcessorUpdateAckInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2180"
+  },
+  {
+    "key": "history.visibilityProcessorUpdateAckIntervalJitterCoefficient",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.15",
+    "source": "common/dynamicconfig/constants.go:2185"
+  },
+  {
+    "key": "history.visibilityQueueMaxReaderCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2",
+    "source": "common/dynamicconfig/constants.go:2213"
+  },
+  {
+    "key": "history.visibilityTaskBatchSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2140"
+  },
+  {
+    "key": "history.workflowIdReuseMinimalInterval",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2785"
+  },
+  {
+    "key": "history.workflowTaskCriticalAttempt",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:2432"
+  },
+  {
+    "key": "history.workflowTaskHeartbeatTimeout",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute * 30",
+    "source": "common/dynamicconfig/constants.go:2427"
+  },
+  {
+    "key": "history.workflowTaskRetryMaxInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute * 10",
+    "source": "common/dynamicconfig/constants.go:2437"
+  },
+  {
+    "key": "history.xdcCacheMaxSizeBytes",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "8 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:1663"
+  },
+  {
+    "key": "internal-frontend.globalNamespaceRPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:736"
+  },
+  {
+    "key": "internal-frontend.globalNamespaceRPS.visibility",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:760"
+  },
+  {
+    "key": "limit.blobSize.error",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:316"
+  },
+  {
+    "key": "limit.blobSize.warn",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "512 * 1024",
+    "source": "common/dynamicconfig/constants.go:321"
+  },
+  {
+    "key": "limit.endpointDescriptionMaxSize",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "20000",
+    "source": "common/dynamicconfig/constants.go:554"
+  },
+  {
+    "key": "limit.endpointExternalURLMaxLength",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "4 * 1024",
+    "source": "common/dynamicconfig/constants.go:549"
+  },
+  {
+    "key": "limit.endpointListDefaultPageSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:559"
+  },
+  {
+    "key": "limit.endpointListMaxPageSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:564"
+  },
+  {
+    "key": "limit.endpointNameMaxLength",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "200",
+    "source": "common/dynamicconfig/constants.go:544"
+  },
+  {
+    "key": "limit.historyCount.error",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "50 * 1024",
+    "source": "common/dynamicconfig/constants.go:376"
+  },
+  {
+    "key": "limit.historyCount.suggestContinueAsNew",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "4 * 1024",
+    "source": "common/dynamicconfig/constants.go:412"
+  },
+  {
+    "key": "limit.historyCount.warn",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10 * 1024",
+    "source": "common/dynamicconfig/constants.go:381"
+  },
+  {
+    "key": "limit.historyMaxPageSize",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "primitives.GetHistoryMaxPageSize",
+    "source": "common/dynamicconfig/constants.go:418"
+  },
+  {
+    "key": "limit.historySize.error",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "50 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:360"
+  },
+  {
+    "key": "limit.historySize.suggestContinueAsNew",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "4 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:370"
+  },
+  {
+    "key": "limit.historySize.warn",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:365"
+  },
+  {
+    "key": "limit.maxIDLength",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:423"
+  },
+  {
+    "key": "limit.memoSize.error",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:326"
+  },
+  {
+    "key": "limit.memoSize.warn",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2 * 1024",
+    "source": "common/dynamicconfig/constants.go:331"
+  },
+  {
+    "key": "limit.mutableStateActivityFailureSize.error",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "4 * 1024",
+    "source": "common/dynamicconfig/constants.go:386"
+  },
+  {
+    "key": "limit.mutableStateActivityFailureSize.warn",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2 * 1024",
+    "source": "common/dynamicconfig/constants.go:392"
+  },
+  {
+    "key": "limit.mutableStateSize.error",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "8 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:397"
+  },
+  {
+    "key": "limit.mutableStateSize.warn",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:402"
+  },
+  {
+    "key": "limit.mutableStateTombstoneCountLimit",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "16",
+    "source": "common/dynamicconfig/constants.go:407"
+  },
+  {
+    "key": "limit.numPendingActivities.error",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "common/dynamicconfig/constants.go:342"
+  },
+  {
+    "key": "limit.numPendingCancelRequests.error",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "common/dynamicconfig/constants.go:354"
+  },
+  {
+    "key": "limit.numPendingChildExecutions.error",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "common/dynamicconfig/constants.go:336"
+  },
+  {
+    "key": "limit.numPendingSignals.error",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "common/dynamicconfig/constants.go:348"
+  },
+  {
+    "key": "limit.reachabilityQueryBuildIds",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "5",
+    "source": "common/dynamicconfig/constants.go:510"
+  },
+  {
+    "key": "limit.reachabilityTaskQueueScan",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:504"
+  },
+  {
+    "key": "limit.taskQueuesPerBuildId",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:538"
+  },
+  {
+    "key": "limit.userMetadataDetailsSize",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "20000",
+    "source": "common/dynamicconfig/constants.go:3171"
+  },
+  {
+    "key": "limit.userMetadataSummarySize",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "400",
+    "source": "common/dynamicconfig/constants.go:3166"
+  },
+  {
+    "key": "limit.versionBuildIdLimitPerQueue",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:444"
+  },
+  {
+    "key": "limit.versionCompatibleSetLimitPerQueue",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:437"
+  },
+  {
+    "key": "limit.workerBuildIdSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "255",
+    "source": "common/dynamicconfig/constants.go:429"
+  },
+  {
+    "key": "limit.wv.AssignmentRuleLimitPerQueue",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:451"
+  },
+  {
+    "key": "limit.wv.RedirectRuleLimitPerQueue",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "500",
+    "source": "common/dynamicconfig/constants.go:458"
+  },
+  {
+    "key": "limit.wv.RedirectRuleMaxUpstreamBuildIDsPerQueue",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "50",
+    "source": "common/dynamicconfig/constants.go:465"
+  },
+  {
+    "key": "matching.PollerHistoryTTL",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:478"
+  },
+  {
+    "key": "matching.TaskQueueInfoByBuildIdTTL",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1360"
+  },
+  {
+    "key": "matching.alignMembershipChange",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "0 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1276"
+  },
+  {
+    "key": "matching.autoEnableV2",
+    "constructor": "NewTaskQueueBoolSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1470"
+  },
+  {
+    "key": "matching.backlogMetricsEmitInterval",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute",
+    "source": "common/dynamicconfig/constants.go:1303"
+  },
+  {
+    "key": "matching.backlogNegligibleAge",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1313"
+  },
+  {
+    "key": "matching.backlogTaskForwardTimeout",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "60 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1436"
+  },
+  {
+    "key": "matching.deploymentWorkflowVersion",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2",
+    "source": "common/dynamicconfig/constants.go:1365"
+  },
+  {
+    "key": "matching.emitTaskDispatchLatencyAtPoll",
+    "constructor": "NewTaskQueueBoolSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1332"
+  },
+  {
+    "key": "matching.enableFairness",
+    "constructor": "NewTaskQueueTypedSettingWithConverter",
+    "scope": "TaskQueue",
+    "value_kind": "Typed",
+    "default_expression": "StaticGradualChange(false)",
+    "source": "common/dynamicconfig/constants.go:1420"
+  },
+  {
+    "key": "matching.enableMigration",
+    "constructor": "NewTaskQueueBoolSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1426"
+  },
+  {
+    "key": "matching.enablePollerAutoscalingMetrics",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1463"
+  },
+  {
+    "key": "matching.enableWorkerPluginMetrics",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:1456"
+  },
+  {
+    "key": "matching.ephemeralDataUpdateInterval",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1297"
+  },
+  {
+    "key": "matching.fairnessCounter",
+    "constructor": "NewTaskQueueTypedSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Typed",
+    "default_expression": "counter.DefaultCounterParams",
+    "source": "common/dynamicconfig/constants.go:1441"
+  },
+  {
+    "key": "matching.fairnessKeyRateLimitCacheSize",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "common/dynamicconfig/constants.go:1446"
+  },
+  {
+    "key": "matching.forwarderMaxChildrenPerNode",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:1271"
+  },
+  {
+    "key": "matching.forwarderMaxOutstandingPolls",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:1256"
+  },
+  {
+    "key": "matching.forwarderMaxOutstandingTasks",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:1261"
+  },
+  {
+    "key": "matching.forwarderMaxRatePerSecond",
+    "constructor": "NewTaskQueueFloatSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Float",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:1266"
+  },
+  {
+    "key": "matching.getTasksBatchSize",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:1148"
+  },
+  {
+    "key": "matching.getTasksReloadAt",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:1153"
+  },
+  {
+    "key": "matching.getUserDataLongPollTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5*time.Minute - 10*time.Second",
+    "source": "common/dynamicconfig/constants.go:1287"
+  },
+  {
+    "key": "matching.getUserDataRefresh",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1292"
+  },
+  {
+    "key": "matching.historyMaxPageSize",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "primitives.GetHistoryMaxPageSize",
+    "source": "common/dynamicconfig/constants.go:1169"
+  },
+  {
+    "key": "matching.listNexusEndpointsLongPollTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5*time.Minute - 10*time.Second",
+    "source": "common/dynamicconfig/constants.go:1338"
+  },
+  {
+    "key": "matching.longPollExpirationInterval",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute",
+    "source": "common/dynamicconfig/constants.go:1158"
+  },
+  {
+    "key": "matching.maxDeployments",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:1375"
+  },
+  {
+    "key": "matching.maxFairnessKeyWeightOverrides",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:1451"
+  },
+  {
+    "key": "matching.maxTaskBatchSize",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:1202"
+  },
+  {
+    "key": "matching.maxTaskDeleteBatchSize",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:1207"
+  },
+  {
+    "key": "matching.maxTaskQueueIdleTime",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1191"
+  },
+  {
+    "key": "matching.maxTaskQueuesInDeployment",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:1370"
+  },
+  {
+    "key": "matching.maxTaskQueuesInDeploymentVersion",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:1391"
+  },
+  {
+    "key": "matching.maxVersionsInDeployment",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:1380"
+  },
+  {
+    "key": "matching.maxVersionsInTaskQueue",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "200",
+    "source": "common/dynamicconfig/constants.go:1385"
+  },
+  {
+    "key": "matching.maxWaitForPollerBeforeFwd",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "200 * time.Millisecond",
+    "source": "common/dynamicconfig/constants.go:1321"
+  },
+  {
+    "key": "matching.membershipUnloadDelay",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "500 * time.Millisecond",
+    "source": "common/dynamicconfig/constants.go:1348"
+  },
+  {
+    "key": "matching.minTaskThrottlingBurstSize",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:1143"
+  },
+  {
+    "key": "matching.nexusEndpointsRefreshInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1343"
+  },
+  {
+    "key": "matching.numTaskqueueReadPartitions",
+    "constructor": "NewTaskQueueIntSettingWithConstrainedDefault",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "defaultNumTaskQueuePartitions",
+    "source": "common/dynamicconfig/constants.go:1227"
+  },
+  {
+    "key": "matching.numTaskqueueWritePartitions",
+    "constructor": "NewTaskQueueIntSettingWithConstrainedDefault",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "defaultNumTaskQueuePartitions",
+    "source": "common/dynamicconfig/constants.go:1222"
+  },
+  {
+    "key": "matching.outstandingTaskAppendsThreshold",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "250",
+    "source": "common/dynamicconfig/constants.go:1197"
+  },
+  {
+    "key": "matching.persistenceDynamicRateLimitingParams",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "DefaultDynamicRateLimitingParams",
+    "source": "common/dynamicconfig/constants.go:1136"
+  },
+  {
+    "key": "matching.persistenceGlobalMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1121"
+  },
+  {
+    "key": "matching.persistenceGlobalNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1131"
+  },
+  {
+    "key": "matching.persistenceMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "3000",
+    "source": "common/dynamicconfig/constants.go:1116"
+  },
+  {
+    "key": "matching.persistenceNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:1126"
+  },
+  {
+    "key": "matching.pollerScalingDecisionsPerSecond",
+    "constructor": "NewTaskQueueFloatSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Float",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:1408"
+  },
+  {
+    "key": "matching.pollerScalingMinimumBacklog",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "200 * time.Millisecond",
+    "source": "common/dynamicconfig/constants.go:1396"
+  },
+  {
+    "key": "matching.pollerScalingWaitTime",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1402"
+  },
+  {
+    "key": "matching.priorityBacklogForwarding",
+    "constructor": "NewTaskQueueBoolSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1308"
+  },
+  {
+    "key": "matching.priorityLevels",
+    "constructor": "NewTaskQueueIntSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Int",
+    "default_expression": "5",
+    "source": "common/dynamicconfig/constants.go:1431"
+  },
+  {
+    "key": "matching.queryPollerUnavailableWindow",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "20 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1327"
+  },
+  {
+    "key": "matching.queryWorkflowTaskTimeoutLogRate",
+    "constructor": "NewTaskQueueFloatSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Float",
+    "default_expression": "0.0",
+    "source": "common/dynamicconfig/constants.go:1354"
+  },
+  {
+    "key": "matching.rps",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1200",
+    "source": "common/dynamicconfig/constants.go:1111"
+  },
+  {
+    "key": "matching.shutdownDrainDuration",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "0 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1282"
+  },
+  {
+    "key": "matching.spreadRoutingBatchSize",
+    "constructor": "NewGlobalTypedSettingWithConverter",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "StaticGradualChange[int](0)",
+    "source": "common/dynamicconfig/constants.go:1509"
+  },
+  {
+    "key": "matching.syncMatchWaitDuration",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "200 * time.Millisecond",
+    "source": "common/dynamicconfig/constants.go:1164"
+  },
+  {
+    "key": "matching.taskDeleteInterval",
+    "constructor": "NewTaskQueueDurationSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "15 * time.Second",
+    "source": "common/dynamicconfig/constants.go:1212"
+  },
+  {
+    "key": "matching.throttledLogRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:1217"
+  },
+  {
+    "key": "matching.updateAckInterval",
+    "constructor": "NewTaskQueueDurationSettingWithConstrainedDefault",
+    "scope": "TaskQueue",
+    "value_kind": "Duration",
+    "default_expression": "[]TypedConstrainedValue[time.Duration]{\n\n\t{\n\t\tConstraints: Constraints{\n\t\t\tTaskQueueName: primitives.PerNSWorkerTaskQueue,\n\t\t},\n\t\tValue: 5 * time.Minute,\n\t},\n\n\t{\n\t\tValue: 1 * time.Minute,\n\t},\n}",
+    "source": "common/dynamicconfig/constants.go:1174"
+  },
+  {
+    "key": "matching.useNewMatcher",
+    "constructor": "NewTaskQueueTypedSettingWithConverter",
+    "scope": "TaskQueue",
+    "value_kind": "Typed",
+    "default_expression": "StaticGradualChange(true)",
+    "source": "common/dynamicconfig/constants.go:1414"
+  },
+  {
+    "key": "matching.workerRegistryEntryTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1483"
+  },
+  {
+    "key": "matching.workerRegistryEvictionInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1503"
+  },
+  {
+    "key": "matching.workerRegistryMaxEntries",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1_000_000",
+    "source": "common/dynamicconfig/constants.go:1497"
+  },
+  {
+    "key": "matching.workerRegistryMinEvictAge",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:1490"
+  },
+  {
+    "key": "matching.workerRegistryNumBuckets",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:1477"
+  },
+  {
+    "key": "matching.wv.DeletedRuleRetentionTime",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "14 * 24 * time.Hour",
+    "source": "common/dynamicconfig/constants.go:472"
+  },
+  {
+    "key": "matching.wv.ReachabilityBuildIdVisibilityGracePeriod",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "3 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:484"
+  },
+  {
+    "key": "matching.wv.VersionDrainageStatusRefreshInterval",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "3 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:498"
+  },
+  {
+    "key": "matching.wv.VersionDrainageStatusVisibilityGracePeriod",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "3 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:492"
+  },
+  {
+    "key": "matching.wv.reachabilityCacheClosedWFsTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:521"
+  },
+  {
+    "key": "matching.wv.reachabilityCacheOpenWFsTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute",
+    "source": "common/dynamicconfig/constants.go:516"
+  },
+  {
+    "key": "metrics.breakdownByBuildID",
+    "constructor": "NewTaskQueueBoolSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1247"
+  },
+  {
+    "key": "metrics.breakdownByPartition",
+    "constructor": "NewTaskQueueBoolSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1239"
+  },
+  {
+    "key": "metrics.breakdownByTaskQueue",
+    "constructor": "NewTaskQueueBoolSetting",
+    "scope": "TaskQueue",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:1232"
+  },
+  {
+    "key": "nexusoperation.callback.endpoint.template",
+    "constructor": "NewGlobalStringSetting",
+    "scope": "Global",
+    "value_kind": "String",
+    "default_expression": "\"unset\"",
+    "source": "chasm/lib/nexusoperation/config.go:110"
+  },
+  {
+    "key": "nexusoperation.disallowedHeaders",
+    "constructor": "NewGlobalTypedSettingWithConverter",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "[]string{\n\t\"request-timeout\",\n\tinterceptor.DCRedirectionApiHeaderName,\n\tinterceptor.DCRedirectionContextHeaderName,\n\theaders.CallerNameHeaderName,\n\theaders.CallerTypeHeaderName,\n\theaders.CallOriginHeaderName,\n}",
+    "source": "chasm/lib/nexusoperation/config.go:79"
+  },
+  {
+    "key": "nexusoperation.enableChasm",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "chasm/lib/nexusoperation/config.go:13"
+  },
+  {
+    "key": "nexusoperation.limit.dispatch.task.timeout.min",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "chasm/lib/nexusoperation/config.go:33"
+  },
+  {
+    "key": "nexusoperation.limit.header.size",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "8192",
+    "source": "chasm/lib/nexusoperation/config.go:71"
+  },
+  {
+    "key": "nexusoperation.limit.operation.concurrency",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "chasm/lib/nexusoperation/config.go:41"
+  },
+  {
+    "key": "nexusoperation.limit.operation.name.length",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "chasm/lib/nexusoperation/config.go:55"
+  },
+  {
+    "key": "nexusoperation.limit.operation.token.length",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "4096",
+    "source": "chasm/lib/nexusoperation/config.go:62"
+  },
+  {
+    "key": "nexusoperation.limit.request.timeout.min",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "time.Millisecond * 1500",
+    "source": "chasm/lib/nexusoperation/config.go:26"
+  },
+  {
+    "key": "nexusoperation.limit.scheduleToCloseTimeout",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "0",
+    "source": "chasm/lib/nexusoperation/config.go:103"
+  },
+  {
+    "key": "nexusoperation.limit.service.name.length",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "chasm/lib/nexusoperation/config.go:48"
+  },
+  {
+    "key": "nexusoperation.metrics.tags",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "NexusMetricTagConfig{}",
+    "source": "chasm/lib/nexusoperation/config.go:131"
+  },
+  {
+    "key": "nexusoperation.request.timeout",
+    "constructor": "NewDestinationDurationSetting",
+    "scope": "Destination",
+    "value_kind": "Duration",
+    "default_expression": "time.Second * 10",
+    "source": "chasm/lib/nexusoperation/config.go:20"
+  },
+  {
+    "key": "nexusoperation.retryPolicy.initialInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "chasm/lib/nexusoperation/config.go:119"
+  },
+  {
+    "key": "nexusoperation.retryPolicy.maxInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "chasm/lib/nexusoperation/config.go:125"
+  },
+  {
+    "key": "nexusoperation.useNewFailureWireFormat",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "chasm/lib/nexusoperation/config.go:144"
+  },
+  {
+    "key": "rpc.slowRequestLoggingThreshold",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:3195"
+  },
+  {
+    "key": "scheduler.retryPolicy.initialInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "chasm/lib/scheduler/config.go:35"
+  },
+  {
+    "key": "scheduler.retryPolicy.maxInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute",
+    "source": "chasm/lib/scheduler/config.go:41"
+  },
+  {
+    "key": "scheduler.serviceCallTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "2 * time.Second",
+    "source": "chasm/lib/scheduler/config.go:47"
+  },
+  {
+    "key": "scheduler.tweakables",
+    "constructor": "NewNamespaceTypedSetting",
+    "scope": "Namespace",
+    "value_kind": "Typed",
+    "default_expression": "DefaultTweakables",
+    "source": "chasm/lib/scheduler/config.go:30"
+  },
+  {
+    "key": "system.clusterMetadataRefreshInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Minute",
+    "source": "common/dynamicconfig/constants.go:153"
+  },
+  {
+    "key": "system.deadlock.AbortProcess",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:291"
+  },
+  {
+    "key": "system.deadlock.DumpGoroutines",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:281"
+  },
+  {
+    "key": "system.deadlock.FailHealthCheck",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:286"
+  },
+  {
+    "key": "system.deadlock.Interval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "60 * time.Second",
+    "source": "common/dynamicconfig/constants.go:296"
+  },
+  {
+    "key": "system.deadlock.MaxWorkersPerRoot",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:301"
+  },
+  {
+    "key": "system.disallowQuery",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:143"
+  },
+  {
+    "key": "system.enableActivityEagerExecution",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:193"
+  },
+  {
+    "key": "system.enableActivityRetryStampIncrement",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:208"
+  },
+  {
+    "key": "system.enableCrossNamespaceCommands",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:148"
+  },
+  {
+    "key": "system.enableDataLossMetrics",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:273"
+  },
+  {
+    "key": "system.enableDeploymentVersions",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:914"
+  },
+  {
+    "key": "system.enableDeployments",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:907"
+  },
+  {
+    "key": "system.enableEagerWorkflowStart",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:213"
+  },
+  {
+    "key": "system.enableInternodeClientKeepAlive",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:261"
+  },
+  {
+    "key": "system.enableInternodeServerKeepAlive",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:256"
+  },
+  {
+    "key": "system.enableNamespaceHandoverWait",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:133"
+  },
+  {
+    "key": "system.enableNamespaceNotActiveAutoForwarding",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:122"
+  },
+  {
+    "key": "system.enableParentClosePolicyWorker",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:183"
+  },
+  {
+    "key": "system.enableReadFromHistoryArchival",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:107"
+  },
+  {
+    "key": "system.enableReadFromSecondaryVisibility",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:59"
+  },
+  {
+    "key": "system.enableReadFromVisibilityArchival",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:117"
+  },
+  {
+    "key": "system.enableRingpopTLS",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:165"
+  },
+  {
+    "key": "system.enableSendTargetVersionChanged",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:931"
+  },
+  {
+    "key": "system.enableStickyQuery",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:188"
+  },
+  {
+    "key": "system.enableSuggestCaNOnNewTargetVersion",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:926"
+  },
+  {
+    "key": "system.forceNamespaceSelectedAPIAutoForwarding",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:128"
+  },
+  {
+    "key": "system.forceSearchAttributesCacheRefreshOnRead",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:158"
+  },
+  {
+    "key": "system.historyArchivalState",
+    "constructor": "NewGlobalStringSetting",
+    "scope": "Global",
+    "value_kind": "String",
+    "default_expression": "\"\"",
+    "source": "common/dynamicconfig/constants.go:102"
+  },
+  {
+    "key": "system.historyHealthSignalMetricsEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:229"
+  },
+  {
+    "key": "system.logAllReqErrors",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3177"
+  },
+  {
+    "key": "system.maxCHASMCallbacksPerWorkflow",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "2000",
+    "source": "common/dynamicconfig/constants.go:1005"
+  },
+  {
+    "key": "system.maxCallbacksPerWorkflow",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "32",
+    "source": "common/dynamicconfig/constants.go:998"
+  },
+  {
+    "key": "system.namespaceCacheRefreshInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "2 * time.Second",
+    "source": "common/dynamicconfig/constants.go:219"
+  },
+  {
+    "key": "system.namespaceMinRetentionGlobal",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "24 * time.Hour",
+    "source": "common/dynamicconfig/constants.go:198"
+  },
+  {
+    "key": "system.namespaceMinRetentionLocal",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "common/dynamicconfig/constants.go:203"
+  },
+  {
+    "key": "system.nexusHTTPTraceConfig",
+    "constructor": "NewGlobalTypedSettingWithConverter",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "defaultHTTPClientTraceConfig",
+    "source": "common/nexus/trace.go:25"
+  },
+  {
+    "key": "system.nexusReadThroughCacheSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:952"
+  },
+  {
+    "key": "system.nexusReadThroughCacheTTL",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:958"
+  },
+  {
+    "key": "system.numConsecutiveWorkflowTaskProblemsToTriggerSearchAttribute",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "5",
+    "source": "common/dynamicconfig/constants.go:307"
+  },
+  {
+    "key": "system.operatorRPSRatio",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "0.2",
+    "source": "common/dynamicconfig/constants.go:249"
+  },
+  {
+    "key": "system.persistenceHealthSignalAggregationEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:234"
+  },
+  {
+    "key": "system.persistenceHealthSignalBufferSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "5000",
+    "source": "common/dynamicconfig/constants.go:244"
+  },
+  {
+    "key": "system.persistenceHealthSignalMetricsEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:224"
+  },
+  {
+    "key": "system.persistenceHealthSignalWindowSize",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "10 * time.Second",
+    "source": "common/dynamicconfig/constants.go:239"
+  },
+  {
+    "key": "system.persistenceQPSBurstRatio",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "1.0",
+    "source": "common/dynamicconfig/constants.go:267"
+  },
+  {
+    "key": "system.refreshNexusEndpointsLongPollTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Minute",
+    "source": "common/dynamicconfig/constants.go:942"
+  },
+  {
+    "key": "system.refreshNexusEndpointsMinWait",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:947"
+  },
+  {
+    "key": "system.ringpopApproximateMaxPropagationTime",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "3 * time.Second",
+    "source": "common/dynamicconfig/constants.go:171"
+  },
+  {
+    "key": "system.ringpopReplicaPoints",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:177"
+  },
+  {
+    "key": "system.secondaryVisibilityWritingMode",
+    "constructor": "NewGlobalStringSetting",
+    "scope": "Global",
+    "value_kind": "String",
+    "default_expression": "\"off\"",
+    "source": "common/dynamicconfig/constants.go:69"
+  },
+  {
+    "key": "system.suppressErrorSetSystemSearchAttribute",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:89"
+  },
+  {
+    "key": "system.transactionSizeLimit",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "primitives.DefaultTransactionSizeLimit",
+    "source": "common/dynamicconfig/constants.go:138"
+  },
+  {
+    "key": "system.useRevisionNumberForWorkerVersioning",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:921"
+  },
+  {
+    "key": "system.visibilityAllowList",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:84"
+  },
+  {
+    "key": "system.visibilityArchivalState",
+    "constructor": "NewGlobalStringSetting",
+    "scope": "Global",
+    "value_kind": "String",
+    "default_expression": "\"\"",
+    "source": "common/dynamicconfig/constants.go:112"
+  },
+  {
+    "key": "system.visibilityDisableOrderByClause",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:74"
+  },
+  {
+    "key": "system.visibilityEnableManualPagination",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:79"
+  },
+  {
+    "key": "system.visibilityEnableShadowReadMode",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:64"
+  },
+  {
+    "key": "system.visibilityEnableUnifiedQueryConverter",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:95"
+  },
+  {
+    "key": "system.visibilityPersistenceMaxReadQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "9000",
+    "source": "common/dynamicconfig/constants.go:44"
+  },
+  {
+    "key": "system.visibilityPersistenceMaxWriteQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "9000",
+    "source": "common/dynamicconfig/constants.go:49"
+  },
+  {
+    "key": "system.visibilityPersistenceSlowQueryThreshold",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Second",
+    "source": "common/dynamicconfig/constants.go:54"
+  },
+  {
+    "key": "worker.ESProcessorAckTimeout",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "30 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2982"
+  },
+  {
+    "key": "worker.ESProcessorBulkActions",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "500",
+    "source": "common/dynamicconfig/constants.go:2967"
+  },
+  {
+    "key": "worker.ESProcessorBulkSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "16 * 1024 * 1024",
+    "source": "common/dynamicconfig/constants.go:2972"
+  },
+  {
+    "key": "worker.ESProcessorFlushInterval",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "1 * time.Second",
+    "source": "common/dynamicconfig/constants.go:2977"
+  },
+  {
+    "key": "worker.ESProcessorNumOfWorkers",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "2",
+    "source": "common/dynamicconfig/constants.go:2962"
+  },
+  {
+    "key": "worker.ParentCloseMaxConcurrentActivityExecutionSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:3090"
+  },
+  {
+    "key": "worker.ParentCloseMaxConcurrentActivityTaskPollers",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "4",
+    "source": "common/dynamicconfig/constants.go:3100"
+  },
+  {
+    "key": "worker.ParentCloseMaxConcurrentWorkflowTaskExecutionSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1000",
+    "source": "common/dynamicconfig/constants.go:3095"
+  },
+  {
+    "key": "worker.ParentCloseMaxConcurrentWorkflowTaskPollers",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "4",
+    "source": "common/dynamicconfig/constants.go:3105"
+  },
+  {
+    "key": "worker.ScannerMaxConcurrentActivityExecutionSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:2993"
+  },
+  {
+    "key": "worker.ScannerMaxConcurrentActivityTaskPollers",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "8",
+    "source": "common/dynamicconfig/constants.go:3003"
+  },
+  {
+    "key": "worker.ScannerMaxConcurrentWorkflowTaskExecutionSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:2998"
+  },
+  {
+    "key": "worker.ScannerMaxConcurrentWorkflowTaskPollers",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "8",
+    "source": "common/dynamicconfig/constants.go:3008"
+  },
+  {
+    "key": "worker.batcherConcurrency",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "5",
+    "source": "common/dynamicconfig/constants.go:3085"
+  },
+  {
+    "key": "worker.batcherRPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "50",
+    "source": "common/dynamicconfig/constants.go:3080"
+  },
+  {
+    "key": "worker.buildIdScavengerEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3048"
+  },
+  {
+    "key": "worker.buildIdScavengerVisibilityRPS",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "1.0",
+    "source": "common/dynamicconfig/constants.go:581"
+  },
+  {
+    "key": "worker.deleteNamespaceActivityLimitsConfig",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "sdkworker.Options{}",
+    "source": "common/dynamicconfig/constants.go:3147"
+  },
+  {
+    "key": "worker.enableHistoryRateLimiter",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3161"
+  },
+  {
+    "key": "worker.enableNamespaceBatcher",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3075"
+  },
+  {
+    "key": "worker.enableScheduler",
+    "constructor": "NewNamespaceBoolSetting",
+    "scope": "Namespace",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3125"
+  },
+  {
+    "key": "worker.executionDataDurationBuffer",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour * 24 * 90",
+    "source": "common/dynamicconfig/constants.go:3028"
+  },
+  {
+    "key": "worker.executionEnableHistoryEventIdValidator",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3038"
+  },
+  {
+    "key": "worker.executionScannerPerHostQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "10",
+    "source": "common/dynamicconfig/constants.go:3018"
+  },
+  {
+    "key": "worker.executionScannerPerShardQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:3023"
+  },
+  {
+    "key": "worker.executionScannerWorkerCount",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "8",
+    "source": "common/dynamicconfig/constants.go:3033"
+  },
+  {
+    "key": "worker.executionsScannerEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3058"
+  },
+  {
+    "key": "worker.generateMigrationTaskViaFrontend",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "false",
+    "source": "common/dynamicconfig/constants.go:3156"
+  },
+  {
+    "key": "worker.historyScannerDataMinAge",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "60 * 24 * time.Hour",
+    "source": "common/dynamicconfig/constants.go:3064"
+  },
+  {
+    "key": "worker.historyScannerEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3053"
+  },
+  {
+    "key": "worker.historyScannerVerifyRetention",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3069"
+  },
+  {
+    "key": "worker.indexerConcurrency",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:2957"
+  },
+  {
+    "key": "worker.perNamespaceWorkerCount",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "1",
+    "source": "common/dynamicconfig/constants.go:3110"
+  },
+  {
+    "key": "worker.perNamespaceWorkerOptions",
+    "constructor": "NewNamespaceTypedSetting",
+    "scope": "Namespace",
+    "value_kind": "Typed",
+    "default_expression": "sdkworker.Options{}",
+    "source": "common/dynamicconfig/constants.go:3115"
+  },
+  {
+    "key": "worker.perNamespaceWorkerStartRate",
+    "constructor": "NewGlobalFloatSetting",
+    "scope": "Global",
+    "value_kind": "Float",
+    "default_expression": "10.0",
+    "source": "common/dynamicconfig/constants.go:3120"
+  },
+  {
+    "key": "worker.persistenceDynamicRateLimitingParams",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "DefaultDynamicRateLimitingParams",
+    "source": "common/dynamicconfig/constants.go:2950"
+  },
+  {
+    "key": "worker.persistenceGlobalMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2935"
+  },
+  {
+    "key": "worker.persistenceGlobalNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2945"
+  },
+  {
+    "key": "worker.persistenceMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "500",
+    "source": "common/dynamicconfig/constants.go:2930"
+  },
+  {
+    "key": "worker.persistenceNamespaceMaxQPS",
+    "constructor": "NewNamespaceIntSetting",
+    "scope": "Namespace",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:2940"
+  },
+  {
+    "key": "worker.protectedNamespaces",
+    "constructor": "NewGlobalTypedSetting",
+    "scope": "Global",
+    "value_kind": "Typed",
+    "default_expression": "([]string)(nil)",
+    "source": "common/dynamicconfig/constants.go:1103"
+  },
+  {
+    "key": "worker.removableBuildIdDurationSinceDefault",
+    "constructor": "NewGlobalDurationSetting",
+    "scope": "Global",
+    "value_kind": "Duration",
+    "default_expression": "time.Hour",
+    "source": "common/dynamicconfig/constants.go:570"
+  },
+  {
+    "key": "worker.scannerPersistenceMaxQPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "100",
+    "source": "common/dynamicconfig/constants.go:3013"
+  },
+  {
+    "key": "worker.schedulerLocalActivitySleepLimit",
+    "constructor": "NewNamespaceDurationSetting",
+    "scope": "Namespace",
+    "value_kind": "Duration",
+    "default_expression": "5 * time.Second",
+    "source": "common/dynamicconfig/constants.go:3141"
+  },
+  {
+    "key": "worker.schedulerNamespaceStartWorkflowRPS",
+    "constructor": "NewNamespaceFloatSetting",
+    "scope": "Namespace",
+    "value_kind": "Float",
+    "default_expression": "30.0",
+    "source": "common/dynamicconfig/constants.go:3136"
+  },
+  {
+    "key": "worker.stickyCacheSize",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "0",
+    "source": "common/dynamicconfig/constants.go:3130"
+  },
+  {
+    "key": "worker.taskQueueScannerEnabled",
+    "constructor": "NewGlobalBoolSetting",
+    "scope": "Global",
+    "value_kind": "Bool",
+    "default_expression": "true",
+    "source": "common/dynamicconfig/constants.go:3043"
+  },
+  {
+    "key": "worker.throttledLogRPS",
+    "constructor": "NewGlobalIntSetting",
+    "scope": "Global",
+    "value_kind": "Int",
+    "default_expression": "20",
+    "source": "common/dynamicconfig/constants.go:2988"
+  }
+]

@@ -153,6 +153,32 @@ fn feature_to_proto(feature: &FeatureEntry) -> proto::FeatureEntry {
         rpcs: feature.rpcs.iter().map(|rpc| (*rpc).to_string()).collect(),
         notes: feature.notes.to_string(),
         evidence: feature.evidence.iter().map(evidence_to_proto).collect(),
+        origin: feature.catalog.origin.label().to_string(),
+        conformance_disposition: feature.catalog.conformance.label().to_string(),
+        temporal_maturity: feature.catalog.temporal_maturity.label().to_string(),
+        temporal_default: feature.catalog.temporal_default.label().to_string(),
+        tokeira_default: feature.catalog.tokeira_default.label().to_string(),
+        enablement_kind: feature.catalog.enablement.kind.label().to_string(),
+        enablement_reference: feature
+            .catalog
+            .enablement
+            .reference
+            .unwrap_or_default()
+            .to_string(),
+        policy_scopes: feature
+            .catalog
+            .scopes
+            .iter()
+            .map(|scope| scope.label().to_string())
+            .collect(),
+        policy_mutability: feature.catalog.mutability.label().to_string(),
+        guidance: feature.catalog.guidance.to_string(),
+        prerequisites: feature
+            .catalog
+            .prerequisites
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
         ..Default::default()
     }
 }
@@ -292,6 +318,19 @@ mod tests {
         assert_eq!(response.sdk_matrix.len(), SDK_MATRIX.len());
         assert_eq!(response.feature_matrix_digest, feature_matrix_digest());
         assert_eq!(response.sdk_matrix_digest, sdk_matrix_digest());
+        let standalone = response
+            .features
+            .iter()
+            .find(|feature| feature.id == "activity-executions")
+            .expect("standalone activity feature");
+        assert_eq!(standalone.origin, "temporal-v1.31.0");
+        assert_eq!(standalone.temporal_default, "disabled");
+        assert_eq!(standalone.tokeira_default, "disabled");
+        assert_eq!(standalone.enablement_kind, "toml");
+        assert_eq!(
+            standalone.enablement_reference,
+            "policy.compatibility.enable_standalone_activities = true"
+        );
     }
 
     #[test]
@@ -307,6 +346,8 @@ mod tests {
         let feature = response.feature.as_option().expect("feature");
 
         assert_eq!(feature.id, "workflow-start");
+        assert_eq!(feature.conformance_disposition, "in-surface");
+        assert!(!feature.guidance.is_empty());
         assert!(handler.feature_response("missing").is_none());
     }
 

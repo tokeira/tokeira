@@ -5,6 +5,7 @@
 //! no I/O and no runtime dependency on the edge or kernel crates, which keeps
 //! compatibility policy reusable across binaries and low-level crates.
 
+pub mod configuration;
 pub mod coverage;
 pub mod digest;
 pub mod dispatch;
@@ -12,6 +13,13 @@ pub mod feature;
 pub mod matrix;
 pub mod sdk;
 
+pub use configuration::{
+    ConfigurationClassification, ConfigurationDisposition, ConfigurationLedger,
+    ConfigurationLedgerError, ConformanceKey, ConformanceOverrideDisposition, SettingDeclaration,
+    StaticConfigurationClassification, TemporalConfigScope, VerifiedConfigurationLedger,
+    checked_configuration_ledger, classification_ledger, source_snapshot,
+    verify_configuration_ledger,
+};
 pub use coverage::{
     ExpectedOutcome, RpcClassification,
     expected::expected_outcome,
@@ -26,10 +34,12 @@ pub use dispatch::{
 };
 pub use feature::{
     CompatibilityEvidence, CompatibilityEvidenceKind, CompatibilitySurface,
-    CompatibilitySurfaceKind, Feature, FeatureEntry, FeatureState, const_str_eq,
-    lookup_feature_const,
+    CompatibilitySurfaceKind, ConformanceDisposition, DefaultPosture, EnablementKind, Feature,
+    FeatureCatalogError, FeatureCatalogMetadata, FeatureEnablement, FeatureEntry, FeatureOrigin,
+    FeatureState, PolicyMutability, PolicyScope, TemporalMaturity, VerifiedFeatureCatalog,
+    const_str_eq, lookup_feature_const, verify_feature_catalog,
 };
-pub use matrix::FEATURE_MATRIX;
+pub use matrix::{FEATURE_MATRIX, NEWER_VENDORED_WIRE_RPCS};
 pub use sdk::{
     IncompatibleVersion, OwnedSdkCompatEntry, SDK_MATRIX, SdkCompatEntry, SdkVerificationState,
 };

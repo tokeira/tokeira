@@ -1,0 +1,21 @@
+[package]
+name = "compatibility-docs"
+publish = false
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic public compatibility and configuration documentation generator"
+
+[dependencies]
+anyhow.workspace = true
+tokeira-compatibility.workspace = true
+tokeira-config.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

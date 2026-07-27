@@ -67,6 +67,17 @@ message FeatureEntry {
   repeated string rpcs = 7;
   string notes = 8;
   repeated CompatibilityEvidence evidence = 9;
+  string origin = 10;
+  string conformance_disposition = 11;
+  string temporal_maturity = 12;
+  string temporal_default = 13;
+  string tokeira_default = 14;
+  string enablement_kind = 15;
+  string enablement_reference = 16;
+  repeated string policy_scopes = 17;
+  string policy_mutability = 18;
+  string guidance = 19;
+  repeated string prerequisites = 20;
 }
 
 enum FeatureState {

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "tools/compatibility-docs",
     "tools/proto-sync",
     "tools/tkw",
     "crates/tokeira-build-info",

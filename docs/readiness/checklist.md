@@ -38,5 +38,7 @@
 
 ## Conformance 2
 
-- [ ] Resolve the remaining open scope decision — auth/authz ([decisions](../conformance/v1.31.0/decisions.md))
-- [x] Worker-versioning V1/V2 scope decision — resolved 2026-07-12: GA Worker Deployments only; the five deprecated RPCs conform as stock-default rejections ([worker-versioning](../conformance/v1.31.0/worker-versioning.md))
+- [x] Authentication/authorization scope decision — resolved 2026-07-16: stock-default
+      no-op parity plus configured bearer authorization and Principal Attribution
+      ([decision](../../.kiro/specs/authorization-foundation/reference/v1.31.0-conformance-decision.md))
+- [x] Worker-versioning V1/V2 scope decision — resolved 2026-07-12: GA Worker Deployments only; the five deprecated RPCs conform as stock-default rejections ([decision](../../.kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md))

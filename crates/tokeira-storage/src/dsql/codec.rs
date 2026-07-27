@@ -7,22 +7,42 @@
 //! used here because these blobs are internal to Tokeira storage, not part of
 //! the public Temporal wire contract.
 
-use anyhow::Result;
+use std::collections::BTreeMap;
+
+use anyhow::{Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use tokeira_kernel::{
     ActivityState, HistoryEvent, ProjectionOp, TimerState, WorkflowState, state::Priority,
 };
 use tokeira_types::{EventPrincipal, Payloads, ProjectionCursor, WorkflowRuleRecord};
 
-use crate::{BacklogPayload, ProjectionContext, StoredWorkerDeployment};
+use crate::{
+    BacklogPayload, ProjectionContext, StoredTaskQueueConfig, StoredTaskQueueConfigKind,
+    StoredTaskQueueConfigMetadata, StoredWorkerDeployment,
+};
 
 const BACKLOG_ENVELOPE_VERSION: u32 = 0x544B_4251;
+const TASK_QUEUE_CONFIG_DOCUMENT_VERSION: u32 = 1;
 
 #[derive(Serialize, serde::Deserialize)]
 struct BacklogEnvelope {
     version: u32,
     payload: BacklogPayload,
     priority: Option<Priority>,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct TaskQueueConfigDocument {
+    version: u32,
+    namespace_id: tokeira_types::NamespaceId,
+    task_queue: tokeira_types::TaskQueueName,
+    kind: i16,
+    revision: u64,
+    queue_rate_limit: Option<f32>,
+    queue_rate_limit_metadata: Option<StoredTaskQueueConfigMetadata>,
+    fairness_key_rate_limit_default: Option<f32>,
+    fairness_key_rate_limit_metadata: Option<StoredTaskQueueConfigMetadata>,
+    fairness_weight_overrides: BTreeMap<String, f32>,
 }
 
 /// Encode a persisted value with postcard.
@@ -184,6 +204,88 @@ pub fn encode_worker_deployment(record: &StoredWorkerDeployment) -> Result<Vec<u
 /// Deserialize one Worker Deployment registry document.
 pub fn decode_worker_deployment(bytes: &[u8]) -> Result<StoredWorkerDeployment> {
     decode(bytes)
+}
+
+/// Serialize one complete task-queue policy record.
+pub fn encode_task_queue_config(record: &StoredTaskQueueConfig) -> Result<Vec<u8>> {
+    validate_task_queue_config(record)?;
+    encode(&TaskQueueConfigDocument {
+        version: TASK_QUEUE_CONFIG_DOCUMENT_VERSION,
+        namespace_id: record.namespace_id,
+        task_queue: record.task_queue.clone(),
+        kind: match record.kind {
+            StoredTaskQueueConfigKind::Workflow => 1,
+            StoredTaskQueueConfigKind::Activity => 2,
+            StoredTaskQueueConfigKind::Nexus => 3,
+        },
+        revision: record.revision,
+        queue_rate_limit: record.queue_rate_limit,
+        queue_rate_limit_metadata: record.queue_rate_limit_metadata.clone(),
+        fairness_key_rate_limit_default: record.fairness_key_rate_limit_default,
+        fairness_key_rate_limit_metadata: record.fairness_key_rate_limit_metadata.clone(),
+        fairness_weight_overrides: record.fairness_weight_overrides.clone(),
+    })
+}
+
+/// Deserialize and validate one complete task-queue policy record.
+pub fn decode_task_queue_config(bytes: &[u8]) -> Result<StoredTaskQueueConfig> {
+    let document: TaskQueueConfigDocument = decode(bytes)?;
+    ensure!(
+        document.version == TASK_QUEUE_CONFIG_DOCUMENT_VERSION,
+        "unsupported task-queue configuration document version {}",
+        document.version
+    );
+    let kind = match document.kind {
+        1 => StoredTaskQueueConfigKind::Workflow,
+        2 => StoredTaskQueueConfigKind::Activity,
+        3 => StoredTaskQueueConfigKind::Nexus,
+        value => bail!("invalid stored task-queue kind {value}"),
+    };
+    let record = StoredTaskQueueConfig {
+        namespace_id: document.namespace_id,
+        task_queue: document.task_queue,
+        kind,
+        revision: document.revision,
+        queue_rate_limit: document.queue_rate_limit,
+        queue_rate_limit_metadata: document.queue_rate_limit_metadata,
+        fairness_key_rate_limit_default: document.fairness_key_rate_limit_default,
+        fairness_key_rate_limit_metadata: document.fairness_key_rate_limit_metadata,
+        fairness_weight_overrides: document.fairness_weight_overrides,
+    };
+    validate_task_queue_config(&record)?;
+    Ok(record)
+}
+
+fn validate_task_queue_config(record: &StoredTaskQueueConfig) -> Result<()> {
+    ensure!(
+        record.revision > 0,
+        "stored task-queue configuration revision must be positive"
+    );
+    for (label, rate) in [
+        ("queue rate", record.queue_rate_limit),
+        (
+            "fairness-key default rate",
+            record.fairness_key_rate_limit_default,
+        ),
+    ] {
+        if let Some(rate) = rate {
+            ensure!(
+                rate.is_finite() && rate >= 0.0,
+                "stored task-queue {label} must be finite and non-negative"
+            );
+        }
+    }
+    for (key, weight) in &record.fairness_weight_overrides {
+        ensure!(
+            !key.is_empty() && key.len() <= 64,
+            "stored task-queue fairness key has invalid encoded length"
+        );
+        ensure!(
+            weight.is_finite() && *weight > 0.0,
+            "stored task-queue fairness weight for {key:?} must be finite and positive"
+        );
+    }
+    Ok(())
 }
 
 /// Serialize one namespace Workflow Rule record.
@@ -405,6 +507,84 @@ mod tests {
             let decoded = decode_payloads(&encoded).unwrap();
             prop_assert_eq!(decoded, payloads);
         }
+
+        // Feature: configuration-policy, Property 10: task-queue codec equivalence
+        #[test]
+        fn task_queue_config_round_trips(
+            namespace in any::<u128>(),
+            queue in "[a-z][a-z0-9_-]{0,24}",
+            kind in 0u8..3,
+            revision in 1u64..1_000_000,
+            queue_rate in prop::option::of(0.0f32..10_000.0),
+            queue_metadata in prop::option::of(("[a-z]{0,12}", "[a-z]{0,12}", -1_000_000i64..1_000_000)),
+            fairness_rate in prop::option::of(0.0f32..10_000.0),
+            fairness_metadata in prop::option::of(("[a-z]{0,12}", "[a-z]{0,12}", -1_000_000i64..1_000_000)),
+            weights in proptest::collection::btree_map("[a-z]{1,12}", 0.001f32..1000.0, 0..24),
+        ) {
+            let metadata = |value: Option<(String, String, i64)>| {
+                value.map(|(reason, update_identity, seconds)| StoredTaskQueueConfigMetadata {
+                    reason,
+                    update_identity,
+                    update_time: OffsetDateTime::from_unix_timestamp(seconds).unwrap(),
+                })
+            };
+            let record = StoredTaskQueueConfig {
+                namespace_id: NamespaceId(Uuid::from_u128(namespace)),
+                task_queue: TaskQueueName(queue),
+                kind: match kind {
+                    0 => StoredTaskQueueConfigKind::Workflow,
+                    1 => StoredTaskQueueConfigKind::Activity,
+                    _ => StoredTaskQueueConfigKind::Nexus,
+                },
+                revision,
+                queue_rate_limit: queue_rate,
+                queue_rate_limit_metadata: metadata(queue_metadata),
+                fairness_key_rate_limit_default: fairness_rate,
+                fairness_key_rate_limit_metadata: metadata(fairness_metadata),
+                fairness_weight_overrides: weights,
+            };
+
+            let encoded = encode_task_queue_config(&record).unwrap();
+            let decoded = decode_task_queue_config(&encoded).unwrap();
+            prop_assert_eq!(decoded, record);
+        }
+    }
+
+    #[test]
+    fn task_queue_config_codec_rejects_bad_kind_revision_and_truncation() {
+        let document = TaskQueueConfigDocument {
+            version: TASK_QUEUE_CONFIG_DOCUMENT_VERSION,
+            namespace_id: NamespaceId(Uuid::from_u128(1)),
+            task_queue: TaskQueueName("queue".to_owned()),
+            kind: 99,
+            revision: 1,
+            queue_rate_limit: None,
+            queue_rate_limit_metadata: None,
+            fairness_key_rate_limit_default: None,
+            fairness_key_rate_limit_metadata: None,
+            fairness_weight_overrides: BTreeMap::new(),
+        };
+        let bad_kind = encode(&document).unwrap();
+        assert!(
+            decode_task_queue_config(&bad_kind)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid stored task-queue kind")
+        );
+
+        let zero_revision = TaskQueueConfigDocument {
+            kind: 1,
+            revision: 0,
+            ..document
+        };
+        let zero_revision = encode(&zero_revision).unwrap();
+        assert!(
+            decode_task_queue_config(&zero_revision)
+                .unwrap_err()
+                .to_string()
+                .contains("revision must be positive")
+        );
+        assert!(decode_task_queue_config(&zero_revision[..zero_revision.len() / 2]).is_err());
     }
 
     #[test]

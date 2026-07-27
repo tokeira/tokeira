@@ -26,6 +26,21 @@ pub fn sdk_matrix_digest() -> String {
 fn hash_feature_entry(hash: &mut Fnv1a, entry: &FeatureEntry) {
     hash.write_str(entry.id);
     hash.write_str(entry.state.label());
+    hash.write_str(entry.catalog.origin.label());
+    hash.write_str(entry.catalog.conformance.label());
+    hash.write_str(entry.catalog.temporal_maturity.label());
+    hash.write_str(entry.catalog.temporal_default.label());
+    hash.write_str(entry.catalog.tokeira_default.label());
+    hash.write_str(entry.catalog.enablement.kind.label());
+    hash.write_str(entry.catalog.enablement.reference.unwrap_or_default());
+    for scope in entry.catalog.scopes {
+        hash.write_str(scope.label());
+    }
+    hash.write_str(entry.catalog.mutability.label());
+    hash.write_str(entry.catalog.guidance);
+    for prerequisite in entry.catalog.prerequisites {
+        hash.write_str(prerequisite);
+    }
     for surface in entry.surfaces {
         hash.write_str(surface.kind.label());
         hash.write_str(surface.identifier);
@@ -115,6 +130,14 @@ mod tests {
             kind: crate::CompatibilityEvidenceKind::ManualReview,
             reference: "docs/changed-evidence.md",
         }];
+
+        assert_ne!(feature_matrix_digest(), feature_matrix_digest_for(&entries));
+    }
+
+    #[test]
+    fn feature_digest_changes_when_catalog_metadata_changes() {
+        let mut entries = FEATURE_MATRIX.to_vec();
+        entries[0].catalog.tokeira_default = crate::DefaultPosture::Enabled;
 
         assert_ne!(feature_matrix_digest(), feature_matrix_digest_for(&entries));
     }

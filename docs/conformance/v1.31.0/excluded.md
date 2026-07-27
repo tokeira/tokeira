@@ -6,8 +6,8 @@
 > (not part of the public SDK/operator API), or an RPC **absent from v1.31.0**. It is **definitional, not
 > a status report**.
 >
-> Surfaces that are present in v1.31.0 but still **under decision** are not here — they are in
-> [`decisions.md`](./decisions.md) (none currently open).
+> No conformance-surface decision is currently open. Future deliberation belongs
+> to the owning feature spec before this authoritative record changes.
 
 ## 1. Experimental / pre-release features (Temporal-designated)
 
@@ -46,8 +46,8 @@ These are Temporal-internal RPC boundaries and operational tooling, not part of 
   JWT-only at the edge with TLS terminated upstream (and even upstream, no shipped v1.31.0 claim
   mapper consumes the TLS peer certificate — mTLS claims require a custom plugin). The
   **configured JWT auth surface itself is in-surface** — see
-  [`supported.md`](./supported.md#authentication-and-authorization) and the decision record
-  [`authorization.md`](./authorization.md).
+  [`supported.md`](./supported.md#authentication-and-authorization) and the
+  [decision record](../../../.kiro/specs/authorization-foundation/reference/v1.31.0-conformance-decision.md).
 
 Read-only and delivery-layer RPCs (e.g. `QueryWorkflow`, `DescribeWorkflowExecution`,
 `RecordActivityTaskStarted`) are **not** excluded by being read-only — they are part of the public
@@ -80,7 +80,8 @@ The V1/V2 enabled path is reachable only through non-default dynamic config
 (`frontend.workerVersioningDataAPIs` / `frontend.workerVersioningRuleAPIs`, both default `false`);
 the five RPCs themselves stay **in-surface as their stock-default rejections** — the exact
 `PERMISSION_DENIED` errors a default-configuration v1.31.0 server produces. Decision record with the
-full factual case: [`worker-versioning.md`](./worker-versioning.md).
+full factual case:
+[`.kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md`](../../../.kiro/specs/worker-deployments/reference/v1-v2-conformance-decision.md).
 
 `PauseActivity`, `UnpauseActivity`, and `ResetActivity` are deliberately absent from this section.
 Temporal v1.31.0 serves all three public RPCs. Their API comments say that they “will be deprecated
@@ -91,5 +92,5 @@ They therefore remain part of the v1.31.0 conformance surface; see [`supported.m
 ## Related pages
 
 - [`supported.md`](./supported.md) — the v1.31.0 conformance surface.
-- [`decisions.md`](./decisions.md) — surfaces present in v1.31.0 that are still under decision
-  (none currently open).
+- [`tokeira-configuration.md`](./tokeira-configuration.md) — current feature
+  availability, defaults, enablement, and production configuration.

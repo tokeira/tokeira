@@ -4,12 +4,12 @@
 > ([`supported.md`](../conformance/v1.31.0/supported.md)) that answer `UNIMPLEMENTED` today — i.e. the
 > remaining edge work. Generated from ground truth, not from a tracker. Intentionally-unimplemented RPCs
 > (experimental, deprecated, internal, or absent from v1.31.0) are **not** work and are **not** here —
-> see [`excluded.md`](../conformance/v1.31.0/excluded.md) / [`decisions.md`](../conformance/v1.31.0/decisions.md).
+> see [`excluded.md`](../conformance/v1.31.0/excluded.md).
 >
 > **Source of truth:** `Status::unimplemented(...)` and the `deferred_unary!` macro in
 > `crates/tokeira-edge/src/grpc/{workflow_service,operator_service}.rs`.
 > **Regenerate:** grep those two files for `unimplemented` and `deferred_unary!`, then drop any RPC that
-> `excluded.md`/`decisions.md` classifies as out-of-surface.
+> `excluded.md` classifies as out-of-surface.
 > **As of:** regenerated for Tier 8.42 · 2026-07-21.
 
 ## Work to be done
@@ -46,7 +46,7 @@ This list is **minimal and complete** when:
 
 - **Complete** — it captures *every* in-surface public-edge RPC that answers `UNIMPLEMENTED`. The raw set
   is the exhaustive grep of `Status::unimplemented` + `deferred_unary!` in the two grpc files; the
-  out-of-surface ones (per `excluded.md`/`decisions.md`) are then removed. RPCs that respond with dropped
+  out-of-surface ones (per `excluded.md`) are then removed. RPCs that respond with dropped
   fields are *not* whole-RPC unimplemented — they are `Partial` and tracked in `UNSUPPORTED_FIELDS.md`.
 - **Minimal** — every row maps to a feature area in
   [`supported.md`](../conformance/v1.31.0/supported.md). Nothing out-of-surface is here.

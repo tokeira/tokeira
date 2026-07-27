@@ -93,6 +93,7 @@ impl From<EdgeError> for Status {
             EdgeError::RemoteRouteUnsupported { target } => Status::unavailable(format!(
                 "request routed to remote target `{target}` but forwarding is not wired yet"
             )),
+            EdgeError::ServiceUnavailable(message) => Status::unavailable(message),
             EdgeError::NotShardOwner {
                 bundle_id,
                 current_epoch,

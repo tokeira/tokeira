@@ -167,6 +167,10 @@ pub enum EdgeError {
     #[error("request routed to remote target `{target}` but forwarding is not wired yet")]
     RemoteRouteUnsupported { target: String },
 
+    /// A required internal service or control-plane repository is unavailable.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error(
         "not shard owner for bundle {bundle_id:?}: current_epoch={current_epoch:?}, current_owner={current_owner_node_id:?}"
     )]
@@ -219,6 +223,7 @@ impl EdgeError {
             EdgeError::TooManyLongPolls => StatusCode::TOO_MANY_REQUESTS,
             EdgeError::LongPollAdmissionTimeout => StatusCode::REQUEST_TIMEOUT,
             EdgeError::RemoteRouteUnsupported { .. } => StatusCode::BAD_GATEWAY,
+            EdgeError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             EdgeError::NotShardOwner { .. } => StatusCode::CONFLICT,
             EdgeError::FailedPrecondition(_) => StatusCode::PRECONDITION_FAILED,
             EdgeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -256,6 +261,7 @@ impl EdgeError {
             EdgeError::TooManyLongPolls => "too_many_long_polls",
             EdgeError::LongPollAdmissionTimeout => "long_poll_admission_timeout",
             EdgeError::RemoteRouteUnsupported { .. } => "remote_route_unsupported",
+            EdgeError::ServiceUnavailable(_) => "service_unavailable",
             EdgeError::NotShardOwner { .. } => "not_shard_owner",
             EdgeError::FailedPrecondition(_) => "failed_precondition",
             EdgeError::Internal(_) => "internal",

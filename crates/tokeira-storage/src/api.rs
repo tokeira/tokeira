@@ -157,6 +157,115 @@ pub enum DeploymentCasResult {
     AlreadyExists,
 }
 
+/// Task category whose live queue policy is stored independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum StoredTaskQueueConfigKind {
+    /// Workflow task queue.
+    Workflow,
+    /// Activity task queue.
+    Activity,
+    /// Nexus worker task queue.
+    Nexus,
+}
+
+/// Durable identity of one task-queue policy record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StoredTaskQueueConfigKey {
+    /// Namespace containing the task queue.
+    pub namespace_id: NamespaceId,
+    /// Logical task-queue name.
+    pub task_queue: TaskQueueName,
+    /// Independently configured task category.
+    pub kind: StoredTaskQueueConfigKind,
+}
+
+/// Audit metadata retained with a rate-limit update or explicit unset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTaskQueueConfigMetadata {
+    /// Caller-supplied reason.
+    pub reason: String,
+    /// Identity that issued the update.
+    pub update_identity: String,
+    /// Time the update was accepted.
+    pub update_time: OffsetDateTime,
+}
+
+/// Complete durable policy for one task queue.
+///
+/// This control-plane record is not workflow state and never enters history.
+/// Its revision fences concurrent public API updates while the runtime cache
+/// remains disposable and reconstructible.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredTaskQueueConfig {
+    /// Namespace containing the task queue.
+    pub namespace_id: NamespaceId,
+    /// Logical task-queue name.
+    pub task_queue: TaskQueueName,
+    /// Independently configured task category.
+    pub kind: StoredTaskQueueConfigKind,
+    /// Monotonic repository-assigned revision, starting at one.
+    pub revision: u64,
+    /// Optional total dispatch rate in tasks per second.
+    pub queue_rate_limit: Option<f32>,
+    /// Metadata for the latest total-rate update or explicit unset.
+    pub queue_rate_limit_metadata: Option<StoredTaskQueueConfigMetadata>,
+    /// Optional default rate for each fairness key.
+    pub fairness_key_rate_limit_default: Option<f32>,
+    /// Metadata for the latest per-key-rate update or explicit unset.
+    pub fairness_key_rate_limit_metadata: Option<StoredTaskQueueConfigMetadata>,
+    /// Complete fairness-key weight override map.
+    pub fairness_weight_overrides: BTreeMap<String, f32>,
+}
+
+impl StoredTaskQueueConfig {
+    /// Return the durable identity of this record.
+    #[must_use]
+    pub fn key(&self) -> StoredTaskQueueConfigKey {
+        StoredTaskQueueConfigKey {
+            namespace_id: self.namespace_id,
+            task_queue: self.task_queue.clone(),
+            kind: self.kind,
+        }
+    }
+}
+
+/// Result of conditionally writing a task-queue policy record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskQueueConfigCasResult {
+    /// The write applied at the returned repository-assigned revision.
+    Applied {
+        /// Fresh durable revision.
+        revision: u64,
+    },
+    /// The expected revision did not match durable state.
+    Conflict,
+}
+
+/// Durable repository for public task-queue policy.
+#[async_trait]
+pub trait TaskQueueConfigRepository: Send + Sync {
+    /// Load one policy record by its complete identity.
+    async fn load_task_queue_config(
+        &self,
+        key: &StoredTaskQueueConfigKey,
+    ) -> Result<Option<StoredTaskQueueConfig>>;
+
+    /// Conditionally create or replace one complete record.
+    ///
+    /// `None` is the create fence and requires no current record. `Some(n)`
+    /// requires revision `n`. The repository assigns `1` or `n + 1` and ignores
+    /// the candidate's incoming revision so stale caller metadata cannot choose
+    /// a durable fence.
+    async fn compare_and_swap_task_queue_config(
+        &self,
+        record: StoredTaskQueueConfig,
+        expected_revision: Option<u64>,
+    ) -> Result<TaskQueueConfigCasResult>;
+
+    /// List every record in deterministic key order for startup hydration.
+    async fn list_all_task_queue_configs(&self) -> Result<Vec<StoredTaskQueueConfig>>;
+}
+
 /// Atomic result of creating a namespace Workflow Rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkflowRuleCreateResult {

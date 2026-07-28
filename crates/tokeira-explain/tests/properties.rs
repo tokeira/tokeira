@@ -222,6 +222,16 @@ proptest! {
                 uncertainty.subject
             );
         }
+        for impact in &explanation.impacts {
+            prop_assert!(explanation.evidence.resolve(&impact.evidence_id).is_some());
+            for subject in &impact.subjects {
+                prop_assert!(
+                    explanation.evidence.resolve(subject).is_some(),
+                    "dangling impact subject: {:?}",
+                    subject
+                );
+            }
+        }
     }
 
     // Property 4 — uncertainty is exhaustive over unconfirmed state: planned
@@ -364,6 +374,173 @@ proptest! {
             .map(|c| c.evidence_id.clone())
             .collect();
         prop_assert_eq!(&explanation.destructive, &engine_classification);
+    }
+
+    // Change-semantics Property 5 — impact derivation is a pure function of
+    // the declarations: identical declarations yield byte-identical impacts,
+    // whatever the refresh coverage said.
+    #[test]
+    fn semantics_property_5_impacts_are_pure(outcome in arb_outcome()) {
+        let first = explain_plan(context(), &outcome);
+        let second = explain_plan(context(), &outcome);
+        prop_assert_eq!(&first.impacts, &second.impacts);
+
+        let mut refreshless = outcome.clone();
+        refreshless.refresh = RefreshCoverage::default();
+        let third = explain_plan(context(), &refreshless);
+        prop_assert_eq!(&first.impacts, &third.impacts,
+            "impacts are a function of declarations, never of coverage");
+    }
+
+    // Change-semantics Property 6 — every impact is grounded, both ways:
+    // each subject's declaration justifies the class, and every qualifying
+    // change appears in its class's impact.
+    #[test]
+    fn semantics_property_6_every_impact_is_grounded(outcome in arb_outcome()) {
+        use tokeira_explain::ImpactClass;
+        use tokeira_iac::{DataEffect, Disruption, ReplacementPolicy};
+
+        let explanation = explain_plan(context(), &outcome);
+        let qualifies = |change: &tokeira_explain::ExplainedChange, class: ImpactClass| {
+            let s = &change.semantics;
+            match class {
+                ImpactClass::DataDestroyed =>
+                    s.data_effect.value() == Some(&DataEffect::Destroyed),
+                ImpactClass::Unavailability =>
+                    s.disruption.value() == Some(&Disruption::UnavailableDuringChange),
+                ImpactClass::Replacement => matches!(
+                    s.replacement.value(),
+                    Some(policy) if *policy != ReplacementPolicy::NotRequired
+                ),
+                ImpactClass::BriefInterruption =>
+                    s.disruption.value() == Some(&Disruption::BriefInterruption),
+                ImpactClass::RollingReplacement =>
+                    s.disruption.value() == Some(&Disruption::Rolling),
+            }
+        };
+
+        for impact in &explanation.impacts {
+            prop_assert!(!impact.subjects.is_empty());
+            for subject in &impact.subjects {
+                let change = explanation
+                    .changes
+                    .iter()
+                    .find(|c| &c.evidence_id == subject)
+                    .expect("impact subject is a change");
+                prop_assert!(
+                    qualifies(change, impact.class),
+                    "unjustified subject {:?} in {:?}",
+                    subject,
+                    impact.class
+                );
+            }
+        }
+        for change in &explanation.changes {
+            for class in [
+                ImpactClass::DataDestroyed,
+                ImpactClass::Unavailability,
+                ImpactClass::Replacement,
+                ImpactClass::BriefInterruption,
+                ImpactClass::RollingReplacement,
+            ] {
+                if qualifies(change, class) {
+                    let listed = explanation
+                        .impacts
+                        .iter()
+                        .find(|i| i.class == class)
+                        .is_some_and(|i| i.subjects.contains(&change.evidence_id));
+                    prop_assert!(
+                        listed,
+                        "qualifying change {:?} missing from {:?}",
+                        change.resource_id,
+                        class
+                    );
+                }
+            }
+        }
+    }
+
+    // Change-semantics Property 7 — Unknown never becomes a claim: a change
+    // declaring nothing joins no impact, and a class nobody triggers emits
+    // no impact.
+    #[test]
+    fn semantics_property_7_unknown_never_becomes_a_claim(outcome in arb_outcome()) {
+        let explanation = explain_plan(context(), &outcome);
+        for change in &explanation.changes {
+            if change.semantics == ChangeSemantics::default() {
+                for impact in &explanation.impacts {
+                    prop_assert!(
+                        !impact.subjects.contains(&change.evidence_id),
+                        "an all-Unknown change joined {:?}",
+                        impact.class
+                    );
+                }
+            }
+        }
+        // With NO declarations anywhere, there are no impacts at all — the
+        // absence is recorded as uncertainty, never as consequence-free.
+        if outcome.semantics_by_id.is_empty() {
+            prop_assert!(explanation.impacts.is_empty());
+            let acting = explanation
+                .changes
+                .iter()
+                .any(|c| c.kind != ChangeKind::NoChange);
+            if acting {
+                prop_assert!(
+                    explanation.uncertainties.iter().any(|u| matches!(
+                        u.reason,
+                        UncertaintyReason::SemanticsUndeclared { .. }
+                    )),
+                    "undeclared world must state the gap"
+                );
+            }
+        }
+    }
+
+    // Change-semantics Property 8 — uncertainty activation is exact, both
+    // directions: per-change iff Unknown-while-stated-elsewhere, one
+    // plan-level entry iff Unknown everywhere applicable, and never for a
+    // kind the field does not apply to.
+    #[test]
+    fn semantics_property_8_uncertainty_activation_is_exact(outcome in arb_outcome()) {
+        let explanation = explain_plan(context(), &outcome);
+        let fields: [(&str, fn(&ChangeSemantics) -> bool, fn(ChangeKind) -> bool); 5] = [
+            ("operation", |s| s.operation.is_known(), |k| k != ChangeKind::NoChange),
+            ("replacement", |s| s.replacement.is_known(),
+             |k| matches!(k, ChangeKind::Update | ChangeKind::Replace)),
+            ("disruption", |s| s.disruption.is_known(), |k| k != ChangeKind::NoChange),
+            ("data_effect", |s| s.data_effect.is_known(),
+             |k| matches!(k, ChangeKind::Update | ChangeKind::Replace | ChangeKind::Delete)),
+            ("reversibility", |s| s.reversibility.is_known(), |k| k != ChangeKind::NoChange),
+        ];
+        for (wire, known, applies) in fields {
+            let applicable: Vec<_> = explanation
+                .changes
+                .iter()
+                .filter(|c| c.kind != ChangeKind::NoChange && applies(c.kind))
+                .collect();
+            let unknowns: Vec<_> = applicable
+                .iter()
+                .filter(|c| !known(&c.semantics))
+                .collect();
+            let expected_subjects: Vec<_> = if applicable.is_empty() || unknowns.is_empty() {
+                Vec::new()
+            } else if unknowns.len() == applicable.len() {
+                vec![tokeira_explain::EvidenceId::deployment("prop")]
+            } else {
+                unknowns.iter().map(|c| c.evidence_id.clone()).collect()
+            };
+            let actual_subjects: Vec<_> = explanation
+                .uncertainties
+                .iter()
+                .filter(|u| matches!(
+                    &u.reason,
+                    UncertaintyReason::SemanticsUndeclared { field } if field == wire
+                ))
+                .map(|u| u.subject.clone())
+                .collect();
+            prop_assert_eq!(actual_subjects, expected_subjects, "field {}", wire);
+        }
     }
 
     // Property 10 — the artifact is self-contained and bounded: a written

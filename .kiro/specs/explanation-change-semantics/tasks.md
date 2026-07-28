@@ -161,41 +161,54 @@ property-based test task.
 
 ## Phase 5 — Impacts and uncertainty activation
 
-- [ ] 5.1 Implement `derive_impacts`
+- [x] 5.1 Implement `derive_impacts`
   - Trigger table from the design, severity-ordered (`DataDestroyed` → `Unavailability` →
     `Replacement` → `BriefInterruption` → `RollingReplacement`)
   - Deterministic statements from templates; subjects ordered by evidence id
   - `Inference` contributes and is marked derived; `Unknown` contributes nothing
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.7_
 
-- [ ] 5.2 Activate `SemanticsUndeclared`
+- [x] 5.2 Activate `SemanticsUndeclared`
   - Per-change when the field is stated elsewhere in the plan; one plan-level uncertainty
     when the field is `Unknown` across every change; nothing where the field does not
     apply to the change kind
   - Resolution action names declaring semantics for the kind
   - _Requirements: 6.1, 6.2, 6.3, 6.4_
 
-- [ ] 5.3 Record absence of impacts honestly
+- [x] 5.3 Record absence of impacts honestly
   - All-`Unknown` plan emits no impacts and records the absence as uncertainty, never as
     an absence of consequence
   - _Requirements: 5.5_
 
-- [ ] 5.4 **PBT: Property 5 — impact derivation is a pure function of declarations**
+- [x] 5.4 **PBT: Property 5 — impact derivation is a pure function of declarations**
   - _Property 5; Requirements: 5.6, 5.7_
 
-- [ ] 5.5 **PBT: Property 6 — every impact is grounded**
+- [x] 5.5 **PBT: Property 6 — every impact is grounded**
   - Both directions: every subject justifies its class, and no qualifying change is missing
   - _Property 6; Requirements: 5.2, 5.3, 5.4_
 
-- [ ] 5.6 **PBT: Property 7 — Unknown never becomes a claim**
+- [x] 5.6 **PBT: Property 7 — Unknown never becomes a claim**
   - _Property 7; Requirements: 5.5, 9.4_
 
-- [ ] 5.7 **PBT: Property 8 — uncertainty activation is exact**
+- [x] 5.7 **PBT: Property 8 — uncertainty activation is exact**
   - If-and-only-if in both directions, plus the plan-level aggregation case
   - _Property 8; Requirements: 6.1, 6.2, 6.4_
 
-- [ ] 5.8 **Checkpoint** — `cargo test -p tokeira-explain` green; a DSQL storage plan
-  reviewed by hand against the umbrella's canonical transcript.
+- [x] 5.8 **Checkpoint** — `cargo test -p tokeira-explain` green; a DSQL storage plan
+  reviewed by hand against the umbrella's canonical transcript. DONE — Phase 5 slice:
+  `tokeira_explain::impacts::derive_impacts` (severity-first trigger table; deterministic
+  templates; subjects by evidence id; deployment-anchored impact identity — recorded
+  signature deviation; Inference contributes, renderer derives the marking from
+  subjects); `SemanticsUndeclared` activated plan-side with the fixed applicability
+  matrix (replacement→Update/Replace; data effect→Update/Replace/Delete; others→all
+  non-NoChange) and field-qualified evidence identity so five plan-level gaps never
+  collide; apply-side derives impacts from reused declarations but never gap-hunts
+  (Req 6 is plan-scoped); all-Unknown plans emit no impacts and state the absence as
+  plan-level uncertainty. Properties 5–8 green; F1's renderer Property 8 evolved
+  (gaps allowed, claims banned — recorded). The storage-plan checkpoint test mirrors
+  the real compose/DSQL declarations and pinned the narrative — and caught a live
+  demon: `counted(2, "uncertainty")` rendered "uncertaintys"; the irregular plural now
+  owns its call-site copy. Impacts render next phase; the model carries them now.
 
 ## Phase 6 — Rendering
 

@@ -124,6 +124,19 @@ pub enum ImpactClass {
     RollingReplacement,
 }
 
+impl ImpactClass {
+    /// The stable kebab tag used in evidence identity (`impact:{tag}:…`).
+    pub fn tag(&self) -> &'static str {
+        match self {
+            ImpactClass::DataDestroyed => "data-destroyed",
+            ImpactClass::Unavailability => "unavailability",
+            ImpactClass::Replacement => "replacement",
+            ImpactClass::BriefInterruption => "brief-interruption",
+            ImpactClass::RollingReplacement => "rolling-replacement",
+        }
+    }
+}
+
 /// A modelled statement that something could not be determined — the
 /// feature that makes a quiet plan distinguishable from an uninformed one
 /// (Requirement 4).

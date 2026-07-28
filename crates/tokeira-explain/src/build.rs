@@ -74,8 +74,19 @@ pub fn explain_plan(context: DeploymentContext, outcome: &PlanOutcome) -> Deploy
         }
     }
 
+    explanation.impacts = crate::impacts::derive_impacts(
+        &EvidenceId::deployment(&explanation.deployment),
+        &explanation.changes,
+    );
+    for impact in &explanation.impacts {
+        explanation
+            .evidence
+            .insert(impact.evidence_id.clone(), EvidenceKind::Impact);
+    }
+
     derive_refresh_uncertainties(&mut explanation, outcome);
     derive_semantics_uncertainties(&mut explanation, outcome);
+    derive_semantics_undeclared(&mut explanation);
     explanation
 }
 
@@ -156,6 +167,20 @@ pub fn explain_applied(
                 Some("run the plan and apply in one invocation".to_string()),
             );
         }
+    }
+
+    // Impacts derive from the reused declarations — a pure function of the
+    // changes, identical rules to the plan side. Undeclared-semantics
+    // uncertainty stays plan-scoped (Requirement 6 speaks of the plan; an
+    // apply reports what happened, and gap-hunting a done thing is noise).
+    explanation.impacts = crate::impacts::derive_impacts(
+        &EvidenceId::deployment(&explanation.deployment),
+        &explanation.changes,
+    );
+    for impact in &explanation.impacts {
+        explanation
+            .evidence
+            .insert(impact.evidence_id.clone(), EvidenceKind::Impact);
     }
 
     explanation
@@ -249,6 +274,142 @@ fn derive_semantics_uncertainties(explanation: &mut DeploymentExplanation, outco
     }
 }
 
+/// Requirement 6: undeclared semantics become uncertainty — a gap, never
+/// silence. Per field: a change whose field is `Unknown` while the field is
+/// stated for another change in the plan gets its own uncertainty; a field
+/// `Unknown` across every applicable change collapses to one plan-level
+/// uncertainty (the noise control — an undeclared world yields at most one
+/// line per field, not one per change); a kind the field does not apply to
+/// is never named.
+fn derive_semantics_undeclared(explanation: &mut DeploymentExplanation) {
+    // Applicability is a fixed property of the change kind, not of what a
+    // declaration happens to state: replacement is about how an update is
+    // effected, and a creation acts on no existing data.
+    fn applies(field: SemanticField, kind: ChangeKind) -> bool {
+        match field {
+            SemanticField::Replacement => matches!(kind, ChangeKind::Update | ChangeKind::Replace),
+            SemanticField::DataEffect => {
+                matches!(
+                    kind,
+                    ChangeKind::Update | ChangeKind::Replace | ChangeKind::Delete
+                )
+            }
+            SemanticField::Operation | SemanticField::Disruption | SemanticField::Reversibility => {
+                kind != ChangeKind::NoChange
+            }
+        }
+    }
+
+    let deployment = EvidenceId::deployment(&explanation.deployment);
+    for field in SemanticField::ALL {
+        let applicable: Vec<(EvidenceId, String, String)> = explanation
+            .changes
+            .iter()
+            .filter(|change| change.kind != ChangeKind::NoChange && applies(field, change.kind))
+            .map(|change| {
+                (
+                    change.evidence_id.clone(),
+                    change.resource_type.clone(),
+                    if field.is_known(&change.semantics) {
+                        String::new()
+                    } else {
+                        change.resource_id.clone()
+                    },
+                )
+            })
+            .collect();
+        if applicable.is_empty() {
+            continue;
+        }
+        let unknowns: Vec<&(EvidenceId, String, String)> = applicable
+            .iter()
+            .filter(|(_, _, gap)| !gap.is_empty())
+            .collect();
+        if unknowns.is_empty() {
+            continue;
+        }
+        if unknowns.len() == applicable.len() {
+            push_uncertainty(
+                explanation,
+                deployment.clone(),
+                UncertaintyReason::SemanticsUndeclared {
+                    field: field.wire_name().to_string(),
+                },
+                format!("no change in this plan declares its {}", field.noun()),
+                Some("declare change semantics for the kinds in this plan".to_string()),
+            );
+        } else {
+            for (subject, resource_type, _) in unknowns {
+                push_uncertainty(
+                    explanation,
+                    subject.clone(),
+                    UncertaintyReason::SemanticsUndeclared {
+                        field: field.wire_name().to_string(),
+                    },
+                    format!("this change's {} is not declared", field.noun()),
+                    Some(format!(
+                        "declare change semantics for the {resource_type} kind"
+                    )),
+                );
+            }
+        }
+    }
+}
+
+/// The five declared fields, iterated in one fixed order so uncertainty
+/// output is deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticField {
+    Operation,
+    Replacement,
+    Disruption,
+    DataEffect,
+    Reversibility,
+}
+
+impl SemanticField {
+    const ALL: [SemanticField; 5] = [
+        SemanticField::Operation,
+        SemanticField::Replacement,
+        SemanticField::Disruption,
+        SemanticField::DataEffect,
+        SemanticField::Reversibility,
+    ];
+
+    /// The wire name carried in `SemanticsUndeclared { field }` — the
+    /// model's own serialized field names, stable for `--json` consumers.
+    fn wire_name(self) -> &'static str {
+        match self {
+            SemanticField::Operation => "operation",
+            SemanticField::Replacement => "replacement",
+            SemanticField::Disruption => "disruption",
+            SemanticField::DataEffect => "data_effect",
+            SemanticField::Reversibility => "reversibility",
+        }
+    }
+
+    /// The operator noun used in consequence prose.
+    fn noun(self) -> &'static str {
+        match self {
+            SemanticField::Operation => "operation",
+            SemanticField::Replacement => "replacement",
+            SemanticField::Disruption => "disruption",
+            SemanticField::DataEffect => "data effect",
+            SemanticField::Reversibility => "reversibility",
+        }
+    }
+
+    fn is_known(self, semantics: &tokeira_iac::ChangeSemantics) -> bool {
+        match self {
+            SemanticField::Operation => semantics.operation.is_known(),
+            SemanticField::Replacement => semantics.replacement.is_known(),
+            SemanticField::Disruption => semantics.disruption.is_known(),
+            SemanticField::DataEffect => semantics.data_effect.is_known(),
+            SemanticField::Reversibility => semantics.reversibility.is_known(),
+        }
+    }
+}
+
 fn push_uncertainty(
     explanation: &mut DeploymentExplanation,
     subject: EvidenceId,
@@ -256,7 +417,15 @@ fn push_uncertainty(
     consequence: String,
     resolvable_by: Option<String>,
 ) {
-    let evidence_id = EvidenceId::uncertainty(reason.tag(), &subject);
+    // The natural key must distinguish facts: five plan-level undeclared
+    // fields on one subject are five uncertainties, so the field joins the
+    // tag for that reason.
+    let evidence_id = match &reason {
+        UncertaintyReason::SemanticsUndeclared { field } => {
+            EvidenceId::uncertainty(&format!("{}:{field}", reason.tag()), &subject)
+        }
+        _ => EvidenceId::uncertainty(reason.tag(), &subject),
+    };
     explanation
         .evidence
         .insert(evidence_id.clone(), EvidenceKind::Uncertainty);

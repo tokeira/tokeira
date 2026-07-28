@@ -209,6 +209,109 @@ impl iac::Resource for ComposeService {
         Ok(())
     }
 
+    /// What a compose-service change does, established from this crate's own
+    /// provider paths. The load-bearing claim:
+    /// an engine `Update` is *effected* as a replacement — `reconcile_service`
+    /// stops and force-removes the container before creating the new one —
+    /// so `~ compose/grafana` means the service goes away and comes back,
+    /// not an in-place edit. Data rides bind-mounted host paths, which
+    /// neither the removal nor the recreation touches.
+    fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
+        // EngineFacts, cited by module identity — never repo layout — so the
+        // citation stays true wherever this crate is used. Every name below
+        // is a real identifier in this module.
+        const RECONCILE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::ComposePlatform::reconcile_service — stop_container(t: 1) → \
+             remove_container(force: true) → create fresh from the definition"
+        ));
+        const REMOVE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::ComposePlatform::remove_service — stop_container + remove_container \
+             with RemoveContainerOptions { force: true, ..Default::default() } — the \
+             `v` (remove volumes) flag stays false, and bind mounts are host paths"
+        ));
+        use iac::{
+            ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
+            Reversibility,
+        };
+        match ctx.kind {
+            ChangeKind::Create => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Created,
+                    citation: RECONCILE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: RECONCILE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: RECONCILE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: RECONCILE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: REMOVE,
+                },
+            },
+            // Update and Replace share one provider path — reconcile — and
+            // therefore one truth: destroy-before-create, unavailable while
+            // it happens, volumes preserved, reversible by re-applying the
+            // prior definition.
+            ChangeKind::Update | ChangeKind::Replace => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Replaced,
+                    citation: RECONCILE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::DestroyBeforeCreate,
+                    citation: RECONCILE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: RECONCILE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: REMOVE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: RECONCILE,
+                },
+            },
+            ChangeKind::Delete => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Deleted,
+                    citation: REMOVE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: REMOVE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: REMOVE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: REMOVE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: RECONCILE,
+                },
+            },
+            // The engine never asks about NoChange; totality answers anyway,
+            // with nothing.
+            ChangeKind::NoChange => iac::ChangeSemantics::default(),
+        }
+    }
+
     async fn describe(
         &self,
         ctx: &iac::ProvisionContext,
@@ -414,7 +517,7 @@ impl ComposePlatform {
 
     /// Returns the container's image digest if it differs from the local image's
     /// current digest for the same tag. This detects rebuilt images behind the
-    /// same tag (e.g., `tokeirad:latest` rebuilt locally).
+    /// same tag (e.g., `app:latest` rebuilt locally).
     ///
     /// Returns `None` if the image is current, or if either lookup fails (in
     /// which case we fall back to tag-only comparison).
@@ -1080,8 +1183,138 @@ pub fn compose_file_path(path: impl AsRef<Path>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use iac::Resource as _;
     use proptest::prelude::*;
+
+    use super::*;
+
+    // Golden declarations (change-semantics task 4.5): the six scenarios,
+    // asserting classification and confidence — never prose. The pivotal
+    // row: an engine Update is *effected* as a replacement with the service
+    // unavailable — the in-place reading of `~` was wrong, and this is where
+    // it stops.
+    #[test]
+    fn compose_service_declarations_are_the_reconcile_truth() {
+        use iac::{
+            ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
+            Reversibility, SemanticsContext,
+        };
+
+        let service = ComposeService::default();
+        let declared = |kind: ChangeKind, field_diffs: &[iac::FieldDiff]| {
+            service.change_semantics(&SemanticsContext {
+                kind,
+                current: None,
+                field_diffs,
+            })
+        };
+
+        // Creation.
+        let create = declared(ChangeKind::Create, &[]);
+        assert!(matches!(
+            create.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::Created,
+                ..
+            }
+        ));
+        assert!(matches!(
+            create.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::NoDataHeld,
+                ..
+            }
+        ));
+
+        // In-place update and drift-driven update: one provider path, one
+        // truth — replaced, destroy-before-create, unavailable meanwhile.
+        // (Drift is the same declaration: the reconcile does not care why
+        // the container differs.)
+        let definition_update = declared(
+            ChangeKind::Update,
+            &[iac::FieldDiff {
+                field: "image".into(),
+                before: Some("a".into()),
+                after: Some("b".into()),
+            }],
+        );
+        let drift_update = declared(
+            ChangeKind::Update,
+            &[iac::FieldDiff::observation("live container drifted")],
+        );
+        for update in [&definition_update, &drift_update] {
+            assert!(matches!(
+                update.operation,
+                Confidence::EngineFact {
+                    value: LifecycleOperation::Replaced,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                update.replacement,
+                Confidence::EngineFact {
+                    value: ReplacementPolicy::DestroyBeforeCreate,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                update.disruption,
+                Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                update.data_effect,
+                Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                update.reversibility,
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    ..
+                }
+            ));
+        }
+
+        // Replacement: identical to update — same reconcile path.
+        let replace = declared(ChangeKind::Replace, &[]);
+        assert_eq!(replace, definition_update);
+
+        // Deletion: the service goes away; bind-mounted data does not.
+        let delete = declared(ChangeKind::Delete, &[]);
+        assert!(matches!(
+            delete.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::Deleted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            delete.disruption,
+            Confidence::EngineFact {
+                value: Disruption::UnavailableDuringChange,
+                ..
+            }
+        ));
+        assert!(matches!(
+            delete.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::Preserved,
+                ..
+            }
+        ));
+
+        // Unknown/inapplicable: NoChange declares nothing — the honest
+        // all-Unknown default, not an invented claim.
+        assert_eq!(
+            declared(ChangeKind::NoChange, &[]),
+            iac::ChangeSemantics::default()
+        );
+    }
 
     // The two compose phantom-drift classes, pinned:
     //

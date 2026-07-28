@@ -608,6 +608,105 @@ impl iac::Resource for ObservabilityConfigFilesResource {
             }
         }
     }
+
+    /// What a config-tree change does, read from this file's own lifecycle
+    /// paths (change-semantics task 4.2). Writes are in place (`write_all`
+    /// overwrites the managed set); the delete genuinely removes the managed
+    /// files — read from the delete implementation, as the spec demands —
+    /// and is still reversible because the tree is a pure function of the
+    /// definition: `create` re-renders it identically.
+    fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
+        // Cited by module identity, never repo layout; every name is a real
+        // identifier in this module.
+        const WRITE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::ObservabilityConfigFilesResource::{create,update} — write_all renders \
+             the managed config set in place"
+        ));
+        const DELETE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::ObservabilityConfigFilesResource::delete — fs::remove_file over \
+             managed_relative_paths(); refuses non-empty foreign directories"
+        ));
+        use iac::{
+            ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
+            Reversibility,
+        };
+        match ctx.kind {
+            ChangeKind::Create => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Created,
+                    citation: WRITE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: WRITE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: WRITE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: WRITE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: DELETE,
+                },
+            },
+            // Definition-driven and drift-driven updates share `write_all`:
+            // an in-place overwrite of the resource's own rendered
+            // artifacts, which are derived entirely from the definition —
+            // nothing operator-authored is touched, so the data is
+            // preserved in the only sense that matters.
+            ChangeKind::Update | ChangeKind::Replace => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::UpdatedInPlace,
+                    citation: WRITE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: WRITE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: WRITE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: WRITE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: WRITE,
+                },
+            },
+            ChangeKind::Delete => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Deleted,
+                    citation: DELETE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: DELETE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: DELETE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Destroyed,
+                    citation: DELETE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: WRITE,
+                },
+            },
+            ChangeKind::NoChange => iac::ChangeSemantics::default(),
+        }
+    }
 }
 
 /// Join a JSON string array for the one-line missing-files observation.
@@ -734,4 +833,103 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), iac::IacError> {
             path.display()
         ))
     })
+}
+
+#[cfg(test)]
+mod semantics_tests {
+    use iac::{
+        ChangeKind, Confidence, DataEffect, LifecycleOperation, Resource as _, SemanticsContext,
+    };
+
+    use super::*;
+
+    fn resource() -> ObservabilityConfigFilesResource {
+        ObservabilityConfigFilesResource::new(
+            PathBuf::from("/tmp/x"),
+            ObservabilityParams {
+                metrics_target_host: "h".into(),
+                metrics_target_port: 1,
+                cluster: "c".into(),
+                deployment: "d".into(),
+                mimir_remote_write_url: "http://m".into(),
+                loki_push_url: "http://l".into(),
+                mimir_http_port: 2,
+                loki_http_port: 3,
+                loki_retention_hours: 4,
+            },
+        )
+    }
+
+    // Golden declarations (change-semantics task 4.5): classification and
+    // confidence only. The headline pair: updates are genuinely in place
+    // (write_all), and the delete genuinely destroys the managed files —
+    // yet stays reversible because the tree re-renders identically from
+    // the definition.
+    #[test]
+    fn config_tree_declarations_match_the_write_and_delete_paths() {
+        let resource = resource();
+        let declared = |kind: ChangeKind, diffs: &[iac::FieldDiff]| {
+            resource.change_semantics(&SemanticsContext {
+                kind,
+                current: None,
+                field_diffs: diffs,
+            })
+        };
+
+        // Definition-driven and drift-driven updates share write_all.
+        let update = declared(
+            ChangeKind::Update,
+            &[iac::FieldDiff::observation("config/mimir.yaml changed")],
+        );
+        let drift = declared(
+            ChangeKind::Update,
+            &[iac::FieldDiff::observation(
+                "missing on disk: config/mimir.yaml",
+            )],
+        );
+        assert_eq!(update, drift);
+        assert!(matches!(
+            update.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::UpdatedInPlace,
+                ..
+            }
+        ));
+        assert!(matches!(
+            update.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::Preserved,
+                ..
+            }
+        ));
+
+        let delete = declared(ChangeKind::Delete, &[]);
+        assert!(matches!(
+            delete.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::Destroyed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            delete.reversibility,
+            Confidence::EngineFact {
+                value: iac::Reversibility::Reversible,
+                ..
+            }
+        ));
+
+        let create = declared(ChangeKind::Create, &[]);
+        assert!(matches!(
+            create.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::Created,
+                ..
+            }
+        ));
+        assert_eq!(
+            declared(ChangeKind::NoChange, &[]),
+            iac::ChangeSemantics::default()
+        );
+    }
 }

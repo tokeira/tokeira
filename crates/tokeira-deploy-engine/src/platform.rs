@@ -45,7 +45,7 @@ pub trait Platform: Send + Sync {
     }
 
     /// Tear down a service's running workload — the inverse of an apply. Used by
-    /// definition-driven rollback (Proposal 002): the superseded binary B deletes
+    /// definition-driven rollback: the superseded binary B deletes
     /// the services it created before the binding re-pins to A. `manifests` are
     /// the service's last-applied manifests, so the platform knows what to remove.
     ///

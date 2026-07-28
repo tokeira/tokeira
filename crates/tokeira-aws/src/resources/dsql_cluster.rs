@@ -2,8 +2,9 @@ use std::{collections::HashMap, time::Duration};
 
 use aws_sdk_dsql::client::Waiters as DsqlWaiters;
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
+    InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource, ResourceId,
+    ResourceState, ResourceType, Reversibility, SemanticsContext, error::IacError,
 };
 
 /// Lifecycle mode for a single DSQL cluster resource.
@@ -134,6 +135,181 @@ impl Resource for DsqlCluster {
                     }
                 }
             }
+        }
+    }
+
+    /// What a DSQL-cluster change does, mode-aware: a **preexisting** cluster is referenced, never managed
+    /// by the deployment — the provider is never called, so every
+    /// declaration is an engine fact about this module's own restraint. A **managed** cluster is real: its
+    /// delete path disables deletion protection and calls
+    /// `dsql:DeleteCluster` — but the AWS documentation read for this
+    /// declaration (the DeleteCluster API reference and the user guide's
+    /// delete-cluster section) establishes the deletion *sequence*, not what
+    /// happens to stored data or whether it is recoverable. Those two fields
+    /// stay `Unknown` — the spec's rule is explicit: where documentation
+    /// does not establish a field, do not infer.
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        // Cited by module identity, never repo layout — these resources are
+        // usable outside this workspace, and their citations must stay true
+        // there. Every name below is a real identifier in this module.
+        const CREATE_MANAGED: Citation = Citation::new(concat!(
+            module_path!(),
+            "::create (Managed) — dsql:CreateCluster with \
+             deletion_protection_enabled(true), then wait_until_cluster_active"
+        ));
+        const UPDATE_MANAGED: Citation = Citation::new(concat!(
+            module_path!(),
+            "::update (Managed) — dsql:TagResource only; no data-plane operation"
+        ));
+        const DELETE_MANAGED: Citation = Citation::new(concat!(
+            module_path!(),
+            "::delete (Managed) — dsql:UpdateCluster with \
+             deletion_protection_enabled(false), then dsql:DeleteCluster, polling \
+             until the cluster is absent from GetCluster and ListClusters; sequence \
+             per https://docs.aws.amazon.com/aurora-dsql/latest/userguide/\
+             single-region-aws-cli.html#delete-cluster"
+        ));
+        const PREEXISTING: Citation = Citation::new(concat!(
+            module_path!(),
+            "::{create,update,delete} (Preexisting) — only the recorded \
+             cluster_endpoint/cluster_arn properties change; no provider call is \
+             made. A preexisting cluster is referenced, never managed by the \
+             deployment; the delete retires the record and leaves the cluster \
+             running"
+        ));
+        let preexisting = self.config.mode == DsqlClusterMode::Preexisting;
+        match ctx.kind {
+            ChangeKind::Create if preexisting => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Created,
+                    citation: PREEXISTING,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: PREEXISTING,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: PREEXISTING,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: PREEXISTING,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: PREEXISTING,
+                },
+            },
+            ChangeKind::Create => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Created,
+                    citation: CREATE_MANAGED,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: CREATE_MANAGED,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: CREATE_MANAGED,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: CREATE_MANAGED,
+                },
+                // Reversing a managed create means deleting the cluster —
+                // and data fate under deletion is exactly what the read
+                // documentation does not establish.
+                reversibility: Confidence::Unknown,
+            },
+            ChangeKind::Update | ChangeKind::Replace if preexisting => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::UpdatedInPlace,
+                    citation: PREEXISTING,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: PREEXISTING,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: PREEXISTING,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: PREEXISTING,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: PREEXISTING,
+                },
+            },
+            ChangeKind::Update | ChangeKind::Replace => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::UpdatedInPlace,
+                    citation: UPDATE_MANAGED,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: UPDATE_MANAGED,
+                },
+                // Inference, not fact: the engine fact is only that
+                // control-plane calls are issued — whether the provider
+                // disrupts on them is not established by the pages fetched.
+                // Ledgered: fetch the TagResource docs and upgrade to
+                // ProviderGuarantee if they establish it.
+                disruption: Confidence::Inference(Disruption::None),
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: UPDATE_MANAGED,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: UPDATE_MANAGED,
+                },
+            },
+            ChangeKind::Delete if preexisting => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Deleted,
+                    citation: PREEXISTING,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: PREEXISTING,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: PREEXISTING,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: PREEXISTING,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: PREEXISTING,
+                },
+            },
+            ChangeKind::Delete => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Deleted,
+                    citation: DELETE_MANAGED,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: DELETE_MANAGED,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: DELETE_MANAGED,
+                },
+                // Not established by the documentation read — deliberately
+                // Unknown, never inferred (see the method doc).
+                data_effect: Confidence::Unknown,
+                reversibility: Confidence::Unknown,
+            },
+            ChangeKind::NoChange => ChangeSemantics::default(),
         }
     }
 
@@ -614,6 +790,105 @@ fn prop_str(rs: &ResourceState, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // Golden declarations (change-semantics task 4.5): classification and
+    // confidence only. The headline: a managed delete's data fate and
+    // recoverability are *not established* by the AWS documentation read —
+    // both stay Unknown, never inferred — while a preexisting cluster's
+    // whole lifecycle is an engine fact about this module's own restraint.
+    #[test]
+    fn dsql_declarations_stay_unknown_where_docs_are_silent() {
+        use tokeira_iac::{
+            ChangeKind, ChangeSemantics, Confidence, DataEffect, Disruption, LifecycleOperation,
+            SemanticsContext,
+        };
+
+        let cluster = |mode: DsqlClusterMode| DsqlCluster {
+            cluster_identity: "t".into(),
+            config: DsqlClusterConfig {
+                mode,
+                preexisting_endpoint: None,
+                preexisting_arn: None,
+                fallback_identifier: None,
+                resource_id: None,
+                module: "dsql".into(),
+            },
+            project: "p".into(),
+            region: "us-east-1".into(),
+            tags: HashMap::new(),
+        };
+        let declared = |mode: DsqlClusterMode, kind: ChangeKind| {
+            cluster(mode).change_semantics(&SemanticsContext {
+                kind,
+                current: None,
+                field_diffs: &[],
+            })
+        };
+
+        let managed_delete = declared(DsqlClusterMode::Managed, ChangeKind::Delete);
+        assert!(matches!(
+            managed_delete.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::Deleted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            managed_delete.disruption,
+            Confidence::EngineFact {
+                value: Disruption::UnavailableDuringChange,
+                ..
+            }
+        ));
+        assert!(matches!(managed_delete.data_effect, Confidence::Unknown));
+        assert!(matches!(managed_delete.reversibility, Confidence::Unknown));
+
+        let managed_create = declared(DsqlClusterMode::Managed, ChangeKind::Create);
+        assert!(matches!(
+            managed_create.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::Created,
+                ..
+            }
+        ));
+        assert!(matches!(managed_create.reversibility, Confidence::Unknown));
+
+        // Managed updates are tag-only; preexisting deletes skip the
+        // provider entirely — the cluster keeps running, data preserved.
+        let managed_update = declared(DsqlClusterMode::Managed, ChangeKind::Update);
+        assert!(matches!(
+            managed_update.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::UpdatedInPlace,
+                ..
+            }
+        ));
+        // Disruption on a control-plane update is an inference, not a fact.
+        assert!(matches!(
+            managed_update.disruption,
+            Confidence::Inference(Disruption::None)
+        ));
+        let preexisting_delete = declared(DsqlClusterMode::Preexisting, ChangeKind::Delete);
+        assert!(matches!(
+            preexisting_delete.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::Preserved,
+                ..
+            }
+        ));
+        assert!(matches!(
+            preexisting_delete.disruption,
+            Confidence::EngineFact {
+                value: Disruption::None,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            declared(DsqlClusterMode::Managed, ChangeKind::NoChange),
+            ChangeSemantics::default()
+        );
+    }
+
     use super::*;
 
     #[test]

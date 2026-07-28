@@ -1,4 +1,4 @@
-//! Config admission (Proposal 004 §8): `#[create]` create-time-immutability and
+//! Config admission: `#[create]` create-time-immutability and
 //! `#[require(expr)]` constraints. Both gate the config *before* `deployment()`;
 //! neither is visible to the structure. Engine-agnostic — names only `syn`, the
 //! value model, and the evaluator.

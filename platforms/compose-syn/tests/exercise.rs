@@ -121,6 +121,21 @@ async fn exercise_compose_syn_end_to_end() {
         explanation.uncertainties.len()
     );
 
+    // Change-semantics 4.6 (end-to-end half): the declaring kinds' words
+    // reach the model over the real engine — every compose-service create
+    // in this plan carries a declared, cited operation instead of the
+    // all-Unknown default. The `--detail` prose review completes at the
+    // rendering phase.
+    for change in &explanation.changes {
+        if change.resource_type == "compose_service" {
+            assert!(
+                change.semantics.operation.is_known(),
+                "compose service {} declares its operation",
+                change.resource_id
+            );
+        }
+    }
+
     // ── 2. Render the observability stack to disk (no Docker) ────────────────
     // The config-files resource is the first in the observability module; the
     // remaining four (mimir/loki/grafana/alloy) are Docker services we skip.

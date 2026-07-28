@@ -32,7 +32,7 @@ pub enum ServiceChangeKind {
     Create,
     Update,
     /// The service's running workload was torn down (delete-only pass —
-    /// definition-driven rollback, Proposal 002).
+    /// definition-driven rollback).
     Delete,
     NoChange,
 }
@@ -159,7 +159,7 @@ impl ServiceEngine {
     ///
     /// This is the runtime counterpart of `Engine::destroy_selected`: the
     /// superseded binary B deletes the services it created before the binding
-    /// re-pins to A (definition-driven rollback, Proposal 002). Deletes run in
+    /// re-pins to A (definition-driven rollback). Deletes run in
     /// reverse dependency order (dependents before dependencies). Fail-closed —
     /// if the platform cannot delete (`supports_delete() == false`) the whole
     /// pass refuses up front, before touching any workload. Idempotent to the

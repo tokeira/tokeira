@@ -1,16 +1,15 @@
 //! The change-semantics vocabulary: what a change *does* to a running
 //! resource, declared by the kind that owns the provider.
 //!
-//! Lives in this crate — not in `tokeira-explain` — because the declaration
-//! point is a method on [`Resource`](crate::Resource), and this crate cannot
-//! depend on a crate that depends on it (recorded as the Feature 1 amendment
-//! in `.kiro/specs/explanation-change-semantics`). `tokeira-explain`
-//! re-exports the vocabulary so its public surface carries it.
+//! The vocabulary lives beside [`Resource`](crate::Resource) because the
+//! declaration point is a method on that trait — the types must live where
+//! the trait does. Layers built on top of this crate re-export them rather
+//! than defining a vocabulary of their own.
 //!
 //! Invariants owned here:
-//! - **`Unknown` is the default of every field** (umbrella decision D4): a
-//!   kind that declares nothing yields uncertainty, never a
-//!   confident-sounding default.
+//! - **`Unknown` is the default of every field**: a kind that declares
+//!   nothing yields uncertainty, never a confident-sounding default. The
+//!   lazy path is the honest path.
 //! - **A claim carries its citation structurally**: `EngineFact` and
 //!   `ProviderGuarantee` cannot be constructed without one, so an uncited
 //!   claim is unrepresentable rather than merely discouraged.
@@ -21,8 +20,8 @@ use serde::{Deserialize, Serialize};
 
 /// How the provider effects the change. Distinct from
 /// [`ChangeKind`](crate::ChangeKind), which describes *state reconciliation*:
-/// a compose service `Update` is effected as `Replaced` because the provider
-/// path stops and recreates the container.
+/// a provider whose update path stops and recreates the resource effects an
+/// `Update` as `Replaced`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LifecycleOperation {
@@ -94,11 +93,11 @@ impl Citation {
     }
 }
 
-/// A value and how firmly Tokeira holds it.
+/// A value and how firmly the engine holds it.
 ///
-/// `Unknown` is the `Default` — the lazy path is the honest path (umbrella
-/// D4). `Inference` is Tokeira-derived and renders as such; `EngineFact`
-/// cites Tokeira's own code; `ProviderGuarantee` cites the provider's
+/// `Unknown` is the `Default` — the lazy path is the honest path.
+/// `Inference` is engine-derived and renders as such; `EngineFact`
+/// cites the engine's own code; `ProviderGuarantee` cites the provider's
 /// documentation. Not `Copy`: citations own their text after deserialization.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -134,8 +133,8 @@ impl<T> Confidence<T> {
 }
 
 /// What a change does to the running resource, in the declaring kind's words.
-/// Every field defaults to `Unknown`; the explanation layer turns unknowns
-/// into uncertainty, never into silence or optimism.
+/// Every field defaults to `Unknown`; consumers surface unknowns as
+/// uncertainty, never as silence or optimism.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeSemantics {
     pub operation: Confidence<LifecycleOperation>,
@@ -145,17 +144,15 @@ pub struct ChangeSemantics {
     pub reversibility: Confidence<Reversibility>,
 }
 
-/// What a kind needs in order to declare — the declaration point's input
-/// (change-semantics design C2).
+/// What a kind needs in order to declare — the declaration point's input.
 ///
-/// A context struct rather than loose parameters so later features (causality
-/// inputs, source spans) can extend what declaration sites see without
-/// breaking every implementor.
+/// A context struct rather than loose parameters so new inputs can be added
+/// without breaking every declaration site.
 #[derive(Debug)]
 pub struct SemanticsContext<'a> {
     /// The engine's reconciliation classification for this change. Distinct
-    /// from the declared [`LifecycleOperation`]: a compose-service `Update`
-    /// may be *effected* as a replacement, and saying so is the point.
+    /// from the declared [`LifecycleOperation`]: a kind may effect an
+    /// `Update` as a replacement, and saying so is the point.
     pub kind: crate::ChangeKind,
     /// The recorded state the change acts on; `None` for a creation.
     pub current: Option<&'a crate::ResourceState>,
@@ -185,7 +182,7 @@ mod tests {
     fn cited_claims_round_trip() {
         let declared = Confidence::EngineFact {
             value: Disruption::UnavailableDuringChange,
-            citation: Citation::new("crates/tokeira-compose/src/lib.rs reconcile_service"),
+            citation: Citation::new("provider::module::reconcile — stop, remove, recreate"),
         };
         let json = serde_json::to_string(&declared).unwrap();
         let back: Confidence<Disruption> = serde_json::from_str(&json).unwrap();

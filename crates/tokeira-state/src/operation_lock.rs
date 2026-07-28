@@ -1,7 +1,7 @@
-//! Renewable remote operation lock (Requirement 11).
+//! Renewable remote operation lock.
 //!
-//! A deployment-level mutual-exclusion lease held across a whole mutating `tkp`
-//! command (e.g. the entire upgrade or rollback sequence) — distinct from the
+//! A deployment-level mutual-exclusion lease held across a whole mutating
+//! command (e.g. an entire upgrade or rollback sequence) — distinct from the
 //! short, per-save lease inside [`S3StateStore`](crate::S3StateStore).
 //!
 //! It is built over any [`StateBackend`], so one primitive serves both the cloud
@@ -168,7 +168,7 @@ impl OperationLock {
     }
 
     /// Adopt an **existing** lease by holder identity + token — the
-    /// orchestrated two-binary flow (task 19.3): a parent process acquired
+    /// orchestrated two-binary flow: a parent process acquired
     /// the lease and hands it to a child, which renews around its work but
     /// never acquires or releases (the parent owns the lease lifecycle, so
     /// the lock is held continuously across the process boundary).

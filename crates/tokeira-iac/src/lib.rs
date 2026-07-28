@@ -476,8 +476,7 @@ pub trait Resource: Send + Sync {
     async fn describe(&self, ctx: &ProvisionContext) -> Result<DescribeResult, error::IacError>;
     fn diff(&self, current: &ResourceState, ctx: &ProvisionContext) -> InternalChange;
 
-    /// Declare what this change does to the running resource
-    /// (change-semantics Requirement 1).
+    /// Declare what this change does to the running resource.
     ///
     /// MUST be pure and total: no I/O, no provider call, no panic, a value
     /// for every input — the engine calls this during change computation,

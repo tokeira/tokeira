@@ -1,6 +1,6 @@
 //! The interpreted subset — a reject-by-default allow-list over the parsed
 //! `.tkd`. `syn` accepts all of Rust; this pass walks the AST and rejects every
-//! node outside the allow-list (Proposal 003 §4 / 004 §6), collecting all
+//! node outside the allow-list, collecting all
 //! violations as spanned diagnostics. It runs *before* evaluation, so the
 //! evaluator only ever sees vetted nodes — the no-panic security model.
 //!

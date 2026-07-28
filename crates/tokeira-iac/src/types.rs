@@ -76,9 +76,8 @@ impl Change {
 }
 
 /// The destructive changes in a plan (Delete and Replace) — the changes `apply`
-/// must surface and confirm (`--yes`) before enacting. The engine classifies;
-/// the CLI / provisioner (`tkp`) enforces the confirmation, since the engine
-/// cannot prompt. Proposal 002 destructive-change gating.
+/// must surface and confirm before enacting. The engine classifies; the
+/// calling shell enforces the confirmation, since the engine cannot prompt.
 pub fn destructive_changes(changes: &[Change]) -> Vec<&Change> {
     changes.iter().filter(|c| c.is_destructive()).collect()
 }

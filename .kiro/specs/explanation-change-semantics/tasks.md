@@ -103,7 +103,7 @@ property-based test task.
 
 ## Phase 4 — Tier 1 and Tier 2 declarations
 
-- [ ] 4.1 Declare `ComposeService`
+- [x] 4.1 Declare `ComposeService`
   - Established from `reconcile_service` (stop → force-remove → create): operation
     `Replaced` even when the change kind is `Update`, replacement `DestroyBeforeCreate`,
     disruption `UnavailableDuringChange`, data effect `Preserved` (state rides
@@ -112,24 +112,24 @@ property-based test task.
   - Verify the data-effect claim against the volume handling before asserting it
   - _Requirements: 2.6, 7.2_
 
-- [ ] 4.2 Declare `ObservabilityConfigFilesResource` and `LocalStateDirResource`
+- [x] 4.2 Declare `ObservabilityConfigFilesResource` and `LocalStateDirResource`
   - `EngineFact` from each resource's own write and delete paths
   - The delete data effect MUST be read from the delete implementation, not assumed
   - _Requirements: 2.6, 7.2_
 
-- [ ] 4.3 Declare `DsqlCluster`
+- [x] 4.3 Declare `DsqlCluster`
   - `ProviderGuarantee` with an AWS documentation URL in each citation
   - Establish from AWS documentation: which field changes force replacement, what deletion
     does to stored data, and whether deletion protection changes reversibility
   - Where documentation does not establish a field, declare `Unknown` — do not infer
   - _Requirements: 2.2, 2.5, 7.2_
 
-- [ ] 4.4 Declare `DynamoDbTable`
+- [x] 4.4 Declare `DynamoDbTable`
   - `ProviderGuarantee` with citations; establish which attribute changes require
     replacement and the data effect of each
   - _Requirements: 2.2, 2.5, 7.2_
 
-- [ ] 4.5 Golden tests for each declaring kind
+- [x] 4.5 Golden tests for each declaring kind
   - Six scenarios per kind: creation, in-place update, replacement, deletion, drift-driven
     update, unknown
   - Assert classification and confidence; never assert prose
@@ -137,9 +137,27 @@ property-based test task.
     omitting the case
   - _Requirements: 8.1, 8.2, 8.3, 8.4_
 
-- [ ] 4.6 **Checkpoint** — `tkr infra plan --detail` against the reference compose
+- [x] 4.6 **Checkpoint** — `tkr infra plan --detail` against the reference compose
   definition states compose service semantics; the misleading in-place reading of `~` is
-  gone.
+  gone. DONE — Phase 4 slice, all five kinds declared from ground truth:
+  **ComposeService** (EngineFacts from `reconcile_service`: Update/Replace are effected as
+  destroy-before-create, unavailable meanwhile, bind-mounted data preserved);
+  **LocalStateDirResource** (the delete is a deliberate no-op → deletion declares data
+  *preserved* — read from the delete impl, exactly as the task demands);
+  **ObservabilityConfigFilesResource** (in-place writes; delete destroys the managed
+  files yet stays reversible — the tree re-renders from the definition);
+  **DsqlCluster** (mode-aware: preexisting = engine-fact restraint; managed delete's
+  data fate and recoverability left **Unknown** — the AWS pages read
+  (API_DeleteCluster + the user guide's delete-cluster section) establish the
+  disable-protection-then-delete sequence, not data fate — the spec's do-not-infer rule
+  applied); **DynamoDbTable** (delete cites AWS verbatim — "deletes a table and all of
+  its items" (API_DeleteTable) — as ProviderGuarantee; recoverability and TTL-bearing
+  updates' data effect stay Unknown; Replace asserted inapplicable — the diff cannot
+  produce one). Golden tests per kind assert classification + confidence, never prose;
+  the end-to-end half of this checkpoint is the exercise-test assertion that compose
+  creates carry declared operations through the real engine — the `--detail` prose
+  review completes at Phase 6's checkpoint (rendering does not exist yet; recorded
+  deviation).
 
 ## Phase 5 — Impacts and uncertainty activation
 

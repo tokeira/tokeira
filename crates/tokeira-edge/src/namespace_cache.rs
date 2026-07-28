@@ -2,7 +2,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use tokeira_runtime::{
+    WorkerComputeCatalogError, WorkerComputeNamespace, WorkerComputeNamespaceCatalog,
+};
+use tokeira_types::NamespaceId;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 /// Default per-namespace workflow-execution retention, in seconds (24h). Tokeira's
 /// scoped namespace model applies this when a `RegisterNamespace` request omits a
@@ -94,6 +99,92 @@ pub struct InMemoryNamespaceCache {
     inner: Arc<RwLock<HashMap<String, ResolvedNamespace>>>,
 }
 
+/// Runtime-facing active-namespace catalog over the edge namespace authority.
+///
+/// The controller receives only stable IDs and public names. Deleted tombstones and
+/// edge-specific retention/visibility metadata never cross this boundary.
+#[derive(Clone)]
+pub struct WorkerComputeNamespaceCatalogAdapter {
+    namespaces: Arc<dyn NamespaceCache>,
+}
+
+impl std::fmt::Debug for WorkerComputeNamespaceCatalogAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerComputeNamespaceCatalogAdapter")
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkerComputeNamespaceCatalogAdapter {
+    /// Construct an adapter over the namespace cache shared by the edge.
+    #[must_use]
+    pub fn new(namespaces: Arc<dyn NamespaceCache>) -> Self {
+        Self { namespaces }
+    }
+}
+
+#[async_trait]
+impl WorkerComputeNamespaceCatalog for WorkerComputeNamespaceCatalogAdapter {
+    async fn list_active(&self) -> Result<Vec<WorkerComputeNamespace>, WorkerComputeCatalogError> {
+        let mut namespaces = self
+            .namespaces
+            .list_all()
+            .await
+            .map_err(worker_compute_catalog_error)?
+            .into_iter()
+            .filter(|namespace| !namespace.deleted)
+            .map(|namespace| {
+                let namespace_id = namespace
+                    .namespace_id
+                    .as_deref()
+                    .map(parse_namespace_id)
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        crate::translate::to_internal::namespace_id_for(&namespace.name)
+                    });
+                Ok(WorkerComputeNamespace {
+                    namespace_id,
+                    name: namespace.name,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkerComputeCatalogError>>()?;
+        namespaces.sort_by(|left, right| {
+            left.namespace_id
+                .0
+                .as_bytes()
+                .cmp(right.namespace_id.0.as_bytes())
+        });
+        Ok(namespaces)
+    }
+
+    async fn name_for_id(
+        &self,
+        namespace_id: NamespaceId,
+    ) -> Result<Option<String>, WorkerComputeCatalogError> {
+        Ok(self
+            .namespaces
+            .get_by_id(&namespace_id.0.to_string())
+            .await
+            .map_err(worker_compute_catalog_error)?
+            .filter(|namespace| !namespace.deleted)
+            .map(|namespace| namespace.name))
+    }
+}
+
+fn parse_namespace_id(value: &str) -> Result<NamespaceId, WorkerComputeCatalogError> {
+    Uuid::parse_str(value)
+        .map(NamespaceId)
+        .map_err(|error| WorkerComputeCatalogError {
+            message: format!("invalid durable namespace ID: {error}"),
+        })
+}
+
+fn worker_compute_catalog_error(error: anyhow::Error) -> WorkerComputeCatalogError {
+    WorkerComputeCatalogError {
+        message: error.to_string(),
+    }
+}
+
 impl InMemoryNamespaceCache {
     pub fn new() -> Self {
         Self::default()
@@ -124,5 +215,49 @@ impl NamespaceCache for InMemoryNamespaceCache {
 
     async fn remove(&self, name: &str) -> Result<Option<ResolvedNamespace>> {
         Ok(self.inner.write().await.remove(name))
+    }
+}
+
+#[cfg(test)]
+mod worker_compute_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_compute_catalog_lists_only_active_namespaces_in_id_order() {
+        let cache = Arc::new(InMemoryNamespaceCache::new());
+        let second = NamespaceId::new();
+        let first = NamespaceId::new();
+        for namespace in [
+            ResolvedNamespace {
+                name: "second".to_owned(),
+                namespace_id: Some(second.0.to_string()),
+                ..ResolvedNamespace::active("second")
+            },
+            ResolvedNamespace {
+                name: "first".to_owned(),
+                namespace_id: Some(first.0.to_string()),
+                ..ResolvedNamespace::active("first")
+            },
+            ResolvedNamespace {
+                name: "deleted".to_owned(),
+                namespace_id: Some(NamespaceId::new().0.to_string()),
+                deleted: true,
+                ..ResolvedNamespace::active("deleted")
+            },
+        ] {
+            cache.insert(namespace).await.expect("namespace insert");
+        }
+        let catalog = WorkerComputeNamespaceCatalogAdapter::new(cache);
+        let listed = catalog.list_active().await.expect("active namespaces");
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed.windows(2).all(|pair| {
+                pair[0].namespace_id.0.as_bytes() < pair[1].namespace_id.0.as_bytes()
+            })
+        );
+        assert_eq!(
+            catalog.name_for_id(first).await.expect("namespace lookup"),
+            Some("first".to_owned())
+        );
     }
 }

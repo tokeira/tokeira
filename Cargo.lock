@@ -7531,6 +7531,7 @@ dependencies = [
  "tokeira-remote-workstation",
  "tokeira-state",
  "tokeira-storage",
+ "tokeira-types",
  "tokio",
  "toml 0.8.23",
  "toml_edit",

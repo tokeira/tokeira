@@ -7,7 +7,12 @@ use tokeira_observability::{
 };
 #[cfg(test)]
 use tokeira_types::validate_metric_name;
-use tokeira_types::{MetricType, NamespaceId, QueueKey, TaskKind, WorkerInstanceKey};
+use tokeira_types::{
+    MetricType, NamespaceId, QueueKey, TaskKind, WorkerComputeHealth, WorkerComputeInvokeReason,
+    WorkerComputeTaskType, WorkerInstanceKey,
+};
+
+use crate::worker_compute::{ObserveResult, ScalerSuppression, WorkerComputeProviderTargetKind};
 
 pub const BROKER_PUBLISH_TOTAL: &str = "tokeira_runtime_broker_publish_total";
 pub const BROKER_SYNC_MATCH_TOTAL: &str = "tokeira_runtime_broker_sync_match_total";
@@ -62,6 +67,34 @@ pub const WORKERS_OBSERVED: &str = "tokeira_worker_heartbeat_entries_observed";
 pub const WORKERS_TOTAL: &str = "tokeira_worker_heartbeat_entries_total";
 pub const WORKER_HEARTBEAT_ACTIVE: &str = "tokeira_worker_heartbeat_active_state";
 pub const WORKER_LAST_HEARTBEAT_AGE_SECONDS: &str = "tokeira_worker_last_heartbeat_age_seconds";
+/// Best-effort worker-compute observations by bounded channel outcome.
+pub const WORKER_COMPUTE_OBSERVATIONS_TOTAL: &str =
+    "tokeira_runtime_worker_compute_observations_total";
+/// Worker-compute scaler actions by task family and bounded reason.
+pub const WORKER_COMPUTE_DECISIONS_TOTAL: &str = "tokeira_runtime_worker_compute_decisions_total";
+/// Worker-compute scaler suppressions by task family and bounded policy reason.
+pub const WORKER_COMPUTE_SUPPRESSIONS_TOTAL: &str =
+    "tokeira_runtime_worker_compute_suppressions_total";
+/// Durable provider-attempt finalizations by Nexus target kind and outcome.
+pub const WORKER_COMPUTE_ACTIONS_TOTAL: &str = "tokeira_runtime_worker_compute_actions_total";
+/// Wall-clock duration of a provider attempt through the selected Nexus target.
+pub const WORKER_COMPUTE_ACTION_LATENCY_SECONDS: &str =
+    "tokeira_runtime_worker_compute_action_latency_seconds";
+/// Current durable scaling-group count by bounded health category.
+pub const WORKER_COMPUTE_HEALTH: &str = "tokeira_runtime_worker_compute_health";
+
+/// Canonical bounded labels for the worker-compute metric family.
+pub const WORKER_COMPUTE_METRIC_LABEL_KEYS: &[(&str, &[&str])] = &[
+    (WORKER_COMPUTE_OBSERVATIONS_TOTAL, &["task_type", "outcome"]),
+    (WORKER_COMPUTE_DECISIONS_TOTAL, &["task_type", "reason"]),
+    (WORKER_COMPUTE_SUPPRESSIONS_TOTAL, &["task_type", "reason"]),
+    (WORKER_COMPUTE_ACTIONS_TOTAL, &["target_kind", "outcome"]),
+    (
+        WORKER_COMPUTE_ACTION_LATENCY_SECONDS,
+        &["target_kind", "outcome"],
+    ),
+    (WORKER_COMPUTE_HEALTH, &["health"]),
+];
 
 // Outbound Nexus requests the runtime (history-service analogue) makes on a caller's
 // behalf. v1.31.0 records these in the history service (`OutboundRequestCounter`,
@@ -112,12 +145,153 @@ pub const METRIC_NAMES: &[(&str, MetricType)] = &[
         WORKER_LAST_HEARTBEAT_AGE_SECONDS,
         MetricType::DurationHistogram,
     ),
+    (WORKER_COMPUTE_OBSERVATIONS_TOTAL, MetricType::Counter),
+    (WORKER_COMPUTE_DECISIONS_TOTAL, MetricType::Counter),
+    (WORKER_COMPUTE_SUPPRESSIONS_TOTAL, MetricType::Counter),
+    (WORKER_COMPUTE_ACTIONS_TOTAL, MetricType::Counter),
+    (
+        WORKER_COMPUTE_ACTION_LATENCY_SECONDS,
+        MetricType::DurationHistogram,
+    ),
+    (WORKER_COMPUTE_HEALTH, MetricType::Gauge),
     (NEXUS_OUTBOUND_REQUESTS_TOTAL, MetricType::Counter),
     (
         NEXUS_OUTBOUND_LATENCY_SECONDS,
         MetricType::DurationHistogram,
     ),
 ];
+
+/// Record one bounded worker-compute observation attempt.
+pub fn record_worker_compute_observation(task_type: WorkerComputeTaskType, result: ObserveResult) {
+    let outcome = match result {
+        ObserveResult::Accepted => "accepted",
+        ObserveResult::Full => "full",
+        ObserveResult::Closed => "closed",
+        ObserveResult::Disabled => "disabled",
+    };
+    counter!(
+        WORKER_COMPUTE_OBSERVATIONS_TOTAL,
+        "task_type" => worker_compute_task_type_label(task_type),
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+/// Record one scaler decision for each task family governed by the group.
+pub fn record_worker_compute_decision(
+    task_types: impl IntoIterator<Item = WorkerComputeTaskType>,
+    reason: WorkerComputeInvokeReason,
+) {
+    for task_type in task_types {
+        counter!(
+            WORKER_COMPUTE_DECISIONS_TOTAL,
+            "task_type" => worker_compute_task_type_label(task_type),
+            "reason" => worker_compute_reason_label(reason),
+        )
+        .increment(1);
+    }
+}
+
+/// Record one deliberate policy suppression.
+pub fn record_worker_compute_suppression(
+    task_type: WorkerComputeTaskType,
+    suppression: ScalerSuppression,
+) {
+    let reason = match suppression {
+        ScalerSuppression::Cooloff => "cooloff",
+        ScalerSuppression::Epsilon => "epsilon",
+    };
+    counter!(
+        WORKER_COMPUTE_SUPPRESSIONS_TOTAL,
+        "task_type" => worker_compute_task_type_label(task_type),
+        "reason" => reason,
+    )
+    .increment(1);
+}
+
+/// Record one finalized provider attempt without identity-sized labels.
+pub fn record_worker_compute_action(
+    target_kind: WorkerComputeProviderTargetKind,
+    outcome: &'static str,
+    duration: std::time::Duration,
+) {
+    let target_kind = match target_kind {
+        WorkerComputeProviderTargetKind::Unresolved => "unresolved",
+        WorkerComputeProviderTargetKind::External => "external",
+        WorkerComputeProviderTargetKind::Worker => "worker",
+    };
+    counter!(
+        WORKER_COMPUTE_ACTIONS_TOTAL,
+        "target_kind" => target_kind,
+        "outcome" => outcome,
+    )
+    .increment(1);
+    histogram!(
+        WORKER_COMPUTE_ACTION_LATENCY_SECONDS,
+        "target_kind" => target_kind,
+        "outcome" => outcome,
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Publish the current durable group count for every bounded health category.
+pub fn record_worker_compute_health(values: impl IntoIterator<Item = WorkerComputeHealth>) {
+    let mut counts = [0_u64; 11];
+    for value in values {
+        counts[worker_compute_health_index(value)] =
+            counts[worker_compute_health_index(value)].saturating_add(1);
+    }
+    for (index, health) in WORKER_COMPUTE_HEALTH_LABELS.iter().enumerate() {
+        gauge!(WORKER_COMPUTE_HEALTH, "health" => *health).set(counts[index] as f64);
+    }
+}
+
+const WORKER_COMPUTE_HEALTH_LABELS: [&str; 11] = [
+    "active",
+    "disabled",
+    "unsupported_provider",
+    "unsupported_scaler",
+    "invalid_configuration",
+    "provider_request_too_large",
+    "misconfigured_endpoint",
+    "capacity_limited",
+    "delivery_retrying",
+    "delivery_terminal_failure",
+    "inactive",
+];
+
+const fn worker_compute_health_index(health: WorkerComputeHealth) -> usize {
+    match health {
+        WorkerComputeHealth::Active => 0,
+        WorkerComputeHealth::Disabled => 1,
+        WorkerComputeHealth::UnsupportedProvider => 2,
+        WorkerComputeHealth::UnsupportedScaler => 3,
+        WorkerComputeHealth::InvalidConfiguration => 4,
+        WorkerComputeHealth::ProviderRequestTooLarge => 5,
+        WorkerComputeHealth::MisconfiguredEndpoint => 6,
+        WorkerComputeHealth::CapacityLimited => 7,
+        WorkerComputeHealth::DeliveryRetrying => 8,
+        WorkerComputeHealth::DeliveryTerminalFailure => 9,
+        WorkerComputeHealth::Inactive => 10,
+    }
+}
+
+const fn worker_compute_task_type_label(task_type: WorkerComputeTaskType) -> &'static str {
+    match task_type {
+        WorkerComputeTaskType::Workflow => "workflow",
+        WorkerComputeTaskType::Activity => "activity",
+        WorkerComputeTaskType::Nexus => "nexus",
+    }
+}
+
+const fn worker_compute_reason_label(reason: WorkerComputeInvokeReason) -> &'static str {
+    match reason {
+        WorkerComputeInvokeReason::ConfigurationActivation => "configuration_activation",
+        WorkerComputeInvokeReason::NoSyncMatch => "no_sync_match",
+        WorkerComputeInvokeReason::Backlog => "backlog",
+        WorkerComputeInvokeReason::WorkerRefresh => "worker_refresh",
+    }
+}
 
 fn task_type_name(kind: TaskKind) -> &'static str {
     match kind {
@@ -420,7 +594,13 @@ mod tests {
     use super::*;
     use metrics::with_local_recorder;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use tokeira_types::{NamespaceId, TaskQueueName};
+    use proptest::prelude::*;
+    use tokeira_storage::WorkerComputeControllerHealthView;
+    use tokeira_types::{
+        BuildId, ConfigurationFingerprint, ControllerInstanceKey, DeploymentId, NamespaceId,
+        ScalingGroupId, TaskQueueName, WorkerComputeFailureCategory,
+    };
+    use uuid::Uuid;
 
     fn snapshot_map(
         recorder: &DebuggingRecorder,
@@ -481,6 +661,36 @@ mod tests {
         assert_eq!(value, &DebugValue::Counter(1));
 
         assert!(snapshot.contains_key(NEXUS_OUTBOUND_LATENCY_SECONDS));
+    }
+
+    #[test]
+    fn worker_compute_helpers_emit_only_bounded_labels() {
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            record_worker_compute_observation(
+                WorkerComputeTaskType::Workflow,
+                ObserveResult::Accepted,
+            );
+            record_worker_compute_decision(
+                [WorkerComputeTaskType::Activity],
+                WorkerComputeInvokeReason::Backlog,
+            );
+            record_worker_compute_suppression(
+                WorkerComputeTaskType::Nexus,
+                ScalerSuppression::Epsilon,
+            );
+            record_worker_compute_action(
+                WorkerComputeProviderTargetKind::External,
+                "retrying",
+                std::time::Duration::from_millis(5),
+            );
+            record_worker_compute_health([WorkerComputeHealth::DeliveryRetrying]);
+        });
+        let snapshot = snapshot_map(&recorder);
+        for (metric, allowed) in WORKER_COMPUTE_METRIC_LABEL_KEYS {
+            let (labels, _) = snapshot.get(*metric).expect("worker-compute metric");
+            assert!(labels.keys().all(|label| allowed.contains(&label.as_str())));
+        }
     }
 
     #[test]
@@ -666,5 +876,80 @@ mod tests {
         let (labels, value) = snapshot.get(KERNEL_COMMANDS_PROCESSED_TOTAL).unwrap();
         assert_eq!(labels.get("command_type"), Some(&"Start".to_string()));
         assert_eq!(value, &DebugValue::Counter(1));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: worker-compute-controller, Property 16: diagnostics and telemetry remain bounded and truthful
+        #[test]
+        fn property_worker_compute_diagnostics_and_telemetry_are_bounded(
+            seed in any::<u128>(),
+            health_index in 0_usize..11,
+            failure_index in proptest::option::of(0_usize..11),
+        ) {
+            let health = [
+                WorkerComputeHealth::Active,
+                WorkerComputeHealth::Disabled,
+                WorkerComputeHealth::UnsupportedProvider,
+                WorkerComputeHealth::UnsupportedScaler,
+                WorkerComputeHealth::InvalidConfiguration,
+                WorkerComputeHealth::ProviderRequestTooLarge,
+                WorkerComputeHealth::MisconfiguredEndpoint,
+                WorkerComputeHealth::CapacityLimited,
+                WorkerComputeHealth::DeliveryRetrying,
+                WorkerComputeHealth::DeliveryTerminalFailure,
+                WorkerComputeHealth::Inactive,
+            ][health_index];
+            let failures = [
+                WorkerComputeFailureCategory::NamespaceUnresolved,
+                WorkerComputeFailureCategory::EndpointNotFound,
+                WorkerComputeFailureCategory::Transport,
+                WorkerComputeFailureCategory::RetryableHandler,
+                WorkerComputeFailureCategory::NonRetryableHandler,
+                WorkerComputeFailureCategory::OperationUnsuccessful,
+                WorkerComputeFailureCategory::AsyncResponse,
+                WorkerComputeFailureCategory::RequestTooLarge,
+                WorkerComputeFailureCategory::InvalidResponsePayload,
+                WorkerComputeFailureCategory::ResponseIdMismatch,
+                WorkerComputeFailureCategory::Storage,
+            ];
+            let failure = failure_index.map(|index| failures[index]);
+            let namespace_id = NamespaceId(Uuid::from_u128(seed));
+            let view = WorkerComputeControllerHealthView {
+                namespace_name: format!("namespace-{seed}"),
+                controller_key: ControllerInstanceKey {
+                    namespace_id,
+                    deployment_name: DeploymentId(format!("deployment-{seed}")),
+                    build_id: BuildId(format!("build-{seed}")),
+                },
+                scaling_group: ScalingGroupId(format!("group-{seed}")),
+                fingerprint: ConfigurationFingerprint::from_canonical_bytes(
+                    &seed.to_be_bytes(),
+                ),
+                health,
+                last_action_id: Some(Uuid::from_u128(seed.rotate_left(1))),
+                last_failure_category: failure,
+                next_metrics_poll_at: None,
+            };
+            let first = serde_json::to_string(&view).expect("diagnostic JSON");
+            let second = serde_json::to_string(&view).expect("diagnostic JSON");
+            prop_assert_eq!(&first, &second);
+            prop_assert_eq!(view.health, health);
+            prop_assert_eq!(view.last_failure_category, failure);
+            prop_assert!(!first.contains("provider_details"));
+            prop_assert!(!first.contains("credential"));
+
+            let forbidden = [
+                "task_queue",
+                "action_id",
+                "deployment",
+                "build_id",
+                "scaling_group",
+            ];
+            for (_, labels) in WORKER_COMPUTE_METRIC_LABEL_KEYS {
+                prop_assert!(labels.iter().all(|label| !forbidden.contains(label)));
+            }
+        }
     }
 }

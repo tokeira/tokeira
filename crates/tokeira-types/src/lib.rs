@@ -52,6 +52,8 @@ pub mod task_queue;
 pub mod tokens;
 /// Projection cursors and visibility-plane helpers.
 pub mod visibility;
+/// Worker Compute Controller task families and configuration identity.
+pub mod worker_compute;
 /// Worker heartbeat observations and store contracts.
 pub mod worker_heartbeat;
 /// Transport-neutral durable Workflow Rule records.
@@ -69,5 +71,6 @@ pub use spread::*;
 pub use task_queue::*;
 pub use tokens::*;
 pub use visibility::*;
+pub use worker_compute::*;
 pub use worker_heartbeat::*;
 pub use workflow_rules::*;

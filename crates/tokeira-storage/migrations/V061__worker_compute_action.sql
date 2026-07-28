@@ -1,0 +1,23 @@
+CREATE TABLE IF NOT EXISTS worker_compute_action (
+    action_id UUID NOT NULL PRIMARY KEY,
+    due_bucket SMALLINT NOT NULL,
+    namespace_id UUID NOT NULL,
+    deployment_name TEXT NOT NULL,
+    build_id TEXT NOT NULL,
+    scaling_group TEXT NOT NULL,
+    configuration_fingerprint BYTEA NOT NULL,
+    reason SMALLINT NOT NULL,
+    status SMALLINT NOT NULL,
+    next_attempt_at TIMESTAMPTZ NOT NULL,
+    claim_owner UUID,
+    claim_epoch BIGINT NOT NULL,
+    claim_until TIMESTAMPTZ,
+    attempts BIGINT NOT NULL,
+    attempt_started_at TIMESTAMPTZ,
+    endpoint_name TEXT NOT NULL,
+    request_data BYTEA NOT NULL,
+    last_error_category TEXT,
+    superseded_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+)

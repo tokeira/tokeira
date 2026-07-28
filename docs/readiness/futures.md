@@ -153,17 +153,18 @@ when no worker is available — primary, low-latency path) and **Task Queue back
 On trigger, the WCI runs an activity that calls the compute provider's invoke API (e.g. AWS Lambda
 `InvokeFunction` via an assumed IAM role).
 
-**Connection to `worker-deployments`:** this is the consumer of the `ComputeConfig` /
-`ComputeConfigScalingGroup` already being persisted there. worker-deployments deliberately persists +
-validates compute config (`ValidateWorkerDeploymentVersionComputeConfig`) **without** building the
-controller that consumes it. Serverless Workers is that controller plus the invocation path.
+**Connection to `worker-deployments`:** the first provider-neutral controller slice is now
+implemented behind `policy.worker_compute.enabled`: Remote Nexus providers plus `no-sync`, with
+durable at-least-once `invoke-worker` delivery. The remaining future work in this section is direct
+provider packaging/actuation (including Lambda), `rate-based`, desired-size updates, and scale-down.
+Provider acknowledgement confirms the capacity request, not worker poll readiness.
 
 **Scope — a 3-layer dependency stack, bottom-up:**
 
 ```
-worker-deployments (versions + ComputeConfig persistence)   ← in progress
-  └── worker-controller-instance (controller + Matching sync-match-failure push + backlog monitor)
-        └── serverless-workers-lambda (compute-provider invocation + worker packaging)
+worker-deployments (versions + ComputeConfig persistence)   ← implemented
+  └── worker-compute-controller (broker demand + durable Remote Nexus invocation) ← implemented opt-in
+        └── serverless-workers-lambda (direct provider + worker packaging)         ← future
 ```
 
 **Key scoping decisions / cautions:**
@@ -176,14 +177,15 @@ worker-deployments (versions + ComputeConfig persistence)   ← in progress
   system-workflow design reintroduces the exact tension `worker-deployments` avoided (control-plane
   correctness weight on synthetic per-run history vs. "history is authority"). Tokeira already has
   `tokeira-controller` and `tokeira-autoscaler`; a WCI plausibly becomes an **autoscaler mode**.
-- **New runtime wiring:** Matching/broker must emit a per-version scaling trigger on sync-match failure
-  (the broker already knows poller presence via `WorkerRegistry`). The compute-provider invocation is a
-  *runtime* AWS call (`tokeira-aws` territory, but invocation not IaC).
-- **Hard dependency:** gate on `worker-deployments` completing first.
+- **Implemented runtime wiring:** the broker emits bounded post-dedupe per-version observations,
+  with periodic backlog sampling as recovery. No Temporal matching-service object or system Workflow
+  was introduced.
+- **Direct cloud invocation remains future work:** the shipped controller deliberately calls only a
+  configured Nexus endpoint; it does not acquire cloud credentials or call Lambda itself.
 
-**Recommendation:** defer. When picked up, spec bottom-up as two new features
-(`worker-controller-instance`, then `serverless-workers-lambda`) with the "controller not system
-workflow" stance decided up front.
+**Recommendation:** keep direct Lambda packaging/invocation deferred as its own provider feature.
+Extend the existing controller contract rather than introducing a second controller or a system
+Workflow.
 
 ### Firecracker worker compute (isolated ephemeral workers) — Tokeira-native compute provider
 

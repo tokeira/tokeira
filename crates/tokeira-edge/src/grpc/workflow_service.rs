@@ -3528,11 +3528,15 @@ mod tests {
         BasicKernel, Command, Kernel, LoadedRun, NexusResolution, SignalRequest, StartRequest,
     };
     use tokeira_proto::public::temporal::api::{
-        deployment::v1::WorkerDeploymentVersion, nexus::v1 as nexus_v1, worker::v1 as worker_v1,
+        deployment::v1::{WorkerDeploymentOptions, WorkerDeploymentVersion},
+        enums::v1::WorkerVersioningMode,
+        nexus::v1 as nexus_v1,
+        worker::v1 as worker_v1,
     };
     use tokeira_runtime::{
-        NexusHttpTaskRequest, NexusHttpTaskRequestVariant, NexusTask, NexusTaskBroker,
-        NexusTaskRequest, NexusTaskToken, TaskQueueConfigStore as _, WorkerRegistry,
+        NexusHttpTaskRequest, NexusHttpTaskRequestVariant, NexusQueueKey, NexusTask,
+        NexusTaskBroker, NexusTaskRequest, NexusTaskToken, TaskQueueConfigStore as _,
+        WorkerRegistry,
     };
     use tokeira_storage::{CommitResult, DispatchableWorkflowTask, RunRepository};
     use tokeira_types::{
@@ -6670,6 +6674,64 @@ mod tests {
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             assert_eq!(error.message(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn poll_nexus_task_queue_routes_by_exact_deployment_version() {
+        let (grpc, broker) = nexus_test_service(Arc::new(PollNoneRuntime));
+        let namespace_id = namespace_id_for("default");
+        let task_queue = TaskQueueName("versioned-nexus".to_owned());
+        let queue_key = NexusQueueKey {
+            namespace_id,
+            task_queue: task_queue.clone(),
+            deployment: Some(tokeira_types::DeploymentId("payments".to_owned())),
+            build_id: Some(tokeira_types::BuildId("build-a".to_owned())),
+        };
+        broker
+            .publish_workflow_versioned(
+                queue_key,
+                RunKey::new(),
+                "operation".to_owned(),
+                7,
+                NexusTaskRequest::CancelOperation {
+                    service: "service".to_owned(),
+                    operation: "cancel".to_owned(),
+                    operation_id: "operation".to_owned(),
+                    operation_token: "token".to_owned(),
+                },
+            )
+            .await;
+
+        assert!(
+            broker
+                .poll(namespace_id, task_queue.clone(), std::time::Duration::ZERO)
+                .await
+                .is_none(),
+            "unversioned poll must not consume exact-version work"
+        );
+        let response = grpc
+            .poll_nexus_task_queue(Request::new(workflowservice::PollNexusTaskQueueRequest {
+                namespace: "default".to_owned(),
+                task_queue: Some(
+                    tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                        name: task_queue.0,
+                        ..Default::default()
+                    },
+                ),
+                identity: "worker".to_owned(),
+                deployment_options: Some(WorkerDeploymentOptions {
+                    worker_versioning_mode: WorkerVersioningMode::Versioned as i32,
+                    deployment_name: "payments".to_owned(),
+                    build_id: "build-a".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("versioned Nexus poll")
+            .into_inner();
+        assert!(!response.task_token.is_empty());
+        assert!(response.request.is_some());
     }
 
     #[tokio::test]

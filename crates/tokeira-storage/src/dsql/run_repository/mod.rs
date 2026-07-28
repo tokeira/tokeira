@@ -28,11 +28,11 @@ use crate::{
     ActivitySweepEntry, AttributedHistoryEvent, BacklogEntry, BacklogPayload, CommitResult,
     CompletionCallbackSweepEntry, CurrentExecutionConflictPolicy, DbClass, DeleteRunRequest,
     DeleteRunResult, DeliveryOrder, DispatchableActivityTask, DispatchableWorkflowTask, DueTimer,
-    NexusSweepEntry, ProjectionRecord, RequestRecord, RunRepository, TransitionAuditRecord,
-    WftTimeoutSweepEntry, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
-    WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
-    dispatchable_workflow_task, metrics, workflow_is_open_and_pinned_to_version,
-    workflow_projection_context_with_previous,
+    NexusSweepEntry, ProjectionRecord, ReconstructibleNexusDelivery, RequestRecord, RunRepository,
+    TransitionAuditRecord, WftTimeoutSweepEntry, WorkerDeploymentVersionKey,
+    WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
+    deleted_workflow_projection_context, dispatchable_workflow_task, metrics,
+    workflow_is_open_and_pinned_to_version, workflow_projection_context_with_previous,
 };
 
 use super::{DsqlConnectionAcquirer, DsqlConnectionDirector, codec, convert};
@@ -103,8 +103,8 @@ use dispatch::collect_dispatchable_workflow_tasks;
 use leases::{RenewDecision, decide_renew, interpret_acquire};
 #[cfg(test)]
 use visibility::{
-    collect_nexus_sweep_entries, collect_started_workflow_task_entries,
-    collect_workflow_timeout_entries,
+    collect_nexus_sweep_entries, collect_reconstructible_nexus_deliveries,
+    collect_started_workflow_task_entries, collect_workflow_timeout_entries,
 };
 
 /// Production `RunRepository` backed by Aurora DSQL.
@@ -609,6 +609,10 @@ impl RunRepository for DsqlRunRepository {
         self.do_backlog_stats_by_priority(queue).await
     }
 
+    async fn list_versioned_backlog_queue_keys(&self) -> Result<Vec<QueueKey>> {
+        self.do_list_versioned_backlog_queue_keys().await
+    }
+
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
         self.do_list_due_timers(now, limit).await
     }
@@ -674,6 +678,16 @@ impl RunRepository for DsqlRunRepository {
         limit: usize,
     ) -> Result<Vec<NexusSweepEntry>> {
         self.do_list_pending_nexus_operations_for_shard(shard_id, limit)
+            .await
+    }
+
+    async fn list_reconstructible_nexus_deliveries_for_shard(
+        &self,
+        shard_id: ShardId,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
+        self.do_list_reconstructible_nexus_deliveries_for_shard(shard_id, now, limit)
             .await
     }
 
@@ -747,7 +761,8 @@ mod tests {
     use time::{Duration, OffsetDateTime};
     use tokeira_kernel::{
         ActivityState, HistoryEvent, HistoryEventKind, PendingNexusOperation, PendingWorkflowTask,
-        ProjectionOp, TimerState, Transition, WorkflowState,
+        ProjectionOp, TimerState, Transition, VersioningBehavior, WorkerDeploymentVersionRef,
+        WorkflowState, WorkflowVersioningInfo,
     };
     use tokeira_types::{
         ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo,
@@ -760,10 +775,10 @@ mod tests {
         ActivityDispatchRow, DEFAULT_HISTORY_PAGE_SIZE, DsqlConnectionAcquirer, DsqlRunRepository,
         RenewDecision, activity_dispatch_from_row, classify_connection_error, classify_outcome,
         collect_activity_sweep_entries, collect_dispatchable_workflow_tasks,
-        collect_nexus_sweep_entries, collect_started_workflow_task_entries,
-        collect_workflow_timeout_entries, decide_renew, dispatchable_workflow_task,
-        effective_history_limit, epoch_from_sql, epoch_to_sql, extract_sqlstate, interpret_acquire,
-        partition_for, should_check_epoch,
+        collect_nexus_sweep_entries, collect_reconstructible_nexus_deliveries,
+        collect_started_workflow_task_entries, collect_workflow_timeout_entries, decide_renew,
+        dispatchable_workflow_task, effective_history_limit, epoch_from_sql, epoch_to_sql,
+        extract_sqlstate, interpret_acquire, partition_for, should_check_epoch,
     };
     use crate::{
         BacklogPayload, CurrentExecutionConflictPolicy, DbClass, LeaseOutcome, LeaseRepository,
@@ -1407,6 +1422,39 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].operation_id, "op-1");
+    }
+
+    #[test]
+    fn nexus_compute_recovery_uses_committed_version_and_due_state() {
+        let mut state = sample_state(RunKey::new());
+        state.versioning_info = Some(WorkflowVersioningInfo {
+            behavior: VersioningBehavior::Pinned,
+            deployment_version: Some(WorkerDeploymentVersionRef {
+                deployment_name: "deployment".to_owned(),
+                build_id: "build".to_owned(),
+            }),
+            ..WorkflowVersioningInfo::default()
+        });
+        state
+            .pending_nexus_operations
+            .insert("ready".to_owned(), sample_nexus_operation("ready", false));
+        let mut backing_off = sample_nexus_operation("later", false);
+        backing_off.next_attempt_at = Some(fixed_now() + Duration::minutes(1));
+        state
+            .pending_nexus_operations
+            .insert("later".to_owned(), backing_off);
+
+        let entries = collect_reconstructible_nexus_deliveries(
+            vec![encoded_workflow_row(state)],
+            fixed_now(),
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].operation_id, "ready");
+        assert_eq!(entries[0].version.deployment_name, "deployment");
+        assert_eq!(entries[0].version.build_id, "build");
     }
 
     #[test]

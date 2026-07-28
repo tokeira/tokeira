@@ -21,7 +21,7 @@ use tokeira_kernel::{
     ExternalCancelResult, ExternalSignalResolvedRequest, ExternalSignalResult,
     ExternalWorkflowExecution, LoadedRun, NexusCancellationAttemptOutcome,
     NexusCancellationAttemptedRequest, PendingNexusOperation, SignalRequest, StartRequest,
-    TerminateRequest, callback_completion_outcome,
+    TerminateRequest, WorkerDeploymentVersionRef, callback_completion_outcome,
 };
 use tokeira_proto::{
     conversions::common::{failure_to_payload, payloads_from_domain},
@@ -48,7 +48,7 @@ use crate::{
         CompletionCallbackTrackingState, CompletionDeliveryOutcome, EndpointTarget,
         NexusCancelResult, NexusCompletion, NexusCompletionClient, NexusCompletionFailureBody,
         NexusCompletionRuntimeConfig, NexusEndpointRegistry, NexusHttpClient, NexusHttpFailureBody,
-        NexusNamespaceResolver, NexusStartResult, NexusTaskBroker, NexusTaskRequest,
+        NexusNamespaceResolver, NexusQueueKey, NexusStartResult, NexusTaskBroker, NexusTaskRequest,
         NexusTimeoutEntry, NexusTimeoutTrackingState, SYSTEM_CALLBACK_URL,
         TEMPORAL_CALLBACK_TOKEN_HEADER, nexus_completion_backoff, nexus_operation_next_attempt_at,
     },
@@ -1136,6 +1136,7 @@ where
         input: Payloads,
         schedule_to_close_timeout: Option<Duration>,
         originator_run_key: RunKey,
+        originator_version: Option<WorkerDeploymentVersionRef>,
         scheduled_event_id: i64,
         scheduled_at: OffsetDateTime,
     ) {
@@ -1209,6 +1210,7 @@ where
                         Ok(NexusStartResult::HandlerError {
                             error_type,
                             failure,
+                            ..
                         }) => external_handler_error_resolution(
                             &error_type,
                             failure.as_ref(),
@@ -1288,9 +1290,12 @@ where
                         callback_token,
                     };
                     self.nexus_broker
-                        .publish_workflow(
-                            *namespace_id,
-                            task_queue.clone(),
+                        .publish_workflow_versioned(
+                            NexusQueueKey::from_version(
+                                *namespace_id,
+                                task_queue.clone(),
+                                originator_version.as_ref(),
+                            ),
                             originator_run_key,
                             operation_id,
                             scheduled_event_id,
@@ -1341,6 +1346,7 @@ where
     async fn handle_cancel_nexus_operation(
         &self,
         originator_run_key: RunKey,
+        originator_version: Option<WorkerDeploymentVersionRef>,
         operation_id: String,
         endpoint_name: String,
         service: String,
@@ -1479,9 +1485,12 @@ where
                     operation_token: pending.operation_token.clone(),
                 };
                 self.nexus_broker
-                    .publish_workflow(
-                        *namespace_id,
-                        task_queue.clone(),
+                    .publish_workflow_versioned(
+                        NexusQueueKey::from_version(
+                            *namespace_id,
+                            task_queue.clone(),
+                            originator_version.as_ref(),
+                        ),
                         originator_run_key,
                         operation_id,
                         scheduled_event_id,
@@ -1502,6 +1511,16 @@ where
             LoadedRun::Existing(state) => {
                 Ok(state.pending_nexus_operations.get(operation_id).cloned())
             }
+            LoadedRun::Absent => Ok(None),
+        }
+    }
+
+    async fn nexus_delivery_version(
+        &self,
+        run_key: RunKey,
+    ) -> Result<Option<WorkerDeploymentVersionRef>> {
+        match self.repo.load_run(run_key).await? {
+            LoadedRun::Existing(state) => Ok(state.effective_deployment().cloned()),
             LoadedRun::Absent => Ok(None),
         }
     }
@@ -2382,6 +2401,11 @@ where
                     let input = input.clone();
                     let schedule_to_close_timeout = *schedule_to_close_timeout;
                     let originator_run_key = *originator_run_key;
+                    // The committed run snapshot, not the endpoint or poller, owns
+                    // workflow-originated Nexus version routing. This is a runtime
+                    // read after commit; no delivery identity enters the pure kernel.
+                    let originator_version =
+                        self.nexus_delivery_version(originator_run_key).await?;
                     let scheduled_event_id = *scheduled_event_id;
                     let scheduled_at = *scheduled_at;
                     tokio::spawn(async move {
@@ -2394,6 +2418,7 @@ where
                                 input,
                                 schedule_to_close_timeout,
                                 originator_run_key,
+                                originator_version,
                                 scheduled_event_id,
                                 scheduled_at,
                             )
@@ -2410,6 +2435,8 @@ where
                 } => {
                     let publisher = RuntimeDispatchPublisher::clone(self);
                     let originator_run_key = *originator_run_key;
+                    let originator_version =
+                        self.nexus_delivery_version(originator_run_key).await?;
                     let operation_id = operation_id.clone();
                     let endpoint = endpoint.clone();
                     let service = service.clone();
@@ -2419,6 +2446,7 @@ where
                         publisher
                             .handle_cancel_nexus_operation(
                                 originator_run_key,
+                                originator_version,
                                 operation_id,
                                 endpoint,
                                 service,

@@ -131,6 +131,43 @@ impl DsqlRunRepository {
         )
     }
 
+    pub(super) async fn do_list_reconstructible_nexus_deliveries_for_shard(
+        &self,
+        shard_id: ShardId,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
+        record_dsql_operation!(
+            self,
+            "list_reconstructible_nexus_deliveries_for_shard",
+            Some(shard_id),
+            {
+                if limit == 0 {
+                    metrics::record_dsql_rows_read(
+                        "list_reconstructible_nexus_deliveries_for_shard",
+                        0,
+                    );
+                    return Ok(Vec::new());
+                }
+                let mut permit = self.director.acquire(DbClass::Read).await?;
+                let rows = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
+                    "SELECT run_key, state_data
+                     FROM workflow_hot
+                     WHERE shard_id = $1",
+                )
+                .bind(Self::shard_id_to_uuid(shard_id))
+                .fetch_all(permit.connection()?)
+                .await?;
+                metrics::record_dsql_rows_read(
+                    "list_reconstructible_nexus_deliveries_for_shard",
+                    rows.len(),
+                );
+
+                collect_reconstructible_nexus_deliveries(rows, now, limit)
+            }
+        )
+    }
+
     pub(super) async fn do_list_runs_with_pending_completion_callbacks_for_shard(
         &self,
         shard_id: ShardId,
@@ -261,6 +298,27 @@ pub(super) fn collect_nexus_sweep_entries(
                 scheduled_event_id: operation.scheduled_event_id,
                 scheduled_at: operation.scheduled_at,
             });
+            if entries.len() == limit {
+                return Ok(entries);
+            }
+        }
+    }
+    Ok(entries)
+}
+
+pub(super) fn collect_reconstructible_nexus_deliveries(
+    rows: Vec<(Uuid, Vec<u8>)>,
+    now: OffsetDateTime,
+    limit: usize,
+) -> Result<Vec<ReconstructibleNexusDelivery>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for (_, state_data) in rows {
+        let state = codec::decode_workflow_state(&state_data)?;
+        for delivery in crate::reconstructible_nexus_deliveries(&state, now) {
+            entries.push(delivery);
             if entries.len() == limit {
                 return Ok(entries);
             }

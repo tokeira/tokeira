@@ -21,6 +21,7 @@ pub(crate) mod config;
 pub(crate) mod deploy;
 pub(crate) mod deployment;
 pub(crate) mod dev;
+pub(crate) mod diagnostics;
 pub(crate) mod exec;
 pub(crate) mod image;
 pub(crate) mod infra;

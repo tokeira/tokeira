@@ -23,6 +23,35 @@ const DRAIN_BACKLOG_SQL: &str = "
     LIMIT $6";
 
 impl DsqlRunRepository {
+    pub(super) async fn do_list_versioned_backlog_queue_keys(&self) -> Result<Vec<QueueKey>> {
+        record_dsql_operation!(self, "list_versioned_backlog_queue_keys", None, {
+            let mut permit = self.director.acquire(DbClass::Read).await?;
+            let rows = sqlx::query_as::<_, (Uuid, String, i16, String, String)>(
+                "SELECT DISTINCT queue_namespace, queue_name, task_kind, deployment, build_id
+                 FROM dispatch_backlog
+                 WHERE deployment IS NOT NULL
+                   AND build_id IS NOT NULL
+                 ORDER BY queue_namespace, queue_name, task_kind, deployment, build_id",
+            )
+            .fetch_all(permit.connection()?)
+            .await?;
+            metrics::record_dsql_rows_read("list_versioned_backlog_queue_keys", rows.len());
+            rows.into_iter()
+                .map(
+                    |(namespace_id, task_queue, task_kind, deployment, build_id)| {
+                        Ok(QueueKey {
+                            namespace_id: NamespaceId(namespace_id),
+                            task_queue: TaskQueueName(task_queue),
+                            task_kind: TaskKind::try_from(task_kind)?,
+                            deployment: Some(DeploymentId(deployment)),
+                            build_id: Some(BuildId(build_id)),
+                        })
+                    },
+                )
+                .collect()
+        })
+    }
+
     pub(super) async fn do_backlog_stats_by_priority(
         &self,
         queue: &QueueKey,

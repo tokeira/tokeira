@@ -225,6 +225,9 @@ pub struct PolicyConfig {
     /// Startup-static task-queue delivery policy.
     #[serde(default)]
     pub task_queues: TaskQueuePolicyConfig,
+    /// Startup-static Worker Compute Controller policy.
+    #[serde(default)]
+    pub worker_compute: WorkerComputePolicyConfig,
     #[serde(default)]
     pub nexus_endpoint_limits: NexusEndpointLimitsConfig,
     #[serde(default)]
@@ -251,6 +254,18 @@ pub struct TaskQueuePolicyConfig {
     /// Opt in to weighted User Fairness for non-sticky task queues.
     #[serde(default)]
     pub enable_fairness: bool,
+}
+
+/// Startup-static policy for remote Worker Compute Controller reconciliation.
+///
+/// The controller is experimental and can cause configured providers to create
+/// billable capacity, so an absent table deliberately remains inert.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerComputePolicyConfig {
+    /// Start the process-local controller service.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Static policy for Temporal's public HTTP/JSON compatibility gateway.
@@ -828,6 +843,7 @@ impl Default for PolicyConfig {
             quotas: QuotasConfig::default(),
             compatibility: CompatibilityConfig::default(),
             task_queues: TaskQueuePolicyConfig::default(),
+            worker_compute: WorkerComputePolicyConfig::default(),
             nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
             nexus_completion: NexusCompletionConfig::default(),
             http_api: HttpApiPolicyConfig::default(),
@@ -1872,6 +1888,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_compute_policy_is_strict_and_default_disabled() {
+        let defaults: TokeiraConfig = toml::from_str("").expect("default config");
+        assert!(!defaults.policy.worker_compute.enabled);
+
+        let enabled: TokeiraConfig = toml::from_str("[policy.worker_compute]\nenabled = true\n")
+            .expect("worker compute policy");
+        assert!(enabled.policy.worker_compute.enabled);
+        assert!(
+            toml::from_str::<TokeiraConfig>(
+                "[policy.worker_compute]\nenabled = false\nunknown = true\n"
+            )
+            .is_err(),
+            "strict config must reject unknown Worker Compute policy fields"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -2037,6 +2070,7 @@ mod tests {
             1u32..=100_000,
             1u32..=10_000,
             any::<bool>(),
+            any::<bool>(),
         )
             .prop_map(
                 |(
@@ -2051,6 +2085,7 @@ mod tests {
                     target_workflow_starts_per_second,
                     target_p99_wft_latency_ms,
                     enable_fairness,
+                    worker_compute_enabled,
                 )| TokeiraConfig {
                     infrastructure: InfrastructureConfig {
                         storage: ConfigStorageKind::InMemory,
@@ -2076,6 +2111,9 @@ mod tests {
                         quotas: QuotasConfig::default(),
                         compatibility: CompatibilityConfig::default(),
                         task_queues: TaskQueuePolicyConfig { enable_fairness },
+                        worker_compute: WorkerComputePolicyConfig {
+                            enabled: worker_compute_enabled,
+                        },
                         nexus_endpoint_limits: NexusEndpointLimitsConfig::default(),
                         nexus_completion: NexusCompletionConfig::default(),
                         http_api: HttpApiPolicyConfig::default(),

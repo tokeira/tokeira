@@ -21,20 +21,30 @@ Each phase assumes the `tokeira-odori` Firecracker runner machinery is reusable 
 
 Grounded by reading the code, not assumption:
 
+> **Implementation update (2026-07-27):** the baseline below is retained as the
+> proposal's source-history snapshot. Tokeira now has an opt-in, default-disabled
+> Worker Compute Controller for Remote Nexus providers using the `no-sync` scaler
+> and `invoke-worker` operation. It derives advisory demand from the delivery
+> broker, persists fenced controller/outbox state in DSQL, and delivers at least
+> once through existing Nexus transports. It does **not** implement the direct
+> Firecracker placement/host/guest plane proposed by this document, and provider
+> acknowledgement is not proof that a Worker reached poll-ready state. The
+> authoritative shipped surface is the Feature Catalog entry
+> `worker-compute-controller` and `.kiro/specs/worker-compute-controller/`.
+
 | Area | State | Where |
 |---|---|---|
 | Worker Deployment **management plane** (v2 RPCs: create/describe/delete/list deployments + versions, set-current, set-ramping, update-metadata) | **Implemented**, registry-backed, ground-truthed to `workerdeployment/*.go @ v1.31.0`, unit-tested | `tokeira-edge` (`runtime_adapter.rs`, `translate.rs`), `WorkerDeploymentRegistry`, `WorkerDeploymentRepository`; matrix `worker-deployments = Implemented` |
 | Deprecated v1 deployment companions | Correctly return `UNIMPLEMENTED` (matches v1.31.0) | `tokeira-edge` |
 | Versioning **behavior**: routing config (current/ramping/percentage), revision **fencing** at dispatch/start | Present (not just stored): `PendingActivity.dispatch_revision` stamped at dispatch, re-validated at start | `tokeira-storage` (`StoredRoutingConfig`), `tokeira-kernel`/`tokeira-runtime` |
 | Full pinned-vs-auto-upgrade **dispatch routing** end-to-end | Pieces present; **not fully traced/verified**; no functional-corpus proof | — |
-| **WCI / compute-config surface** (`SetWorkerDeploymentManager`, `Update/ValidateWorkerDeploymentVersionComputeConfig`, `ComputeConfig{provider,scaler}`, `manager_identity`) | **Plumbed but inert** — persisted + served over RPC, from the ahead-of-target `v1.62.11` proto; **no control loop enacts it**; outside the v1.31.0 behavioural claim | `tokeira-edge`, `tokeira-storage` (`ComputeScaler`, `ComputeProvider`) |
+| **WCI / compute-config surface** (`SetWorkerDeploymentManager`, `Update/ValidateWorkerDeploymentVersionComputeConfig`, `ComputeConfig{provider,scaler}`, `manager_identity`) | **Experimental opt-in slice active** — persisted + served over RPC; Remote Nexus + `no-sync` is enacted by the default-disabled Worker Compute Controller. `rate-based` and direct providers remain stored but controller-ineligible; the feature remains outside the v1.31.0 behavioural claim | `tokeira-edge`, `tokeira-runtime::worker_compute`, `tokeira-storage` |
 | Compute provider, Worker Placement Controller, `tokeira-hostd`, `tokeira-guest-agent`, Worker Fleet Autoscaler, tokeira-native demand source, slot-lease store, warm pools/snapshots | **Do not exist** | — (this proposal) |
 | Reusable adjacent machinery | Firecracker runner daemons (`odori-runnerd`/`-vmm`/`-guestd` + guest agent + vsock) in `tokeira-odori`; DSQL fenced-lease pattern ([035](035-placement-and-membership.md)); Mimir-decides/AWS-enacts autoscaler ([045](045-autoscaling-on-ecs-ec2.md)) | `tokeira-odori`, `tokeira-storage`, `platforms/ecs` |
 
-**Net:** the *control surface* (a client can register a deployment version, set a manager, attach a
-compute config, and have workers bind to `deployment_name/build_id`) is done. The **actuation** —
-turning a compute config into running, leased Firecracker Worker microVMs — is entirely unbuilt. That
-actuation is this proposal.
+**Net:** the *control surface* and the provider-neutral Remote Nexus controller are done. The
+**direct Firecracker actuation** — turning a compute config into running, leased Worker microVMs —
+remains unbuilt. That direct provider/placement/host/guest work is this proposal.
 
 ## Implementation approach
 

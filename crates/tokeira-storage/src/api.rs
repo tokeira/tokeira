@@ -18,7 +18,10 @@ use time::OffsetDateTime;
 use tokeira_kernel::{
     ActivityOp, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, RequestIdInfo, TimerOp,
     Transition, WorkflowState,
-    state::{Priority, VersioningBehavior, VersioningOverride},
+    state::{
+        NexusOperationCancellationState, Priority, VersioningBehavior, VersioningOverride,
+        WorkerDeploymentVersionRef,
+    },
 };
 use tokeira_types::{
     ArchetypeId, BuildId as RuntimeBuildId, DeploymentId, EventPrincipal, ExecutionRef,
@@ -928,6 +931,15 @@ pub trait RunRepository: Send + Sync {
         Ok(BTreeMap::new())
     }
 
+    /// Enumerate exact-version durable backlog queue identities.
+    ///
+    /// This low-frequency advisory scan lets capacity sampling recover queue
+    /// discovery after process-local broker/counter loss. Implementations that
+    /// predate worker compute may return an empty set.
+    async fn list_versioned_backlog_queue_keys(&self) -> Result<Vec<QueueKey>> {
+        Ok(Vec::new())
+    }
+
     /// Return timers whose `fire_at` is at or before
     /// `now`, up to `limit`.
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>>;
@@ -989,6 +1001,20 @@ pub trait RunRepository: Send + Sync {
         shard_id: ShardId,
         limit: usize,
     ) -> Result<Vec<NexusSweepEntry>>;
+
+    /// List currently eligible exact-version Nexus deliveries for advisory backlog
+    /// reconstruction after broker-memory loss.
+    ///
+    /// Endpoint targets remain unresolved here; runtime owns that registry and
+    /// filters Worker targets without moving routing policy into storage.
+    async fn list_reconstructible_nexus_deliveries_for_shard(
+        &self,
+        _shard_id: ShardId,
+        _now: OffsetDateTime,
+        _limit: usize,
+    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
+        Ok(Vec::new())
+    }
 
     /// List the *pending* (`Scheduled` or `BackingOff`) completion callbacks of runs homed
     /// on `shard_id`, so the completion-callback retry scanner can rebuild its volatile
@@ -1346,6 +1372,66 @@ pub struct NexusSweepEntry {
     pub scheduled_event_id: i64,
     /// When the operation was scheduled.
     pub scheduled_at: OffsetDateTime,
+}
+
+/// One authoritative pending Nexus delivery available for exact-version backlog
+/// reconstruction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconstructibleNexusDelivery {
+    /// Durable owner used for stable diagnostics and deduplication.
+    pub run_key: RunKey,
+    /// Operation identifier within the run.
+    pub operation_id: String,
+    /// Endpoint name resolved through runtime's current endpoint registry.
+    pub endpoint: String,
+    /// Effective Deployment Version from the committed run snapshot.
+    pub version: WorkerDeploymentVersionRef,
+}
+
+/// Derive advisory Nexus backlog candidates from one committed run snapshot.
+///
+/// Scheduled work is included even when it may already be in flight: the sampler
+/// deliberately prefers a conservative capacity hint after disposable broker loss.
+/// Backing-off work appears only once its durable retry deadline is due.
+#[must_use]
+pub fn reconstructible_nexus_deliveries(
+    state: &WorkflowState,
+    now: OffsetDateTime,
+) -> Vec<ReconstructibleNexusDelivery> {
+    if !state.status.is_open() {
+        return Vec::new();
+    }
+    let Some(version) = state.effective_deployment().cloned() else {
+        return Vec::new();
+    };
+
+    state
+        .pending_nexus_operations
+        .values()
+        .filter(|operation| {
+            if !operation.started {
+                return operation.next_attempt_at.is_none_or(|due| due <= now);
+            }
+            operation
+                .cancellation
+                .as_ref()
+                .is_some_and(|cancellation| match cancellation.state {
+                    NexusOperationCancellationState::Scheduled => true,
+                    NexusOperationCancellationState::BackingOff => {
+                        cancellation.next_attempt_at.is_some_and(|due| due <= now)
+                    }
+                    NexusOperationCancellationState::Unspecified
+                    | NexusOperationCancellationState::Succeeded
+                    | NexusOperationCancellationState::Failed => false,
+                })
+        })
+        .map(|operation| ReconstructibleNexusDelivery {
+            run_key: state.run_key,
+            operation_id: operation.operation_id.clone(),
+            endpoint: operation.endpoint.clone(),
+            version: version.clone(),
+        })
+        .collect()
 }
 
 /// A *pending* (`Scheduled` or `BackingOff`) completion callback that the
@@ -2147,6 +2233,10 @@ where
         (**self).backlog_stats_by_priority(queue).await
     }
 
+    async fn list_versioned_backlog_queue_keys(&self) -> Result<Vec<QueueKey>> {
+        (**self).list_versioned_backlog_queue_keys().await
+    }
+
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
         (**self).list_due_timers(now, limit).await
     }
@@ -2219,6 +2309,17 @@ where
     ) -> Result<Vec<NexusSweepEntry>> {
         (**self)
             .list_pending_nexus_operations_for_shard(shard_id, limit)
+            .await
+    }
+
+    async fn list_reconstructible_nexus_deliveries_for_shard(
+        &self,
+        shard_id: ShardId,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
+        (**self)
+            .list_reconstructible_nexus_deliveries_for_shard(shard_id, now, limit)
             .await
     }
 

@@ -36,12 +36,13 @@ use crate::{
         DeleteRunResult, DeploymentCasResult, DeploymentKey, DeploymentName,
         DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult,
         LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch, ProjectionLog,
-        ProjectionRecord, RequestRecord, RunRepository, StoredTaskQueueConfig,
-        StoredTaskQueueConfigKey, StoredWorkerDeployment, TaskQueueConfigCasResult,
-        TaskQueueConfigRepository, TransitionAuditRecord, WftTimeoutSweepEntry,
-        WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkflowRuleCreateResult,
-        WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry, deleted_workflow_projection_context,
-        dispatchable_workflow_task, workflow_is_open_and_pinned_to_version,
+        ProjectionRecord, ReconstructibleNexusDelivery, RequestRecord, RunRepository,
+        StoredTaskQueueConfig, StoredTaskQueueConfigKey, StoredWorkerDeployment,
+        TaskQueueConfigCasResult, TaskQueueConfigRepository, TransitionAuditRecord,
+        WftTimeoutSweepEntry, WorkerDeploymentRepository, WorkerDeploymentVersionKey,
+        WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
+        deleted_workflow_projection_context, dispatchable_workflow_task,
+        reconstructible_nexus_deliveries, workflow_is_open_and_pinned_to_version,
         workflow_projection_context_with_previous,
     },
     metrics as storage_metrics,
@@ -1178,6 +1179,43 @@ impl RunRepository for InMemoryStore {
         Ok(stats)
     }
 
+    async fn list_versioned_backlog_queue_keys(&self) -> Result<Vec<QueueKey>> {
+        let store = self.inner.lock().await;
+        let mut queues = store
+            .dispatch_backlog
+            .iter()
+            .filter(|entry| entry.queue.deployment.is_some() && entry.queue.build_id.is_some())
+            .map(|entry| entry.queue.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        queues.sort_by(|left, right| {
+            left.namespace_id
+                .0
+                .as_bytes()
+                .cmp(right.namespace_id.0.as_bytes())
+                .then_with(|| left.task_queue.0.cmp(&right.task_queue.0))
+                .then_with(|| {
+                    left.task_kind
+                        .to_db_smallint()
+                        .cmp(&right.task_kind.to_db_smallint())
+                })
+                .then_with(|| {
+                    left.deployment
+                        .as_ref()
+                        .map(|value| value.0.as_str())
+                        .cmp(&right.deployment.as_ref().map(|value| value.0.as_str()))
+                })
+                .then_with(|| {
+                    left.build_id
+                        .as_ref()
+                        .map(|value| value.0.as_str())
+                        .cmp(&right.build_id.as_ref().map(|value| value.0.as_str()))
+                })
+        });
+        Ok(queues)
+    }
+
     async fn list_due_timers(&self, now: OffsetDateTime, limit: usize) -> Result<Vec<DueTimer>> {
         let store = self.inner.lock().await;
         let mut due = Vec::new();
@@ -1393,6 +1431,31 @@ impl RunRepository for InMemoryStore {
                     scheduled_at: op.scheduled_at,
                 });
                 if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_reconstructible_nexus_deliveries_for_shard(
+        &self,
+        shard_id: ShardId,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<ReconstructibleNexusDelivery>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let store = self.inner.lock().await;
+        let mut out = Vec::new();
+        for state in store.runs.values() {
+            if store.run_shard_map.get(&state.run_key) != Some(&shard_id) {
+                continue;
+            }
+            for delivery in reconstructible_nexus_deliveries(state, now) {
+                out.push(delivery);
+                if out.len() == limit {
                     return Ok(out);
                 }
             }

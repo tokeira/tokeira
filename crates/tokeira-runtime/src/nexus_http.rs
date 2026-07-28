@@ -72,7 +72,7 @@ const NEXUS_MIN_REQUEST_TIMEOUT: Duration = Duration::milliseconds(1500);
 /// limit to the decoded public protobuf `Payload`; both defaults are 2 MiB in v1.31.0
 /// (`common/rpc/grpc.go:34-37`, `common/dynamicconfig/constants.go:316-321`, and
 /// `components/nexusoperations/executors.go:313-316 @ v1.31.0`).
-const NEXUS_RESPONSE_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+pub(crate) const NEXUS_PAYLOAD_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 /// `nexus-operation-state` header on a completion `POST` (`headerOperationState`,
 /// `common/nexus/nexusrpc/api.go:23 @ v1.31.0`). Aliases the public protocol const so
 /// the firing client and the inbound `/nexus/callback` server share one source of truth.
@@ -200,6 +200,15 @@ impl NexusHttpClient for HttpNexusClient {
             .map_err(|e| anyhow!("nexus start request failed: {}", error_chain(&e)))?;
 
         let status = response.status();
+        let retry_override = response
+            .headers()
+            .get(HEADER_RETRYABLE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| match value.to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            });
         // Links are read from response headers up front (mirrors v1.31.0, which
         // parses `Nexus-Link` before branching on status). Header decoding is
         // strict; the `temporal://` → kernel-`Link` conversion is lenient (a
@@ -258,8 +267,9 @@ impl NexusHttpClient for HttpNexusClient {
                 // A non-2xx, non-424 status is a Nexus *handler* error (e.g. 400
                 // BAD_REQUEST). Surface its type + body so the publisher resolves the
                 // caller's operation as failed AND tags `nexus_outbound_requests` with
-                // `handler-error:<TYPE>` (`startCallOutcomeTag @ v1.31.0`). A single
-                // attempt only — no retry classification here (Req 5.3).
+                // `handler-error:<TYPE>` (`startCallOutcomeTag @ v1.31.0`). Existing
+                // workflow-origin callers remain single-attempt; the bounded
+                // retryability bit is consumed only by worker-compute outbox delivery.
                 let bytes =
                     read_response_body_limited(response, "nexus start: reading handler error body")
                         .await?;
@@ -270,6 +280,8 @@ impl NexusHttpClient for HttpNexusClient {
                 Ok(NexusStartResult::HandlerError {
                     error_type: handler_error_type_for_status(other).to_string(),
                     failure,
+                    retryable: retry_override
+                        .unwrap_or_else(|| mapped_handler_error_retryable(other).unwrap_or(true)),
                 })
             }
         }
@@ -698,7 +710,7 @@ async fn read_response_body_limited(
         .await
         .map_err(|error| anyhow!("{context} failed: {error}"))?
     {
-        if body.len().saturating_add(chunk.len()) > NEXUS_RESPONSE_SIZE_LIMIT {
+        if body.len().saturating_add(chunk.len()) > NEXUS_PAYLOAD_SIZE_LIMIT {
             bail!("http: response body too large");
         }
         body.extend_from_slice(&chunk);
@@ -713,7 +725,7 @@ async fn read_response_body_limited(
 fn ensure_successful_payload_size(result: &Payloads) -> Result<()> {
     if result.0.iter().any(|payload| {
         tokeira_proto::conversions::common::payload_from_domain(payload).encoded_len()
-            > NEXUS_RESPONSE_SIZE_LIMIT
+            > NEXUS_PAYLOAD_SIZE_LIMIT
     }) {
         bail!("http: response body too large");
     }
@@ -1143,7 +1155,7 @@ mod tests {
         // The raw body is deliberately below 2 MiB. Its `encoding=json/plain`
         // metadata pushes the public protobuf Payload over the limit, matching the
         // Tier 7.37 corpus boundary case.
-        let body = "x".repeat(NEXUS_RESPONSE_SIZE_LIMIT - 10);
+        let body = "x".repeat(NEXUS_PAYLOAD_SIZE_LIMIT - 10);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -1168,7 +1180,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_sync_rejects_raw_response_over_transport_limit() {
-        let body = "x".repeat(NEXUS_RESPONSE_SIZE_LIMIT + 1);
+        let body = "x".repeat(NEXUS_PAYLOAD_SIZE_LIMIT + 1);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -1241,6 +1253,56 @@ mod tests {
             NexusStartResult::SyncFailed { message } => assert_eq!(message, "boom"),
             other => panic!("expected SyncFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn start_handler_error_preserves_v1_31_retry_classification() {
+        let base =
+            serve_once("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n").await;
+        let client = HttpNexusClient::new();
+        assert_eq!(
+            client
+                .start_operation(
+                    &base,
+                    "req-1",
+                    "service",
+                    "operation",
+                    &empty_input(),
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap(),
+            NexusStartResult::HandlerError {
+                error_type: "INTERNAL".to_owned(),
+                failure: None,
+                retryable: true,
+            },
+        );
+
+        let base = serve_once(
+            "HTTP/1.1 400 Bad Request\r\nNexus-Request-Retryable: true\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            client
+                .start_operation(
+                    &base,
+                    "req-2",
+                    "service",
+                    "operation",
+                    &empty_input(),
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap(),
+            NexusStartResult::HandlerError {
+                error_type: "BAD_REQUEST".to_owned(),
+                failure: None,
+                retryable: true,
+            },
+        );
     }
 
     #[tokio::test]

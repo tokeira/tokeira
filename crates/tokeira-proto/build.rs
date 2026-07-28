@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = workspace_root.join("proto");
     let upstream_dir = proto_root.join("upstream");
     let internal_dir = proto_root.join("tokeira");
+    let compute_dir = internal_dir.join("compute");
     let controller_dir = internal_dir.join("internal/controller");
 
     println!("cargo:rerun-if-changed={}", upstream_dir.display());
@@ -29,7 +30,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Internal (Tokeira) — tonic/prost for backward compat ────────────────
-    let internal_protos = discover_protos(&internal_dir)?;
+    let mut internal_protos = discover_protos(&internal_dir)?;
+    // The public provider-neutral compute contract imports Temporal Payload.
+    // Compile it separately with an extern mapping; otherwise prost regenerates
+    // the imported Temporal packages during this second pass and overwrites the
+    // complete upstream output with a transitive subset.
+    internal_protos.retain(|path| !path.starts_with(&compute_dir));
     if !internal_protos.is_empty() {
         tonic_build::configure()
             .build_client(true)
@@ -38,6 +44,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .file_descriptor_set_path(out_dir.join("tokeira_internal_descriptor.bin"))
             .compile(
                 &internal_protos,
+                &[proto_root.as_path(), upstream_dir.as_path()],
+            )?;
+    }
+
+    // ── Tokeira compute provider contract — tonic/prost ────────────────────
+    let compute_protos = discover_protos(&compute_dir)?;
+    if !compute_protos.is_empty() {
+        tonic_build::configure()
+            .build_client(false)
+            .build_server(false)
+            .btree_map(["."])
+            .extern_path(".temporal.api", "crate::public::temporal::api")
+            .compile(
+                &compute_protos,
                 &[proto_root.as_path(), upstream_dir.as_path()],
             )?;
     }

@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package tokeira.compute.v1;
+
+import "temporal/api/common/v1/message.proto";
+
+// One task-queue family a launched worker should poll.
+message TaskQueueBinding {
+  string name = 1;
+  TaskQueueType type = 2;
+}
+
+// Task family owned by one worker-compute scaling group.
+enum TaskQueueType {
+  TASK_QUEUE_TYPE_UNSPECIFIED = 0;
+  TASK_QUEUE_TYPE_WORKFLOW = 1;
+  TASK_QUEUE_TYPE_ACTIVITY = 2;
+  TASK_QUEUE_TYPE_NEXUS = 3;
+}
+
+// Reason the controller requested another worker.
+enum InvokeReason {
+  INVOKE_REASON_UNSPECIFIED = 0;
+  INVOKE_REASON_CONFIGURATION_ACTIVATION = 1;
+  INVOKE_REASON_NO_SYNC_MATCH = 2;
+  INVOKE_REASON_BACKLOG = 3;
+  INVOKE_REASON_WORKER_REFRESH = 4;
+}
+
+// Provider-neutral input to the Nexus invoke-worker operation.
+message InvokeWorkerRequest {
+  string request_id = 1;
+  string namespace = 2;
+  string deployment_name = 3;
+  string build_id = 4;
+  string scaling_group = 5;
+  int32 count = 6;
+  repeated TaskQueueBinding task_queues = 7;
+  string provider_type = 8;
+  temporal.api.common.v1.Payload provider_details = 9;
+  bytes configuration_fingerprint = 10;
+  InvokeReason reason = 11;
+}
+
+// Synchronous acknowledgement of one idempotent invocation request.
+message InvokeWorkerResponse {
+  string request_id = 1;
+}

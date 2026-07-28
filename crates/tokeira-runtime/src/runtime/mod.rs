@@ -239,6 +239,8 @@ pub struct TokeiraRuntime<R> {
     completion_callback_tracking: CompletionCallbackTrackingState,
     /// In-memory Nexus worker-task broker.
     nexus_task_broker: NexusTaskBroker,
+    /// Current endpoint routing table used by Nexus delivery and backlog recovery.
+    nexus_registry: NexusEndpointRegistry,
     /// In-memory update caller registry.
     update_registry: UpdateRegistry,
     /// Run-local buffered consistent queries.
@@ -249,6 +251,8 @@ pub struct TokeiraRuntime<R> {
     heartbeat_store: Arc<dyn HeartbeatStore>,
     /// Runtime-local delivery metrics for fairness/observability.
     delivery_metrics: DeliveryMetrics,
+    /// Process-local exact-version counters consumed only by periodic capacity advice.
+    worker_compute_queue_metrics: crate::WorkerComputeQueueMetrics,
     /// Runtime-local backlog fairness state.
     fairness_state: FairnessState,
     /// Optional durable Worker Deployment registry used for v2 routing decisions.
@@ -692,6 +696,10 @@ where
         let worker_deployment_registry = Arc::new(RwLock::new(None));
         let heartbeat_store: Arc<dyn HeartbeatStore> = Arc::new(InMemoryHeartbeatStore::new());
         let delivery_metrics = DeliveryMetrics::new();
+        let worker_compute_queue_metrics = crate::WorkerComputeQueueMetrics::default();
+        broker.set_worker_compute_queue_metrics(worker_compute_queue_metrics.clone());
+        activity_broker.set_worker_compute_queue_metrics(worker_compute_queue_metrics.clone());
+        nexus_task_broker.set_worker_compute_queue_metrics(worker_compute_queue_metrics.clone());
         let fairness_state = FairnessState::new();
         let runtime_drain = Arc::new(RuntimeDrain::default());
         let shard_count = shard_count.max(1);
@@ -895,11 +903,13 @@ where
             )),
             completion_callback_tracking,
             nexus_task_broker,
+            nexus_registry,
             update_registry,
             buffered_queries,
             worker_registry,
             heartbeat_store,
             delivery_metrics,
+            worker_compute_queue_metrics,
             fairness_state,
             nexus_timeout_scanner_handle,
             nexus_timeout_scanner_cancel,
@@ -979,6 +989,38 @@ where
     /// Return a clone of the activity-task broker.
     pub fn activity_broker(&self) -> InMemoryActivityBroker {
         self.activity_broker.clone()
+    }
+
+    /// Return the advisory exact-version queue counter set for periodic sampling.
+    pub fn worker_compute_queue_metrics(&self) -> crate::WorkerComputeQueueMetrics {
+        self.worker_compute_queue_metrics.clone()
+    }
+
+    /// Build the queue-home sampler from the runtime's existing advisory delivery views.
+    pub fn worker_compute_queue_sampler(
+        &self,
+        sample_repository: Arc<dyn crate::WorkerComputeRepository>,
+        writer_id: IncarnationId,
+    ) -> crate::WorkerComputeQueueSampler<R> {
+        crate::WorkerComputeQueueSampler::new(
+            self.repo.clone(),
+            sample_repository,
+            self.broker.clone(),
+            self.activity_broker.clone(),
+            self.nexus_task_broker.clone(),
+            self.nexus_registry.clone(),
+            self.worker_compute_queue_metrics.clone(),
+            writer_id,
+        )
+    }
+
+    /// Snapshot active shard ownership for one advisory recovery scan.
+    pub fn active_shards(&self) -> Vec<ShardId> {
+        self.shard_owner
+            .read()
+            .expect("shard_owner lock poisoned")
+            .active_shards()
+            .collect()
     }
 
     /// Snapshot live and durable backlog once, grouped by effective priority.

@@ -41,6 +41,7 @@ An empty TOML document is valid. It selects Tokeira's documented safe defaults: 
 | `task-queue-management` — Task queue management, priority, and fairness | implemented | in-surface | general-availability | enabled | enabled | public-api: `WorkflowService.UpdateTaskQueueConfig` | task-queue / durable-live-api |
 | `user-fairness` — Task queue User Fairness | implemented | in-surface | general-availability | disabled | disabled | toml: `policy.task_queues.enable_fairness = true` | cluster, task-queue / startup-static |
 | `visibility` — Workflow visibility | partial | in-surface | general-availability | enabled | enabled | none | not-applicable / immutable |
+| `worker-compute-controller` — Worker Compute Controller | experimental | out-of-surface | experimental | disabled | disabled | toml: `policy.worker_compute.enabled = true` | cluster / startup-static |
 | `worker-config` — Worker configuration | unsupported | in-surface | general-availability | enabled | unavailable | unavailable | not-applicable / not-applicable |
 | `worker-deployments` — Worker deployments | implemented | in-surface | general-availability | enabled | enabled | none | not-applicable / immutable |
 | `worker-deployments-pre-release` — Worker deployments pre-release additions | experimental | out-of-surface | experimental | conditional | enabled | none | not-applicable / immutable |
@@ -251,6 +252,14 @@ Visibility list/count/describe APIs are backed by projection, but strict Tempora
 - Prerequisites: none
 - Evidence: manual-review `docs/conformance/v1.31.0/{supported.md,excluded.md}; docs/readiness/conformance.md`
 
+### Worker Compute Controller (`worker-compute-controller`)
+
+The opt-in controller activates only remote Nexus providers with the no-sync scaler and invoke-worker operation. Rate-based scaling, direct cloud providers, worker-set desired-size updates, scale-down, and proof of worker poll readiness are unavailable. Provider delivery is at least once; providers must deduplicate Action_Request_ID.
+
+- Guidance: Set [policy.worker_compute].enabled = true and restart tokeirad; configured Nexus providers may create billable external capacity.
+- Prerequisites: `Configured remote Nexus endpoint implementing invoke-worker`
+- Evidence: test `.kiro/specs/worker-compute-controller; provider-neutral lifecycle Properties 1–17`
+
 ### Worker configuration (`worker-config`)
 
 FetchWorkerConfig and UpdateWorkerConfig remain unsupported; live worker inventory belongs to worker-heartbeats.
@@ -458,6 +467,7 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `policy.quotas.max_signal_payload_bytes` | configured parity | `4194304` | no | yes | `workflow-signal` | Maximum admitted signal payload size. |
 | `policy.quotas.max_workflow_timeout_seconds` | configured parity | `315360000` | no | yes | `workflow-start` | Maximum admitted workflow execution timeout. |
 | `policy.task_queues.enable_fairness` | configured parity | `false` | no | yes | `user-fairness` | Opt in to weighted User Fairness; priority remains enabled. |
+| `policy.worker_compute.enabled` | Tokeira native | `false` | no | yes | `worker-compute-controller` | Enable the experimental remote Worker Compute Controller; configured providers may create billable capacity. |
 
 ## Durable live task-queue policy
 

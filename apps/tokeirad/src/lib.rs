@@ -37,7 +37,7 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use tokio::{
     net::TcpListener,
-    sync::{broadcast, oneshot},
+    sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_stream::wrappers::TcpListenerStream;
@@ -73,7 +73,8 @@ use tokeira_edge::{
     HistoryNotifyingRepository, HistoryWaitRegistry, HttpApiCatalog, HttpApiPolicy,
     InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig, LongPollGate,
     NamespaceCache, OperatorService, PendingQueryStore, PollerRegistry, ResolvedNamespace,
-    RoutingCache, WorkflowExecutionDescription, WorkflowService,
+    RoutingCache, WorkerComputeNamespaceCatalogAdapter, WorkflowExecutionDescription,
+    WorkflowService,
     conformance::{WireCoverageLayer, WireCoverageRecorder},
     grpc::{
         admin_service::AdminServiceGrpc, operator_service::OperatorServiceGrpc,
@@ -183,17 +184,20 @@ use tokeira_projection::{
     VisibilityQueryService, VisibilitySink, VisibilityStore,
 };
 use tokeira_runtime::{
+    ChannelDemandObservationSink, ChannelWorkerComputeReconcileSink,
     CompletionCallbackScannerConfig, ConnectionBudgetApplier, HttpNexusClient,
     HttpNexusCompletionClient, InMemoryNexusEndpointStore, MembershipConfig, NEXUS_CALLBACK_PATH,
     NEXUS_OPERATION_STATE_HEADER, NexusCompletionDeps, NexusCompletionRuntimeConfig,
     NexusEndpointRegistry, NexusEndpointSpec, NexusEndpointSpecTarget, NexusEndpointStore,
-    NexusNamespaceResolver, RepositoryBackedTaskQueueConfigStore, RuntimeConfig,
-    ScheduleEngineConfig, ScheduleStore, TEMPORAL_CALLBACK_TOKEN_HEADER, TokeiraRuntime,
+    NexusNamespaceResolver, NexusWorkerComputeProvider, OBSERVATION_CHANNEL_CAPACITY,
+    RECONCILE_CHANNEL_CAPACITY, RepositoryBackedTaskQueueConfigStore, RuntimeConfig,
+    ScheduleEngineConfig, ScheduleStore, SystemWorkerComputeClock, TEMPORAL_CALLBACK_TOKEN_HEADER,
+    TokeiraRuntime, WorkerComputeControllerService, WorkerComputeOutbox, WorkerComputeReconciler,
     WorkflowTaskReportedProblem, reported_problem_from_state, run_schedule_engine,
 };
 use tokeira_storage::{
-    InMemoryStore, LeaseOutcome, LeaseRepository, ProjectionLog, RunRepository,
-    TaskQueueConfigRepository, WorkerDeploymentRepository,
+    InMemoryStore, InMemoryWorkerComputeRepository, LeaseOutcome, LeaseRepository, ProjectionLog,
+    RunRepository, TaskQueueConfigRepository, WorkerComputeRepository, WorkerDeploymentRepository,
     dsql::{DsqlAuthConfig, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore},
 };
 use tokeira_types::{
@@ -700,11 +704,17 @@ async fn build_and_serve(
             let visibility_store = InMemoryVisibilityStore::default();
             let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
                 Arc::new(store.clone());
+            let worker_compute_repository =
+                effective_config.policy.worker_compute.enabled.then(|| {
+                    Arc::new(InMemoryWorkerComputeRepository::default())
+                        as Arc<dyn WorkerComputeRepository>
+                });
             build_and_serve_with_storage(
                 addr,
                 effective_config,
                 Arc::new(store.clone()),
                 worker_deployment_repository,
+                worker_compute_repository,
                 Arc::new(store.clone()),
                 store,
                 visibility_store.clone(),
@@ -740,6 +750,12 @@ async fn build_and_serve(
             let task_queue_config_repository: Arc<dyn TaskQueueConfigRepository> = Arc::new(
                 tokeira_storage::dsql::DsqlTaskQueueConfigRepository::new(director.clone()),
             );
+            let worker_compute_repository =
+                effective_config.policy.worker_compute.enabled.then(|| {
+                    Arc::new(tokeira_storage::dsql::DsqlWorkerComputeRepository::new(
+                        director.clone(),
+                    )) as Arc<dyn WorkerComputeRepository>
+                });
             let visibility_store = DsqlVisibilityStore::new(director);
             let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
                 Arc::new(worker_deployment_repository);
@@ -748,6 +764,7 @@ async fn build_and_serve(
                 effective_config,
                 Arc::new(run_repository),
                 worker_deployment_repository,
+                worker_compute_repository,
                 task_queue_config_repository,
                 projection_log,
                 visibility_store.clone(),
@@ -844,6 +861,7 @@ async fn build_and_serve_with_storage<R, L, S, V, F>(
     effective_config: Arc<TokeiraConfig>,
     run_repository: Arc<R>,
     worker_deployment_repository: Arc<dyn WorkerDeploymentRepository>,
+    worker_compute_repository: Option<Arc<dyn WorkerComputeRepository>>,
     task_queue_config_repository: Arc<dyn TaskQueueConfigRepository>,
     projection_log: L,
     visibility_query_store: V,
@@ -882,6 +900,8 @@ where
     )
     .await?;
     let nexus_registry = NexusEndpointRegistry::new(nexus_store.clone());
+    let nexus_http_client: Arc<dyn tokeira_runtime::NexusHttpClient> =
+        Arc::new(HttpNexusClient::new());
 
     // The runtime owns execution orchestration, scanners, brokers, and all
     // run-local in-memory coordination such as buffered consistent queries.
@@ -951,6 +971,7 @@ where
         scanner: CompletionCallbackScannerConfig::default(),
     };
 
+    let worker_compute_deployment_repository = worker_deployment_repository.clone();
     let runtime = TokeiraRuntime::new_with_nexus_and_shards_and_endpoint(
         repo.clone(),
         runtime_config.lane_count,
@@ -960,8 +981,8 @@ where
         runtime_config.backlog,
         runtime_config.activity_timeout_scanner,
         runtime_config.nexus_timeout_scanner,
-        nexus_registry,
-        Arc::new(HttpNexusClient::new()),
+        nexus_registry.clone(),
+        nexus_http_client.clone(),
         // Wave 5: the real `HttpNexusCompletionClient` POSTs completions to the
         // inbound `/nexus/callback` listener bound above; `system_callback_url` was
         // resolved to that listener's actual address so the loopback closes.
@@ -1011,6 +1032,76 @@ where
     let _task_queue_config_refresh = task_queue_config_store
         .clone()
         .spawn_refresh(background_cancel.clone());
+
+    let _worker_compute_service = if effective_config.policy.worker_compute.enabled {
+        let controller_repository = worker_compute_repository
+            .clone()
+            .context("worker-compute enabled without a controller repository")?;
+        let (observation_sender, observation_receiver) =
+            mpsc::channel(OBSERVATION_CHANNEL_CAPACITY);
+        let observation_sink = Arc::new(ChannelDemandObservationSink::new(observation_sender));
+        runtime
+            .broker()
+            .set_demand_observation_sink(observation_sink.clone());
+        runtime
+            .activity_broker()
+            .set_demand_observation_sink(observation_sink.clone());
+        runtime
+            .nexus_task_broker()
+            .set_demand_observation_sink(observation_sink);
+
+        let (reconcile_sender, reconcile_receiver) = mpsc::channel(RECONCILE_CHANNEL_CAPACITY);
+        runtime
+            .deployment_registry()
+            .expect("Worker Deployment repository was installed above")
+            .set_worker_compute_reconcile_sink(Arc::new(ChannelWorkerComputeReconcileSink::new(
+                reconcile_sender,
+            )));
+
+        let clock = Arc::new(SystemWorkerComputeClock);
+        let catalog = Arc::new(WorkerComputeNamespaceCatalogAdapter::new(
+            namespaces.clone(),
+        ));
+        let reconciler = WorkerComputeReconciler::new(
+            worker_compute_deployment_repository,
+            controller_repository.clone(),
+            node_id,
+        );
+        let sampler = runtime.worker_compute_queue_sampler(controller_repository.clone(), node_id);
+        let provider = Arc::new(NexusWorkerComputeProvider::new(
+            nexus_registry,
+            nexus_http_client,
+            runtime.nexus_task_broker(),
+        ));
+        let outbox = WorkerComputeOutbox::new(
+            controller_repository.clone(),
+            provider,
+            clock.clone(),
+            node_id,
+        );
+        let shard_runtime = runtime.clone();
+        let active_shards: tokeira_runtime::WorkerComputeActiveShards =
+            Arc::new(move || shard_runtime.active_shards());
+        let service = WorkerComputeControllerService::new(
+            catalog,
+            controller_repository,
+            reconciler,
+            sampler,
+            outbox,
+            clock,
+            active_shards,
+            observation_receiver,
+            reconcile_receiver,
+        );
+        let service_cancel = background_cancel.clone();
+        Some(tokio::spawn(async move {
+            if let Err(error) = service.run(service_cancel).await {
+                tracing::warn!(?error, "worker-compute controller service exited");
+            }
+        }))
+    } else {
+        None
+    };
 
     let _membership_client = effective_config
         .infrastructure

@@ -263,9 +263,20 @@ pub struct PollWorkflowTaskQueueRequest {
     pub task_queue: String,
     /// Declared normal queue for a sticky poll; absent for normal queues.
     pub normal_task_queue: Option<String>,
+    /// Whether `task_queue` is an SDK-generated sticky queue.
+    pub is_sticky: bool,
     pub worker_identity: String,
     /// Stable SDK worker-process key used by matching shutdown cancellation.
     pub worker_instance_key: String,
+    /// Dedicated Worker control queue supplied by modern SDKs.
+    pub worker_control_task_queue: String,
+    /// True only for explicit `WorkerDeploymentOptions` in VERSIONED mode.
+    ///
+    /// Deprecated capabilities may still populate the compatibility routing
+    /// fields below, but cannot prove scoped Worker authority.
+    pub scoped_versioned: bool,
+    /// Whether modern or enabled deprecated versioning metadata was present.
+    pub versioning_metadata_present: bool,
     pub deployment: Option<DeploymentId>,
     pub build_id: Option<BuildId>,
     pub sticky_run: Option<RunKey>,
@@ -702,9 +713,19 @@ pub struct ListNamespacesResponse {
 pub struct PollActivityTaskQueueRequest {
     pub namespace: String,
     pub task_queue: String,
+    /// Declared normal queue for a sticky poll; absent for normal queues.
+    pub normal_task_queue: Option<String>,
+    /// Whether `task_queue` is an SDK-generated sticky queue.
+    pub is_sticky: bool,
     pub worker_identity: String,
     /// Stable SDK worker-process key used by matching shutdown cancellation.
     pub worker_instance_key: String,
+    /// Dedicated Worker control queue supplied by modern SDKs.
+    pub worker_control_task_queue: String,
+    /// True only for explicit `WorkerDeploymentOptions` in VERSIONED mode.
+    pub scoped_versioned: bool,
+    /// Whether modern or enabled deprecated versioning metadata was present.
+    pub versioning_metadata_present: bool,
     /// Worker Deployment selected by the poller's versioning options.
     pub deployment: Option<DeploymentId>,
     /// Build within `deployment` selected by the poller's versioning options.

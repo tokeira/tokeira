@@ -616,6 +616,7 @@ mod tests {
             )
             .await
             .expect("worker-target provider task");
+        let expected_origin = task.origin.clone();
         let NexusTaskRequest::Http(request) = task.request else {
             panic!("provider delivery must use the neutral HTTP request envelope");
         };
@@ -641,6 +642,7 @@ mod tests {
             Some(crate::NexusTaskCorrelation::WorkerCompute {
                 action_id,
                 claim_epoch: 7,
+                origin: expected_origin,
             })
         );
         assert!(broker.complete_worker_compute(
@@ -759,6 +761,7 @@ mod tests {
                                 Some(crate::NexusTaskCorrelation::WorkerCompute {
                                     action_id,
                                     claim_epoch,
+                                    origin: task.origin.clone(),
                                 }),
                             );
                             assert!(broker.complete_worker_compute(

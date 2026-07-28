@@ -32,7 +32,8 @@ use tokeira_types::{
     ActivityTaskToken, BuildId, DeploymentId, ExecutionRef, ExecutionStatus, Headers,
     HeartbeatStore, IncarnationId, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
     RequestId, RetryPolicy, RunId, RunKey, ShardEpoch, ShardId, TaskKind, TaskQueueName,
-    TransitionSeq, WorkerIdentity, WorkflowTaskToken, execution_home_bundle,
+    TransitionSeq, WorkerIdentity, WorkerTaskClass, WorkerTaskOrigin, WorkflowTaskToken,
+    execution_home_bundle,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -1093,16 +1094,26 @@ where
         namespace_id: NamespaceId,
         task_queue: TaskQueueName,
         worker: WorkerIdentity,
+        task_classes: &[WorkerTaskClass],
     ) -> bool {
         if !cancel_worker_polls_on_shutdown() {
             return false;
         }
-        self.broker
-            .deny_worker(namespace_id, task_queue.clone(), worker.clone())
-            .await;
-        self.activity_broker
-            .deny_worker(namespace_id, task_queue, worker)
-            .await;
+        if task_classes.contains(&WorkerTaskClass::Workflow) {
+            self.broker
+                .deny_worker(namespace_id, task_queue.clone(), worker.clone())
+                .await;
+        }
+        if task_classes.contains(&WorkerTaskClass::Activity) {
+            self.activity_broker
+                .deny_worker(namespace_id, task_queue.clone(), worker.clone())
+                .await;
+        }
+        if task_classes.contains(&WorkerTaskClass::Nexus) {
+            self.nexus_task_broker
+                .deny_worker(namespace_id, task_queue, worker)
+                .await;
+        }
         true
     }
 
@@ -1535,6 +1546,8 @@ pub struct StartedWorkflowTask {
     pub target_worker_deployment_version_changed: bool,
     /// Opaque token used to complete the task.
     pub token: WorkflowTaskToken,
+    /// Exact final server-authored delivery origin.
+    pub origin: WorkerTaskOrigin,
 }
 
 /// Work returned from the Temporal-compatible workflow poll path.
@@ -1617,6 +1630,8 @@ pub struct StartedActivityTask {
     /// Heartbeat interval; missing heartbeats trigger
     /// a timeout.
     pub heartbeat_timeout: Option<Duration>,
+    /// Exact final server-authored delivery origin.
+    pub origin: WorkerTaskOrigin,
 }
 
 /// Durable flags returned after recording an activity heartbeat.

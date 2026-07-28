@@ -655,6 +655,46 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "Temporal namespace:role grants for matching JWT subjects."
     ),
     field!(
+        "policy.authorization.jwt.issuers[].worker_scopes[].match_sub",
+        TokeiraNative,
+        "\"\"",
+        true,
+        Some("scoped-worker-authorization"),
+        "Full-string JWT subject glob for one exact Worker scope."
+    ),
+    field!(
+        "policy.authorization.jwt.issuers[].worker_scopes[].namespace",
+        TokeiraNative,
+        "\"\"",
+        true,
+        Some("scoped-worker-authorization"),
+        "Exact namespace name authorized for the scoped Worker."
+    ),
+    field!(
+        "policy.authorization.jwt.issuers[].worker_scopes[].task_queues",
+        TokeiraNative,
+        "[]",
+        true,
+        Some("scoped-worker-authorization"),
+        "Non-empty exact normal task-queue allowlist; sticky aliases are not configured."
+    ),
+    field!(
+        "policy.authorization.jwt.issuers[].worker_scopes[].deployment_name",
+        TokeiraNative,
+        "\"\"",
+        true,
+        Some("scoped-worker-authorization"),
+        "Exact Worker Deployment name."
+    ),
+    field!(
+        "policy.authorization.jwt.issuers[].worker_scopes[].build_id",
+        TokeiraNative,
+        "\"\"",
+        true,
+        Some("scoped-worker-authorization"),
+        "Exact Worker Build ID paired with deployment_name."
+    ),
+    field!(
         "policy.authorization.aws_iam.grants[].match_arn",
         TokeiraNative,
         "\"\"",
@@ -669,6 +709,46 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         true,
         Some("aws-iam-bearer-authorization"),
         "Temporal namespace:role grants for matching AWS identities."
+    ),
+    field!(
+        "policy.authorization.aws_iam.worker_scopes[].match_arn",
+        TokeiraNative,
+        "\"\"",
+        true,
+        Some("scoped-worker-authorization"),
+        "Full-string verified STS caller-ARN glob for one exact Worker scope."
+    ),
+    field!(
+        "policy.authorization.aws_iam.worker_scopes[].namespace",
+        TokeiraNative,
+        "\"\"",
+        true,
+        Some("scoped-worker-authorization"),
+        "Exact namespace name authorized for the scoped AWS identity."
+    ),
+    field!(
+        "policy.authorization.aws_iam.worker_scopes[].task_queues",
+        TokeiraNative,
+        "[]",
+        true,
+        Some("scoped-worker-authorization"),
+        "Non-empty exact normal task-queue allowlist for the scoped AWS identity."
+    ),
+    field!(
+        "policy.authorization.aws_iam.worker_scopes[].deployment_name",
+        TokeiraNative,
+        "\"\"",
+        true,
+        Some("scoped-worker-authorization"),
+        "Exact Worker Deployment name."
+    ),
+    field!(
+        "policy.authorization.aws_iam.worker_scopes[].build_id",
+        TokeiraNative,
+        "\"\"",
+        true,
+        Some("scoped-worker-authorization"),
+        "Exact Worker Build ID paired with deployment_name."
     ),
     field!(
         "capacity.performance.target_workflow_starts_per_second",
@@ -852,10 +932,24 @@ permissions_claim = "permissions"
 match_sub = "system:serviceaccount:*"
 grant = ["default:worker"]
 
+[[policy.authorization.jwt.issuers.worker_scopes]]
+match_sub = "system:serviceaccount:workers:*"
+namespace = "default"
+task_queues = ["worker-queue"]
+deployment_name = "workers"
+build_id = "build-a"
+
 [policy.authorization.aws_iam]
 [[policy.authorization.aws_iam.grants]]
 match_arn = "arn:aws:sts::123456789012:assumed-role/tokeira-*"
 grant = ["default:worker"]
+
+[[policy.authorization.aws_iam.worker_scopes]]
+match_arn = "arn:aws:sts::123456789012:assumed-role/tokeira-worker-*"
+namespace = "default"
+task_queues = ["worker-queue"]
+deployment_name = "workers"
+build_id = "build-a"
 
 [capacity.performance]
 target_workflow_starts_per_second = 1000

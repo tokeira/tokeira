@@ -2241,7 +2241,10 @@ mod tests {
     };
     use proptest::prelude::*;
     use time::Duration as TimeDuration;
-    use tokeira_types::{BuildId, DeploymentId, NamespaceId, Payloads, TaskKind, TaskQueueName};
+    use tokeira_types::{
+        BuildId, DeploymentId, NamespaceId, Payloads, TaskKind, TaskQueueName, WorkerTaskClass,
+        WorkerTaskOrigin,
+    };
     use tokio::sync::{mpsc, oneshot};
     use uuid::Uuid;
 
@@ -2283,6 +2286,10 @@ mod tests {
             deployment: deployment.map(|value| DeploymentId(value.to_string())),
             build_id: build_id.map(|value| BuildId(value.to_string())),
         }
+    }
+
+    fn query_origin(queue: &QueueKey) -> WorkerTaskOrigin {
+        WorkerTaskOrigin::from_queue_key(queue, queue.task_queue.clone(), WorkerTaskClass::Query)
     }
 
     fn workflow_task(queue: QueueKey) -> DispatchableWorkflowTask {
@@ -3665,9 +3672,11 @@ mod tests {
                     query_type: query_type.to_string(),
                     query_args: Payloads::default(),
                     queue: queue.clone(),
+                    origin: query_origin(&queue),
                     sticky_preferred: None,
                     sticky_queue: None,
                     sticky_deadline: None,
+                    deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(1),
                     response_tx: tx,
                 })
                 .await;
@@ -3707,9 +3716,11 @@ mod tests {
                 query_type: "sticky".into(),
                 query_args: Payloads::default(),
                 queue: queue.clone(),
+                origin: query_origin(&queue),
                 sticky_preferred: Some(sticky_worker.clone()),
                 sticky_queue: None,
                 sticky_deadline: None,
+                deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(1),
                 response_tx: sticky_tx,
             })
             .await;
@@ -3720,9 +3731,11 @@ mod tests {
                 query_type: "general".into(),
                 query_args: Payloads::default(),
                 queue: queue.clone(),
+                origin: query_origin(&queue),
                 sticky_preferred: None,
                 sticky_queue: None,
                 sticky_deadline: None,
+                deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(1),
                 response_tx: general_tx,
             })
             .await;
@@ -3762,9 +3775,11 @@ mod tests {
                 query_type: "sticky".into(),
                 query_args: Payloads::default(),
                 queue: normal_queue.clone(),
+                origin: query_origin(&normal_queue),
                 sticky_preferred: Some(worker.clone()),
                 sticky_queue: Some(sticky_name),
                 sticky_deadline: None,
+                deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(1),
                 response_tx: tx,
             })
             .await;
@@ -3800,9 +3815,11 @@ mod tests {
                 query_type: "direct".into(),
                 query_args: Payloads::default(),
                 queue: queue.clone(),
+                origin: query_origin(&queue),
                 sticky_preferred: None,
                 sticky_queue: None,
                 sticky_deadline: None,
+                deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(1),
                 response_tx: tx,
             })
             .await;
@@ -3835,9 +3852,11 @@ mod tests {
                 query_type: "sticky-expired".into(),
                 query_args: Payloads::default(),
                 queue: queue.clone(),
+                origin: query_origin(&queue),
                 sticky_preferred: Some(WorkerIdentity("worker-a".into())),
                 sticky_queue: None,
                 sticky_deadline: Some(OffsetDateTime::UNIX_EPOCH),
+                deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(1),
                 response_tx: tx,
             })
             .await;
@@ -3875,9 +3894,11 @@ mod tests {
                 query_type: "sticky-waits".into(),
                 query_args: Payloads::default(),
                 queue: queue.clone(),
+                origin: query_origin(&queue),
                 sticky_preferred: Some(sticky_worker),
                 sticky_queue: None,
                 sticky_deadline: Some(OffsetDateTime::now_utc() + TimeDuration::milliseconds(1)),
+                deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(1),
                 response_tx: tx,
             })
             .await;
@@ -3913,9 +3934,11 @@ mod tests {
                 query_type: "fallback-now".into(),
                 query_args: Payloads::default(),
                 queue: normal_queue.clone(),
+                origin: query_origin(&normal_queue),
                 sticky_preferred: Some(WorkerIdentity("departed-worker".into())),
                 sticky_queue: Some(TaskQueueName("sticky".into())),
                 sticky_deadline: Some(OffsetDateTime::now_utc() + TimeDuration::seconds(5)),
+                deadline: OffsetDateTime::now_utc() + TimeDuration::minutes(1),
                 response_tx: tx,
             })
             .await;

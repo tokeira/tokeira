@@ -16,12 +16,14 @@ use thiserror::Error;
 
 mod jwt;
 mod sts;
+mod worker_scope;
 
 pub use jwt::{JwksKeyProvider, JwtAuthenticator, JwtIssuerProfile};
 pub use sts::{
     StsAuthenticator, ValidatedStsRequest, is_aws_bearer, strip_aws_bearer_prefix,
     validate_presigned_sts_url,
 };
+pub use worker_scope::*;
 
 /// Presence-enabled claim mapper combining configured JWT and AWS IAM sources.
 #[derive(Debug)]
@@ -124,6 +126,8 @@ pub struct Claims {
     pub namespaces: HashMap<String, Role>,
     /// Authentication method, such as `jwt` or `aws-iam`.
     pub auth_type: String,
+    /// Exact Worker attenuation, when this credential is task-bound.
+    pub worker_scope: Option<WorkerScope>,
 }
 
 /// Server-computed identity eligible for durable history attribution.
@@ -208,6 +212,8 @@ pub struct CallTarget<'a> {
     pub namespace: Option<&'a str>,
     /// Ground-truthed method classification.
     pub classification: CallClassification,
+    /// Resolved Worker intent, absent for every non-Worker operation.
+    pub worker: Option<WorkerCallTarget<'a>>,
 }
 
 /// Successful authorizer decision.
@@ -267,6 +273,26 @@ impl Authorizer for DefaultAuthorizer {
         let Some(claims) = claims else {
             return Ok(AuthzDecision::Deny { reason: None });
         };
+        if let Some(scope) = claims.worker_scope.as_ref() {
+            let Some(worker) = target.worker else {
+                return Ok(AuthzDecision::Deny { reason: None });
+            };
+            return Ok(
+                match scope.authorize(
+                    worker.operation,
+                    target.namespace.unwrap_or_default(),
+                    worker.target,
+                ) {
+                    WorkerScopeDecision::Allow => AuthzDecision::Allow {
+                        principal: Some(AuthPrincipal {
+                            principal_type: claims.auth_type.clone(),
+                            name: claims.subject.clone(),
+                        }),
+                    },
+                    WorkerScopeDecision::Deny(_) => AuthzDecision::Deny { reason: None },
+                },
+            );
+        }
         let role = match target.classification.scope {
             Scope::Cluster => claims.system,
             Scope::Namespace => {
@@ -465,6 +491,9 @@ impl GrantRules {
 mod tests {
     use proptest::prelude::*;
     use regex::Regex;
+    use tokeira_types::{
+        BuildId, DeploymentId, NamespaceId, TaskQueueName, WorkerTaskClass, WorkerTaskOrigin,
+    };
 
     use super::*;
 
@@ -474,6 +503,20 @@ mod tests {
         assert!(!Role::WORKER.satisfies(Role::WRITER));
         assert!(!Role::WORKER.satisfies(Role::ADMIN));
         assert!((Role::WORKER | Role::READER).satisfies(Role::READER));
+    }
+
+    #[test]
+    fn worker_task_origin_serde_round_trips() {
+        let origin = WorkerTaskOrigin {
+            namespace_id: NamespaceId::default(),
+            normal_task_queue: TaskQueueName("payments".to_owned()),
+            task_class: WorkerTaskClass::Activity,
+            deployment: DeploymentId("payments".to_owned()),
+            build_id: BuildId("2026.07.28".to_owned()),
+        };
+        let encoded = serde_json::to_string(&origin).expect("serialize origin");
+        let decoded: WorkerTaskOrigin = serde_json::from_str(&encoded).expect("deserialize origin");
+        assert_eq!(decoded, origin);
     }
 
     #[test]
@@ -546,6 +589,7 @@ mod tests {
                     scope: if scope_namespace { Scope::Namespace } else { Scope::Cluster },
                     access,
                 },
+                worker: None,
             };
             let decision = DefaultAuthorizer.authorize(Some(&claims), &target).expect("decision");
             let effective = if scope_namespace { system | namespace_role } else { system };
@@ -556,6 +600,191 @@ mod tests {
             };
             prop_assert_eq!(
                 matches!(decision, AuthzDecision::Allow { .. }),
+                effective >= required
+            );
+        }
+    }
+
+    fn operation(index: u8) -> WorkerOperation {
+        match index % 15 {
+            0 => WorkerOperation::PollWorkflowTaskQueue,
+            1 => WorkerOperation::PollActivityTaskQueue,
+            2 => WorkerOperation::PollNexusTaskQueue,
+            3 => WorkerOperation::RespondWorkflowTaskCompleted,
+            4 => WorkerOperation::RespondWorkflowTaskFailed,
+            5 => WorkerOperation::RespondQueryTaskCompleted,
+            6 => WorkerOperation::RespondActivityTaskCompleted,
+            7 => WorkerOperation::RespondActivityTaskFailed,
+            8 => WorkerOperation::RespondActivityTaskCanceled,
+            9 => WorkerOperation::RecordActivityTaskHeartbeat,
+            10 => WorkerOperation::RespondNexusTaskCompleted,
+            11 => WorkerOperation::RespondNexusTaskFailed,
+            12 => WorkerOperation::RecordWorkerHeartbeat,
+            13 => WorkerOperation::ShutdownWorker,
+            _ => WorkerOperation::DescribeTaskQueue,
+        }
+    }
+
+    fn expected_class(operation: WorkerOperation) -> Option<Option<WorkerTaskClass>> {
+        match operation {
+            WorkerOperation::PollWorkflowTaskQueue
+            | WorkerOperation::RespondWorkflowTaskCompleted
+            | WorkerOperation::RespondWorkflowTaskFailed => Some(Some(WorkerTaskClass::Workflow)),
+            WorkerOperation::PollActivityTaskQueue
+            | WorkerOperation::RespondActivityTaskCompleted
+            | WorkerOperation::RespondActivityTaskFailed
+            | WorkerOperation::RespondActivityTaskCanceled
+            | WorkerOperation::RecordActivityTaskHeartbeat => Some(Some(WorkerTaskClass::Activity)),
+            WorkerOperation::PollNexusTaskQueue
+            | WorkerOperation::RespondNexusTaskCompleted
+            | WorkerOperation::RespondNexusTaskFailed => Some(Some(WorkerTaskClass::Nexus)),
+            WorkerOperation::RespondQueryTaskCompleted => Some(Some(WorkerTaskClass::Query)),
+            WorkerOperation::RecordWorkerHeartbeat => Some(None),
+            WorkerOperation::ShutdownWorker | WorkerOperation::DescribeTaskQueue => None,
+        }
+    }
+
+    // Feature: scoped-worker-authorization, Property 4: Scoped authorizer decision matrix
+    proptest! {
+        #[test]
+        fn property_scoped_authorizer_decision_matrix(
+            operation_index in 0u8..15,
+            target_kind in 0u8..3,
+            wrong_namespace in any::<bool>(),
+            wrong_queue in any::<bool>(),
+            wrong_deployment in any::<bool>(),
+            wrong_build in any::<bool>(),
+            class_index in 0u8..4,
+        ) {
+            let scope = WorkerScope::try_new(
+                "payments".to_owned(),
+                vec!["payments-worker".to_owned()],
+                "payments".to_owned(),
+                "build-a".to_owned(),
+            ).expect("scope");
+            let claims = Claims {
+                subject: "worker".to_owned(),
+                system: Role::ADMIN,
+                auth_type: "jwt".to_owned(),
+                worker_scope: Some(scope),
+                ..Default::default()
+            };
+            let operation = operation(operation_index);
+            let class = match class_index {
+                0 => WorkerTaskClass::Workflow,
+                1 => WorkerTaskClass::Activity,
+                2 => WorkerTaskClass::Query,
+                _ => WorkerTaskClass::Nexus,
+            };
+            let worker_target = match target_kind {
+                0 => WorkerTarget::Preflight,
+                1 => WorkerTarget::TaskQueue {
+                    normal_task_queue: if wrong_queue { "other" } else { "payments-worker" },
+                },
+                _ => WorkerTarget::VersionedTask {
+                    normal_task_queue: if wrong_queue { "other" } else { "payments-worker" },
+                    task_class: class,
+                    deployment_name: if wrong_deployment { "other" } else { "payments" },
+                    build_id: if wrong_build { "other" } else { "build-a" },
+                },
+            };
+            let namespace = if wrong_namespace { "other" } else { "payments" };
+            let target = CallTarget {
+                api_name: "/test.Service/WorkerMethod",
+                namespace: Some(namespace),
+                classification: CallClassification {
+                    scope: Scope::Namespace,
+                    access: Access::Write,
+                },
+                worker: Some(WorkerCallTarget {
+                    operation,
+                    target: worker_target,
+                }),
+            };
+            let actual = DefaultAuthorizer
+                .authorize(Some(&claims), &target)
+                .expect("decision");
+            let expected = if wrong_namespace {
+                false
+            } else {
+                match worker_target {
+                    WorkerTarget::Preflight => true,
+                    WorkerTarget::TaskQueue { .. } => {
+                        expected_class(operation).is_none() && !wrong_queue
+                    }
+                    WorkerTarget::VersionedTask { task_class, .. } => {
+                        let class_matches = if operation
+                            == WorkerOperation::PollWorkflowTaskQueue
+                        {
+                            matches!(
+                                task_class,
+                                WorkerTaskClass::Workflow | WorkerTaskClass::Query
+                            )
+                        } else {
+                            expected_class(operation).is_some_and(|expected| {
+                                expected.is_none_or(|expected| expected == task_class)
+                            })
+                        };
+                        class_matches && !wrong_queue && !wrong_deployment && !wrong_build
+                    }
+                }
+            };
+            prop_assert_eq!(matches!(actual, AuthzDecision::Allow { .. }), expected);
+        }
+    }
+
+    // Feature: scoped-worker-authorization, Property 12: Ordinary-identity preservation
+    proptest! {
+        #[test]
+        fn property_ordinary_identity_preservation(
+            system in 0i16..16,
+            namespace_role in 0i16..16,
+            scope_namespace in any::<bool>(),
+            access_index in 0u8..4,
+            include_worker_target in any::<bool>(),
+        ) {
+            let mut claims = Claims {
+                subject: "ordinary".to_owned(),
+                system: Role(system),
+                auth_type: "jwt".to_owned(),
+                ..Default::default()
+            };
+            claims.namespaces.insert("namespace".to_owned(), Role(namespace_role));
+            let access = match access_index {
+                0 => Access::ReadOnly,
+                1 => Access::Write,
+                2 => Access::Admin,
+                _ => Access::Unknown,
+            };
+            let target = CallTarget {
+                api_name: "/test.Service/Method",
+                namespace: scope_namespace.then_some("namespace"),
+                classification: CallClassification {
+                    scope: if scope_namespace { Scope::Namespace } else { Scope::Cluster },
+                    access,
+                },
+                worker: include_worker_target.then_some(WorkerCallTarget {
+                    operation: WorkerOperation::DescribeTaskQueue,
+                    target: WorkerTarget::TaskQueue {
+                        normal_task_queue: "ignored",
+                    },
+                }),
+            };
+            let actual = DefaultAuthorizer
+                .authorize(Some(&claims), &target)
+                .expect("decision");
+            let effective = if scope_namespace {
+                system | namespace_role
+            } else {
+                system
+            };
+            let required = match access {
+                Access::ReadOnly => Role::READER.0,
+                Access::Write => Role::WRITER.0,
+                Access::Admin | Access::Unknown => Role::ADMIN.0,
+            };
+            prop_assert_eq!(
+                matches!(actual, AuthzDecision::Allow { .. }),
                 effective >= required
             );
         }

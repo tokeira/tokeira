@@ -37,6 +37,7 @@ An empty TOML document is valid. It selects Tokeira's documented safe defaults: 
 | `remote-cluster` — Remote cluster administration | unsupported | in-surface | general-availability | enabled | unavailable | unavailable | not-applicable / not-applicable |
 | `reported-problems-search-attribute` — Workflow task reported problems | partial | in-surface | general-availability | enabled | enabled | none | not-applicable / immutable |
 | `schedules` — Schedules | partial | in-surface | general-availability | enabled | enabled | none | not-applicable / immutable |
+| `scoped-worker-authorization` — Scoped Worker authorization | implemented | not-applicable | not-applicable | not-applicable | disabled | toml: `policy.authorization.jwt.issuers[].worker_scopes or policy.authorization.aws_iam.worker_scopes` | worker, namespace, task-queue / startup-static |
 | `search-attributes` — Search attributes | partial | in-surface | general-availability | enabled | enabled | none | not-applicable / immutable |
 | `task-queue-management` — Task queue management, priority, and fairness | implemented | in-surface | general-availability | enabled | enabled | public-api: `WorkflowService.UpdateTaskQueueConfig` | task-queue / durable-live-api |
 | `user-fairness` — Task queue User Fairness | implemented | in-surface | general-availability | disabled | disabled | toml: `policy.task_queues.enable_fairness = true` | cluster, task-queue / startup-static |
@@ -219,6 +220,14 @@ The public v1.31.0 schedule behavior is conformance-tested; the native schedule 
 - Guidance: Enabled with an empty production configuration.
 - Prerequisites: none
 - Evidence: test `Temporal functional corpus TestScheduleV1 @ v1.31.0: Tier 5.30`
+
+### Scoped Worker authorization (`scoped-worker-authorization`)
+
+Tokeira-native, presence-activated credential attenuation limits a standard SDK Worker to one exact namespace, an allowlist of normal task queues, one exact Deployment Version, and a fixed Worker RPC matrix. Server-authored durable token provenance prevents a scoped credential from completing work it was not authorized to receive.
+
+- Guidance: Configure one exact subject or verified-ARN Worker scope and restart tokeirad; the standard SDK supplies that external bearer on every Worker RPC.
+- Prerequisites: `Configured JWT issuer or AWS IAM verifier`, `Exact Worker Deployment and Build ID`
+- Evidence: test `.kiro/specs/scoped-worker-authorization`
 
 ### Search attributes (`search-attributes`)
 
@@ -437,6 +446,11 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `infrastructure.storage` | infrastructure | `"in-memory"` | no | yes | — | Select in-memory development storage or Aurora DSQL. |
 | `policy.authorization.aws_iam.grants[].grant` | Tokeira native | `[]` | yes | yes | `aws-iam-bearer-authorization` | Temporal namespace:role grants for matching AWS identities. |
 | `policy.authorization.aws_iam.grants[].match_arn` | Tokeira native | `""` | yes | yes | `aws-iam-bearer-authorization` | Full-string STS caller-ARN glob. |
+| `policy.authorization.aws_iam.worker_scopes[].build_id` | Tokeira native | `""` | yes | yes | `scoped-worker-authorization` | Exact Worker Build ID paired with deployment_name. |
+| `policy.authorization.aws_iam.worker_scopes[].deployment_name` | Tokeira native | `""` | yes | yes | `scoped-worker-authorization` | Exact Worker Deployment name. |
+| `policy.authorization.aws_iam.worker_scopes[].match_arn` | Tokeira native | `""` | yes | yes | `scoped-worker-authorization` | Full-string verified STS caller-ARN glob for one exact Worker scope. |
+| `policy.authorization.aws_iam.worker_scopes[].namespace` | Tokeira native | `""` | yes | yes | `scoped-worker-authorization` | Exact namespace name authorized for the scoped AWS identity. |
+| `policy.authorization.aws_iam.worker_scopes[].task_queues` | Tokeira native | `[]` | yes | yes | `scoped-worker-authorization` | Non-empty exact normal task-queue allowlist for the scoped AWS identity. |
 | `policy.authorization.expose_authorizer_errors` | configured parity | `false` | no | yes | `authorization` | Expose authorizer implementation failures instead of generic denial. |
 | `policy.authorization.jwt.issuers[].audience` | configured parity | `""` | no | yes | `authorization` | Optional exact audience; blank disables audience validation. |
 | `policy.authorization.jwt.issuers[].grants[].grant` | configured parity | `[]` | yes | yes | `authorization` | Temporal namespace:role grants for matching JWT subjects. |
@@ -446,6 +460,11 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `policy.authorization.jwt.issuers[].name` | configured parity | `""` | yes | yes | `authorization` | Stable operator label for one issuer profile. |
 | `policy.authorization.jwt.issuers[].permissions_claim` | configured parity | `"permissions"` | no | yes | `authorization` | JWT array claim containing Temporal namespace:role grants. |
 | `policy.authorization.jwt.issuers[].refresh_interval` | configured parity | `<unset>` | no | yes | `authorization` | Optional positive JWKS refresh duration using ms, s, m, or h. |
+| `policy.authorization.jwt.issuers[].worker_scopes[].build_id` | Tokeira native | `""` | yes | yes | `scoped-worker-authorization` | Exact Worker Build ID paired with deployment_name. |
+| `policy.authorization.jwt.issuers[].worker_scopes[].deployment_name` | Tokeira native | `""` | yes | yes | `scoped-worker-authorization` | Exact Worker Deployment name. |
+| `policy.authorization.jwt.issuers[].worker_scopes[].match_sub` | Tokeira native | `""` | yes | yes | `scoped-worker-authorization` | Full-string JWT subject glob for one exact Worker scope. |
+| `policy.authorization.jwt.issuers[].worker_scopes[].namespace` | Tokeira native | `""` | yes | yes | `scoped-worker-authorization` | Exact namespace name authorized for the scoped Worker. |
+| `policy.authorization.jwt.issuers[].worker_scopes[].task_queues` | Tokeira native | `[]` | yes | yes | `scoped-worker-authorization` | Non-empty exact normal task-queue allowlist; sticky aliases are not configured. |
 | `policy.authorization.principal_attribution` | configured parity | `false` | no | yes | `authorization` | Write the authenticated principal to server-authored history metadata. |
 | `policy.compatibility.enable_standalone_activities` | configured parity | `false` | no | yes | `activity-executions` | Enable the v1.31.0 preview standalone-activity surface. |
 | `policy.default_retention_days` | stock parity | `30` | no | yes | `namespace-management` | Default workflow-history retention for newly created namespaces. |
@@ -468,6 +487,58 @@ All accepted production leaves are listed below. Fields are startup-static; chan
 | `policy.quotas.max_workflow_timeout_seconds` | configured parity | `315360000` | no | yes | `workflow-start` | Maximum admitted workflow execution timeout. |
 | `policy.task_queues.enable_fairness` | configured parity | `false` | no | yes | `user-fairness` | Opt in to weighted User Fairness; priority remains enabled. |
 | `policy.worker_compute.enabled` | Tokeira native | `false` | no | yes | `worker-compute-controller` | Enable the experimental remote Worker Compute Controller; configured providers may create billable capacity. |
+
+## Scoped Worker authorization
+
+`scoped-worker-authorization` is a Tokeira-native, presence-activated attenuation for standard Temporal SDK Workers. Tokeira does not mint, rotate, or distribute the bearer: an external IdP, workload-identity system, or Worker Compute provider owns that lifecycle. When the verified credential carries or maps to a Worker scope, ordinary Temporal roles cannot widen it.
+
+The fixed signed JWT claim is `tokeira_worker_scope`:
+
+```json
+{
+"version": 1,
+"namespace": "payments",
+"task_queues": ["payments-worker"],
+"deployment_name": "payments",
+"build_id": "2026-07-28.1"
+}
+```
+
+Alternatively, map a verified JWT subject or AWS STS caller ARN in TOML:
+
+```toml
+[[policy.authorization.jwt.issuers.worker_scopes]]
+match_sub = "system:serviceaccount:workers:payments-*"
+namespace = "payments"
+task_queues = ["payments-worker"]
+deployment_name = "payments"
+build_id = "2026-07-28.1"
+
+[[policy.authorization.aws_iam.worker_scopes]]
+match_arn = "arn:aws:sts::123456789012:assumed-role/payments-worker-*"
+namespace = "payments"
+task_queues = ["payments-worker"]
+deployment_name = "payments"
+build_id = "2026-07-28.1"
+```
+
+Every resource comparison is exact and case-sensitive. Polls must use VERSIONED Worker Deployment mode with both the configured deployment name and build ID. The fixed Worker RPC surface is `PollWorkflowTaskQueue`, `PollActivityTaskQueue`, `PollNexusTaskQueue`, `RespondWorkflowTaskCompleted`, `RespondWorkflowTaskFailed`, `RespondQueryTaskCompleted`, `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RespondActivityTaskCanceled`, `RecordActivityTaskHeartbeat`, `RespondNexusTaskCompleted`, `RespondNexusTaskFailed`, `RecordWorkerHeartbeat`, `ShutdownWorker`, and queue-scoped `DescribeTaskQueue`. Universal `Health/Check` and `GetSystemInfo` remain available independently of Worker scope.
+
+Activity By-ID aliases, standalone Activities, unversioned or deprecated Worker Versioning, Worker inventory, visibility/history reads, Workflow starts, and every other namespace-wide API are denied for a scoped identity. Sticky Workflow polls authorize the request's stable `normal_name`; sticky aliases are never configured as resources.
+
+The Go SDK can refresh an externally issued bearer through its standard credentials callback; return the token without a `Bearer ` prefix because the SDK adds it:
+
+```go
+c, err := client.Dial(client.Options{
+HostPort:  "tokeira.example:7233",
+Namespace: "payments",
+Credentials: client.NewAPIKeyDynamicCredentials(
+func(ctx context.Context) (string, error) {
+return credentialSource.Token(ctx)
+},
+),
+})
+```
 
 ## Durable live task-queue policy
 

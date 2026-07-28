@@ -206,6 +206,9 @@ where
         }
 
         let now = OffsetDateTime::now_utc();
+        let deadline = now
+            .checked_add(timeout_after)
+            .ok_or_else(|| anyhow!("query deadline exceeds the supported time range"))?;
         // A sticky worker is eligible only while it still owns the version to
         // which the query routes. If AUTO_UPGRADE moved the target, v1.31.0
         // bypasses the old sticky queue and sends the query to the new normal
@@ -228,6 +231,11 @@ where
 
         let (response_tx, response_rx) = oneshot::channel();
         let query_id = Uuid::new_v4().to_string();
+        let origin = WorkerTaskOrigin::from_queue_key(
+            &queue,
+            state.task_queue.clone(),
+            tokeira_types::WorkerTaskClass::Query,
+        );
         // Direct dispatch requires BOTH a completed workflow task (else no
         // worker can answer) AND a quiescent run — closed, or open with no
         // in-flight WFT (`safeToDispatchDirectly`, queryworkflow/api.go:
@@ -247,6 +255,7 @@ where
                         query_args,
                         required_barrier,
                         enqueued_at: std::time::Instant::now(),
+                        deadline,
                         response_tx,
                     },
                 )
@@ -275,7 +284,9 @@ where
                     sticky_preferred,
                     sticky_queue,
                     sticky_deadline,
+                    deadline,
                     response_tx,
+                    origin,
                 })
                 .await;
             runtime_metrics::record_query_dispatch(

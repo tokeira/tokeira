@@ -36,10 +36,11 @@ use crate::{
         DeleteRunResult, DeploymentCasResult, DeploymentKey, DeploymentName,
         DispatchableActivityTask, DispatchableWorkflowTask, DueTimer, GenerationAdvanceResult,
         LeaseOutcome, LeaseRepository, NexusSweepEntry, ProjectionBatch, ProjectionLog,
-        ProjectionRecord, ReconstructibleNexusDelivery, RequestRecord, RunRepository,
-        StoredTaskQueueConfig, StoredTaskQueueConfigKey, StoredWorkerDeployment,
+        ProjectionRecord, ProvenancePut, ReconstructibleNexusDelivery, RequestRecord,
+        RunRepository, StoredTaskQueueConfig, StoredTaskQueueConfigKey, StoredWorkerDeployment,
         TaskQueueConfigCasResult, TaskQueueConfigRepository, TransitionAuditRecord,
         WftTimeoutSweepEntry, WorkerDeploymentRepository, WorkerDeploymentVersionKey,
+        WorkerTaskProvenance, WorkerTaskProvenanceError, WorkerTaskProvenanceStore,
         WorkflowRuleCreateResult, WorkflowRuleDeleteResult, WorkflowTimeoutSweepEntry,
         deleted_workflow_projection_context, dispatchable_workflow_task,
         reconstructible_nexus_deliveries, workflow_is_open_and_pinned_to_version,
@@ -98,6 +99,8 @@ struct StoreState {
     workflow_rules: HashMap<NamespaceId, BTreeMap<String, WorkflowRuleRecord>>,
     /// Public task-queue delivery policy, independent from workflow history.
     task_queue_configs: HashMap<StoredTaskQueueConfigKey, StoredTaskQueueConfig>,
+    /// Scoped Worker token evidence, independent of authoritative run state.
+    worker_task_provenance: HashMap<[u8; 32], WorkerTaskProvenance>,
     /// Per-deployment conflict-token high-water-mark.
     ///
     /// The conflict token must increase monotonically across the entire
@@ -145,6 +148,67 @@ struct StoreState {
     run_shard_map: HashMap<RunKey, ShardId>,
     /// Total shard count for deterministic assignment.
     shard_count: u32,
+}
+
+#[async_trait]
+impl WorkerTaskProvenanceStore for InMemoryStore {
+    async fn put(
+        &self,
+        record: WorkerTaskProvenance,
+    ) -> Result<ProvenancePut, WorkerTaskProvenanceError> {
+        let mut store = self.inner.lock().await;
+        match store.worker_task_provenance.get(&record.token_digest) {
+            Some(existing) if existing == &record => Ok(ProvenancePut::AlreadyPresent),
+            Some(_) => Err(WorkerTaskProvenanceError::DigestConflict),
+            None => {
+                store
+                    .worker_task_provenance
+                    .insert(record.token_digest, record);
+                Ok(ProvenancePut::Inserted)
+            }
+        }
+    }
+
+    async fn get(
+        &self,
+        token_digest: [u8; 32],
+    ) -> Result<Option<WorkerTaskProvenance>, WorkerTaskProvenanceError> {
+        let store = self.inner.lock().await;
+        Ok(store
+            .worker_task_provenance
+            .get(&token_digest)
+            .filter(|record| record.expires_at > OffsetDateTime::now_utc())
+            .cloned())
+    }
+
+    async fn delete(&self, token_digest: [u8; 32]) -> Result<(), WorkerTaskProvenanceError> {
+        self.inner
+            .lock()
+            .await
+            .worker_task_provenance
+            .remove(&token_digest);
+        Ok(())
+    }
+
+    async fn delete_expired(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<usize, WorkerTaskProvenanceError> {
+        let mut store = self.inner.lock().await;
+        let mut expired = store
+            .worker_task_provenance
+            .values()
+            .filter(|record| record.expires_at <= now)
+            .map(|record| (record.expires_at, record.token_digest))
+            .collect::<Vec<_>>();
+        expired.sort_unstable();
+        expired.truncate(limit);
+        for (_, digest) in &expired {
+            store.worker_task_provenance.remove(digest);
+        }
+        Ok(expired.len())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1864,7 +1928,7 @@ mod tests {
     // mechanics (transition_seq OCC, activity side-tables, timer side-tables,
     // workflow-id uniqueness) without a placement controller. Epoch fencing is
     // tested separately in the fencing-specific test suites.
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use proptest::prelude::*;
     use time::Duration;
@@ -1874,9 +1938,10 @@ mod tests {
         state::{VersioningOverride, WorkerDeploymentVersionRef, WorkflowVersioningInfo},
     };
     use tokeira_types::{
-        EventPrincipal, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo, NamespaceId, QueueKey,
-        RequestId, RunId, RunKey, SearchAttrValue, SearchAttributes, TaskKind, TaskQueueName,
-        TransitionSeq, VisibilityLifecycleState, WorkerIdentity, WorkflowId, WorkflowType,
+        BuildId, DeploymentId, EventPrincipal, ExecutionRef, ExecutionStatus, LogicalTaskSeq, Memo,
+        NamespaceId, QueueKey, RequestId, RunId, RunKey, SearchAttrValue, SearchAttributes,
+        TaskKind, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkerIdentity,
+        WorkerTaskClass, WorkerTaskOrigin, WorkflowId, WorkflowType,
     };
     use tracing::{
         Subscriber,
@@ -5136,6 +5201,117 @@ mod tests {
                         .revision,
                     3
                 );
+                Ok(())
+            })?;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: scoped-worker-authorization, Property 6: Provenance-store state machine
+        #[test]
+        fn worker_task_provenance_store_matches_reference_state_machine(
+            namespace in any::<u128>(),
+            operations in prop::collection::vec((0u8..4, any::<u8>(), any::<bool>()), 1..80),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let store = InMemoryStore::default();
+                let base = OffsetDateTime::now_utc();
+                let mut reference = HashMap::<[u8; 32], WorkerTaskProvenance>::new();
+                for (operation, token_seed, variant) in operations {
+                    let token = [token_seed; 8];
+                    let digest = crate::worker_task_token_digest(&token);
+                    let record = WorkerTaskProvenance {
+                        token_digest: digest,
+                        origin: WorkerTaskOrigin {
+                            namespace_id: NamespaceId(uuid::Uuid::from_u128(namespace)),
+                            normal_task_queue: TaskQueueName(if variant {
+                                "queue-a".to_owned()
+                            } else {
+                                "queue-b".to_owned()
+                            }),
+                            task_class: if variant {
+                                WorkerTaskClass::Workflow
+                            } else {
+                                WorkerTaskClass::Activity
+                            },
+                            deployment: DeploymentId("payments".to_owned()),
+                            build_id: BuildId("build-a".to_owned()),
+                        },
+                        expires_at: if variant {
+                            base + Duration::hours(2)
+                        } else {
+                            base - Duration::hours(2)
+                        },
+                        created_at: base,
+                    };
+                    match operation {
+                        0 => {
+                            let expected = match reference.get(&digest) {
+                                Some(existing) if existing == &record => Ok(ProvenancePut::AlreadyPresent),
+                                Some(_) => Err(WorkerTaskProvenanceError::DigestConflict),
+                                None => {
+                                    reference.insert(digest, record.clone());
+                                    Ok(ProvenancePut::Inserted)
+                                }
+                            };
+                            prop_assert_eq!(
+                                WorkerTaskProvenanceStore::put(&store, record).await,
+                                expected
+                            );
+                        }
+                        1 => {
+                            let expected = reference
+                                .get(&digest)
+                                .filter(|record| record.expires_at > OffsetDateTime::now_utc())
+                                .cloned();
+                            prop_assert_eq!(
+                                WorkerTaskProvenanceStore::get(&store, digest).await.unwrap(),
+                                expected
+                            );
+                        }
+                        2 => {
+                            WorkerTaskProvenanceStore::delete(&store, digest)
+                                .await
+                                .unwrap();
+                            reference.remove(&digest);
+                        }
+                        _ => {
+                            let limit = usize::from(token_seed % 4);
+                            let mut expired = reference
+                                .values()
+                                .filter(|record| record.expires_at <= base)
+                                .map(|record| (record.expires_at, record.token_digest))
+                                .collect::<Vec<_>>();
+                            expired.sort_unstable();
+                            expired.truncate(limit);
+                            let removed = WorkerTaskProvenanceStore::delete_expired(
+                                &store,
+                                base,
+                                limit,
+                            )
+                            .await
+                            .unwrap();
+                            prop_assert_eq!(removed, expired.len());
+                            for (_, expired_digest) in expired {
+                                reference.remove(&expired_digest);
+                            }
+                        }
+                    }
+                }
+                for (digest, record) in reference {
+                    let expected = (record.expires_at > OffsetDateTime::now_utc())
+                        .then_some(record);
+                    prop_assert_eq!(
+                        WorkerTaskProvenanceStore::get(&store, digest).await.unwrap(),
+                        expected
+                    );
+                }
                 Ok(())
             })?;
         }

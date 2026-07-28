@@ -58,6 +58,11 @@
 # @field infrastructure.storage | infrastructure | default="in-memory" | Select in-memory development storage or Aurora DSQL.
 # @field policy.authorization.aws_iam.grants[].grant | Tokeira native | default=[] | Temporal namespace:role grants for matching AWS identities.
 # @field policy.authorization.aws_iam.grants[].match_arn | Tokeira native | default="" | Full-string STS caller-ARN glob.
+# @field policy.authorization.aws_iam.worker_scopes[].build_id | Tokeira native | default="" | Exact Worker Build ID paired with deployment_name.
+# @field policy.authorization.aws_iam.worker_scopes[].deployment_name | Tokeira native | default="" | Exact Worker Deployment name.
+# @field policy.authorization.aws_iam.worker_scopes[].match_arn | Tokeira native | default="" | Full-string verified STS caller-ARN glob for one exact Worker scope.
+# @field policy.authorization.aws_iam.worker_scopes[].namespace | Tokeira native | default="" | Exact namespace name authorized for the scoped AWS identity.
+# @field policy.authorization.aws_iam.worker_scopes[].task_queues | Tokeira native | default=[] | Non-empty exact normal task-queue allowlist for the scoped AWS identity.
 # @field policy.authorization.expose_authorizer_errors | configured parity | default=false | Expose authorizer implementation failures instead of generic denial.
 # @field policy.authorization.jwt.issuers[].audience | configured parity | default="" | Optional exact audience; blank disables audience validation.
 # @field policy.authorization.jwt.issuers[].grants[].grant | configured parity | default=[] | Temporal namespace:role grants for matching JWT subjects.
@@ -67,6 +72,11 @@
 # @field policy.authorization.jwt.issuers[].name | configured parity | default="" | Stable operator label for one issuer profile.
 # @field policy.authorization.jwt.issuers[].permissions_claim | configured parity | default="permissions" | JWT array claim containing Temporal namespace:role grants.
 # @field policy.authorization.jwt.issuers[].refresh_interval | configured parity | default=<unset> | Optional positive JWKS refresh duration using ms, s, m, or h.
+# @field policy.authorization.jwt.issuers[].worker_scopes[].build_id | Tokeira native | default="" | Exact Worker Build ID paired with deployment_name.
+# @field policy.authorization.jwt.issuers[].worker_scopes[].deployment_name | Tokeira native | default="" | Exact Worker Deployment name.
+# @field policy.authorization.jwt.issuers[].worker_scopes[].match_sub | Tokeira native | default="" | Full-string JWT subject glob for one exact Worker scope.
+# @field policy.authorization.jwt.issuers[].worker_scopes[].namespace | Tokeira native | default="" | Exact namespace name authorized for the scoped Worker.
+# @field policy.authorization.jwt.issuers[].worker_scopes[].task_queues | Tokeira native | default=[] | Non-empty exact normal task-queue allowlist; sticky aliases are not configured.
 # @field policy.authorization.principal_attribution | configured parity | default=false | Write the authenticated principal to server-authored history metadata.
 # @field policy.compatibility.enable_standalone_activities | configured parity | default=false | Enable the v1.31.0 preview standalone-activity surface.
 # @field policy.default_retention_days | stock parity | default=30 | Default workflow-history retention for newly created namespaces.
@@ -202,7 +212,23 @@ freeze_projection = false
 # match_sub = "system:serviceaccount:workers:*"
 # grant = ["default:worker"]
 #
+# # Presence activates exact scoped-Worker attenuation. The IdP may instead
+# # sign the fixed version-1 `tokeira_worker_scope` JWT claim with equal fields.
+# [[policy.authorization.jwt.issuers.worker_scopes]]
+# match_sub = "system:serviceaccount:workers:payments-*"
+# namespace = "payments"
+# task_queues = ["payments-worker"]
+# deployment_name = "payments"
+# build_id = "2026-07-28.1"
+#
 # [policy.authorization.aws_iam]
 # [[policy.authorization.aws_iam.grants]]
 # match_arn = "arn:aws:sts::123456789012:assumed-role/tokeira-worker-*"
 # grant = ["default:worker"]
+#
+# [[policy.authorization.aws_iam.worker_scopes]]
+# match_arn = "arn:aws:sts::123456789012:assumed-role/payments-worker-*"
+# namespace = "payments"
+# task_queues = ["payments-worker"]
+# deployment_name = "payments"
+# build_id = "2026-07-28.1"

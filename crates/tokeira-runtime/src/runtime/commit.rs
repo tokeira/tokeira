@@ -159,6 +159,11 @@ where
                         deployment: new_state.deployment.clone(),
                         build_id: new_state.build_id.clone(),
                     };
+                    let origin = WorkerTaskOrigin::from_queue_key(
+                        &queue,
+                        new_state.task_queue.clone(),
+                        tokeira_types::WorkerTaskClass::Query,
+                    );
                     tokio::spawn(async move {
                         for query in unblocked {
                             broker
@@ -170,7 +175,9 @@ where
                                     sticky_preferred: None,
                                     sticky_queue: None,
                                     sticky_deadline: None,
+                                    deadline: query.deadline,
                                     response_tx: query.response_tx,
+                                    origin: origin.clone(),
                                 })
                                 .await;
                         }

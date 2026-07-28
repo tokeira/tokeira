@@ -22,7 +22,7 @@ use crate::runtime::workflow_task::{
     route_activity_task_queue,
 };
 use tokeira_observability::OutcomeLabel;
-use tokeira_types::TaskKind;
+use tokeira_types::{TaskKind, WorkerTaskClass, WorkerTaskOrigin};
 
 const ACTIVITY_BACKLOG_REPROCESS_BATCH: usize = 100;
 
@@ -1154,6 +1154,11 @@ where
                         &next_activity.activity_id,
                         OffsetDateTime::now_utc(),
                     );
+                    let origin = WorkerTaskOrigin::from_queue_key(
+                        &task.queue,
+                        next_activity.task_queue.clone(),
+                        WorkerTaskClass::Activity,
+                    );
                     return Ok(Some(StartedActivityTask {
                         run_key: task.run_key,
                         run_id: state.run_id,
@@ -1180,6 +1185,7 @@ where
                         schedule_to_close_timeout: next_activity.schedule_to_close_timeout,
                         start_to_close_timeout: next_activity.start_to_close_timeout,
                         heartbeat_timeout: next_activity.heartbeat_timeout,
+                        origin,
                     }));
                 }
                 CommitResult::Conflict { .. } | CommitResult::CurrentExecutionConflict { .. } => {

@@ -309,6 +309,7 @@ impl NexusHttpAuthorizer for PolicyNexusHttpAuthorizer {
                 scope: Scope::Namespace,
                 access: Access::Write,
             },
+            worker: None,
         };
         match self.authorizer.authorize(Some(&claims), &call_target) {
             Ok(AuthzDecision::Allow { .. }) => NexusAuthorizationDecision::Allow,

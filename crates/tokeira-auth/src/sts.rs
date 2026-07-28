@@ -21,7 +21,7 @@ use time::{
 };
 use url::Url;
 
-use crate::{AuthError, Claims, GrantRules};
+use crate::{AuthError, Claims, GrantRules, WorkerScopeRules};
 
 const AWS_BEARER_PREFIX: &str = "tokeira-aws-v1.";
 const MAX_STS_RESPONSE_BYTES: usize = 64 * 1024;
@@ -196,6 +196,7 @@ struct CachedVerdict {
 /// AWS IAM claim mapper backed by an STS verification request.
 pub struct StsAuthenticator {
     grants: GrantRules,
+    worker_scopes: WorkerScopeRules,
     client: reqwest::Client,
     verification_base_url: Option<Url>,
     cache: Arc<Mutex<HashMap<[u8; 32], CachedVerdict>>>,
@@ -215,6 +216,7 @@ impl StsAuthenticator {
     pub fn new(grants: GrantRules) -> Self {
         Self {
             grants,
+            worker_scopes: WorkerScopeRules::default(),
             client: reqwest::Client::builder()
                 // Proxy environment variables would move the actual outbound
                 // peer outside the validated STS-host boundary. Direct-only
@@ -229,6 +231,12 @@ impl StsAuthenticator {
             verification_base_url: None,
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach validated ARN-to-Worker-scope mappings.
+    pub fn with_worker_scopes(mut self, worker_scopes: WorkerScopeRules) -> Self {
+        self.worker_scopes = worker_scopes;
+        self
     }
 
     /// Override only the outbound fixture origin while retaining the validated
@@ -256,6 +264,10 @@ impl StsAuthenticator {
             ..Default::default()
         };
         self.grants.apply(&arn, &mut claims);
+        claims.worker_scope = self
+            .worker_scopes
+            .resolve(&arn)
+            .map_err(|_| AuthError::new("conflicting configured Worker scopes"))?;
         let mut cache = self.cache();
         cache.retain(|_, verdict| now <= verdict.expires_at);
         if cache.len() >= MAX_CACHE_ENTRIES
@@ -437,12 +449,26 @@ mod tests {
                 .await
                 .expect("response");
         });
+        let worker_scope = crate::WorkerScope::try_new(
+            "prod".to_owned(),
+            vec!["payments-worker".to_owned()],
+            "payments".to_owned(),
+            "build-a".to_owned(),
+        )
+        .expect("scope");
         let authenticator = StsAuthenticator::new(GrantRules::new(vec![
             crate::GrantRule::new(
                 "arn:aws:sts::123456789012:assumed-role/tokeira-worker-*",
                 ["prod:worker", "prod:write"],
             )
             .expect("grant"),
+        ]))
+        .with_worker_scopes(crate::WorkerScopeRules::new(vec![
+            crate::WorkerScopeRule::new(
+                "arn:aws:sts::123456789012:assumed-role/tokeira-worker-*",
+                worker_scope.clone(),
+            )
+            .expect("scope rule"),
         ]))
         .with_test_base_url(Url::parse(&format!("http://{address}/")).expect("base URL"));
 
@@ -477,6 +503,7 @@ mod tests {
             first.namespaces.get("prod"),
             Some(&(crate::Role::WORKER | crate::Role::WRITER))
         );
+        assert_eq!(first.worker_scope, Some(worker_scope));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let decision = DefaultAuthorizer
             .authorize(
@@ -488,11 +515,32 @@ mod tests {
                         scope: Scope::Namespace,
                         access: Access::Write,
                     },
+                    worker: None,
                 },
             )
             .expect("authorization decision");
+        assert!(matches!(decision, AuthzDecision::Deny { .. }));
+        let worker_decision = DefaultAuthorizer
+            .authorize(
+                Some(&first),
+                &CallTarget {
+                    api_name: "/temporal.api.workflowservice.v1.WorkflowService/DescribeTaskQueue",
+                    namespace: Some("prod"),
+                    classification: CallClassification {
+                        scope: Scope::Namespace,
+                        access: Access::ReadOnly,
+                    },
+                    worker: Some(crate::WorkerCallTarget {
+                        operation: crate::WorkerOperation::DescribeTaskQueue,
+                        target: crate::WorkerTarget::TaskQueue {
+                            normal_task_queue: "payments-worker",
+                        },
+                    }),
+                },
+            )
+            .expect("Worker authorization decision");
         assert!(matches!(
-            decision,
+            worker_decision,
             AuthzDecision::Allow {
                 principal: Some(crate::AuthPrincipal {
                     principal_type,

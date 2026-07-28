@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
 use time::OffsetDateTime;
 use tokeira_kernel::{
     ActivityOp, DispatchOp, HistoryEvent, LoadedRun, ProjectionOp, RequestIdInfo, TimerOp,
@@ -27,10 +29,96 @@ use tokeira_types::{
     ArchetypeId, BuildId as RuntimeBuildId, DeploymentId, EventPrincipal, ExecutionRef,
     ExecutionStatus, GenerationCounter, Memo, NamespaceId, Payload, Payloads, ProjectionCursor,
     QueueKey, RequestId, RunId, RunKey, SearchAttrValue, SearchAttributes, ShardEpoch, ShardId,
-    TaskKind, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkerIdentity, WorkflowId,
-    WorkflowRuleRecord, WorkflowType,
+    TaskKind, TaskQueueName, TransitionSeq, VisibilityLifecycleState, WorkerIdentity,
+    WorkerTaskOrigin, WorkflowId, WorkflowRuleRecord, WorkflowType,
 };
 use uuid::Uuid;
+
+const WORKER_TASK_PROVENANCE_DIGEST_DOMAIN: &[u8] = b"tokeira-worker-task-provenance-v1\0";
+
+/// Compute the durable provenance key for exact public task-token bytes.
+///
+/// The digest is an index key, not a signature. Authorization comes from the
+/// server-side provenance row, which a caller cannot create by changing token
+/// bytes.
+#[must_use]
+pub fn worker_task_token_digest(token: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(WORKER_TASK_PROVENANCE_DIGEST_DOMAIN);
+    hasher.update(token);
+    hasher.finalize().into()
+}
+
+/// Server-authored authorization evidence for one public Worker task token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerTaskProvenance {
+    /// Domain-separated digest of the exact public token bytes.
+    pub token_digest: [u8; 32],
+    /// Exact final task origin observed after routing and task start.
+    pub origin: WorkerTaskOrigin,
+    /// Existing task deadline after which this row grants no authority.
+    pub expires_at: OffsetDateTime,
+    /// Edge insertion time retained only for diagnostics.
+    pub created_at: OffsetDateTime,
+}
+
+/// Result of idempotently inserting one provenance record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvenancePut {
+    /// No row previously existed for the digest.
+    Inserted,
+    /// An exact equal row already existed.
+    AlreadyPresent,
+}
+
+/// Durable provenance repository failure.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum WorkerTaskProvenanceError {
+    /// Storage could not be reached or complete the operation.
+    #[error("Worker task provenance storage unavailable: {message}")]
+    Unavailable {
+        /// Backend diagnostic without token or credential material.
+        message: String,
+    },
+    /// The same cryptographic digest identified different record contents.
+    #[error("Worker task provenance digest conflict")]
+    DigestConflict,
+    /// Durable row contents could not be decoded safely.
+    #[error("Worker task provenance row is corrupt: {message}")]
+    Corrupt {
+        /// Bounded row-shape diagnostic without stored values.
+        message: String,
+    },
+}
+
+/// Durable authorization-evidence repository for scoped Worker task tokens.
+///
+/// This store never starts or completes work. Runtime fencing and task
+/// correlation remain mandatory after any successful lookup.
+#[async_trait]
+pub trait WorkerTaskProvenanceStore: Send + Sync {
+    /// Insert one record, accepting an exact duplicate idempotently.
+    async fn put(
+        &self,
+        record: WorkerTaskProvenance,
+    ) -> Result<ProvenancePut, WorkerTaskProvenanceError>;
+
+    /// Load one non-expired record by exact token digest.
+    async fn get(
+        &self,
+        token_digest: [u8; 32],
+    ) -> Result<Option<WorkerTaskProvenance>, WorkerTaskProvenanceError>;
+
+    /// Idempotently delete one record.
+    async fn delete(&self, token_digest: [u8; 32]) -> Result<(), WorkerTaskProvenanceError>;
+
+    /// Delete at most `limit` records expired at or before `now`.
+    async fn delete_expired(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> Result<usize, WorkerTaskProvenanceError>;
+}
 
 /// Write result from persisting one authoritative
 /// run transition.

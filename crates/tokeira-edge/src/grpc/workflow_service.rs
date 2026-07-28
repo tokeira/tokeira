@@ -27,7 +27,7 @@ use tokeira_runtime::{
     ScheduleError, TaskQueueConfigFieldPatch, TaskQueueConfigKey, TaskQueueConfigKind,
     TaskQueueConfigMetadata, TaskQueueConfigPatch, compute_matching_times, compute_next_times,
 };
-use tokeira_types::{NamespaceId, TaskQueueName, WorkerIdentity};
+use tokeira_types::{NamespaceId, TaskQueueName, WorkerIdentity, WorkerTaskClass};
 
 use tokeira_chasm_activity::ActivityStatus;
 use tokeira_proto::public::temporal::api::{activity::v1 as activity_v1, worker::v1 as worker_v1};
@@ -48,6 +48,23 @@ use crate::{
 
 const DEPRECATED_DEPLOYMENTS_UNIMPLEMENTED: &str =
     "Deployments are deprecated and no longer supported, use Worker Deployments instead";
+
+fn shutdown_worker_task_classes(task_queue_types: &[i32]) -> Vec<WorkerTaskClass> {
+    if task_queue_types.is_empty() {
+        return vec![WorkerTaskClass::Workflow, WorkerTaskClass::Activity];
+    }
+    task_queue_types
+        .iter()
+        .filter_map(
+            |task_type| match TaskQueueType::try_from(*task_type).ok()? {
+                TaskQueueType::Workflow => Some(WorkerTaskClass::Workflow),
+                TaskQueueType::Activity => Some(WorkerTaskClass::Activity),
+                TaskQueueType::Nexus => Some(WorkerTaskClass::Nexus),
+                TaskQueueType::Unspecified => None,
+            },
+        )
+        .collect()
+}
 
 fn standard_search_attributes() -> BTreeMap<String, i32> {
     // Temporal returns `NameTypeMap.All()` from WorkflowService
@@ -912,17 +929,27 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
     ) -> Result<Response<workflowservice::PollActivityTaskQueueResponse>, Status> {
         let headers = metadata_to_header_map(request.metadata());
         let req = request.into_inner();
-        // Translate before the standalone-activity fast path so shared Temporal
-        // poll validation (notably versioned sticky NormalName) runs before any
-        // task can be claimed (`validateVersioningInfo`, workflow_handler.go
-        // @ v1.31.0).
+        // Retain the complete poll target before the standalone-activity fast
+        // path. The edge then authenticates and authorizes the final target
+        // before either CHASM or workflow-backed delivery can claim work.
         let edge_req = translate::poll_activity_request_to_edge(req.clone())
             .map_err(proto_conversion_status)?;
+        let context = self
+            .inner
+            .admit_activity_task_queue_poll(&headers, &edge_req)
+            .await?;
+        let scoped_worker = context
+            .claims
+            .as_ref()
+            .is_some_and(|claims| claims.worker_scope.is_some());
         // CHASM-first: serve a queued standalone-activity task if one is waiting on
         // this task queue, before falling through to the workflow-activity path
-        // (the two share this RPC).
+        // (the two share this RPC). Scoped workers cannot enter this bridge:
+        // standalone tasks are unversioned and therefore fail the fixed exact
+        // Deployment-Version admission model.
         if let Some(bridge) = &self.chasm_activity
             && bridge.is_enabled()
+            && !scoped_worker
         {
             let task_queue = req
                 .task_queue
@@ -943,7 +970,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         debug!(task_queue = %edge_req.task_queue, "poll_activity_task_queue");
         let edge_resp = self
             .inner
-            .poll_activity_task_queue(&headers, edge_req)
+            .poll_activity_task_queue_admitted(&headers, edge_req, context)
             .await?;
 
         let has_task = edge_resp.is_some();
@@ -965,6 +992,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && bridge.owns_task_token(&req.task_token)
         {
+            self.inner
+                .admit_request(
+                    &headers,
+                    Some(&req.namespace),
+                    Action::RespondActivityTaskCompleted,
+                    false,
+                )
+                .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
             let result = req.result.map(|p| p.encode_to_vec()).unwrap_or_default();
             bridge
@@ -1002,6 +1037,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && bridge.owns_task_token(&req.task_token)
         {
+            self.inner
+                .admit_request(
+                    &headers,
+                    Some(&req.namespace),
+                    Action::RespondActivityTaskFailed,
+                    false,
+                )
+                .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
             let failure = req
                 .failure
@@ -1056,6 +1099,17 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && bridge.is_enabled()
         {
+            // Scoped Worker credentials never authorize standalone Activity
+            // tokens. Authenticate and reject that identity before the CHASM
+            // bridge validates or mutates any standalone execution.
+            self.inner
+                .admit_request(
+                    &headers,
+                    Some(&req.namespace),
+                    Action::RecordActivityTaskHeartbeat,
+                    false,
+                )
+                .await?;
             if req.task_token.is_empty() {
                 return Err(Status::invalid_argument("Task token not set on request"));
             }
@@ -1355,6 +1409,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && req.workflow_id.is_empty()
         {
+            self.inner
+                .admit_request(
+                    &headers,
+                    Some(&req.namespace),
+                    Action::RecordActivityTaskHeartbeatById,
+                    false,
+                )
+                .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
             let details = req.details.map(|p| p.encode_to_vec()).unwrap_or_default();
             let cancel_requested = bridge
@@ -1395,6 +1457,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && req.workflow_id.is_empty()
         {
+            self.inner
+                .admit_request(
+                    &headers,
+                    Some(&req.namespace),
+                    Action::RespondActivityTaskCompletedById,
+                    false,
+                )
+                .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
             let result = req.result.map(|p| p.encode_to_vec()).unwrap_or_default();
             bridge
@@ -1429,6 +1499,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && req.workflow_id.is_empty()
         {
+            self.inner
+                .admit_request(
+                    &headers,
+                    Some(&req.namespace),
+                    Action::RespondActivityTaskFailedById,
+                    false,
+                )
+                .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
             let failure = req
                 .failure
@@ -1483,6 +1561,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && bridge.owns_task_token(&req.task_token)
         {
+            self.inner
+                .admit_request(
+                    &headers,
+                    Some(&req.namespace),
+                    Action::RespondActivityTaskCanceled,
+                    false,
+                )
+                .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
             let details = req.details.map(|p| p.encode_to_vec()).unwrap_or_default();
             bridge
@@ -1515,6 +1601,14 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         if let Some(bridge) = &self.chasm_activity
             && req.workflow_id.is_empty()
         {
+            self.inner
+                .admit_request(
+                    &headers,
+                    Some(&req.namespace),
+                    Action::RespondActivityTaskCanceledById,
+                    false,
+                )
+                .await?;
             let namespace_id = self.resolve_namespace_id(&req.namespace).await?;
             let details = req.details.map(|p| p.encode_to_vec()).unwrap_or_default();
             bridge
@@ -1726,7 +1820,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         }
         let context = self
             .inner
-            .admit_request(
+            .admit_worker_request(
                 &headers,
                 Some(&req.namespace),
                 Action::RecordWorkerHeartbeat,
@@ -1739,24 +1833,35 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .map(|namespace| crate::to_internal::namespace_id_for(&namespace.name))
             .ok_or_else(|| Status::internal("worker heartbeat admitted without namespace"))?;
         let heartbeat_count = req.worker_heartbeat.len();
-        for proto in req.worker_heartbeat {
-            let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(
-                namespace_id,
-                proto,
-                context.received_at,
-            );
-            let key = heartbeat.worker_instance_key.clone();
-            let active = heartbeat.status.0 != 3;
+        let heartbeats = req
+            .worker_heartbeat
+            .into_iter()
+            .map(|proto| {
+                worker_heartbeat::worker_heartbeat_from_proto(
+                    namespace_id,
+                    proto,
+                    context.received_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        for heartbeat in &heartbeats {
             self.inner
-                .heartbeat_store()
-                .insert(heartbeat)
-                .map_err(|error| {
-                    tokeira_runtime::metrics::record_worker_heartbeat_rejected(
-                        &req.namespace,
-                        "store_error",
-                    );
-                    Status::internal(error.to_string())
-                })?;
+                .authorize_worker_heartbeat(&context, Action::RecordWorkerHeartbeat, heartbeat)
+                .await?;
+        }
+        self.inner
+            .heartbeat_store()
+            .insert_batch(heartbeats.clone())
+            .map_err(|error| {
+                tokeira_runtime::metrics::record_worker_heartbeat_rejected(
+                    &req.namespace,
+                    "store_error",
+                );
+                Status::internal(error.to_string())
+            })?;
+        for heartbeat in heartbeats {
+            let key = heartbeat.worker_instance_key;
+            let active = heartbeat.status.0 != 3;
             tokeira_runtime::metrics::record_worker_heartbeat_accepted(namespace_id, &key);
             tokeira_runtime::metrics::record_worker_heartbeat_active(namespace_id, &key, active);
         }
@@ -1783,7 +1888,7 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
         // rejecting it with `InvalidArgument` is an over-rejection (C6-class) that breaks SDK shutdown.
         let context = self
             .inner
-            .admit_request(
+            .admit_worker_request(
                 &headers,
                 Some(&req.namespace),
                 Action::ShutdownWorker,
@@ -1795,12 +1900,25 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
             .as_ref()
             .map(|namespace| crate::to_internal::namespace_id_for(&namespace.name))
             .ok_or_else(|| Status::internal("worker shutdown admitted without namespace"))?;
-        if let Some(proto) = req.worker_heartbeat {
-            let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(
-                namespace_id,
-                proto,
-                context.received_at,
-            );
+        let shutdown_heartbeat = req.worker_heartbeat.map(|proto| {
+            worker_heartbeat::worker_heartbeat_from_proto(namespace_id, proto, context.received_at)
+        });
+        if let Some(heartbeat) = shutdown_heartbeat.as_ref() {
+            self.inner
+                .authorize_worker_heartbeat(&context, Action::ShutdownWorker, heartbeat)
+                .await?;
+        }
+        self.inner
+            .authorize_scoped_worker_shutdown(
+                &context,
+                &req.namespace,
+                &req.worker_instance_key,
+                &req.identity,
+                &req.task_queue,
+                (!req.sticky_task_queue.is_empty()).then_some(req.sticky_task_queue.as_str()),
+            )
+            .await?;
+        if let Some(heartbeat) = shutdown_heartbeat {
             let key = heartbeat.worker_instance_key.clone();
             let active = heartbeat.status.0 != 3;
             match self.inner.heartbeat_store().insert(heartbeat) {
@@ -1830,11 +1948,18 @@ impl WorkflowServiceGrpcApi for WorkflowServiceGrpc {
                 .await;
         }
         if !req.task_queue.is_empty() {
+            // v1.31.0 fans cancellation out only to the task types named by the
+            // SDK, defaulting an absent list to Workflow + Activity
+            // (`cancelOutstandingWorkerPolls`,
+            // `service/frontend/workflow_handler.go @ v1.31.0`). Nexus is not
+            // part of that legacy default, but modern SDKs name it explicitly.
+            let task_classes = shutdown_worker_task_classes(&req.task_queue_types);
             self.inner
                 .cancel_outstanding_worker_polls(
                     namespace_id,
                     TaskQueueName(req.task_queue),
                     WorkerIdentity(req.identity),
+                    &task_classes,
                 )
                 .await;
         }
@@ -3513,17 +3638,21 @@ mod tests {
     use super::*;
     use crate::{
         history_wait::{HistoryNotifyingRepository, HistoryWaitRegistry},
-        interceptors::EdgeInterceptors,
+        interceptors::{EdgeInterceptors, PolicyAuthenticator},
         long_poll::{LongPollConfig, LongPollGate},
         namespace_cache::{InMemoryNamespaceCache, NamespaceCache, ResolvedNamespace},
         operator_service::InMemoryOperatorApi,
         poller_registry::PollerRegistry,
         routing::LocalOnlyRouter,
+        scoped_worker_session::{
+            ScopedWorkerSessionError, ScopedWorkerSessionKey, ScopedWorkerSessionRegistry,
+        },
         to_internal::namespace_id_for,
         workflow_service::{
             EmptyVisibilityApi, ExecutionResolver, WorkflowMutationOutcome, WorkflowRuntimeApi,
         },
     };
+    use tokeira_auth::{AuthError, ClaimMapper, Claims, DefaultAuthorizer, WorkerScope};
     use tokeira_kernel::{
         BasicKernel, Command, Kernel, LoadedRun, NexusResolution, SignalRequest, StartRequest,
     };
@@ -4319,8 +4448,25 @@ mod tests {
 
     struct FailingHeartbeatStore;
 
+    #[derive(Clone, Debug)]
+    struct FixedClaimsMapper(Claims);
+
+    #[async_trait]
+    impl ClaimMapper for FixedClaimsMapper {
+        async fn get_claims(&self, _token: &str, _extra: &str) -> Result<Claims, AuthError> {
+            Ok(self.0.clone())
+        }
+    }
+
     impl HeartbeatStore for FailingHeartbeatStore {
         fn insert(&self, _heartbeat: HeartbeatObservation) -> Result<(), HeartbeatStoreError> {
+            Err(HeartbeatStoreError::Backend("injected failure".to_owned()))
+        }
+
+        fn insert_batch(
+            &self,
+            _heartbeats: Vec<HeartbeatObservation>,
+        ) -> Result<(), HeartbeatStoreError> {
             Err(HeartbeatStoreError::Backend("injected failure".to_owned()))
         }
 
@@ -4434,6 +4580,80 @@ mod tests {
             HistoryWaitRegistry::default(),
         );
         (WorkflowServiceGrpc::new(service), broker)
+    }
+
+    async fn scoped_worker_test_service() -> (
+        WorkflowServiceGrpc,
+        tokeira_runtime::InMemoryBroker,
+        Arc<tokeira_runtime::InMemoryHeartbeatStore>,
+        ScopedWorkerSessionRegistry,
+        WorkerScope,
+    ) {
+        let cache = Arc::new(InMemoryNamespaceCache::new());
+        cache
+            .insert(ResolvedNamespace::active("default"))
+            .await
+            .expect("default namespace should seed");
+        let scope = WorkerScope::try_new(
+            "default".to_owned(),
+            vec!["queue".to_owned()],
+            "deployment-a".to_owned(),
+            "build-a".to_owned(),
+        )
+        .expect("fixed scoped Worker fixture");
+        let authenticator = Arc::new(PolicyAuthenticator::new(
+            Arc::new(FixedClaimsMapper(Claims {
+                subject: "scoped-worker".to_owned(),
+                auth_type: "jwt".to_owned(),
+                worker_scope: Some(scope.clone()),
+                ..Claims::default()
+            })),
+            Arc::new(DefaultAuthorizer),
+            false,
+        ));
+        let broker = tokeira_runtime::InMemoryBroker::default();
+        let heartbeat_store = Arc::new(tokeira_runtime::InMemoryHeartbeatStore::default());
+        let sessions = ScopedWorkerSessionRegistry::default();
+        let service =
+            WorkflowService::new_with_stores_and_buffered_queries_and_history_wait_registry(
+                Arc::new(PollNoneRuntime),
+                Arc::new(NoopResolver),
+                Arc::new(EmptyVisibilityApi),
+                Arc::new(tokeira_storage::InMemoryStore::default()),
+                Arc::new(InMemoryOperatorApi::new("tokeira-local")),
+                cache.clone(),
+                Arc::new(EdgeInterceptors::configured(cache, authenticator, false)),
+                PollerRegistry::default(),
+                crate::PendingQueryStore::default(),
+                tokeira_runtime::BufferedQueryRegistry::default(),
+                broker.clone(),
+                tokeira_runtime::NexusTaskBroker::default(),
+                LongPollGate::new(LongPollConfig::default()),
+                Arc::new(LocalOnlyRouter),
+                HistoryWaitRegistry::default(),
+                WorkerRegistry::default(),
+                heartbeat_store.clone(),
+                Arc::new(tokeira_runtime::ScheduleStore::default()),
+                Arc::new(tokeira_runtime::InMemoryTaskQueueConfigStore::default()),
+                Arc::new(tokeira_runtime::BatchOperationStore::default()),
+            )
+            .with_scoped_worker_sessions(sessions.clone());
+        (
+            WorkflowServiceGrpc::new(service),
+            broker,
+            heartbeat_store,
+            sessions,
+            scope,
+        )
+    }
+
+    fn scoped_deployment_options() -> WorkerDeploymentOptions {
+        WorkerDeploymentOptions {
+            worker_versioning_mode: WorkerVersioningMode::Versioned as i32,
+            deployment_name: "deployment-a".to_owned(),
+            build_id: "build-a".to_owned(),
+            ..Default::default()
+        }
     }
 
     fn worker_deployment_test_service() -> WorkflowServiceGrpc {
@@ -5471,6 +5691,184 @@ mod tests {
         assert!(stored.is_none(), "shutdown is removal, not a tombstone");
     }
 
+    #[test]
+    fn shutdown_worker_task_types_match_v1_31_defaults_and_explicit_nexus() {
+        assert_eq!(
+            shutdown_worker_task_classes(&[]),
+            vec![WorkerTaskClass::Workflow, WorkerTaskClass::Activity]
+        );
+        assert_eq!(
+            shutdown_worker_task_classes(&[
+                TaskQueueType::Nexus as i32,
+                TaskQueueType::Workflow as i32,
+            ]),
+            vec![WorkerTaskClass::Nexus, WorkerTaskClass::Workflow]
+        );
+        assert!(shutdown_worker_task_classes(&[TaskQueueType::Unspecified as i32]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn scoped_shutdown_rejects_mismatched_heartbeat_before_lifecycle_effects() {
+        let (grpc, broker, heartbeat_store, _sessions, _scope) = scoped_worker_test_service().await;
+        grpc.poll_workflow_task_queue(Request::new(
+            workflowservice::PollWorkflowTaskQueueRequest {
+                namespace: "default".to_owned(),
+                task_queue: Some(
+                    tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                        name: "sticky-a".to_owned(),
+                        kind: tokeira_proto::enums::TaskQueueKind::Sticky as i32,
+                        normal_name: "queue".to_owned(),
+                        ..Default::default()
+                    },
+                ),
+                identity: "worker-a".to_owned(),
+                worker_instance_key: "instance-a".to_owned(),
+                deployment_options: Some(scoped_deployment_options()),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("authorized sticky poll establishes the scoped session");
+
+        let mut mismatched = test_worker_heartbeat("instance-a");
+        mismatched
+            .deployment_version
+            .as_mut()
+            .expect("fixture version")
+            .build_id = "other-build".to_owned();
+        let denied = grpc
+            .shutdown_worker(Request::new(workflowservice::ShutdownWorkerRequest {
+                namespace: "default".to_owned(),
+                sticky_task_queue: "sticky-a".to_owned(),
+                identity: "worker-a".to_owned(),
+                worker_heartbeat: Some(mismatched),
+                worker_instance_key: "instance-a".to_owned(),
+                task_queue: "queue".to_owned(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("mismatched shutdown heartbeat must deny");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(
+            heartbeat_store
+                .get_worker(
+                    &namespace_id_for("default"),
+                    &WorkerInstanceKey("instance-a".to_owned()),
+                )
+                .expect("heartbeat lookup")
+                .is_none(),
+            "denial must not insert the shutdown heartbeat"
+        );
+
+        let queue = QueueKey {
+            namespace_id: namespace_id_for("default"),
+            task_queue: TaskQueueName("sticky-a".to_owned()),
+            task_kind: TaskKind::Workflow,
+            deployment: Some(tokeira_types::DeploymentId("deployment-a".to_owned())),
+            build_id: Some(tokeira_types::BuildId("build-a".to_owned())),
+        };
+        broker
+            .publish_workflow_task(
+                DispatchableWorkflowTask {
+                    run_key: RunKey::new(),
+                    queue: queue.clone(),
+                    logical_seq: LogicalTaskSeq(1),
+                    sticky_preferred: None,
+                    normal_queue: Some(QueueKey {
+                        task_queue: TaskQueueName("queue".to_owned()),
+                        ..queue.clone()
+                    }),
+                    sticky_deadline: None,
+                    priority: None,
+                    order: None,
+                },
+                None,
+            )
+            .await;
+        assert!(
+            broker
+                .poll_workflow_task(
+                    &queue,
+                    &WorkerIdentity("worker-a".to_owned()),
+                    std::time::Duration::ZERO,
+                )
+                .await
+                .expect("broker poll")
+                .is_some(),
+            "denial must not install the sticky-worker block"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_nexus_heartbeat_mismatch_precedes_session_and_store_mutation() {
+        let (grpc, _broker, heartbeat_store, sessions, scope) = scoped_worker_test_service().await;
+        let mut mismatched = test_worker_heartbeat("instance-nexus");
+        mismatched.task_queue = "other-queue".to_owned();
+
+        let denied = grpc
+            .poll_nexus_task_queue(Request::new(workflowservice::PollNexusTaskQueueRequest {
+                namespace: "default".to_owned(),
+                task_queue: Some(
+                    tokeira_proto::public::temporal::api::taskqueue::v1::TaskQueue {
+                        name: "queue".to_owned(),
+                        ..Default::default()
+                    },
+                ),
+                identity: "worker-nexus".to_owned(),
+                worker_instance_key: "instance-nexus".to_owned(),
+                deployment_options: Some(scoped_deployment_options()),
+                worker_heartbeat: vec![mismatched],
+                ..Default::default()
+            }))
+            .await
+            .expect_err("mismatched piggyback heartbeat must deny");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(
+            heartbeat_store
+                .get_worker(
+                    &namespace_id_for("default"),
+                    &WorkerInstanceKey("instance-nexus".to_owned()),
+                )
+                .expect("heartbeat lookup")
+                .is_none()
+        );
+        assert_eq!(
+            sessions.authorize_shutdown(
+                &ScopedWorkerSessionKey {
+                    namespace_id: namespace_id_for("default"),
+                    subject: "scoped-worker".to_owned(),
+                    worker_instance_key: WorkerInstanceKey("instance-nexus".to_owned()),
+                },
+                &scope,
+                &WorkerIdentity("worker-nexus".to_owned()),
+                &TaskQueueName("queue".to_owned()),
+                None,
+                None,
+                OffsetDateTime::now_utc(),
+            ),
+            Err(ScopedWorkerSessionError::MissingSession),
+            "denied piggyback heartbeat must not establish a poll session"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_explicit_namespace_preserves_malformed_task_token_status() {
+        let (grpc, _broker, _heartbeat_store, _sessions, _scope) =
+            scoped_worker_test_service().await;
+        let malformed = grpc
+            .respond_activity_task_completed(Request::new(
+                workflowservice::RespondActivityTaskCompletedRequest {
+                    namespace: "default".to_owned(),
+                    task_token: b"not-a-task-token".to_vec(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("malformed token must retain its existing status after preflight");
+        assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+        assert!(malformed.message().contains("invalid task token"));
+    }
+
     #[tokio::test]
     async fn poll_none_returns_default_proto_response() {
         let cache = Arc::new(InMemoryNamespaceCache::new());
@@ -5610,8 +6008,13 @@ mod tests {
         let req = crate::translate::PollActivityTaskQueueRequest {
             namespace: "default".to_string(),
             task_queue: "queue".to_string(),
+            normal_task_queue: None,
+            is_sticky: false,
             worker_identity: "w2".to_string(),
             worker_instance_key: String::new(),
+            worker_control_task_queue: String::new(),
+            scoped_versioned: false,
+            versioning_metadata_present: false,
             deployment: None,
             build_id: None,
             worker_rate_limit: None,
@@ -6534,6 +6937,11 @@ mod tests {
                         callback_url: None,
                         callback_token: None,
                     },
+                    origin: tokeira_runtime::NexusQueueKey::unversioned(
+                        namespace_id_for("default"),
+                        TaskQueueName("nexus-q".to_string()),
+                    )
+                    .worker_task_origin(),
                 },
             )
             .await;

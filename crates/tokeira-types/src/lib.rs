@@ -52,6 +52,8 @@ pub mod task_queue;
 pub mod tokens;
 /// Projection cursors and visibility-plane helpers.
 pub mod visibility;
+/// Server-authored task origins used by scoped Worker authorization.
+pub mod worker_authorization;
 /// Worker Compute Controller task families and configuration identity.
 pub mod worker_compute;
 /// Worker heartbeat observations and store contracts.
@@ -71,6 +73,7 @@ pub use spread::*;
 pub use task_queue::*;
 pub use tokens::*;
 pub use visibility::*;
+pub use worker_authorization::*;
 pub use worker_compute::*;
 pub use worker_heartbeat::*;
 pub use workflow_rules::*;

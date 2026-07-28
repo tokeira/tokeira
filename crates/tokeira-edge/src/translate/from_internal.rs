@@ -286,11 +286,22 @@ mod tests {
     use time::OffsetDateTime;
     use tokeira_runtime::{StartedActivityTask, StartedWorkflowTask};
     use tokeira_types::{
-        ActivityTaskToken, LogicalTaskSeq, Payloads, RunId, RunKey, ShardEpoch, TaskQueueName,
-        WorkflowId, WorkflowTaskToken,
+        ActivityTaskToken, BuildId, DeploymentId, LogicalTaskSeq, NamespaceId, Payloads, RunId,
+        RunKey, ShardEpoch, TaskQueueName, WorkerTaskClass, WorkerTaskOrigin, WorkflowId,
+        WorkflowTaskToken,
     };
 
     use super::{poll_activity_response, workflow_task_history_after_event_id};
+
+    fn task_origin(task_class: WorkerTaskClass) -> WorkerTaskOrigin {
+        WorkerTaskOrigin {
+            namespace_id: NamespaceId::new(),
+            normal_task_queue: TaskQueueName("queue".to_string()),
+            task_class,
+            deployment: DeploymentId(String::new()),
+            build_id: BuildId(String::new()),
+        }
+    }
 
     fn started_task(previous_started_event_id: i64, is_sticky_match: bool) -> StartedWorkflowTask {
         let run_key = RunKey::new();
@@ -313,6 +324,7 @@ mod tests {
             scheduled_time: OffsetDateTime::UNIX_EPOCH,
             started_time: OffsetDateTime::UNIX_EPOCH,
             target_worker_deployment_version_changed: false,
+            origin: task_origin(WorkerTaskClass::Workflow),
         }
     }
 
@@ -344,6 +356,7 @@ mod tests {
             schedule_to_close_timeout: None,
             start_to_close_timeout: None,
             heartbeat_timeout: None,
+            origin: task_origin(WorkerTaskClass::Activity),
         }
     }
 

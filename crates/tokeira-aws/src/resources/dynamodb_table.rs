@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
+    InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource, ResourceId,
+    ResourceState, ResourceType, Reversibility, SemanticsContext, error::IacError,
 };
 
 /// DynamoDB key type.
@@ -292,6 +293,120 @@ impl Resource for DynamoDbTable {
             InternalChange::NoChange {
                 resource_id: self.resource_id(),
             }
+        }
+    }
+
+    /// What a DynamoDB-table change does (change-semantics task 4.4). The
+    /// engine-side facts come from this file's own paths (update issues
+    /// control-plane calls only; there is no replace path — the diff never
+    /// produces one). The provider-side facts carry AWS's own words: the
+    /// DeleteTable API reference states "The DeleteTable operation deletes a
+    /// table and all of its items." Recoverability of a deleted table is
+    /// not established by that page (backups and PITR are conditional
+    /// features), so reversibility of a delete stays `Unknown` rather than
+    /// inferred; likewise a TTL-bearing update's data effect depends on
+    /// per-item expiry values, which no declaration can know.
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE_PATH: Citation = Citation::new(
+            "crates/tokeira-aws/src/resources/dynamodb_table.rs::create — \
+             dynamodb:CreateTable, waits ACTIVE",
+        );
+        const UPDATE_PATH: Citation = Citation::new(
+            "crates/tokeira-aws/src/resources/dynamodb_table.rs::update — \
+             dynamodb:TagResource and dynamodb:UpdateTimeToLive only; no data-plane \
+             operation",
+        );
+        const DELETE_TABLE_DOC: Citation = Citation::new(
+            "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/\
+             API_DeleteTable.html — \"The DeleteTable operation deletes a table and \
+             all of its items.\"",
+        );
+        match ctx.kind {
+            ChangeKind::Create => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Created,
+                    citation: CREATE_PATH,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: CREATE_PATH,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: CREATE_PATH,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: CREATE_PATH,
+                },
+                // Reversing a create is DeleteTable — anything written since
+                // goes with the table, in AWS's own words.
+                reversibility: Confidence::ProviderGuarantee {
+                    value: Reversibility::ReversibleWithDataLoss,
+                    citation: DELETE_TABLE_DOC,
+                },
+            },
+            ChangeKind::Update => {
+                // The only updates this kind's diff produces are tags and the
+                // TTL attribute. A TTL change puts item expiry in play, and
+                // what expires depends on per-item values no declaration can
+                // know — those fields stay Unknown by design.
+                let ttl_involved = ctx.field_diffs.iter().any(|d| d.field.contains("ttl"));
+                ChangeSemantics {
+                    operation: Confidence::EngineFact {
+                        value: LifecycleOperation::UpdatedInPlace,
+                        citation: UPDATE_PATH,
+                    },
+                    replacement: Confidence::EngineFact {
+                        value: ReplacementPolicy::NotRequired,
+                        citation: UPDATE_PATH,
+                    },
+                    disruption: Confidence::EngineFact {
+                        value: Disruption::None,
+                        citation: UPDATE_PATH,
+                    },
+                    data_effect: if ttl_involved {
+                        Confidence::Unknown
+                    } else {
+                        Confidence::EngineFact {
+                            value: DataEffect::Preserved,
+                            citation: UPDATE_PATH,
+                        }
+                    },
+                    reversibility: if ttl_involved {
+                        Confidence::Unknown
+                    } else {
+                        Confidence::EngineFact {
+                            value: Reversibility::Reversible,
+                            citation: UPDATE_PATH,
+                        }
+                    },
+                }
+            }
+            ChangeKind::Delete => ChangeSemantics {
+                operation: Confidence::ProviderGuarantee {
+                    value: LifecycleOperation::Deleted,
+                    citation: DELETE_TABLE_DOC,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: DELETE_TABLE_DOC,
+                },
+                disruption: Confidence::ProviderGuarantee {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: DELETE_TABLE_DOC,
+                },
+                data_effect: Confidence::ProviderGuarantee {
+                    value: DataEffect::Destroyed,
+                    citation: DELETE_TABLE_DOC,
+                },
+                // The page read does not establish recoverability of a
+                // deleted table — Unknown, never inferred.
+                reversibility: Confidence::Unknown,
+            },
+            // The diff never produces a replacement; reported inapplicable
+            // via the all-Unknown default, kept total.
+            ChangeKind::Replace | ChangeKind::NoChange => ChangeSemantics::default(),
         }
     }
 
@@ -683,5 +798,109 @@ impl Resource for DynamoDbTable {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Golden declarations (change-semantics task 4.5): classification and
+    // confidence only. The headlines: a delete carries AWS's own words —
+    // the table and all its items are deleted — as a ProviderGuarantee,
+    // while its recoverability and a TTL-bearing update's data effect stay
+    // Unknown (not established / not knowable per item). The diff never
+    // produces a replacement, so that scenario is asserted inapplicable.
+    #[test]
+    fn dynamodb_declarations_cite_aws_and_stay_unknown_at_the_edges() {
+        use tokeira_iac::{
+            ChangeKind, ChangeSemantics, Confidence, DataEffect, LifecycleOperation, Reversibility,
+            SemanticsContext,
+        };
+
+        let table = DynamoDbTable {
+            table_name: "t".into(),
+            config: DynamoDbTableConfig {
+                key_schema: Vec::new(),
+                billing_mode: BillingMode::OnDemand,
+                ttl_attribute: None,
+                module: "dynamo".into(),
+            },
+            project: "p".into(),
+            region: "us-east-1".into(),
+            tags: HashMap::new(),
+        };
+        let declared = |kind: ChangeKind, diffs: &[tokeira_iac::FieldDiff]| {
+            table.change_semantics(&SemanticsContext {
+                kind,
+                current: None,
+                field_diffs: diffs,
+            })
+        };
+
+        let delete = declared(ChangeKind::Delete, &[]);
+        assert!(matches!(
+            delete.operation,
+            Confidence::ProviderGuarantee {
+                value: LifecycleOperation::Deleted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            delete.data_effect,
+            Confidence::ProviderGuarantee {
+                value: DataEffect::Destroyed,
+                ..
+            }
+        ));
+        assert!(matches!(delete.reversibility, Confidence::Unknown));
+
+        let tags_update = declared(
+            ChangeKind::Update,
+            &[tokeira_iac::FieldDiff::observation("tags changed")],
+        );
+        assert!(matches!(
+            tags_update.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::UpdatedInPlace,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tags_update.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::Preserved,
+                ..
+            }
+        ));
+
+        // Drift-driven or definition-driven, a TTL change is the same
+        // declaration: expiry consequences are per-item and unknowable here.
+        let ttl_update = declared(
+            ChangeKind::Update,
+            &[tokeira_iac::FieldDiff::observation("ttl attribute changed")],
+        );
+        assert!(matches!(ttl_update.data_effect, Confidence::Unknown));
+        assert!(matches!(ttl_update.reversibility, Confidence::Unknown));
+
+        let create = declared(ChangeKind::Create, &[]);
+        assert!(matches!(
+            create.reversibility,
+            Confidence::ProviderGuarantee {
+                value: Reversibility::ReversibleWithDataLoss,
+                ..
+            }
+        ));
+
+        // Inapplicable scenarios: the diff cannot produce a replacement, and
+        // NoChange never declares — both report the all-Unknown default.
+        assert_eq!(
+            declared(ChangeKind::Replace, &[]),
+            ChangeSemantics::default()
+        );
+        assert_eq!(
+            declared(ChangeKind::NoChange, &[]),
+            ChangeSemantics::default()
+        );
     }
 }

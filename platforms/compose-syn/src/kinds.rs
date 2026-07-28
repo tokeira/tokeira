@@ -225,6 +225,99 @@ impl iac::Resource for LocalStateDirResource {
             resource_id: self.resource_id(),
         }
     }
+
+    /// What a state-dir change does, read from this file's own lifecycle
+    /// paths (change-semantics task 4.2). The headline is the delete: it is
+    /// deliberately a no-op — the record retires, `<deployment_dir>/state`
+    /// and everything in it survive — so a deletion declares its data
+    /// **preserved**, the opposite of what the kind's name suggests.
+    fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
+        const CREATE: iac::Citation = iac::Citation::new(
+            "platforms/compose-syn/src/kinds.rs::LocalStateDirResource::create — \
+             create_dir_all; an existing tree is left as-is",
+        );
+        const DELETE: iac::Citation = iac::Citation::new(
+            "platforms/compose-syn/src/kinds.rs::LocalStateDirResource::delete — \
+             deliberate no-op: the record retires; the directory and its contents survive",
+        );
+        use iac::{
+            ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
+            Reversibility,
+        };
+        match ctx.kind {
+            ChangeKind::Create => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Created,
+                    citation: CREATE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: CREATE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: CREATE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: CREATE,
+                },
+                // Reversal (the no-op delete) leaves only an empty directory
+                // behind — no data, so the create is classified reversible.
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: DELETE,
+                },
+            },
+            // The diff never produces an update or replacement (always
+            // NoChange); declared anyway — totality — from the no-op update.
+            ChangeKind::Update | ChangeKind::Replace => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::UpdatedInPlace,
+                    citation: CREATE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: CREATE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: CREATE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: CREATE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: CREATE,
+                },
+            },
+            ChangeKind::Delete => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Deleted,
+                    citation: DELETE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: DELETE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: DELETE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: DELETE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: CREATE,
+                },
+            },
+            ChangeKind::NoChange => iac::ChangeSemantics::default(),
+        }
+    }
 }
 
 /// A service workload (→ `tokeira_compose::ComposeService`). A compose service is
@@ -335,5 +428,88 @@ fn aws_ctx(cx: &Cx, region: &str) -> ResourceContext {
         project: cx.project_name.clone(),
         region: region.to_owned(),
         tags: HashMap::from([("ManagedBy".to_owned(), "tkr".to_owned())]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iac::{
+        ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, Resource as _,
+        SemanticsContext,
+    };
+
+    use super::*;
+
+    // Golden declarations (change-semantics task 4.5): scenarios asserting
+    // classification and confidence — never prose. Scenarios the kind's diff
+    // cannot produce are asserted inapplicable (the all-Unknown default).
+    // The headline: the state-dir delete is a deliberate no-op, so a
+    // deletion declares its data preserved.
+    #[test]
+    fn local_state_dir_declarations_match_the_noop_delete() {
+        let resource = LocalStateDirResource {
+            state_dir: PathBuf::from("/tmp/x/state"),
+        };
+        let declared = |kind: ChangeKind| {
+            resource.change_semantics(&SemanticsContext {
+                kind,
+                current: None,
+                field_diffs: &[],
+            })
+        };
+
+        let create = declared(ChangeKind::Create);
+        assert!(matches!(
+            create.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::Created,
+                ..
+            }
+        ));
+        assert!(matches!(
+            create.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::NoDataHeld,
+                ..
+            }
+        ));
+
+        let delete = declared(ChangeKind::Delete);
+        assert!(matches!(
+            delete.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::Deleted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            delete.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::Preserved,
+                ..
+            }
+        ));
+        assert!(matches!(
+            delete.disruption,
+            Confidence::EngineFact {
+                value: Disruption::None,
+                ..
+            }
+        ));
+
+        // Update/replace/drift cannot arise (diff is always NoChange) but
+        // the declaration stays total and in-place; NoChange declares
+        // nothing.
+        assert!(matches!(
+            declared(ChangeKind::Update).operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::UpdatedInPlace,
+                ..
+            }
+        ));
+        assert_eq!(
+            declared(ChangeKind::NoChange),
+            iac::ChangeSemantics::default()
+        );
     }
 }

@@ -160,10 +160,16 @@ pub enum UncertaintyReason {
     /// are known, field-level evidence is not (Proposal 002's ids-only
     /// audit).
     FieldEvidenceUnavailable,
-    /// Reserved for Feature 2.
+    /// Reserved for Feature 2's Phase 5 (activation is deliberate — emitting
+    /// it before any kind can declare would attach an uncertainty to every
+    /// change in every plan).
     SemanticsUndeclared { field: String },
     /// Reserved for Feature 2.
     ProviderAssignedAtApply { field: String },
+    /// A deletion whose resource type no recoverer claims: the kind cannot
+    /// be reached to declare what the delete does, and that absence is
+    /// stated rather than silent (change-semantics Requirement 3.4).
+    KindUnavailableForRemovedResource,
 }
 
 impl UncertaintyReason {
@@ -175,6 +181,9 @@ impl UncertaintyReason {
             UncertaintyReason::FieldEvidenceUnavailable => "field-evidence-unavailable",
             UncertaintyReason::SemanticsUndeclared { .. } => "semantics-undeclared",
             UncertaintyReason::ProviderAssignedAtApply { .. } => "provider-assigned-at-apply",
+            UncertaintyReason::KindUnavailableForRemovedResource => {
+                "kind-unavailable-for-removed-resource"
+            }
         }
     }
 }

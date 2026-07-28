@@ -145,6 +145,25 @@ pub struct ChangeSemantics {
     pub reversibility: Confidence<Reversibility>,
 }
 
+/// What a kind needs in order to declare — the declaration point's input
+/// (change-semantics design C2).
+///
+/// A context struct rather than loose parameters so later features (causality
+/// inputs, source spans) can extend what declaration sites see without
+/// breaking every implementor.
+#[derive(Debug)]
+pub struct SemanticsContext<'a> {
+    /// The engine's reconciliation classification for this change. Distinct
+    /// from the declared [`LifecycleOperation`]: a compose-service `Update`
+    /// may be *effected* as a replacement, and saying so is the point.
+    pub kind: crate::ChangeKind,
+    /// The recorded state the change acts on; `None` for a creation.
+    pub current: Option<&'a crate::ResourceState>,
+    /// The field-level differences driving the change; empty for creations
+    /// and deletions.
+    pub field_diffs: &'a [crate::FieldDiff],
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

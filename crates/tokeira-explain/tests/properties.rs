@@ -2,7 +2,9 @@
 //! 10): construction is total over changes, deterministic, closed over
 //! evidence, exhaustive over unconfirmed state, incapable of inventing
 //! apply-side evidence — and the written artifact stands alone within the
-//! field policy.
+//! field policy. Plus the change-semantics transport properties (Feature 2,
+//! Properties 3–4): declarations cross verbatim, and no declaration can move
+//! the destructive set.
 
 use std::collections::BTreeMap;
 
@@ -12,7 +14,9 @@ use tokeira_explain::{
     explain_plan,
 };
 use tokeira_iac::{
-    Change, ChangeKind, FieldDiff, PlanOutcome, RefreshCoverage, RefreshStatus, ResourceId,
+    Change, ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, Disruption, FieldDiff,
+    LifecycleOperation, PlanOutcome, RefreshCoverage, RefreshStatus, ReplacementPolicy, ResourceId,
+    Reversibility,
 };
 
 fn context() -> DeploymentContext {
@@ -60,18 +64,91 @@ fn arb_diffs() -> impl Strategy<Value = Vec<FieldDiff>> {
     )
 }
 
+/// Declarations at every confidence tier. Citations come from a const pool —
+/// content is irrelevant to the transport properties; presence is not.
+fn arb_semantics() -> impl Strategy<Value = ChangeSemantics> {
+    const CITE: Citation = Citation::new("test/citation");
+    let operation = prop_oneof![
+        Just(Confidence::Unknown),
+        Just(Confidence::Inference(LifecycleOperation::Replaced)),
+        Just(Confidence::EngineFact {
+            value: LifecycleOperation::UpdatedInPlace,
+            citation: CITE,
+        }),
+        Just(Confidence::ProviderGuarantee {
+            value: LifecycleOperation::Deleted,
+            citation: CITE,
+        }),
+    ];
+    let replacement = prop_oneof![
+        Just(Confidence::Unknown),
+        Just(Confidence::Inference(ReplacementPolicy::NotRequired)),
+        Just(Confidence::EngineFact {
+            value: ReplacementPolicy::DestroyBeforeCreate,
+            citation: CITE,
+        }),
+    ];
+    let disruption = prop_oneof![
+        Just(Confidence::Unknown),
+        Just(Confidence::ProviderGuarantee {
+            value: Disruption::UnavailableDuringChange,
+            citation: CITE,
+        }),
+    ];
+    let data_effect = prop_oneof![
+        Just(Confidence::Unknown),
+        Just(Confidence::EngineFact {
+            value: DataEffect::Destroyed,
+            citation: CITE,
+        }),
+        Just(Confidence::Inference(DataEffect::Preserved)),
+    ];
+    let reversibility = prop_oneof![
+        Just(Confidence::Unknown),
+        Just(Confidence::Inference(Reversibility::Irreversible)),
+    ];
+    (
+        operation,
+        replacement,
+        disruption,
+        data_effect,
+        reversibility,
+    )
+        .prop_map(
+            |(operation, replacement, disruption, data_effect, reversibility)| ChangeSemantics {
+                operation,
+                replacement,
+                disruption,
+                data_effect,
+                reversibility,
+            },
+        )
+}
+
 /// A generated plan outcome: changes with unique resource ids (an engine
-/// invariant — one change per id), and coverage over a subset of them plus
-/// occasionally an extra examined-but-unplanned id.
+/// invariant — one change per id), coverage over a subset of them, and
+/// declarations honouring the engine's own invariants — `NoChange` never
+/// declares, and a declaration-less deletion models an unclaimed recoverer.
 fn arb_outcome() -> impl Strategy<Value = PlanOutcome> {
     (
-        proptest::collection::vec((arb_kind(), arb_diffs(), any::<bool>(), arb_status()), 0..8),
+        proptest::collection::vec(
+            (
+                arb_kind(),
+                arb_diffs(),
+                any::<bool>(),
+                arb_status(),
+                proptest::option::of(arb_semantics()),
+            ),
+            0..8,
+        ),
         any::<bool>(),
     )
         .prop_map(|(rows, examined)| {
             let mut changes = Vec::new();
             let mut status_by_id = BTreeMap::new();
-            for (index, (kind, details, covered, status)) in rows.into_iter().enumerate() {
+            let mut semantics_by_id = BTreeMap::new();
+            for (index, (kind, details, covered, status, declared)) in rows.into_iter().enumerate()
+            {
                 let resource = format!("compose/r{index}");
                 changes.push(Change {
                     kind,
@@ -81,7 +158,12 @@ fn arb_outcome() -> impl Strategy<Value = PlanOutcome> {
                     details,
                 });
                 if covered {
-                    status_by_id.insert(ResourceId(resource), status);
+                    status_by_id.insert(ResourceId(resource.clone()), status);
+                }
+                if kind != ChangeKind::NoChange
+                    && let Some(semantics) = declared
+                {
+                    semantics_by_id.insert(ResourceId(resource), semantics);
                 }
             }
             PlanOutcome {
@@ -90,6 +172,7 @@ fn arb_outcome() -> impl Strategy<Value = PlanOutcome> {
                     status_by_id,
                     examined,
                 },
+                semantics_by_id,
             }
         })
 }
@@ -226,6 +309,61 @@ proptest! {
         } else {
             prop_assert_eq!(unavailable, committed.len());
         }
+    }
+
+    // Change-semantics Property 3 — transport is verbatim: every explained
+    // change carries exactly the declaration the map holds for its id (or
+    // declares nothing when absent), and a declaration-less deletion is
+    // stated as uncertainty, never silence (Req 3.4/3.5/3.6).
+    #[test]
+    fn semantics_property_3_transport_is_verbatim(outcome in arb_outcome()) {
+        let explanation = explain_plan(context(), &outcome);
+        for change in &explanation.changes {
+            let declared = outcome
+                .semantics_by_id
+                .get(&ResourceId(change.resource_id.clone()));
+            match declared {
+                Some(semantics) => prop_assert_eq!(&change.semantics, semantics),
+                None => prop_assert_eq!(&change.semantics, &ChangeSemantics::default()),
+            }
+        }
+        let expected_undeclared: Vec<_> = explanation
+            .changes
+            .iter()
+            .filter(|c| {
+                c.kind == ChangeKind::Delete
+                    && !outcome
+                        .semantics_by_id
+                        .contains_key(&ResourceId(c.resource_id.clone()))
+            })
+            .map(|c| c.evidence_id.clone())
+            .collect();
+        let actual_undeclared: Vec<_> = explanation
+            .uncertainties
+            .iter()
+            .filter(|u| matches!(u.reason, UncertaintyReason::KindUnavailableForRemovedResource))
+            .map(|u| u.subject.clone())
+            .collect();
+        prop_assert_eq!(actual_undeclared, expected_undeclared);
+    }
+
+    // Change-semantics Property 4 — declarations cannot move the destructive
+    // set: whatever any kind declares (fuzzed across every confidence tier),
+    // the destructive set equals the engine's own classification. The safety
+    // property of the feature: a wrong declaration can mislead a reader, but
+    // it can never re-gate `apply --yes`.
+    #[test]
+    fn semantics_property_4_declarations_cannot_move_the_destructive_set(
+        outcome in arb_outcome(),
+    ) {
+        let explanation = explain_plan(context(), &outcome);
+        let engine_classification: Vec<_> = explanation
+            .changes
+            .iter()
+            .filter(|c| matches!(c.kind, ChangeKind::Replace | ChangeKind::Delete))
+            .map(|c| c.evidence_id.clone())
+            .collect();
+        prop_assert_eq!(&explanation.destructive, &engine_classification);
     }
 
     // Property 10 — the artifact is self-contained and bounded: a written

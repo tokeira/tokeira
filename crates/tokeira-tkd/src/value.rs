@@ -65,8 +65,8 @@ pub struct EnumPath {
 
 // `PartialEq` on values (config diff domain). Impl'd manually with NO `H:
 // PartialEq` bound: host handles are never value-comparable, so the `Host` arm
-// trips a debug assert and returns `false` — matching the compose-era semantics
-// (Proposal 004 §2). Config values being diffed are never hosts.
+// trips a debug assert and returns `false` — matching the compose-era
+// semantics. Config values being diffed are never hosts.
 impl<H> PartialEq for Value<H> {
     fn eq(&self, other: &Self) -> bool {
         use Value::*;

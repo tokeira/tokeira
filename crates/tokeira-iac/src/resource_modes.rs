@@ -12,8 +12,8 @@
 //! }
 //! ```
 //!
-//! This convention prevents orphaning resources that were originally created by
-//! Tokeira and later reconfigured as preexisting before destroy. The engine
+//! This convention prevents orphaning resources that were originally created
+//! as managed and later reconfigured as preexisting before destroy. The engine
 //! still calls `Resource::delete` unconditionally; the resource implementation
 //! decides whether that should perform a provider delete or return without
 //! side effects.

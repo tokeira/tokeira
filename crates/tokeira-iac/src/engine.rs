@@ -135,8 +135,7 @@ impl Engine {
             changes: filter_changes_by_modules(&delta.changes, &ctx.state, &active),
             // Coverage and semantics are carried unfiltered: a resource
             // filtered out of this plan's changes was still examined, and its
-            // declaration was still made (evidence-model Requirement 5;
-            // change-semantics Requirement 3).
+            // declaration was still made.
             refresh: RefreshCoverage {
                 status_by_id: refreshed.status_by_id,
                 examined: true,
@@ -275,8 +274,8 @@ impl Engine {
     /// Delete exactly the resources named in `ids`, over the current
     /// `ctx.state`, leaving every other resource untouched.
     ///
-    /// This is the delete-only primitive used by definition-driven rollback
-    /// (Proposal 002): the superseded binary B removes the resources it created
+    /// This is the delete-only primitive used by definition-driven rollback:
+    /// the superseded binary B removes the resources it created
     /// (`keys(S_B) − keys(S_A)`) before the binding re-pins to A. It runs the
     /// shared fail-closed, reverse-dependency-ordered delete path — an id in
     /// `ids` but absent from `known` errors ([`IacError::UnknownResourceDelete`],
@@ -307,8 +306,8 @@ impl Engine {
     }
 
     /// Delete exactly `ids` over the current state, with `known` collected
-    /// and validated from the composition — the rollback B-pass entry point
-    /// (task 19.3). Collection and validation here; the fail-closed,
+    /// and validated from the composition — the rollback B-pass entry
+    /// point. Collection and validation here; the fail-closed,
     /// reverse-dependency-ordered, idempotent semantics live in
     /// [`destroy_selected`](Self::destroy_selected).
     pub async fn destroy_selected_in(
@@ -443,12 +442,12 @@ fn topological_sort_modules(modules: &[Box<dyn crate::Module>]) -> Result<Vec<St
 /// Per-resource refresh outcome — what the engine could confirm about live
 /// state while planning.
 ///
-/// Public because it is explanation-grade evidence (the evidence-model spec):
-/// a consumer reading these can conclude, per resource, whether the plan's
-/// claims rest on a confirmed live read. `Unknown` is the honesty-critical
-/// variant — a plan over an `Unknown` resource is asserting desired state
-/// against live state it could not see, and the explanation layer surfaces
-/// that as uncertainty rather than letting the plan sound confident.
+/// Public because it is explanation-grade evidence: a consumer reading these
+/// can conclude, per resource, whether the plan's claims rest on a confirmed
+/// live read. `Unknown` is the honesty-critical variant — a plan over an
+/// `Unknown` resource is asserting desired state against live state it could
+/// not see, and a consumer can surface that as uncertainty rather than
+/// letting the plan sound confident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RefreshStatus {
@@ -476,10 +475,9 @@ pub enum RefreshStatus {
 ///
 /// `examined == false` means the verb performed no live-state check — a
 /// materially different statement from "everything was confirmed", and one
-/// the explanation layer must be able to make (evidence-model Requirement
-/// 5.5). `BTreeMap` is required, not preferred: serialization order must be
-/// a function of the keys so explanation construction is deterministic
-/// (evidence-model Property 2).
+/// a consumer must be able to make. `BTreeMap` is required, not preferred:
+/// serialization order must be a function of the keys so downstream
+/// construction is deterministic.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefreshCoverage {
     pub status_by_id: BTreeMap<ResourceId, RefreshStatus>,
@@ -494,12 +492,11 @@ pub struct PlanOutcome {
     pub changes: Vec<Change>,
     pub refresh: RefreshCoverage,
     /// Per-resource change semantics, declared by the kind during change
-    /// computation (change-semantics Requirement 3). Keyed like the refresh
-    /// coverage and carried unfiltered by module selection for the same
-    /// reason: a declaration was made whether or not this plan's view shows
-    /// the change. An id absent here on a deletion means no recoverer
-    /// claimed the resource's type — the explanation layer surfaces that as
-    /// uncertainty, never silence.
+    /// computation. Keyed like the refresh coverage and carried unfiltered
+    /// by module selection for the same reason: a declaration was made
+    /// whether or not this plan's view shows the change. An id absent here
+    /// on a deletion means no recoverer claimed the resource's type — a
+    /// consumer surfaces that as uncertainty, never silence.
     pub semantics_by_id: BTreeMap<ResourceId, crate::ChangeSemantics>,
 }
 
@@ -632,9 +629,9 @@ async fn refresh_state(
 // ── Change computation ────────────────────────────────────────────────
 
 /// A computed Delta: the changes, plus what each kind declared the change
-/// does (change-semantics Requirement 3). One pass — declarations are
-/// collected beside the diff that produced the change, never by a second
-/// composition walk or a provider call.
+/// does. One pass — declarations are collected beside the diff that
+/// produced the change, never by a second composition walk or a provider
+/// call.
 struct ComputedDelta {
     changes: Vec<Change>,
     semantics_by_id: BTreeMap<ResourceId, crate::ChangeSemantics>,
@@ -671,7 +668,7 @@ fn compute_changes(
             },
         };
         // NoChange declares nothing: semantics describe what a change does,
-        // and there is none (change-semantics Req 3.1).
+        // and there is none.
         if change.kind != ChangeKind::NoChange {
             semantics_by_id.insert(
                 rid.clone(),
@@ -688,8 +685,7 @@ fn compute_changes(
     // Resources in state but not desired → delete. The desired set has no
     // resource to ask, so the kind is reached through the platform's
     // recovery seam; a type no recoverer claims stays absent from the map,
-    // which the explanation layer turns into uncertainty rather than
-    // silence (change-semantics Req 3.3/3.4).
+    // which a consumer turns into uncertainty rather than silence.
     for (rid, rs) in &state.resources {
         if !desired_ids.contains(rid) {
             if let Some(recovered) = ctx

@@ -403,7 +403,7 @@ impl<D: Deployment> InfraEngine<D> {
     }
 
     /// Delete exactly the named resource ids and persist state — the rollback
-    /// B-delete pass (task 19.3): fail-closed (an id outside the composition's
+    /// B-delete pass: fail-closed (an id outside the composition's
     /// known set errors rather than orphaning), reverse-dependency-ordered,
     /// idempotent (an id absent from state is done); every other resource
     /// untouched.

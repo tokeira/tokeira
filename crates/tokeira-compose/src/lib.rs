@@ -210,7 +210,7 @@ impl iac::Resource for ComposeService {
     }
 
     /// What a compose-service change does, established from this crate's own
-    /// provider paths (change-semantics task 4.1). The load-bearing claim:
+    /// provider paths. The load-bearing claim:
     /// an engine `Update` is *effected* as a replacement — `reconcile_service`
     /// stops and force-removes the container before creating the new one —
     /// so `~ compose/grafana` means the service goes away and comes back,
@@ -517,7 +517,7 @@ impl ComposePlatform {
 
     /// Returns the container's image digest if it differs from the local image's
     /// current digest for the same tag. This detects rebuilt images behind the
-    /// same tag (e.g., `tokeirad:latest` rebuilt locally).
+    /// same tag (e.g., `app:latest` rebuilt locally).
     ///
     /// Returns `None` if the image is current, or if either lookup fails (in
     /// which case we fall back to tag-only comparison).

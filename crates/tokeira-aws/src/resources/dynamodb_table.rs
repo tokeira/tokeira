@@ -296,7 +296,7 @@ impl Resource for DynamoDbTable {
         }
     }
 
-    /// What a DynamoDB-table change does (change-semantics task 4.4). The
+    /// What a DynamoDB-table change does. The
     /// engine-side facts come from this file's own paths (update issues
     /// control-plane calls only; there is no replace path — the diff never
     /// produces one). The provider-side facts carry AWS's own words: the

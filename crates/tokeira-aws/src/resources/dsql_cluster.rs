@@ -138,8 +138,7 @@ impl Resource for DsqlCluster {
         }
     }
 
-    /// What a DSQL-cluster change does (change-semantics task 4.3),
-    /// mode-aware: a **preexisting** cluster is referenced, never managed
+    /// What a DSQL-cluster change does, mode-aware: a **preexisting** cluster is referenced, never managed
     /// by the deployment — the provider is never called, so every
     /// declaration is an engine fact about this module's own restraint. A **managed** cluster is real: its
     /// delete path disables deletion protection and calls

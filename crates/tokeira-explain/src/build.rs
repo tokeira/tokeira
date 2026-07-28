@@ -51,10 +51,17 @@ pub fn explain_plan(context: DeploymentContext, outcome: &PlanOutcome) -> Deploy
             resource_id: change.resource.clone(),
             module: change.module.clone(),
             resource_type: change.resource_type.clone(),
-            kind: change.kind.clone(),
+            kind: change.kind,
             field_diffs: change.details.clone(),
             refresh_status,
-            semantics: Default::default(),
+            // Verbatim from the kind's declaration (change-semantics
+            // Property 3): the explanation transports, it never amends. An
+            // absent id declares nothing — all fields Unknown.
+            semantics: outcome
+                .semantics_by_id
+                .get(&ResourceId(change.resource.clone()))
+                .cloned()
+                .unwrap_or_default(),
             cause: Default::default(),
             dependants: Vec::new(),
             source: None,
@@ -68,6 +75,7 @@ pub fn explain_plan(context: DeploymentContext, outcome: &PlanOutcome) -> Deploy
     }
 
     derive_refresh_uncertainties(&mut explanation, outcome);
+    derive_semantics_uncertainties(&mut explanation, outcome);
     explanation
 }
 
@@ -117,10 +125,15 @@ pub fn explain_applied(
             resource_id: entry.id.clone(),
             module: String::new(),
             resource_type: String::new(),
-            kind: kind.clone(),
+            kind,
             field_diffs,
             refresh_status,
-            semantics: Default::default(),
+            // Reused from the preceding plan's declarations when one exists
+            // — the same reuse-never-invent rule as field evidence (Req 2).
+            semantics: preceding
+                .and_then(|plan| plan.semantics_by_id.get(&ResourceId(entry.id.clone())))
+                .cloned()
+                .unwrap_or_default(),
             cause: Default::default(),
             dependants: Vec::new(),
             source: None,
@@ -203,6 +216,35 @@ fn derive_refresh_uncertainties(explanation: &mut DeploymentExplanation, outcome
              desired state against records, not observations"
                 .to_string(),
             Some("make the platform reachable and re-run the plan".to_string()),
+        );
+    }
+}
+
+/// Change-semantics Requirement 3.4: a deletion whose id is absent from the
+/// declaration map means no recoverer claimed the resource's type — the kind
+/// could not be reached to say what the delete does. Stated as uncertainty,
+/// never silence. Non-deletions are always reachable (they sit in the
+/// desired set), so absence there carries no such meaning.
+fn derive_semantics_uncertainties(explanation: &mut DeploymentExplanation, outcome: &PlanOutcome) {
+    let undeclared: Vec<EvidenceId> = explanation
+        .changes
+        .iter()
+        .filter(|change| {
+            change.kind == ChangeKind::Delete
+                && !outcome
+                    .semantics_by_id
+                    .contains_key(&ResourceId(change.resource_id.clone()))
+        })
+        .map(|change| change.evidence_id.clone())
+        .collect();
+    for subject in undeclared {
+        push_uncertainty(
+            explanation,
+            subject,
+            UncertaintyReason::KindUnavailableForRemovedResource,
+            "what this deletion does to the running resource could not be established              from recorded state"
+                .to_string(),
+            Some("register recovery for this resource type in the platform".to_string()),
         );
     }
 }

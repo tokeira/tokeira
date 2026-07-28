@@ -31,17 +31,19 @@ property-based test task.
     `&'static str` alone cannot `Deserialize` for the JSON round-trip); `EngineFact` and
     `ProviderGuarantee` both carry citations structurally.
 
-- [ ] 1.3 Extend `PlanOutcome` with `semantics_by_id`
+- [x] 1.3 Extend `PlanOutcome` with `semantics_by_id`
   - `BTreeMap<ResourceId, ChangeSemantics>` beside the refresh coverage, populated empty
     until Phase 3
   - _Requirements: 3.2_
 
-- [ ] 1.4 **Checkpoint** — workspace check, test, lint clean; explanation output unchanged
-  (every field still `Unknown`, renderer still silent).
+- [x] 1.4 **Checkpoint** — workspace check, test, lint clean; explanation output unchanged
+  (every field still `Unknown`, renderer still silent). DONE — Phases 1–3 slice:
+  `semantics_by_id: BTreeMap<ResourceId, ChangeSemantics>` on `PlanOutcome`, carried
+  unfiltered by module selection (same rationale as refresh coverage).
 
 ## Phase 2 — The declaration point
 
-- [ ] 2.1 Add `SemanticsContext` and `Resource::change_semantics`
+- [x] 2.1 Add `SemanticsContext` and `Resource::change_semantics`
   - Context struct carrying change kind, recorded state, and field differences, so
     Features 3–4 can extend inputs without breaking declaration sites
   - Default implementation returns `ChangeSemantics::default()`
@@ -49,45 +51,55 @@ property-based test task.
     honest posture rather than a placeholder
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6_
 
-- [ ] 2.2 **PBT: Property 1 — the default declares nothing**
+- [x] 2.2 **PBT: Property 1 — the default declares nothing**
   - _Property 1; Requirements: 1.4, 2.4_
 
-- [ ] 2.3 **PBT: Property 2 — declaration is total**
+- [x] 2.3 **PBT: Property 2 — declaration is total**
   - Generated over every `ChangeKind`, empty/observation-only/populated diff sets, and
     present/absent recorded state; run against the default and (after Phase 4) every
     declaring kind
   - _Property 2; Requirements: 1.5, 1.6_
 
-- [ ] 2.4 **Checkpoint** — trait change compiles workspace-wide with no kind edits (the
-  default keeps all 34 non-declaring kinds correct).
+- [x] 2.4 **Checkpoint** — trait change compiles workspace-wide with no kind edits (the
+  default keeps all 34 non-declaring kinds correct). DONE — `SemanticsContext` in
+  `semantics.rs`; defaulted `change_semantics` on `Resource` (dyn-compatible, purity/
+  totality contract in the doc); Properties 1+2 as one engine proptest over every kind,
+  diff shape, and state presence; zero kind edits workspace-wide. `ChangeKind` gained
+  `Copy` (fieldless enum; the context carries it by value).
 
 ## Phase 3 — Collection during change computation
 
-- [ ] 3.1 Collect declarations in `compute_changes`
+- [x] 3.1 Collect declarations in `compute_changes`
   - One call per non-`NoChange` change; result keyed by resource id
   - No second composition pass and no additional provider call
   - _Requirements: 3.1, 3.2, 3.7_
 
-- [ ] 3.2 Reach removed resources through the recovery seam
+- [x] 3.2 Reach removed resources through the recovery seam
   - For deletions, recover the kind from recorded state via `ResourceRecovery` and declare
   - Where no recoverer claims the type, leave the id absent from the map
   - _Requirements: 3.3, 3.4_
 
-- [ ] 3.3 Carry declarations into the explanation
+- [x] 3.3 Carry declarations into the explanation
   - `ExplainedChange.semantics` populated verbatim from `semantics_by_id`
   - Absent id on a deletion → `KindUnavailableForRemovedResource` uncertainty
   - _Requirements: 3.4, 3.5, 3.6_
 
-- [ ] 3.4 **PBT: Property 3 — transport is verbatim**
+- [x] 3.4 **PBT: Property 3 — transport is verbatim**
   - _Property 3; Requirements: 3.5, 3.6_
 
-- [ ] 3.5 **PBT: Property 4 — declarations cannot move the destructive set**
+- [x] 3.5 **PBT: Property 4 — declarations cannot move the destructive set**
   - Fuzz declarations against a fixed change set; the destructive set must equal the
     engine's classification every time
   - _Property 4; Requirements: 4.1, 4.2_
 
-- [ ] 3.6 **Checkpoint** — with no kind declaring yet, plans are unchanged; the transport
-  is proven inert before any declaration lands.
+- [x] 3.6 **Checkpoint** — with no kind declaring yet, plans are unchanged; the transport
+  is proven inert before any declaration lands. DONE — collection inside
+  `compute_changes` (one `ComputedDelta` pass: desired changes declare, `NoChange`
+  never, deletions via `ResourceRecovery` with unclaimed types absent — unit-pinned);
+  verbatim transport into `ExplainedChange.semantics` on the plan side and preceding-plan
+  reuse on the apply side; `KindUnavailableForRemovedResource` states the unclaimed-
+  deletion absence; Properties 3+4 green over declarations fuzzed at every confidence
+  tier; full §10.4 bar green with every declaration still all-Unknown.
 
 ## Phase 4 — Tier 1 and Tier 2 declarations
 

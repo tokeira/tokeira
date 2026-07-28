@@ -38,7 +38,7 @@ pub struct InfraComposition {
 }
 
 /// The kind of change detected by the diff engine.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChangeKind {
     Create,

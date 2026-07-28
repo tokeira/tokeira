@@ -307,6 +307,7 @@ mod tests {
                 status_by_id,
                 examined: true,
             },
+            ..Default::default()
         }
     }
 
@@ -533,6 +534,7 @@ mod tests {
             let outcome = PlanOutcome {
                 changes,
                 refresh: RefreshCoverage { status_by_id, examined },
+                ..Default::default()
             };
             ExplanationReport {
                 initialized,

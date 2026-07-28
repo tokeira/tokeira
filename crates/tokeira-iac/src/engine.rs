@@ -101,13 +101,14 @@ impl Engine {
     ) -> Result<PlanOutcome, IacError> {
         let refreshed = refresh_state(known, desired, ctx, None).await?;
         ctx.state = refreshed.state;
-        let changes = compute_changes(desired, &ctx.state, ctx);
+        let delta = compute_changes(desired, &ctx.state, ctx);
         Ok(PlanOutcome {
-            changes,
+            changes: delta.changes,
             refresh: RefreshCoverage {
                 status_by_id: refreshed.status_by_id,
                 examined: true,
             },
+            semantics_by_id: delta.semantics_by_id,
         })
     }
 
@@ -124,21 +125,23 @@ impl Engine {
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         let refreshed = refresh_state(&known_refs, &desired_refs, ctx, None).await?;
         ctx.state = refreshed.state;
-        let changes = compute_changes(&desired_refs, &ctx.state, ctx);
+        let delta = compute_changes(&desired_refs, &ctx.state, ctx);
         let active: Vec<&str> = composition
             .active_modules
             .iter()
             .map(|s| s.as_str())
             .collect();
         Ok(PlanOutcome {
-            changes: filter_changes_by_modules(&changes, &ctx.state, &active),
-            // Coverage is carried unfiltered: a resource filtered out of this
-            // plan's changes was still examined, and saying so is correct
-            // (evidence-model Requirement 5).
+            changes: filter_changes_by_modules(&delta.changes, &ctx.state, &active),
+            // Coverage and semantics are carried unfiltered: a resource
+            // filtered out of this plan's changes was still examined, and its
+            // declaration was still made (evidence-model Requirement 5;
+            // change-semantics Requirement 3).
             refresh: RefreshCoverage {
                 status_by_id: refreshed.status_by_id,
                 examined: true,
             },
+            semantics_by_id: delta.semantics_by_id,
         })
     }
 
@@ -172,7 +175,7 @@ impl Engine {
     ) -> Result<Vec<Change>, IacError> {
         let refreshed = refresh_state(known, desired, ctx, saver).await?;
         ctx.state = refreshed.state;
-        let changes = compute_changes(desired, &ctx.state, ctx);
+        let changes = compute_changes(desired, &ctx.state, ctx).changes;
         apply_changes(known, ctx, changes, saver).await
     }
 
@@ -190,7 +193,7 @@ impl Engine {
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         let refreshed = refresh_state(&known_refs, &desired_refs, ctx, saver).await?;
         ctx.state = refreshed.state;
-        let changes = compute_changes(&desired_refs, &ctx.state, ctx);
+        let changes = compute_changes(&desired_refs, &ctx.state, ctx).changes;
         let active: Vec<&str> = composition
             .active_modules
             .iter()
@@ -225,13 +228,14 @@ impl Engine {
         let desired: [&dyn Resource; 0] = [];
         let refreshed = refresh_state(&known_refs, &desired, ctx, None).await?;
         ctx.state = refreshed.state;
-        let changes = compute_changes(&desired, &ctx.state, ctx);
+        let delta = compute_changes(&desired, &ctx.state, ctx);
         Ok(PlanOutcome {
-            changes,
+            changes: delta.changes,
             refresh: RefreshCoverage {
                 status_by_id: refreshed.status_by_id,
                 examined: true,
             },
+            semantics_by_id: delta.semantics_by_id,
         })
     }
 
@@ -250,6 +254,7 @@ impl Engine {
         Ok(PlanOutcome {
             changes: filter_changes_by_modules(&outcome.changes, &ctx.state, &active),
             refresh: outcome.refresh,
+            semantics_by_id: outcome.semantics_by_id,
         })
     }
 
@@ -263,7 +268,7 @@ impl Engine {
         let desired: [&dyn Resource; 0] = [];
         let refreshed = refresh_state(known, &desired, ctx, saver).await?;
         ctx.state = refreshed.state;
-        let changes = compute_changes(&desired, &ctx.state, ctx);
+        let changes = compute_changes(&desired, &ctx.state, ctx).changes;
         destroy_changes(known, ctx, changes, saver).await
     }
 
@@ -332,7 +337,7 @@ impl Engine {
         let desired: [&dyn Resource; 0] = [];
         let refreshed = refresh_state(&known_refs, &desired, ctx, saver).await?;
         ctx.state = refreshed.state;
-        let changes = compute_changes(&desired, &ctx.state, ctx);
+        let changes = compute_changes(&desired, &ctx.state, ctx).changes;
         let active: Vec<&str> = composition
             .active_modules
             .iter()
@@ -481,12 +486,21 @@ pub struct RefreshCoverage {
     pub examined: bool,
 }
 
-/// What a plan produced: the changes, and what the engine could confirm
-/// about live state while producing them.
+/// What a plan produced: the changes, what the engine could confirm about
+/// live state while producing them, and what the declaring kinds said each
+/// change does.
 #[derive(Debug, Clone, Default)]
 pub struct PlanOutcome {
     pub changes: Vec<Change>,
     pub refresh: RefreshCoverage,
+    /// Per-resource change semantics, declared by the kind during change
+    /// computation (change-semantics Requirement 3). Keyed like the refresh
+    /// coverage and carried unfiltered by module selection for the same
+    /// reason: a declaration was made whether or not this plan's view shows
+    /// the change. An id absent here on a deletion means no recoverer
+    /// claimed the resource's type — the explanation layer surfaces that as
+    /// uncertainty, never silence.
+    pub semantics_by_id: BTreeMap<ResourceId, crate::ChangeSemantics>,
 }
 
 #[derive(Debug)]
@@ -617,41 +631,80 @@ async fn refresh_state(
 
 // ── Change computation ────────────────────────────────────────────────
 
+/// A computed Delta: the changes, plus what each kind declared the change
+/// does (change-semantics Requirement 3). One pass — declarations are
+/// collected beside the diff that produced the change, never by a second
+/// composition walk or a provider call.
+struct ComputedDelta {
+    changes: Vec<Change>,
+    semantics_by_id: BTreeMap<ResourceId, crate::ChangeSemantics>,
+}
+
 fn compute_changes(
     desired: &[&dyn Resource],
     state: &crate::document::InfraState,
     ctx: &ProvisionContext,
-) -> Vec<Change> {
+) -> ComputedDelta {
     let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.resource_id()).collect();
     let mut changes = Vec::new();
+    let mut semantics_by_id = BTreeMap::new();
 
     for resource in desired {
         let rid = resource.resource_id();
-        match state.resources.get(&rid) {
+        let current = state.resources.get(&rid);
+        let change = match current {
             Some(current) => {
                 let diff = resource.diff(current, ctx);
-                changes.push(internal_change_to_flat(
+                internal_change_to_flat(
                     &diff,
                     resource.module(),
                     &rid.0,
                     &resource.resource_type().0,
-                ));
+                )
             }
-            None => {
-                changes.push(Change {
-                    kind: ChangeKind::Create,
-                    resource_type: resource.resource_type().0.clone(),
-                    module: resource.module().to_string(),
-                    resource: rid.0.clone(),
-                    details: Vec::new(),
-                });
-            }
+            None => Change {
+                kind: ChangeKind::Create,
+                resource_type: resource.resource_type().0.clone(),
+                module: resource.module().to_string(),
+                resource: rid.0.clone(),
+                details: Vec::new(),
+            },
+        };
+        // NoChange declares nothing: semantics describe what a change does,
+        // and there is none (change-semantics Req 3.1).
+        if change.kind != ChangeKind::NoChange {
+            semantics_by_id.insert(
+                rid.clone(),
+                resource.change_semantics(&crate::SemanticsContext {
+                    kind: change.kind,
+                    current,
+                    field_diffs: &change.details,
+                }),
+            );
         }
+        changes.push(change);
     }
 
-    // Resources in state but not desired → delete
+    // Resources in state but not desired → delete. The desired set has no
+    // resource to ask, so the kind is reached through the platform's
+    // recovery seam; a type no recoverer claims stays absent from the map,
+    // which the explanation layer turns into uncertainty rather than
+    // silence (change-semantics Req 3.3/3.4).
     for (rid, rs) in &state.resources {
         if !desired_ids.contains(rid) {
+            if let Some(recovered) = ctx
+                .extension::<ResourceRecovery>()
+                .and_then(|recovery| recovery.recover(rs))
+            {
+                semantics_by_id.insert(
+                    rid.clone(),
+                    recovered.change_semantics(&crate::SemanticsContext {
+                        kind: ChangeKind::Delete,
+                        current: Some(rs),
+                        field_diffs: &[],
+                    }),
+                );
+            }
             changes.push(Change {
                 kind: ChangeKind::Delete,
                 resource_type: rs.resource_type.0.clone(),
@@ -662,7 +715,10 @@ fn compute_changes(
         }
     }
 
-    changes
+    ComputedDelta {
+        changes,
+        semantics_by_id,
+    }
 }
 
 // ── Apply ─────────────────────────────────────────────────────────────
@@ -1467,7 +1523,7 @@ mod tests {
     ) -> Result<Vec<Change>, IacError> {
         let refreshed = refresh_state(known, desired, ctx, None).await?;
         ctx.state = refreshed.state;
-        Ok(compute_changes(desired, &ctx.state, ctx))
+        Ok(compute_changes(desired, &ctx.state, ctx).changes)
     }
 
     /// One generated resource's world: membership, live-describe behaviour,
@@ -1517,6 +1573,61 @@ mod tests {
             stubs.push(stub);
         }
         (stubs, ctx)
+    }
+
+    // Property 1 (change-semantics): the default declares nothing — and
+    // Property 2: it is total. Over every ChangeKind, diff shape, and
+    // state presence, a kind that does not override `change_semantics`
+    // returns all-Unknown, for every input, without panicking. Declaring
+    // kinds join this generator when Phase 4 lands them.
+    #[test]
+    fn property_1_and_2_default_declaration_is_nothing_and_total() {
+        use proptest::prelude::*;
+        let context_inputs = (
+            prop_oneof![
+                Just(ChangeKind::Create),
+                Just(ChangeKind::Update),
+                Just(ChangeKind::Replace),
+                Just(ChangeKind::Delete),
+                Just(ChangeKind::NoChange),
+            ],
+            any::<bool>(),
+            proptest::collection::vec(
+                prop_oneof![
+                    "[a-z]{1,12}".prop_map(crate::FieldDiff::observation),
+                    ("[a-z]{1,8}", "[a-z]{0,8}", "[a-z]{0,8}").prop_map(|(f, b, a)| {
+                        crate::FieldDiff {
+                            field: f,
+                            before: Some(b),
+                            after: Some(a),
+                        }
+                    }),
+                ],
+                0..4,
+            ),
+        );
+        let mut runner = proptest::test_runner::TestRunner::default();
+        runner
+            .run(&context_inputs, |(kind, with_state, field_diffs)| {
+                let stub = StubResource::missing("compose/probe", "m");
+                let state = crate::ResourceState {
+                    resource_type: crate::ResourceType("compose_service".into()),
+                    physical_id: "p".into(),
+                    properties: serde_json::json!({}),
+                    dependencies: Vec::new(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    module: "m".into(),
+                };
+                let declared = stub.change_semantics(&crate::SemanticsContext {
+                    kind,
+                    current: with_state.then_some(&state),
+                    field_diffs: &field_diffs,
+                });
+                prop_assert_eq!(declared, crate::ChangeSemantics::default());
+                Ok(())
+            })
+            .expect("default declaration property");
     }
 
     // Property 7 (evidence-model): widening preserves planning. For any
@@ -1699,6 +1810,76 @@ mod tests {
                 .resources
                 .contains_key(&ResourceId("orphan".into())),
             "fail-closed must NOT drop the orphan from state"
+        );
+    }
+
+    // Change-semantics 3.1/3.2: the collection honours its three rules —
+    // desired changes declare (Create included), NoChange never declares,
+    // and a deletion declares only when a recoverer claims its type; an
+    // unclaimed type stays absent for the explanation layer to state.
+    #[tokio::test]
+    async fn semantics_collection_declares_desired_and_recovered_only() {
+        let engine = Engine::new();
+        let mut ctx = ProvisionContext::default();
+        // A removed resource whose type the recoverer claims, and one it
+        // does not.
+        ctx.state
+            .resources
+            .insert(ResourceId("removed".into()), stub_state("removed", "ghost"));
+        ctx.state.resources.insert(ResourceId("alien".into()), {
+            let mut s = stub_state("alien", "ghost");
+            s.resource_type = crate::ResourceType::new("not-a-stub");
+            s
+        });
+        ctx.set_extension(ResourceRecovery::new(|state| {
+            (state.resource_type.0 == "Stub").then(|| {
+                Box::new(StubResource::missing(&state.physical_id, "ghost")) as Box<dyn Resource>
+            })
+        }));
+
+        // One desired create; one desired resource already in state,
+        // confirmed live by describe, and unchanged by diff (NoChange).
+        let unchanged_state = stub_state("steady", "m");
+        ctx.state
+            .resources
+            .insert(ResourceId("steady".into()), unchanged_state.clone());
+        let steady = StubResource {
+            describe_state: Some(unchanged_state),
+            ..StubResource::missing("steady", "m")
+        };
+        let desired = boxed_resources(vec![StubResource::missing("fresh", "m"), steady]);
+
+        let outcome = engine
+            .plan_with_known(&refs(&desired), &refs(&desired), &mut ctx)
+            .await
+            .expect("plan");
+
+        let declared: Vec<&str> = outcome
+            .semantics_by_id
+            .keys()
+            .map(|id| id.0.as_str())
+            .collect();
+        assert!(declared.contains(&"fresh"), "creates declare: {declared:?}");
+        assert!(
+            declared.contains(&"removed"),
+            "recovered deletions declare: {declared:?}"
+        );
+        assert!(
+            !declared.contains(&"steady"),
+            "NoChange never declares: {declared:?}"
+        );
+        assert!(
+            !declared.contains(&"alien"),
+            "unclaimed deletions stay absent: {declared:?}"
+        );
+        // With no kind overriding the declaration point, everything declared
+        // is the honest default.
+        assert!(
+            outcome
+                .semantics_by_id
+                .values()
+                .all(|s| *s == crate::ChangeSemantics::default()),
+            "no kind declares yet — every declaration is all-Unknown"
         );
     }
 

@@ -307,15 +307,18 @@ impl Resource for DynamoDbTable {
     /// inferred; likewise a TTL-bearing update's data effect depends on
     /// per-item expiry values, which no declaration can know.
     fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
-        const CREATE_PATH: Citation = Citation::new(
-            "crates/tokeira-aws/src/resources/dynamodb_table.rs::create — \
-             dynamodb:CreateTable, waits ACTIVE",
-        );
-        const UPDATE_PATH: Citation = Citation::new(
-            "crates/tokeira-aws/src/resources/dynamodb_table.rs::update — \
-             dynamodb:TagResource and dynamodb:UpdateTimeToLive only; no data-plane \
-             operation",
-        );
+        // Cited by module identity, never repo layout; every name is a real
+        // identifier in this module. The delete citation stays a
+        // documentation URL: that claim is AWS's, not this module's.
+        const CREATE_PATH: Citation = Citation::new(concat!(
+            module_path!(),
+            "::create — dynamodb:CreateTable, then wait_until_active"
+        ));
+        const UPDATE_PATH: Citation = Citation::new(concat!(
+            module_path!(),
+            "::update — dynamodb:TagResource and dynamodb:UpdateTimeToLive only; \
+             no data-plane operation"
+        ));
         const DELETE_TABLE_DOC: Citation = Citation::new(
             "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/\
              API_DeleteTable.html — \"The DeleteTable operation deletes a table and \
@@ -361,10 +364,13 @@ impl Resource for DynamoDbTable {
                         value: ReplacementPolicy::NotRequired,
                         citation: UPDATE_PATH,
                     },
-                    disruption: Confidence::EngineFact {
-                        value: Disruption::None,
-                        citation: UPDATE_PATH,
-                    },
+                    // Inference, not fact: the engine fact is only that
+                    // control-plane calls are issued — whether the provider
+                    // disrupts on them is not established by the pages
+                    // fetched. Ledgered: fetch the TagResource /
+                    // UpdateTimeToLive docs and upgrade to ProviderGuarantee
+                    // if they establish it.
+                    disruption: Confidence::Inference(Disruption::None),
                     data_effect: if ttl_involved {
                         Confidence::Unknown
                     } else {
@@ -814,8 +820,8 @@ mod tests {
     #[test]
     fn dynamodb_declarations_cite_aws_and_stay_unknown_at_the_edges() {
         use tokeira_iac::{
-            ChangeKind, ChangeSemantics, Confidence, DataEffect, LifecycleOperation, Reversibility,
-            SemanticsContext,
+            ChangeKind, ChangeSemantics, Confidence, DataEffect, Disruption, LifecycleOperation,
+            Reversibility, SemanticsContext,
         };
 
         let table = DynamoDbTable {
@@ -872,6 +878,12 @@ mod tests {
                 value: DataEffect::Preserved,
                 ..
             }
+        ));
+        // Disruption on a control-plane update is an inference, not a fact:
+        // the pages fetched do not establish the provider's behaviour.
+        assert!(matches!(
+            tags_update.disruption,
+            Confidence::Inference(Disruption::None)
         ));
 
         // Drift-driven or definition-driven, a TTL change is the same

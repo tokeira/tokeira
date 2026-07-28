@@ -616,16 +616,18 @@ impl iac::Resource for ObservabilityConfigFilesResource {
     /// and is still reversible because the tree is a pure function of the
     /// definition: `create` re-renders it identically.
     fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
-        const WRITE: iac::Citation = iac::Citation::new(
-            "platforms/compose-syn/src/observability_config.rs::\
-             ObservabilityConfigFilesResource::{create,update} — write_all renders the \
-             managed config set in place",
-        );
-        const DELETE: iac::Citation = iac::Citation::new(
-            "platforms/compose-syn/src/observability_config.rs::\
-             ObservabilityConfigFilesResource::delete — removes each managed file; \
-             refuses non-empty foreign directories",
-        );
+        // Cited by module identity, never repo layout; every name is a real
+        // identifier in this module.
+        const WRITE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::ObservabilityConfigFilesResource::{create,update} — write_all renders \
+             the managed config set in place"
+        ));
+        const DELETE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::ObservabilityConfigFilesResource::delete — fs::remove_file over \
+             managed_relative_paths(); refuses non-empty foreign directories"
+        ));
         use iac::{
             ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
             Reversibility,

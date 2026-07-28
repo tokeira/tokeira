@@ -98,7 +98,7 @@ impl Citation {
 ///
 /// `Unknown` is the `Default` — the lazy path is the honest path (umbrella
 /// D4). `Inference` is Tokeira-derived and renders as such; `EngineFact`
-/// cites Tokeira's own code; `ProviderGuarantee` cites the provider's
+/// cites the engine's own code; `ProviderGuarantee` cites the provider's
 /// documentation. Not `Copy`: citations own their text after deserialization.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

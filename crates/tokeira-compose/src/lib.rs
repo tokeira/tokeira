@@ -217,16 +217,20 @@ impl iac::Resource for ComposeService {
     /// not an in-place edit. Data rides bind-mounted host paths, which
     /// neither the removal nor the recreation touches.
     fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
-        // EngineFacts, cited to the provider paths in this file.
-        const RECONCILE: iac::Citation = iac::Citation::new(
-            "crates/tokeira-compose/src/lib.rs::ComposePlatform::reconcile_service — \
-             stop(t=1) → remove_container(force) → create fresh from the definition",
-        );
-        const REMOVE: iac::Citation = iac::Citation::new(
-            "crates/tokeira-compose/src/lib.rs::ComposePlatform::remove_service — \
-             stop + remove_container; bind-mounted host data is never touched \
-             (RemoveContainerOptions.v defaults false; binds live on the host)",
-        );
+        // EngineFacts, cited by module identity — never repo layout — so the
+        // citation stays true wherever this crate is used. Every name below
+        // is a real identifier in this module.
+        const RECONCILE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::ComposePlatform::reconcile_service — stop_container(t: 1) → \
+             remove_container(force: true) → create fresh from the definition"
+        ));
+        const REMOVE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::ComposePlatform::remove_service — stop_container + remove_container \
+             with RemoveContainerOptions { force: true, ..Default::default() } — the \
+             `v` (remove volumes) flag stays false, and bind mounts are host paths"
+        ));
         use iac::{
             ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
             Reversibility,

@@ -232,14 +232,18 @@ impl iac::Resource for LocalStateDirResource {
     /// and everything in it survive — so a deletion declares its data
     /// **preserved**, the opposite of what the kind's name suggests.
     fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
-        const CREATE: iac::Citation = iac::Citation::new(
-            "platforms/compose-syn/src/kinds.rs::LocalStateDirResource::create — \
-             create_dir_all; an existing tree is left as-is",
-        );
-        const DELETE: iac::Citation = iac::Citation::new(
-            "platforms/compose-syn/src/kinds.rs::LocalStateDirResource::delete — \
-             deliberate no-op: the record retires; the directory and its contents survive",
-        );
+        // Cited by module identity, never repo layout; every name is a real
+        // identifier in this module.
+        const CREATE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::LocalStateDirResource::create — std::fs::create_dir_all; an existing \
+             tree is left as-is"
+        ));
+        const DELETE: iac::Citation = iac::Citation::new(concat!(
+            module_path!(),
+            "::LocalStateDirResource::delete — deliberate no-op (returns Ok(())): \
+             the record retires; the directory and its contents survive"
+        ));
         use iac::{
             ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
             Reversibility,

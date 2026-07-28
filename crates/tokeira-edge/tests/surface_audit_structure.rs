@@ -29,6 +29,17 @@ fn design_doc() -> String {
     fs::read_to_string(path).expect("temporal API sync design should be readable")
 }
 
+fn rust_sources(root: &std::path::Path, output: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(root).expect("source directory should be readable") {
+        let path = entry.expect("source entry should be readable").path();
+        if path.is_dir() {
+            rust_sources(&path, output);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            output.push(path);
+        }
+    }
+}
+
 fn table_cells(line: &str) -> Option<Vec<String>> {
     if !line.starts_with('|') || line.contains("|---") {
         return None;
@@ -190,5 +201,37 @@ fn worker_inventory_surface_audit_is_observation_backed() {
             target_spec_name(&row.target_spec).as_deref(),
             Some("worker-heartbeat-observability")
         );
+    }
+}
+
+#[test]
+fn scoped_worker_authorization_is_absent_from_kernel_authority() {
+    let root = workspace_root();
+    let manifest = fs::read_to_string(root.join("crates/tokeira-kernel/Cargo.toml"))
+        .expect("kernel manifest should be readable");
+    for forbidden in ["tokeira-auth", "tokeira-storage"] {
+        assert!(
+            !manifest.contains(forbidden),
+            "scoped Worker authorization must not add kernel dependency {forbidden}"
+        );
+    }
+
+    let mut sources = Vec::new();
+    rust_sources(&root.join("crates/tokeira-kernel/src"), &mut sources);
+    for source_path in sources {
+        let source = fs::read_to_string(&source_path).expect("kernel source should be readable");
+        for forbidden in [
+            "WorkerScope",
+            "WorkerTaskProvenance",
+            "ScopedWorkerSession",
+            "tokeira_auth",
+            "worker_task_provenance",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "scoped Worker authority leaked into {} through {forbidden}",
+                source_path.display()
+            );
+        }
     }
 }

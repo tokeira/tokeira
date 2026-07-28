@@ -43,6 +43,8 @@ pub struct BufferedQuery {
     pub query_args: Payloads,
     pub required_barrier: i64,
     pub enqueued_at: Instant,
+    /// Caller-facing deadline preserved if the query is later unblocked.
+    pub deadline: time::OffsetDateTime,
     pub response_tx: oneshot::Sender<QueryResult>,
 }
 
@@ -164,6 +166,7 @@ mod tests {
             query_args: Payloads::default(),
             required_barrier: barrier,
             enqueued_at: Instant::now(),
+            deadline: time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
             response_tx: tx,
         }
     }

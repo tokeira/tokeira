@@ -33,6 +33,16 @@ pub struct PollNexusTaskQueueRequest {
     pub namespace: String,
     pub worker_identity: String,
     pub task_queue: String,
+    /// Declared normal queue for a sticky poll; absent for normal queues.
+    pub normal_task_queue: Option<String>,
+    /// Whether `task_queue` is an SDK-generated sticky queue.
+    pub is_sticky: bool,
+    /// Stable SDK worker-process key.
+    pub worker_instance_key: String,
+    /// True only for explicit `WorkerDeploymentOptions` in VERSIONED mode.
+    pub scoped_versioned: bool,
+    /// Whether modern or enabled deprecated versioning metadata was present.
+    pub versioning_metadata_present: bool,
     /// Exact Worker Deployment Version selected by a VERSIONED poll.
     pub deployment: Option<WorkerDeploymentVersionRef>,
     /// Worker observations piggybacked by the SDK on this long poll.
@@ -95,31 +105,48 @@ pub fn poll_request_to_edge(
             "task_queue.name must not be empty".to_string(),
         ));
     }
-    // v1.31.0 applies `validateDeploymentOptions` to Nexus polls just like
-    // workflow/activity polls: only VERSIONED mode requires both coordinates;
-    // unspecified and unversioned options carry no routing identity
-    // (`WorkflowHandler.PollNexusTaskQueue` and `validateDeploymentOptions`,
-    // service/frontend/workflow_handler.go @ v1.31.0).
-    let deployment = req.deployment_options.as_ref().and_then(|options| {
-        (enums::WorkerVersioningMode::try_from(options.worker_versioning_mode).ok()
-            == Some(enums::WorkerVersioningMode::Versioned))
-        .then_some(options)
+    // Retain partial modern options until after authentication. Ordinary
+    // callers still receive v1.31.0's InvalidArgument, while a scoped caller
+    // must receive the generic authorization denial before any poll effect.
+    let versioned_options = req.deployment_options.as_ref().filter(|options| {
+        enums::WorkerVersioningMode::try_from(options.worker_versioning_mode).ok()
+            == Some(enums::WorkerVersioningMode::Versioned)
     });
-    if deployment.is_some_and(|options| {
-        options.deployment_name.trim().is_empty() || options.build_id.trim().is_empty()
-    }) {
-        return Err(NexusTranslateError::InvalidArgument(
-            "deployment_options must set deployment_name and build_id in VERSIONED mode".to_owned(),
-        ));
-    }
-    let deployment = deployment.map(|options| WorkerDeploymentVersionRef {
-        deployment_name: options.deployment_name.clone(),
-        build_id: options.build_id.clone(),
-    });
+    let scoped_versioned = versioned_options.is_some();
+    #[allow(deprecated)]
+    let versioning_metadata_present = req.deployment_options.is_some()
+        || req
+            .worker_version_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.use_versioning);
+    #[allow(deprecated)]
+    let deployment = versioned_options
+        .map(|options| WorkerDeploymentVersionRef {
+            deployment_name: options.deployment_name.clone(),
+            build_id: options.build_id.clone(),
+        })
+        .or_else(|| {
+            req.worker_version_capabilities
+                .as_ref()
+                .filter(|capabilities| capabilities.use_versioning)
+                .map(|capabilities| WorkerDeploymentVersionRef {
+                    deployment_name: capabilities.deployment_series_name.clone(),
+                    build_id: capabilities.build_id.clone(),
+                })
+        });
+    let is_sticky =
+        enums::TaskQueueKind::try_from(task_queue.kind).ok() == Some(enums::TaskQueueKind::Sticky);
     Ok(PollNexusTaskQueueRequest {
         namespace: req.namespace,
         worker_identity: req.identity,
         task_queue: task_queue.name,
+        normal_task_queue: is_sticky
+            .then_some(task_queue.normal_name)
+            .filter(|name| !name.is_empty()),
+        is_sticky,
+        worker_instance_key: req.worker_instance_key,
+        scoped_versioned,
+        versioning_metadata_present,
         deployment,
         worker_heartbeats: req.worker_heartbeat,
     })
@@ -827,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn nexus_poll_preserves_only_complete_versioned_deployment_options() {
+    fn nexus_poll_retains_partial_versioned_options_for_post_auth_validation() {
         let request = |options| ProtoPollNexusTaskQueueRequest {
             namespace: "default".to_owned(),
             task_queue: Some(TaskQueue {
@@ -861,14 +888,21 @@ mod tests {
         .expect("unversioned options");
         assert_eq!(unversioned.deployment, None);
 
-        let error = poll_request_to_edge(request(Some(WorkerDeploymentOptions {
+        let partial = poll_request_to_edge(request(Some(WorkerDeploymentOptions {
             worker_versioning_mode: enums::WorkerVersioningMode::Versioned as i32,
             deployment_name: "payments".to_owned(),
             build_id: String::new(),
             ..Default::default()
         })))
-        .expect_err("incomplete versioned options");
-        assert!(matches!(error, NexusTranslateError::InvalidArgument(_)));
+        .expect("translation retains the target until authorization");
+        assert!(partial.scoped_versioned);
+        assert_eq!(
+            partial.deployment,
+            Some(WorkerDeploymentVersionRef {
+                deployment_name: "payments".to_owned(),
+                build_id: String::new(),
+            })
+        );
     }
 
     #[test]

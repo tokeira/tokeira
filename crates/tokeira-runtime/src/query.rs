@@ -15,7 +15,7 @@
 //! query path can run concurrently with, and independently of, the run's
 //! workflow-task lane without coordinating on history.
 
-use tokeira_types::{Payloads, QueueKey, RunKey, TaskQueueName, WorkerIdentity};
+use tokeira_types::{Payloads, QueueKey, RunKey, TaskQueueName, WorkerIdentity, WorkerTaskOrigin};
 use tokio::sync::oneshot;
 
 /// A transient read-only query task delivered to a worker.
@@ -46,8 +46,12 @@ pub struct QueryTask {
     /// broker stores the concrete deadline so the timeout decision stays local
     /// to transient delivery and never becomes workflow correctness state.
     pub sticky_deadline: Option<time::OffsetDateTime>,
+    /// Caller-facing query deadline; scoped token provenance cannot outlive it.
+    pub deadline: time::OffsetDateTime,
     /// One-shot response channel back to the caller.
     pub response_tx: oneshot::Sender<QueryResult>,
+    /// Exact final server-authored delivery origin.
+    pub origin: WorkerTaskOrigin,
 }
 
 /// Result returned by a worker query handler.
@@ -547,9 +551,15 @@ mod tests {
                             query_type: format!("q{i}"),
                             query_args: Payloads::default(),
                             queue: queue.clone(),
+                            origin: WorkerTaskOrigin::from_queue_key(
+                                &queue,
+                                queue.task_queue.clone(),
+                                tokeira_types::WorkerTaskClass::Query,
+                            ),
                             sticky_preferred: None,
                             sticky_queue: None,
                             sticky_deadline: None,
+                            deadline: OffsetDateTime::now_utc() + Duration::minutes(1),
                             response_tx: tx,
                         })
                         .await;

@@ -23,7 +23,7 @@ use tokeira_kernel::{
 use tokeira_storage::RunRepository;
 use tokeira_types::{
     BuildId, DeploymentId, NamespaceId, Payload, Payloads, RunKey, ShardId, TaskQueueName,
-    WorkerComputeTaskType,
+    WorkerComputeTaskType, WorkerIdentity, WorkerTaskClass, WorkerTaskOrigin,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -670,7 +670,7 @@ impl NexusTaskToken {
 /// workflow authority nor an HTTP waiter leaks onto the wire. Workflow routing
 /// is reconstructible from authoritative pending state; HTTP routing is scoped
 /// to the lifetime of the current caller.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NexusTaskCorrelation {
     /// Route a worker outcome to the authoritative pending workflow operation.
     Workflow {
@@ -684,12 +684,16 @@ pub enum NexusTaskCorrelation {
         /// worker responses do not echo a response variant, so the private route
         /// retains this distinction for correct lifecycle handling.
         task_kind: NexusWorkflowTaskKind,
+        /// Exact queue/version origin returned to the Worker.
+        origin: WorkerTaskOrigin,
     },
     /// Deliver one worker response to the caller-facing HTTP request that
     /// synchronously dispatched this task.
     Http {
         /// Opaque ID understood only by the edge-owned waiter registry.
         waiter_id: String,
+        /// Unversioned origin retained for uniform response validation.
+        origin: WorkerTaskOrigin,
     },
     /// Deliver one worker response to the current worker-compute outbox attempt.
     WorkerCompute {
@@ -697,6 +701,8 @@ pub enum NexusTaskCorrelation {
         action_id: uuid::Uuid,
         /// Current delivery-claim fence.
         claim_epoch: u64,
+        /// Unversioned origin retained for uniform response validation.
+        origin: WorkerTaskOrigin,
     },
 }
 
@@ -1022,6 +1028,8 @@ pub struct NexusTaskLink {
 pub struct NexusTask {
     pub token: NexusTaskToken,
     pub request: NexusTaskRequest,
+    /// Exact final server-authored delivery origin.
+    pub origin: WorkerTaskOrigin,
 }
 
 /// Exact disposable delivery identity for one Nexus task-queue partition.
@@ -1065,6 +1073,24 @@ impl NexusQueueKey {
             task_queue,
             deployment: version.map(|version| DeploymentId(version.deployment_name.clone())),
             build_id: version.map(|version| BuildId(version.build_id.clone())),
+        }
+    }
+
+    /// Convert the final broker key into Worker authorization evidence.
+    #[must_use]
+    pub fn worker_task_origin(&self) -> WorkerTaskOrigin {
+        WorkerTaskOrigin {
+            namespace_id: self.namespace_id,
+            normal_task_queue: self.task_queue.clone(),
+            task_class: WorkerTaskClass::Nexus,
+            deployment: self
+                .deployment
+                .clone()
+                .unwrap_or_else(|| DeploymentId(String::new())),
+            build_id: self
+                .build_id
+                .clone()
+                .unwrap_or_else(|| BuildId(String::new())),
         }
     }
 }
@@ -1117,6 +1143,9 @@ struct NexusBrokerState {
     /// Per-queue wake handles (see `tokeira-runtime::broker`'s per-queue wake
     /// pattern): a publish wakes only pollers on that namespace+task-queue.
     wakes: HashMap<NexusQueueKey, Arc<Notify>>,
+    /// Worker identities whose current and subsequent long polls must return
+    /// empty after an enabled `ShutdownWorker` cancellation.
+    denied_workers: HashSet<(NamespaceId, TaskQueueName, WorkerIdentity)>,
     rate_origin: tokio::time::Instant,
     rate_limits: DispatchRateLimits,
 }
@@ -1127,6 +1156,7 @@ impl Default for NexusBrokerState {
             ready: HashMap::new(),
             outstanding: HashMap::new(),
             wakes: HashMap::new(),
+            denied_workers: HashSet::new(),
             rate_origin: tokio::time::Instant::now(),
             rate_limits: DispatchRateLimits::default(),
         }
@@ -1214,9 +1244,10 @@ impl NexusTaskBroker {
         &self,
         namespace_id: NamespaceId,
         task_queue: TaskQueueName,
-        task: NexusTask,
+        mut task: NexusTask,
     ) {
         let key = NexusQueueKey::unversioned(namespace_id, task_queue);
+        task.origin = key.worker_task_origin();
         let mut inner = self.inner.lock().await;
         inner.ready.entry(key.clone()).or_default().push_back(task);
         let wake = inner.wakes.entry(key.clone()).or_default().clone();
@@ -1298,13 +1329,18 @@ impl NexusTaskBroker {
                 operation_id,
                 scheduled_event_id,
                 task_kind,
+                origin: key.worker_task_origin(),
             },
         );
         inner
             .ready
             .entry(key.clone())
             .or_default()
-            .push_back(NexusTask { token, request });
+            .push_back(NexusTask {
+                token,
+                request,
+                origin: key.worker_task_origin(),
+            });
         let wake = inner.wakes.entry(key.clone()).or_default().clone();
         drop(inner);
         if let (Some(deployment_name), Some(build_id)) =
@@ -1357,14 +1393,22 @@ impl NexusTaskBroker {
         };
         let key = NexusQueueKey::unversioned(namespace_id, task_queue);
         let mut inner = self.inner.lock().await;
-        inner
-            .outstanding
-            .insert(task_id.clone(), NexusTaskCorrelation::Http { waiter_id });
+        inner.outstanding.insert(
+            task_id.clone(),
+            NexusTaskCorrelation::Http {
+                waiter_id,
+                origin: key.worker_task_origin(),
+            },
+        );
         inner
             .ready
             .entry(key.clone())
             .or_default()
-            .push_back(NexusTask { token, request });
+            .push_back(NexusTask {
+                token,
+                request,
+                origin: key.worker_task_origin(),
+            });
         let wake = inner.wakes.entry(key).or_default().clone();
         drop(inner);
         wake.notify_waiters();
@@ -1418,13 +1462,18 @@ impl NexusTaskBroker {
             NexusTaskCorrelation::WorkerCompute {
                 action_id,
                 claim_epoch,
+                origin: key.worker_task_origin(),
             },
         );
         inner
             .ready
             .entry(key.clone())
             .or_default()
-            .push_back(NexusTask { token, request });
+            .push_back(NexusTask {
+                token,
+                request,
+                origin: key.worker_task_origin(),
+            });
         let wake = inner.wakes.entry(key).or_default().clone();
         drop(inner);
         wake.notify_waiters();
@@ -1467,6 +1516,14 @@ impl NexusTaskBroker {
         self.inner.lock().await.outstanding.remove(task_id)
     }
 
+    /// Read one response route without consuming its single-use fence.
+    ///
+    /// The compatibility edge uses this before authorization; only a
+    /// subsequently authorized response may call [`Self::consume`].
+    pub async fn correlation(&self, task_id: &str) -> Option<NexusTaskCorrelation> {
+        self.inner.lock().await.outstanding.get(task_id).cloned()
+    }
+
     async fn expire_http(&self, task_id: &str) {
         let mut inner = self.inner.lock().await;
         if !matches!(
@@ -1489,6 +1546,7 @@ impl NexusTaskBroker {
             Some(NexusTaskCorrelation::WorkerCompute {
                 action_id: current_action,
                 claim_epoch: current_epoch,
+                ..
             }) if *current_action == action_id && *current_epoch == claim_epoch
         ) {
             return;
@@ -1519,6 +1577,26 @@ impl NexusTaskBroker {
         key: NexusQueueKey,
         wait_for: tokio::time::Duration,
     ) -> Option<NexusTask> {
+        self.poll_versioned_for_worker(key, &WorkerIdentity(String::new()), wait_for)
+            .await
+    }
+
+    /// Poll one exact Deployment-Version Nexus queue for a Worker identity.
+    ///
+    /// The identity remains disposable broker evidence. It exists only so an
+    /// enabled `ShutdownWorker` request can wake the SDK's parked Nexus long
+    /// poll and prevent a zombie re-poll from taking new work, matching
+    /// `cancelOutstandingWorkerPolls` in
+    /// `service/frontend/workflow_handler.go @ v1.31.0`.
+    pub async fn poll_versioned_for_worker(
+        &self,
+        key: NexusQueueKey,
+        worker: &WorkerIdentity,
+        wait_for: tokio::time::Duration,
+    ) -> Option<NexusTask> {
+        if self.is_denied(&key, worker).await {
+            return None;
+        }
         match self.try_take(&key).await {
             NexusTakeOutcome::Ready(task) => return Some(task),
             NexusTakeOutcome::WaitUntil(_)
@@ -1550,6 +1628,9 @@ impl NexusTaskBroker {
             tokio::pin!(changed);
             changed.as_mut().enable();
 
+            if self.is_denied(&key, worker).await {
+                return None;
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return None;
@@ -1567,6 +1648,37 @@ impl NexusTaskBroker {
                 _ = tokio::time::sleep(rate_wait.min(remaining)) => {}
             }
         }
+    }
+
+    /// Cancel current and reject future Nexus polls for one shutting-down
+    /// Worker identity on a task-queue family.
+    pub async fn deny_worker(
+        &self,
+        namespace_id: NamespaceId,
+        task_queue: TaskQueueName,
+        worker: WorkerIdentity,
+    ) {
+        let mut inner = self.inner.lock().await;
+        inner
+            .denied_workers
+            .insert((namespace_id, task_queue, worker));
+        // Shutdown identifies a queue family rather than an exact versioned
+        // broker key. Wake all Nexus waiters; only the denied identity exits
+        // after each poll re-checks the deny set.
+        let wakes = inner.wakes.values().cloned().collect::<Vec<_>>();
+        drop(inner);
+        for wake in wakes {
+            wake.notify_waiters();
+        }
+    }
+
+    async fn is_denied(&self, key: &NexusQueueKey, worker: &WorkerIdentity) -> bool {
+        !worker.0.is_empty()
+            && self.inner.lock().await.denied_workers.contains(&(
+                key.namespace_id,
+                key.task_queue.clone(),
+                worker.clone(),
+            ))
     }
 
     /// Whether a Nexus poll that just claimed one task left runnable work on
@@ -2494,6 +2606,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn denied_nexus_worker_is_woken_and_cannot_take_future_work() {
+        let namespace_id = NamespaceId::new();
+        let task_queue = TaskQueueName("nexus".to_owned());
+        let key = versioned_key(namespace_id, &task_queue, "payments", "build-a");
+        let denied_worker = WorkerIdentity("worker-a".to_owned());
+        let broker = NexusTaskBroker::default();
+
+        let poll = {
+            let broker = broker.clone();
+            let key = key.clone();
+            let worker = denied_worker.clone();
+            tokio::spawn(async move {
+                broker
+                    .poll_versioned_for_worker(key, &worker, tokio::time::Duration::from_secs(60))
+                    .await
+            })
+        };
+        await_nexus_waiter(&broker, &key).await;
+        broker
+            .deny_worker(namespace_id, task_queue.clone(), denied_worker.clone())
+            .await;
+
+        let cancelled = tokio::time::timeout(tokio::time::Duration::from_secs(1), poll)
+            .await
+            .expect("shutdown must wake the parked Nexus poll")
+            .expect("poll task");
+        assert!(cancelled.is_none());
+
+        broker
+            .publish_workflow_versioned(
+                key.clone(),
+                RunKey::new(),
+                "operation".to_owned(),
+                7,
+                cancel_request("operation"),
+            )
+            .await;
+        assert!(
+            broker
+                .poll_versioned_for_worker(
+                    key.clone(),
+                    &denied_worker,
+                    tokio::time::Duration::ZERO,
+                )
+                .await
+                .is_none()
+        );
+        assert!(
+            broker
+                .poll_versioned_for_worker(
+                    key,
+                    &WorkerIdentity("worker-b".to_owned()),
+                    tokio::time::Duration::ZERO,
+                )
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn nexus_zero_rate_blocks_and_live_unset_releases_ready_work() {
         let broker = NexusTaskBroker::default();
         let repository = Arc::new(tokeira_storage::InMemoryStore::default());
@@ -2541,6 +2713,8 @@ mod tests {
                         operation_id: "operation-id".to_string(),
                         operation_token: "operation-token".to_string(),
                     },
+                    origin: NexusQueueKey::unversioned(namespace_id, task_queue.clone())
+                        .worker_task_origin(),
                 },
             )
             .await;
@@ -2620,6 +2794,7 @@ mod tests {
                 } else {
                     versioned_key(namespace_id, &task_queue, &deployment, &build_id)
                 };
+                let expected_origin = key.worker_task_origin();
 
                 broker
                     .publish_workflow_versioned(
@@ -2652,6 +2827,7 @@ mod tests {
                         operation_id,
                         scheduled_event_id: 11,
                         task_kind: NexusWorkflowTaskKind::CancelOperation,
+                        origin: expected_origin,
                     })
                 );
                 Ok(())
@@ -2675,6 +2851,9 @@ mod tests {
                 let task_queue = TaskQueueName(format!("queue-{queue_suffix}"));
                 let first_run = RunKey::new();
                 let second_run = RunKey::new();
+                let expected_origin =
+                    NexusQueueKey::unversioned(namespace_id, task_queue.clone())
+                        .worker_task_origin();
 
                 broker
                     .publish_workflow(
@@ -2723,6 +2902,7 @@ mod tests {
                         operation_id: first_operation,
                         scheduled_event_id: 1,
                         task_kind: NexusWorkflowTaskKind::CancelOperation,
+                        origin: expected_origin.clone(),
                     })
                 );
                 prop_assert_eq!(broker.consume(&first.token.task_id).await, None);
@@ -2733,6 +2913,7 @@ mod tests {
                         operation_id: second_operation,
                         scheduled_event_id: 2,
                         task_kind: NexusWorkflowTaskKind::CancelOperation,
+                        origin: expected_origin,
                     })
                 );
                 Ok(())
@@ -2756,6 +2937,9 @@ mod tests {
                 let namespace_id = NamespaceId(Uuid::from_u128(namespace_seed));
                 let task_queue = TaskQueueName(format!("queue-{queue_suffix}"));
                 let run_key = RunKey::new();
+                let expected_origin =
+                    NexusQueueKey::unversioned(namespace_id, task_queue.clone())
+                        .worker_task_origin();
                 broker
                     .publish_workflow(
                         namespace_id,
@@ -2800,11 +2984,15 @@ mod tests {
                         operation_id,
                         scheduled_event_id: 7,
                         task_kind: NexusWorkflowTaskKind::CancelOperation,
+                        origin: expected_origin.clone(),
                     })
                 );
                 prop_assert_eq!(
                     broker.consume(&http.token.task_id).await,
-                    Some(NexusTaskCorrelation::Http { waiter_id })
+                    Some(NexusTaskCorrelation::Http {
+                        waiter_id,
+                        origin: expected_origin,
+                    })
                 );
                 Ok(())
             })?;
@@ -2915,6 +3103,8 @@ mod tests {
                         operation_id: first_operation.clone(),
                         operation_token: String::new(),
                     },
+                    origin: NexusQueueKey::unversioned(namespace_a, queue_a.clone())
+                        .worker_task_origin(),
                 };
                 let second = NexusTask {
                     token: NexusTaskToken {
@@ -2928,6 +3118,8 @@ mod tests {
                         operation_id: second_operation.clone(),
                         operation_token: String::new(),
                     },
+                    origin: NexusQueueKey::unversioned(namespace_b, queue_b.clone())
+                        .worker_task_origin(),
                 };
                 let third = NexusTask {
                     token: NexusTaskToken {
@@ -2941,6 +3133,8 @@ mod tests {
                         operation_id: third_operation.clone(),
                         operation_token: String::new(),
                     },
+                    origin: NexusQueueKey::unversioned(namespace_a, queue_a.clone())
+                        .worker_task_origin(),
                 };
 
                 broker

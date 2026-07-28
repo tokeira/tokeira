@@ -22,6 +22,9 @@ pub const AUTHORIZATION_DURATION_SECONDS: &str = "tokeira_edge_authorization_dur
 pub const AUTHORIZATION_DENIED_TOTAL: &str = "tokeira_edge_authorization_denied_total";
 /// Authentication or authorizer implementation failures by stage.
 pub const AUTHORIZATION_ERROR_TOTAL: &str = "tokeira_edge_authorization_error_total";
+/// Scoped Worker denials by a bounded code-owned reason.
+pub const SCOPED_WORKER_AUTHORIZATION_DENIED_TOTAL: &str =
+    "tokeira_edge_scoped_worker_authorization_denied_total";
 const EDGE_SERVICE_LABEL: &str = "edge";
 
 // Nexus operational metrics owned by the edge. Names are tokeira-prefixed; the conformance
@@ -154,6 +157,16 @@ pub fn record_authorization_duration(api_name: &str, outcome: &str, duration: st
 /// Record one intentional policy denial.
 pub fn record_authorization_denied(api_name: &str) {
     counter!(AUTHORIZATION_DENIED_TOTAL, "api_name" => api_name.to_owned()).increment(1);
+}
+
+/// Record one scoped Worker denial without resource-coordinate labels.
+pub fn record_scoped_worker_authorization_denied(api_name: &str, reason: &str) {
+    counter!(
+        SCOPED_WORKER_AUTHORIZATION_DENIED_TOTAL,
+        "api_name" => api_name.to_owned(),
+        "reason" => reason.to_owned(),
+    )
+    .increment(1);
 }
 
 /// Record an authentication or authorizer implementation failure.

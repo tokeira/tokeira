@@ -356,6 +356,9 @@ pub struct JwtIssuerConfig {
     /// Subject-to-role augmentation rules.
     #[serde(default)]
     pub grants: Vec<JwtGrantConfig>,
+    /// Subject-to-exact-Worker-scope attenuation rules.
+    #[serde(default)]
+    pub worker_scopes: Vec<JwtWorkerScopeConfig>,
 }
 
 impl Default for JwtIssuerConfig {
@@ -368,6 +371,7 @@ impl Default for JwtIssuerConfig {
             refresh_interval: None,
             permissions_claim: default_permissions_claim(),
             grants: Vec::new(),
+            worker_scopes: Vec::new(),
         }
     }
 }
@@ -393,13 +397,37 @@ pub struct JwtGrantConfig {
     pub grant: Vec<String>,
 }
 
+/// Subject-pattern to exact Worker-scope mapping for one JWT issuer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JwtWorkerScopeConfig {
+    /// Full-string, case-sensitive subject pattern.
+    #[serde(default)]
+    pub match_sub: String,
+    /// Exact namespace name.
+    #[serde(default)]
+    pub namespace: String,
+    /// Non-empty normal task-queue allowlist.
+    #[serde(default)]
+    pub task_queues: Vec<String>,
+    /// Exact Worker Deployment name.
+    #[serde(default)]
+    pub deployment_name: String,
+    /// Exact Worker Build ID.
+    #[serde(default)]
+    pub build_id: String,
+}
+
 /// AWS IAM presigned-STS identity-source configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AwsIamAuthorizationConfig {
-    /// ARN-to-role rules; at least one is required when the table is present.
+    /// ARN-to-role rules.
     #[serde(default)]
     pub grants: Vec<AwsIamGrantConfig>,
+    /// ARN-to-exact-Worker-scope attenuation rules.
+    #[serde(default)]
+    pub worker_scopes: Vec<AwsIamWorkerScopeConfig>,
 }
 
 /// ARN-pattern role grants.
@@ -412,6 +440,27 @@ pub struct AwsIamGrantConfig {
     /// Temporal `namespace:role` grants.
     #[serde(default)]
     pub grant: Vec<String>,
+}
+
+/// ARN-pattern to exact Worker-scope mapping.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsIamWorkerScopeConfig {
+    /// Full-string, case-sensitive STS caller-ARN pattern.
+    #[serde(default)]
+    pub match_arn: String,
+    /// Exact namespace name.
+    #[serde(default)]
+    pub namespace: String,
+    /// Non-empty normal task-queue allowlist.
+    #[serde(default)]
+    pub task_queues: Vec<String>,
+    /// Exact Worker Deployment name.
+    #[serde(default)]
+    pub deployment_name: String,
+    /// Exact Worker Build ID.
+    #[serde(default)]
+    pub build_id: String,
 }
 
 fn default_permissions_claim() -> String {
@@ -464,13 +513,25 @@ fn validate_authorization(authorization: &AuthorizationConfig, errors: &mut Vec<
                 errors,
             );
         }
+        for (rule_index, rule) in issuer.worker_scopes.iter().enumerate() {
+            validate_worker_scope_rule(
+                &format!("{base}.worker_scopes[{rule_index}]"),
+                "match_sub",
+                &rule.match_sub,
+                &rule.namespace,
+                &rule.task_queues,
+                &rule.deployment_name,
+                &rule.build_id,
+                errors,
+            );
+        }
     }
 
     if let Some(aws_iam) = authorization.aws_iam.as_ref() {
-        if aws_iam.grants.is_empty() {
+        if aws_iam.grants.is_empty() && aws_iam.worker_scopes.is_empty() {
             errors.push(ValidationError::Field {
                 field: "policy.authorization.aws_iam.grants".to_owned(),
-                message: "must contain at least one ARN grant rule".to_owned(),
+                message: "must contain at least one ARN grant or Worker-Scope rule".to_owned(),
             });
         }
         for (index, rule) in aws_iam.grants.iter().enumerate() {
@@ -482,6 +543,61 @@ fn validate_authorization(authorization: &AuthorizationConfig, errors: &mut Vec<
                 errors,
             );
         }
+        for (index, rule) in aws_iam.worker_scopes.iter().enumerate() {
+            validate_worker_scope_rule(
+                &format!("policy.authorization.aws_iam.worker_scopes[{index}]"),
+                "match_arn",
+                &rule.match_arn,
+                &rule.namespace,
+                &rule.task_queues,
+                &rule.deployment_name,
+                &rule.build_id,
+                errors,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_worker_scope_rule(
+    base: &str,
+    pattern_name: &str,
+    pattern: &str,
+    namespace: &str,
+    task_queues: &[String],
+    deployment_name: &str,
+    build_id: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Err(error) = tokeira_auth::GlobPattern::new(pattern) {
+        errors.push(ValidationError::Field {
+            field: format!("{base}.{pattern_name}"),
+            message: error.to_string(),
+        });
+    }
+    if let Err(error) = tokeira_auth::WorkerScope::try_new(
+        namespace.to_owned(),
+        task_queues.to_vec(),
+        deployment_name.to_owned(),
+        build_id.to_owned(),
+    ) {
+        let field = match &error {
+            tokeira_auth::WorkerScopeError::Blank { field }
+            | tokeira_auth::WorkerScopeError::Wildcard { field } => {
+                format!("{base}.{field}")
+            }
+            tokeira_auth::WorkerScopeError::EmptyTaskQueues
+            | tokeira_auth::WorkerScopeError::DuplicateTaskQueue { .. } => {
+                format!("{base}.task_queues")
+            }
+            tokeira_auth::WorkerScopeError::TaskQueue { index, .. } => {
+                format!("{base}.task_queues[{index}]")
+            }
+        };
+        errors.push(ValidationError::Field {
+            field,
+            message: error.to_string(),
+        });
     }
 }
 
@@ -1415,6 +1531,54 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    // Feature: scoped-worker-authorization, Property 11: Configuration validation and round-trip
+    proptest! {
+        #[test]
+        fn property_worker_scope_configuration_validation_and_round_trip(
+            namespace in "[a-z]{1,12}",
+            queue in "[a-z]{1,12}",
+            deployment in "[a-z]{1,12}",
+            build_id in "[a-z0-9]{1,12}",
+        ) {
+            let authorization = AuthorizationConfig {
+                aws_iam: Some(AwsIamAuthorizationConfig {
+                    grants: Vec::new(),
+                    worker_scopes: vec![AwsIamWorkerScopeConfig {
+                        match_arn: "arn:aws:sts::*:assumed-role/worker-*".to_owned(),
+                        namespace: namespace.clone(),
+                        task_queues: vec![queue.clone()],
+                        deployment_name: deployment.clone(),
+                        build_id: build_id.clone(),
+                    }],
+                }),
+                ..Default::default()
+            };
+            let encoded = toml::to_string(&authorization).expect("serialize authorization");
+            let decoded: AuthorizationConfig =
+                toml::from_str(&encoded).expect("deserialize authorization");
+            prop_assert_eq!(&decoded, &authorization);
+            let mut errors = Vec::new();
+            validate_authorization(&decoded, &mut errors);
+            prop_assert!(errors.is_empty());
+
+            let mut invalid = decoded;
+            invalid
+                .aws_iam
+                .as_mut()
+                .expect("AWS IAM")
+                .worker_scopes[0]
+                .task_queues[0] = "*".to_owned();
+            let mut errors = Vec::new();
+            validate_authorization(&invalid, &mut errors);
+            let has_indexed_error = errors.iter().any(|error| matches!(
+                error,
+                ValidationError::Field { field, .. }
+                    if field == "policy.authorization.aws_iam.worker_scopes[0].task_queues[0]"
+            ));
+            prop_assert!(has_indexed_error);
+        }
+    }
+
     #[test]
     fn authorization_section_is_presence_enabled_and_flags_are_inert_without_sources() {
         let absent: TokeiraConfig = toml::from_str("").expect("empty config");
@@ -1452,10 +1616,24 @@ mod tests {
                 match_sub = "system:serviceaccount:prod:*"
                 grant = ["prod:worker", "prod:write"]
 
+                [[policy.authorization.jwt.issuers.worker_scopes]]
+                match_sub = "system:serviceaccount:prod:*"
+                namespace = "prod"
+                task_queues = ["payments-worker"]
+                deployment_name = "payments"
+                build_id = "build-a"
+
                 [policy.authorization.aws_iam]
                 [[policy.authorization.aws_iam.grants]]
                 match_arn = "arn:aws:sts::123456789012:assumed-role/tokeira-worker-*"
                 grant = ["prod:worker"]
+
+                [[policy.authorization.aws_iam.worker_scopes]]
+                match_arn = "arn:aws:sts::123456789012:assumed-role/tokeira-worker-*"
+                namespace = "prod"
+                task_queues = ["payments-worker"]
+                deployment_name = "payments"
+                build_id = "build-a"
             "#,
         )
         .expect("authorization config");
@@ -1466,6 +1644,23 @@ mod tests {
             authorization.jwt.issuers[0].permissions_claim,
             "permissions"
         );
+    }
+
+    #[test]
+    fn aws_iam_scope_only_source_is_valid() {
+        let config: TokeiraConfig = toml::from_str(
+            r#"
+                [policy.authorization.aws_iam]
+                [[policy.authorization.aws_iam.worker_scopes]]
+                match_arn = "arn:aws:sts::*:assumed-role/worker-*"
+                namespace = "prod"
+                task_queues = ["payments-worker"]
+                deployment_name = "payments"
+                build_id = "build-a"
+            "#,
+        )
+        .expect("authorization config");
+        config.validate().expect("scope-only source is valid");
     }
 
     #[test]

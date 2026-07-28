@@ -14,8 +14,8 @@ use tokeira_runtime::{
 use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
     BuildId, DeploymentId, Memo, NamespaceId, Payload, Payloads, QueueKey, RequestContext,
-    RequestId, RetryPolicy, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
-    WorkflowType,
+    RequestId, RetryPolicy, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity,
+    WorkerTaskClass, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -210,6 +210,11 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
         .await?
         .expect("versioned first attempt should be pollable");
     assert_eq!(first.attempt, 1);
+    assert_eq!(first.origin.namespace_id, namespace_id);
+    assert_eq!(first.origin.normal_task_queue.0, "activity-q");
+    assert_eq!(first.origin.task_class, WorkerTaskClass::Activity);
+    assert_eq!(first.origin.deployment, deployment);
+    assert_eq!(first.origin.build_id, build_id);
 
     runtime
         .fail_activity_task(
@@ -237,13 +242,21 @@ async fn retryable_activity_failure_preserves_versioned_queue() -> Result<()> {
     // (activity.go:74 @ v1.31.0), so the poll window must cover it.
     let second = runtime
         .poll_activity_task(
-            activity_queue_with_version(namespace_id, Some(deployment), Some(build_id)),
+            activity_queue_with_version(
+                namespace_id,
+                Some(deployment.clone()),
+                Some(build_id.clone()),
+            ),
             WorkerIdentity("worker-a".to_string()),
             tokio::time::Duration::from_secs(5),
         )
         .await?
         .expect("versioned retry should be pollable");
     assert_eq!(second.attempt, 2);
+    assert_eq!(second.origin.normal_task_queue.0, "activity-q");
+    assert_eq!(second.origin.task_class, WorkerTaskClass::Activity);
+    assert_eq!(second.origin.deployment, deployment);
+    assert_eq!(second.origin.build_id, build_id);
     Ok(())
 }
 

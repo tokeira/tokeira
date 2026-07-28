@@ -19,7 +19,7 @@ use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
 use tokeira_types::{
     BuildId, DeploymentId, ExecutionRef, Headers, LogicalTaskSeq, Memo, NamespaceId, Payload,
     Payloads, QueueKey, RequestContext, RequestId, RunKey, SearchAttributes, ShardId, TaskKind,
-    TaskQueueName, WorkerIdentity, WorkflowId, WorkflowType,
+    TaskQueueName, WorkerIdentity, WorkerTaskClass, WorkflowId, WorkflowType,
 };
 
 #[tokio::test]
@@ -55,6 +55,10 @@ async fn start_and_signal_publish_workflow_tasks() -> Result<()> {
         .expect("start should publish a workflow task");
     assert_eq!(first_task.run_key, started_state.run_key);
     assert_eq!(first_task.token.logical_seq, LogicalTaskSeq::ONE);
+    assert_eq!(first_task.origin.namespace_id, namespace_id);
+    assert_eq!(first_task.origin.normal_task_queue.0, "queue-a");
+    assert_eq!(first_task.origin.task_class, WorkerTaskClass::Workflow);
+    assert!(!first_task.origin.is_versioned());
 
     runtime
         .complete_workflow_task(WorkflowTaskCompletedRequest {
@@ -486,6 +490,11 @@ async fn restart_preserves_delayed_start_callbacks_and_versioning_route() -> Res
         )
         .await?
         .expect("delayed start should route to the pinned worker deployment after reload");
+    assert_eq!(versioned_task.origin.namespace_id, namespace_id);
+    assert_eq!(versioned_task.origin.normal_task_queue.0, "queue-a");
+    assert_eq!(versioned_task.origin.task_class, WorkerTaskClass::Workflow);
+    assert_eq!(versioned_task.origin.deployment.0, deployment);
+    assert_eq!(versioned_task.origin.build_id.0, build_id);
 
     runtime_after_restart
         .complete_workflow_task(WorkflowTaskCompletedRequest {

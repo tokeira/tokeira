@@ -10,8 +10,8 @@
 //! next heartbeat. Nothing in the correctness path (dispatch, transitions,
 //! projection) may read this store to make a decision; it exists only to power
 //! operator-facing observability (worker listings, last-seen age, observed
-//! counts). Keeping it off the durable path is what lets it use a lock-free
-//! `DashMap` and drop entries freely under memory pressure.
+//! counts). A single short-lived lock makes repeated heartbeat requests
+//! atomically visible without putting this volatile state on the durable path.
 //!
 //! Two eviction forces keep the map bounded: TTL (entries older than the TTL
 //! are stale and removed) and capacity (a hard ceiling on total entries). See
@@ -19,9 +19,10 @@
 //! respects a minimum age, and [`InMemoryHeartbeatStore::insert`] for why
 //! `last_seen` is held monotonic under last-write-wins.
 
-use std::{collections::HashMap, sync::Arc};
-
-use dashmap::DashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 use time::OffsetDateTime;
 use tokeira_types::{
     EvictionReport, HeartbeatStore, HeartbeatStoreError, NamespaceId, WorkerHeartbeat,
@@ -58,7 +59,7 @@ const WORKER_STATUS_SHUTDOWN: i32 = 3;
 
 type WorkerHeartbeatKey = (NamespaceId, WorkerInstanceKey);
 
-/// Process-local [`HeartbeatStore`] backed by a lock-free map.
+/// Process-local [`HeartbeatStore`] backed by one batch-atomic map.
 ///
 /// Holds the latest heartbeat per `(namespace, worker instance)`. It is volatile
 /// observability state — see the module docs — and never consulted on the
@@ -66,7 +67,7 @@ type WorkerHeartbeatKey = (NamespaceId, WorkerInstanceKey);
 /// [`maintain`](Self::maintain).
 #[derive(Debug, Default)]
 pub struct InMemoryHeartbeatStore {
-    entries: DashMap<WorkerHeartbeatKey, WorkerHeartbeat>,
+    entries: RwLock<HashMap<WorkerHeartbeatKey, WorkerHeartbeat>>,
 }
 
 impl InMemoryHeartbeatStore {
@@ -88,32 +89,16 @@ impl InMemoryHeartbeatStore {
 
 impl HeartbeatStore for InMemoryHeartbeatStore {
     fn insert(&self, heartbeat: WorkerHeartbeat) -> Result<(), HeartbeatStoreError> {
-        let key = (
-            heartbeat.namespace_id,
-            heartbeat.worker_instance_key.clone(),
-        );
-        if heartbeat.status.0 == WORKER_STATUS_SHUTDOWN {
-            self.entries.remove(&key);
-            return Ok(());
+        self.insert_batch(vec![heartbeat])
+    }
+
+    fn insert_batch(&self, heartbeats: Vec<WorkerHeartbeat>) -> Result<(), HeartbeatStoreError> {
+        for heartbeat in &heartbeats {
+            validate_heartbeat(heartbeat)?;
         }
-        match self.entries.get_mut(&key) {
-            // Last-write-wins on the body (status, build/SDK metadata) but
-            // monotonic on `last_seen`: heartbeats can arrive out of order
-            // (retries, multiplexed connections, clock skew across the worker
-            // fleet), and a later-delivered-but-older sample must not pull the
-            // observed liveness backwards. Adopt the new payload, keep the
-            // greatest `last_seen` seen so far so age never appears to increase.
-            Some(mut existing) if existing.last_seen > heartbeat.last_seen => {
-                let last_seen = existing.last_seen;
-                *existing = heartbeat;
-                existing.last_seen = last_seen;
-            }
-            Some(mut existing) => {
-                *existing = heartbeat;
-            }
-            None => {
-                self.entries.insert(key, heartbeat);
-            }
+        let mut entries = self.entries.write().expect("heartbeat store poisoned");
+        for heartbeat in heartbeats {
+            apply_heartbeat(&mut entries, heartbeat);
         }
         Ok(())
     }
@@ -125,8 +110,10 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
     ) -> Result<Option<WorkerHeartbeat>, HeartbeatStoreError> {
         Ok(self
             .entries
+            .read()
+            .expect("heartbeat store poisoned")
             .get(&(*namespace, worker_instance_key.clone()))
-            .map(|entry| entry.clone()))
+            .cloned())
     }
 
     fn list_workers(
@@ -135,9 +122,11 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
     ) -> Result<Vec<WorkerHeartbeat>, HeartbeatStoreError> {
         Ok(self
             .entries
+            .read()
+            .expect("heartbeat store poisoned")
             .iter()
-            .filter(|entry| entry.key().0 == *namespace)
-            .map(|entry| entry.value().clone())
+            .filter(|(key, _)| key.0 == *namespace)
+            .map(|(_, heartbeat)| heartbeat.clone())
             .collect())
     }
 
@@ -148,19 +137,20 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
         min_evict_age: time::Duration,
         max_entries: usize,
     ) -> Result<EvictionReport, HeartbeatStoreError> {
+        let mut entries = self.entries.write().expect("heartbeat store poisoned");
         let cutoff = now - ttl;
         let mut ttl_evicted = Vec::new();
-        for entry in self.entries.iter() {
-            if entry.last_seen < cutoff {
-                ttl_evicted.push(entry.key().clone());
+        for (key, heartbeat) in entries.iter() {
+            if heartbeat.last_seen < cutoff {
+                ttl_evicted.push(key.clone());
             }
         }
         for key in &ttl_evicted {
-            self.entries.remove(key);
+            entries.remove(key);
         }
 
         let mut capacity_evicted = Vec::new();
-        if self.entries.len() > max_entries {
+        if entries.len() > max_entries {
             // Capacity eviction only targets entries already older than
             // `min_evict_age`. Evicting a still-fresh worker to honour the cap
             // would drop someone actively heartbeating — they would vanish from
@@ -169,11 +159,10 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
             // the cap rather than evict live workers; TTL will reclaim them once
             // they age out.
             let min_cutoff = now - min_evict_age;
-            let mut candidates: Vec<_> = self
-                .entries
+            let mut candidates: Vec<_> = entries
                 .iter()
-                .filter(|entry| entry.last_seen <= min_cutoff)
-                .map(|entry| (entry.key().clone(), entry.last_seen))
+                .filter(|(_, heartbeat)| heartbeat.last_seen <= min_cutoff)
+                .map(|(key, heartbeat)| (key.clone(), heartbeat.last_seen))
                 .collect();
             // Oldest-first, with key as a deterministic tiebreak so the report is
             // reproducible regardless of DashMap iteration order.
@@ -184,20 +173,16 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
                     .then_with(|| left_key.1.0.cmp(&right_key.1.0))
             });
             for (key, _) in candidates {
-                if self.entries.len() <= max_entries {
+                if entries.len() <= max_entries {
                     break;
                 }
-                if self.entries.remove(&key).is_some() {
+                if entries.remove(&key).is_some() {
                     capacity_evicted.push(key);
                 }
             }
         }
 
-        let mut live: Vec<_> = self
-            .entries
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
+        let mut live: Vec<_> = entries.values().cloned().collect();
         live.sort_by(|left, right| {
             left.worker_instance_key
                 .0
@@ -213,6 +198,52 @@ impl HeartbeatStore for InMemoryHeartbeatStore {
             namespace_counts,
             remaining,
         })
+    }
+}
+
+fn validate_heartbeat(heartbeat: &WorkerHeartbeat) -> Result<(), HeartbeatStoreError> {
+    if heartbeat.worker_instance_key.0.trim().is_empty() {
+        return Err(HeartbeatStoreError::Invalid(
+            "worker_instance_key must not be empty".to_owned(),
+        ));
+    }
+    if heartbeat.task_queue.0.trim().is_empty() {
+        return Err(HeartbeatStoreError::Invalid(
+            "task_queue must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_heartbeat(
+    entries: &mut HashMap<WorkerHeartbeatKey, WorkerHeartbeat>,
+    heartbeat: WorkerHeartbeat,
+) {
+    let key = (
+        heartbeat.namespace_id,
+        heartbeat.worker_instance_key.clone(),
+    );
+    if heartbeat.status.0 == WORKER_STATUS_SHUTDOWN {
+        entries.remove(&key);
+        return;
+    }
+    match entries.get_mut(&key) {
+        // Last-write-wins on the body (status, build/SDK metadata) but
+        // monotonic on `last_seen`: heartbeats can arrive out of order
+        // (retries, multiplexed connections, clock skew across the worker
+        // fleet), and a later-delivered-but-older sample must not pull the
+        // observed liveness backwards.
+        Some(existing) if existing.last_seen > heartbeat.last_seen => {
+            let last_seen = existing.last_seen;
+            *existing = heartbeat;
+            existing.last_seen = last_seen;
+        }
+        Some(existing) => {
+            *existing = heartbeat;
+        }
+        None => {
+            entries.insert(key, heartbeat);
+        }
     }
 }
 
@@ -283,6 +314,7 @@ pub fn record_maintenance_report(now: OffsetDateTime, report: EvictionReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tokeira_types::{TaskQueueName, WorkerHeartbeatStatus, WorkerIdentity};
     use uuid::Uuid;
 
@@ -389,5 +421,48 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn property_heartbeat_batch_atomicity(
+            existing_keys in proptest::collection::btree_set("[a-z]{1,8}", 0..8),
+            batch_keys in proptest::collection::vec("[a-z]{1,8}", 0..8),
+            invalid_index in proptest::option::of(0_usize..8),
+        ) {
+            // Feature: scoped-worker-authorization, Property 8: Heartbeat batch atomicity
+            let store = InMemoryHeartbeatStore::new();
+            let namespace_id = namespace(1);
+            let now = OffsetDateTime::UNIX_EPOCH;
+            for key in &existing_keys {
+                store.insert(heartbeat(namespace_id, key, now)).expect("seed");
+            }
+            let mut batch = batch_keys
+                .iter()
+                .map(|key| heartbeat(namespace_id, key, now + time::Duration::seconds(1)))
+                .collect::<Vec<_>>();
+            let invalid = invalid_index.filter(|index| *index < batch.len());
+            if let Some(index) = invalid {
+                batch[index].worker_instance_key = WorkerInstanceKey(String::new());
+            }
+
+            let result = store.insert_batch(batch);
+            let actual = store
+                .list_workers(&namespace_id)
+                .expect("list")
+                .into_iter()
+                .map(|heartbeat| heartbeat.worker_instance_key.0)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut expected = existing_keys;
+            if invalid.is_none() {
+                expected.extend(batch_keys);
+                prop_assert!(result.is_ok());
+            } else {
+                prop_assert!(matches!(result, Err(HeartbeatStoreError::Invalid(_))));
+            }
+            prop_assert_eq!(actual, expected);
+        }
     }
 }

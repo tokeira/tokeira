@@ -9,6 +9,11 @@ const NO_POLICY_SCOPE: &[PolicyScope] = &[PolicyScope::NotApplicable];
 const CLUSTER_SCOPE: &[PolicyScope] = &[PolicyScope::Cluster];
 const NAMESPACE_SCOPE: &[PolicyScope] = &[PolicyScope::Namespace];
 const TASK_QUEUE_SCOPE: &[PolicyScope] = &[PolicyScope::TaskQueue];
+const SCOPED_WORKER_SCOPE: &[PolicyScope] = &[
+    PolicyScope::Worker,
+    PolicyScope::Namespace,
+    PolicyScope::TaskQueue,
+];
 
 const TEMPORAL_GA_ENABLED: FeatureCatalogMetadata = FeatureCatalogMetadata {
     origin: FeatureOrigin::TemporalV1_31,
@@ -186,6 +191,27 @@ const AWS_IAM_AUTHORIZATION_CATALOG: FeatureCatalogMetadata = FeatureCatalogMeta
     prerequisites: &["AWS identity verification and configured authorization grants"],
 };
 
+const SCOPED_WORKER_AUTHORIZATION_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TokeiraNative,
+    conformance: ConformanceDisposition::NotApplicable,
+    temporal_maturity: TemporalMaturity::NotApplicable,
+    temporal_default: DefaultPosture::NotApplicable,
+    tokeira_default: DefaultPosture::Disabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Toml,
+        reference: Some(
+            "policy.authorization.jwt.issuers[].worker_scopes or policy.authorization.aws_iam.worker_scopes",
+        ),
+    },
+    scopes: SCOPED_WORKER_SCOPE,
+    mutability: PolicyMutability::StartupStatic,
+    guidance: "Configure one exact subject or verified-ARN Worker scope and restart tokeirad; the standard SDK supplies that external bearer on every Worker RPC.",
+    prerequisites: &[
+        "Configured JWT issuer or AWS IAM verifier",
+        "Exact Worker Deployment and Build ID",
+    ],
+};
+
 const COMPATIBILITY_METADATA_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
     origin: FeatureOrigin::TokeiraNative,
     conformance: ConformanceDisposition::NotApplicable,
@@ -264,6 +290,11 @@ const AUTHORIZATION_SURFACES: &[CompatibilitySurface] = &[
 const AWS_IAM_AUTHORIZATION_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
     kind: CompatibilitySurfaceKind::BehaviouralInvariant,
     identifier: "TokeiraAwsIamBearerAuthorization",
+}];
+
+const SCOPED_WORKER_AUTHORIZATION_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
+    kind: CompatibilitySurfaceKind::BehaviouralInvariant,
+    identifier: "TokeiraScopedWorkerAuthorization",
 }];
 
 const COMPATIBILITY_METADATA_SURFACES: &[CompatibilitySurface] = &[
@@ -1097,6 +1128,21 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         evidence: &[CompatibilityEvidence {
             kind: crate::CompatibilityEvidenceKind::Test,
             reference: "Temporal functional corpus TestScheduleV1 @ v1.31.0: Tier 5.30",
+        }],
+    },
+    FeatureEntry {
+        catalog: SCOPED_WORKER_AUTHORIZATION_CATALOG,
+        id: "scoped-worker-authorization",
+        name: "Scoped Worker authorization",
+        state: FeatureState::Implemented,
+        surfaces: SCOPED_WORKER_AUTHORIZATION_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: EMPTY_RPCS,
+        notes: "Tokeira-native, presence-activated credential attenuation limits a standard SDK Worker to one exact namespace, an allowlist of normal task queues, one exact Deployment Version, and a fixed Worker RPC matrix. Server-authored durable token provenance prevents a scoped credential from completing work it was not authorized to receive.",
+        evidence: &[CompatibilityEvidence {
+            kind: crate::CompatibilityEvidenceKind::Test,
+            reference: ".kiro/specs/scoped-worker-authorization",
         }],
     },
     FeatureEntry {

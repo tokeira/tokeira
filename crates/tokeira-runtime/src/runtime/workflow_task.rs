@@ -25,7 +25,7 @@ use tokeira_proto::failure::{Failure, failure::FailureInfo};
 use tokeira_storage::{
     DeploymentKey, DeploymentName, StoredRoutingConfig, WorkerDeploymentVersionKey,
 };
-use tokeira_types::WorkflowId;
+use tokeira_types::{WorkerTaskClass, WorkerTaskOrigin, WorkflowId};
 
 use crate::timeout::WorkflowTimeoutEntry;
 
@@ -1761,6 +1761,11 @@ where
         // name; broker redirects rewrite only build ids, never queue names).
         let is_sticky_match = offered.queue.task_queue != new_state.task_queue
             && offered.sticky_preferred.as_ref() == Some(&worker_identity);
+        let origin = WorkerTaskOrigin::from_queue_key(
+            &offered.queue,
+            new_state.task_queue.clone(),
+            WorkerTaskClass::Workflow,
+        );
         Ok(StartedWorkflowTask {
             run_key: new_state.run_key,
             run_id: new_state.run_id,
@@ -1775,6 +1780,7 @@ where
             target_worker_deployment_version_changed: pending
                 .target_worker_deployment_version_changed,
             token,
+            origin,
         })
     }
 
@@ -1815,6 +1821,13 @@ where
                 workflow_task_timeout: state.workflow_task_timeout,
             });
         }
+        let queue = QueueKey {
+            namespace_id: state.namespace_id,
+            task_queue: state.task_queue.clone(),
+            task_kind: TaskKind::Workflow,
+            deployment: state.deployment.clone(),
+            build_id: state.build_id.clone(),
+        };
         Ok(StartedWorkflowTask {
             run_key: state.run_key,
             run_id: state.run_id,
@@ -1829,6 +1842,11 @@ where
             target_worker_deployment_version_changed: pending
                 .target_worker_deployment_version_changed,
             token,
+            origin: WorkerTaskOrigin::from_queue_key(
+                &queue,
+                state.task_queue.clone(),
+                WorkerTaskClass::Workflow,
+            ),
         })
     }
 }

@@ -348,9 +348,10 @@ where
         namespace_id: NamespaceId,
         task_queue: TaskQueueName,
         worker: WorkerIdentity,
+        task_classes: &[tokeira_types::WorkerTaskClass],
     ) -> bool {
         self.runtime
-            .cancel_outstanding_worker_polls(namespace_id, task_queue, worker)
+            .cancel_outstanding_worker_polls(namespace_id, task_queue, worker, task_classes)
             .await
     }
 

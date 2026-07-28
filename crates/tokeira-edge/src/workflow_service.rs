@@ -45,7 +45,7 @@ use tokeira_runtime::{
     BatchOperationStore, BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry,
     CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion, DeleteWorkflowRequest,
     DeploymentPage, DeploymentView, DescribeVersion, InMemoryBroker, ListDeployments,
-    MultiOperationError, MultiOperationResult, NexusQueueKey, NexusTaskBroker,
+    MultiOperationError, MultiOperationResult, NexusQueueKey, NexusTask, NexusTaskBroker,
     NexusTaskCorrelation, NexusTaskToken, NexusWorkflowTaskKind, OverlapDecision, OverlapPolicy,
     PendingUpdateTransport, QueryResult, RegisterPolledDeployment, ResetWorkflowResult,
     ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager,
@@ -61,12 +61,13 @@ use tokeira_runtime::{
 };
 use tokeira_storage::{
     AttributedHistoryEvent, ConflictToken, DeploymentKey, DeploymentName, DeploymentTaskQueueType,
-    RunRepository,
+    RunRepository, WorkerTaskProvenance, WorkerTaskProvenanceError, WorkerTaskProvenanceStore,
+    worker_task_token_digest,
 };
 use tokeira_types::{
     ActivityTaskToken, ArchetypeId, BuildId, DeploymentId, ExecutionRef, ExecutionStatus,
     HeartbeatStore, Payload, Payloads, QueueKey, RequestContext, RequestId, RunId, RunKey,
-    TaskKind, TaskQueueName, WorkerIdentity, WorkflowId,
+    TaskKind, TaskQueueName, WorkerIdentity, WorkerInstanceKey, WorkflowId,
 };
 use uuid::Uuid;
 
@@ -84,6 +85,9 @@ use crate::{
     pending_queries::{LEGACY_QUERY_ID, PendingQueryStore},
     poller_registry::{ActivePoller, PollerRegistry},
     routing::{EdgeRouter, ensure_local},
+    scoped_worker_session::{
+        ScopedWorkerPollSession, ScopedWorkerSessionKey, ScopedWorkerSessionRegistry,
+    },
     translate::{
         ActivityTarget, CountActivityExecutionsRequest, CountActivityExecutionsResponse,
         CountWorkflowExecutionsRequest, CountWorkflowExecutionsResponse,
@@ -771,6 +775,7 @@ pub trait WorkflowRuntimeApi: Send + Sync + 'static {
         _namespace_id: tokeira_types::NamespaceId,
         _task_queue: tokeira_types::TaskQueueName,
         _worker: tokeira_types::WorkerIdentity,
+        _task_classes: &[tokeira_types::WorkerTaskClass],
     ) -> bool {
         false
     }
@@ -1277,6 +1282,7 @@ pub struct WorkflowService {
     namespaces: Arc<dyn NamespaceCache>,
     interceptors: Arc<EdgeInterceptors>,
     poller_registry: PollerRegistry,
+    scoped_worker_sessions: ScopedWorkerSessionRegistry,
     pending_queries: PendingQueryStore,
     buffered_queries: BufferedQueryRegistry,
     broker: InMemoryBroker,
@@ -1289,6 +1295,7 @@ pub struct WorkflowService {
     heartbeat_store: Arc<dyn HeartbeatStore>,
     schedule_store: Arc<ScheduleStore>,
     task_queue_config_store: Arc<dyn TaskQueueConfigStore>,
+    worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore>,
     batch_store: Arc<BatchOperationStore>,
     workflow_rules: WorkflowRuleStore,
     eager_dispatch_config: EagerDispatchConfig,
@@ -1521,6 +1528,101 @@ impl WorkflowService {
             .await
     }
 
+    /// Run the first phase of a fixed Worker RPC without decoding resources.
+    pub(crate) async fn admit_worker_request(
+        &self,
+        headers: &HeaderMap,
+        namespace: Option<&str>,
+        action: Action,
+        is_long_poll: bool,
+    ) -> EdgeResult<EdgeContext> {
+        self.interceptors
+            .begin_worker_preflight(headers, namespace, action, is_long_poll)
+            .await
+    }
+
+    /// Authorize one heartbeat's exact queue and Deployment Version.
+    pub(crate) async fn authorize_worker_heartbeat(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        heartbeat: &tokeira_types::WorkerHeartbeat,
+    ) -> EdgeResult<()> {
+        self.interceptors
+            .authorize_worker_operation_target(
+                context,
+                action,
+                tokeira_auth::WorkerOperation::RecordWorkerHeartbeat,
+                tokeira_auth::WorkerTarget::VersionedTask {
+                    normal_task_queue: &heartbeat.task_queue.0,
+                    // RecordWorkerHeartbeat's operation shape accepts any
+                    // Worker task class; the queue/version coordinates carry
+                    // the authorization meaning.
+                    task_class: tokeira_types::WorkerTaskClass::Workflow,
+                    deployment_name: heartbeat.deployment_name.as_deref().unwrap_or_default(),
+                    build_id: heartbeat.build_id.as_deref().unwrap_or_default(),
+                },
+            )
+            .await
+    }
+
+    /// Authorize caller-authored shutdown coordinates against its poll session.
+    pub(crate) async fn authorize_scoped_worker_shutdown(
+        &self,
+        context: &EdgeContext,
+        request_namespace: &str,
+        worker_instance_key: &str,
+        worker_identity: &str,
+        normal_task_queue: &str,
+        sticky_task_queue: Option<&str>,
+    ) -> EdgeResult<()> {
+        self.interceptors
+            .authorize_worker_target(
+                context,
+                Action::ShutdownWorker,
+                tokeira_auth::WorkerTarget::TaskQueue { normal_task_queue },
+            )
+            .await?;
+        let Some(claims) = context.claims.as_ref() else {
+            return Ok(());
+        };
+        let Some(scope) = claims.worker_scope.as_ref() else {
+            return Ok(());
+        };
+        let key = ScopedWorkerSessionKey {
+            namespace_id: resolved_namespace_id(context, request_namespace)?,
+            subject: claims.subject.clone(),
+            worker_instance_key: WorkerInstanceKey(worker_instance_key.to_owned()),
+        };
+        self.scoped_worker_sessions
+            .authorize_shutdown(
+                &key,
+                scope,
+                &WorkerIdentity(worker_identity.to_owned()),
+                &TaskQueueName(normal_task_queue.to_owned()),
+                sticky_task_queue
+                    .filter(|queue| !queue.is_empty())
+                    .map(|queue| TaskQueueName(queue.to_owned()))
+                    .as_ref(),
+                None,
+                context.received_at,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    reason = %error,
+                    "scoped Worker shutdown did not match its live poll session"
+                );
+                edge_metrics::record_scoped_worker_authorization_denied(
+                    Action::ShutdownWorker.api_name(),
+                    tokeira_auth::WorkerScopeDenyReason::WorkerSession.metric_label(),
+                );
+                EdgeError::PermissionDenied {
+                    message: "Request unauthorized.".to_owned(),
+                    reason: None,
+                }
+            })
+    }
+
     async fn observe_edge_call<T, F>(
         &self,
         headers: &HeaderMap,
@@ -1705,6 +1807,7 @@ impl WorkflowService {
             namespaces,
             interceptors,
             poller_registry,
+            scoped_worker_sessions: ScopedWorkerSessionRegistry::default(),
             pending_queries,
             buffered_queries,
             broker,
@@ -1717,6 +1820,7 @@ impl WorkflowService {
             heartbeat_store,
             schedule_store,
             task_queue_config_store,
+            worker_task_provenance: Arc::new(tokeira_storage::InMemoryStore::default()),
             batch_store,
             workflow_rules,
             eager_dispatch_config: EagerDispatchConfig::default(),
@@ -1853,6 +1957,277 @@ impl WorkflowService {
         self
     }
 
+    /// Attach the durable server-authored evidence store for scoped task tokens.
+    pub fn with_worker_task_provenance(
+        mut self,
+        worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore>,
+    ) -> Self {
+        self.worker_task_provenance = worker_task_provenance;
+        self
+    }
+
+    async fn register_scoped_task_provenance(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        token: &[u8],
+        origin: &tokeira_types::WorkerTaskOrigin,
+        expires_at: OffsetDateTime,
+    ) -> EdgeResult<()> {
+        if context
+            .claims
+            .as_ref()
+            .is_none_or(|claims| claims.worker_scope.is_none())
+        {
+            return Ok(());
+        }
+
+        self.interceptors
+            .authorize_worker_target(
+                context,
+                action,
+                tokeira_auth::WorkerTarget::VersionedTask {
+                    normal_task_queue: &origin.normal_task_queue.0,
+                    task_class: origin.task_class,
+                    deployment_name: &origin.deployment.0,
+                    build_id: &origin.build_id.0,
+                },
+            )
+            .await?;
+
+        if expires_at <= context.received_at {
+            edge_metrics::record_scoped_worker_authorization_denied(
+                action.api_name(),
+                tokeira_auth::WorkerScopeDenyReason::TaskOrigin.metric_label(),
+            );
+            return Err(scoped_worker_denied());
+        }
+
+        self.worker_task_provenance
+            .put(WorkerTaskProvenance {
+                token_digest: worker_task_token_digest(token),
+                origin: origin.clone(),
+                expires_at,
+                created_at: context.received_at,
+            })
+            .await
+            .map(|_| ())
+            .map_err(worker_task_provenance_write_error)
+    }
+
+    async fn authorize_scoped_task_token(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        token: &[u8],
+    ) -> EdgeResult<Option<[u8; 32]>> {
+        if !is_scoped_worker(context) {
+            return Ok(None);
+        }
+        let digest = worker_task_token_digest(token);
+        let record = self
+            .worker_task_provenance
+            .get(digest)
+            .await
+            .map_err(worker_task_provenance_read_error)?
+            .ok_or_else(|| {
+                edge_metrics::record_scoped_worker_authorization_denied(
+                    action.api_name(),
+                    tokeira_auth::WorkerScopeDenyReason::TaskOrigin.metric_label(),
+                );
+                scoped_worker_denied()
+            })?;
+        let namespace_id = resolved_namespace_id(
+            context,
+            context
+                .namespace
+                .as_ref()
+                .map_or("", |namespace| namespace.name.as_str()),
+        )?;
+        if record.origin.namespace_id != namespace_id {
+            edge_metrics::record_scoped_worker_authorization_denied(
+                action.api_name(),
+                tokeira_auth::WorkerScopeDenyReason::TaskOrigin.metric_label(),
+            );
+            return Err(scoped_worker_denied());
+        }
+        self.interceptors
+            .authorize_worker_target(
+                context,
+                action,
+                tokeira_auth::WorkerTarget::VersionedTask {
+                    normal_task_queue: &record.origin.normal_task_queue.0,
+                    task_class: record.origin.task_class,
+                    deployment_name: &record.origin.deployment.0,
+                    build_id: &record.origin.build_id.0,
+                },
+            )
+            .await?;
+        Ok(Some(digest))
+    }
+
+    async fn nexus_task_deadline(&self, task: &NexusTask) -> EdgeResult<OffsetDateTime> {
+        let correlation = self
+            .nexus_broker
+            .correlation(&task.token.task_id)
+            .await
+            .ok_or_else(|| {
+                EdgeError::NotFound("Nexus task not found or already expired".to_owned())
+            })?;
+        let correlation_origin = match &correlation {
+            NexusTaskCorrelation::Workflow { origin, .. }
+            | NexusTaskCorrelation::Http { origin, .. }
+            | NexusTaskCorrelation::WorkerCompute { origin, .. } => origin,
+        };
+        let token_namespace_id = Uuid::parse_str(&task.token.namespace_id)
+            .map(tokeira_types::NamespaceId)
+            .map_err(|_| {
+                EdgeError::Internal("Nexus task token has an invalid namespace.".into())
+            })?;
+        if correlation_origin != &task.origin
+            || token_namespace_id != task.origin.namespace_id
+            || task.token.task_queue != task.origin.normal_task_queue.0
+        {
+            return Err(EdgeError::Internal(
+                "Nexus task origin disagrees with its response correlation.".to_owned(),
+            ));
+        }
+
+        match (&task.request, correlation) {
+            (
+                tokeira_runtime::NexusTaskRequest::Http(request),
+                NexusTaskCorrelation::Http { .. },
+            ) => Ok(request.dispatch_deadline),
+            (
+                _,
+                NexusTaskCorrelation::Workflow {
+                    run_key,
+                    operation_id,
+                    ..
+                },
+            ) => {
+                let pending = match self.repo.load_run(run_key).await.map_err(EdgeError::from)? {
+                    LoadedRun::Existing(state) => {
+                        state.pending_nexus_operations.get(&operation_id).cloned()
+                    }
+                    LoadedRun::Absent => None,
+                }
+                .ok_or_else(|| {
+                    EdgeError::NotFound("Nexus task not found or already expired".to_owned())
+                })?;
+                nexus_operation_deadline(&pending)
+            }
+            _ => Err(EdgeError::Internal(
+                "Nexus task request disagrees with its response correlation.".to_owned(),
+            )),
+        }
+    }
+
+    async fn delete_consumed_task_provenance(&self, digest: Option<[u8; 32]>, action: Action) {
+        let Some(digest) = digest else {
+            return;
+        };
+        if let Err(error) = self.worker_task_provenance.delete(digest).await {
+            // Runtime fencing has already consumed the task. A cleanup failure
+            // cannot make that work repeatable; bounded expiry maintenance owns
+            // the stale evidence row.
+            tracing::warn!(
+                api_name = action.api_name(),
+                error_kind = worker_task_provenance_error_kind(&error),
+                "failed to delete consumed Worker task authorization evidence"
+            );
+        }
+    }
+
+    async fn register_optional_scoped_task_provenance(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        token: &[u8],
+        origin: &tokeira_types::WorkerTaskOrigin,
+        expires_at: OffsetDateTime,
+    ) -> bool {
+        match self
+            .register_scoped_task_provenance(context, action, token, origin, expires_at)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                // The completing Workflow Task has already committed. Optional
+                // inline work is therefore withheld rather than turning that
+                // successful completion into an error; its existing task
+                // timeout makes it dispatchable again.
+                tracing::warn!(
+                    api_name = action.api_name(),
+                    error_kind = optional_task_provenance_error_kind(&error),
+                    "withholding optional Worker task after authorization-evidence failure"
+                );
+                false
+            }
+        }
+    }
+
+    /// Attach the process-local scoped Worker-session registry.
+    pub fn with_scoped_worker_sessions(mut self, sessions: ScopedWorkerSessionRegistry) -> Self {
+        self.scoped_worker_sessions = sessions;
+        self
+    }
+
+    fn record_scoped_worker_poll_session(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        request_namespace: &str,
+        worker_instance_key: &str,
+        worker_identity: &str,
+        task_queue: &str,
+        normal_task_queue: Option<&str>,
+        is_sticky: bool,
+        worker_control_task_queue: Option<&str>,
+    ) -> EdgeResult<()> {
+        let Some(claims) = context.claims.as_ref() else {
+            return Ok(());
+        };
+        let Some(scope) = claims.worker_scope.as_ref() else {
+            return Ok(());
+        };
+        let normal_task_queue = if is_sticky {
+            normal_task_queue.unwrap_or_default()
+        } else {
+            task_queue
+        };
+        let key = ScopedWorkerSessionKey {
+            namespace_id: resolved_namespace_id(context, request_namespace)?,
+            subject: claims.subject.clone(),
+            worker_instance_key: WorkerInstanceKey(worker_instance_key.to_owned()),
+        };
+        let observation = ScopedWorkerPollSession {
+            scope: scope.clone(),
+            worker_identity: WorkerIdentity(worker_identity.to_owned()),
+            normal_task_queue: TaskQueueName(normal_task_queue.to_owned()),
+            sticky_task_queue: is_sticky.then(|| TaskQueueName(task_queue.to_owned())),
+            worker_control_task_queue: worker_control_task_queue
+                .filter(|queue| !queue.is_empty())
+                .map(|queue| TaskQueueName(queue.to_owned())),
+        };
+        self.scoped_worker_sessions
+            .record_poll(key, observation, context.received_at)
+            .map_err(|error| {
+                tracing::warn!(
+                    reason = %error,
+                    "scoped Worker poll conflicted with its established session"
+                );
+                edge_metrics::record_scoped_worker_authorization_denied(
+                    action.api_name(),
+                    tokeira_auth::WorkerScopeDenyReason::WorkerSession.metric_label(),
+                );
+                EdgeError::PermissionDenied {
+                    message: "Request unauthorized.".to_owned(),
+                    reason: None,
+                }
+            })
+    }
+
     pub fn schedule_store(&self) -> Arc<ScheduleStore> {
         self.schedule_store.clone()
     }
@@ -1922,7 +2297,13 @@ impl WorkflowService {
         request_namespace: &str,
         task_token: &[u8],
         action: Action,
-    ) -> EdgeResult<(T, Option<tokeira_types::NamespaceId>, EdgeContext, String)> {
+    ) -> EdgeResult<(
+        T,
+        Option<tokeira_types::NamespaceId>,
+        EdgeContext,
+        String,
+        Option<[u8; 32]>,
+    )> {
         if request_namespace.is_empty() {
             // The namespace validator back-fills before authentication in
             // v1.31.0, so malformed bytes on this branch are intentionally
@@ -1931,25 +2312,32 @@ impl WorkflowService {
                 .map_err(|error| EdgeError::BadRequest(format!("invalid task token: {error}")))?;
             let (context, namespace) = self
                 .interceptors
-                .begin_with_task_token_backfill(headers, token_namespace_id, action)
+                .begin_worker_with_task_token_backfill(headers, token_namespace_id, action)
                 .await?;
-            Ok((token, token_namespace_id, context, namespace))
+            let provenance = self
+                .authorize_scoped_task_token(&context, action, task_token)
+                .await?;
+            Ok((token, token_namespace_id, context, namespace, provenance))
         } else {
             // The explicit request namespace is the authorization target. Only
             // an allowed caller may learn that its token is malformed or names
             // a different namespace (`fx.go:256-290 @ v1.31.0`).
             let context = self
                 .interceptors
-                .begin(headers, Some(request_namespace), action, false)
+                .begin_worker_preflight(headers, Some(request_namespace), action, false)
                 .await?;
             let (token, token_namespace_id) = crate::task_token::decode(task_token)
                 .map_err(|error| EdgeError::BadRequest(format!("invalid task token: {error}")))?;
             crate::interceptors::validate_task_token_namespace(&context, token_namespace_id)?;
+            let provenance = self
+                .authorize_scoped_task_token(&context, action, task_token)
+                .await?;
             Ok((
                 token,
                 token_namespace_id,
                 context,
                 request_namespace.to_owned(),
+                provenance,
             ))
         }
     }
@@ -1976,7 +2364,7 @@ impl WorkflowService {
         request_namespace: &str,
         task_token: &[u8],
         action: Action,
-    ) -> EdgeResult<(NexusTaskToken, EdgeContext, String)> {
+    ) -> EdgeResult<(NexusTaskToken, EdgeContext, String, Option<[u8; 32]>)> {
         if request_namespace.is_empty() {
             let token = decode_nexus_task_token(task_token)?;
             let namespace_id = Uuid::parse_str(&token.namespace_id)
@@ -1984,18 +2372,24 @@ impl WorkflowService {
                 .map_err(|_| EdgeError::BadRequest("Invalid TaskToken.".to_owned()))?;
             let (context, namespace) = self
                 .interceptors
-                .begin_with_task_token_backfill(headers, Some(namespace_id), action)
+                .begin_worker_with_task_token_backfill(headers, Some(namespace_id), action)
+                .await?;
+            let provenance = self
+                .authorize_scoped_task_token(&context, action, task_token)
                 .await?;
             validate_nexus_task_token(&context, &token)?;
-            Ok((token, context, namespace))
+            Ok((token, context, namespace, provenance))
         } else {
             let context = self
                 .interceptors
-                .begin(headers, Some(request_namespace), action, false)
+                .begin_worker_preflight(headers, Some(request_namespace), action, false)
                 .await?;
             let token = decode_nexus_task_token(task_token)?;
             validate_nexus_task_token(&context, &token)?;
-            Ok((token, context, request_namespace.to_owned()))
+            let provenance = self
+                .authorize_scoped_task_token(&context, action, task_token)
+                .await?;
+            Ok((token, context, request_namespace.to_owned(), provenance))
         }
     }
 
@@ -2014,7 +2408,7 @@ impl WorkflowService {
             async move {
                 let context = self
                     .interceptors
-                    .begin(
+                    .begin_worker_preflight(
                         headers,
                         Some(&req.namespace),
                         Action::PollNexusTaskQueue,
@@ -2028,17 +2422,81 @@ impl WorkflowService {
                     )
                 })?;
                 let namespace_id = to_internal::namespace_id_for(&resolved_namespace.name);
+                self.interceptors
+                    .authorize_worker_target(
+                        &context,
+                        Action::PollNexusTaskQueue,
+                        crate::interceptors::normalize_worker_poll_target(
+                            &req.task_queue,
+                            req.normal_task_queue.as_deref(),
+                            req.is_sticky,
+                            req.scoped_versioned,
+                            req.deployment
+                                .as_ref()
+                                .map(|version| version.deployment_name.as_str()),
+                            req.deployment
+                                .as_ref()
+                                .map(|version| version.build_id.as_str()),
+                            tokeira_types::WorkerTaskClass::Nexus,
+                        ),
+                    )
+                    .await?;
+                validate_versioned_sticky_normal_name_after_auth(
+                    req.is_sticky,
+                    req.normal_task_queue.as_deref(),
+                    req.versioning_metadata_present,
+                )?;
+                validate_complete_modern_poll_version(
+                    req.scoped_versioned,
+                    req.deployment
+                        .as_ref()
+                        .map(|version| version.deployment_name.as_str()),
+                    req.deployment
+                        .as_ref()
+                        .map(|version| version.build_id.as_str()),
+                )?;
                 let heartbeat_count = req.worker_heartbeats.len();
-                for proto in req.worker_heartbeats {
-                    let heartbeat = worker_heartbeat::worker_heartbeat_from_proto(
-                        namespace_id,
-                        proto,
-                        context.received_at,
-                    );
-                    let key = heartbeat.worker_instance_key.clone();
-                    let active = heartbeat.status.0 != 3;
-                    match self.heartbeat_store.insert(heartbeat) {
-                        Ok(()) => {
+                let heartbeats = req
+                    .worker_heartbeats
+                    .into_iter()
+                    .map(|proto| {
+                        worker_heartbeat::worker_heartbeat_from_proto(
+                            namespace_id,
+                            proto,
+                            context.received_at,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let scoped_worker = context
+                    .claims
+                    .as_ref()
+                    .is_some_and(|claims| claims.worker_scope.is_some());
+                if scoped_worker {
+                    for heartbeat in &heartbeats {
+                        self.authorize_worker_heartbeat(
+                            &context,
+                            Action::PollNexusTaskQueue,
+                            heartbeat,
+                        )
+                        .await?;
+                    }
+                }
+                self.record_scoped_worker_poll_session(
+                    &context,
+                    Action::PollNexusTaskQueue,
+                    &req.namespace,
+                    &req.worker_instance_key,
+                    &req.worker_identity,
+                    &req.task_queue,
+                    req.normal_task_queue.as_deref(),
+                    req.is_sticky,
+                    None,
+                )?;
+                match self.heartbeat_store.insert_batch(heartbeats.clone()) {
+                    Ok(()) => {
+                        for heartbeat in heartbeats {
+                            let key = heartbeat.worker_instance_key;
+                            let active = heartbeat.status.0 != 3;
                             tokeira_runtime::metrics::record_worker_heartbeat_accepted(
                                 namespace_id,
                                 &key,
@@ -2049,22 +2507,28 @@ impl WorkflowService {
                                 active,
                             );
                         }
-                        Err(error) => {
-                            // Temporal dispatches this observation batch
-                            // asynchronously and does not fail the Nexus poll
-                            // when matching cannot record it
-                            // (`workflow_handler.go:5957-5978 @ v1.31.0`).
-                            tokeira_runtime::metrics::record_worker_heartbeat_rejected(
-                                &req.namespace,
-                                "store_error",
-                            );
-                            tracing::warn!(
-                                ?error,
-                                namespace = %req.namespace,
-                                worker_instance_key = %key.0,
-                                "failed to record Nexus-piggybacked worker heartbeat"
-                            );
-                        }
+                    }
+                    Err(error) if scoped_worker => {
+                        tokeira_runtime::metrics::record_worker_heartbeat_rejected(
+                            &req.namespace,
+                            "store_error",
+                        );
+                        return Err(EdgeError::Internal(error.to_string()));
+                    }
+                    Err(error) => {
+                        // Temporal dispatches this observation batch
+                        // asynchronously and does not fail the Nexus poll when
+                        // matching cannot record it (`workflow_handler.go:
+                        // 5957-5978 @ v1.31.0`).
+                        tokeira_runtime::metrics::record_worker_heartbeat_rejected(
+                            &req.namespace,
+                            "store_error",
+                        );
+                        tracing::warn!(
+                            ?error,
+                            namespace = %req.namespace,
+                            "failed to record Nexus-piggybacked worker heartbeat batch"
+                        );
                     }
                 }
                 tracing::debug!(
@@ -2110,19 +2574,37 @@ impl WorkflowService {
                     NexusQueueKey::from_version(namespace_id, task_queue, req.deployment.as_ref());
                 let task = self
                     .nexus_broker
-                    .poll_versioned(queue_key.clone(), std::time::Duration::from_secs(60))
+                    .poll_versioned_for_worker(
+                        queue_key.clone(),
+                        &WorkerIdentity(req.worker_identity.clone()),
+                        std::time::Duration::from_secs(60),
+                    )
                     .await;
 
                 match task {
-                    Some(task) => Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
-                        task_token: task.token.encode().map_err(EdgeError::from)?,
-                        request: task.request,
-                        poller_scaling_decision: self
-                            .nexus_broker
-                            .has_runnable_backlog_versioned(&queue_key)
-                            .await
-                            .then_some(1),
-                    })),
+                    Some(task) => {
+                        let task_token = task.token.encode().map_err(EdgeError::from)?;
+                        if scoped_worker {
+                            let deadline = self.nexus_task_deadline(&task).await?;
+                            self.register_scoped_task_provenance(
+                                &context,
+                                Action::PollNexusTaskQueue,
+                                &task_token,
+                                &task.origin,
+                                deadline,
+                            )
+                            .await?;
+                        }
+                        Ok(Some(crate::translate::nexus::PollNexusTaskQueueResponse {
+                            task_token,
+                            request: task.request,
+                            poller_scaling_decision: self
+                                .nexus_broker
+                                .has_runnable_backlog_versioned(&queue_key)
+                                .await
+                                .then_some(1),
+                        }))
+                    }
                     None => Ok(None),
                 }
             },
@@ -2144,11 +2626,11 @@ impl WorkflowService {
             None,
             async move {
                 let response = req.response.unwrap_or_default();
-                let token = if req.namespace.is_empty() {
+                let (token, provenance) = if req.namespace.is_empty() {
                     // Namespace back-fill is an earlier interceptor than auth;
                     // decoding therefore precedes handler-level operation-token
                     // validation on the omitted-name branch.
-                    let (token, _ctx, effective_namespace) = self
+                    let (token, _ctx, effective_namespace, provenance) = self
                         .admit_nexus_task_token(
                             headers,
                             &req.namespace,
@@ -2158,11 +2640,11 @@ impl WorkflowService {
                         .await?;
                     req.namespace = effective_namespace;
                     validate_nexus_completed_response_token(&response)?;
-                    token
+                    (token, provenance)
                 } else {
                     let context = self
                         .interceptors
-                        .begin(
+                        .begin_worker_preflight(
                             headers,
                             Some(&req.namespace),
                             Action::RespondNexusTaskCompleted,
@@ -2175,7 +2657,14 @@ impl WorkflowService {
                     validate_nexus_completed_response_token(&response)?;
                     let token = decode_nexus_task_token(&req.task_token)?;
                     validate_nexus_task_token(&context, &token)?;
-                    token
+                    let provenance = self
+                        .authorize_scoped_task_token(
+                            &context,
+                            Action::RespondNexusTaskCompleted,
+                            &req.task_token,
+                        )
+                        .await?;
+                    (token, provenance)
                 };
                 // v1.31.0 validates operation-error JSON only after the task token
                 // has been decoded and namespace-fenced, but before consuming its
@@ -2196,8 +2685,13 @@ impl WorkflowService {
                                 "Nexus task not found or already expired".to_string(),
                             )
                         })?;
+                self.delete_consumed_task_provenance(
+                    provenance,
+                    Action::RespondNexusTaskCompleted,
+                )
+                .await;
                 let (run_key, operation_id, scheduled_event_id, task_kind) = match correlation {
-                    NexusTaskCorrelation::Http { waiter_id } => {
+                    NexusTaskCorrelation::Http { waiter_id, .. } => {
                         // Consuming the delivery correlation acknowledges the worker.
                         // A concurrent caller disconnect may remove the edge waiter after
                         // that point without turning the worker response into an RPC error,
@@ -2210,6 +2704,7 @@ impl WorkflowService {
                     NexusTaskCorrelation::WorkerCompute {
                         action_id,
                         claim_epoch,
+                        ..
                     } => {
                         let completion =
                             crate::translate::nexus::worker_compute_completion_from_response(
@@ -2227,6 +2722,7 @@ impl WorkflowService {
                         operation_id,
                         scheduled_event_id,
                         task_kind,
+                        ..
                     } => (run_key, operation_id, scheduled_event_id, task_kind),
                 };
 
@@ -2361,7 +2857,7 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let (token, _ctx, effective_namespace) = self
+                let (token, _ctx, effective_namespace, provenance) = self
                     .admit_nexus_task_token(
                         headers,
                         &req.namespace,
@@ -2403,8 +2899,13 @@ impl WorkflowService {
                             "Nexus task not found or already expired".to_string(),
                         )
                     })?;
+                self.delete_consumed_task_provenance(
+                    provenance,
+                    Action::RespondNexusTaskFailed,
+                )
+                .await;
                 let (run_key, operation_id, scheduled_event_id, task_kind) = match correlation {
-                    NexusTaskCorrelation::Http { waiter_id } => {
+                    NexusTaskCorrelation::Http { waiter_id, .. } => {
                         let _ = self.nexus_http_waiters.complete(
                             &waiter_id,
                             NexusHttpWorkerOutcome::Failed {
@@ -2417,6 +2918,7 @@ impl WorkflowService {
                     NexusTaskCorrelation::WorkerCompute {
                         action_id,
                         claim_epoch,
+                        ..
                     } => {
                         let retryable = req
                             .failure
@@ -2442,6 +2944,7 @@ impl WorkflowService {
                         operation_id,
                         scheduled_event_id,
                         task_kind,
+                        ..
                     } => (run_key, operation_id, scheduled_event_id, task_kind),
                 };
                 // A failed worker response is the terminal result of an outbound
@@ -3584,10 +4087,16 @@ impl WorkflowService {
         namespace_id: tokeira_types::NamespaceId,
         task_queue: tokeira_types::TaskQueueName,
         worker: tokeira_types::WorkerIdentity,
+        task_classes: &[tokeira_types::WorkerTaskClass],
     ) -> bool {
         let applied = self
             .runtime
-            .cancel_outstanding_worker_polls(namespace_id, task_queue.clone(), worker.clone())
+            .cancel_outstanding_worker_polls(
+                namespace_id,
+                task_queue.clone(),
+                worker.clone(),
+                task_classes,
+            )
             .await;
         if applied {
             self.poller_registry
@@ -3704,6 +4213,11 @@ impl WorkflowService {
             deployment: state.deployment.clone(),
             build_id: state.build_id.clone(),
         };
+        let origin = tokeira_types::WorkerTaskOrigin::from_queue_key(
+            &queue,
+            state.task_queue.clone(),
+            tokeira_types::WorkerTaskClass::Query,
+        );
 
         for query in self.buffered_queries.drain_satisfied(run_key, barrier) {
             self.broker
@@ -3715,7 +4229,9 @@ impl WorkflowService {
                     sticky_preferred: sticky_preferred.clone(),
                     sticky_queue: sticky_queue.clone(),
                     sticky_deadline,
+                    deadline: query.deadline,
                     response_tx: query.response_tx,
+                    origin: origin.clone(),
                 })
                 .await;
         }
@@ -3725,7 +4241,13 @@ impl WorkflowService {
         &self,
         query: tokeira_runtime::QueryTask,
         worker: &WorkerIdentity,
-    ) -> EdgeResult<PollWorkflowTaskQueueResponse> {
+    ) -> EdgeResult<(
+        PollWorkflowTaskQueueResponse,
+        tokeira_types::WorkerTaskOrigin,
+        OffsetDateTime,
+    )> {
+        let origin = query.origin.clone();
+        let deadline = query.deadline;
         let state = match self
             .repo
             .load_run(query.run_key)
@@ -3783,29 +4305,33 @@ impl WorkflowService {
             .insert(&task_token, LEGACY_QUERY_ID.to_string(), query.response_tx)
             .await;
 
-        Ok(PollWorkflowTaskQueueResponse {
-            task_token,
-            started_event_id: 0,
-            previous_started_event_id: state.previous_started_event_id,
-            attempt: 1,
-            scheduled_time: None,
-            started_time: None,
-            payload: crate::translate::WorkflowTaskPayloadDto {
-                workflow_id: state.workflow_id.0,
-                run_key: state.run_key,
-                run_id: state.run_id,
-                task_queue: state.task_queue.0,
-                history,
-                history_principals,
+        Ok((
+            PollWorkflowTaskQueueResponse {
+                task_token,
+                started_event_id: 0,
+                previous_started_event_id: state.previous_started_event_id,
+                attempt: 1,
+                scheduled_time: None,
+                started_time: None,
+                payload: crate::translate::WorkflowTaskPayloadDto {
+                    workflow_id: state.workflow_id.0,
+                    run_key: state.run_key,
+                    run_id: state.run_id,
+                    task_queue: state.task_queue.0,
+                    history,
+                    history_principals,
+                },
+                query: Some(WorkflowQueryDto {
+                    query_type: query.query_type,
+                    query_args: query.query_args,
+                }),
+                queries: std::collections::HashMap::new(),
+                messages: Vec::new(),
+                poller_scaling_decision: None,
             },
-            query: Some(WorkflowQueryDto {
-                query_type: query.query_type,
-                query_args: query.query_args,
-            }),
-            queries: std::collections::HashMap::new(),
-            messages: Vec::new(),
-            poller_scaling_decision: None,
-        })
+            origin,
+            deadline,
+        ))
     }
 
     pub async fn start_workflow_execution(
@@ -4099,7 +4625,7 @@ impl WorkflowService {
             async move {
                 let ctx = self
                     .interceptors
-                    .begin(
+                    .begin_worker_preflight(
                         headers,
                         Some(&req.namespace),
                         Action::PollWorkflowTaskQueue,
@@ -4107,6 +4633,42 @@ impl WorkflowService {
                     )
                     .await?;
                 let namespace_id = resolved_namespace_id(&ctx, &req.namespace)?;
+                self.interceptors
+                    .authorize_worker_target(
+                        &ctx,
+                        Action::PollWorkflowTaskQueue,
+                        crate::interceptors::normalize_worker_poll_target(
+                            &req.task_queue,
+                            req.normal_task_queue.as_deref(),
+                            req.is_sticky,
+                            req.scoped_versioned,
+                            req.deployment.as_ref().map(|value| value.0.as_str()),
+                            req.build_id.as_ref().map(|value| value.0.as_str()),
+                            tokeira_types::WorkerTaskClass::Workflow,
+                        ),
+                    )
+                    .await?;
+                validate_versioned_sticky_normal_name_after_auth(
+                    req.is_sticky,
+                    req.normal_task_queue.as_deref(),
+                    req.versioning_metadata_present,
+                )?;
+                validate_complete_modern_poll_version(
+                    req.scoped_versioned,
+                    req.deployment.as_ref().map(|value| value.0.as_str()),
+                    req.build_id.as_ref().map(|value| value.0.as_str()),
+                )?;
+                self.record_scoped_worker_poll_session(
+                    &ctx,
+                    Action::PollWorkflowTaskQueue,
+                    &req.namespace,
+                    &req.worker_instance_key,
+                    &req.worker_identity,
+                    &req.task_queue,
+                    req.normal_task_queue.as_deref(),
+                    req.is_sticky,
+                    Some(&req.worker_control_task_queue),
+                )?;
 
                 ensure_local(
                     self.router
@@ -4211,14 +4773,41 @@ impl WorkflowService {
                         self.decorate_workflow_task_response(&started, &mut response)
                             .await?;
                         response.poller_scaling_decision = scaling_decision;
+                        if is_scoped_worker(&ctx) {
+                            let expires_at = started
+                                .started_time
+                                .checked_add(started.workflow_task_timeout)
+                                .ok_or_else(|| {
+                                    EdgeError::Internal(
+                                        "Workflow Task deadline exceeds the supported time range."
+                                            .to_owned(),
+                                    )
+                                })?;
+                            self.register_scoped_task_provenance(
+                                &ctx,
+                                Action::PollWorkflowTaskQueue,
+                                &response.task_token,
+                                &started.origin,
+                                expires_at,
+                            )
+                            .await?;
+                        }
 
                         Ok(Some(response))
                     }
                     Some(WorkflowActivation::QueryTask(query)) => {
-                        let mut response = self
+                        let (mut response, origin, deadline) = self
                             .build_direct_query_poll_response(query, &internal.worker_identity)
                             .await?;
                         response.poller_scaling_decision = scaling_decision;
+                        self.register_scoped_task_provenance(
+                            &ctx,
+                            Action::PollWorkflowTaskQueue,
+                            &response.task_token,
+                            &origin,
+                            deadline,
+                        )
+                        .await?;
                         Ok(Some(response))
                     }
                     None => Ok(None),
@@ -4322,7 +4911,7 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let (task_token, token_namespace_id, context, namespace) = self
+                let (task_token, token_namespace_id, context, namespace, provenance) = self
                     .admit_json_task_token::<tokeira_types::WorkflowTaskToken>(
                         headers,
                         &req.namespace,
@@ -4353,11 +4942,22 @@ impl WorkflowService {
                         LoadedRun::Absent => to_internal::namespace_id_for(&req.namespace),
                     },
                 };
+                let cross_namespace_targets =
+                    cross_namespace_authorization_targets(&req.namespace, &req.commands);
+                if !scoped_worker_allows_completion_targets(&context, &cross_namespace_targets) {
+                    // A scoped Worker may schedule work onto another queue in
+                    // its current namespace, but its credential never grants
+                    // authority to mutate another namespace. Reject the whole
+                    // completion before query resolution or the authoritative
+                    // Workflow Task transition.
+                    edge_metrics::record_scoped_worker_authorization_denied(
+                        Action::RespondWorkflowTaskCompleted.api_name(),
+                        tokeira_auth::WorkerScopeDenyReason::Namespace.metric_label(),
+                    );
+                    return Err(scoped_worker_denied());
+                }
                 if cross_namespace_commands_enabled() {
-                    for (target_namespace, action) in cross_namespace_authorization_targets(
-                        &req.namespace,
-                        &req.commands,
-                    ) {
+                    for (target_namespace, action) in cross_namespace_targets {
                         self.interceptors
                             .authorize_existing_context(&context, action, &target_namespace)
                             .await?;
@@ -4448,6 +5048,11 @@ impl WorkflowService {
                 }
 
                 if query_only && req.commands.is_empty() {
+                    self.delete_consumed_task_provenance(
+                        provenance,
+                        Action::RespondWorkflowTaskCompleted,
+                    )
+                    .await;
                     return Ok(RespondWorkflowTaskCompletedResponse {
                         transition_seq: 0,
                         last_event_id: 0,
@@ -4501,6 +5106,11 @@ impl WorkflowService {
                     .complete_workflow_task(internal)
                     .await
                     .map_err(EdgeError::from)?;
+                self.delete_consumed_task_provenance(
+                    provenance,
+                    Action::RespondWorkflowTaskCompleted,
+                )
+                .await;
                 self.notify_history_run_key(run_key, outcome.last_event_id)
                     .await;
 
@@ -4526,6 +5136,18 @@ impl WorkflowService {
                             deployment,
                             build_id,
                         };
+                        let prospective_origin = tokeira_types::WorkerTaskOrigin::from_queue_key(
+                            &queue,
+                            queue.task_queue.clone(),
+                            tokeira_types::WorkerTaskClass::Activity,
+                        );
+                        if !scoped_worker_allows_task_origin(
+                            &context,
+                            Action::PollActivityTaskQueue,
+                            &prospective_origin,
+                        ) {
+                            continue;
+                        }
                         if let Some(started) = self
                             .runtime
                             .try_claim_activity_task(
@@ -4537,12 +5159,23 @@ impl WorkflowService {
                             .await
                             .map_err(EdgeError::from)?
                         {
-                            resp.activity_tasks
-                                .push(from_internal::poll_activity_response(
-                                    started,
-                                    namespace_id,
-                                    workflow_namespace,
-                                )?);
+                            let task = from_internal::poll_activity_response(
+                                started.clone(),
+                                namespace_id,
+                                workflow_namespace,
+                            )?;
+                            if self
+                                .register_optional_scoped_task_provenance(
+                                    &context,
+                                    Action::PollActivityTaskQueue,
+                                    &task.task_token,
+                                    &started.origin,
+                                    activity_task_deadline(&started)?,
+                                )
+                                .await
+                            {
+                                resp.activity_tasks.push(task);
+                            }
                         }
                     }
                 }
@@ -4584,6 +5217,19 @@ impl WorkflowService {
                                 deployment: state.deployment.clone(),
                                 build_id: state.build_id.clone(),
                             };
+                            let prospective_origin =
+                                tokeira_types::WorkerTaskOrigin::from_queue_key(
+                                    &queue,
+                                    state.task_queue.clone(),
+                                    tokeira_types::WorkerTaskClass::Workflow,
+                                );
+                            if !scoped_worker_allows_task_origin(
+                                &context,
+                                Action::PollWorkflowTaskQueue,
+                                &prospective_origin,
+                            ) {
+                                return Ok(resp);
+                            }
                             if let Some(mut started) = self
                                 .runtime
                                 .try_claim_workflow_task(
@@ -4610,7 +5256,27 @@ impl WorkflowService {
                                 .map_err(EdgeError::from)?;
                                 self.decorate_workflow_task_response(&started, &mut workflow_task)
                                     .await?;
-                                resp.workflow_task = Some(workflow_task);
+                                let expires_at = started
+                                    .started_time
+                                    .checked_add(started.workflow_task_timeout)
+                                    .ok_or_else(|| {
+                                        EdgeError::Internal(
+                                            "Workflow Task deadline exceeds the supported time range."
+                                                .to_owned(),
+                                        )
+                                    })?;
+                                if self
+                                    .register_optional_scoped_task_provenance(
+                                        &context,
+                                        Action::PollWorkflowTaskQueue,
+                                        &workflow_task.task_token,
+                                        &started.origin,
+                                        expires_at,
+                                    )
+                                    .await
+                                {
+                                    resp.workflow_task = Some(workflow_task);
+                                }
                             }
                         } else if state.pending_workflow_task.is_none() {
                             // The completing WFT created no follow-up task:
@@ -4653,31 +5319,40 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let token_namespace_id = query_task_namespace_id(&task_token)?;
-                if namespace.is_empty() {
-                    let _ = self
-                        .interceptors
-                        .begin_with_task_token_backfill(
+                let context = if namespace.is_empty() {
+                    let token_namespace_id = query_task_namespace_id(&task_token)?;
+                    self.interceptors
+                        .begin_worker_with_task_token_backfill(
                             headers,
                             Some(token_namespace_id),
                             Action::RespondQueryTaskCompleted,
                         )
-                        .await?;
+                        .await?
+                        .0
                 } else {
                     let context = self
                         .interceptors
-                        .begin(
+                        .begin_worker_preflight(
                             headers,
                             Some(&namespace),
                             Action::RespondQueryTaskCompleted,
                             false,
                         )
                         .await?;
+                    let token_namespace_id = query_task_namespace_id(&task_token)?;
                     crate::interceptors::validate_task_token_namespace(
                         &context,
                         Some(token_namespace_id),
                     )?;
-                }
+                    context
+                };
+                let provenance = self
+                    .authorize_scoped_task_token(
+                        &context,
+                        Action::RespondQueryTaskCompleted,
+                        &task_token,
+                    )
+                    .await?;
 
                 if let Some(sender) = self
                     .pending_queries
@@ -4685,6 +5360,15 @@ impl WorkflowService {
                     .await
                 {
                     let _ = sender.send(result);
+                    self.delete_consumed_task_provenance(
+                        provenance,
+                        Action::RespondQueryTaskCompleted,
+                    )
+                    .await;
+                } else if provenance.is_some() {
+                    return Err(EdgeError::NotFound(
+                        "Query task not found or already completed.".to_owned(),
+                    ));
                 }
                 Ok(())
             },
@@ -5184,13 +5868,22 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let _ctx = self
+                let context = self
                     .interceptors
-                    .begin(
+                    .begin_worker_preflight(
                         headers,
                         Some(&req.namespace),
                         Action::DescribeTaskQueue,
                         false,
+                    )
+                    .await?;
+                self.interceptors
+                    .authorize_worker_target(
+                        &context,
+                        Action::DescribeTaskQueue,
+                        tokeira_auth::WorkerTarget::TaskQueue {
+                            normal_task_queue: &req.task_queue,
+                        },
                     )
                     .await?;
 
@@ -5946,6 +6639,79 @@ impl WorkflowService {
         headers: &HeaderMap,
         req: PollActivityTaskQueueRequest,
     ) -> EdgeResult<Option<PollActivityTaskQueueResponse>> {
+        self.poll_activity_task_queue_inner(headers, req, None)
+            .await
+    }
+
+    pub(crate) async fn admit_activity_task_queue_poll(
+        &self,
+        headers: &HeaderMap,
+        req: &PollActivityTaskQueueRequest,
+    ) -> EdgeResult<EdgeContext> {
+        let context = self
+            .interceptors
+            .begin_worker_preflight(
+                headers,
+                Some(&req.namespace),
+                Action::PollActivityTaskQueue,
+                true,
+            )
+            .await?;
+        self.interceptors
+            .authorize_worker_target(
+                &context,
+                Action::PollActivityTaskQueue,
+                crate::interceptors::normalize_worker_poll_target(
+                    &req.task_queue,
+                    req.normal_task_queue.as_deref(),
+                    req.is_sticky,
+                    req.scoped_versioned,
+                    req.deployment.as_ref().map(|value| value.0.as_str()),
+                    req.build_id.as_ref().map(|value| value.0.as_str()),
+                    tokeira_types::WorkerTaskClass::Activity,
+                ),
+            )
+            .await?;
+        validate_versioned_sticky_normal_name_after_auth(
+            req.is_sticky,
+            req.normal_task_queue.as_deref(),
+            req.versioning_metadata_present,
+        )?;
+        validate_complete_modern_poll_version(
+            req.scoped_versioned,
+            req.deployment.as_ref().map(|value| value.0.as_str()),
+            req.build_id.as_ref().map(|value| value.0.as_str()),
+        )?;
+        self.record_scoped_worker_poll_session(
+            &context,
+            Action::PollActivityTaskQueue,
+            &req.namespace,
+            &req.worker_instance_key,
+            &req.worker_identity,
+            &req.task_queue,
+            req.normal_task_queue.as_deref(),
+            req.is_sticky,
+            Some(&req.worker_control_task_queue),
+        )?;
+        Ok(context)
+    }
+
+    pub(crate) async fn poll_activity_task_queue_admitted(
+        &self,
+        headers: &HeaderMap,
+        req: PollActivityTaskQueueRequest,
+        context: EdgeContext,
+    ) -> EdgeResult<Option<PollActivityTaskQueueResponse>> {
+        self.poll_activity_task_queue_inner(headers, req, Some(context))
+            .await
+    }
+
+    async fn poll_activity_task_queue_inner(
+        &self,
+        headers: &HeaderMap,
+        req: PollActivityTaskQueueRequest,
+        admitted: Option<EdgeContext>,
+    ) -> EdgeResult<Option<PollActivityTaskQueueResponse>> {
         let namespace_label = req.namespace.clone();
         self.observe_edge_call(
             headers,
@@ -5953,15 +6719,10 @@ impl WorkflowService {
             Some(namespace_label.as_str()),
             None,
             async move {
-                let ctx = self
-                    .interceptors
-                    .begin(
-                        headers,
-                        Some(&req.namespace),
-                        Action::PollActivityTaskQueue,
-                        true,
-                    )
-                    .await?;
+                let ctx = match admitted {
+                    Some(context) => context,
+                    None => self.admit_activity_task_queue_poll(headers, &req).await?,
+                };
                 let namespace_id = resolved_namespace_id(&ctx, &req.namespace)?;
                 let workflow_namespace = ctx
                     .namespace
@@ -6066,12 +6827,22 @@ impl WorkflowService {
                 match started {
                     Some(started) => {
                         let mut response = from_internal::poll_activity_response(
-                            started,
+                            started.clone(),
                             namespace_id,
                             &workflow_namespace,
                         )
                         .map_err(EdgeError::from)?;
                         response.poller_scaling_decision = scaling_decision;
+                        if is_scoped_worker(&ctx) {
+                            self.register_scoped_task_provenance(
+                                &ctx,
+                                Action::PollActivityTaskQueue,
+                                &response.task_token,
+                                &started.origin,
+                                activity_task_deadline(&started)?,
+                            )
+                            .await?;
+                        }
                         Ok(Some(response))
                     }
                     None => Ok(None),
@@ -6092,7 +6863,7 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let (token, token_namespace_id, ctx, effective_namespace) = self
+                let (token, token_namespace_id, ctx, effective_namespace, provenance) = self
                     .admit_json_task_token::<ActivityTaskToken>(
                         headers,
                         &req.namespace,
@@ -6118,6 +6889,11 @@ impl WorkflowService {
                     )
                     .await
                     .map_err(EdgeError::from)?;
+                self.delete_consumed_task_provenance(
+                    provenance,
+                    Action::RespondActivityTaskCompleted,
+                )
+                .await;
                 self.notify_history_run_key(
                     token.run_key,
                     read_last_event_id(self.repo.as_ref(), token.run_key).await?,
@@ -6141,7 +6917,7 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let (token, token_namespace_id, ctx, effective_namespace) = self
+                let (token, token_namespace_id, ctx, effective_namespace, provenance) = self
                     .admit_json_task_token::<ActivityTaskToken>(
                         headers,
                         &req.namespace,
@@ -6168,6 +6944,8 @@ impl WorkflowService {
                     )
                     .await
                     .map_err(EdgeError::from)?;
+                self.delete_consumed_task_provenance(provenance, Action::RespondActivityTaskFailed)
+                    .await;
                 self.notify_history_run_key(
                     token.run_key,
                     read_last_event_id(self.repo.as_ref(), token.run_key).await?,
@@ -6199,7 +6977,7 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let (token, token_namespace_id, ctx, effective_namespace) = self
+                let (token, token_namespace_id, ctx, effective_namespace, provenance) = self
                     .admit_json_task_token::<tokeira_types::WorkflowTaskToken>(
                         headers,
                         &namespace,
@@ -6233,6 +7011,8 @@ impl WorkflowService {
                     )
                     .await
                     .map_err(EdgeError::from)?;
+                self.delete_consumed_task_provenance(provenance, Action::RespondWorkflowTaskFailed)
+                    .await;
                 self.notify_history_run_key(
                     run_key,
                     read_last_event_id(self.repo.as_ref(), run_key).await?,
@@ -6256,7 +7036,7 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let (token, token_namespace_id, _ctx, effective_namespace) = self
+                let (token, token_namespace_id, _ctx, effective_namespace, _provenance) = self
                     .admit_json_task_token::<ActivityTaskToken>(
                         headers,
                         &req.namespace,
@@ -6302,7 +7082,7 @@ impl WorkflowService {
             None,
             None,
             async move {
-                let (token, token_namespace_id, ctx, effective_namespace) = self
+                let (token, token_namespace_id, ctx, effective_namespace, provenance) = self
                     .admit_json_task_token::<ActivityTaskToken>(
                         headers,
                         &req.namespace,
@@ -6328,6 +7108,11 @@ impl WorkflowService {
                     )
                     .await
                     .map_err(EdgeError::from)?;
+                self.delete_consumed_task_provenance(
+                    provenance,
+                    Action::RespondActivityTaskCanceled,
+                )
+                .await;
                 self.notify_history_run_key(token.run_key, outcome.last_event_id)
                     .await;
 
@@ -6354,7 +7139,7 @@ impl WorkflowService {
                     .begin(
                         headers,
                         Some(&req.namespace),
-                        Action::RecordActivityTaskHeartbeat,
+                        Action::RecordActivityTaskHeartbeatById,
                         false,
                     )
                     .await?;
@@ -6431,7 +7216,7 @@ impl WorkflowService {
                     .begin(
                         headers,
                         Some(&req.namespace),
-                        Action::RespondActivityTaskCompleted,
+                        Action::RespondActivityTaskCompletedById,
                         false,
                     )
                     .await?;
@@ -6511,7 +7296,7 @@ impl WorkflowService {
                     .begin(
                         headers,
                         Some(&req.namespace),
-                        Action::RespondActivityTaskFailed,
+                        Action::RespondActivityTaskFailedById,
                         false,
                     )
                     .await?;
@@ -6571,7 +7356,7 @@ impl WorkflowService {
                     .begin(
                         headers,
                         Some(&req.namespace),
-                        Action::RespondActivityTaskCanceled,
+                        Action::RespondActivityTaskCanceledById,
                         false,
                     )
                     .await?;
@@ -7871,6 +8656,200 @@ fn resolved_namespace_id(
     }
 }
 
+fn scoped_worker_denied() -> EdgeError {
+    EdgeError::PermissionDenied {
+        message: "Request unauthorized.".to_owned(),
+        reason: None,
+    }
+}
+
+fn is_scoped_worker(context: &EdgeContext) -> bool {
+    context
+        .claims
+        .as_ref()
+        .is_some_and(|claims| claims.worker_scope.is_some())
+}
+
+fn scoped_worker_allows_task_origin(
+    context: &EdgeContext,
+    action: Action,
+    origin: &tokeira_types::WorkerTaskOrigin,
+) -> bool {
+    let Some(scope) = context
+        .claims
+        .as_ref()
+        .and_then(|claims| claims.worker_scope.as_ref())
+    else {
+        return true;
+    };
+    let Some(namespace) = context.namespace.as_ref() else {
+        return false;
+    };
+    let Some(operation) = action.worker_operation() else {
+        return false;
+    };
+    matches!(
+        scope.authorize(
+            operation,
+            &namespace.name,
+            tokeira_auth::WorkerTarget::VersionedTask {
+                normal_task_queue: &origin.normal_task_queue.0,
+                task_class: origin.task_class,
+                deployment_name: &origin.deployment.0,
+                build_id: &origin.build_id.0,
+            },
+        ),
+        tokeira_auth::WorkerScopeDecision::Allow
+    )
+}
+
+fn scoped_worker_allows_completion_targets(
+    context: &EdgeContext,
+    cross_namespace_targets: &[(String, Action)],
+) -> bool {
+    !is_scoped_worker(context) || cross_namespace_targets.is_empty()
+}
+
+fn optional_task_provenance_error_kind(error: &EdgeError) -> &'static str {
+    match error {
+        EdgeError::ServiceUnavailable(_) => "unavailable",
+        EdgeError::Internal(_) => "internal",
+        EdgeError::PermissionDenied { .. } => "denied",
+        _ => "other",
+    }
+}
+
+fn activity_task_deadline(started: &StartedActivityTask) -> EdgeResult<OffsetDateTime> {
+    let schedule_to_close = started
+        .schedule_to_close_timeout
+        .map(|timeout| {
+            started.scheduled_time.checked_add(timeout).ok_or_else(|| {
+                EdgeError::Internal(
+                    "Activity schedule-to-close deadline exceeds the supported time range."
+                        .to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    let start_to_close = started
+        .start_to_close_timeout
+        .map(|timeout| {
+            started.started_time.checked_add(timeout).ok_or_else(|| {
+                EdgeError::Internal(
+                    "Activity start-to-close deadline exceeds the supported time range.".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    schedule_to_close
+        .into_iter()
+        .chain(start_to_close)
+        .min()
+        .ok_or_else(|| {
+            EdgeError::Internal(
+                "Scoped Activity Task has no server-authored completion deadline.".to_owned(),
+            )
+        })
+}
+
+fn nexus_operation_deadline(pending: &PendingNexusOperation) -> EdgeResult<OffsetDateTime> {
+    let mut deadlines = Vec::with_capacity(2);
+    if let Some(timeout) = pending.schedule_to_close_timeout {
+        deadlines.push(pending.scheduled_at.checked_add(timeout).ok_or_else(|| {
+            EdgeError::Internal(
+                "Nexus schedule-to-close deadline exceeds the supported time range.".to_owned(),
+            )
+        })?);
+    }
+    if !pending.started {
+        if let Some(timeout) = pending.schedule_to_start_timeout {
+            deadlines.push(pending.scheduled_at.checked_add(timeout).ok_or_else(|| {
+                EdgeError::Internal(
+                    "Nexus schedule-to-start deadline exceeds the supported time range.".to_owned(),
+                )
+            })?);
+        }
+    } else if let (Some(started_at), Some(timeout)) =
+        (pending.started_at, pending.start_to_close_timeout)
+    {
+        deadlines.push(started_at.checked_add(timeout).ok_or_else(|| {
+            EdgeError::Internal(
+                "Nexus start-to-close deadline exceeds the supported time range.".to_owned(),
+            )
+        })?);
+    }
+    deadlines.into_iter().min().ok_or_else(|| {
+        EdgeError::Internal(
+            "Scoped Nexus Task has no server-authored dispatch deadline.".to_owned(),
+        )
+    })
+}
+
+fn worker_task_provenance_write_error(error: WorkerTaskProvenanceError) -> EdgeError {
+    match error {
+        WorkerTaskProvenanceError::Unavailable { .. } => EdgeError::ServiceUnavailable(
+            "Worker task authorization evidence could not be recorded.".to_owned(),
+        ),
+        WorkerTaskProvenanceError::DigestConflict | WorkerTaskProvenanceError::Corrupt { .. } => {
+            EdgeError::Internal("Worker task authorization evidence is inconsistent.".to_owned())
+        }
+    }
+}
+
+fn worker_task_provenance_read_error(error: WorkerTaskProvenanceError) -> EdgeError {
+    match error {
+        WorkerTaskProvenanceError::Unavailable { .. } => EdgeError::ServiceUnavailable(
+            "Worker task authorization evidence could not be loaded.".to_owned(),
+        ),
+        WorkerTaskProvenanceError::DigestConflict | WorkerTaskProvenanceError::Corrupt { .. } => {
+            EdgeError::Internal("Worker task authorization evidence is inconsistent.".to_owned())
+        }
+    }
+}
+
+fn worker_task_provenance_error_kind(error: &WorkerTaskProvenanceError) -> &'static str {
+    match error {
+        WorkerTaskProvenanceError::Unavailable { .. } => "unavailable",
+        WorkerTaskProvenanceError::DigestConflict => "digest_conflict",
+        WorkerTaskProvenanceError::Corrupt { .. } => "corrupt",
+    }
+}
+
+fn validate_complete_modern_poll_version(
+    scoped_versioned: bool,
+    deployment_name: Option<&str>,
+    build_id: Option<&str>,
+) -> EdgeResult<()> {
+    if scoped_versioned
+        && (deployment_name.is_none_or(str::is_empty) || build_id.is_none_or(str::is_empty))
+    {
+        return Err(EdgeError::BadRequest(
+            "deployment_options must set deployment_name and build_id in VERSIONED mode".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_versioned_sticky_normal_name_after_auth(
+    is_sticky: bool,
+    normal_task_queue: Option<&str>,
+    versioning_metadata_present: bool,
+) -> EdgeResult<()> {
+    if is_sticky && versioning_metadata_present && normal_task_queue.is_none_or(str::is_empty) {
+        // v1.31.0 rejects before poll admission because a versioned sticky
+        // queue cannot be redirected through its normal family
+        // (`WorkflowHandler.validateVersioningInfo`,
+        // workflow_handler.go:6356-6375 @ v1.31.0). Tokeira stages this after
+        // auth so a scoped credential cannot use validation as a resource
+        // oracle; ordinary callers retain the same external error.
+        return Err(EdgeError::BadRequest(
+            "NormalName must be set on sticky queue when UseVersioning is true or DeploymentOptions are set."
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Render v1.31.0's `WorkflowExecutionAlreadyStarted` message for a start
 /// rejected by the workflow-id conflict/reuse policy — the corpus asserts the
 /// policy suffixes verbatim (`workflow_id_dedup.go:95-129 @ v1.31.0`).
@@ -8657,6 +9636,7 @@ mod tests {
         activity_offer_requires_rule_evaluation, apply_matrix_capability_field,
         build_update_activity_options_command, collect_eager_activity_specs,
         cross_namespace_authorization_targets, resolve_build_id_reset_point,
+        scoped_worker_allows_completion_targets, scoped_worker_allows_task_origin,
         system_capabilities_with_matrix_overlay, worker_identity_from_request,
         workflow_rule_crud_admitted,
     };
@@ -8674,17 +9654,20 @@ mod tests {
         UpdateLifecycleStage, UpdateWaitPolicy, WorkerRegistrationKey,
         WorkflowTimeoutScannerConfig,
     };
-    use tokeira_storage::{CommitResult, InMemoryStore, RunRepository};
+    use tokeira_storage::{
+        CommitResult, InMemoryStore, ProvenancePut, RunRepository, WorkerTaskProvenance,
+        WorkerTaskProvenanceError, WorkerTaskProvenanceStore, worker_task_token_digest,
+    };
     use tokeira_types::{
         BuildId, DeploymentId, ExecutionRef, Memo, NamespaceId, Payload, Payloads, RequestContext,
         RequestId, RunId, RunKey, SearchAttributes, TaskKind, TaskQueueName, WorkerIdentity,
-        WorkflowId, WorkflowType,
+        WorkerTaskClass, WorkerTaskOrigin, WorkflowId, WorkflowType,
     };
 
     use crate::{
         errors::EdgeError,
         grpc::runtime_adapter::RuntimeAdapter,
-        interceptors::{Action, EdgeContext},
+        interceptors::{Action, EdgeContext, EdgeInterceptors, PolicyAuthenticator},
         long_poll::{LongPollConfig, LongPollGate},
         namespace_cache::{InMemoryNamespaceCache, NamespaceCache, ResolvedNamespace},
         operator_service::InMemoryOperatorApi,
@@ -8692,10 +9675,13 @@ mod tests {
         routing::LocalOnlyRouter,
         to_internal::namespace_id_for,
         translate::{
-            ActivityOptions, Priority, SignalWorkflowExecutionRequest, SystemCapabilities,
-            UpdateActivityOptionsRequest, UpdateWaitPolicyDto, UpdateWorkflowExecutionRequest,
+            ActivityOptions, PollWorkflowTaskQueueRequest, Priority,
+            RespondWorkflowTaskCompletedRequest, SignalWorkflowExecutionRequest,
+            SystemCapabilities, UpdateActivityOptionsRequest, UpdateWaitPolicyDto,
+            UpdateWorkflowExecutionRequest,
         },
     };
+    use tokeira_auth::{AuthError, ClaimMapper, Claims, DefaultAuthorizer, WorkerScope};
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
@@ -8919,6 +9905,126 @@ mod tests {
         }
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        // Feature: scoped-worker-authorization, Property 7: Exact-token origin binding
+        #[test]
+        fn property_exact_token_origin_binding(
+            token in prop::collection::vec(any::<u8>(), 1..64),
+            byte_index in any::<usize>(),
+            coordinate in 0u8..5,
+        ) {
+            let scope = WorkerScope::try_new(
+                "payments".to_owned(),
+                vec!["payments-worker".to_owned()],
+                "payments".to_owned(),
+                "build-a".to_owned(),
+            )
+            .expect("scope");
+            let context = scoped_edge_context(scope);
+            let expected_namespace_id = namespace_id_for("payments");
+            let origin = WorkerTaskOrigin {
+                namespace_id: expected_namespace_id,
+                normal_task_queue: TaskQueueName("payments-worker".to_owned()),
+                task_class: WorkerTaskClass::Activity,
+                deployment: DeploymentId("payments".to_owned()),
+                build_id: BuildId("build-a".to_owned()),
+            };
+
+            prop_assert!(scoped_worker_allows_task_origin(
+                &context,
+                Action::PollActivityTaskQueue,
+                &origin,
+            ));
+
+            let mut changed_token = token.clone();
+            let changed_index = byte_index % changed_token.len();
+            changed_token[changed_index] ^= 1;
+            prop_assert_ne!(
+                tokeira_storage::worker_task_token_digest(&token),
+                tokeira_storage::worker_task_token_digest(&changed_token),
+            );
+
+            let mut changed_origin = origin.clone();
+            match coordinate {
+                0 => changed_origin.namespace_id = NamespaceId(uuid::Uuid::nil()),
+                1 => {
+                    changed_origin.normal_task_queue =
+                        TaskQueueName("other-worker".to_owned());
+                }
+                2 => changed_origin.task_class = WorkerTaskClass::Workflow,
+                3 => changed_origin.deployment = DeploymentId("other".to_owned()),
+                _ => changed_origin.build_id = BuildId("other".to_owned()),
+            }
+            let admitted = changed_origin.namespace_id == expected_namespace_id
+                && scoped_worker_allows_task_origin(
+                    &context,
+                    Action::PollActivityTaskQueue,
+                    &changed_origin,
+                );
+            prop_assert!(!admitted);
+        }
+
+        // Feature: scoped-worker-authorization, Property 10: Workflow-completion return filtering
+        #[test]
+        fn property_workflow_completion_return_filtering(
+            cross_namespace in any::<bool>(),
+            in_scope in any::<bool>(),
+            workflow_task in any::<bool>(),
+        ) {
+            let scope = WorkerScope::try_new(
+                "payments".to_owned(),
+                vec!["payments-worker".to_owned()],
+                "payments".to_owned(),
+                "build-a".to_owned(),
+            )
+            .expect("scope");
+            let context = scoped_edge_context(scope);
+            let targets = if cross_namespace {
+                vec![("other".to_owned(), Action::StartWorkflowExecution)]
+            } else {
+                Vec::new()
+            };
+            prop_assert_eq!(
+                scoped_worker_allows_completion_targets(&context, &targets),
+                !cross_namespace,
+            );
+
+            let (task_class, action) = if workflow_task {
+                (WorkerTaskClass::Workflow, Action::PollWorkflowTaskQueue)
+            } else {
+                (WorkerTaskClass::Activity, Action::PollActivityTaskQueue)
+            };
+            let origin = WorkerTaskOrigin {
+                namespace_id: namespace_id_for("payments"),
+                normal_task_queue: TaskQueueName(if in_scope {
+                    "payments-worker".to_owned()
+                } else {
+                    "other-worker".to_owned()
+                }),
+                task_class,
+                deployment: DeploymentId("payments".to_owned()),
+                build_id: BuildId("build-a".to_owned()),
+            };
+            prop_assert_eq!(
+                scoped_worker_allows_task_origin(&context, action, &origin),
+                in_scope,
+            );
+
+            let ordinary = test_edge_context();
+            prop_assert!(scoped_worker_allows_completion_targets(
+                &ordinary,
+                &targets,
+            ));
+            prop_assert!(scoped_worker_allows_task_origin(
+                &ordinary,
+                action,
+                &origin,
+            ));
+        }
+    }
+
     fn arb_workflow_command() -> impl Strategy<Value = WorkflowCommand> {
         prop_oneof![
             (arb_small_string(), arb_small_string(), any::<bool>(),).prop_map(
@@ -8975,8 +10081,76 @@ mod tests {
         }
     }
 
+    fn scoped_edge_context(scope: WorkerScope) -> EdgeContext {
+        EdgeContext {
+            request_id: crate::request_id::RequestId::new("scoped-edge-request"),
+            claims: Some(Claims {
+                subject: "worker-subject".to_owned(),
+                worker_scope: Some(scope),
+                ..Claims::default()
+            }),
+            auth_principal: None,
+            namespace: Some(ResolvedNamespace::active("payments")),
+            received_at: time::OffsetDateTime::UNIX_EPOCH,
+            is_long_poll: false,
+        }
+    }
+
     #[derive(Default)]
     struct NoopResolver;
+
+    struct StaticScopedMapper;
+
+    #[async_trait]
+    impl ClaimMapper for StaticScopedMapper {
+        async fn get_claims(&self, _token: &str, _extra: &str) -> Result<Claims, AuthError> {
+            Ok(Claims {
+                subject: "worker-subject".to_owned(),
+                auth_type: "fixture".to_owned(),
+                worker_scope: Some(payments_worker_scope()),
+                ..Claims::default()
+            })
+        }
+    }
+
+    struct UnavailableProvenanceStore;
+
+    #[async_trait]
+    impl WorkerTaskProvenanceStore for UnavailableProvenanceStore {
+        async fn put(
+            &self,
+            _record: WorkerTaskProvenance,
+        ) -> Result<ProvenancePut, WorkerTaskProvenanceError> {
+            Err(WorkerTaskProvenanceError::Unavailable {
+                message: "fixture unavailable".to_owned(),
+            })
+        }
+
+        async fn get(
+            &self,
+            _token_digest: [u8; 32],
+        ) -> Result<Option<WorkerTaskProvenance>, WorkerTaskProvenanceError> {
+            Err(WorkerTaskProvenanceError::Unavailable {
+                message: "fixture unavailable".to_owned(),
+            })
+        }
+
+        async fn delete(&self, _token_digest: [u8; 32]) -> Result<(), WorkerTaskProvenanceError> {
+            Err(WorkerTaskProvenanceError::Unavailable {
+                message: "fixture unavailable".to_owned(),
+            })
+        }
+
+        async fn delete_expired(
+            &self,
+            _now: OffsetDateTime,
+            _limit: usize,
+        ) -> Result<usize, WorkerTaskProvenanceError> {
+            Err(WorkerTaskProvenanceError::Unavailable {
+                message: "fixture unavailable".to_owned(),
+            })
+        }
+    }
 
     #[async_trait]
     impl ExecutionResolver for NoopResolver {
@@ -9016,6 +10190,7 @@ mod tests {
         ));
         let cache = Arc::new(InMemoryNamespaceCache::new());
         cache.insert(ResolvedNamespace::active("default")).await?;
+        cache.insert(ResolvedNamespace::active("payments")).await?;
         let service = WorkflowService::new(
             Arc::new(RuntimeAdapter::new(runtime.clone())),
             Arc::new(NoopResolver),
@@ -9094,6 +10269,491 @@ mod tests {
         assert!(matches!(result, CommitResult::Applied { .. }));
 
         Ok((service, runtime, namespace_id, workflow_id, run_id))
+    }
+
+    fn scoped_activity_origin() -> WorkerTaskOrigin {
+        WorkerTaskOrigin {
+            namespace_id: namespace_id_for("payments"),
+            normal_task_queue: TaskQueueName("payments-worker".to_owned()),
+            task_class: WorkerTaskClass::Activity,
+            deployment: DeploymentId("payments".to_owned()),
+            build_id: BuildId("build-a".to_owned()),
+        }
+    }
+
+    fn payments_worker_scope() -> WorkerScope {
+        WorkerScope::try_new(
+            "payments".to_owned(),
+            vec!["payments-worker".to_owned()],
+            "payments".to_owned(),
+            "build-a".to_owned(),
+        )
+        .expect("scope")
+    }
+
+    async fn start_scoped_test_workflow(
+        runtime: &TokeiraRuntime<InMemoryStore>,
+        workflow_id: &str,
+        workflow_task_timeout: Duration,
+    ) -> Result<(RunKey, RunId, tokeira_types::QueueKey)> {
+        let namespace_id = namespace_id_for("payments");
+        let run_id = RunId::new();
+        let run_key = RunKey::new();
+        let queue = tokeira_types::QueueKey {
+            namespace_id,
+            task_queue: TaskQueueName("payments-worker".to_owned()),
+            task_kind: TaskKind::Workflow,
+            deployment: Some(DeploymentId("payments".to_owned())),
+            build_id: Some(BuildId("build-a".to_owned())),
+        };
+        let start = runtime
+            .start_workflow(StartRequest {
+                initiator: None,
+                run_key,
+                namespace_id,
+                workflow_id: WorkflowId(workflow_id.to_owned()),
+                run_id,
+                workflow_type: WorkflowType("workflow-type".to_owned()),
+                task_queue: queue.task_queue.clone(),
+                deployment: queue.deployment.clone(),
+                build_id: queue.build_id.clone(),
+                versioning_override: None,
+                workflow_start_delay: None,
+                client_cron_schedule: None,
+                completion_callbacks: Vec::new(),
+                user_metadata: None,
+                links: Vec::new(),
+                on_conflict_options: None,
+                priority: None,
+                input: Payloads::default(),
+                header: None,
+                memo: Memo::default(),
+                search_attributes: SearchAttributes::default(),
+                workflow_execution_timeout: None,
+                workflow_run_timeout: None,
+                workflow_task_timeout,
+                retry_policy: None,
+                conflict_policy: tokeira_kernel::WorkflowIdConflictPolicy::Fail,
+                reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+                continued_execution_run_id: None,
+                attempt: 1,
+                first_execution_run_id: Some(run_id),
+                first_run_started_at: None,
+                parent_run_key: None,
+                parent_workflow_id: None,
+                parent_run_id: None,
+                parent_namespace_id: None,
+                parent_namespace_name: None,
+                parent_initiated_event_id: 0,
+                root_workflow_id: None,
+                root_run_id: None,
+                original_execution_run_id: Some(run_id),
+                continued_failure: None,
+                last_completion_result: None,
+                request: RequestContext {
+                    request_id: RequestId(workflow_id.to_owned()),
+                    caller_identity: None,
+                    principal: None,
+                    received_at: OffsetDateTime::now_utc(),
+                },
+                now: OffsetDateTime::now_utc(),
+                cron_schedule: None,
+                reserved_poller_identity: None,
+                eager_execution_accepted: false,
+                inherited_versioning_info: None,
+            })
+            .await?;
+        assert!(matches!(start, CommitResult::Applied { .. }));
+        Ok((run_key, run_id, queue))
+    }
+
+    fn configure_scoped_test_auth(service: &mut WorkflowService) {
+        service.interceptors = Arc::new(EdgeInterceptors::configured(
+            service.namespaces.clone(),
+            Arc::new(PolicyAuthenticator::new(
+                Arc::new(StaticScopedMapper),
+                Arc::new(DefaultAuthorizer),
+                false,
+            )),
+            false,
+        ));
+    }
+
+    fn scoped_workflow_completion(
+        task_token: Vec<u8>,
+        commands: Vec<WorkflowCommand>,
+    ) -> RespondWorkflowTaskCompletedRequest {
+        RespondWorkflowTaskCompletedRequest {
+            namespace: "payments".to_owned(),
+            task_token,
+            identity: "worker-a".to_owned(),
+            client_discards_speculative_with_events: false,
+            sdk_metadata: None,
+            metering_metadata: None,
+            worker_version: None,
+            versioning_behavior: tokeira_kernel::state::VersioningBehavior::Unspecified,
+            deployment_version: None,
+            worker_deployment_name: None,
+            sticky: None,
+            resource_id: String::new(),
+            worker_instance_key: "worker-instance-a".to_owned(),
+            worker_control_task_queue: "worker-control-a".to_owned(),
+            commands,
+            return_new_workflow_task: false,
+            force_create_new_workflow_task: false,
+            query_results: std::collections::HashMap::new(),
+            messages: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_provenance_failures_map_before_task_exposure_or_runtime_use() -> Result<()> {
+        let (service, _runtime, _namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        let service = service.with_worker_task_provenance(Arc::new(UnavailableProvenanceStore));
+        let context = scoped_edge_context(payments_worker_scope());
+        let token = b"unexposed-task-token";
+        let origin = scoped_activity_origin();
+
+        let insert_error = service
+            .register_scoped_task_provenance(
+                &context,
+                Action::PollActivityTaskQueue,
+                token,
+                &origin,
+                OffsetDateTime::now_utc() + Duration::minutes(1),
+            )
+            .await
+            .expect_err("unavailable insert must withhold");
+        assert!(matches!(insert_error, EdgeError::ServiceUnavailable(_)));
+
+        let lookup_error = service
+            .authorize_scoped_task_token(&context, Action::RespondActivityTaskCompleted, token)
+            .await
+            .expect_err("unavailable lookup must deny before runtime");
+        assert!(matches!(lookup_error, EdgeError::ServiceUnavailable(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withheld_workflow_token_recovers_through_authoritative_task_timeout() -> Result<()> {
+        let (service, runtime, _namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        let service = service.with_worker_task_provenance(Arc::new(UnavailableProvenanceStore));
+        let (run_key, _run_id, queue) =
+            start_scoped_test_workflow(&runtime, "withheld-token-recovery", Duration::ZERO).await?;
+        let namespace_id = queue.namespace_id;
+
+        let first = runtime
+            .poll_workflow_task(
+                queue.clone(),
+                WorkerIdentity("worker-a".to_owned()),
+                tokio::time::Duration::from_secs(1),
+            )
+            .await?
+            .expect("initial task");
+        let token = crate::task_token::encode(first.token.clone(), namespace_id)?;
+        let evidence_error = service
+            .register_scoped_task_provenance(
+                &scoped_edge_context(payments_worker_scope()),
+                Action::PollWorkflowTaskQueue,
+                &token,
+                &first.origin,
+                first.started_time + first.workflow_task_timeout,
+            )
+            .await
+            .expect_err("failed evidence insertion must withhold the token");
+        assert!(matches!(evidence_error, EdgeError::ServiceUnavailable(_)));
+
+        let recovered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(3),
+            runtime.poll_workflow_task(
+                queue,
+                WorkerIdentity("worker-b".to_owned()),
+                tokio::time::Duration::from_secs(3),
+            ),
+        )
+        .await
+        .expect("the timeout scanner should redispatch the withheld task")?
+        .expect("redispatched task");
+        assert_eq!(recovered.run_key, run_key);
+        assert!(recovered.token.attempt > first.token.attempt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_completion_rejects_cross_namespace_atomically_and_preserves_optional_work()
+    -> Result<()> {
+        let (mut service, runtime, _namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        configure_scoped_test_auth(&mut service);
+        let (run_key, _run_id, workflow_queue) = start_scoped_test_workflow(
+            &runtime,
+            "scoped-completion-boundaries",
+            Duration::seconds(10),
+        )
+        .await?;
+        let poll = service
+            .poll_workflow_task_queue(
+                &HeaderMap::new(),
+                PollWorkflowTaskQueueRequest {
+                    namespace: "payments".to_owned(),
+                    task_queue: workflow_queue.task_queue.0.clone(),
+                    normal_task_queue: None,
+                    is_sticky: false,
+                    worker_identity: "worker-a".to_owned(),
+                    worker_instance_key: "worker-instance-a".to_owned(),
+                    worker_control_task_queue: "worker-control-a".to_owned(),
+                    scoped_versioned: true,
+                    versioning_metadata_present: true,
+                    deployment: workflow_queue.deployment.clone(),
+                    build_id: workflow_queue.build_id.clone(),
+                    sticky_run: None,
+                    timeout: std::time::Duration::from_secs(1),
+                    sticky_ttl: std::time::Duration::from_secs(10),
+                },
+            )
+            .await?
+            .expect("scoped Workflow Task");
+        let tokeira_kernel::LoadedRun::Existing(before) = runtime.repo().load_run(run_key).await?
+        else {
+            anyhow::bail!("scoped Workflow run disappeared before completion");
+        };
+
+        let cross_namespace = WorkflowCommand::StartChildWorkflow {
+            child_workflow_id: WorkflowId("cross-namespace-child".to_owned()),
+            namespace_id: namespace_id_for("other"),
+            namespace: Some("other".to_owned()),
+            workflow_type: WorkflowType("child-type".to_owned()),
+            task_queue: TaskQueueName("other-queue".to_owned()),
+            input: Payloads::default(),
+            header: None,
+            memo: Memo::default(),
+            search_attributes: SearchAttributes::default(),
+            workflow_execution_timeout: None,
+            workflow_run_timeout: None,
+            workflow_task_timeout: Duration::seconds(10),
+            retry_policy: None,
+            cron_schedule: None,
+            parent_close_policy: ParentClosePolicy::Terminate,
+            reuse_policy: tokeira_kernel::WorkflowIdReusePolicy::AllowDuplicate,
+            priority: None,
+        };
+        let denied = service
+            .respond_workflow_task_completed(
+                &HeaderMap::new(),
+                scoped_workflow_completion(poll.task_token.clone(), vec![cross_namespace]),
+            )
+            .await
+            .expect_err("cross-namespace command must reject the whole completion");
+        assert!(matches!(denied, EdgeError::PermissionDenied { .. }));
+        let tokeira_kernel::LoadedRun::Existing(after_denial) =
+            runtime.repo().load_run(run_key).await?
+        else {
+            anyhow::bail!("scoped Workflow run disappeared after denied completion");
+        };
+        assert_eq!(after_denial.transition_seq, before.transition_seq);
+        assert_eq!(after_denial.last_event_id, before.last_event_id);
+        assert_eq!(
+            after_denial.pending_workflow_task,
+            before.pending_workflow_task
+        );
+
+        let activity_queue = tokeira_types::QueueKey {
+            namespace_id: workflow_queue.namespace_id,
+            task_queue: TaskQueueName("other-worker".to_owned()),
+            task_kind: TaskKind::Activity,
+            deployment: workflow_queue.deployment.clone(),
+            build_id: workflow_queue.build_id.clone(),
+        };
+        let same_namespace = WorkflowCommand::ScheduleActivity {
+            activity_id: "activity-a".to_owned(),
+            activity_type: "activity-type".to_owned(),
+            task_queue: activity_queue.task_queue.clone(),
+            input: Payloads::default(),
+            header: None,
+            request_eager_execution: true,
+            retry_policy: None,
+            deployment: activity_queue.deployment.clone(),
+            build_id: activity_queue.build_id.clone(),
+            schedule_to_close_timeout: Some(Duration::seconds(30)),
+            schedule_to_start_timeout: None,
+            start_to_close_timeout: Some(Duration::seconds(10)),
+            heartbeat_timeout: None,
+            priority: None,
+        };
+        let completed = service
+            .respond_workflow_task_completed(
+                &HeaderMap::new(),
+                scoped_workflow_completion(poll.task_token, vec![same_namespace]),
+            )
+            .await?;
+        assert!(
+            completed.activity_tasks.is_empty(),
+            "an out-of-scope eager return must be withheld"
+        );
+
+        let tokeira_kernel::LoadedRun::Existing(after_completion) =
+            runtime.repo().load_run(run_key).await?
+        else {
+            anyhow::bail!("scoped Workflow run disappeared after completion");
+        };
+        let activity = after_completion
+            .activities
+            .get("activity-a")
+            .expect("same-namespace command must durably schedule the Activity");
+        assert_eq!(activity.task_queue, activity_queue.task_queue);
+        assert_eq!(activity.deployment, activity_queue.deployment);
+        assert_eq!(activity.build_id, activity_queue.build_id);
+        assert!(
+            activity.started_at.is_none(),
+            "withholding an optional return must not claim the durable Activity"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_provenance_requires_a_nonexpired_exact_record() -> Result<()> {
+        let (service, _runtime, _namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        let store = Arc::new(InMemoryStore::default());
+        let service = service.with_worker_task_provenance(store.clone());
+        let context = scoped_edge_context(payments_worker_scope());
+        let origin = scoped_activity_origin();
+
+        let missing = service
+            .authorize_scoped_task_token(&context, Action::RespondActivityTaskCompleted, b"missing")
+            .await
+            .expect_err("missing provenance");
+        assert!(matches!(missing, EdgeError::PermissionDenied { .. }));
+
+        let expired_token = b"expired";
+        store
+            .put(WorkerTaskProvenance {
+                token_digest: worker_task_token_digest(expired_token),
+                origin,
+                expires_at: OffsetDateTime::now_utc() - Duration::seconds(1),
+                created_at: OffsetDateTime::now_utc() - Duration::minutes(1),
+            })
+            .await
+            .expect("insert expired fixture");
+        let expired = service
+            .authorize_scoped_task_token(
+                &context,
+                Action::RespondActivityTaskCompleted,
+                expired_token,
+            )
+            .await
+            .expect_err("expired provenance");
+        assert!(matches!(expired, EdgeError::PermissionDenied { .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_provenance_survives_edge_reconstruction_and_deletes_only_at_terminal_use()
+    -> Result<()> {
+        let store = Arc::new(InMemoryStore::default());
+        let (first, _runtime, _namespace_id, _workflow_id, _run_id) = update_test_service().await?;
+        let first = first.with_worker_task_provenance(store.clone());
+        let context = scoped_edge_context(payments_worker_scope());
+        let token = b"reconstructed-edge-task";
+        let origin = scoped_activity_origin();
+        let expires_at = OffsetDateTime::now_utc() + Duration::minutes(1);
+
+        first
+            .register_scoped_task_provenance(
+                &context,
+                Action::PollActivityTaskQueue,
+                token,
+                &origin,
+                expires_at,
+            )
+            .await?;
+        let heartbeat_digest = first
+            .authorize_scoped_task_token(&context, Action::RecordActivityTaskHeartbeat, token)
+            .await?
+            .expect("scoped heartbeat should resolve provenance");
+        assert!(
+            store
+                .get(heartbeat_digest)
+                .await
+                .expect("retained heartbeat evidence")
+                .is_some(),
+            "a non-terminal heartbeat must retain task provenance"
+        );
+
+        let (reconstructed, _runtime, _namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        let reconstructed = reconstructed.with_worker_task_provenance(store.clone());
+        let terminal_digest = reconstructed
+            .authorize_scoped_task_token(&context, Action::RespondActivityTaskCompleted, token)
+            .await?
+            .expect("a reconstructed edge should use the shared durable evidence");
+        reconstructed
+            .delete_consumed_task_provenance(
+                Some(terminal_digest),
+                Action::RespondActivityTaskCompleted,
+            )
+            .await;
+        assert!(
+            store
+                .get(terminal_digest)
+                .await
+                .expect("terminal deletion lookup")
+                .is_none(),
+            "terminal task use must remove authorization evidence"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_provenance_conflict_is_internal_and_ordinary_identity_never_writes()
+    -> Result<()> {
+        let (service, _runtime, _namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        let store = Arc::new(InMemoryStore::default());
+        let service = service.with_worker_task_provenance(store.clone());
+        let context = scoped_edge_context(payments_worker_scope());
+        let token = b"conflicting-token";
+        let expires_at = OffsetDateTime::now_utc() + Duration::minutes(1);
+        let origin = scoped_activity_origin();
+        service
+            .register_scoped_task_provenance(
+                &context,
+                Action::PollActivityTaskQueue,
+                token,
+                &origin,
+                expires_at,
+            )
+            .await?;
+        let mut conflicting_origin = origin;
+        conflicting_origin.build_id = BuildId("other-build".to_owned());
+        let conflict = service
+            .register_scoped_task_provenance(
+                &context,
+                Action::PollActivityTaskQueue,
+                token,
+                &conflicting_origin,
+                expires_at,
+            )
+            .await
+            .expect_err("digest conflict");
+        assert!(matches!(conflict, EdgeError::Internal(_)));
+
+        let (ordinary_service, _runtime, _namespace_id, _workflow_id, _run_id) =
+            update_test_service().await?;
+        ordinary_service
+            .with_worker_task_provenance(Arc::new(UnavailableProvenanceStore))
+            .register_scoped_task_provenance(
+                &test_edge_context(),
+                Action::PollActivityTaskQueue,
+                b"ordinary-token",
+                &scoped_activity_origin(),
+                expires_at,
+            )
+            .await
+            .expect("ordinary identity bypasses provenance");
+        Ok(())
     }
 
     #[tokio::test]

@@ -68,6 +68,9 @@ pub struct EvictionReport {
 /// Failure returned by a heartbeat observation store.
 #[derive(Debug, Error)]
 pub enum HeartbeatStoreError {
+    /// A heartbeat batch was structurally invalid.
+    #[error("invalid heartbeat observation: {0}")]
+    Invalid(String),
     /// Store-specific backend failure.
     #[error("heartbeat store backend error: {0}")]
     Backend(String),
@@ -77,6 +80,12 @@ pub enum HeartbeatStoreError {
 pub trait HeartbeatStore: Send + Sync + 'static {
     /// Upsert a live observation or apply its status-specific lifecycle action.
     fn insert(&self, heartbeat: WorkerHeartbeat) -> Result<(), HeartbeatStoreError>;
+
+    /// Atomically apply a complete repeated-heartbeat request.
+    ///
+    /// Implementations validate the whole batch before mutation and make
+    /// either every observation or none visible.
+    fn insert_batch(&self, heartbeats: Vec<WorkerHeartbeat>) -> Result<(), HeartbeatStoreError>;
 
     /// Return the latest observation for an exact namespace and worker key.
     fn get_worker(

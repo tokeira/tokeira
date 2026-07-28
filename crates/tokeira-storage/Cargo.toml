@@ -18,7 +18,7 @@ metrics.workspace = true
 postcard = { version = "1.0", features = ["alloc"], optional = true }
 rand = { version = "0.8", optional = true }
 serde.workspace = true
-sha2 = { workspace = true, optional = true }
+sha2.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "time", "uuid"], optional = true }
 thiserror.workspace = true
 time.workspace = true
@@ -40,7 +40,6 @@ dsql = [
     "dep:aws-smithy-runtime-api",
     "dep:postcard",
     "dep:rand",
-    "dep:sha2",
     "dep:sqlx",
 ]
 dsql-integration = ["dsql"]

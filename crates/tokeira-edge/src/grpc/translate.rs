@@ -1307,27 +1307,6 @@ pub fn signal_request_to_edge(
 // v1.62-sync: reads deprecated `PollWorkflowTaskQueueRequest.worker_version_capabilities`
 // for wire-compat with v0.4-era SDK workers. v1.62 replaces it with
 // `deployment_options`; migration is tracked under `runtime-worker-versioning`.
-const VERSIONED_STICKY_NORMAL_NAME_REQUIRED: &str = "NormalName must be set on sticky queue when UseVersioning is true or DeploymentOptions are set.";
-
-fn validate_versioned_sticky_normal_name(
-    task_queue: &taskqueue_proto::TaskQueue,
-    deployment_options_present: bool,
-    legacy_use_versioning: bool,
-) -> Result<(), ProtoConversionError> {
-    // v1.31.0 rejects before poll admission because a versioned sticky queue
-    // cannot be redirected through its normal family when NormalName is absent
-    // (`WorkflowHandler.validateVersioningInfo`, workflow_handler.go:6356-6375).
-    if enums::TaskQueueKind::try_from(task_queue.kind).ok() == Some(enums::TaskQueueKind::Sticky)
-        && task_queue.normal_name.is_empty()
-        && (deployment_options_present || legacy_use_versioning)
-    {
-        return Err(ProtoConversionError::InvalidArgument(
-            VERSIONED_STICKY_NORMAL_NAME_REQUIRED.to_string(),
-        ));
-    }
-    Ok(())
-}
-
 #[allow(deprecated)]
 pub fn poll_request_to_edge(
     req: workflowservice::PollWorkflowTaskQueueRequest,
@@ -1338,14 +1317,16 @@ pub fn poll_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "PollWorkflowTaskQueueRequest.task_queue",
         ))?;
-    validate_versioned_sticky_normal_name(
-        task_queue,
-        req.deployment_options.is_some(),
-        req.worker_version_capabilities
+    let versioning_metadata_present = req.deployment_options.is_some()
+        || req
+            .worker_version_capabilities
             .as_ref()
-            .is_some_and(|capabilities| capabilities.use_versioning),
-    )?;
+            .is_some_and(|capabilities| capabilities.use_versioning);
 
+    let scoped_versioned = req.deployment_options.as_ref().is_some_and(|options| {
+        enums::WorkerVersioningMode::try_from(options.worker_versioning_mode).ok()
+            == Some(enums::WorkerVersioningMode::Versioned)
+    });
     let (deployment, build_id) = req
         .deployment_options
         .as_ref()
@@ -1377,15 +1358,20 @@ pub fn poll_request_to_edge(
         })
         .unwrap_or((None, None));
 
+    let is_sticky =
+        enums::TaskQueueKind::try_from(task_queue.kind).ok() == Some(enums::TaskQueueKind::Sticky);
     Ok(PollWorkflowTaskQueueRequest {
         namespace: req.namespace,
         task_queue: task_queue.name.clone(),
-        normal_task_queue: (enums::TaskQueueKind::try_from(task_queue.kind).ok()
-            == Some(enums::TaskQueueKind::Sticky))
-        .then(|| task_queue.normal_name.clone())
-        .filter(|name| !name.is_empty()),
+        normal_task_queue: is_sticky
+            .then(|| task_queue.normal_name.clone())
+            .filter(|name| !name.is_empty()),
+        is_sticky,
         worker_identity: req.identity,
         worker_instance_key: req.worker_instance_key,
+        worker_control_task_queue: req.worker_control_task_queue,
+        scoped_versioned,
+        versioning_metadata_present,
         deployment,
         build_id,
         sticky_run: None,
@@ -5806,14 +5792,16 @@ pub fn poll_activity_request_to_edge(
         .ok_or(ProtoConversionError::MissingField(
             "PollActivityTaskQueueRequest.task_queue",
         ))?;
-    validate_versioned_sticky_normal_name(
-        task_queue,
-        req.deployment_options.is_some(),
-        req.worker_version_capabilities
+    let versioning_metadata_present = req.deployment_options.is_some()
+        || req
+            .worker_version_capabilities
             .as_ref()
-            .is_some_and(|capabilities| capabilities.use_versioning),
-    )?;
+            .is_some_and(|capabilities| capabilities.use_versioning);
 
+    let scoped_versioned = req.deployment_options.as_ref().is_some_and(|options| {
+        enums::WorkerVersioningMode::try_from(options.worker_versioning_mode).ok()
+            == Some(enums::WorkerVersioningMode::Versioned)
+    });
     let (deployment, build_id) = req
         .deployment_options
         .as_ref()
@@ -5841,11 +5829,20 @@ pub fn poll_activity_request_to_edge(
         })
         .unwrap_or((None, None));
 
+    let is_sticky =
+        enums::TaskQueueKind::try_from(task_queue.kind).ok() == Some(enums::TaskQueueKind::Sticky);
     Ok(crate::translate::PollActivityTaskQueueRequest {
         namespace: req.namespace,
         task_queue: task_queue.name.clone(),
+        normal_task_queue: is_sticky
+            .then(|| task_queue.normal_name.clone())
+            .filter(|name| !name.is_empty()),
+        is_sticky,
         worker_identity: req.identity,
         worker_instance_key: req.worker_instance_key,
+        worker_control_task_queue: req.worker_control_task_queue,
+        scoped_versioned,
+        versioning_metadata_present,
         deployment,
         build_id,
         worker_rate_limit: req
@@ -8204,7 +8201,7 @@ mod tests {
     }
 
     #[test]
-    fn versioned_sticky_polls_require_a_normal_queue_name() {
+    fn versioned_sticky_polls_retain_missing_normal_name_for_post_auth_validation() {
         let sticky_without_normal_name = || taskqueue::TaskQueue {
             name: "sticky".to_string(),
             kind: enums::TaskQueueKind::Sticky as i32,
@@ -8212,19 +8209,18 @@ mod tests {
             ..Default::default()
         };
 
-        let workflow_error = poll_request_to_edge(workflowservice::PollWorkflowTaskQueueRequest {
+        let workflow = poll_request_to_edge(workflowservice::PollWorkflowTaskQueueRequest {
             namespace: "default".to_string(),
             task_queue: Some(sticky_without_normal_name()),
             deployment_options: Some(deployment_proto::WorkerDeploymentOptions::default()),
             ..Default::default()
         })
-        .expect_err("deployment options require a normal sticky-queue name");
-        let ProtoConversionError::InvalidArgument(workflow_message) = workflow_error else {
-            panic!("expected invalid-argument error");
-        };
-        assert_eq!(workflow_message, VERSIONED_STICKY_NORMAL_NAME_REQUIRED);
+        .expect("translation stages validation until after authentication");
+        assert!(workflow.is_sticky);
+        assert_eq!(workflow.normal_task_queue, None);
+        assert!(workflow.versioning_metadata_present);
 
-        let activity_error =
+        let activity =
             poll_activity_request_to_edge(workflowservice::PollActivityTaskQueueRequest {
                 namespace: "default".to_string(),
                 task_queue: Some(sticky_without_normal_name()),
@@ -8236,11 +8232,10 @@ mod tests {
                 ),
                 ..Default::default()
             })
-            .expect_err("legacy versioning requires a normal sticky-queue name");
-        let ProtoConversionError::InvalidArgument(activity_message) = activity_error else {
-            panic!("expected invalid-argument error");
-        };
-        assert_eq!(activity_message, VERSIONED_STICKY_NORMAL_NAME_REQUIRED);
+            .expect("translation stages validation until after authentication");
+        assert!(activity.is_sticky);
+        assert_eq!(activity.normal_task_queue, None);
+        assert!(activity.versioning_metadata_present);
     }
 
     #[test]

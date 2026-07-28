@@ -257,7 +257,63 @@ not a TOML field and is described separately.\n\n\
     }
 
     output.push_str(
-        "\n## Durable live task-queue policy\n\n\
+        "\n## Scoped Worker authorization\n\n\
+`scoped-worker-authorization` is a Tokeira-native, presence-activated attenuation for \
+standard Temporal SDK Workers. Tokeira does not mint, rotate, or distribute the bearer: an \
+external IdP, workload-identity system, or Worker Compute provider owns that lifecycle. When \
+the verified credential carries or maps to a Worker scope, ordinary Temporal roles cannot \
+widen it.\n\n\
+The fixed signed JWT claim is `tokeira_worker_scope`:\n\n\
+```json\n\
+{\n\
+  \"version\": 1,\n\
+  \"namespace\": \"payments\",\n\
+  \"task_queues\": [\"payments-worker\"],\n\
+  \"deployment_name\": \"payments\",\n\
+  \"build_id\": \"2026-07-28.1\"\n\
+}\n\
+```\n\n\
+Alternatively, map a verified JWT subject or AWS STS caller ARN in TOML:\n\n\
+```toml\n\
+[[policy.authorization.jwt.issuers.worker_scopes]]\n\
+match_sub = \"system:serviceaccount:workers:payments-*\"\n\
+namespace = \"payments\"\n\
+task_queues = [\"payments-worker\"]\n\
+deployment_name = \"payments\"\n\
+build_id = \"2026-07-28.1\"\n\n\
+[[policy.authorization.aws_iam.worker_scopes]]\n\
+match_arn = \"arn:aws:sts::123456789012:assumed-role/payments-worker-*\"\n\
+namespace = \"payments\"\n\
+task_queues = [\"payments-worker\"]\n\
+deployment_name = \"payments\"\n\
+build_id = \"2026-07-28.1\"\n\
+```\n\n\
+Every resource comparison is exact and case-sensitive. Polls must use VERSIONED Worker \
+Deployment mode with both the configured deployment name and build ID. The fixed Worker RPC \
+surface is `PollWorkflowTaskQueue`, `PollActivityTaskQueue`, `PollNexusTaskQueue`, \
+`RespondWorkflowTaskCompleted`, `RespondWorkflowTaskFailed`, `RespondQueryTaskCompleted`, \
+`RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RespondActivityTaskCanceled`, \
+`RecordActivityTaskHeartbeat`, `RespondNexusTaskCompleted`, `RespondNexusTaskFailed`, \
+`RecordWorkerHeartbeat`, `ShutdownWorker`, and queue-scoped `DescribeTaskQueue`. Universal \
+`Health/Check` and `GetSystemInfo` remain available independently of Worker scope.\n\n\
+Activity By-ID aliases, standalone Activities, unversioned or deprecated Worker Versioning, \
+Worker inventory, visibility/history reads, Workflow starts, and every other namespace-wide \
+API are denied for a scoped identity. Sticky Workflow polls authorize the request's stable \
+`normal_name`; sticky aliases are never configured as resources.\n\n\
+The Go SDK can refresh an externally issued bearer through its standard credentials callback; \
+return the token without a `Bearer ` prefix because the SDK adds it:\n\n\
+```go\n\
+c, err := client.Dial(client.Options{\n\
+    HostPort:  \"tokeira.example:7233\",\n\
+    Namespace: \"payments\",\n\
+    Credentials: client.NewAPIKeyDynamicCredentials(\n\
+        func(ctx context.Context) (string, error) {\n\
+            return credentialSource.Token(ctx)\n\
+        },\n\
+    ),\n\
+})\n\
+```\n\n\
+## Durable live task-queue policy\n\n\
 `UpdateTaskQueueConfig` authors durable policy independently for each \
 `(namespace, task queue, task kind)`. Queue rate limits, the default per-fairness-key \
 rate, and fairness-weight overrides commit through compare-and-swap storage before \
@@ -326,10 +382,26 @@ pub fn render_config_example(fields: &[ConfigFieldDocumentation]) -> Result<Stri
 # match_sub = \"system:serviceaccount:workers:*\"\n\
 # grant = [\"default:worker\"]\n\
 #\n\
+# # Presence activates exact scoped-Worker attenuation. The IdP may instead\n\
+# # sign the fixed version-1 `tokeira_worker_scope` JWT claim with equal fields.\n\
+# [[policy.authorization.jwt.issuers.worker_scopes]]\n\
+# match_sub = \"system:serviceaccount:workers:payments-*\"\n\
+# namespace = \"payments\"\n\
+# task_queues = [\"payments-worker\"]\n\
+# deployment_name = \"payments\"\n\
+# build_id = \"2026-07-28.1\"\n\
+#\n\
 # [policy.authorization.aws_iam]\n\
 # [[policy.authorization.aws_iam.grants]]\n\
 # match_arn = \"arn:aws:sts::123456789012:assumed-role/tokeira-worker-*\"\n\
-# grant = [\"default:worker\"]\n",
+# grant = [\"default:worker\"]\n\
+#\n\
+# [[policy.authorization.aws_iam.worker_scopes]]\n\
+# match_arn = \"arn:aws:sts::123456789012:assumed-role/payments-worker-*\"\n\
+# namespace = \"payments\"\n\
+# task_queues = [\"payments-worker\"]\n\
+# deployment_name = \"payments\"\n\
+# build_id = \"2026-07-28.1\"\n",
     );
     Ok(output)
 }
@@ -372,9 +444,39 @@ mod tests {
                 .contains("`policy.task_queues.enable_fairness`")
         );
         assert!(
+            rendered
+                .tokeira_configuration
+                .contains("`scoped-worker-authorization`")
+        );
+        assert!(
+            rendered
+                .tokeira_configuration
+                .contains("`tokeira_worker_scope`")
+        );
+        assert!(
+            rendered
+                .tokeira_configuration
+                .contains("Activity By-ID aliases, standalone Activities")
+        );
+        assert!(
+            rendered
+                .config_example
+                .contains("# [[policy.authorization.jwt.issuers.worker_scopes]]")
+        );
+        assert!(
+            rendered
+                .config_example
+                .contains("# [[policy.authorization.aws_iam.worker_scopes]]")
+        );
+        assert!(
             !rendered
                 .config_example
                 .contains("\n[[policy.authorization.jwt.issuers]]")
+        );
+        assert!(
+            !rendered
+                .config_example
+                .contains("\n[[policy.authorization.jwt.issuers.worker_scopes]]")
         );
         let parsed: TokeiraConfig =
             toml::from_str(&rendered.config_example).expect("example parses strictly");

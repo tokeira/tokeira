@@ -15,9 +15,14 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
-use crate::{AuthError, ClaimMapper, Claims, GrantRules, Role};
+use crate::{
+    AuthError, ClaimMapper, Claims, GrantRules, Role, WorkerScope, WorkerScopeRules,
+    resolve_effective_scope,
+};
 
 const DEFAULT_PERMISSIONS_CLAIM: &str = "permissions";
+const TOKEIRA_WORKER_SCOPE_CLAIM: &str = "tokeira_worker_scope";
+const WORKER_SCOPE_VERSION: u32 = 1;
 
 #[derive(Clone)]
 struct VerificationKey {
@@ -214,6 +219,8 @@ pub struct JwtIssuerProfile {
     pub permissions_claim: String,
     /// Subject-based role augmentation.
     pub grants: GrantRules,
+    /// Subject-based Worker-scope attenuation.
+    pub worker_scopes: WorkerScopeRules,
     /// Isolated JWKS source for this profile.
     pub keys: Arc<JwksKeyProvider>,
 }
@@ -238,8 +245,15 @@ impl JwtIssuerProfile {
                 permissions_claim
             },
             grants,
+            worker_scopes: WorkerScopeRules::default(),
             keys,
         }
+    }
+
+    /// Attach validated subject-to-Worker-scope mappings.
+    pub fn with_worker_scopes(mut self, worker_scopes: WorkerScopeRules) -> Self {
+        self.worker_scopes = worker_scopes;
+        self
     }
 }
 
@@ -313,6 +327,16 @@ impl ClaimMapper for JwtAuthenticator {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| AuthError::new("unexpected value type of \"sub\" claim"))?;
         claims.subject = subject.to_owned();
+        let signed_scope = verified
+            .get(TOKEIRA_WORKER_SCOPE_CLAIM)
+            .map(parse_worker_scope_claim)
+            .transpose()?;
+        let configured_scope = profile
+            .worker_scopes
+            .resolve(subject)
+            .map_err(|_| AuthError::new("conflicting configured Worker scopes"))?;
+        claims.worker_scope = resolve_effective_scope(signed_scope, configured_scope)
+            .map_err(|_| AuthError::new("signed and configured Worker scopes conflict"))?;
         if let Some(permissions) = verified
             .get(&profile.permissions_claim)
             .and_then(JsonValue::as_array)
@@ -322,6 +346,33 @@ impl ClaimMapper for JwtAuthenticator {
         profile.grants.apply(subject, &mut claims);
         Ok(claims)
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerScopeClaimV1 {
+    version: u32,
+    namespace: String,
+    task_queues: Vec<String>,
+    deployment_name: String,
+    build_id: String,
+}
+
+fn parse_worker_scope_claim(value: &JsonValue) -> Result<WorkerScope, AuthError> {
+    let claim = serde_json::from_value::<WorkerScopeClaimV1>(value.clone())
+        .map_err(|_| AuthError::new("invalid tokeira_worker_scope claim"))?;
+    if claim.version != WORKER_SCOPE_VERSION {
+        return Err(AuthError::new(
+            "unsupported tokeira_worker_scope claim version",
+        ));
+    }
+    WorkerScope::try_new(
+        claim.namespace,
+        claim.task_queues,
+        claim.deployment_name,
+        claim.build_id,
+    )
+    .map_err(|_| AuthError::new("invalid tokeira_worker_scope resources"))
 }
 
 fn unverified_issuer(token: &str) -> Result<String, AuthError> {
@@ -487,6 +538,41 @@ mod tests {
         )
     }
 
+    // Feature: scoped-worker-authorization, Property 3: Fixed JWT claim parsing is fail-closed
+    proptest! {
+        #[test]
+        fn property_fixed_worker_scope_claim_parsing_is_fail_closed(
+            namespace in "[a-z]{1,12}",
+            queue in "[a-z]{1,12}",
+            deployment in "[a-z]{1,12}",
+            build_id in "[a-z0-9]{1,12}",
+            mutation in 0u8..7,
+        ) {
+            let mut claim = serde_json::json!({
+                "version": 1,
+                "namespace": namespace,
+                "task_queues": [queue],
+                "deployment_name": deployment,
+                "build_id": build_id,
+            });
+            match mutation {
+                0 => {}
+                1 => {
+                    claim.as_object_mut().expect("object").remove("version");
+                }
+                2 => claim["version"] = serde_json::json!(2),
+                3 => claim["unknown"] = serde_json::json!(true),
+                4 => claim["task_queues"] = serde_json::json!("queue"),
+                5 => {
+                    let queue = claim["task_queues"][0].clone();
+                    claim["task_queues"] = serde_json::json!([queue.clone(), queue]);
+                }
+                _ => claim["deployment_name"] = serde_json::json!("*"),
+            }
+            prop_assert_eq!(parse_worker_scope_claim(&claim).is_ok(), mutation == 0);
+        }
+    }
+
     #[tokio::test]
     async fn header_format_errors_match_v1_31() {
         let mapper = JwtAuthenticator::new(Vec::new());
@@ -505,6 +591,59 @@ mod tests {
                 .expect_err("scheme")
                 .to_string(),
             "unexpected name in authorization token"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_and_subject_mapped_worker_scopes_must_agree() {
+        let scope = WorkerScope::try_new(
+            "payments".to_owned(),
+            vec!["payments-worker".to_owned()],
+            "payments".to_owned(),
+            "build-a".to_owned(),
+        )
+        .expect("scope");
+        let profile = signed_profile("").with_worker_scopes(WorkerScopeRules::new(vec![
+            crate::WorkerScopeRule::new("worker-*", scope.clone()).expect("scope rule"),
+        ]));
+        let mapper = JwtAuthenticator::new(vec![profile]);
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let token = signed_token(serde_json::json!({
+            "iss": "https://issuer.example",
+            "sub": "worker-a",
+            "exp": now + 300,
+            "tokeira_worker_scope": {
+                "version": 1,
+                "namespace": "payments",
+                "task_queues": ["payments-worker"],
+                "deployment_name": "payments",
+                "build_id": "build-a"
+            }
+        }));
+        let claims = mapper
+            .get_claims(&format!("Bearer {token}"), "")
+            .await
+            .expect("equal scopes");
+        assert_eq!(claims.worker_scope, Some(scope));
+
+        let conflicting = signed_token(serde_json::json!({
+            "iss": "https://issuer.example",
+            "sub": "worker-a",
+            "exp": now + 300,
+            "permissions": ["payments:admin"],
+            "tokeira_worker_scope": {
+                "version": 1,
+                "namespace": "payments",
+                "task_queues": ["other-worker"],
+                "deployment_name": "payments",
+                "build_id": "build-a"
+            }
+        }));
+        assert!(
+            mapper
+                .get_claims(&format!("Bearer {conflicting}"), "")
+                .await
+                .is_err()
         );
     }
 
@@ -780,6 +919,7 @@ mod tests {
                 scope: Scope::Namespace,
                 access: Access::Write,
             },
+            worker: None,
         };
         assert!(matches!(
             DefaultAuthorizer

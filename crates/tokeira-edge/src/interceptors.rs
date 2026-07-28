@@ -24,14 +24,15 @@ use http::HeaderMap;
 use time::OffsetDateTime;
 use tokeira_auth::{
     Access, AuthPrincipal, Authorizer, AuthzDecision, CallClassification, CallTarget, ClaimMapper,
-    Claims, Scope,
+    Claims, Scope, WorkerCallTarget, WorkerOperation, WorkerScopeDenyReason, WorkerTarget,
 };
-use tokeira_types::{EventPrincipal, NamespaceId};
+use tokeira_types::{EventPrincipal, NamespaceId, WorkerTaskClass};
 
 use crate::{
     errors::{EdgeError, EdgeResult},
     metrics::{
         record_authorization_denied, record_authorization_duration, record_authorization_error,
+        record_scoped_worker_authorization_denied,
     },
     namespace_cache::{NamespaceCache, ResolvedNamespace},
     request_id::{RequestId, RequestIdGenerator, UuidRequestIdGenerator, extract_or_generate},
@@ -59,6 +60,9 @@ pub enum Action {
     RespondActivityTaskCompleted,
     RespondActivityTaskFailed,
     RespondActivityTaskCanceled,
+    RespondActivityTaskCompletedById,
+    RespondActivityTaskFailedById,
+    RespondActivityTaskCanceledById,
     UpdateActivityOptions,
     PauseActivity,
     UnpauseActivity,
@@ -73,6 +77,7 @@ pub enum Action {
     RespondNexusTaskCompleted,
     RespondNexusTaskFailed,
     RecordActivityTaskHeartbeat,
+    RecordActivityTaskHeartbeatById,
     TerminateWorkflowExecution,
     RequestCancelWorkflowExecution,
     PauseWorkflowExecution,
@@ -122,6 +127,90 @@ pub enum Action {
 }
 
 impl Action {
+    /// Complete authorization-action catalog used by fixed-surface audits.
+    pub const ALL: &'static [Self] = &[
+        Self::GetWorkflowExecutionHistory,
+        Self::StartWorkflowExecution,
+        Self::SignalWorkflowExecution,
+        Self::PollWorkflowTaskQueue,
+        Self::RespondWorkflowTaskCompleted,
+        Self::RespondWorkflowTaskFailed,
+        Self::RespondQueryTaskCompleted,
+        Self::DescribeWorkflowExecution,
+        Self::ListWorkflowExecutions,
+        Self::CountWorkflowExecutions,
+        Self::ListActivityExecutions,
+        Self::CountActivityExecutions,
+        Self::PollActivityTaskQueue,
+        Self::RespondActivityTaskCompleted,
+        Self::RespondActivityTaskFailed,
+        Self::RespondActivityTaskCanceled,
+        Self::RespondActivityTaskCompletedById,
+        Self::RespondActivityTaskFailedById,
+        Self::RespondActivityTaskCanceledById,
+        Self::UpdateActivityOptions,
+        Self::PauseActivity,
+        Self::UnpauseActivity,
+        Self::ResetActivity,
+        Self::WorkflowRulesRead,
+        Self::WorkflowRulesWrite,
+        Self::RecordWorkerHeartbeat,
+        Self::ShutdownWorker,
+        Self::DescribeWorker,
+        Self::ListWorkers,
+        Self::PollNexusTaskQueue,
+        Self::RespondNexusTaskCompleted,
+        Self::RespondNexusTaskFailed,
+        Self::RecordActivityTaskHeartbeat,
+        Self::RecordActivityTaskHeartbeatById,
+        Self::TerminateWorkflowExecution,
+        Self::RequestCancelWorkflowExecution,
+        Self::PauseWorkflowExecution,
+        Self::UnpauseWorkflowExecution,
+        Self::QueryWorkflow,
+        Self::UpdateWorkflowExecution,
+        Self::PollWorkflowExecutionUpdate,
+        Self::UpdateWorkflowExecutionOptions,
+        Self::DescribeNamespace,
+        Self::ListNamespaces,
+        Self::RegisterNamespace,
+        Self::UpdateNamespace,
+        Self::GetWorkflowExecutionHistoryReverse,
+        Self::DescribeTaskQueue,
+        Self::ListTaskQueuePartitions,
+        Self::DeleteWorkflowExecution,
+        Self::ResetWorkflowExecution,
+        Self::ResetStickyTaskQueue,
+        Self::StartBatchOperation,
+        Self::StopBatchOperation,
+        Self::DescribeBatchOperation,
+        Self::ListBatchOperations,
+        Self::SignalWithStartWorkflowExecution,
+        Self::GetClusterInfo,
+        Self::GetSystemInfo,
+        Self::GetSearchAttributes,
+        Self::AddSearchAttributes,
+        Self::RemoveSearchAttributes,
+        Self::ListSearchAttributes,
+        Self::DeleteNamespace,
+        Self::AddOrUpdateRemoteCluster,
+        Self::RemoveRemoteCluster,
+        Self::ListClusters,
+        Self::CreateNexusEndpoint,
+        Self::UpdateNexusEndpoint,
+        Self::DeleteNexusEndpoint,
+        Self::GetNexusEndpoint,
+        Self::ListNexusEndpoints,
+        Self::StartActivityExecution,
+        Self::DescribeActivityExecution,
+        Self::PollActivityExecution,
+        Self::RequestCancelActivityExecution,
+        Self::TerminateActivityExecution,
+        Self::DeleteActivityExecution,
+        Self::DescribeMutableState,
+        Self::HealthRead,
+    ];
+
     /// Stable metric label for the public API intent.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -141,6 +230,9 @@ impl Action {
             Action::RespondActivityTaskCompleted => "respond_activity_task_completed",
             Action::RespondActivityTaskFailed => "respond_activity_task_failed",
             Action::RespondActivityTaskCanceled => "respond_activity_task_canceled",
+            Action::RespondActivityTaskCompletedById => "respond_activity_task_completed_by_id",
+            Action::RespondActivityTaskFailedById => "respond_activity_task_failed_by_id",
+            Action::RespondActivityTaskCanceledById => "respond_activity_task_canceled_by_id",
             Action::UpdateActivityOptions => "update_activity_options",
             Action::PauseActivity => "pause_activity",
             Action::UnpauseActivity => "unpause_activity",
@@ -155,6 +247,7 @@ impl Action {
             Action::RespondNexusTaskCompleted => "respond_nexus_task_completed",
             Action::RespondNexusTaskFailed => "respond_nexus_task_failed",
             Action::RecordActivityTaskHeartbeat => "record_activity_task_heartbeat",
+            Action::RecordActivityTaskHeartbeatById => "record_activity_task_heartbeat_by_id",
             Action::TerminateWorkflowExecution => "terminate_workflow_execution",
             Action::RequestCancelWorkflowExecution => "request_cancel_workflow_execution",
             Action::PauseWorkflowExecution => "pause_workflow_execution",
@@ -239,6 +332,9 @@ impl Action {
             Action::RespondActivityTaskCompleted => "RespondActivityTaskCompleted",
             Action::RespondActivityTaskFailed => "RespondActivityTaskFailed",
             Action::RespondActivityTaskCanceled => "RespondActivityTaskCanceled",
+            Action::RespondActivityTaskCompletedById => "RespondActivityTaskCompletedById",
+            Action::RespondActivityTaskFailedById => "RespondActivityTaskFailedById",
+            Action::RespondActivityTaskCanceledById => "RespondActivityTaskCanceledById",
             Action::UpdateActivityOptions => "UpdateActivityOptions",
             Action::PauseActivity => "PauseActivity",
             Action::UnpauseActivity => "UnpauseActivity",
@@ -253,6 +349,7 @@ impl Action {
             Action::RespondNexusTaskCompleted => "RespondNexusTaskCompleted",
             Action::RespondNexusTaskFailed => "RespondNexusTaskFailed",
             Action::RecordActivityTaskHeartbeat => "RecordActivityTaskHeartbeat",
+            Action::RecordActivityTaskHeartbeatById => "RecordActivityTaskHeartbeatById",
             Action::TerminateWorkflowExecution => "TerminateWorkflowExecution",
             Action::RequestCancelWorkflowExecution => "RequestCancelWorkflowExecution",
             Action::PauseWorkflowExecution => "PauseWorkflowExecution",
@@ -392,6 +489,15 @@ impl Action {
                 "RespondActivityTaskCanceled" => {
                     "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskCanceled"
                 }
+                "RespondActivityTaskCompletedById" => {
+                    "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskCompletedById"
+                }
+                "RespondActivityTaskFailedById" => {
+                    "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskFailedById"
+                }
+                "RespondActivityTaskCanceledById" => {
+                    "/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskCanceledById"
+                }
                 "UpdateActivityOptions" => {
                     "/temporal.api.workflowservice.v1.WorkflowService/UpdateActivityOptions"
                 }
@@ -427,6 +533,9 @@ impl Action {
                 }
                 "RecordActivityTaskHeartbeat" => {
                     "/temporal.api.workflowservice.v1.WorkflowService/RecordActivityTaskHeartbeat"
+                }
+                "RecordActivityTaskHeartbeatById" => {
+                    "/temporal.api.workflowservice.v1.WorkflowService/RecordActivityTaskHeartbeatById"
                 }
                 "TerminateWorkflowExecution" => {
                     "/temporal.api.workflowservice.v1.WorkflowService/TerminateWorkflowExecution"
@@ -577,6 +686,9 @@ impl Action {
             | Action::RespondActivityTaskCompleted
             | Action::RespondActivityTaskFailed
             | Action::RespondActivityTaskCanceled
+            | Action::RespondActivityTaskCompletedById
+            | Action::RespondActivityTaskFailedById
+            | Action::RespondActivityTaskCanceledById
             | Action::UpdateActivityOptions
             | Action::PauseActivity
             | Action::UnpauseActivity
@@ -588,6 +700,7 @@ impl Action {
             | Action::RespondNexusTaskCompleted
             | Action::RespondNexusTaskFailed
             | Action::RecordActivityTaskHeartbeat
+            | Action::RecordActivityTaskHeartbeatById
             | Action::TerminateWorkflowExecution
             | Action::RequestCancelWorkflowExecution
             | Action::PauseWorkflowExecution
@@ -607,6 +720,100 @@ impl Action {
         };
         CallClassification { scope, access }
     }
+
+    /// Fixed scoped-Worker operation for this API, when one exists.
+    ///
+    /// Activity By-ID aliases are deliberately absent: v1.31.0 exposes them
+    /// as separate public methods, but they carry no server-authored task
+    /// token and therefore cannot satisfy exact task-origin authorization.
+    pub const fn worker_operation(self) -> Option<WorkerOperation> {
+        match self {
+            Self::PollWorkflowTaskQueue => Some(WorkerOperation::PollWorkflowTaskQueue),
+            Self::RespondWorkflowTaskCompleted => {
+                Some(WorkerOperation::RespondWorkflowTaskCompleted)
+            }
+            Self::RespondWorkflowTaskFailed => Some(WorkerOperation::RespondWorkflowTaskFailed),
+            Self::RespondQueryTaskCompleted => Some(WorkerOperation::RespondQueryTaskCompleted),
+            Self::PollActivityTaskQueue => Some(WorkerOperation::PollActivityTaskQueue),
+            Self::RespondActivityTaskCompleted => {
+                Some(WorkerOperation::RespondActivityTaskCompleted)
+            }
+            Self::RespondActivityTaskFailed => Some(WorkerOperation::RespondActivityTaskFailed),
+            Self::RespondActivityTaskCanceled => Some(WorkerOperation::RespondActivityTaskCanceled),
+            Self::PollNexusTaskQueue => Some(WorkerOperation::PollNexusTaskQueue),
+            Self::RespondNexusTaskCompleted => Some(WorkerOperation::RespondNexusTaskCompleted),
+            Self::RespondNexusTaskFailed => Some(WorkerOperation::RespondNexusTaskFailed),
+            Self::RecordActivityTaskHeartbeat => Some(WorkerOperation::RecordActivityTaskHeartbeat),
+            Self::RecordWorkerHeartbeat => Some(WorkerOperation::RecordWorkerHeartbeat),
+            Self::ShutdownWorker => Some(WorkerOperation::ShutdownWorker),
+            Self::DescribeTaskQueue => Some(WorkerOperation::DescribeTaskQueue),
+            Self::GetWorkflowExecutionHistory
+            | Self::StartWorkflowExecution
+            | Self::SignalWorkflowExecution
+            | Self::DescribeWorkflowExecution
+            | Self::ListWorkflowExecutions
+            | Self::CountWorkflowExecutions
+            | Self::ListActivityExecutions
+            | Self::CountActivityExecutions
+            | Self::RespondActivityTaskCompletedById
+            | Self::RespondActivityTaskFailedById
+            | Self::RespondActivityTaskCanceledById
+            | Self::UpdateActivityOptions
+            | Self::PauseActivity
+            | Self::UnpauseActivity
+            | Self::ResetActivity
+            | Self::WorkflowRulesRead
+            | Self::WorkflowRulesWrite
+            | Self::DescribeWorker
+            | Self::ListWorkers
+            | Self::RecordActivityTaskHeartbeatById
+            | Self::TerminateWorkflowExecution
+            | Self::RequestCancelWorkflowExecution
+            | Self::PauseWorkflowExecution
+            | Self::UnpauseWorkflowExecution
+            | Self::QueryWorkflow
+            | Self::UpdateWorkflowExecution
+            | Self::PollWorkflowExecutionUpdate
+            | Self::UpdateWorkflowExecutionOptions
+            | Self::DescribeNamespace
+            | Self::ListNamespaces
+            | Self::RegisterNamespace
+            | Self::UpdateNamespace
+            | Self::GetWorkflowExecutionHistoryReverse
+            | Self::ListTaskQueuePartitions
+            | Self::DeleteWorkflowExecution
+            | Self::ResetWorkflowExecution
+            | Self::ResetStickyTaskQueue
+            | Self::StartBatchOperation
+            | Self::StopBatchOperation
+            | Self::DescribeBatchOperation
+            | Self::ListBatchOperations
+            | Self::SignalWithStartWorkflowExecution
+            | Self::GetClusterInfo
+            | Self::GetSystemInfo
+            | Self::GetSearchAttributes
+            | Self::AddSearchAttributes
+            | Self::RemoveSearchAttributes
+            | Self::ListSearchAttributes
+            | Self::DeleteNamespace
+            | Self::AddOrUpdateRemoteCluster
+            | Self::RemoveRemoteCluster
+            | Self::ListClusters
+            | Self::CreateNexusEndpoint
+            | Self::UpdateNexusEndpoint
+            | Self::DeleteNexusEndpoint
+            | Self::GetNexusEndpoint
+            | Self::ListNexusEndpoints
+            | Self::StartActivityExecution
+            | Self::DescribeActivityExecution
+            | Self::PollActivityExecution
+            | Self::RequestCancelActivityExecution
+            | Self::TerminateActivityExecution
+            | Self::DeleteActivityExecution
+            | Self::DescribeMutableState
+            | Self::HealthRead => None,
+        }
+    }
 }
 
 /// Edge authentication and authorization pipeline.
@@ -622,6 +829,21 @@ pub trait Authenticator: Send + Sync + 'static {
         action: Action,
         namespace_name: Option<&str>,
     ) -> EdgeResult<Option<AuthPrincipal>>;
+
+    /// Decide a fully classified scoped-Worker intent without re-authenticating.
+    ///
+    /// Custom authenticators that predate scoped Workers retain their ordinary
+    /// behavior through this default. The configured policy adapter overrides
+    /// it to pass the exact Worker target into the shared authorizer.
+    async fn authorize_worker(
+        &self,
+        claims: Option<&Claims>,
+        action: Action,
+        namespace_name: Option<&str>,
+        _worker: WorkerCallTarget<'_>,
+    ) -> EdgeResult<Option<AuthPrincipal>> {
+        self.authorize(claims, action, namespace_name).await
+    }
 }
 
 /// Useful development default.
@@ -681,6 +903,32 @@ impl PolicyAuthenticator {
         EdgeError::PermissionDenied {
             message: "Request unauthorized.".to_owned(),
             reason,
+        }
+    }
+
+    fn authorize_target(
+        &self,
+        claims: Option<&Claims>,
+        target: CallTarget<'_>,
+    ) -> EdgeResult<Option<AuthPrincipal>> {
+        match self.authorizer.authorize(claims, &target) {
+            Ok(AuthzDecision::Allow { principal }) => Ok(principal),
+            Ok(AuthzDecision::Deny { reason }) => {
+                record_authorization_denied(target.api_name);
+                Err(Self::denied(reason))
+            }
+            Err(error) => {
+                tracing::error!(%error, api = target.api_name, "request authorizer failed");
+                record_authorization_error(target.api_name, "authorize");
+                if authorizer_errors_exposed(self.expose_authorizer_errors) {
+                    Err(EdgeError::PermissionDenied {
+                        message: error.to_string(),
+                        reason: None,
+                    })
+                } else {
+                    Err(Self::denied(None))
+                }
+            }
         }
     }
 }
@@ -749,26 +997,27 @@ impl Authenticator for PolicyAuthenticator {
             api_name: action.api_name(),
             namespace: namespace_name,
             classification: action.classification(),
+            worker: None,
         };
-        match self.authorizer.authorize(claims, &target) {
-            Ok(AuthzDecision::Allow { principal }) => Ok(principal),
-            Ok(AuthzDecision::Deny { reason }) => {
-                record_authorization_denied(target.api_name);
-                Err(Self::denied(reason))
-            }
-            Err(error) => {
-                tracing::error!(%error, api = target.api_name, "request authorizer failed");
-                record_authorization_error(target.api_name, "authorize");
-                if authorizer_errors_exposed(self.expose_authorizer_errors) {
-                    Err(EdgeError::PermissionDenied {
-                        message: error.to_string(),
-                        reason: None,
-                    })
-                } else {
-                    Err(Self::denied(None))
-                }
-            }
-        }
+        self.authorize_target(claims, target)
+    }
+
+    async fn authorize_worker(
+        &self,
+        claims: Option<&Claims>,
+        action: Action,
+        namespace_name: Option<&str>,
+        worker: WorkerCallTarget<'_>,
+    ) -> EdgeResult<Option<AuthPrincipal>> {
+        self.authorize_target(
+            claims,
+            CallTarget {
+                api_name: action.api_name(),
+                namespace: namespace_name,
+                classification: action.classification(),
+                worker: Some(worker),
+            },
+        )
     }
 }
 
@@ -906,6 +1155,47 @@ impl EdgeInterceptors {
         action: Action,
         is_long_poll: bool,
     ) -> EdgeResult<EdgeContext> {
+        self.begin_with_worker_target(headers, namespace_name, action, is_long_poll, None)
+            .await
+    }
+
+    /// Authenticate and perform the namespace/API preflight for a Worker RPC.
+    ///
+    /// Resource decoding and any broker/runtime effect must occur only after
+    /// this succeeds. The returned claims are reused by
+    /// [`Self::authorize_worker_target`], so signed credentials and STS
+    /// requests are verified exactly once.
+    pub async fn begin_worker_preflight(
+        &self,
+        headers: &HeaderMap,
+        namespace_name: Option<&str>,
+        action: Action,
+        is_long_poll: bool,
+    ) -> EdgeResult<EdgeContext> {
+        let operation = action.worker_operation().ok_or_else(|| {
+            EdgeError::Internal("non-Worker API requested Worker preflight".to_owned())
+        })?;
+        self.begin_with_worker_target(
+            headers,
+            namespace_name,
+            action,
+            is_long_poll,
+            Some(WorkerCallTarget {
+                operation,
+                target: WorkerTarget::Preflight,
+            }),
+        )
+        .await
+    }
+
+    async fn begin_with_worker_target(
+        &self,
+        headers: &HeaderMap,
+        namespace_name: Option<&str>,
+        action: Action,
+        is_long_poll: bool,
+        worker: Option<WorkerCallTarget<'_>>,
+    ) -> EdgeResult<EdgeContext> {
         let request_id = extract_or_generate(headers, self.request_ids.as_ref());
         let started = Instant::now();
         let claims = match self.authenticator.authenticate(headers).await {
@@ -919,13 +1209,30 @@ impl EdgeInterceptors {
 
         // Authorization deliberately precedes existence resolution so an
         // unprivileged caller cannot probe namespace names (`interceptor.go @ v1.31.0`).
-        let auth_principal = match self
-            .authenticator
-            .authorize(claims.as_ref(), action, namespace_name)
-            .await
-        {
+        let authorization = match worker {
+            Some(worker) => {
+                self.authenticator
+                    .authorize_worker(claims.as_ref(), action, namespace_name, worker)
+                    .await
+            }
+            None => {
+                self.authenticator
+                    .authorize(claims.as_ref(), action, namespace_name)
+                    .await
+            }
+        };
+        let auth_principal = match authorization {
             Ok(principal) => principal,
             Err(error) => {
+                if let Some(reason) =
+                    scoped_worker_deny_reason(claims.as_ref(), namespace_name, worker)
+                {
+                    record_scoped_worker_authorization_denied(
+                        action.api_name(),
+                        reason.metric_label(),
+                    );
+                    log_scoped_worker_authorization_denied(claims.as_ref(), action, reason);
+                }
                 record_authorization_duration(action.api_name(), "denied", started.elapsed());
                 return Err(error);
             }
@@ -966,6 +1273,66 @@ impl EdgeInterceptors {
         })
     }
 
+    /// Complete authorization against a normalized Worker resource.
+    ///
+    /// Callers must invoke this after preflight and before registering a
+    /// waiter, claiming work, mutating a heartbeat/session registry, or
+    /// resolving a task token against runtime state.
+    pub async fn authorize_worker_target(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        target: WorkerTarget<'_>,
+    ) -> EdgeResult<()> {
+        let operation = action.worker_operation().ok_or_else(|| {
+            EdgeError::Internal("non-Worker API requested Worker target authorization".to_owned())
+        })?;
+        self.authorize_worker_operation_target(context, action, operation, target)
+            .await
+    }
+
+    /// Authorize one fixed Worker operation as part of an enclosing Worker RPC.
+    ///
+    /// Compound RPCs use this for nested Worker resources such as a shutdown
+    /// heartbeat. `action` retains the outer API name for metrics and policy
+    /// diagnostics while `operation` selects the fixed resource shape.
+    pub(crate) async fn authorize_worker_operation_target(
+        &self,
+        context: &EdgeContext,
+        action: Action,
+        operation: WorkerOperation,
+        target: WorkerTarget<'_>,
+    ) -> EdgeResult<()> {
+        let worker = WorkerCallTarget { operation, target };
+        let namespace_name = context
+            .namespace
+            .as_ref()
+            .map(|namespace| namespace.name.as_str());
+        let started = Instant::now();
+        match self
+            .authenticator
+            .authorize_worker(context.claims.as_ref(), action, namespace_name, worker)
+            .await
+        {
+            Ok(_) => {
+                record_authorization_duration(action.api_name(), "allowed", started.elapsed());
+                Ok(())
+            }
+            Err(error) => {
+                let reason = scoped_worker_deny_reason(
+                    context.claims.as_ref(),
+                    namespace_name,
+                    Some(worker),
+                )
+                .unwrap_or(WorkerScopeDenyReason::Operation);
+                record_scoped_worker_authorization_denied(action.api_name(), reason.metric_label());
+                log_scoped_worker_authorization_denied(context.claims.as_ref(), action, reason);
+                record_authorization_duration(action.api_name(), "denied", started.elapsed());
+                Err(error)
+            }
+        }
+    }
+
     /// Back-fill an omitted request namespace from a decoded task token, then
     /// run normal authentication and authorization against the current name.
     ///
@@ -1000,6 +1367,38 @@ impl EdgeInterceptors {
         Ok((context, current_name))
     }
 
+    /// Back-fill an omitted namespace, then perform Worker preflight admission.
+    ///
+    /// Token decoding remains the caller's responsibility so the empty-name
+    /// validation precedence stays identical to
+    /// [`Self::begin_with_task_token_backfill`]. The returned context is reused
+    /// for exact provenance authorization without verifying credentials twice.
+    pub async fn begin_worker_with_task_token_backfill(
+        &self,
+        headers: &HeaderMap,
+        token_namespace_id: Option<NamespaceId>,
+        action: Action,
+    ) -> EdgeResult<(EdgeContext, String)> {
+        let Some(token_namespace_id) = token_namespace_id else {
+            return self
+                .begin_worker_preflight(headers, None, action, false)
+                .await
+                .map(|context| (context, String::new()));
+        };
+        let namespace_id = token_namespace_id.0.to_string();
+        let namespace = self
+            .namespaces
+            .get_by_id(&namespace_id)
+            .await
+            .map_err(EdgeError::from)?
+            .ok_or(EdgeError::NamespaceNotFound(namespace_id))?;
+        let current_name = namespace.name;
+        let context = self
+            .begin_worker_preflight(headers, Some(&current_name), action, false)
+            .await?;
+        Ok((context, current_name))
+    }
+
     /// Re-authorize one target namespace using the caller admitted at `begin`.
     ///
     /// Cross-namespace workflow commands do not re-run authentication: the
@@ -1026,6 +1425,78 @@ impl EdgeInterceptors {
                 Err(error)
             }
         }
+    }
+}
+
+fn scoped_worker_deny_reason(
+    claims: Option<&Claims>,
+    namespace_name: Option<&str>,
+    worker: Option<WorkerCallTarget<'_>>,
+) -> Option<WorkerScopeDenyReason> {
+    let claims = claims?;
+    let scope = claims.worker_scope.as_ref()?;
+    let worker = worker?;
+    match scope.authorize(
+        worker.operation,
+        namespace_name.unwrap_or_default(),
+        worker.target,
+    ) {
+        tokeira_auth::WorkerScopeDecision::Allow => None,
+        tokeira_auth::WorkerScopeDecision::Deny(reason) => Some(reason),
+    }
+}
+
+fn log_scoped_worker_authorization_denied(
+    claims: Option<&Claims>,
+    action: Action,
+    reason: WorkerScopeDenyReason,
+) {
+    let Some(claims) = claims.filter(|claims| claims.worker_scope.is_some()) else {
+        return;
+    };
+    // Subject is the only identity detail permitted by Requirement 11.6. Keep
+    // resource coordinates and bearer material out of this event; the bounded
+    // reason is sufficient for an operator to diagnose the policy dimension.
+    tracing::warn!(
+        subject = %claims.subject,
+        api = action.api_name(),
+        reason = reason.metric_label(),
+        "scoped Worker authorization denied"
+    );
+}
+
+/// Normalize a poll's complete wire target into the fixed authorization shape.
+///
+/// A false `scoped_versioned` deliberately erases any deprecated routing
+/// coordinates. They remain available to ordinary compatibility routing, but
+/// cannot prove authority for a scoped identity. Missing sticky `normal_name`
+/// and partial modern versions normalize to empty exact coordinates, which a
+/// valid non-empty [`tokeira_auth::WorkerScope`] necessarily rejects.
+pub(crate) fn normalize_worker_poll_target<'a>(
+    task_queue: &'a str,
+    normal_task_queue: Option<&'a str>,
+    is_sticky: bool,
+    scoped_versioned: bool,
+    deployment_name: Option<&'a str>,
+    build_id: Option<&'a str>,
+    task_class: WorkerTaskClass,
+) -> WorkerTarget<'a> {
+    let normal_task_queue = if is_sticky {
+        normal_task_queue.unwrap_or_default()
+    } else {
+        task_queue
+    };
+    WorkerTarget::VersionedTask {
+        normal_task_queue,
+        task_class,
+        deployment_name: scoped_versioned
+            .then_some(deployment_name)
+            .flatten()
+            .unwrap_or_default(),
+        build_id: scoped_versioned
+            .then_some(build_id)
+            .flatten()
+            .unwrap_or_default(),
     }
 }
 
@@ -1059,7 +1530,12 @@ pub(crate) fn validate_task_token_namespace(
 
 #[cfg(test)]
 mod tests {
-    use tokeira_auth::{AuthError, AuthzError, DefaultAuthorizer, Role};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use proptest::prelude::*;
+    use tokeira_auth::{
+        AuthError, AuthzError, DefaultAuthorizer, Role, WorkerScope, WorkerScopeDecision,
+    };
 
     use super::*;
 
@@ -1071,6 +1547,20 @@ mod tests {
     #[async_trait]
     impl ClaimMapper for StaticMapper {
         async fn get_claims(&self, _token: &str, _extra: &str) -> Result<Claims, AuthError> {
+            Ok(self.claims.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingMapper {
+        claims: Claims,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ClaimMapper for CountingMapper {
+        async fn get_claims(&self, _token: &str, _extra: &str) -> Result<Claims, AuthError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.claims.clone())
         }
     }
@@ -1186,6 +1676,171 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fixed_worker_action_mapping_excludes_activity_by_id_aliases() {
+        assert_eq!(
+            Action::RespondActivityTaskCompleted.worker_operation(),
+            Some(WorkerOperation::RespondActivityTaskCompleted)
+        );
+        for action in [
+            Action::RespondActivityTaskCompletedById,
+            Action::RespondActivityTaskFailedById,
+            Action::RespondActivityTaskCanceledById,
+            Action::RecordActivityTaskHeartbeatById,
+        ] {
+            assert_eq!(action.worker_operation(), None);
+            assert_eq!(action.classification().access, Access::Write);
+        }
+    }
+
+    #[test]
+    fn fixed_worker_action_mapping_is_exhaustive() {
+        assert_eq!(
+            Action::ALL.len(),
+            Action::HealthRead as usize + 1,
+            "Action::ALL must include every action exactly once"
+        );
+        for action in Action::ALL {
+            let expected = matches!(
+                action,
+                Action::PollWorkflowTaskQueue
+                    | Action::RespondWorkflowTaskCompleted
+                    | Action::RespondWorkflowTaskFailed
+                    | Action::RespondQueryTaskCompleted
+                    | Action::PollActivityTaskQueue
+                    | Action::RespondActivityTaskCompleted
+                    | Action::RespondActivityTaskFailed
+                    | Action::RespondActivityTaskCanceled
+                    | Action::PollNexusTaskQueue
+                    | Action::RespondNexusTaskCompleted
+                    | Action::RespondNexusTaskFailed
+                    | Action::RecordActivityTaskHeartbeat
+                    | Action::RecordWorkerHeartbeat
+                    | Action::ShutdownWorker
+                    | Action::DescribeTaskQueue
+            );
+            assert_eq!(
+                action.worker_operation().is_some(),
+                expected,
+                "unexpected scoped Worker mapping for {action:?}"
+            );
+        }
+        for denied in [
+            Action::ResetStickyTaskQueue,
+            Action::ListWorkers,
+            Action::DescribeWorker,
+            Action::RespondActivityTaskCompletedById,
+            Action::StartActivityExecution,
+        ] {
+            assert_eq!(denied.worker_operation(), None);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn property_poll_target_normalization(
+            namespace_matches in any::<bool>(),
+            queue_matches in any::<bool>(),
+            sticky in any::<bool>(),
+            sticky_normal_present in any::<bool>(),
+            version_case in 0_u8..4,
+            deployment_matches in any::<bool>(),
+            build_matches in any::<bool>(),
+        ) {
+            // Feature: scoped-worker-authorization, Property 5: Poll-target normalization
+            let scope = WorkerScope::try_new(
+                "payments".to_owned(),
+                vec!["payments-queue".to_owned()],
+                "payments-deployment".to_owned(),
+                "build-a".to_owned(),
+            )
+            .expect("fixed valid scope");
+            let namespace = if namespace_matches { "payments" } else { "other" };
+            let selected_queue = if queue_matches {
+                "payments-queue"
+            } else {
+                "other-queue"
+            };
+            let task_queue = if sticky { "sticky-cache" } else { selected_queue };
+            let normal_task_queue = (sticky && sticky_normal_present).then_some(selected_queue);
+            let scoped_versioned = version_case == 0 || version_case == 1;
+            let deployment = match version_case {
+                0 => Some(if deployment_matches {
+                    "payments-deployment"
+                } else {
+                    "other-deployment"
+                }),
+                1 => None,
+                2 => Some("payments-deployment"), // deprecated-only coordinates
+                _ => None,
+            };
+            let build_id = match version_case {
+                0 => Some(if build_matches { "build-a" } else { "build-b" }),
+                1 => Some("build-a"), // partial modern options
+                2 => Some("build-a"),
+                _ => None,
+            };
+            let target = normalize_worker_poll_target(
+                task_queue,
+                normal_task_queue,
+                sticky,
+                scoped_versioned,
+                deployment,
+                build_id,
+                WorkerTaskClass::Workflow,
+            );
+
+            let actual = scope.authorize(
+                WorkerOperation::PollWorkflowTaskQueue,
+                namespace,
+                target,
+            );
+            let expected = namespace_matches
+                && queue_matches
+                && (!sticky || sticky_normal_present)
+                && version_case == 0
+                && deployment_matches
+                && build_matches;
+            prop_assert_eq!(actual == WorkerScopeDecision::Allow, expected);
+        }
+
+        #[test]
+        fn property_scoped_denial_classification_is_bounded_and_secret_free(
+            reason_index in 0_usize..8,
+            sensitive in ".{1,64}",
+        ) {
+            // Feature: scoped-worker-authorization, Property 13: Bounded denial classification
+            let reasons = [
+                WorkerScopeDenyReason::Operation,
+                WorkerScopeDenyReason::Namespace,
+                WorkerScopeDenyReason::Queue,
+                WorkerScopeDenyReason::Version,
+                WorkerScopeDenyReason::TaskOrigin,
+                WorkerScopeDenyReason::Heartbeat,
+                WorkerScopeDenyReason::WorkerSession,
+                WorkerScopeDenyReason::AmbiguousMapping,
+            ];
+            let label = reasons[reason_index].metric_label();
+            prop_assert!(matches!(
+                label,
+                "operation"
+                    | "namespace"
+                    | "queue"
+                    | "version"
+                    | "task_origin"
+                    | "heartbeat"
+                    | "worker_session"
+                    | "ambiguous_mapping"
+            ));
+            prop_assert!(!label.contains(&sensitive));
+            let public = PolicyAuthenticator::denied(None).to_string();
+            prop_assert_eq!(public.as_str(), "Request unauthorized.");
+            prop_assert!(!public.contains(&sensitive));
+        }
+    }
+
     #[cfg(not(feature = "conformance"))]
     #[test]
     fn production_auth_gates_equal_their_static_defaults() {
@@ -1247,6 +1902,66 @@ mod tests {
             .await
             .expect_err("allowed caller reaches lookup");
         assert!(matches!(error, EdgeError::NamespaceNotFound(namespace) if namespace == "missing"));
+    }
+
+    #[tokio::test]
+    async fn worker_preflight_and_final_target_reuse_one_authentication() {
+        let namespace_id = NamespaceId::new();
+        let namespaces = Arc::new(crate::namespace_cache::InMemoryNamespaceCache::new());
+        namespaces
+            .insert(ResolvedNamespace {
+                namespace_id: Some(namespace_id.0.to_string()),
+                ..ResolvedNamespace::active("payments")
+            })
+            .await
+            .expect("insert namespace");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let authenticator = Arc::new(PolicyAuthenticator::new(
+            Arc::new(CountingMapper {
+                claims: Claims {
+                    subject: "worker-a".to_owned(),
+                    auth_type: "jwt".to_owned(),
+                    worker_scope: Some(
+                        WorkerScope::try_new(
+                            "payments".to_owned(),
+                            vec!["payments-queue".to_owned()],
+                            "payments-deployment".to_owned(),
+                            "build-a".to_owned(),
+                        )
+                        .expect("scope"),
+                    ),
+                    ..Claims::default()
+                },
+                calls: calls.clone(),
+            }),
+            Arc::new(DefaultAuthorizer),
+            false,
+        ));
+        let edge = EdgeInterceptors::configured(namespaces, authenticator, false);
+
+        let context = edge
+            .begin_worker_preflight(
+                &HeaderMap::new(),
+                Some("payments"),
+                Action::PollWorkflowTaskQueue,
+                true,
+            )
+            .await
+            .expect("preflight");
+        edge.authorize_worker_target(
+            &context,
+            Action::PollWorkflowTaskQueue,
+            WorkerTarget::VersionedTask {
+                normal_task_queue: "payments-queue",
+                task_class: WorkerTaskClass::Workflow,
+                deployment_name: "payments-deployment",
+                build_id: "build-a",
+            },
+        )
+        .await
+        .expect("final target");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

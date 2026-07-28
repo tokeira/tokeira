@@ -64,7 +64,8 @@ use http_api_transport::HttpApiLayer;
 use nexus_http_transport::NexusHttpLayer;
 use tokeira_auth::{
     Authorizer, ClaimMapper, DefaultAuthorizer, GrantRule, GrantRules, JwksKeyProvider,
-    JwtAuthenticator, JwtIssuerProfile, MultiSourceClaimMapper, StsAuthenticator,
+    JwtAuthenticator, JwtIssuerProfile, MultiSourceClaimMapper, StsAuthenticator, WorkerScope,
+    WorkerScopeRule, WorkerScopeRules,
 };
 use tokeira_chasm::Library as _;
 use tokeira_config::{Cli, ConfigStorageKind, TokeiraConfig};
@@ -73,8 +74,8 @@ use tokeira_edge::{
     HistoryNotifyingRepository, HistoryWaitRegistry, HttpApiCatalog, HttpApiPolicy,
     InMemoryNamespaceCache, InMemoryOperatorApi, LocalOnlyRouter, LongPollConfig, LongPollGate,
     NamespaceCache, OperatorService, PendingQueryStore, PollerRegistry, ResolvedNamespace,
-    RoutingCache, WorkerComputeNamespaceCatalogAdapter, WorkflowExecutionDescription,
-    WorkflowService,
+    RoutingCache, ScopedWorkerSessionRegistry, WorkerComputeNamespaceCatalogAdapter,
+    WorkflowExecutionDescription, WorkflowService,
     conformance::{WireCoverageLayer, WireCoverageRecorder},
     grpc::{
         admin_service::AdminServiceGrpc, operator_service::OperatorServiceGrpc,
@@ -130,24 +131,50 @@ async fn build_authorization_stack(config: &TokeiraConfig) -> Result<Authorizati
                 })
                 .collect::<Result<Vec<_>>>()?,
         );
+        let worker_scopes = WorkerScopeRules::new(
+            issuer
+                .worker_scopes
+                .iter()
+                .map(|rule| {
+                    let scope = WorkerScope::try_new(
+                        rule.namespace.clone(),
+                        rule.task_queues.clone(),
+                        rule.deployment_name.clone(),
+                        rule.build_id.clone(),
+                    )
+                    .with_context(|| {
+                        format!("invalid JWT Worker scope for issuer {}", issuer.name)
+                    })?;
+                    WorkerScopeRule::new(rule.match_sub.clone(), scope).with_context(|| {
+                        format!(
+                            "invalid JWT Worker-scope subject for issuer {}",
+                            issuer.name
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
         let keys =
             JwksKeyProvider::start(issuer.jwks_uri.clone(), issuer.refresh_interval_duration())
                 .await;
-        profiles.push(JwtIssuerProfile::new(
-            issuer.name.clone(),
-            issuer.issuer.clone(),
-            issuer.audience.clone(),
-            issuer.permissions_claim.clone(),
-            grants,
-            keys,
-        ));
+        profiles.push(
+            JwtIssuerProfile::new(
+                issuer.name.clone(),
+                issuer.issuer.clone(),
+                issuer.audience.clone(),
+                issuer.permissions_claim.clone(),
+                grants,
+                keys,
+            )
+            .with_worker_scopes(worker_scopes),
+        );
     }
     let jwt = (!profiles.is_empty()).then(|| JwtAuthenticator::new(profiles));
     let sts = authorization
         .aws_iam
         .as_ref()
         .map(|aws_iam| {
-            aws_iam
+            let grants = aws_iam
                 .grants
                 .iter()
                 .map(|rule| {
@@ -158,8 +185,25 @@ async fn build_authorization_stack(config: &TokeiraConfig) -> Result<Authorizati
                     .context("invalid AWS IAM grants")
                 })
                 .collect::<Result<Vec<_>>>()
-                .map(GrantRules::new)
-                .map(StsAuthenticator::new)
+                .map(GrantRules::new)?;
+            let worker_scopes = WorkerScopeRules::new(
+                aws_iam
+                    .worker_scopes
+                    .iter()
+                    .map(|rule| {
+                        let scope = WorkerScope::try_new(
+                            rule.namespace.clone(),
+                            rule.task_queues.clone(),
+                            rule.deployment_name.clone(),
+                            rule.build_id.clone(),
+                        )
+                        .context("invalid AWS IAM Worker scope")?;
+                        WorkerScopeRule::new(rule.match_arn.clone(), scope)
+                            .context("invalid AWS IAM Worker-scope ARN")
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            Ok::<_, anyhow::Error>(StsAuthenticator::new(grants).with_worker_scopes(worker_scopes))
         })
         .transpose()?;
     let mapper: Arc<dyn ClaimMapper> = Arc::new(MultiSourceClaimMapper::new(jwt, sts));
@@ -198,6 +242,7 @@ use tokeira_runtime::{
 use tokeira_storage::{
     InMemoryStore, InMemoryWorkerComputeRepository, LeaseOutcome, LeaseRepository, ProjectionLog,
     RunRepository, TaskQueueConfigRepository, WorkerComputeRepository, WorkerDeploymentRepository,
+    WorkerTaskProvenanceStore,
     dsql::{DsqlAuthConfig, DsqlCoordinationConfig, DsqlPoolConfig, DsqlStore},
 };
 use tokeira_types::{
@@ -380,12 +425,28 @@ impl TokeiradHandle {
     /// configuration uses `TokeiraConfig::default()`, which selects the
     /// in-memory storage path.
     pub async fn start_in_memory(addr: SocketAddr) -> Result<Self> {
-        let mut config = TokeiraConfig::default();
+        Self::start_in_memory_with_config(addr, TokeiraConfig::default()).await
+    }
+
+    /// Start an in-memory `tokeirad` with an explicit validated configuration.
+    ///
+    /// This is the production bootstrap path with only storage selection and
+    /// listener addresses fixed for process-local integration tests. In
+    /// particular, configured authentication, authorization, and Worker-scope
+    /// policy are constructed exactly as they are by the binary.
+    pub async fn start_in_memory_with_config(
+        addr: SocketAddr,
+        mut config: TokeiraConfig,
+    ) -> Result<Self> {
+        config.infrastructure.storage = ConfigStorageKind::InMemory;
         // Bind the inbound Nexus completion listener on an ephemeral loopback port so
         // parallel in-memory servers (tests, multi-node harnesses) never collide on the
         // fixed default port; the runtime resolves `temporal://system` to the bound port.
         config.policy.nexus_completion.http_addr = "127.0.0.1:0".to_string();
         config.policy.nexus_completion.system_callback_url = "http://127.0.0.1:0".to_string();
+        config
+            .validate()
+            .context("invalid in-memory server config")?;
         let effective_config = Arc::new(config);
         let (server_task, bound_addr, shutdown_tx, background_cancel, log_broadcast, _recorder) =
             build_and_serve(addr, effective_config).await?;
@@ -396,6 +457,16 @@ impl TokeiradHandle {
             background_cancel,
             log_broadcast,
         })
+    }
+
+    /// Parse TOML and start the in-memory integration facade.
+    ///
+    /// Keeping parsing inside this crate lets cross-crate integration tests
+    /// exercise the public configuration surface without depending directly on
+    /// the configuration implementation crate.
+    pub async fn start_in_memory_with_toml(addr: SocketAddr, config: &str) -> Result<Self> {
+        let config = toml::from_str(config).context("parse in-memory server config")?;
+        Self::start_in_memory_with_config(addr, config).await
     }
 
     /// The socket address the server is bound to after startup.
@@ -704,6 +775,8 @@ async fn build_and_serve(
             let visibility_store = InMemoryVisibilityStore::default();
             let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
                 Arc::new(store.clone());
+            let worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore> =
+                Arc::new(store.clone());
             let worker_compute_repository =
                 effective_config.policy.worker_compute.enabled.then(|| {
                     Arc::new(InMemoryWorkerComputeRepository::default())
@@ -716,6 +789,7 @@ async fn build_and_serve(
                 worker_deployment_repository,
                 worker_compute_repository,
                 Arc::new(store.clone()),
+                worker_task_provenance,
                 store,
                 visibility_store.clone(),
                 {
@@ -756,6 +830,9 @@ async fn build_and_serve(
                         director.clone(),
                     )) as Arc<dyn WorkerComputeRepository>
                 });
+            let worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore> = Arc::new(
+                tokeira_storage::dsql::DsqlWorkerTaskProvenanceStore::new(director.clone()),
+            );
             let visibility_store = DsqlVisibilityStore::new(director);
             let worker_deployment_repository: Arc<dyn WorkerDeploymentRepository> =
                 Arc::new(worker_deployment_repository);
@@ -766,6 +843,7 @@ async fn build_and_serve(
                 worker_deployment_repository,
                 worker_compute_repository,
                 task_queue_config_repository,
+                worker_task_provenance,
                 projection_log,
                 visibility_store.clone(),
                 {
@@ -783,6 +861,52 @@ async fn build_and_serve(
 /// How often the visibility repair scanner sweeps committed executions to repair any
 /// projection lost by the best-effort post-commit write (Req 10.11).
 const VISIBILITY_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Authorization evidence is derived from task deadlines, so cleanup needs no
+/// operator TTL. One bounded batch per tick prevents expired rows from
+/// monopolizing the shared DSQL connection budget.
+const WORKER_TASK_PROVENANCE_CLEANUP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+const WORKER_TASK_PROVENANCE_CLEANUP_BATCH: usize = 256;
+
+fn spawn_worker_task_provenance_cleanup(
+    store: Arc<dyn WorkerTaskProvenanceStore>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(WORKER_TASK_PROVENANCE_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Err(error) = store
+                        .delete_expired(
+                            time::OffsetDateTime::now_utc(),
+                            WORKER_TASK_PROVENANCE_CLEANUP_BATCH,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error_kind = worker_task_provenance_cleanup_error_kind(&error),
+                            "Worker task authorization-evidence cleanup pass failed"
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn worker_task_provenance_cleanup_error_kind(
+    error: &tokeira_storage::WorkerTaskProvenanceError,
+) -> &'static str {
+    match error {
+        tokeira_storage::WorkerTaskProvenanceError::Unavailable { .. } => "unavailable",
+        tokeira_storage::WorkerTaskProvenanceError::DigestConflict => "conflict",
+        tokeira_storage::WorkerTaskProvenanceError::Corrupt { .. } => "corrupt",
+    }
+}
 
 /// Spawn the background visibility repair scanner: it reconstructs each committed
 /// execution's snapshot from authoritative node state and re-applies it iff-newer, so
@@ -863,6 +987,7 @@ async fn build_and_serve_with_storage<R, L, S, V, F>(
     worker_deployment_repository: Arc<dyn WorkerDeploymentRepository>,
     worker_compute_repository: Option<Arc<dyn WorkerComputeRepository>>,
     task_queue_config_repository: Arc<dyn TaskQueueConfigRepository>,
+    worker_task_provenance: Arc<dyn WorkerTaskProvenanceStore>,
     projection_log: L,
     visibility_query_store: V,
     projection_sink: F,
@@ -1032,6 +1157,10 @@ where
     let _task_queue_config_refresh = task_queue_config_store
         .clone()
         .spawn_refresh(background_cancel.clone());
+    let _worker_task_provenance_cleanup = spawn_worker_task_provenance_cleanup(
+        worker_task_provenance.clone(),
+        background_cancel.clone(),
+    );
 
     let _worker_compute_service = if effective_config.policy.worker_compute.enabled {
         let controller_repository = worker_compute_repository
@@ -1235,6 +1364,8 @@ where
             Arc::new(tokeira_runtime::BatchOperationStore::default()),
         )
         .with_nexus_http_waiters(nexus_http_waiters.clone())
+        .with_worker_task_provenance(worker_task_provenance)
+        .with_scoped_worker_sessions(ScopedWorkerSessionRegistry::default())
         .with_worker_deployment_runtime(runtime_adapter);
     // The Nexus endpoint admin shares the dispatch store, gated through the operator
     // interceptor (create/update/delete = OperatorWrite, get/list = OperatorRead).

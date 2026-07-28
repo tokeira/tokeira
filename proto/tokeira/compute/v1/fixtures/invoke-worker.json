@@ -1,0 +1,18 @@
+{
+  "schema": "tokeira.compute.v1.InvokeWorkerRequest",
+  "nexus": {
+    "service": "tokeira.worker.compute.v1.ComputeProvider",
+    "operation": "invoke-worker",
+    "request_id": "018f4f62-87c5-7b5c-a56e-1b3d9a7c4210"
+  },
+  "request_payload": {
+    "encoding": "binary/protobuf",
+    "message_type": "tokeira.compute.v1.InvokeWorkerRequest",
+    "data_base64": "CiQwMThmNGY2Mi04N2M1LTdiNWMtYTU2ZS0xYjNkOWE3YzQyMTASDXBheW1lbnRzLXByb2QaCHBheW1lbnRzIgdidWlsZC1hKgdwcmltYXJ5MAE6FQoRcGF5bWVudHMtd29ya2Zsb3cQAToVChFwYXltZW50cy1hY3Rpdml0eRACOhIKDnBheW1lbnRzLW5leHVzEANCBnlhZG9yaUosChYKCGVuY29kaW5nEgpqc29uL3BsYWluEhJ7InBvb2wiOiJkZWZhdWx0In1SIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHWAI="
+  },
+  "response_payload": {
+    "encoding": "binary/protobuf",
+    "message_type": "tokeira.compute.v1.InvokeWorkerResponse",
+    "data_base64": "CiQwMThmNGY2Mi04N2M1LTdiNWMtYTU2ZS0xYjNkOWE3YzQyMTA="
+  }
+}

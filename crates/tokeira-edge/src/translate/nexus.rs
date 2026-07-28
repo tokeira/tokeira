@@ -7,12 +7,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
-use tokeira_kernel::NexusResolution;
+use tokeira_kernel::{NexusResolution, WorkerDeploymentVersionRef};
 use tokeira_proto::{
     conversions::common::{
         failure_to_payload, payload_from_domain, payload_to_domain, to_proto_timestamp,
     },
-    public::temporal::api::{failure::v1 as failure_proto, nexus::v1 as nexus_v1},
+    public::temporal::api::{
+        enums::v1 as enums, failure::v1 as failure_proto, nexus::v1 as nexus_v1,
+    },
     workflowservice,
 };
 use tokeira_runtime::{NexusHttpTaskRequestVariant, NexusTaskRequest};
@@ -31,6 +33,8 @@ pub struct PollNexusTaskQueueRequest {
     pub namespace: String,
     pub worker_identity: String,
     pub task_queue: String,
+    /// Exact Worker Deployment Version selected by a VERSIONED poll.
+    pub deployment: Option<WorkerDeploymentVersionRef>,
     /// Worker observations piggybacked by the SDK on this long poll.
     ///
     /// They remain public protos until namespace admission because the edge
@@ -91,10 +95,32 @@ pub fn poll_request_to_edge(
             "task_queue.name must not be empty".to_string(),
         ));
     }
+    // v1.31.0 applies `validateDeploymentOptions` to Nexus polls just like
+    // workflow/activity polls: only VERSIONED mode requires both coordinates;
+    // unspecified and unversioned options carry no routing identity
+    // (`WorkflowHandler.PollNexusTaskQueue` and `validateDeploymentOptions`,
+    // service/frontend/workflow_handler.go @ v1.31.0).
+    let deployment = req.deployment_options.as_ref().and_then(|options| {
+        (enums::WorkerVersioningMode::try_from(options.worker_versioning_mode).ok()
+            == Some(enums::WorkerVersioningMode::Versioned))
+        .then_some(options)
+    });
+    if deployment.is_some_and(|options| {
+        options.deployment_name.trim().is_empty() || options.build_id.trim().is_empty()
+    }) {
+        return Err(NexusTranslateError::InvalidArgument(
+            "deployment_options must set deployment_name and build_id in VERSIONED mode".to_owned(),
+        ));
+    }
+    let deployment = deployment.map(|options| WorkerDeploymentVersionRef {
+        deployment_name: options.deployment_name.clone(),
+        build_id: options.build_id.clone(),
+    });
     Ok(PollNexusTaskQueueRequest {
         namespace: req.namespace,
         worker_identity: req.identity,
         task_queue: task_queue.name,
+        deployment,
         worker_heartbeats: req.worker_heartbeat,
     })
 }
@@ -297,6 +323,37 @@ pub fn proto_response_to_resolution(
         }
         Some(nexus_v1::response::Variant::CancelOperation(_)) => Ok(None),
         None => Err(NexusTranslateError::MissingField("response.variant")),
+    }
+}
+
+/// Reduce a worker's completed response to the provider-neutral compute contract.
+///
+/// Worker-compute accepts only synchronous StartOperation success. Exact payload
+/// shape and request-ID validation remain in runtime controller code.
+pub fn worker_compute_completion_from_response(
+    response: nexus_v1::Response,
+) -> tokeira_runtime::WorkerComputeProviderCompletion {
+    match response.variant {
+        Some(nexus_v1::response::Variant::StartOperation(start)) => match start.variant {
+            Some(nexus_v1::start_operation_response::Variant::SyncSuccess(sync)) => {
+                tokeira_runtime::WorkerComputeProviderCompletion::Synchronous(
+                    single_payload_to_payloads(sync.payload),
+                )
+            }
+            Some(nexus_v1::start_operation_response::Variant::AsyncSuccess(_)) => {
+                tokeira_runtime::WorkerComputeProviderCompletion::Asynchronous
+            }
+            Some(nexus_v1::start_operation_response::Variant::OperationError(_))
+            | Some(nexus_v1::start_operation_response::Variant::Failure(_)) => {
+                tokeira_runtime::WorkerComputeProviderCompletion::OperationUnsuccessful
+            }
+            None => {
+                tokeira_runtime::WorkerComputeProviderCompletion::Synchronous(Payloads::default())
+            }
+        },
+        Some(nexus_v1::response::Variant::CancelOperation(_)) | None => {
+            tokeira_runtime::WorkerComputeProviderCompletion::Synchronous(Payloads::default())
+        }
     }
 }
 
@@ -629,6 +686,25 @@ pub fn nexus_handler_failure_retryable(failure: &failure_proto::Failure) -> bool
     }
 }
 
+/// Retry classification for the deprecated worker HandlerError response.
+#[allow(deprecated)]
+pub fn legacy_nexus_handler_error_retryable(error: &nexus_v1::HandlerError) -> bool {
+    use tokeira_proto::public::temporal::api::enums::v1::NexusHandlerErrorRetryBehavior;
+    match error.retry_behavior() {
+        NexusHandlerErrorRetryBehavior::Retryable => true,
+        NexusHandlerErrorRetryBehavior::NonRetryable => false,
+        NexusHandlerErrorRetryBehavior::Unspecified => !matches!(
+            error.error_type.as_str(),
+            "BAD_REQUEST"
+                | "UNAUTHENTICATED"
+                | "UNAUTHORIZED"
+                | "NOT_FOUND"
+                | "NOT_IMPLEMENTED"
+                | "CONFLICT"
+        ),
+    }
+}
+
 /// Build the caller-facing `NexusResolution::Failed` for a worker handler failure,
 /// wrapping the handler's `failure` (the cause) in a `NexusOperationFailureInfo`,
 /// exactly as v1.31.0 records it on the `NexusOperationFailed` event
@@ -732,7 +808,13 @@ mod tests {
     use proptest::prelude::*;
     use time::OffsetDateTime;
     use tokeira_kernel::NexusResolution;
-    use tokeira_proto::public::common::Payload as ProtoPayload;
+    use tokeira_proto::{
+        public::{
+            common::Payload as ProtoPayload,
+            temporal::api::{deployment::v1::WorkerDeploymentOptions, taskqueue::v1::TaskQueue},
+        },
+        workflowservice::PollNexusTaskQueueRequest as ProtoPollNexusTaskQueueRequest,
+    };
 
     use super::*;
 
@@ -742,6 +824,51 @@ mod tests {
             metadata: BTreeMap::new(),
             external_payloads: Vec::new(),
         }
+    }
+
+    #[test]
+    fn nexus_poll_preserves_only_complete_versioned_deployment_options() {
+        let request = |options| ProtoPollNexusTaskQueueRequest {
+            namespace: "default".to_owned(),
+            task_queue: Some(TaskQueue {
+                name: "nexus".to_owned(),
+                ..Default::default()
+            }),
+            deployment_options: options,
+            ..Default::default()
+        };
+        let versioned = poll_request_to_edge(request(Some(WorkerDeploymentOptions {
+            worker_versioning_mode: enums::WorkerVersioningMode::Versioned as i32,
+            deployment_name: "payments".to_owned(),
+            build_id: "build-a".to_owned(),
+            ..Default::default()
+        })))
+        .expect("complete versioned poll");
+        assert_eq!(
+            versioned.deployment,
+            Some(WorkerDeploymentVersionRef {
+                deployment_name: "payments".to_owned(),
+                build_id: "build-a".to_owned(),
+            })
+        );
+
+        let unversioned = poll_request_to_edge(request(Some(WorkerDeploymentOptions {
+            worker_versioning_mode: enums::WorkerVersioningMode::Unversioned as i32,
+            deployment_name: "ignored".to_owned(),
+            build_id: "ignored".to_owned(),
+            ..Default::default()
+        })))
+        .expect("unversioned options");
+        assert_eq!(unversioned.deployment, None);
+
+        let error = poll_request_to_edge(request(Some(WorkerDeploymentOptions {
+            worker_versioning_mode: enums::WorkerVersioningMode::Versioned as i32,
+            deployment_name: "payments".to_owned(),
+            build_id: String::new(),
+            ..Default::default()
+        })))
+        .expect_err("incomplete versioned options");
+        assert!(matches!(error, NexusTranslateError::InvalidArgument(_)));
     }
 
     #[test]
@@ -765,6 +892,93 @@ mod tests {
             ..Default::default()
         };
         assert!(!failure_has_nexus_handler_info(&without));
+    }
+
+    #[test]
+    fn worker_compute_completion_translation_preserves_only_transport_shape() {
+        let sync = nexus_v1::Response {
+            variant: Some(nexus_v1::response::Variant::StartOperation(
+                nexus_v1::StartOperationResponse {
+                    variant: Some(nexus_v1::start_operation_response::Variant::SyncSuccess(
+                        nexus_v1::start_operation_response::Sync {
+                            payload: Some(ProtoPayload {
+                                metadata: BTreeMap::new(),
+                                data: b"result".to_vec(),
+                                external_payloads: Vec::new(),
+                            }),
+                            links: Vec::new(),
+                        },
+                    )),
+                },
+            )),
+        };
+        assert_eq!(
+            worker_compute_completion_from_response(sync),
+            tokeira_runtime::WorkerComputeProviderCompletion::Synchronous(Payloads(vec![
+                Payload {
+                    metadata: BTreeMap::new(),
+                    data: b"result".to_vec(),
+                    external_payloads: Vec::new(),
+                },
+            ])),
+        );
+
+        let asynchronous = nexus_v1::Response {
+            variant: Some(nexus_v1::response::Variant::StartOperation(
+                nexus_v1::StartOperationResponse {
+                    variant: Some(nexus_v1::start_operation_response::Variant::AsyncSuccess(
+                        nexus_v1::start_operation_response::Async::default(),
+                    )),
+                },
+            )),
+        };
+        assert_eq!(
+            worker_compute_completion_from_response(asynchronous),
+            tokeira_runtime::WorkerComputeProviderCompletion::Asynchronous,
+        );
+        assert_eq!(
+            worker_compute_completion_from_response(nexus_v1::Response {
+                variant: Some(nexus_v1::response::Variant::CancelOperation(
+                    nexus_v1::CancelOperationResponse {},
+                )),
+            }),
+            tokeira_runtime::WorkerComputeProviderCompletion::Synchronous(Payloads::default()),
+            "runtime contract validation owns whether this shape is terminal",
+        );
+    }
+
+    #[test]
+    fn worker_compute_handler_retryability_matches_v1_31_0_defaults_and_overrides() {
+        let modern = |error_type: &str, retry_behavior| failure_proto::Failure {
+            failure_info: Some(
+                failure_proto::failure::FailureInfo::NexusHandlerFailureInfo(
+                    failure_proto::NexusHandlerFailureInfo {
+                        r#type: error_type.to_owned(),
+                        retry_behavior,
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        assert!(!nexus_handler_failure_retryable(&modern(
+            "BAD_REQUEST",
+            enums::NexusHandlerErrorRetryBehavior::Unspecified as i32,
+        )));
+        assert!(nexus_handler_failure_retryable(&modern(
+            "INTERNAL",
+            enums::NexusHandlerErrorRetryBehavior::Unspecified as i32,
+        )));
+        assert!(nexus_handler_failure_retryable(&modern(
+            "BAD_REQUEST",
+            enums::NexusHandlerErrorRetryBehavior::Retryable as i32,
+        )));
+
+        let legacy = nexus_v1::HandlerError {
+            error_type: "INTERNAL".to_owned(),
+            failure: None,
+            retry_behavior: enums::NexusHandlerErrorRetryBehavior::NonRetryable as i32,
+        };
+        assert!(!legacy_nexus_handler_error_retryable(&legacy));
     }
 
     #[test]

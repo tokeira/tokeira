@@ -54,6 +54,7 @@ pub mod task_queue_config;
 pub mod timeout;
 pub mod update;
 pub mod wft_timeout;
+pub mod worker_compute;
 pub mod worker_registry;
 mod workflow_rules;
 
@@ -86,4 +87,5 @@ pub use task_queue_config::*;
 pub use timeout::*;
 pub use update::*;
 pub use wft_timeout::*;
+pub use worker_compute::*;
 pub use worker_registry::*;

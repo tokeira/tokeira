@@ -113,6 +113,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: ObservabilityAction,
     },
+    /// Inspect durable operational state without mutating the deployment.
+    Diagnostics {
+        #[command(subcommand)]
+        action: DiagnosticsAction,
+    },
     Workstation {
         #[command(subcommand)]
         action: WorkstationAction,
@@ -131,6 +136,16 @@ pub(crate) enum Command {
         verbose: bool,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DiagnosticsAction {
+    /// Report durable Worker Compute Controller health for one namespace.
+    WorkerCompute {
+        /// Public Temporal namespace name.
+        #[arg(long)]
+        namespace: String,
     },
 }
 

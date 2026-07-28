@@ -1,6 +1,7 @@
 # Canonical Tokeira production configuration example.
 # An empty document is valid; the active values below spell out the same safe defaults.
 # Priority remains enabled. User Fairness is disabled unless enable_fairness is true.
+# Worker Compute is disabled; enabling it may cause configured providers to create billable capacity.
 # The Nexus callback URL must be reachable from Nexus workers; loopback assumes co-location.
 # JWT issuer routing requires issuer to exactly equal the token's signed iss value.
 # Optional JWT/AWS identity sources are shown commented and are not enabled by this file.
@@ -87,6 +88,7 @@
 # @field policy.quotas.max_signal_payload_bytes | configured parity | default=4194304 | Maximum admitted signal payload size.
 # @field policy.quotas.max_workflow_timeout_seconds | configured parity | default=315360000 | Maximum admitted workflow execution timeout.
 # @field policy.task_queues.enable_fairness | configured parity | default=false | Opt in to weighted User Fairness; priority remains enabled.
+# @field policy.worker_compute.enabled | Tokeira native | default=false | Enable the experimental remote Worker Compute Controller; configured providers may create billable capacity.
 
 [infrastructure]
 cluster_name = "tokeira-local"
@@ -146,6 +148,9 @@ enable_standalone_activities = false
 
 [policy.task_queues]
 enable_fairness = false
+
+[policy.worker_compute]
+enabled = false
 
 [policy.nexus_endpoint_limits]
 name_max_length = 200

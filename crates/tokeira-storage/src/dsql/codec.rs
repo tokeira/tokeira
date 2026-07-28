@@ -18,7 +18,7 @@ use tokeira_types::{EventPrincipal, Payloads, ProjectionCursor, WorkflowRuleReco
 
 use crate::{
     BacklogPayload, ProjectionContext, StoredTaskQueueConfig, StoredTaskQueueConfigKind,
-    StoredTaskQueueConfigMetadata, StoredWorkerDeployment,
+    StoredTaskQueueConfigMetadata, StoredWorkerDeployment, WorkerComputeControllerRecord,
 };
 
 const BACKLOG_ENVELOPE_VERSION: u32 = 0x544B_4251;
@@ -60,6 +60,16 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 /// means the repository cannot safely infer derived state from that row.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     postcard::from_bytes(bytes).map_err(Into::into)
+}
+
+/// Serialize one versioned Worker Compute Controller record.
+pub fn encode_worker_compute_controller(record: &WorkerComputeControllerRecord) -> Result<Vec<u8>> {
+    encode(record)
+}
+
+/// Deserialize one versioned Worker Compute Controller record.
+pub fn decode_worker_compute_controller(bytes: &[u8]) -> Result<WorkerComputeControllerRecord> {
+    decode(bytes)
 }
 
 /// Serialize the current materialized workflow state for `workflow_hot`.

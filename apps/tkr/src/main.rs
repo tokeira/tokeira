@@ -231,6 +231,10 @@ async fn main() -> Result<()> {
             let ctx = load_context(&deployments, selected)?;
             commands::observability::run(action, ctx)
         }
+        Command::Diagnostics { action } => {
+            let ctx = load_context(&deployments, selected)?;
+            commands::diagnostics::run(action, ctx, cli.json).await
+        }
         Command::Workstation { action } => commands::workstation::run(action, cli.json).await,
         Command::Admin { command } => {
             let ctx = load_context(&deployments, selected)?;
@@ -393,7 +397,7 @@ mod tests {
     use crate::{
         cli::{
             CliPlatformKind, CliStorageKind, ConfigAction, DeployAction, DeploymentAction,
-            DevAction, InfraAction, ObservabilityAction, ScaleAction,
+            DevAction, DiagnosticsAction, InfraAction, ObservabilityAction, ScaleAction,
         },
         deployment_dir::{DEPLOYMENT_TOML, METADATA_JSON, TOKEIRAD_TOML},
     };
@@ -481,6 +485,26 @@ mod tests {
                 action: DevAction::Check
             }
         ));
+    }
+
+    #[test]
+    fn parses_worker_compute_diagnostics_as_read_only() {
+        let command = Cli::try_parse_from([
+            "tkr",
+            "diagnostics",
+            "worker-compute",
+            "--namespace",
+            "payments",
+        ])
+        .expect("diagnostics command")
+        .command;
+        assert!(matches!(
+            &command,
+            Command::Diagnostics {
+                action: DiagnosticsAction::WorkerCompute { namespace }
+            } if namespace == "payments"
+        ));
+        assert!(mutation_target(&command, Some("prod")).is_none());
     }
 
     #[test]

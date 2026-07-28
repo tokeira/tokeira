@@ -40,10 +40,11 @@ use tokeira_storage::{
     WorkerDeploymentRepository, WorkerDeploymentVersionKey, WorkerDeploymentVersionStatus,
 };
 use tokeira_types::{
-    BuildId as RuntimeBuildId, DeploymentId, NamespaceId, Payload, TaskKind, TaskQueueName,
+    BuildId as RuntimeBuildId, ControllerInstanceKey, DeploymentId, NamespaceId, Payload, TaskKind,
+    TaskQueueName,
 };
 
-use crate::WorkerRegistry;
+use crate::{DisabledWorkerComputeSink, WorkerComputeReconcileSink, WorkerRegistry};
 
 const MAX_CAS_ATTEMPTS: usize = 32;
 const MAX_DEPLOYMENT_PAGE_SIZE: usize = 100;
@@ -225,6 +226,7 @@ pub struct DeploymentRegistry {
     clock: Arc<dyn RegistryClock>,
     membership_cache: Arc<Mutex<HashMap<VersionMembershipCacheKey, CachedMembership>>>,
     reactivation_cache: Arc<Mutex<HashMap<VersionReactivationCacheKey, OffsetDateTime>>>,
+    worker_compute_reconcile_sink: Arc<Mutex<Arc<dyn WorkerComputeReconcileSink>>>,
 }
 
 impl DeploymentRegistry {
@@ -247,6 +249,9 @@ impl DeploymentRegistry {
             clock,
             membership_cache: Arc::new(Mutex::new(HashMap::new())),
             reactivation_cache: Arc::new(Mutex::new(HashMap::new())),
+            worker_compute_reconcile_sink: Arc::new(Mutex::new(Arc::new(
+                DisabledWorkerComputeSink,
+            ))),
         }
     }
 
@@ -276,6 +281,9 @@ impl DeploymentRegistry {
             clock,
             membership_cache: Arc::new(Mutex::new(HashMap::new())),
             reactivation_cache: Arc::new(Mutex::new(HashMap::new())),
+            worker_compute_reconcile_sink: Arc::new(Mutex::new(Arc::new(
+                DisabledWorkerComputeSink,
+            ))),
         }
     }
 
@@ -285,6 +293,14 @@ impl DeploymentRegistry {
 
     pub fn now(&self) -> OffsetDateTime {
         self.clock.now()
+    }
+
+    /// Share the non-blocking controller reconciliation sink with registry clones.
+    pub fn set_worker_compute_reconcile_sink(&self, sink: Arc<dyn WorkerComputeReconcileSink>) {
+        *self
+            .worker_compute_reconcile_sink
+            .lock()
+            .expect("worker-compute reconcile-sink lock poisoned") = sink;
     }
 
     /// Determine whether a pinned workflow query has no eligible worker.
@@ -1670,44 +1686,57 @@ impl DeploymentRegistry {
             namespace_id: cmd.namespace_id,
             deployment_name: version.deployment_name.clone(),
         };
-        self.mutate_deployment(&key, |loaded, _now| {
-            let Some(record) = loaded else {
-                return Err(RegistryError::NotFound);
-            };
-            let Some(version_record) = record.versions.get(&version.build_id) else {
-                return Err(RegistryError::NotFound);
-            };
-            // Idempotency dedupe is keyed per Version (its own request-id set), so a
-            // replayed compute-config update is a no-op even after other Versions changed.
-            if request_id_matches(&version_record.compute_config_request_ids, &cmd.request_id) {
-                return Ok(RegistryMutation::Unchanged(()));
-            }
-            validate_compute_config_change(&cmd.updates, &cmd.removals)?;
-
-            let mut next = record.clone();
-            {
-                let version_record = next
-                    .versions
-                    .get_mut(&version.build_id)
-                    .expect("version present: resolved on the record this was cloned from");
-                apply_compute_config_change(
-                    &mut version_record.compute_config,
-                    &cmd.updates,
-                    &cmd.removals,
-                )?;
-                validate_compute_config_shape(&version_record.compute_config)?;
-                if !cmd.request_id.is_empty() {
-                    version_record
-                        .compute_config_request_ids
-                        .insert(cmd.request_id.clone());
+        let changed = self
+            .mutate_deployment(&key, |loaded, _now| {
+                let Some(record) = loaded else {
+                    return Err(RegistryError::NotFound);
+                };
+                let Some(version_record) = record.versions.get(&version.build_id) else {
+                    return Err(RegistryError::NotFound);
+                };
+                // Idempotency dedupe is keyed per Version (its own request-id set), so a
+                // replayed compute-config update is a no-op even after other Versions changed.
+                if request_id_matches(&version_record.compute_config_request_ids, &cmd.request_id) {
+                    return Ok(RegistryMutation::Unchanged(false));
                 }
-                record_version_modifier(version_record, &cmd.identity);
-            }
-            record_deployment_modifier(&mut next, &cmd.identity);
-            Ok(RegistryMutation::Put(next, ()))
-        })
-        .await
-        .map(|_| ())
+                validate_compute_config_change(&cmd.updates, &cmd.removals)?;
+
+                let mut next = record.clone();
+                {
+                    let version_record = next
+                        .versions
+                        .get_mut(&version.build_id)
+                        .expect("version present: resolved on the record this was cloned from");
+                    apply_compute_config_change(
+                        &mut version_record.compute_config,
+                        &cmd.updates,
+                        &cmd.removals,
+                    )?;
+                    validate_compute_config_shape(&version_record.compute_config)?;
+                    if !cmd.request_id.is_empty() {
+                        version_record
+                            .compute_config_request_ids
+                            .insert(cmd.request_id.clone());
+                    }
+                    record_version_modifier(version_record, &cmd.identity);
+                }
+                record_deployment_modifier(&mut next, &cmd.identity);
+                Ok(RegistryMutation::Put(next, true))
+            })
+            .await?
+            .value;
+        if changed {
+            let _ = self
+                .worker_compute_reconcile_sink
+                .lock()
+                .expect("worker-compute reconcile-sink lock poisoned")
+                .try_reconcile(ControllerInstanceKey {
+                    namespace_id: cmd.namespace_id,
+                    deployment_name: DeploymentId(version.deployment_name.0),
+                    build_id: RuntimeBuildId(version.build_id.0),
+                });
+        }
+        Ok(())
     }
 
     pub async fn validate_compute_config(
@@ -2972,90 +3001,14 @@ fn validate_compute_config_change(
 }
 
 fn validate_compute_config_shape(compute_config: &ComputeConfig) -> Result<(), RegistryError> {
-    let mut catch_all_seen = false;
-    let mut task_types = BTreeSet::new();
-    for (name, group) in &compute_config.scaling_groups {
-        validate_non_empty_key(name, "compute config scaling group")?;
-        if group.task_queue_types.is_empty() {
-            if catch_all_seen {
-                return Err(RegistryError::InvalidArgument(format!(
-                    "entry {name}: only one scaling group can have no task types defined"
-                )));
-            }
-            catch_all_seen = true;
-        }
-        for task_type in &group.task_queue_types {
-            if *task_type == DeploymentTaskQueueType::Unspecified {
-                return Err(RegistryError::InvalidArgument(format!(
-                    "entry {name}: task type undefined not allowed in compute spec"
-                )));
-            }
-            if !task_types.insert(*task_type) {
-                return Err(RegistryError::InvalidArgument(format!(
-                    "entry {name}: task type {} appears in more than one entry",
-                    deployment_task_queue_type_name(*task_type)
-                )));
-            }
-        }
-
-        let provider_type = group
-            .provider
-            .as_ref()
-            .map(|provider| provider.provider_type.as_str())
-            .unwrap_or_default();
-        if !matches!(
-            provider_type,
-            "aws-lambda"
-                | "aws-ecs"
-                | "subprocess"
-                | "k8s"
-                | "gcp-cloud-run"
-                | "test-invoke"
-                | "test-worker-set"
-        ) {
-            return Err(RegistryError::InvalidArgument(format!(
-                "entry {name}: invalid compute provider type '{provider_type}'"
-            )));
-        }
-        if matches!(provider_type, "test-invoke" | "test-worker-set")
-            && group
-                .provider
-                .as_ref()
-                .and_then(|provider| provider.details.as_ref())
-                .is_some_and(|details| {
-                    serde_json::from_slice::<serde_json::Value>(&details.data)
-                        .ok()
-                        .and_then(|value| value.as_object().cloned())
-                        .is_some_and(|object| object.contains_key("illegal_field"))
-                })
-        {
-            // The v1.31.0 server delegates provider validation to the WCI package
-            // pinned in its go.mod. Its two test providers deliberately reject this
-            // field; the functional corpus exercises that public rejection.
-            return Err(RegistryError::InvalidArgument(
-                "illegal_field found in config".to_string(),
-            ));
-        }
-
-        if let Some(scaler) = &group.scaler
-            && !matches!(scaler.scaler_type.as_str(), "no-sync" | "rate-based")
-        {
-            return Err(RegistryError::InvalidArgument(format!(
-                "entry {name}: invalid scaling algorithm type '{}'",
-                scaler.scaler_type
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn deployment_task_queue_type_name(task_type: DeploymentTaskQueueType) -> &'static str {
-    match task_type {
-        DeploymentTaskQueueType::Workflow => "Workflow",
-        DeploymentTaskQueueType::Activity => "Activity",
-        DeploymentTaskQueueType::Nexus => "Nexus",
-        DeploymentTaskQueueType::Unspecified => "Unspecified",
-    }
+    // Remote-provider eligibility is pure and endpoint-agnostic: endpoint
+    // existence is deliberately resolved only when an action is delivered, so
+    // Worker Deployment and Nexus endpoint resources can be authored in either
+    // order. The mutation closure applies changes to a clone before this call,
+    // preserving the existing CAS atomicity on rejection.
+    crate::worker_compute::validate_compute_config(compute_config)
+        .map(|_| ())
+        .map_err(|error| RegistryError::InvalidArgument(error.to_string()))
 }
 
 fn deployment_has_task_queue(
@@ -3446,6 +3399,19 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingReconcileSink(Mutex<Vec<ControllerInstanceKey>>);
+
+    impl WorkerComputeReconcileSink for RecordingReconcileSink {
+        fn try_reconcile(&self, key: ControllerInstanceKey) -> crate::ObserveResult {
+            self.0
+                .lock()
+                .expect("recording reconcile-sink lock poisoned")
+                .push(key);
+            crate::ObserveResult::Accepted
+        }
+    }
+
     fn registry_with_store() -> (DeploymentRegistry, Arc<InMemoryStore>) {
         registry_with_store_at(OffsetDateTime::UNIX_EPOCH)
     }
@@ -3687,6 +3653,13 @@ mod tests {
     }
 
     fn scaling_group(provider_type: &str, scaler_type: &str) -> ComputeConfigScalingGroup {
+        // Every scaler fixture uses a valid JSON object because update-mask tests may
+        // retain `scaler.type = no-sync` while replacing only `scaler.details`.
+        let scaler_details = Payload {
+            data: br#"{"scale_up_backlog_threshold":1}"#.to_vec(),
+            metadata: BTreeMap::from([("encoding".to_string(), "json/plain".to_string())]),
+            external_payloads: Vec::new(),
+        };
         ComputeConfigScalingGroup {
             task_queue_types: vec![DeploymentTaskQueueType::Workflow],
             provider: Some(ComputeProvider {
@@ -3696,7 +3669,7 @@ mod tests {
             }),
             scaler: Some(ComputeScaler {
                 scaler_type: scaler_type.to_string(),
-                details: Some(Payload::new(format!("scaler-{scaler_type}"))),
+                details: Some(scaler_details),
             }),
         }
     }
@@ -5325,6 +5298,147 @@ mod tests {
                             TestCaseError::fail(format!("describe version failed: {error:?}"))
                         })?;
                     prop_assert_eq!(&described.record.compute_config, &model);
+                }
+
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+
+        // Feature: worker-compute-controller, Property 2: eligibility is deterministic and mutation-atomic
+        #[test]
+        fn property_worker_compute_validation_is_registry_atomic(
+            remote in any::<bool>(),
+            provider_mode in 0u8..3,
+            scaler_mode in 0u8..4,
+            task_types in proptest::collection::btree_set(0u8..3, 0..=3),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async move {
+                let (registry, store) = registry_with_store();
+                let namespace_id = NamespaceId::new();
+                registry
+                    .create_deployment(create_cmd(
+                        namespace_id,
+                        "deployment-a",
+                        "create-deployment",
+                    ))
+                    .await
+                    .map_err(|error| {
+                        TestCaseError::fail(format!("seed deployment failed: {error:?}"))
+                    })?;
+                registry
+                    .create_version(create_version_cmd(
+                        namespace_id,
+                        "deployment-a",
+                        "build-a",
+                        "create-version",
+                    ))
+                    .await
+                    .map_err(|error| {
+                        TestCaseError::fail(format!("seed version failed: {error:?}"))
+                    })?;
+
+                let provider_type = match provider_mode {
+                    0 => "aws-lambda",
+                    1 => "implementation-specific",
+                    _ => "",
+                };
+                let scaler = match scaler_mode {
+                    0 => None,
+                    1 => Some(ComputeScaler {
+                        scaler_type: "no-sync".to_owned(),
+                        details: None,
+                    }),
+                    2 => Some(ComputeScaler {
+                        scaler_type: "rate-based".to_owned(),
+                        details: None,
+                    }),
+                    _ => Some(ComputeScaler {
+                        scaler_type: "unknown".to_owned(),
+                        details: None,
+                    }),
+                };
+                let task_queue_types = task_types
+                    .into_iter()
+                    .map(|value| match value {
+                        0 => DeploymentTaskQueueType::Workflow,
+                        1 => DeploymentTaskQueueType::Activity,
+                        _ => DeploymentTaskQueueType::Nexus,
+                    })
+                    .collect::<Vec<_>>();
+                let group = ComputeConfigScalingGroup {
+                    task_queue_types,
+                    provider: Some(ComputeProvider {
+                        provider_type: provider_type.to_owned(),
+                        details: None,
+                        nexus_endpoint: if remote {
+                            "provider-endpoint".to_owned()
+                        } else {
+                            String::new()
+                        },
+                    }),
+                    scaler,
+                };
+                let proposed = ComputeConfig {
+                    scaling_groups: BTreeMap::from([("group".to_owned(), group.clone())]),
+                };
+                let first_validation =
+                    crate::worker_compute::validate_compute_config(&proposed);
+                prop_assert_eq!(
+                    &first_validation,
+                    &crate::worker_compute::validate_compute_config(&proposed)
+                );
+
+                let provider_valid = provider_mode == 0 || (remote && provider_mode == 1);
+                let scaler_valid = scaler_mode < 3;
+                let remote_has_scaler = !remote || scaler_mode != 0;
+                let expected_valid = provider_valid && scaler_valid && remote_has_scaler;
+                prop_assert_eq!(first_validation.is_ok(), expected_valid);
+
+                let key = deployment_key(namespace_id, "deployment-a");
+                let before = store.load_deployment(&key).await.unwrap();
+                let mut cmd = compute_update_cmd(
+                    namespace_id,
+                    "deployment-a",
+                    Some("build-a"),
+                    "worker-compute-update",
+                );
+                cmd.updates.insert(
+                    "group".to_owned(),
+                    ComputeConfigScalingGroupUpdate {
+                        scaling_group: group,
+                        update_mask: Vec::new(),
+                    },
+                );
+                let result = registry.update_compute_config(cmd).await;
+                let after = store.load_deployment(&key).await.unwrap();
+
+                if expected_valid {
+                    result.map_err(|error| {
+                        TestCaseError::fail(format!("valid update failed: {error:?}"))
+                    })?;
+                    prop_assert_ne!(&after, &before);
+                    prop_assert_eq!(
+                        &after
+                            .as_ref()
+                            .expect("deployment remains")
+                            .versions
+                            .get(&BuildId("build-a".to_owned()))
+                            .expect("version remains")
+                            .compute_config,
+                        &proposed
+                    );
+                } else {
+                    let error = result.expect_err("invalid update must fail");
+                    prop_assert_eq!(
+                        registry_error_kind(&error),
+                        RegistryErrorKind::InvalidArgument
+                    );
+                    prop_assert_eq!(after, before);
                 }
 
                 Ok::<(), proptest::test_runner::TestCaseError>(())
@@ -8516,6 +8630,57 @@ mod tests {
             .await
             .unwrap();
         assert!(removed.record.compute_config.scaling_groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compute_config_commit_emits_one_non_blocking_reconcile_hint() {
+        let (registry, _) = registry_with_store();
+        let sink = Arc::new(RecordingReconcileSink::default());
+        registry.set_worker_compute_reconcile_sink(sink.clone());
+        let namespace_id = NamespaceId::new();
+        registry
+            .create_deployment(create_cmd(namespace_id, "deployment-a", "request-a"))
+            .await
+            .expect("deployment create");
+        registry
+            .create_version(create_version_cmd(
+                namespace_id,
+                "deployment-a",
+                "build-a",
+                "version-request-a",
+            ))
+            .await
+            .expect("version create");
+
+        let mut update =
+            compute_update_cmd(namespace_id, "deployment-a", Some("build-a"), "compute-a");
+        update.updates.insert(
+            "primary".to_owned(),
+            ComputeConfigScalingGroupUpdate {
+                scaling_group: scaling_group("remote-provider", "no-sync"),
+                update_mask: vec!["provider".to_owned(), "scaler".to_owned()],
+            },
+        );
+        registry
+            .update_compute_config(update.clone())
+            .await
+            .expect("compute-config update");
+        registry
+            .update_compute_config(update)
+            .await
+            .expect("idempotent replay");
+
+        assert_eq!(
+            *sink
+                .0
+                .lock()
+                .expect("recording reconcile-sink lock poisoned"),
+            vec![ControllerInstanceKey {
+                namespace_id,
+                deployment_name: DeploymentId("deployment-a".to_owned()),
+                build_id: RuntimeBuildId("build-a".to_owned()),
+            }]
+        );
     }
 
     #[tokio::test]

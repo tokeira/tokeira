@@ -28,6 +28,7 @@ pub mod run_repository;
 pub mod slot_block_manager;
 pub mod task_queue_config;
 pub mod validation;
+pub mod worker_compute_repository;
 pub mod worker_deployment_repository;
 
 pub use aws_http::offline_ddb_client;
@@ -43,6 +44,7 @@ pub use run_repository::*;
 pub use slot_block_manager::*;
 pub use task_queue_config::*;
 pub use validation::*;
+pub use worker_compute_repository::*;
 pub use worker_deployment_repository::*;
 
 /// Production DSQL storage foundation.
@@ -219,6 +221,13 @@ impl DsqlStore {
     /// field or a wider `into_parts` tuple.
     pub fn task_queue_config_repository(&self) -> task_queue_config::DsqlTaskQueueConfigRepository {
         task_queue_config::DsqlTaskQueueConfigRepository::new(Arc::clone(&self.director))
+    }
+
+    /// Construct a Worker Compute Controller repository over the shared director.
+    pub fn worker_compute_repository(
+        &self,
+    ) -> worker_compute_repository::DsqlWorkerComputeRepository {
+        worker_compute_repository::DsqlWorkerComputeRepository::new(Arc::clone(&self.director))
     }
 
     /// Decompose the facade into owned backend components.

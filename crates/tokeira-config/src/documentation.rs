@@ -455,6 +455,14 @@ pub const CONFIG_FIELD_CATALOG: &[ConfigFieldDocumentation] = &[
         "Opt in to weighted User Fairness; priority remains enabled."
     ),
     field!(
+        "policy.worker_compute.enabled",
+        TokeiraNative,
+        "false",
+        false,
+        Some("worker-compute-controller"),
+        "Enable the experimental remote Worker Compute Controller; configured providers may create billable capacity."
+    ),
+    field!(
         "policy.nexus_endpoint_limits.name_max_length",
         StockParity,
         "200",
@@ -801,6 +809,10 @@ enable_standalone_activities = false
 [policy.task_queues]
 # Priority remains enabled when this field is absent; User Fairness does not.
 enable_fairness = false
+
+[policy.worker_compute]
+# Enabling this can cause configured Nexus providers to create billable capacity.
+enabled = false
 
 [policy.nexus_endpoint_limits]
 name_max_length = 200

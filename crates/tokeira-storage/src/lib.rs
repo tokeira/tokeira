@@ -30,8 +30,10 @@ pub mod memory;
 pub mod metrics;
 #[cfg(test)]
 mod preservation_property_tests;
+pub mod worker_compute;
 
 pub use api::*;
 pub use chasm::*;
 pub use memory::*;
 pub use metrics::*;
+pub use worker_compute::*;

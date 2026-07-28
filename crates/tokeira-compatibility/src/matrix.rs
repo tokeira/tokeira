@@ -234,6 +234,22 @@ const USER_FAIRNESS_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
     prerequisites: &["Priority-aware delivery (enabled by default)"],
 };
 
+const WORKER_COMPUTE_CONTROLLER_CATALOG: FeatureCatalogMetadata = FeatureCatalogMetadata {
+    origin: FeatureOrigin::TemporalV1_31,
+    conformance: ConformanceDisposition::OutOfSurface,
+    temporal_maturity: TemporalMaturity::Experimental,
+    temporal_default: DefaultPosture::Disabled,
+    tokeira_default: DefaultPosture::Disabled,
+    enablement: FeatureEnablement {
+        kind: EnablementKind::Toml,
+        reference: Some("policy.worker_compute.enabled = true"),
+    },
+    scopes: CLUSTER_SCOPE,
+    mutability: PolicyMutability::StartupStatic,
+    guidance: "Set [policy.worker_compute].enabled = true and restart tokeirad; configured Nexus providers may create billable external capacity.",
+    prerequisites: &["Configured remote Nexus endpoint implementing invoke-worker"],
+};
+
 const AUTHORIZATION_SURFACES: &[CompatibilitySurface] = &[
     CompatibilitySurface {
         kind: CompatibilitySurfaceKind::BehaviouralInvariant,
@@ -308,6 +324,11 @@ const WORKER_DEPLOYMENT_EVIDENCE: &[CompatibilityEvidence] = &[
         reference: "crates/tokeira-runtime/src/runtime/activity.rs::activity_deployment_transition_lifecycle",
     },
 ];
+
+const WORKER_COMPUTE_CONTROLLER_EVIDENCE: &[CompatibilityEvidence] = &[CompatibilityEvidence {
+    kind: crate::CompatibilityEvidenceKind::Test,
+    reference: ".kiro/specs/worker-compute-controller; provider-neutral lifecycle Properties 1–17",
+}];
 
 const WORKER_HEARTBEAT_EVIDENCE: &[CompatibilityEvidence] = &[
     CompatibilityEvidence {
@@ -652,6 +673,17 @@ const WORKER_CONFIG_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
 const WORKER_CONFIG_RPCS: &[&str] = &[
     "WorkflowService.FetchWorkerConfig",
     "WorkflowService.UpdateWorkerConfig",
+];
+
+const WORKER_COMPUTE_CONTROLLER_SURFACES: &[CompatibilitySurface] = &[
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::BehaviouralInvariant,
+        identifier: "WorkerComputeController.RemoteNexusNoSync",
+    },
+    CompatibilitySurface {
+        kind: CompatibilitySurfaceKind::BehaviouralInvariant,
+        identifier: "ComputeProvider.InvokeWorker",
+    },
 ];
 
 const WORKER_DEPLOYMENT_SURFACES: &[CompatibilitySurface] = &[CompatibilitySurface {
@@ -1114,6 +1146,18 @@ pub const FEATURE_MATRIX: &[FeatureEntry] = &[
         rpcs: VISIBILITY_RPCS,
         notes: "Visibility list/count/describe APIs are backed by projection, but strict Temporal query compatibility remains partial.",
         evidence: MATRIX_AUDIT_EVIDENCE,
+    },
+    FeatureEntry {
+        catalog: WORKER_COMPUTE_CONTROLLER_CATALOG,
+        id: "worker-compute-controller",
+        name: "Worker Compute Controller",
+        state: FeatureState::Experimental,
+        surfaces: WORKER_COMPUTE_CONTROLLER_SURFACES,
+        capability_field: None,
+        dynamic_config_key: None,
+        rpcs: EMPTY_RPCS,
+        notes: "The opt-in controller activates only remote Nexus providers with the no-sync scaler and invoke-worker operation. Rate-based scaling, direct cloud providers, worker-set desired-size updates, scale-down, and proof of worker poll readiness are unavailable. Provider delivery is at least once; providers must deduplicate Action_Request_ID.",
+        evidence: WORKER_COMPUTE_CONTROLLER_EVIDENCE,
     },
     FeatureEntry {
         catalog: TEMPORAL_GA_UNAVAILABLE,

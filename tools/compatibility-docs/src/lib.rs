@@ -285,6 +285,7 @@ pub fn render_config_example(fields: &[ConfigFieldDocumentation]) -> Result<Stri
         "# Canonical Tokeira production configuration example.\n\
 # An empty document is valid; the active values below spell out the same safe defaults.\n\
 # Priority remains enabled. User Fairness is disabled unless enable_fairness is true.\n\
+# Worker Compute is disabled; enabling it may cause configured providers to create billable capacity.\n\
 # The Nexus callback URL must be reachable from Nexus workers; loopback assumes co-location.\n\
 # JWT issuer routing requires issuer to exactly equal the token's signed iss value.\n\
 # Optional JWT/AWS identity sources are shown commented and are not enabled by this file.\n\n\

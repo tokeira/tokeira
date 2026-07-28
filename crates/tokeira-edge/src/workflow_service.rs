@@ -45,13 +45,13 @@ use tokeira_runtime::{
     BatchOperationStore, BatchProgressCounters, BatchResetTarget, BufferedQueryRegistry,
     CreateDeployment, CreateVersion, DeleteDeployment, DeleteVersion, DeleteWorkflowRequest,
     DeploymentPage, DeploymentView, DescribeVersion, InMemoryBroker, ListDeployments,
-    MultiOperationError, MultiOperationResult, NexusTaskBroker, NexusTaskCorrelation,
-    NexusTaskToken, NexusWorkflowTaskKind, OverlapDecision, OverlapPolicy, PendingUpdateTransport,
-    QueryResult, RegisterPolledDeployment, ResetWorkflowResult, ScheduleActionResult,
-    SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager, SetManagerOutcome,
-    SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult, StartedActivityTask,
-    StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigKey, TaskQueueConfigKind,
-    TaskQueueConfigStore, TaskQueueConfigStoreError, TaskQueueVersioningView,
+    MultiOperationError, MultiOperationResult, NexusQueueKey, NexusTaskBroker,
+    NexusTaskCorrelation, NexusTaskToken, NexusWorkflowTaskKind, OverlapDecision, OverlapPolicy,
+    PendingUpdateTransport, QueryResult, RegisterPolledDeployment, ResetWorkflowResult,
+    ScheduleActionResult, SchedulePatch, ScheduleStore, SetCurrent, SetCurrentOutcome, SetManager,
+    SetManagerOutcome, SetRamping, SetRampingOutcome, SignalWithStartResult, StartWorkflowResult,
+    StartedActivityTask, StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigKey,
+    TaskQueueConfigKind, TaskQueueConfigStore, TaskQueueConfigStoreError, TaskQueueVersioningView,
     UpdateActivitiesOptionsRequest, UpdateComputeConfig, UpdateLifecycleError,
     UpdateLifecycleSnapshot, UpdateMetadata, UpdateTransportResolution, UpdateWaitPolicy,
     ValidateComputeConfig, VersionMetadataView, VersionView, WorkerRegistrationKey, WorkerRegistry,
@@ -2084,16 +2084,33 @@ impl WorkflowService {
                         .await?,
                 )?;
 
+                // Nexus polls participate in the same Deployment-Version membership
+                // contract as workflow/activity polls. Registration precedes the long
+                // wait, so even an empty timeout records Nexus queue membership
+                // (`WorkflowHandler.PollNexusTaskQueue`,
+                // service/frontend/workflow_handler.go @ v1.31.0).
+                if let (Some(worker_deployments), Some(version)) =
+                    (self.worker_deployments.as_ref(), req.deployment.as_ref())
+                {
+                    worker_deployments
+                        .register_polled_deployment(RegisterPolledDeployment {
+                            namespace_id,
+                            deployment_name: DeploymentName(version.deployment_name.clone()),
+                            build_id: tokeira_storage::BuildId(version.build_id.clone()),
+                            task_queue: req.task_queue.clone(),
+                            task_queue_type: DeploymentTaskQueueType::Nexus,
+                            identity: req.worker_identity.clone(),
+                        })
+                        .await?;
+                }
                 let _permit = self.long_polls.acquire().await?;
                 let (_, task_queue) =
                     crate::translate::nexus::broker_queue(&req.namespace, &req.task_queue);
+                let queue_key =
+                    NexusQueueKey::from_version(namespace_id, task_queue, req.deployment.as_ref());
                 let task = self
                     .nexus_broker
-                    .poll(
-                        namespace_id,
-                        task_queue.clone(),
-                        std::time::Duration::from_secs(60),
-                    )
+                    .poll_versioned(queue_key.clone(), std::time::Duration::from_secs(60))
                     .await;
 
                 match task {
@@ -2102,7 +2119,7 @@ impl WorkflowService {
                         request: task.request,
                         poller_scaling_decision: self
                             .nexus_broker
-                            .has_runnable_backlog(namespace_id, &task_queue)
+                            .has_runnable_backlog_versioned(&queue_key)
                             .await
                             .then_some(1),
                     })),
@@ -2188,6 +2205,21 @@ impl WorkflowService {
                         let _ = self
                             .nexus_http_waiters
                             .complete(&waiter_id, NexusHttpWorkerOutcome::Completed(response));
+                        return Ok(());
+                    }
+                    NexusTaskCorrelation::WorkerCompute {
+                        action_id,
+                        claim_epoch,
+                    } => {
+                        let completion =
+                            crate::translate::nexus::worker_compute_completion_from_response(
+                                response,
+                            );
+                        let _ = self.nexus_broker.complete_worker_compute(
+                            action_id,
+                            claim_epoch,
+                            completion,
+                        );
                         return Ok(());
                     }
                     NexusTaskCorrelation::Workflow {
@@ -2378,6 +2410,29 @@ impl WorkflowService {
                             NexusHttpWorkerOutcome::Failed {
                                 error: req.error,
                                 failure: req.failure,
+                            },
+                        );
+                        return Ok(());
+                    }
+                    NexusTaskCorrelation::WorkerCompute {
+                        action_id,
+                        claim_epoch,
+                    } => {
+                        let retryable = req
+                            .failure
+                            .as_ref()
+                            .map(crate::translate::nexus::nexus_handler_failure_retryable)
+                            .or_else(|| {
+                                req.error.as_ref().map(
+                                    crate::translate::nexus::legacy_nexus_handler_error_retryable,
+                                )
+                            })
+                            .unwrap_or(true);
+                        let _ = self.nexus_broker.complete_worker_compute(
+                            action_id,
+                            claim_epoch,
+                            tokeira_runtime::WorkerComputeProviderCompletion::HandlerError {
+                                retryable,
                             },
                         );
                         return Ok(());

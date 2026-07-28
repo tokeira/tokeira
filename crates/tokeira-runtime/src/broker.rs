@@ -52,7 +52,10 @@ use std::{
 use anyhow::Result;
 use time::OffsetDateTime;
 use tokeira_storage::{DeliveryOrder, DispatchableActivityTask, DispatchableWorkflowTask};
-use tokeira_types::{LogicalTaskSeq, NamespaceId, QueueKey, RunKey, TaskQueueName, WorkerIdentity};
+use tokeira_types::{
+    LogicalTaskSeq, NamespaceId, QueueKey, RunKey, TaskQueueName, WorkerComputeQueueKey,
+    WorkerComputeTaskType, WorkerIdentity,
+};
 use tokio::{
     sync::{Mutex, Notify, oneshot},
     time::{Duration, Instant},
@@ -60,9 +63,11 @@ use tokio::{
 
 use crate::{
     ConfiguredDeliveryModeProvider, DeliveryMetrics, DeliveryModeProvider, DeliveryOrdering,
+    DemandMatchKind, DemandObservation, DemandObservationSink, DisabledWorkerComputeSink,
     DispatchEligibility, DispatchRateLimits, InMemoryTaskQueueConfigStore, QueryResult, QueryTask,
     StartedWorkflowTask, TaskQueueConfigEntry, TaskQueueConfigKey, TaskQueueConfigKind,
-    TaskQueueConfigStore, effective_priority, metrics as runtime_metrics,
+    TaskQueueConfigStore, WorkerComputeQueueMetrics, effective_priority,
+    metrics as runtime_metrics,
 };
 
 const STICKY_POLLER_AVAILABILITY_WINDOW: Duration = Duration::from_secs(10);
@@ -212,6 +217,8 @@ struct BrokerState {
 struct BrokerPolicy {
     config_store: StdRwLock<Arc<dyn TaskQueueConfigStore>>,
     mode_provider: StdRwLock<Arc<dyn DeliveryModeProvider>>,
+    observation_sink: StdRwLock<Arc<dyn DemandObservationSink>>,
+    queue_metrics: StdRwLock<WorkerComputeQueueMetrics>,
 }
 
 impl Default for BrokerPolicy {
@@ -219,6 +226,8 @@ impl Default for BrokerPolicy {
         Self {
             config_store: StdRwLock::new(Arc::new(InMemoryTaskQueueConfigStore::default())),
             mode_provider: StdRwLock::new(Arc::new(ConfiguredDeliveryModeProvider::default())),
+            observation_sink: StdRwLock::new(Arc::new(DisabledWorkerComputeSink)),
+            queue_metrics: StdRwLock::new(WorkerComputeQueueMetrics::default()),
         }
     }
 }
@@ -278,6 +287,66 @@ impl BrokerPolicy {
             .expect("task queue config store lock poisoned")
             .clone()
     }
+
+    fn set_observation_sink(&self, sink: Arc<dyn DemandObservationSink>) {
+        *self
+            .observation_sink
+            .write()
+            .expect("worker-compute observation sink lock poisoned") = sink;
+    }
+
+    fn observation_sink(&self) -> Arc<dyn DemandObservationSink> {
+        self.observation_sink
+            .read()
+            .expect("worker-compute observation sink lock poisoned")
+            .clone()
+    }
+
+    fn set_queue_metrics(&self, metrics: WorkerComputeQueueMetrics) {
+        *self
+            .queue_metrics
+            .write()
+            .expect("worker-compute queue-metrics lock poisoned") = metrics;
+    }
+
+    fn queue_metrics(&self) -> WorkerComputeQueueMetrics {
+        self.queue_metrics
+            .read()
+            .expect("worker-compute queue-metrics lock poisoned")
+            .clone()
+    }
+}
+
+fn demand_observation(
+    queue: &QueueKey,
+    task_type: WorkerComputeTaskType,
+    has_waiter: bool,
+) -> Option<DemandObservation> {
+    Some(DemandObservation {
+        namespace_id: queue.namespace_id,
+        task_queue: queue.task_queue.clone(),
+        task_type,
+        deployment_name: queue.deployment.clone()?,
+        build_id: queue.build_id.clone()?,
+        match_kind: if has_waiter {
+            DemandMatchKind::Sync
+        } else {
+            DemandMatchKind::NoSync
+        },
+    })
+}
+
+fn queue_metrics_key(
+    queue: &QueueKey,
+    task_type: WorkerComputeTaskType,
+) -> Option<WorkerComputeQueueKey> {
+    Some(WorkerComputeQueueKey {
+        namespace_id: queue.namespace_id,
+        task_queue: queue.task_queue.clone(),
+        task_type,
+        deployment_name: queue.deployment.clone()?,
+        build_id: queue.build_id.clone()?,
+    })
 }
 
 impl Default for InMemoryBroker {
@@ -516,6 +585,19 @@ enum ActivityTakeOutcome {
 }
 
 impl InMemoryBroker {
+    /// Share the process-local worker-compute observation sink with broker clones.
+    ///
+    /// Publications use only the sink's non-blocking method. Replacing or stopping
+    /// the controller therefore cannot alter broker ordering or success.
+    pub fn set_demand_observation_sink(&self, sink: Arc<dyn DemandObservationSink>) {
+        self.policy.set_observation_sink(sink);
+    }
+
+    /// Share the process-local periodic queue-metrics recorder with broker clones.
+    pub fn set_worker_compute_queue_metrics(&self, metrics: WorkerComputeQueueMetrics) {
+        self.policy.set_queue_metrics(metrics);
+    }
+
     /// Share the runtime's live task-queue configuration store with this broker.
     ///
     /// Existing clones observe the replacement because construction-time
@@ -592,6 +674,19 @@ impl InMemoryBroker {
             );
         }
         stats
+    }
+
+    /// Snapshot normal ready backlog for every exact-version workflow queue.
+    pub async fn versioned_backlog_counts(&self) -> BTreeMap<WorkerComputeQueueKey, u64> {
+        let inner = self.inner.lock().await;
+        inner
+            .general_ready
+            .iter()
+            .filter_map(|(queue, ready)| {
+                queue_metrics_key(queue, WorkerComputeTaskType::Workflow)
+                    .map(|key| (key, u64::try_from(ready.len()).unwrap_or(u64::MAX)))
+            })
+            .collect()
     }
 
     /// Snapshot a directly addressed sticky workflow backlog by priority band.
@@ -706,10 +801,23 @@ impl InMemoryBroker {
         });
 
         if let Some(removed) = matched {
+            let metric_key = removed
+                .task
+                .sticky_preferred
+                .is_none()
+                .then(|| {
+                    demand_observation(&removed.task.queue, WorkerComputeTaskType::Workflow, false)
+                })
+                .flatten()
+                .map(|observation| observation.queue_key());
             inner
                 .enqueued
                 .remove(&(removed.task.run_key, removed.task.logical_seq));
             Self::emit_queue_depths(&inner, queue);
+            drop(inner);
+            if let Some(metric_key) = metric_key {
+                self.policy.queue_metrics().record_dispatch(metric_key);
+            }
             return Some((removed.task, removed.entered_at));
         }
 
@@ -958,6 +1066,11 @@ impl InMemoryBroker {
         };
         task.order = Some(order);
         let has_waiter = inner.waiter_counts.get(&task.queue).copied().unwrap_or(0) > 0;
+        let observation = task
+            .sticky_preferred
+            .is_none()
+            .then(|| demand_observation(&task.queue, WorkerComputeTaskType::Workflow, has_waiter))
+            .flatten();
         if let Some(metrics) = metrics {
             if has_waiter {
                 metrics.record_sync_match(&task.queue);
@@ -994,6 +1107,12 @@ impl InMemoryBroker {
             .filter_map(|sticky| inner.wakes.get(sticky).cloned())
             .collect::<Vec<_>>();
         drop(inner);
+        if let Some(observation) = observation {
+            self.policy
+                .queue_metrics()
+                .record_add(observation.queue_key());
+            let _ = self.policy.observation_sink().try_observe(observation);
+        }
         wake.notify_waiters();
         for alias_wake in alias_wakes {
             alias_wake.notify_waiters();
@@ -1352,6 +1471,15 @@ impl InMemoryBroker {
         };
 
         if let Some(task) = task {
+            let metric_key = task
+                .task
+                .sticky_preferred
+                .is_none()
+                .then(|| {
+                    demand_observation(&task.task.queue, WorkerComputeTaskType::Workflow, false)
+                })
+                .flatten()
+                .map(|observation| observation.queue_key());
             if let Some(order) = task.task.order {
                 inner.ordering.served(&task.task.queue, order);
             }
@@ -1361,6 +1489,10 @@ impl InMemoryBroker {
             Self::emit_queue_depths(&inner, queue);
             if general_queue != queue {
                 Self::emit_queue_depths(&inner, general_queue);
+            }
+            drop(inner);
+            if let Some(metric_key) = metric_key {
+                self.policy.queue_metrics().record_dispatch(metric_key);
             }
             return Ok(Some((task.task, task.entered_at)));
         }
@@ -1554,6 +1686,19 @@ impl InMemoryBroker {
 }
 
 impl InMemoryActivityBroker {
+    /// Share the process-local worker-compute observation sink with broker clones.
+    ///
+    /// Publications use only the sink's non-blocking method. Replacing or stopping
+    /// the controller therefore cannot alter broker ordering or success.
+    pub fn set_demand_observation_sink(&self, sink: Arc<dyn DemandObservationSink>) {
+        self.policy.set_observation_sink(sink);
+    }
+
+    /// Share the process-local periodic queue-metrics recorder with broker clones.
+    pub fn set_worker_compute_queue_metrics(&self, metrics: WorkerComputeQueueMetrics) {
+        self.policy.set_queue_metrics(metrics);
+    }
+
     /// Share the runtime's live task-queue configuration store with this broker.
     pub fn set_task_queue_config_store(&self, store: Arc<dyn TaskQueueConfigStore>) {
         self.policy.set_config_store(store);
@@ -1606,6 +1751,19 @@ impl InMemoryActivityBroker {
             );
         }
         stats
+    }
+
+    /// Snapshot ready backlog for every exact-version activity queue.
+    pub async fn versioned_backlog_counts(&self) -> BTreeMap<WorkerComputeQueueKey, u64> {
+        let inner = self.inner.lock().await;
+        inner
+            .ready
+            .iter()
+            .filter_map(|(queue, ready)| {
+                queue_metrics_key(queue, WorkerComputeTaskType::Activity)
+                    .map(|key| (key, u64::try_from(ready.len()).unwrap_or(u64::MAX)))
+            })
+            .collect()
     }
 
     /// Move already-ready unversioned activities onto a newly promoted
@@ -1746,6 +1904,9 @@ impl InMemoryActivityBroker {
         let removed = ready.remove_where(|task| {
             task.task.run_key == run_key && task.task.activity_id == activity_id
         })?;
+        let metric_key =
+            demand_observation(&removed.task.queue, WorkerComputeTaskType::Activity, false)
+                .map(|observation| observation.queue_key());
         if let Some(order) = removed.task.order {
             inner.ordering.served(&removed.task.queue, order);
         }
@@ -1756,6 +1917,10 @@ impl InMemoryActivityBroker {
             removed.task.stamp,
         ));
         Self::emit_queue_depth(&inner, queue);
+        drop(inner);
+        if let Some(metric_key) = metric_key {
+            self.policy.queue_metrics().record_dispatch(metric_key);
+        }
         Some((removed.task, removed.entered_at))
     }
 
@@ -1794,6 +1959,8 @@ impl InMemoryActivityBroker {
         };
         task.order = Some(order);
         let has_waiter = inner.waiter_counts.get(&task.queue).copied().unwrap_or(0) > 0;
+        let observation =
+            demand_observation(&task.queue, WorkerComputeTaskType::Activity, has_waiter);
         if let Some(metrics) = metrics {
             if has_waiter {
                 metrics.record_sync_match(&task.queue);
@@ -1813,6 +1980,12 @@ impl InMemoryActivityBroker {
         Self::emit_queue_depth(&inner, &queue);
         let wake = inner.wakes.entry(queue).or_default().clone();
         drop(inner);
+        if let Some(observation) = observation {
+            self.policy
+                .queue_metrics()
+                .record_add(observation.queue_key());
+            let _ = self.policy.observation_sink().try_observe(observation);
+        }
         wake.notify_waiters();
         Ok(())
     }
@@ -1990,6 +2163,10 @@ impl InMemoryActivityBroker {
             DispatchEligibility::Ready => {}
         }
         let task = inner.ready.get_mut(queue).and_then(|q| q.pop_front());
+        let metric_key = task.as_ref().and_then(|task| {
+            demand_observation(&task.task.queue, WorkerComputeTaskType::Activity, false)
+                .map(|observation| observation.queue_key())
+        });
         if let Some(task) = &task {
             if let Some(order) = task.task.order {
                 inner.ordering.served(&task.task.queue, order);
@@ -2005,9 +2182,14 @@ impl InMemoryActivityBroker {
             ));
         }
         Self::emit_queue_depth(&inner, queue);
-        Ok(task.map_or(ActivityTakeOutcome::Empty, |task| {
+        let outcome = task.map_or(ActivityTakeOutcome::Empty, |task| {
             ActivityTakeOutcome::Ready((task.task, task.entered_at))
-        }))
+        });
+        drop(inner);
+        if let Some(metric_key) = metric_key {
+            self.policy.queue_metrics().record_dispatch(metric_key);
+        }
+        Ok(outcome)
     }
 
     async fn increment_waiter(&self, queue: &QueueKey) {
@@ -2053,11 +2235,14 @@ fn activity_config_key(queue: &QueueKey) -> TaskQueueConfigKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DeliveryMode, QueryTask, TaskQueueConfigMetadata};
+    use crate::{
+        ChannelDemandObservationSink, DeliveryMode, NexusQueueKey, NexusTaskBroker,
+        NexusTaskRequest, QueryTask, TaskQueueConfigMetadata,
+    };
     use proptest::prelude::*;
     use time::Duration as TimeDuration;
     use tokeira_types::{BuildId, DeploymentId, NamespaceId, Payloads, TaskKind, TaskQueueName};
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use uuid::Uuid;
 
     fn arb_small_string() -> impl Strategy<Value = String> {
@@ -2210,6 +2395,101 @@ mod tests {
         assert_eq!(
             (first.activity_id, second.activity_id),
             ("low-first".into(), "high-second".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_observation_sinks_preserve_dedupe_and_priority_order() {
+        let queue = QueueKey {
+            deployment: Some(DeploymentId("payments".to_owned())),
+            build_id: Some(BuildId("build-a".to_owned())),
+            ..activity_queue("observation-isolation")
+        };
+        let broker = InMemoryActivityBroker::default();
+        let (sender, _blocked_receiver) = mpsc::channel(1);
+        let sink = Arc::new(ChannelDemandObservationSink::new(sender));
+        assert_eq!(
+            sink.try_observe(DemandObservation {
+                namespace_id: queue.namespace_id,
+                task_queue: queue.task_queue.clone(),
+                task_type: WorkerComputeTaskType::Activity,
+                deployment_name: queue.deployment.clone().expect("deployment"),
+                build_id: queue.build_id.clone().expect("build ID"),
+                match_kind: DemandMatchKind::NoSync,
+            }),
+            crate::ObserveResult::Accepted
+        );
+        broker.set_demand_observation_sink(sink);
+
+        let low = named_activity_task(&queue, "low", priority(5, "", 0.0));
+        let high = named_activity_task(&queue, "high", priority(1, "", 0.0));
+        broker
+            .publish_activity_task(low.clone(), None)
+            .await
+            .expect("full sink cannot fail publication");
+        broker
+            .publish_activity_task(high.clone(), None)
+            .await
+            .expect("full sink cannot fail publication");
+        broker
+            .publish_activity_task(high, None)
+            .await
+            .expect("full sink cannot change dedupe");
+
+        let first = broker
+            .poll_activity_task(&queue, Duration::ZERO)
+            .await
+            .expect("poll")
+            .expect("high priority task")
+            .0;
+        let second = broker
+            .poll_activity_task(&queue, Duration::ZERO)
+            .await
+            .expect("poll")
+            .expect("low priority task")
+            .0;
+        assert_eq!([first.activity_id, second.activity_id], ["high", "low"]);
+        assert!(
+            broker
+                .poll_activity_task(&queue, Duration::ZERO)
+                .await
+                .expect("poll")
+                .is_none(),
+            "duplicate publication must remain suppressed"
+        );
+
+        let closed_broker = InMemoryActivityBroker::default();
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        closed_broker
+            .set_demand_observation_sink(Arc::new(ChannelDemandObservationSink::new(sender)));
+        let closed_task = named_activity_task(&queue, "closed", priority(3, "", 0.0));
+        closed_broker
+            .publish_activity_task(closed_task.clone(), None)
+            .await
+            .expect("closed sink cannot fail publication");
+        assert_eq!(
+            closed_broker
+                .poll_activity_task(&queue, Duration::ZERO)
+                .await
+                .expect("poll")
+                .map(|entry| entry.0),
+            Some(closed_task)
+        );
+
+        let disabled_broker = InMemoryActivityBroker::default();
+        let disabled_task = named_activity_task(&queue, "disabled", priority(3, "", 0.0));
+        disabled_broker
+            .publish_activity_task(disabled_task.clone(), None)
+            .await
+            .expect("disabled sink cannot fail publication");
+        assert_eq!(
+            disabled_broker
+                .poll_activity_task(&queue, Duration::ZERO)
+                .await
+                .expect("poll")
+                .map(|entry| entry.0),
+            Some(disabled_task)
         );
     }
 
@@ -2622,6 +2902,224 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
+    }
+
+    async fn await_activity_waiter(broker: &InMemoryActivityBroker, queue: &QueueKey) {
+        loop {
+            if broker
+                .inner
+                .lock()
+                .await
+                .waiter_counts
+                .get(queue)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_observation_is_post_dedupe_and_uses_actual_match_result() {
+        let broker = InMemoryBroker::default();
+        let (sender, mut receiver) = mpsc::channel(4);
+        broker.set_demand_observation_sink(Arc::new(ChannelDemandObservationSink::new(sender)));
+        let queue = workflow_queue("capacity", Some("payments"), Some("build-a"));
+        let task = workflow_task(queue.clone());
+
+        broker.publish_workflow_task(task.clone(), None).await;
+        broker.publish_workflow_task(task, None).await;
+
+        assert_eq!(
+            receiver.try_recv().expect("one unique observation"),
+            DemandObservation {
+                namespace_id: queue.namespace_id,
+                task_queue: queue.task_queue.clone(),
+                task_type: WorkerComputeTaskType::Workflow,
+                deployment_name: queue.deployment.clone().expect("deployment"),
+                build_id: queue.build_id.clone().expect("build ID"),
+                match_kind: DemandMatchKind::NoSync,
+            }
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let sync_broker = InMemoryBroker::default();
+        let (sender, mut receiver) = mpsc::channel(1);
+        sync_broker
+            .set_demand_observation_sink(Arc::new(ChannelDemandObservationSink::new(sender)));
+        let poll = {
+            let broker = sync_broker.clone();
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                broker
+                    .poll_workflow_task(
+                        &queue,
+                        &WorkerIdentity("worker-a".to_owned()),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        await_workflow_waiter(&sync_broker, &queue).await;
+        sync_broker
+            .publish_workflow_task(workflow_task(queue.clone()), None)
+            .await;
+
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("parked exact-version poll is observed"),
+            DemandObservation {
+                namespace_id: queue.namespace_id,
+                task_queue: queue.task_queue,
+                task_type: WorkerComputeTaskType::Workflow,
+                deployment_name: queue.deployment.expect("deployment"),
+                build_id: queue.build_id.expect("build ID"),
+                match_kind: DemandMatchKind::Sync,
+            }
+        );
+        assert!(
+            poll.await
+                .expect("poll task")
+                .expect("poll result")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_observation_excludes_unversioned_and_sticky_until_normal_fallback() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let sink = Arc::new(ChannelDemandObservationSink::new(sender));
+        let versioned_normal = workflow_queue("normal", Some("payments"), Some("build-a"));
+        let unversioned = QueueKey {
+            deployment: None,
+            build_id: None,
+            ..versioned_normal.clone()
+        };
+        let sticky_queue = QueueKey {
+            task_queue: TaskQueueName("sticky".to_owned()),
+            ..versioned_normal.clone()
+        };
+        let sticky_worker = WorkerIdentity("sticky-worker".to_owned());
+
+        let sticky_broker = InMemoryBroker::default();
+        sticky_broker.set_demand_observation_sink(sink.clone());
+        assert!(
+            sticky_broker
+                .record_workflow_poller(&sticky_queue, &sticky_worker)
+                .await
+        );
+        sticky_broker
+            .publish_workflow_task(
+                DispatchableWorkflowTask {
+                    sticky_preferred: Some(sticky_worker.clone()),
+                    normal_queue: Some(versioned_normal.clone()),
+                    ..workflow_task(sticky_queue.clone())
+                },
+                None,
+            )
+            .await;
+        sticky_broker
+            .publish_workflow_task(workflow_task(unversioned), None)
+            .await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let fallback_broker = InMemoryBroker::default();
+        fallback_broker.set_demand_observation_sink(sink);
+        fallback_broker
+            .publish_workflow_task(
+                DispatchableWorkflowTask {
+                    sticky_preferred: Some(sticky_worker),
+                    normal_queue: Some(versioned_normal.clone()),
+                    ..workflow_task(sticky_queue)
+                },
+                None,
+            )
+            .await;
+
+        let observation = receiver.try_recv().expect("normal fallback observation");
+        assert_eq!(observation.task_queue, versioned_normal.task_queue);
+        assert_eq!(observation.deployment_name, DeploymentId("payments".into()));
+        assert_eq!(observation.build_id, BuildId("build-a".into()));
+        assert_eq!(observation.match_kind, DemandMatchKind::NoSync);
+    }
+
+    #[tokio::test]
+    async fn activity_observation_is_post_dedupe_and_uses_actual_match_result() {
+        let broker = InMemoryActivityBroker::default();
+        let (sender, mut receiver) = mpsc::channel(2);
+        broker.set_demand_observation_sink(Arc::new(ChannelDemandObservationSink::new(sender)));
+        let queue = QueueKey {
+            deployment: Some(DeploymentId("payments".to_owned())),
+            build_id: Some(BuildId("build-a".to_owned())),
+            ..activity_queue("capacity")
+        };
+        let task = activity_task(queue.clone());
+
+        broker
+            .publish_activity_task(task.clone(), None)
+            .await
+            .expect("publish activity");
+        broker
+            .publish_activity_task(task, None)
+            .await
+            .expect("dedupe activity");
+        assert_eq!(
+            receiver.try_recv().expect("one unique observation"),
+            DemandObservation {
+                namespace_id: queue.namespace_id,
+                task_queue: queue.task_queue.clone(),
+                task_type: WorkerComputeTaskType::Activity,
+                deployment_name: queue.deployment.clone().expect("deployment"),
+                build_id: queue.build_id.clone().expect("build ID"),
+                match_kind: DemandMatchKind::NoSync,
+            }
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let sync_broker = InMemoryActivityBroker::default();
+        let (sender, mut receiver) = mpsc::channel(1);
+        sync_broker
+            .set_demand_observation_sink(Arc::new(ChannelDemandObservationSink::new(sender)));
+        let poll = {
+            let broker = sync_broker.clone();
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                broker
+                    .poll_activity_task(&queue, std::time::Duration::from_secs(5))
+                    .await
+            })
+        };
+        await_activity_waiter(&sync_broker, &queue).await;
+        sync_broker
+            .publish_activity_task(activity_task(queue.clone()), None)
+            .await
+            .expect("publish activity to parked poller");
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("parked exact-version poll is observed")
+                .match_kind,
+            DemandMatchKind::Sync
+        );
+        assert!(
+            poll.await
+                .expect("poll task")
+                .expect("poll result")
+                .is_some()
+        );
     }
 
     // Property: queue isolation. A publish to queue B must not end an in-flight
@@ -3442,6 +3940,187 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn property_worker_compute_observation_is_post_dedupe_and_non_blocking(
+            namespace_seed in any::<u128>(),
+            queue_suffix in arb_small_string(),
+            sink_case in 0_u8..4,
+        ) {
+            // Feature: worker-compute-controller, Property 5: observation is post-dedupe and non-blocking
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let namespace_id = NamespaceId(Uuid::from_u128(namespace_seed));
+                let deployment = Some(DeploymentId("deployment".to_owned()));
+                let build_id = Some(BuildId("build".to_owned()));
+                let workflow_queue = QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName(format!("workflow-{queue_suffix}")),
+                    task_kind: TaskKind::Workflow,
+                    deployment: deployment.clone(),
+                    build_id: build_id.clone(),
+                };
+                let activity_queue = QueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName(format!("activity-{queue_suffix}")),
+                    task_kind: TaskKind::Activity,
+                    deployment: deployment.clone(),
+                    build_id: build_id.clone(),
+                };
+                let nexus_queue = NexusQueueKey {
+                    namespace_id,
+                    task_queue: TaskQueueName(format!("nexus-{queue_suffix}")),
+                    deployment,
+                    build_id,
+                };
+
+                let mut receiver = None;
+                let sink: Arc<dyn DemandObservationSink> = match sink_case {
+                    0 => {
+                        let (sender, rx) = mpsc::channel(8);
+                        receiver = Some(rx);
+                        Arc::new(ChannelDemandObservationSink::new(sender))
+                    }
+                    1 => {
+                        let (sender, rx) = mpsc::channel(1);
+                        sender
+                            .try_send(DemandObservation {
+                                namespace_id,
+                                task_queue: TaskQueueName("already-full".to_owned()),
+                                task_type: WorkerComputeTaskType::Workflow,
+                                deployment_name: DeploymentId("deployment".to_owned()),
+                                build_id: BuildId("build".to_owned()),
+                                match_kind: DemandMatchKind::NoSync,
+                            })
+                            .expect("prefill bounded sink");
+                        receiver = Some(rx);
+                        Arc::new(ChannelDemandObservationSink::new(sender))
+                    }
+                    2 => {
+                        let (sender, rx) = mpsc::channel(1);
+                        drop(rx);
+                        Arc::new(ChannelDemandObservationSink::new(sender))
+                    }
+                    _ => Arc::new(DisabledWorkerComputeSink),
+                };
+
+                let workflow_broker = InMemoryBroker::default();
+                let activity_broker = InMemoryActivityBroker::default();
+                let nexus_broker = NexusTaskBroker::default();
+                let queue_metrics = WorkerComputeQueueMetrics::default();
+                workflow_broker.set_demand_observation_sink(sink.clone());
+                activity_broker.set_demand_observation_sink(sink.clone());
+                nexus_broker.set_demand_observation_sink(sink);
+                workflow_broker.set_worker_compute_queue_metrics(queue_metrics.clone());
+                activity_broker.set_worker_compute_queue_metrics(queue_metrics.clone());
+                nexus_broker.set_worker_compute_queue_metrics(queue_metrics.clone());
+
+                let workflow = workflow_task(workflow_queue.clone());
+                workflow_broker
+                    .publish_workflow_task(workflow.clone(), None)
+                    .await;
+                workflow_broker
+                    .publish_workflow_task(workflow.clone(), None)
+                    .await;
+                let activity = activity_task(activity_queue.clone());
+                activity_broker
+                    .publish_activity_task(activity.clone(), None)
+                    .await
+                    .expect("activity publication");
+                activity_broker
+                    .publish_activity_task(activity.clone(), None)
+                    .await
+                    .expect("activity dedupe");
+                nexus_broker
+                    .publish_workflow_versioned(
+                        nexus_queue.clone(),
+                        RunKey::new(),
+                        "operation".to_owned(),
+                        7,
+                        NexusTaskRequest::CancelOperation {
+                            service: "service".to_owned(),
+                            operation: "cancel".to_owned(),
+                            operation_id: "operation".to_owned(),
+                            operation_token: "token".to_owned(),
+                        },
+                    )
+                    .await;
+
+                prop_assert!(
+                    workflow_broker
+                        .poll_workflow_task(
+                            &workflow_queue,
+                            &WorkerIdentity("worker".to_owned()),
+                            Duration::ZERO,
+                        )
+                        .await
+                        .expect("workflow poll")
+                        .is_some()
+                );
+                prop_assert!(
+                    workflow_broker
+                        .poll_workflow_task(
+                            &workflow_queue,
+                            &WorkerIdentity("worker".to_owned()),
+                            Duration::ZERO,
+                        )
+                        .await
+                        .expect("workflow duplicate poll")
+                        .is_none()
+                );
+                prop_assert!(
+                    activity_broker
+                        .poll_activity_task(&activity_queue, Duration::ZERO)
+                        .await
+                        .expect("activity poll")
+                        .is_some()
+                );
+                prop_assert!(
+                    activity_broker
+                        .poll_activity_task(&activity_queue, Duration::ZERO)
+                        .await
+                        .expect("activity duplicate poll")
+                        .is_none()
+                );
+                prop_assert!(
+                    nexus_broker
+                        .poll_versioned(nexus_queue.clone(), tokio::time::Duration::ZERO)
+                        .await
+                        .is_some()
+                );
+                let counters = queue_metrics.snapshot();
+                prop_assert_eq!(counters.len(), 3);
+                let all_counted_once = counters.values().all(|value| {
+                    *value
+                        == crate::WorkerComputeQueueCounters {
+                            adds: 1,
+                            dispatches: 1,
+                        }
+                });
+                prop_assert!(all_counted_once);
+
+                let accepted = receiver
+                    .as_mut()
+                    .map(|receiver| {
+                        let mut count = 0;
+                        while receiver.try_recv().is_ok() {
+                            count += 1;
+                        }
+                        count
+                    })
+                    .unwrap_or(0);
+                prop_assert_eq!(
+                    accepted,
+                    match sink_case {
+                        0 => 3,
+                        1 => 1,
+                        2 | 3 => 0,
+                        _ => unreachable!(),
+                    }
+                );
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
+        }
+
         #[test]
         fn property_publish_records_entry_timestamp(is_activity in any::<bool>()) {
             let rt = tokio::runtime::Runtime::new().unwrap();

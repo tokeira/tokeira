@@ -308,8 +308,13 @@ impl Resource for DynamoDbTable {
     /// PITR model — the system backup exists only when PITR is enabled, this
     /// engine's create leaves PITR at its documented DISABLED default, and a
     /// restore in any case "always restores to a new table" (researched
-    /// 2026-07-29). A TTL-bearing update's data effect stays Unknown:
-    /// per-item expiry is unknowable at declaration time.
+    /// 2026-07-29). A TTL-bearing update enacts a data policy — the general
+    /// `DataEffect::Policy` with the statement carrying the specific
+    /// meaning. The diff covers tags and TTL today; DynamoDB's wider update
+    /// surface (billing mode, provisioned throughput, streams, table class,
+    /// SSE, deletion protection) joins these branches as the kind grows —
+    /// settings changes declare in-place/`Preserved`, data-affecting
+    /// policies declare `Policy`, each with its citation.
     fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
         // Cited by module identity, never repo layout; every name is a real
         // identifier in this module. The provider claims cite AWS's own
@@ -327,6 +332,12 @@ impl Resource for DynamoDbTable {
             "DeleteTable — Amazon DynamoDB API Reference",
             "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_DeleteTable.html",
             "The DeleteTable operation deletes a table and all of its items.",
+        );
+        const TTL_DOC: Citation = Citation::doc_quoted(
+            "Using time to live (TTL) in DynamoDB",
+            "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html",
+            "DynamoDB automatically deletes expired items within a few days of their \
+             expiration time, without consuming write throughput.",
         );
         const PITR_DOC: Citation = Citation::doc_quoted(
             "Enable point-in-time recovery in DynamoDB",
@@ -386,23 +397,44 @@ impl Resource for DynamoDbTable {
                         value: Disruption::None,
                         citation: UPDATE_PATH,
                     },
+                    // A TTL change enacts a data policy: the apply deletes
+                    // nothing, and thereafter the provider deletes expired
+                    // items on its own schedule (the 6.7 vocabulary decision,
+                    // resolved 2026-07-29: the general `Policy` value with the
+                    // statement carrying the specific meaning).
                     data_effect: if ttl_involved {
-                        Confidence::Unknown
+                        Confidence::ProviderGuarantee {
+                            value: DataEffect::Policy,
+                            citation: TTL_DOC,
+                        }
                     } else {
                         Confidence::EngineFact {
                             value: DataEffect::Preserved,
                             citation: UPDATE_PATH,
                         }
                     },
+                    // Disabling TTL stops future expiry; items already
+                    // expired and deleted do not return — derived from the
+                    // documented model.
                     reversibility: if ttl_involved {
-                        Confidence::Unknown
+                        Confidence::Inference {
+                            value: Reversibility::ReversibleWithDataLoss,
+                            citation: TTL_DOC,
+                        }
                     } else {
                         Confidence::EngineFact {
                             value: Reversibility::Reversible,
                             citation: UPDATE_PATH,
                         }
                     },
-                    statement: None,
+                    statement: if ttl_involved {
+                        Some(std::borrow::Cow::Borrowed(
+                            "items past their declared expiry would be deleted, on the \
+                             provider's schedule",
+                        ))
+                    } else {
+                        None
+                    },
                 }
             }
             ChangeKind::Delete => ChangeSemantics {
@@ -919,14 +951,31 @@ mod tests {
             }
         ));
 
-        // Drift-driven or definition-driven, a TTL change is the same
-        // declaration: expiry consequences are per-item and unknowable here.
+        // A TTL change enacts a data policy (the resolved 6.7 decision):
+        // guaranteed by the provider's documentation, with the statement
+        // carrying the specific meaning, and reversal derived as lossy.
         let ttl_update = declared(
             ChangeKind::Update,
             &[tokeira_iac::FieldDiff::observation("ttl attribute changed")],
         );
-        assert!(matches!(ttl_update.data_effect, Confidence::Unknown));
-        assert!(matches!(ttl_update.reversibility, Confidence::Unknown));
+        assert!(matches!(
+            ttl_update.data_effect,
+            Confidence::ProviderGuarantee {
+                value: DataEffect::Policy,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ttl_update.reversibility,
+            Confidence::Inference {
+                value: Reversibility::ReversibleWithDataLoss,
+                ..
+            }
+        ));
+        assert!(
+            ttl_update.statement.is_some(),
+            "the statement speaks the policy"
+        );
 
         let create = declared(ChangeKind::Create, &[]);
         assert!(matches!(

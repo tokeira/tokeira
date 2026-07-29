@@ -28,7 +28,7 @@ the model is the truth; every presentation derives from it.
 
 | Form | Flag | Contract |
 |---|---|---|
-| **narrative** | *(default)* | Human prose under the depth contract above. |
+| **narrative** | *(default)* | Deterministic Markdown under the depth contract above — skinned for a terminal (termimad) and emitted raw when stdout is not a TTY, so pipes, PR comments, and agents receive the Markdown itself. |
 | **structured** | `--json` | The complete result model, verbatim. |
 
 ### The collapse rule
@@ -47,7 +47,12 @@ Depth is a human affordance only, so the 2×2 matrix has three real cells.
 
 ## Narrative copy rules
 
-1. Fact lines are `subject: state` — lowercase key, no trailing period.
+1. Fact lines are `subject: state` — lowercase key, no trailing period. Markdown
+   reports carry structure instead: a `#` title (title-case), the `**Plan for
+   {platform}**` assurance line, and `##` sections whose headings state the action
+   once — lines beneath carry no glyphs, counts, or type annotations, and code
+   identifiers appear only inside code spans and citation links (values embedding a
+   backtick widen to double-backtick spans).
 2. Tense carries meaning: past = done (`placed \`tkp\``), infinitive = planned
    (`1 to update`), present = standing fact (`storage: in-memory`).
 3. Errors state *what happened, why, and what to do next* — the contract as it stands,
@@ -68,12 +73,14 @@ What belongs where, by example:
 
 | Content | Depth |
 |---|---|
-| Plan category counts (`1 to update (4 unchanged)`) | summary |
-| Acting resource lines (`~ tokeira::tokeirad`) | summary |
+| Plan action sections (`## Update` + templated resource lines) | summary |
+| Operational impacts (`## Impacts`, severity-first) | summary |
+| The header's live-state coverage clause | summary |
 | Applied resource lines after a mutation | summary |
 | Binding verdict and what it means for this verb | summary |
-| Field-level diffs (`image: sha256:9f3c… → sha256:41c2…`) | detail |
-| Unchanged (`=`) resource listing | detail |
+| Field-level diffs (`` `image` ``: `sha256:9f3c…` → `sha256:41c2…`) | detail |
+| Declared behaviour in its confidence voice, with citations | detail |
+| The `## Unchanged` section | detail |
 | Digests, manifest entries, retained revisions, state heads | detail |
 | Filesystem paths and provenance chains | detail |
 

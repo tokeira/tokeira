@@ -112,6 +112,10 @@ fn arb_semantics() -> impl Strategy<Value = ChangeSemantics> {
             value: DataEffect::Preserved,
             citation: DOC,
         }),
+        Just(Confidence::ProviderGuarantee {
+            value: DataEffect::Policy,
+            citation: DOC,
+        }),
     ];
     let reversibility = prop_oneof![
         Just(Confidence::Unknown),

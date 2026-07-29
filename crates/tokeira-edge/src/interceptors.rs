@@ -1809,9 +1809,17 @@ mod tests {
         #[test]
         fn property_scoped_denial_classification_is_bounded_and_secret_free(
             reason_index in 0_usize..8,
-            sensitive in ".{1,64}",
+            secret in "[A-Za-z0-9]{8,64}",
         ) {
             // Feature: scoped-worker-authorization, Property 13: Bounded denial classification
+            //
+            // The sensitive value is prefixed so it is distinctive by
+            // construction: the labels below are fixed identifiers, and an
+            // unconstrained 1..64-char generator could (rarely) produce one
+            // of their substrings — a flaky false positive, not a leak. A
+            // real leak embeds the caller's value verbatim and is still
+            // caught.
+            let sensitive = format!("sk-{secret}");
             let reasons = [
                 WorkerScopeDenyReason::Operation,
                 WorkerScopeDenyReason::Namespace,

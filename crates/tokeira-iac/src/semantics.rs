@@ -59,6 +59,10 @@ pub enum DataEffect {
     Preserved,
     Migrated,
     Destroyed,
+    /// Data is affected under the resource's own declared policy — expiry,
+    /// retention, lifecycle — rather than by the change itself. The
+    /// declaration's statement and citation carry the specific policy.
+    Policy,
 }
 
 /// Whether applying the inverse change restores the prior state.

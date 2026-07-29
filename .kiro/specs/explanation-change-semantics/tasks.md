@@ -255,7 +255,7 @@ voices this spec owns.
     (defaulted) + five nouns + the model's `display` slot, pinned end-to-end in the
     exercise test.
 
-- [ ] 6.4 The Markdown renderer
+- [x] 6.4 The Markdown renderer
   - `# Infra Plan` + `**Plan for {platform}** with *live state* {state}` header; `##`
     action sections in would-mood templated prose; ids once (sections, never impacts);
     `## Impacts` severity-first, one line per subject, kind-specialized templates;
@@ -268,7 +268,7 @@ voices this spec owns.
   - termimad skin at the binary edge; raw Markdown when piped; `--json` untouched
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.7, 9.8; evidence-model Req 4.5/6 (amended)_
 
-- [ ] 6.5 Lexicon and contract migration
+- [x] 6.5 Lexicon and contract migration
   - Add disruption, data effect, reversibility, replacement, confidence, citation to
     `docs/platforms/operator-language.md`; replace the canonical plan transcripts with
     the Markdown target; amend `operator-output-contract.md` (narrative form = rendered
@@ -276,16 +276,25 @@ voices this spec owns.
     delta lines pending the output pass)
   - _Requirements: 9.6_
 
-- [ ] 6.6 Rendering properties reworked
+- [x] 6.6 Rendering properties reworked
   - Feature 1's renderer properties re-anchored to the Markdown form (depth superset,
     depth-blind JSON, lexicon conformance over prose outside code spans/links); the
     claims-not-gaps form of slot silence retained
   - _Property 7; Requirements: 9.4, 6.5_
 
-- [ ] 6.7 **Checkpoint** — rendered summary and detail reviewed against the 2026-07-29
+- [x] 6.7 **Checkpoint** — rendered summary and detail reviewed against the 2026-07-29
   target transcripts (the PR #40 body's rendering target); `tkr infra plan` against
   `compose-explore` reviewed live; a TTL-update plan reviewed for the `DataEffect`
   vocabulary gap and the resolution decided (extend the enum vs hold).
+  DONE — slice B: the storage-plan checkpoint test pins the target (voices, citations,
+  impacts, gaps machine-side); live against `compose-explore` the fresh `tkp` rendered
+  the header assurance and the `## Unchanged` section with real nouns — the
+  multiplicity rule visible in the wild (five *services* instance-named, singleton
+  kinds kind-forward). **Resolved at the slice-B review (operator-directed):** `DataEffect`
+  gains the general `Policy` value ("too specific" ruled out `ExpiresByPolicy`) — the
+  TTL update declares `ProviderGuarantee(Policy)` with the statement carrying the
+  specific meaning and `Inference(ReversibleWithDataLoss)`; the settings-vs-policy
+  rule recorded for DynamoDB's wider update surface.
 
 ## Phase 7 — Coverage enforcement
 

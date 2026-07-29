@@ -31,6 +31,10 @@ env:
 jobs:
   build-and-lint:
     name: "Format, docs, and lint"
+    # TEMPORARILY DISABLED 2026-07-29 (operator-directed): the Actions budget
+    # is nearly exhausted. A skipped job satisfies branch protection; the
+    # local §10.4 bar (fmt/lint/doc) is the gate until this is re-enabled.
+    if: false
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:

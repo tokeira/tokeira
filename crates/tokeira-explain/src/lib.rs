@@ -20,11 +20,13 @@
 pub mod artifact;
 pub mod build;
 pub mod evidence;
+pub mod impacts;
 pub mod model;
 
 pub use artifact::ExplainError;
 pub use build::{DeploymentContext, explain_applied, explain_plan};
 pub use evidence::{EvidenceId, EvidenceIndex, EvidenceKind};
+pub use impacts::derive_impacts;
 pub use model::{
     Cause, CommittedChange, CommittedOp, DeploymentExplanation, EXPLANATION_SCHEMA_VERSION,
     ExplainedChange, ImpactClass, OperationalImpact, SourceLocation, Uncertainty,

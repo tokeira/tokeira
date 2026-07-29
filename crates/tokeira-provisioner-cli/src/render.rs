@@ -70,10 +70,16 @@ fn uncertainty_narrative(explanation: &DeploymentExplanation, depth: Depth, out:
         out.push_str("live state: fully confirmed\n");
         return;
     }
-    out.push_str(&format!(
-        "{} — `--detail` explains each\n",
-        tokeira_report::counted(explanation.uncertainties.len(), "uncertainty"),
-    ));
+    // "uncertainty" inflects irregularly — per `counted`'s contract the
+    // call site owns the copy. (Caught by the storage-plan checkpoint: the
+    // plural path first arises with multiple gaps.)
+    let count = explanation.uncertainties.len();
+    let counted = if count == 1 {
+        "1 uncertainty".to_string()
+    } else {
+        format!("{count} uncertainties")
+    };
+    out.push_str(&format!("{counted} — `--detail` explains each\n"));
     if depth == Depth::Detail {
         for uncertainty in &explanation.uncertainties {
             out.push_str(&format!(
@@ -295,11 +301,50 @@ mod tests {
         }
     }
 
+    /// A fully-declared semantics value: these tests exercise refresh and
+    /// depth behaviour, so declarations are complete to keep the
+    /// undeclared-semantics activation out of their frame (it has its own
+    /// tests below).
+    fn declared() -> tokeira_iac::ChangeSemantics {
+        use tokeira_iac::{
+            Citation, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
+            Reversibility,
+        };
+        const CITE: Citation = Citation::new("test/declared");
+        tokeira_iac::ChangeSemantics {
+            operation: Confidence::EngineFact {
+                value: LifecycleOperation::UpdatedInPlace,
+                citation: CITE,
+            },
+            replacement: Confidence::EngineFact {
+                value: ReplacementPolicy::NotRequired,
+                citation: CITE,
+            },
+            disruption: Confidence::EngineFact {
+                value: Disruption::None,
+                citation: CITE,
+            },
+            data_effect: Confidence::EngineFact {
+                value: DataEffect::Preserved,
+                citation: CITE,
+            },
+            reversibility: Confidence::EngineFact {
+                value: Reversibility::Reversible,
+                citation: CITE,
+            },
+        }
+    }
+
     fn examined(changes: Vec<Change>) -> PlanOutcome {
         // Every planned resource confirmed live — the fully-confirmed case.
         let status_by_id = changes
             .iter()
             .map(|c| (ResourceId(c.resource.clone()), RefreshStatus::DesiredLive))
+            .collect();
+        let semantics_by_id = changes
+            .iter()
+            .filter(|c| c.kind != ChangeKind::NoChange)
+            .map(|c| (ResourceId(c.resource.clone()), declared()))
             .collect();
         PlanOutcome {
             changes,
@@ -307,7 +352,7 @@ mod tests {
                 status_by_id,
                 examined: true,
             },
-            ..Default::default()
+            semantics_by_id,
         }
     }
 
@@ -409,6 +454,101 @@ mod tests {
         assert!(
             detail.contains("live state: unconfirmed"),
             "per-change evidence: {detail}"
+        );
+    }
+
+    // Change-semantics 5.8 checkpoint: a storage plan with a DSQL delete
+    // states its gaps. The delete's disruption is declared (EngineFact), but
+    // its data effect and reversibility are Unknown — the documentation did
+    // not establish them — so beside a fully-declared service update, the
+    // plan names those two gaps on the cluster, resource and field, with the
+    // resolving action. "Nobody said" is distinguishable from "this is
+    // safe".
+    #[test]
+    fn a_storage_plan_states_its_gaps() {
+        use tokeira_iac::{Citation, Confidence, Disruption, LifecycleOperation};
+        const CITE: Citation = Citation::new("test/dsql-delete");
+
+        let mut outcome = examined(vec![
+            change(ChangeKind::Update, "compose/tokeirad"),
+            change(ChangeKind::Delete, "dsql/monitored"),
+        ]);
+        // Mirror the real ComposeService update declaration: effected as a
+        // destroy-before-create replacement, unavailable meanwhile.
+        outcome.semantics_by_id.insert(
+            ResourceId("compose/tokeirad".into()),
+            tokeira_iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Replaced,
+                    citation: CITE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: tokeira_iac::ReplacementPolicy::DestroyBeforeCreate,
+                    citation: CITE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: CITE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: tokeira_iac::DataEffect::Preserved,
+                    citation: CITE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: tokeira_iac::Reversibility::Reversible,
+                    citation: CITE,
+                },
+            },
+        );
+        // Mirror the real DsqlCluster managed-delete declaration: operation
+        // and disruption stated, data effect and reversibility Unknown.
+        outcome.semantics_by_id.insert(
+            ResourceId("dsql/monitored".into()),
+            tokeira_iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Deleted,
+                    citation: CITE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: tokeira_iac::ReplacementPolicy::NotRequired,
+                    citation: CITE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: CITE,
+                },
+                data_effect: Confidence::Unknown,
+                reversibility: Confidence::Unknown,
+            },
+        );
+        let r = report_for(&outcome, BindingVerdict::DevIterate, true);
+
+        let summary = render(&r, Mode::resolve(false, false)).unwrap();
+        assert!(
+            summary.contains("2 uncertainties"),
+            "the gaps are present at summary: {summary}"
+        );
+
+        let detail = render(&r, Mode::resolve(false, true)).unwrap();
+        assert!(
+            detail.contains("? dsql/monitored — no declaration states this change's data effect"),
+            "data-effect gap named on the resource: {detail}"
+        );
+        assert!(
+            detail.contains("? dsql/monitored — no declaration states this change's reversibility"),
+            "reversibility gap named on the resource: {detail}"
+        );
+        assert!(
+            detail.contains("resolve: declare `data_effect` in `t`'s `change_semantics`"),
+            "resolution names the kind: {detail}"
+        );
+
+        // The model carries the disruption impact the declarations justify
+        // (rendering it is the next phase's task).
+        assert_eq!(
+            r.explanation.impacts.len(),
+            2,
+            "unavailability + replacement"
         );
     }
 
@@ -576,18 +716,32 @@ mod tests {
             prop_assert_eq!(&back, &report.explanation, "JSON must round-trip to an equal model");
         }
 
-        // Property 8 — not-determined slots are silent: Feature 1 leaves the
-        // forward-compatible slots (semantics, cause, dependants, source) at
-        // their defaults, and no narrative line may derive from them.
+        // Property 8 — not-determined slots make no claims. Evolved with
+        // change-semantics Phase 5: an undeclared field may now appear as a
+        // *gap* (a SemanticsUndeclared uncertainty naming it), but never as
+        // a consequence — with every declaration defaulted there are no
+        // impacts, so no impact-statement vocabulary can appear, and the
+        // still-dormant slots (cause, dependants, source) stay wholly
+        // silent.
         #[test]
         fn property_8_not_determined_slots_are_silent(report in arb_report()) {
             for detail in [false, true] {
                 let text = render(&report, Mode::resolve(false, detail)).unwrap().to_lowercase();
-                for slot_word in ["cause", "impact", "disruption", "data effect",
-                                  "reversibility", "replacement policy", "derived"] {
+                for claim in ["destroys the data held by",
+                              "unavailable while the change applies",
+                              "briefly interrupts",
+                              "one at a time"] {
+                    prop_assert!(
+                        !text.contains(claim),
+                        "undeclared semantics produced a consequence claim {:?}: {}",
+                        claim,
+                        text,
+                    );
+                }
+                for slot_word in ["cause", "derived", "because of"] {
                     prop_assert!(
                         !text.contains(slot_word),
-                        "slot vocabulary {:?} leaked into narrative: {}",
+                        "dormant slot vocabulary {:?} leaked into narrative: {}",
                         slot_word,
                         text,
                     );

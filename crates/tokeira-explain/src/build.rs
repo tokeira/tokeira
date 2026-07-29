@@ -49,6 +49,10 @@ pub fn explain_plan(context: DeploymentContext, outcome: &PlanOutcome) -> Deploy
         explanation.changes.push(ExplainedChange {
             evidence_id: evidence_id.clone(),
             resource_id: change.resource.clone(),
+            display: outcome
+                .display_by_id
+                .get(&ResourceId(change.resource.clone()))
+                .cloned(),
             module: change.module.clone(),
             resource_type: change.resource_type.clone(),
             kind: change.kind,
@@ -134,6 +138,9 @@ pub fn explain_applied(
         explanation.changes.push(ExplainedChange {
             evidence_id: evidence_id.clone(),
             resource_id: entry.id.clone(),
+            display: preceding
+                .and_then(|plan| plan.display_by_id.get(&ResourceId(entry.id.clone())))
+                .cloned(),
             module: String::new(),
             resource_type: String::new(),
             kind,

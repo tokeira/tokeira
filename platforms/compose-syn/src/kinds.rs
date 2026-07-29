@@ -180,6 +180,10 @@ impl iac::Resource for LocalStateDirResource {
         "local_state"
     }
 
+    fn display_kind(&self) -> Option<&'static str> {
+        Some("state directory")
+    }
+
     async fn create(
         &self,
         _ctx: &iac::ProvisionContext,
@@ -234,12 +238,12 @@ impl iac::Resource for LocalStateDirResource {
     fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
         // Cited by module identity, never repo layout; every name is a real
         // identifier in this module.
-        const CREATE: iac::Citation = iac::Citation::new(concat!(
+        const CREATE: iac::Citation = iac::Citation::code(concat!(
             module_path!(),
             "::LocalStateDirResource::create — std::fs::create_dir_all; an existing \
              tree is left as-is"
         ));
-        const DELETE: iac::Citation = iac::Citation::new(concat!(
+        const DELETE: iac::Citation = iac::Citation::code(concat!(
             module_path!(),
             "::LocalStateDirResource::delete — deliberate no-op (returns Ok(())): \
              the record retires; the directory and its contents survive"
@@ -272,6 +276,7 @@ impl iac::Resource for LocalStateDirResource {
                     value: Reversibility::Reversible,
                     citation: DELETE,
                 },
+                statement: None,
             },
             // The diff never produces an update or replacement (always
             // NoChange); declared anyway — totality — from the no-op update.
@@ -296,6 +301,7 @@ impl iac::Resource for LocalStateDirResource {
                     value: Reversibility::Reversible,
                     citation: CREATE,
                 },
+                statement: None,
             },
             ChangeKind::Delete => iac::ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -318,6 +324,7 @@ impl iac::Resource for LocalStateDirResource {
                     value: Reversibility::Reversible,
                     citation: CREATE,
                 },
+                statement: None,
             },
             ChangeKind::NoChange => iac::ChangeSemantics::default(),
         }

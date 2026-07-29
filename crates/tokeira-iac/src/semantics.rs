@@ -70,26 +70,66 @@ pub enum Reversibility {
     Irreversible,
 }
 
-/// A documentation reference establishing a declared behaviour.
+/// A reference establishing a declared behaviour — the engine's own code,
+/// or product documentation.
 ///
-/// Constructed `const` at declaration sites (declarations are `const` items
-/// by convention precisely so the non-empty assertion evaluates at compile
-/// time). Stored as a `Cow` rather than `&'static str` so the artifact can
-/// round-trip through JSON — an implementation deviation from the design's
-/// literal sketch, recorded here: deserialized citations are owned, `const`
-/// ones are borrowed, and equality is by content either way.
+/// The two forms exist because the two claims are different in kind: a code
+/// citation names the module identity a reader greps for; a documentation
+/// citation carries a title and URL that render as a link, plus optionally
+/// the establishing sentence, quoted so the ground survives a moved page.
+/// Constructed `const` at declaration sites so the non-empty assertions
+/// evaluate at compile time; stored as `Cow` so the serialized form
+/// round-trips (deserialized citations are owned, `const` ones borrowed,
+/// equality by content either way).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Citation(Cow<'static, str>);
+#[serde(rename_all = "kebab-case")]
+pub enum Citation {
+    /// The engine's own code, by module identity.
+    Code(Cow<'static, str>),
+    /// Product documentation: title + URL, with the establishing quote
+    /// where one sentence carries the claim.
+    Doc {
+        title: Cow<'static, str>,
+        url: Cow<'static, str>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quote: Option<Cow<'static, str>>,
+    },
+}
 
 impl Citation {
-    /// A compile-time-checked citation. Empty citations refuse to build.
-    pub const fn new(reference: &'static str) -> Self {
+    /// A compile-time-checked code citation. Empty citations refuse to build.
+    pub const fn code(reference: &'static str) -> Self {
         assert!(!reference.is_empty(), "a citation must name its source");
-        Self(Cow::Borrowed(reference))
+        Citation::Code(Cow::Borrowed(reference))
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// A compile-time-checked documentation citation.
+    pub const fn doc(title: &'static str, url: &'static str) -> Self {
+        assert!(!title.is_empty(), "a documentation citation must be titled");
+        assert!(
+            !url.is_empty(),
+            "a documentation citation must carry its URL"
+        );
+        Citation::Doc {
+            title: Cow::Borrowed(title),
+            url: Cow::Borrowed(url),
+            quote: None,
+        }
+    }
+
+    /// A documentation citation carrying its establishing sentence.
+    pub const fn doc_quoted(title: &'static str, url: &'static str, quote: &'static str) -> Self {
+        assert!(!title.is_empty(), "a documentation citation must be titled");
+        assert!(
+            !url.is_empty(),
+            "a documentation citation must carry its URL"
+        );
+        assert!(!quote.is_empty(), "an establishing quote must not be empty");
+        Citation::Doc {
+            title: Cow::Borrowed(title),
+            url: Cow::Borrowed(url),
+            quote: Some(Cow::Borrowed(quote)),
+        }
     }
 }
 
@@ -98,13 +138,20 @@ impl Citation {
 /// `Unknown` is the `Default` — the lazy path is the honest path.
 /// `Inference` is engine-derived and renders as such; `EngineFact`
 /// cites the engine's own code; `ProviderGuarantee` cites the provider's
-/// documentation. Not `Copy`: citations own their text after deserialization.
+/// documentation. Every tier above `Unknown` carries a citation — an
+/// uncited conclusion is as unrepresentable as an uncited fact. Not
+/// `Copy`: citations own their text after deserialization.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Confidence<T> {
     #[default]
     Unknown,
-    Inference(T),
+    /// A conclusion the engine derives from cited facts — owned as the
+    /// engine's own, never presented as a guarantee.
+    Inference {
+        value: T,
+        citation: Citation,
+    },
     EngineFact {
         value: T,
         citation: Citation,
@@ -125,9 +172,19 @@ impl<T> Confidence<T> {
     pub fn value(&self) -> Option<&T> {
         match self {
             Confidence::Unknown => None,
-            Confidence::Inference(value)
+            Confidence::Inference { value, .. }
             | Confidence::EngineFact { value, .. }
             | Confidence::ProviderGuarantee { value, .. } => Some(value),
+        }
+    }
+
+    /// The citation behind the held value, if anything is held.
+    pub fn citation(&self) -> Option<&Citation> {
+        match self {
+            Confidence::Unknown => None,
+            Confidence::Inference { citation, .. }
+            | Confidence::EngineFact { citation, .. }
+            | Confidence::ProviderGuarantee { citation, .. } => Some(citation),
         }
     }
 }
@@ -142,6 +199,13 @@ pub struct ChangeSemantics {
     pub disruption: Confidence<Disruption>,
     pub data_effect: Confidence<DataEffect>,
     pub reversibility: Confidence<Reversibility>,
+    /// One kind-authored sentence of operator prose stating the change's
+    /// mechanism more precisely than the generic template ("it would be
+    /// stopped, removed, and recreated from the definition"). Optional: a
+    /// renderer falls back to the generic template. Carries the same
+    /// research obligation as the fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<Cow<'static, str>>,
 }
 
 /// What a kind needs in order to declare — the declaration point's input.
@@ -182,7 +246,7 @@ mod tests {
     fn cited_claims_round_trip() {
         let declared = Confidence::EngineFact {
             value: Disruption::UnavailableDuringChange,
-            citation: Citation::new("provider::module::reconcile — stop, remove, recreate"),
+            citation: Citation::code("provider::module::reconcile — stop, remove, recreate"),
         };
         let json = serde_json::to_string(&declared).unwrap();
         let back: Confidence<Disruption> = serde_json::from_str(&json).unwrap();

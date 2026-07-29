@@ -51,6 +51,10 @@ pub struct DeploymentExplanation {
 pub struct ExplainedChange {
     pub evidence_id: EvidenceId,
     pub resource_id: String,
+    /// The kind's operator-facing noun ("service", "Aurora DSQL cluster"),
+    /// composed into prose by renderers; `None` falls back to identifiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
     pub module: String,
     pub resource_type: String,
     pub kind: ChangeKind,

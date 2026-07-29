@@ -67,22 +67,29 @@ fn arb_diffs() -> impl Strategy<Value = Vec<FieldDiff>> {
 /// Declarations at every confidence tier. Citations come from a const pool —
 /// content is irrelevant to the transport properties; presence is not.
 fn arb_semantics() -> impl Strategy<Value = ChangeSemantics> {
-    const CITE: Citation = Citation::new("test/citation");
+    const CITE: Citation = Citation::code("test/citation");
+    const DOC: Citation = Citation::doc_quoted("A page", "https://example.test/page", "A quote.");
     let operation = prop_oneof![
         Just(Confidence::Unknown),
-        Just(Confidence::Inference(LifecycleOperation::Replaced)),
+        Just(Confidence::Inference {
+            value: LifecycleOperation::Replaced,
+            citation: CITE,
+        }),
         Just(Confidence::EngineFact {
             value: LifecycleOperation::UpdatedInPlace,
             citation: CITE,
         }),
         Just(Confidence::ProviderGuarantee {
             value: LifecycleOperation::Deleted,
-            citation: CITE,
+            citation: DOC,
         }),
     ];
     let replacement = prop_oneof![
         Just(Confidence::Unknown),
-        Just(Confidence::Inference(ReplacementPolicy::NotRequired)),
+        Just(Confidence::Inference {
+            value: ReplacementPolicy::NotRequired,
+            citation: CITE,
+        }),
         Just(Confidence::EngineFact {
             value: ReplacementPolicy::DestroyBeforeCreate,
             citation: CITE,
@@ -92,7 +99,7 @@ fn arb_semantics() -> impl Strategy<Value = ChangeSemantics> {
         Just(Confidence::Unknown),
         Just(Confidence::ProviderGuarantee {
             value: Disruption::UnavailableDuringChange,
-            citation: CITE,
+            citation: DOC,
         }),
     ];
     let data_effect = prop_oneof![
@@ -101,11 +108,17 @@ fn arb_semantics() -> impl Strategy<Value = ChangeSemantics> {
             value: DataEffect::Destroyed,
             citation: CITE,
         }),
-        Just(Confidence::Inference(DataEffect::Preserved)),
+        Just(Confidence::Inference {
+            value: DataEffect::Preserved,
+            citation: DOC,
+        }),
     ];
     let reversibility = prop_oneof![
         Just(Confidence::Unknown),
-        Just(Confidence::Inference(Reversibility::Irreversible)),
+        Just(Confidence::Inference {
+            value: Reversibility::Irreversible,
+            citation: CITE,
+        }),
     ];
     (
         operation,
@@ -121,6 +134,7 @@ fn arb_semantics() -> impl Strategy<Value = ChangeSemantics> {
                 disruption,
                 data_effect,
                 reversibility,
+                statement: None,
             },
         )
 }
@@ -173,6 +187,7 @@ fn arb_outcome() -> impl Strategy<Value = PlanOutcome> {
                     examined,
                 },
                 semantics_by_id,
+                ..Default::default()
             }
         })
 }
@@ -577,7 +592,7 @@ proptest! {
         ])?;
         for change in value["changes"].as_array().into_iter().flatten() {
             keys_within(change, &[
-                "evidence_id", "resource_id", "module", "resource_type",
+                "evidence_id", "resource_id", "display", "module", "resource_type",
                 "kind", "field_diffs", "refresh_status", "semantics", "cause",
                 "dependants", "source",
             ])?;

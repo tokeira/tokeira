@@ -109,6 +109,7 @@ impl Engine {
                 examined: true,
             },
             semantics_by_id: delta.semantics_by_id,
+            display_by_id: delta.display_by_id,
         })
     }
 
@@ -141,6 +142,7 @@ impl Engine {
                 examined: true,
             },
             semantics_by_id: delta.semantics_by_id,
+            display_by_id: delta.display_by_id,
         })
     }
 
@@ -235,6 +237,7 @@ impl Engine {
                 examined: true,
             },
             semantics_by_id: delta.semantics_by_id,
+            display_by_id: delta.display_by_id,
         })
     }
 
@@ -254,6 +257,7 @@ impl Engine {
             changes: filter_changes_by_modules(&outcome.changes, &ctx.state, &active),
             refresh: outcome.refresh,
             semantics_by_id: outcome.semantics_by_id,
+            display_by_id: outcome.display_by_id,
         })
     }
 
@@ -498,6 +502,9 @@ pub struct PlanOutcome {
     /// on a deletion means no recoverer claimed the resource's type — a
     /// consumer surfaces that as uncertainty, never silence.
     pub semantics_by_id: BTreeMap<ResourceId, crate::ChangeSemantics>,
+    /// Per-resource display nouns ([`Resource::display_kind`]), collected
+    /// beside the semantics; absent where a kind declares none.
+    pub display_by_id: BTreeMap<ResourceId, String>,
 }
 
 #[derive(Debug)]
@@ -635,6 +642,7 @@ async fn refresh_state(
 struct ComputedDelta {
     changes: Vec<Change>,
     semantics_by_id: BTreeMap<ResourceId, crate::ChangeSemantics>,
+    display_by_id: BTreeMap<ResourceId, String>,
 }
 
 fn compute_changes(
@@ -645,9 +653,13 @@ fn compute_changes(
     let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.resource_id()).collect();
     let mut changes = Vec::new();
     let mut semantics_by_id = BTreeMap::new();
+    let mut display_by_id = BTreeMap::new();
 
     for resource in desired {
         let rid = resource.resource_id();
+        if let Some(noun) = resource.display_kind() {
+            display_by_id.insert(rid.clone(), noun.to_string());
+        }
         let current = state.resources.get(&rid);
         let change = match current {
             Some(current) => {
@@ -700,6 +712,9 @@ fn compute_changes(
                         field_diffs: &[],
                     }),
                 );
+                if let Some(noun) = recovered.display_kind() {
+                    display_by_id.insert(rid.clone(), noun.to_string());
+                }
             }
             changes.push(Change {
                 kind: ChangeKind::Delete,
@@ -714,6 +729,7 @@ fn compute_changes(
     ComputedDelta {
         changes,
         semantics_by_id,
+        display_by_id,
     }
 }
 

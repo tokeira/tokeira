@@ -157,7 +157,8 @@ property-based test task.
   the end-to-end half of this checkpoint is the exercise-test assertion that compose
   creates carry declared operations through the real engine — the `--detail` prose
   review completes at Phase 6's checkpoint (rendering does not exist yet; recorded
-  deviation).
+  deviation). *2026-07-29:* Phase 4's deliberate DSQL/DynamoDB Unknowns were closed by
+  the task-6.2 research — the goldens now assert the cited answers.
 
 ## Phase 5 — Impacts and uncertainty activation
 
@@ -219,14 +220,14 @@ form (sections, templates, display names, header) is specified by the evidence-m
 spec's amended Requirement 6; this phase implements it together with the semantics
 voices this spec owns.
 
-- [ ] 6.1 Vocabulary amendments
+- [x] 6.1 Vocabulary amendments
   - `Citation` → `Code(..) | Doc { title, url, quote }` with const constructors and
     non-empty guarantees; `Inference` gains a citation; `ChangeSemantics` gains the
     optional kind-authored mechanism `statement`
   - Migrate the five Tier 1/2 declarations onto the new shapes
   - _Requirements: 1 (amendment), 2.7, 2.8_
 
-- [ ] 6.2 Declaration upgrades from the 2026-07-29 research
+- [x] 6.2 Declaration upgrades from the 2026-07-29 research
   - DSQL managed delete: `reversibility = ProviderGuarantee(Irreversible)` (doc-cited),
     `data_effect = Inference(Destroyed)` (derivation-cited); managed create:
     `reversibility = Inference(ReversibleWithDataLoss)`
@@ -235,12 +236,24 @@ voices this spec owns.
   - Golden tests updated; Phase 4 DONE records annotated
   - _Requirements: 2.5 (amended), 7.2_
 
-- [ ] 6.3 Display names
+- [x] 6.3 Display names
   - Kind noun declared beside the kind (e.g. "service", "Aurora DSQL cluster"); carried
     through `Change` and the model as a new slot in the field policy (evidence-model
     amendment); instance name joins the rendering only when the plan holds more than one
     resource of the kind; `.tkd` author override ledgered for the source-spans feature
   - _Requirements: evidence-model Req 6 (amended)_
+  - DONE — slice A (with 6.1/6.2): `Citation` → `Code | Doc {title, url, quote}` with
+    const constructors; `Inference {value, citation}`; `ChangeSemantics.statement`
+    (authored for the compose replace mechanism and the DSQL protection-disable
+    sequence); all five declarations migrated; researched upgrades landed with their
+    establishing quotes (DSQL delete PG(Irreversible)+Inference(Destroyed), create
+    Inference(ReversibleWithDataLoss); DynamoDB delete PG(Irreversible) via the PITR
+    page); goldens evolved to the researched answers; display channel as
+    `display_by_id` on `PlanOutcome` (collected beside semantics, recovery path
+    included — a deviation from the task's `Change`-field sketch, recorded: the map
+    pattern breaks no literals and matches coverage/semantics) + `Resource::display_kind`
+    (defaulted) + five nouns + the model's `display` slot, pinned end-to-end in the
+    exercise test.
 
 - [ ] 6.4 The Markdown renderer
   - `# Infra Plan` + `**Plan for {platform}** with *live state* {state}` header; `##`

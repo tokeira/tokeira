@@ -158,6 +158,10 @@ impl iac::Resource for ComposeService {
         &self.name
     }
 
+    fn display_kind(&self) -> Option<&'static str> {
+        Some("service")
+    }
+
     async fn create(
         &self,
         ctx: &iac::ProvisionContext,
@@ -220,12 +224,12 @@ impl iac::Resource for ComposeService {
         // EngineFacts, cited by module identity — never repo layout — so the
         // citation stays true wherever this crate is used. Every name below
         // is a real identifier in this module.
-        const RECONCILE: iac::Citation = iac::Citation::new(concat!(
+        const RECONCILE: iac::Citation = iac::Citation::code(concat!(
             module_path!(),
             "::ComposePlatform::reconcile_service — stop_container(t: 1) → \
              remove_container(force: true) → create fresh from the definition"
         ));
-        const REMOVE: iac::Citation = iac::Citation::new(concat!(
+        const REMOVE: iac::Citation = iac::Citation::code(concat!(
             module_path!(),
             "::ComposePlatform::remove_service — stop_container + remove_container \
              with RemoveContainerOptions { force: true, ..Default::default() } — the \
@@ -257,6 +261,7 @@ impl iac::Resource for ComposeService {
                     value: Reversibility::Reversible,
                     citation: REMOVE,
                 },
+                statement: None,
             },
             // Update and Replace share one provider path — reconcile — and
             // therefore one truth: destroy-before-create, unavailable while
@@ -283,6 +288,9 @@ impl iac::Resource for ComposeService {
                     value: Reversibility::Reversible,
                     citation: RECONCILE,
                 },
+                statement: Some(std::borrow::Cow::Borrowed(
+                    "it would be stopped, removed, and recreated from the definition",
+                )),
             },
             ChangeKind::Delete => iac::ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -305,6 +313,7 @@ impl iac::Resource for ComposeService {
                     value: Reversibility::Reversible,
                     citation: RECONCILE,
                 },
+                statement: None,
             },
             // The engine never asks about NoChange; totality answers anyway,
             // with nothing.

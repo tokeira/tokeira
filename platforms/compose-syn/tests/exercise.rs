@@ -133,6 +133,11 @@ async fn exercise_compose_syn_end_to_end() {
                 "compose service {} declares its operation",
                 change.resource_id
             );
+            assert_eq!(
+                change.display.as_deref(),
+                Some("service"),
+                "the kind's display noun reaches the model"
+            );
         }
     }
 

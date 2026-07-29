@@ -310,7 +310,7 @@ mod tests {
             Citation, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
             Reversibility,
         };
-        const CITE: Citation = Citation::new("test/declared");
+        const CITE: Citation = Citation::code("test/declared");
         tokeira_iac::ChangeSemantics {
             operation: Confidence::EngineFact {
                 value: LifecycleOperation::UpdatedInPlace,
@@ -332,6 +332,7 @@ mod tests {
                 value: Reversibility::Reversible,
                 citation: CITE,
             },
+            statement: None,
         }
     }
 
@@ -353,6 +354,7 @@ mod tests {
                 examined: true,
             },
             semantics_by_id,
+            ..Default::default()
         }
     }
 
@@ -467,7 +469,7 @@ mod tests {
     #[test]
     fn a_storage_plan_states_its_gaps() {
         use tokeira_iac::{Citation, Confidence, Disruption, LifecycleOperation};
-        const CITE: Citation = Citation::new("test/dsql-delete");
+        const CITE: Citation = Citation::code("test/dsql-delete");
 
         let mut outcome = examined(vec![
             change(ChangeKind::Update, "compose/tokeirad"),
@@ -498,6 +500,7 @@ mod tests {
                     value: tokeira_iac::Reversibility::Reversible,
                     citation: CITE,
                 },
+                statement: None,
             },
         );
         // Mirror the real DsqlCluster managed-delete declaration: operation
@@ -519,6 +522,7 @@ mod tests {
                 },
                 data_effect: Confidence::Unknown,
                 reversibility: Confidence::Unknown,
+                statement: None,
             },
         );
         let r = report_for(&outcome, BindingVerdict::DevIterate, true);

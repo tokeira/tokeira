@@ -489,6 +489,14 @@ pub trait Resource: Send + Sync {
         let _ = ctx;
         ChangeSemantics::default()
     }
+
+    /// A short operator-facing noun for what this resource is — "service",
+    /// "DNS zone", "state directory". Consumers compose it into prose
+    /// ("the *grafana* service"); `None` falls back to identifiers. Keep it
+    /// lowercase unless the noun is a proper name.
+    fn display_kind(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 #[cfg(test)]

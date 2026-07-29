@@ -266,6 +266,10 @@ impl Resource for DynamoDbTable {
         &self.config.module
     }
 
+    fn display_kind(&self) -> Option<&'static str> {
+        Some("DynamoDB table")
+    }
+
     fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
         let current_tags: HashMap<String, String> = current
             .properties
@@ -296,33 +300,40 @@ impl Resource for DynamoDbTable {
         }
     }
 
-    /// What a DynamoDB-table change does. The
-    /// engine-side facts come from this file's own paths (update issues
-    /// control-plane calls only; there is no replace path — the diff never
-    /// produces one). The provider-side facts carry AWS's own words: the
-    /// DeleteTable API reference states "The DeleteTable operation deletes a
-    /// table and all of its items." Recoverability of a deleted table is
-    /// not established by that page (backups and PITR are conditional
-    /// features), so reversibility of a delete stays `Unknown` rather than
-    /// inferred; likewise a TTL-bearing update's data effect depends on
-    /// per-item expiry values, which no declaration can know.
+    /// What a DynamoDB-table change does. The engine-side facts come from
+    /// this file's own paths (update issues control-plane calls only; there
+    /// is no replace path — the diff never produces one). The provider-side
+    /// facts carry AWS's own words: DeleteTable "deletes a table and all of
+    /// its items", and recoverability is a provider guarantee grounded in the
+    /// PITR model — the system backup exists only when PITR is enabled, this
+    /// engine's create leaves PITR at its documented DISABLED default, and a
+    /// restore in any case "always restores to a new table" (researched
+    /// 2026-07-29). A TTL-bearing update's data effect stays Unknown:
+    /// per-item expiry is unknowable at declaration time.
     fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
         // Cited by module identity, never repo layout; every name is a real
-        // identifier in this module. The delete citation stays a
-        // documentation URL: that claim is AWS's, not this module's.
-        const CREATE_PATH: Citation = Citation::new(concat!(
+        // identifier in this module. The provider claims cite AWS's own
+        // pages, quoted.
+        const CREATE_PATH: Citation = Citation::code(concat!(
             module_path!(),
             "::create — dynamodb:CreateTable, then wait_until_active"
         ));
-        const UPDATE_PATH: Citation = Citation::new(concat!(
+        const UPDATE_PATH: Citation = Citation::code(concat!(
             module_path!(),
             "::update — dynamodb:TagResource and dynamodb:UpdateTimeToLive only; \
              no data-plane operation"
         ));
-        const DELETE_TABLE_DOC: Citation = Citation::new(
-            "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/\
-             API_DeleteTable.html — \"The DeleteTable operation deletes a table and \
-             all of its items.\"",
+        const DELETE_TABLE_DOC: Citation = Citation::doc_quoted(
+            "DeleteTable — Amazon DynamoDB API Reference",
+            "https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_DeleteTable.html",
+            "The DeleteTable operation deletes a table and all of its items.",
+        );
+        const PITR_DOC: Citation = Citation::doc_quoted(
+            "Enable point-in-time recovery in DynamoDB",
+            "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/PointInTimeRecovery_Howitworks.html",
+            "When you delete a table that has point-in-time recovery enabled, \
+             DynamoDB automatically creates a backup snapshot called a system \
+             backup and retains it for 35 days",
         );
         match ctx.kind {
             ChangeKind::Create => ChangeSemantics {
@@ -348,6 +359,7 @@ impl Resource for DynamoDbTable {
                     value: Reversibility::ReversibleWithDataLoss,
                     citation: DELETE_TABLE_DOC,
                 },
+                statement: None,
             },
             ChangeKind::Update => {
                 // The only updates this kind's diff produces are tags and the
@@ -370,7 +382,10 @@ impl Resource for DynamoDbTable {
                     // fetched. Ledgered: fetch the TagResource /
                     // UpdateTimeToLive docs and upgrade to ProviderGuarantee
                     // if they establish it.
-                    disruption: Confidence::Inference(Disruption::None),
+                    disruption: Confidence::Inference {
+                        value: Disruption::None,
+                        citation: UPDATE_PATH,
+                    },
                     data_effect: if ttl_involved {
                         Confidence::Unknown
                     } else {
@@ -387,6 +402,7 @@ impl Resource for DynamoDbTable {
                             citation: UPDATE_PATH,
                         }
                     },
+                    statement: None,
                 }
             }
             ChangeKind::Delete => ChangeSemantics {
@@ -406,9 +422,15 @@ impl Resource for DynamoDbTable {
                     value: DataEffect::Destroyed,
                     citation: DELETE_TABLE_DOC,
                 },
-                // The page read does not establish recoverability of a
-                // deleted table — Unknown, never inferred.
-                reversibility: Confidence::Unknown,
+                // The system backup that would allow recovery exists only
+                // when PITR is enabled; this engine's create leaves PITR at
+                // its documented DISABLED default, and a restore always
+                // creates a new table.
+                reversibility: Confidence::ProviderGuarantee {
+                    value: Reversibility::Irreversible,
+                    citation: PITR_DOC,
+                },
+                statement: None,
             },
             // The diff never produces a replacement; reported inapplicable
             // via the all-Unknown default, kept total.
@@ -811,12 +833,14 @@ impl Resource for DynamoDbTable {
 mod tests {
     use super::*;
 
-    // Golden declarations (change-semantics task 4.5): classification and
-    // confidence only. The headlines: a delete carries AWS's own words —
-    // the table and all its items are deleted — as a ProviderGuarantee,
-    // while its recoverability and a TTL-bearing update's data effect stay
-    // Unknown (not established / not knowable per item). The diff never
-    // produces a replacement, so that scenario is asserted inapplicable.
+    // Golden declarations (change-semantics tasks 4.5 + 6.2): classification
+    // and confidence only. A delete carries AWS's own words — the table and
+    // all its items are deleted — and, since the 2026-07-29 research, its
+    // recoverability is a cited provider guarantee (the system backup exists
+    // only under PITR, which this engine's create leaves at its documented
+    // default). A TTL-bearing update's data effect stays Unknown: per-item
+    // expiry is unknowable at declaration time. The diff never produces a
+    // replacement, so that scenario is asserted inapplicable.
     #[test]
     fn dynamodb_declarations_cite_aws_and_stay_unknown_at_the_edges() {
         use tokeira_iac::{
@@ -859,7 +883,13 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(delete.reversibility, Confidence::Unknown));
+        assert!(matches!(
+            delete.reversibility,
+            Confidence::ProviderGuarantee {
+                value: Reversibility::Irreversible,
+                ..
+            }
+        ));
 
         let tags_update = declared(
             ChangeKind::Update,
@@ -883,7 +913,10 @@ mod tests {
         // the pages fetched do not establish the provider's behaviour.
         assert!(matches!(
             tags_update.disruption,
-            Confidence::Inference(Disruption::None)
+            Confidence::Inference {
+                value: Disruption::None,
+                ..
+            }
         ));
 
         // Drift-driven or definition-driven, a TTL change is the same

@@ -311,6 +311,9 @@ fn change_detail(change: &ExplainedChange, out: &mut String) {
             DataEffect::Preserved => Some("the data it holds would be preserved"),
             DataEffect::Migrated => Some("its data would be migrated"),
             DataEffect::Destroyed => Some("its stored data would be destroyed"),
+            // The general value; the kind's statement carries the specific
+            // policy ("items past their declared expiry would be deleted").
+            DataEffect::Policy => Some("its data follows its declared policy"),
         };
         if let Some(claim) = claim {
             out.push_str(&format!("  - {}\n", voiced(claim, &semantics.data_effect)));

@@ -290,8 +290,11 @@ voices this spec owns.
   impacts, gaps machine-side); live against `compose-explore` the fresh `tkp` rendered
   the header assurance and the `## Unchanged` section with real nouns — the
   multiplicity rule visible in the wild (five *services* instance-named, singleton
-  kinds kind-forward). **Held open:** the TTL `DataEffect` vocabulary decision — the
-  operator picks extend-the-enum vs hold at the slice-B review.
+  kinds kind-forward). **Resolved at the slice-B review (operator-directed):** `DataEffect`
+  gains the general `Policy` value ("too specific" ruled out `ExpiresByPolicy`) — the
+  TTL update declares `ProviderGuarantee(Policy)` with the statement carrying the
+  specific meaning and `Inference(ReversibleWithDataLoss)`; the settings-vs-policy
+  rule recorded for DynamoDB's wider update surface.
 
 ## Phase 7 — Coverage enforcement
 

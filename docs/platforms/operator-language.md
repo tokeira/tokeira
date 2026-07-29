@@ -39,7 +39,7 @@ The operator's nouns. Reports use these words and no synonyms.
 | **live state** | What actually runs, as the engine examined it during a plan. Spoken with its coverage: "live state: fully confirmed" when every planned resource answered, "live state: unconfirmed" as per-resource evidence otherwise. | refresh, refreshed state (in prose) |
 | **impact** | An operational consequence of a change, stated only with cited evidence — the engine speaks impacts it can substantiate, never speculation. Rendered as the `## Impacts` section, severity-first, speaking descriptive names. | side effect |
 | **disruption** | What a change does to availability while it applies ("would be unavailable while the change applies"). | downtime (as a label), outage |
-| **data effect** | What a change does to the data a resource holds — preserved, migrated, or destroyed. | data loss (as a bare label) |
+| **data effect** | What a change does to the data a resource holds — preserved, migrated, destroyed, or following the resource's own declared policy. | data loss (as a bare label) |
 | **reversibility** | Whether a change could be undone — reversible, reversible with data loss, or not reversible. | rollbackable |
 | **replacement** | A change effected by destroying and recreating the resource; the plan says so even when the engine classifies it as an update. | recreate (as a label) |
 | **confidence** | How firmly a stated behaviour is held: the engine's own fact, the provider's documented guarantee, or a conclusion the engine derives — each carrying its citation. | certainty |

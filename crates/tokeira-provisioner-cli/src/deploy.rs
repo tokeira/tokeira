@@ -55,7 +55,7 @@ pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
             if let Some(path) = explanation_path {
                 tokeira_explain::artifact::write(path, &report.explanation)?;
             }
-            print!("{}", tokeira_report::render(&report, mode)?);
+            crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
         }
     }
     Ok(())

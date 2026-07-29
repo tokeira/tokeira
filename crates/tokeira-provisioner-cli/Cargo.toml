@@ -20,6 +20,7 @@ tokeira-build-info = { workspace = true }
 tokeira-iac = { workspace = true }
 tokeira-report = { workspace = true }
 tokeira-explain = { workspace = true }
+termimad = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

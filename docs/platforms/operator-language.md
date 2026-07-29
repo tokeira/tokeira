@@ -37,7 +37,13 @@ The operator's nouns. Reports use these words and no synonyms.
 | **retained** | Kept for return: retained revisions (`revert`), the retained prior provisioner (`rollback`). | checkpoint, snapshot (in prose) |
 | **uncertainty** | Something the engine could not determine, stated with its consequence and (where one exists) the action that resolves it. An empty set is itself stated: "live state: fully confirmed". | unknown status, refresh status (in prose) |
 | **live state** | What actually runs, as the engine examined it during a plan. Spoken with its coverage: "live state: fully confirmed" when every planned resource answered, "live state: unconfirmed" as per-resource evidence otherwise. | refresh, refreshed state (in prose) |
-| **impact** | An operational consequence of a change ("restarts grafana"), stated only with cited evidence — the engine speaks impacts it can substantiate, never speculation. Defined ahead of emission: reports carry impacts once change semantics land. | side effect, disruption (as a label) |
+| **impact** | An operational consequence of a change, stated only with cited evidence — the engine speaks impacts it can substantiate, never speculation. Rendered as the `## Impacts` section, severity-first, speaking descriptive names. | side effect |
+| **disruption** | What a change does to availability while it applies ("would be unavailable while the change applies"). | downtime (as a label), outage |
+| **data effect** | What a change does to the data a resource holds — preserved, migrated, or destroyed. | data loss (as a bare label) |
+| **reversibility** | Whether a change could be undone — reversible, reversible with data loss, or not reversible. | rollbackable |
+| **replacement** | A change effected by destroying and recreating the resource; the plan says so even when the engine classifies it as an update. | recreate (as a label) |
+| **confidence** | How firmly a stated behaviour is held: the engine's own fact, the provider's documented guarantee, or a conclusion the engine derives — each carrying its citation. | certainty |
+| **citation** | The reference behind a stated behaviour: the engine's module identity, or a product document (title, link, and the establishing sentence). | source (as a label) |
 
 The operator's verbs, with their one-line meanings:
 
@@ -72,6 +78,23 @@ prose may not.
 ## Canonical transcripts
 
 The lexicon applied — these are the reference renderings new output imitates.
+
+```markdown
+# Infra Plan
+**Plan for compose-syn** with *live state* confirmed
+
+## Update
+- the *tokeirad* service would be updated - `tokeirad::compose/tokeirad`
+
+## Delete
+- the *Aurora DSQL cluster* would be deleted - `dsql::dsql/monitored`
+
+## Impacts
+- data held by the *Aurora DSQL cluster* would be destroyed, irreversibly
+- the *Aurora DSQL cluster* would no longer be available
+- the *tokeirad* service would be unavailable while the change applies
+- the *tokeirad* service would be replaced
+```
 
 ```text
 # apply, closing lines

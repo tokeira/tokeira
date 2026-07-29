@@ -179,6 +179,19 @@ pub fn change_log_entries(changes: &[Change]) -> Vec<ChangeLogEntry> {
         .collect()
 }
 
+/// Emit a rendered report: Markdown narrative is skinned for a terminal via
+/// termimad and emitted raw everywhere else — a pipe, a redirect, or an
+/// agent receives the deterministic Markdown itself (operator-explanation
+/// D8). `--json` output is never skinned.
+pub(crate) fn emit_report(text: &str, mode: tokeira_report::Mode) {
+    use std::io::IsTerminal;
+    if matches!(mode.form, tokeira_report::Form::Narrative) && std::io::stdout().is_terminal() {
+        termimad::print_text(text);
+    } else {
+        print!("{text}");
+    }
+}
+
 /// Map audit entries to the explanation's committed changes at the shell
 /// boundary (evidence-model C3): the model crate must not depend on
 /// `tokeira-provisioner` (Req 9.1), so the audit type crosses into the

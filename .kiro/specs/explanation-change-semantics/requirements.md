@@ -266,8 +266,10 @@ posture, so that silence is always a decision and never an oversight.
 #### Acceptance Criteria
 
 1. THE kind inventory SHALL account for every `Resource` implementation in the workspace.
-2. WHERE a kind is Tier 1 or Tier 2 THE kind SHALL declare every applicable field with
-   engine-fact or provider-guarantee confidence.
+2. WHERE a kind is Tier 1 or Tier 2 THE kind SHALL declare every applicable field above
+   unknown confidence — engine fact, provider guarantee, or cited inference. *(Amended
+   2026-07-29, consistent with 2.8: a researched declaration may honestly be an
+   inference; the enforcement bar is above-unknown, as Property 9 states.)*
 3. WHERE a kind is Tier 3 THE kind SHALL retain the unknown default and the inventory
    SHALL record that as deliberate.
 4. WHEN a new `Resource` implementation is added THE inventory SHALL be updated in the

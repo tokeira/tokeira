@@ -523,7 +523,9 @@ proptest! {
     #[test]
     fn semantics_property_8_uncertainty_activation_is_exact(outcome in arb_outcome()) {
         let explanation = explain_plan(context(), &outcome);
-        let fields: [(&str, fn(&ChangeSemantics) -> bool, fn(ChangeKind) -> bool); 5] = [
+        // (wire name, field-is-declared, field-applies-to-change-kind).
+        type FieldProbe = (&'static str, fn(&ChangeSemantics) -> bool, fn(ChangeKind) -> bool);
+        let fields: [FieldProbe; 5] = [
             ("operation", |s| s.operation.is_known(), |k| k != ChangeKind::NoChange),
             ("replacement", |s| s.replacement.is_known(),
              |k| matches!(k, ChangeKind::Update | ChangeKind::Replace)),

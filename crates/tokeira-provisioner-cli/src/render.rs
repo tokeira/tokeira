@@ -531,15 +531,15 @@ mod tests {
 
         let detail = render(&r, Mode::resolve(false, true)).unwrap();
         assert!(
-            detail.contains("? dsql/monitored — this change's data effect is not declared"),
+            detail.contains("? dsql/monitored — no declaration states this change's data effect"),
             "data-effect gap named on the resource: {detail}"
         );
         assert!(
-            detail.contains("? dsql/monitored — this change's reversibility is not declared"),
+            detail.contains("? dsql/monitored — no declaration states this change's reversibility"),
             "reversibility gap named on the resource: {detail}"
         );
         assert!(
-            detail.contains("resolve: declare change semantics for the t kind"),
+            detail.contains("resolve: declare `data_effect` in `t`'s `change_semantics`"),
             "resolution names the kind: {detail}"
         );
 

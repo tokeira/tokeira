@@ -251,7 +251,7 @@ fn derive_refresh_uncertainties(explanation: &mut DeploymentExplanation, outcome
 /// never silence. Non-deletions are always reachable (they sit in the
 /// desired set), so absence there carries no such meaning.
 fn derive_semantics_uncertainties(explanation: &mut DeploymentExplanation, outcome: &PlanOutcome) {
-    let undeclared: Vec<EvidenceId> = explanation
+    let undeclared: Vec<(EvidenceId, String)> = explanation
         .changes
         .iter()
         .filter(|change| {
@@ -260,16 +260,19 @@ fn derive_semantics_uncertainties(explanation: &mut DeploymentExplanation, outco
                     .semantics_by_id
                     .contains_key(&ResourceId(change.resource_id.clone()))
         })
-        .map(|change| change.evidence_id.clone())
+        .map(|change| (change.evidence_id.clone(), change.resource_type.clone()))
         .collect();
-    for subject in undeclared {
+    for (subject, resource_type) in undeclared {
         push_uncertainty(
             explanation,
             subject,
             UncertaintyReason::KindUnavailableForRemovedResource,
-            "what this deletion does to the running resource could not be established              from recorded state"
+            "no declaration can state what this deletion does; the resource's type is \
+             not registered for recovery"
                 .to_string(),
-            Some("register recovery for this resource type in the platform".to_string()),
+            Some(format!(
+                "register a `ResourceRecovery` for `{resource_type}`"
+            )),
         );
     }
 }
@@ -335,8 +338,8 @@ fn derive_semantics_undeclared(explanation: &mut DeploymentExplanation) {
                 UncertaintyReason::SemanticsUndeclared {
                     field: field.wire_name().to_string(),
                 },
-                format!("no change in this plan declares its {}", field.noun()),
-                Some("declare change semantics for the kinds in this plan".to_string()),
+                format!("no declaration states any change's {}", field.noun()),
+                Some("declare `change_semantics` for this plan's resource types".to_string()),
             );
         } else {
             for (subject, resource_type, _) in unknowns {
@@ -346,9 +349,10 @@ fn derive_semantics_undeclared(explanation: &mut DeploymentExplanation) {
                     UncertaintyReason::SemanticsUndeclared {
                         field: field.wire_name().to_string(),
                     },
-                    format!("this change's {} is not declared", field.noun()),
+                    format!("no declaration states this change's {}", field.noun()),
                     Some(format!(
-                        "declare change semantics for the {resource_type} kind"
+                        "declare `{}` in `{resource_type}`'s `change_semantics`",
+                        field.wire_name(),
                     )),
                 );
             }

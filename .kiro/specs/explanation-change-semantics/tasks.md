@@ -210,24 +210,69 @@ property-based test task.
   demon: `counted(2, "uncertainty")` rendered "uncertaintys"; the irregular plural now
   owns its call-site copy. Impacts render next phase; the model carries them now.
 
-## Phase 6 — Rendering
+## Phase 6 — Rendering (rewritten 2026-07-29 to the Markdown target)
 
-- [ ] 6.1 Render impacts at summary depth
-  - Operational impacts stated; per-change semantics not enumerated
-  - _Requirements: 9.1_
+The narrative becomes deterministic Markdown, rendered for the terminal via `termimad`
+(new dependency — architectural, approved in the 2026-07-29 exploration; raw Markdown is
+emitted when stdout is not a TTY, which is the agent- and PR-native form). The document
+form (sections, templates, display names, header) is specified by the evidence-model
+spec's amended Requirement 6; this phase implements it together with the semantics
+voices this spec owns.
 
-- [ ] 6.2 Render semantics at detail depth
-  - Per-change fields with confidence; `Inference` marked as derived; `Unknown` omitted
-  - `--json` carries every declared field with confidence and citation at any depth
-  - _Requirements: 9.2, 9.3, 9.4, 9.5_
+- [ ] 6.1 Vocabulary amendments
+  - `Citation` → `Code(..) | Doc { title, url, quote }` with const constructors and
+    non-empty guarantees; `Inference` gains a citation; `ChangeSemantics` gains the
+    optional kind-authored mechanism `statement`
+  - Migrate the five Tier 1/2 declarations onto the new shapes
+  - _Requirements: 1 (amendment), 2.7, 2.8_
 
-- [ ] 6.3 Lexicon additions
-  - Add disruption, data effect, reversibility, replacement, confidence, and citation to
-    `docs/platforms/operator-language.md` with their definitions and banned alternatives
+- [ ] 6.2 Declaration upgrades from the 2026-07-29 research
+  - DSQL managed delete: `reversibility = ProviderGuarantee(Irreversible)` (doc-cited),
+    `data_effect = Inference(Destroyed)` (derivation-cited); managed create:
+    `reversibility = Inference(ReversibleWithDataLoss)`
+  - DynamoDB delete: `reversibility = ProviderGuarantee(Irreversible)` (doc-cited; the
+    engine's create leaves PITR at its documented default)
+  - Golden tests updated; Phase 4 DONE records annotated
+  - _Requirements: 2.5 (amended), 7.2_
+
+- [ ] 6.3 Display names
+  - Kind noun declared beside the kind (e.g. "service", "Aurora DSQL cluster"); carried
+    through `Change` and the model as a new slot in the field policy (evidence-model
+    amendment); instance name joins the rendering only when the plan holds more than one
+    resource of the kind; `.tkd` author override ledgered for the source-spans feature
+  - _Requirements: evidence-model Req 6 (amended)_
+
+- [ ] 6.4 The Markdown renderer
+  - `# Infra Plan` + `**Plan for {platform}** with *live state* {state}` header; `##`
+    action sections in would-mood templated prose; ids once (sections, never impacts);
+    `## Impacts` severity-first, one line per subject, kind-specialized templates;
+    `## Unchanged` at detail; field diffs as code spans; escaping rule for literal text
+  - Confidence voices (engine fact plain / "AWS documents …" / "Tokeira derives …");
+    kind-authored `statement` in place of the generic mechanism template when present
+  - Citations at detail: `Doc` as links, `Code` as code spans
+  - No narrative rendering of undeclared-semantics uncertainties (Req 6.5); live-state
+    coverage speaks through the header and, when unconfirmed, per-change lines
+  - termimad skin at the binary edge; raw Markdown when piped; `--json` untouched
+  - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.7, 9.8; evidence-model Req 4.5/6 (amended)_
+
+- [ ] 6.5 Lexicon and contract migration
+  - Add disruption, data effect, reversibility, replacement, confidence, citation to
+    `docs/platforms/operator-language.md`; replace the canonical plan transcripts with
+    the Markdown target; amend `operator-output-contract.md` (narrative form = rendered
+    Markdown; header-case exception; escaping; symbol vocabulary scoped to compact
+    delta lines pending the output pass)
   - _Requirements: 9.6_
 
-- [ ] 6.4 **Checkpoint** — Feature 1's Property 11 (lexicon conformance) still passes with
-  the new vocabulary; rendered output reviewed against the canonical transcripts.
+- [ ] 6.6 Rendering properties reworked
+  - Feature 1's renderer properties re-anchored to the Markdown form (depth superset,
+    depth-blind JSON, lexicon conformance over prose outside code spans/links); the
+    claims-not-gaps form of slot silence retained
+  - _Property 7; Requirements: 9.4, 6.5_
+
+- [ ] 6.7 **Checkpoint** — rendered summary and detail reviewed against the 2026-07-29
+  target transcripts (the PR #40 body's rendering target); `tkr infra plan` against
+  `compose-explore` reviewed live; a TTL-update plan reviewed for the `DataEffect`
+  vocabulary gap and the resolution decided (extend the enum vs hold).
 
 ## Phase 7 — Coverage enforcement
 

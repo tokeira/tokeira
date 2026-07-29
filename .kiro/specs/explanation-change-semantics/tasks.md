@@ -298,23 +298,41 @@ voices this spec owns.
 
 ## Phase 7 — Coverage enforcement
 
-- [ ] 7.1 Maintain the kind registry
+- [x] 7.1 Maintain the kind registry
   - A test-visible registry of Tier 1 and Tier 2 kinds, mirroring the requirements'
     inventory
+  - DONE (2026-07-29): `platforms/compose-syn/tests/semantics_registry.rs` — the
+    operating platform realizes every kind through its own factory (the reference
+    definition plus both DSQL storage variants, so the mode-aware DSQL declaration is
+    probed in both constructions), and the accounting test holds registry and platform
+    in exact agreement both ways (an unclassified realized kind and a stale row each
+    fail with a message saying what to do)
   - _Requirements: 7.1, 7.3, 7.4_
 
-- [ ] 7.2 **PBT: Property 9 — tier coverage holds**
+- [x] 7.2 **PBT: Property 9 — tier coverage holds**
   - Every registered Tier 1/2 kind declares its applicable fields above `Unknown`
+  - DONE (2026-07-29): generated probes (applicable change kind × diff lists mixing the
+    kind's real field names with arbitrary ones — DynamoDB's TTL branch covered by
+    construction) assert every semantic field above `Unknown`, and every inapplicable
+    change kind answers the all-`Unknown` default. Teeth verified: misregistering
+    DynamoDB `Replace` as applicable fails the property. Req 7.2 amended for
+    consistency with 2.8 (cited inference is a legitimate tier; the bar is
+    above-unknown)
   - _Property 9; Requirements: 7.2, 7.5_
 
-- [ ] 7.3 **PBT: Property 10 — every claim cites**
+- [x] 7.3 **PBT: Property 10 — every claim cites**
   - Every `ProviderGuarantee` and `EngineFact` in the registry carries a non-empty citation
+  - DONE (2026-07-29): over the same probe space, every declared field (all cited
+    tiers, per amended 2.8 — inference included) carries a citation; code citations
+    non-empty; documentation citations carry a non-empty title and URL, and a non-empty
+    establishing quote when one is given
   - _Property 10; Requirements: 2.2, 2.3, 2.6_
 
-- [ ] 7.4 **Final checkpoint** — full bar: `cargo +nightly fmt --all`,
+- [x] 7.4 **Final checkpoint** — full bar: `cargo +nightly fmt --all`,
   `cargo lint --locked` (zero warnings), `cargo check --workspace --locked`,
   `cargo test --workspace --locked`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
   --no-deps --locked`.
+  - DONE (2026-07-29): all five green. The feature is complete — Phases 1–7 landed.
 
 ## Task Dependency Graph
 

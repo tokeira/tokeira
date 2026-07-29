@@ -119,8 +119,9 @@ its source cannot supply it. No field may be silently omitted.
 | `evidence_id` | Construction | detail | n/a |
 | `resource_id` | `Change.resource` | summary | n/a |
 | `module` | `Change.module` | summary | n/a |
-| `resource_type` | `Change.resource_type` | summary | n/a |
-| `kind` | `Change.kind` | summary (as symbol) | n/a |
+| `resource_type` | `Change.resource_type` | `--json` only *(2026-07-29: the type annotation left the narrative)* | n/a |
+| `kind` | `Change.kind` | summary (as the action section) *(2026-07-29: symbols retired from the plan)* | n/a |
+| `display` | Kind-declared noun (+ instance name) *(added 2026-07-29)* | summary — "the *tokeirad* service" | `None` — falls back to the engine id |
 | `field_diffs[]` | `Change.details` | detail | empty vector |
 | `refresh_status` | Refresh report (new plumbing) | detail | `Unknown`, which itself produces an uncertainty |
 | `semantics` | **Slot** — Feature 2 | detail | all fields `Unknown` |
@@ -210,10 +211,15 @@ so that I can tell a confident plan from an uninformed one.
 3. WHEN an explained change's semantics slot carries `Unknown` for a field the renderer
    would otherwise state THE explanation model SHALL record an uncertainty for that field.
 4. THE uncertainty record SHALL carry a subject that resolves in the evidence index.
-5. IF the plan contains no uncertainties THEN THE renderer SHALL state that live state was
-   fully confirmed.
-6. WHERE uncertainties exist THE summary SHALL state their count and the summary SHALL NOT
-   require detail depth to reveal that uncertainty exists at all.
+5. IF the plan contains no uncertainties THEN THE renderer SHALL state full confirmation
+   in the report's header assurance line: `**Plan for {platform}** with *live state*
+   confirmed`. *(Amended 2026-07-29, operator-directed: the assurance joins the header,
+   styled with the document, replacing the trailing fact line.)*
+6. WHERE live-state uncertainties exist THE header SHALL state the coverage (`with *live
+   state* unconfirmed for N resources` / `without *live state* examined`) and the
+   affected changes SHALL carry the statement in place at detail depth; undeclared-
+   semantics uncertainties are machine-channel only and never render (change-semantics
+   Req 6.5). *(Amended 2026-07-29.)*
 
 ### Requirement 5: Refresh status reaches the shell
 
@@ -241,20 +247,35 @@ report, so that I learn one product, not two.
 
 #### Acceptance Criteria
 
-1. WHEN rendering at summary depth THE renderer SHALL state the change counts by kind, the
-   acting resources, the destructive actions, the operational impacts, and the count of
-   uncertainties.
+*(Amended 2026-07-29, operator-directed: the narrative form is deterministic Markdown —
+rendered for the terminal via `termimad`, emitted raw when stdout is not a TTY — replacing
+the counted-summary text form. Sections carry the actions; lines carry no glyphs, no
+counts, and no type annotation; ids appear once.)*
+
+1. WHEN rendering at summary depth THE renderer SHALL emit a Markdown document: the
+   `# {verb}` title, the header assurance line (`**Plan for {platform}** with *live
+   state* …`), one `## {Action}` section per present action listing each change as
+   templated would-mood prose ("the *{name}* {kind} would be {verb}") with its engine id
+   stated once, and the `## Impacts` section — and SHALL NOT enumerate per-change
+   semantics or render counts.
 2. WHEN rendering at detail depth THE renderer SHALL additionally state per-change field
-   evidence, refresh status, each uncertainty in full, and each populated slot.
+   evidence (as code spans), the declared behaviour in its confidence voice with
+   citations, in-place live-state statements where unconfirmed, and the `## Unchanged`
+   section.
 3. WHEN `--json` is requested THE renderer SHALL emit the complete explanation model
    regardless of depth.
 4. THE renderer SHALL render through `tokeira-report` and SHALL NOT assemble narrative
    outside a `Report` implementation.
-5. THE renderer SHALL use only vocabulary defined in `operator-language.md`.
+5. THE renderer SHALL use only vocabulary defined in `operator-language.md` in prose;
+   code identifiers appear only inside code spans and citation links.
 6. THE renderer SHALL NOT render a slot that carries a not-determined value as though it
    were a determination.
-7. WHEN counts are rendered THE renderer SHALL compute plurals and SHALL attach the noun
-   to every number.
+7. WHEN counts are rendered (the header's coverage state) THE renderer SHALL compute
+   plurals and SHALL attach the noun to every number.
+8. THE renderer SHALL name resources by their descriptive names — the kind noun, joined
+   by the instance name only when the plan holds more than one resource of that kind —
+   with Markdown emphasis per the target transcripts. *(Amended 2026-07-29; the
+   descriptive-name slot joins the field policy.)*
 
 ### Requirement 7: The artifact
 

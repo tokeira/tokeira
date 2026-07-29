@@ -242,6 +242,23 @@ vocabulary and per-platform injection mechanics are deliberately **outside this
 umbrella** (future platform work); the shipped template's `admin_password` field is a
 recorded defect against this decision until that work lands.
 
+### D8. The narrative is deterministic Markdown (2026-07-29)
+
+One narrative, three consumers: reports are emitted as deterministic Markdown, rendered
+for the terminal through `termimad` and emitted raw when stdout is not a TTY — the form
+agents, PR comments, and pipes consume natively. Templated would-mood prose over
+descriptive names; ids stated once; no glyphs or counts where a section states the
+action.
+
+### D9. Knowledge renders; gaps enforce (2026-07-29)
+
+Narrative states established behaviour only, in the declaration's confidence voice —
+engine facts plainly, provider guarantees attributed, inferences owned ("Tokeira derives
+…"). Undeclared behaviour never renders as prose: it is carried machine-side (model,
+artifact) for agents and CI, and tier coverage makes it a build failure for first-party
+kinds. Authors research their contributions fully; the product never surrenders a meek
+don't-know.
+
 ## Requirements
 
 ## Feature 1: Evidence Model and Explanation IR

@@ -138,6 +138,12 @@ than a separate project.
 6. THE `change_semantics` method SHALL be total: it SHALL return a value for every change
    kind and every field-difference set without panicking.
 
+*Amendment (2026-07-29):* WHERE the kind can state a change's mechanism more precisely
+than the vocabulary's generic rendering, the declaration MAY carry a single kind-authored
+statement (one sentence of operator prose, e.g. "it would be stopped, removed, and
+recreated from the definition"); absence falls back to the generic template. The
+statement is part of the declaration and carries the same research obligation.
+
 ### Requirement 2: Confidence is explicit and citations are structural
 
 **User Story:** As an operator, I want to know whether Tokeira is telling me something the
@@ -152,10 +158,19 @@ to put on it.
    citation identifying the provider documentation establishing it.
 3. THE type SHALL make a provider guarantee without a citation unrepresentable.
 4. THE unknown confidence SHALL be the default value of every field.
-5. IF a kind author cannot establish a behaviour from provider documentation THEN the kind
-   SHALL declare unknown rather than inference.
+5. IF a behaviour can neither be established from provider documentation nor derived
+   from documented facts THEN the kind SHALL declare unknown; a conclusion derived from
+   documented facts SHALL be declared as inference, never presented as a guarantee.
 6. WHERE a behaviour follows from Tokeira's own engine rather than the provider THE
    declaration SHALL use engine fact and SHALL NOT claim a provider guarantee.
+7. THE citation type SHALL distinguish a code citation (module identity) from a
+   product-documentation citation carrying a title, a URL, and optionally the
+   establishing quote — so a documentation reference is machine-usable and renders as a
+   link. *(Amended 2026-07-29: product-doc references become first-class in lifecycle
+   annotations.)*
+8. THE inference confidence SHALL carry a citation identifying the documented facts it
+   derives from; an uncited inference SHALL be unrepresentable, exactly as for the other
+   cited tiers. *(Amended 2026-07-29.)*
 
 ### Requirement 3: Declarations reach the explanation unaltered
 
@@ -231,10 +246,17 @@ than as silence, so that I can tell "this is safe" from "nobody said".
    uncertainty naming the resource and the field.
 2. WHERE every change in a plan declares unknown for a field THE explanation SHALL record
    one uncertainty for the plan rather than one per change.
-3. THE uncertainty SHALL name the action that would resolve it as declaring semantics for
-   the kind.
+3. THE uncertainty SHALL name the resolving action by its concrete identifiers — the
+   field, the resource type, and the declaration point — never as generic advice.
+   *(Amended 2026-07-29, operator-directed: concrete and realisable.)*
 4. THE explanation SHALL NOT record an undeclared-semantics uncertainty for a change kind
    that the field does not apply to.
+5. THE undeclared-semantics uncertainties SHALL be carried in the model and the artifact
+   for machine consumers (agents, CI gates); narrative output SHALL NOT render them.
+   The narrative states established behaviour only — **knowledge renders; gaps
+   enforce** — and Requirement 7's coverage enforcement is the demand-side guarantee
+   that first-party kinds never ship gaps. *(Amended 2026-07-29, operator-directed:
+   Tokeira states what it knows; authors research their contributions fully.)*
 
 ### Requirement 7: Kind coverage is accounted for and enforced where it matters
 
@@ -275,18 +297,33 @@ so that the report respects my attention.
 
 #### Acceptance Criteria
 
-1. WHEN rendering at summary depth THE renderer SHALL state the operational impacts and
-   SHALL NOT enumerate per-change semantics.
+*(Amended 2026-07-29 to the Markdown rendering target; the document form itself —
+sections, templates, display names, the header assurance line — is owned by the
+evidence-model spec's amended Requirement 6.)*
+
+1. WHEN rendering at summary depth THE renderer SHALL state the operational impacts as
+   an `## Impacts` section — one templated line per subject, severity-first, speaking
+   descriptive names only — and SHALL NOT enumerate per-change semantics.
 2. WHEN rendering at detail depth THE renderer SHALL state each change's declared
-   semantics with its confidence.
-3. WHERE a field's confidence is inference THE renderer SHALL mark it as derived rather
-   than stating it as established.
+   behaviour as templated would-mood prose beneath the change's line, in the
+   declaration's confidence voice.
+3. THE confidence voices SHALL be: an engine fact speaks plainly in the engine's own
+   voice; a provider guarantee attributes itself ("AWS documents that …"); an inference
+   owns itself ("Tokeira derives this from …"). No scaffolding labels (`note:`, `help:`)
+   appear.
 4. WHERE a field's confidence is unknown THE renderer SHALL omit the field from narrative
    output.
 5. THE `--json` rendering SHALL carry every declared field with its confidence and
    citation regardless of depth.
 6. THE renderer SHALL use only vocabulary defined in `operator-language.md`, extending the
    lexicon in the same change where this feature introduces terms.
+7. WHEN rendering at detail depth THE renderer SHALL render each claim's citation —
+   a product-documentation citation as a Markdown link titled by the document, a code
+   citation as a code span.
+8. THE impact statement templates SHALL specialize on the subject's change kind (an
+   unavailability reads "would be unavailable while the change applies" for an update
+   and "would no longer be available" for a deletion) and SHALL state irreversibility
+   where every contributing declaration establishes it.
 
 ## Notes
 

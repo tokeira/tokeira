@@ -142,6 +142,31 @@ pub struct ChangeSemantics {
 }
 ```
 
+#### C1 amendment (2026-07-29): structured citations
+
+`Citation` evolves from an opaque string into the two reference forms the claims
+actually make, keeping `const` construction and the non-empty guarantees:
+
+```rust
+pub enum Citation {
+    /// The engine's own code, by module identity (`module_path!()`-based).
+    Code(Cow<'static, str>),
+    /// Product documentation: title + URL render as a link; the quote
+    /// preserves the establishing sentence.
+    Doc {
+        title: Cow<'static, str>,
+        url: Cow<'static, str>,
+        quote: Option<Cow<'static, str>>,
+    },
+}
+```
+
+`Inference` gains a citation alongside `EngineFact` and `ProviderGuarantee` — an
+uncited conclusion is as unrepresentable as an uncited fact. This is a durable-format
+change to the artifact's citation serialization (see Data Models). The optional
+kind-authored mechanism `statement` (Requirement 1 amendment) joins `ChangeSemantics`
+as an `Option<Cow<'static, str>>`.
+
 ### C2. The declaration point
 
 ```rust
@@ -251,6 +276,11 @@ there — is emitted here under exactly the conditions in Requirement 6:
 The middle rule is the noise control that makes the section readable: before any kind
 declares, a plan carries at most five plan-level uncertainties rather than five per change.
 
+*Amendment (2026-07-29):* these uncertainties are a **machine channel** — model and
+artifact only, for agents and CI gates. Narrative never renders them (knowledge renders;
+gaps enforce — amended Requirement 6.5); Requirement 7's tier coverage is what makes an
+undeclared first-party field a build failure rather than an operator-visible shrug.
+
 ### C6. Tier 1 and Tier 2 declarations
 
 The declarations this feature writes. **The design fixes the shape and the citation
@@ -263,12 +293,18 @@ provider's documentation and records the reference in the `Citation`.
 | `ComposeService` | Tokeira's own `reconcile_service` — stop, force-remove, create | `EngineFact` throughout, citing `crates/tokeira-compose/src/lib.rs`. Operation `Replaced` even when `ChangeKind` is `Update`; replacement `DestroyBeforeCreate`; disruption `UnavailableDuringChange`; data effect `Preserved` (state rides bind-mounted volumes); reversibility `Reversible` |
 | `ObservabilityConfigFilesResource` | Tokeira's own write path | `EngineFact`. Files are rewritten in place; consuming services are not restarted by this resource, so disruption is `None` at this resource and any restart belongs to the service's own change |
 | `LocalStateDirResource` | Tokeira's own directory management | `EngineFact`. Deletion's data effect is the operator-visible question and MUST be established from the delete implementation, not assumed |
-| `DsqlCluster` | AWS DSQL documentation | `ProviderGuarantee` with URL. Establish: which field changes force replacement, what deletion does to stored data, and whether deletion protection alters reversibility |
-| `DynamoDbTable` | AWS DynamoDB documentation | `ProviderGuarantee` with URL. Establish: which attribute changes require replacement, and the data effect of each |
+| `DsqlCluster` | AWS DSQL documentation | Researched 2026-07-29: managed-delete `reversibility = ProviderGuarantee(Irreversible)` — "AWS Backup creates a new cluster from your snapshots; the restored cluster won't overwrite the source cluster" (aws-backup devguide restore-auroradsql) and restore requires a pre-existing recovery point; `data_effect = Inference(Destroyed)` — derived from the documented recovery model (whole-cluster backups are the sole path; restore is new-cluster-only), cited per amended Req 2.8; managed-create `reversibility = Inference(ReversibleWithDataLoss)` |
+| `DynamoDbTable` | AWS DynamoDB documentation | Researched 2026-07-29: delete `reversibility = ProviderGuarantee(Irreversible)` — the system backup exists only "when you delete a table that has point-in-time recovery enabled" (developerguide PointInTimeRecovery_Howitworks) and this engine's create leaves PITR at its documented DISABLED default; restore in any case "always restores to a new table". TTL-bearing updates expose a vocabulary gap (`DataEffect` cannot say "expires by policy") — held open, tracked in the Phase 6 tasks |
 
 ## Data Models
 
-No durable format changes. `ChangeSemantics` is serialized inside the explanation artifact
+*Amendment (2026-07-29):* the structured `Citation` **is** a durable format change — the
+artifact's citation serialization becomes the `Code`/`Doc` shape and `Inference` carries
+one. The explanation schema is still pre-1.0-of-this-feature (no artifact consumers
+beyond this workspace), so the shape changes in place; the field policy in the
+evidence-model spec is amended in the same pass.
+
+Otherwise: no durable format changes. `ChangeSemantics` is serialized inside the explanation artifact
 (Feature 1's schema), so the artifact gains populated `semantics` objects where it
 previously carried all-`Unknown` ones — an additive change to a field that already exists,
 which is exactly what Feature 1's slot reservation was for.
@@ -309,8 +345,9 @@ corresponding impact.
 
 **Property 7 — Unknown never becomes a claim.**
 *For any* explanation, no narrative output asserts a field whose confidence is `Unknown`,
-and no `Unknown` field contributes to any impact.
-**Validates: Requirements 5.5, 9.4**
+and no `Unknown` field contributes to any impact. *(2026-07-29: narrative additionally
+renders no undeclared-semantics uncertainty — gaps are machine-channel only.)*
+**Validates: Requirements 5.5, 6.5, 9.4**
 
 **Property 8 — Uncertainty activation is exact.**
 *For any* explanation, a `SemanticsUndeclared` uncertainty exists for (resource, field) if
@@ -325,9 +362,10 @@ above `Unknown`.
 **Validates: Requirements 7.2, 7.5**
 
 **Property 10 — Every claim cites.**
-*For any* declaration in the workspace, a field carrying `ProviderGuarantee` or
-`EngineFact` carries a non-empty citation.
-**Validates: Requirements 2.2, 2.3, 2.6**
+*For any* declaration in the workspace, a field carrying `ProviderGuarantee`,
+`EngineFact`, or `Inference` carries a non-empty citation; a `Doc` citation carries a
+non-empty title and URL. *(Amended 2026-07-29.)*
+**Validates: Requirements 2.2, 2.3, 2.6, 2.7, 2.8**
 
 ## Error Handling
 

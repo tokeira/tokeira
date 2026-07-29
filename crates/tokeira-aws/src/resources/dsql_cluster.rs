@@ -98,6 +98,10 @@ impl Resource for DsqlCluster {
         &self.config.module
     }
 
+    fn display_kind(&self) -> Option<&'static str> {
+        Some("Aurora DSQL cluster")
+    }
+
     fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
         match self.config.mode {
             DsqlClusterMode::Managed => InternalChange::NoChange {
@@ -138,38 +142,35 @@ impl Resource for DsqlCluster {
         }
     }
 
-    /// What a DSQL-cluster change does, mode-aware: a **preexisting** cluster is referenced, never managed
-    /// by the deployment — the provider is never called, so every
-    /// declaration is an engine fact about this module's own restraint. A **managed** cluster is real: its
-    /// delete path disables deletion protection and calls
-    /// `dsql:DeleteCluster` — but the AWS documentation read for this
-    /// declaration (the DeleteCluster API reference and the user guide's
-    /// delete-cluster section) establishes the deletion *sequence*, not what
-    /// happens to stored data or whether it is recoverable. Those two fields
-    /// stay `Unknown` — the spec's rule is explicit: where documentation
-    /// does not establish a field, do not infer.
+    /// What a DSQL-cluster change does, mode-aware: a **preexisting** cluster
+    /// is referenced, never managed by the deployment — the provider is never
+    /// called, so every declaration is an engine fact about this module's own
+    /// restraint. A **managed** cluster is real: its delete disables deletion
+    /// protection, then deletes the cluster. Data fate and recoverability are
+    /// declared from AWS's documented recovery model — restores require a
+    /// pre-existing recovery point and only ever create a *new* cluster — as
+    /// a cited inference and a cited provider guarantee respectively
+    /// (researched 2026-07-29).
     fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
         // Cited by module identity, never repo layout — these resources are
         // usable outside this workspace, and their citations must stay true
         // there. Every name below is a real identifier in this module.
-        const CREATE_MANAGED: Citation = Citation::new(concat!(
+        const CREATE_MANAGED: Citation = Citation::code(concat!(
             module_path!(),
             "::create (Managed) — dsql:CreateCluster with \
              deletion_protection_enabled(true), then wait_until_cluster_active"
         ));
-        const UPDATE_MANAGED: Citation = Citation::new(concat!(
+        const UPDATE_MANAGED: Citation = Citation::code(concat!(
             module_path!(),
             "::update (Managed) — dsql:TagResource only; no data-plane operation"
         ));
-        const DELETE_MANAGED: Citation = Citation::new(concat!(
+        const DELETE_MANAGED: Citation = Citation::code(concat!(
             module_path!(),
             "::delete (Managed) — dsql:UpdateCluster with \
              deletion_protection_enabled(false), then dsql:DeleteCluster, polling \
-             until the cluster is absent from GetCluster and ListClusters; sequence \
-             per https://docs.aws.amazon.com/aurora-dsql/latest/userguide/\
-             single-region-aws-cli.html#delete-cluster"
+             until the cluster is absent from GetCluster and ListClusters"
         ));
-        const PREEXISTING: Citation = Citation::new(concat!(
+        const PREEXISTING: Citation = Citation::code(concat!(
             module_path!(),
             "::{create,update,delete} (Preexisting) — only the recorded \
              cluster_endpoint/cluster_arn properties change; no provider call is \
@@ -177,6 +178,18 @@ impl Resource for DsqlCluster {
              deployment; the delete retires the record and leaves the cluster \
              running"
         ));
+        const RESTORE_DOC: Citation = Citation::doc_quoted(
+            "Amazon Aurora DSQL restore",
+            "https://docs.aws.amazon.com/aws-backup/latest/devguide/restore-auroradsql.html",
+            "AWS Backup creates a new cluster from your snapshots; the restored \
+             cluster won't overwrite the source cluster.",
+        );
+        const BACKUP_DOC: Citation = Citation::doc_quoted(
+            "Backup and restore for Amazon Aurora DSQL",
+            "https://docs.aws.amazon.com/aurora-dsql/latest/userguide/backup-aurora-dsql.html",
+            "When you restore Aurora DSQL clusters, AWS Backup always creates new \
+             clusters to preserve your source data.",
+        );
         let preexisting = self.config.mode == DsqlClusterMode::Preexisting;
         match ctx.kind {
             ChangeKind::Create if preexisting => ChangeSemantics {
@@ -200,6 +213,7 @@ impl Resource for DsqlCluster {
                     value: Reversibility::Reversible,
                     citation: PREEXISTING,
                 },
+                statement: None,
             },
             ChangeKind::Create => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -218,10 +232,15 @@ impl Resource for DsqlCluster {
                     value: DataEffect::NoDataHeld,
                     citation: CREATE_MANAGED,
                 },
-                // Reversing a managed create means deleting the cluster —
-                // and data fate under deletion is exactly what the read
-                // documentation does not establish.
-                reversibility: Confidence::Unknown,
+                // Reversing a managed create means deleting the cluster: the
+                // deleted cluster never returns, and data written since the
+                // last backup (if any) goes with it — derived from AWS's
+                // documented restore model.
+                reversibility: Confidence::Inference {
+                    value: Reversibility::ReversibleWithDataLoss,
+                    citation: RESTORE_DOC,
+                },
+                statement: None,
             },
             ChangeKind::Update | ChangeKind::Replace if preexisting => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -244,6 +263,7 @@ impl Resource for DsqlCluster {
                     value: Reversibility::Reversible,
                     citation: PREEXISTING,
                 },
+                statement: None,
             },
             ChangeKind::Update | ChangeKind::Replace => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -259,7 +279,10 @@ impl Resource for DsqlCluster {
                 // disrupts on them is not established by the pages fetched.
                 // Ledgered: fetch the TagResource docs and upgrade to
                 // ProviderGuarantee if they establish it.
-                disruption: Confidence::Inference(Disruption::None),
+                disruption: Confidence::Inference {
+                    value: Disruption::None,
+                    citation: UPDATE_MANAGED,
+                },
                 data_effect: Confidence::EngineFact {
                     value: DataEffect::Preserved,
                     citation: UPDATE_MANAGED,
@@ -268,6 +291,7 @@ impl Resource for DsqlCluster {
                     value: Reversibility::Reversible,
                     citation: UPDATE_MANAGED,
                 },
+                statement: None,
             },
             ChangeKind::Delete if preexisting => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -290,6 +314,7 @@ impl Resource for DsqlCluster {
                     value: Reversibility::Reversible,
                     citation: PREEXISTING,
                 },
+                statement: None,
             },
             ChangeKind::Delete => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -304,10 +329,21 @@ impl Resource for DsqlCluster {
                     value: Disruption::UnavailableDuringChange,
                     citation: DELETE_MANAGED,
                 },
-                // Not established by the documentation read — deliberately
-                // Unknown, never inferred (see the method doc).
-                data_effect: Confidence::Unknown,
-                reversibility: Confidence::Unknown,
+                // Derived, and owned as derived: the documented recovery
+                // model's only path is restore-from-a-prior-recovery-point
+                // into a NEW cluster, so data not backed up before the
+                // delete has no documented recovery.
+                data_effect: Confidence::Inference {
+                    value: DataEffect::Destroyed,
+                    citation: BACKUP_DOC,
+                },
+                reversibility: Confidence::ProviderGuarantee {
+                    value: Reversibility::Irreversible,
+                    citation: RESTORE_DOC,
+                },
+                statement: Some(std::borrow::Cow::Borrowed(
+                    "deletion protection would be disabled first, then the cluster deleted",
+                )),
             },
             ChangeKind::NoChange => ChangeSemantics::default(),
         }
@@ -790,13 +826,15 @@ fn prop_str(rs: &ResourceState, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    // Golden declarations (change-semantics task 4.5): classification and
-    // confidence only. The headline: a managed delete's data fate and
-    // recoverability are *not established* by the AWS documentation read —
-    // both stay Unknown, never inferred — while a preexisting cluster's
-    // whole lifecycle is an engine fact about this module's own restraint.
+    // Golden declarations (change-semantics tasks 4.5 + 6.2): classification
+    // and confidence only. The 2026-07-29 research closed Phase 4's
+    // deliberate Unknowns: a managed delete's recoverability is now a cited
+    // provider guarantee (restores only ever create a new cluster) and its
+    // data fate a cited inference from the documented recovery model — while
+    // a preexisting cluster's whole lifecycle remains an engine fact about
+    // this module's own restraint.
     #[test]
-    fn dsql_declarations_stay_unknown_where_docs_are_silent() {
+    fn dsql_declarations_carry_the_researched_answers() {
         use tokeira_iac::{
             ChangeKind, ChangeSemantics, Confidence, DataEffect, Disruption, LifecycleOperation,
             SemanticsContext,
@@ -839,8 +877,20 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(managed_delete.data_effect, Confidence::Unknown));
-        assert!(matches!(managed_delete.reversibility, Confidence::Unknown));
+        assert!(matches!(
+            managed_delete.data_effect,
+            Confidence::Inference {
+                value: DataEffect::Destroyed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            managed_delete.reversibility,
+            Confidence::ProviderGuarantee {
+                value: tokeira_iac::Reversibility::Irreversible,
+                ..
+            }
+        ));
 
         let managed_create = declared(DsqlClusterMode::Managed, ChangeKind::Create);
         assert!(matches!(
@@ -850,7 +900,13 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(managed_create.reversibility, Confidence::Unknown));
+        assert!(matches!(
+            managed_create.reversibility,
+            Confidence::Inference {
+                value: tokeira_iac::Reversibility::ReversibleWithDataLoss,
+                ..
+            }
+        ));
 
         // Managed updates are tag-only; preexisting deletes skip the
         // provider entirely — the cluster keeps running, data preserved.
@@ -865,7 +921,10 @@ mod tests {
         // Disruption on a control-plane update is an inference, not a fact.
         assert!(matches!(
             managed_update.disruption,
-            Confidence::Inference(Disruption::None)
+            Confidence::Inference {
+                value: Disruption::None,
+                ..
+            }
         ));
         let preexisting_delete = declared(DsqlClusterMode::Preexisting, ChangeKind::Delete);
         assert!(matches!(

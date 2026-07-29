@@ -459,6 +459,10 @@ impl iac::Resource for ObservabilityConfigFilesResource {
         MODULE_OBSERVABILITY
     }
 
+    fn display_kind(&self) -> Option<&'static str> {
+        Some("configuration files")
+    }
+
     async fn create(
         &self,
         _ctx: &iac::ProvisionContext,
@@ -618,12 +622,12 @@ impl iac::Resource for ObservabilityConfigFilesResource {
     fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
         // Cited by module identity, never repo layout; every name is a real
         // identifier in this module.
-        const WRITE: iac::Citation = iac::Citation::new(concat!(
+        const WRITE: iac::Citation = iac::Citation::code(concat!(
             module_path!(),
             "::ObservabilityConfigFilesResource::{create,update} — write_all renders \
              the managed config set in place"
         ));
-        const DELETE: iac::Citation = iac::Citation::new(concat!(
+        const DELETE: iac::Citation = iac::Citation::code(concat!(
             module_path!(),
             "::ObservabilityConfigFilesResource::delete — fs::remove_file over \
              managed_relative_paths(); refuses non-empty foreign directories"
@@ -654,6 +658,7 @@ impl iac::Resource for ObservabilityConfigFilesResource {
                     value: Reversibility::Reversible,
                     citation: DELETE,
                 },
+                statement: None,
             },
             // Definition-driven and drift-driven updates share `write_all`:
             // an in-place overwrite of the resource's own rendered
@@ -681,6 +686,7 @@ impl iac::Resource for ObservabilityConfigFilesResource {
                     value: Reversibility::Reversible,
                     citation: WRITE,
                 },
+                statement: None,
             },
             ChangeKind::Delete => iac::ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -703,6 +709,7 @@ impl iac::Resource for ObservabilityConfigFilesResource {
                     value: Reversibility::Reversible,
                     citation: WRITE,
                 },
+                statement: None,
             },
             ChangeKind::NoChange => iac::ChangeSemantics::default(),
         }

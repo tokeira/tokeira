@@ -384,7 +384,12 @@ impl iac::Resource for ComposeService {
 /// Sort the set-valued manifest arrays so equality means set equality. The
 /// desired side is authored order; the live side is Docker-map iteration
 /// order — only the canonical form is comparable.
-fn canonicalize_manifest(mut manifest: serde_json::Value) -> serde_json::Value {
+///
+/// Public because canonical form must have exactly one owner: the diff
+/// boundary here and any consumer comparing desired manifests against each
+/// other (desired-snapshot paths) call this one function — two independently
+/// maintained canonicalizations would drift and manufacture phantom diffs.
+pub fn canonicalize_manifest(mut manifest: serde_json::Value) -> serde_json::Value {
     if let Some(object) = manifest.as_object_mut() {
         for key in ["ports", "volumes", "depends_on"] {
             if let Some(array) = object.get_mut(key).and_then(|v| v.as_array_mut()) {

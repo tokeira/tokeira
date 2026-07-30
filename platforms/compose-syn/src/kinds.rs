@@ -64,6 +64,18 @@ impl Kind for DsqlCluster {
             &aws_ctx(cx, &self.region),
         ))
     }
+
+    fn manifest(&self) -> serde_json::Value {
+        serde_json::json!({
+            "region": self.region,
+            "mode": match self.mode {
+                DsqlMode::Managed => "managed",
+                DsqlMode::Preexisting => "preexisting",
+            },
+            "endpoint": self.endpoint,
+            "arn": self.arn,
+        })
+    }
 }
 
 /// A DynamoDB coordination table (→ `tokeira_aws` `DynamoDbTable`): on-demand,
@@ -92,6 +104,14 @@ impl Kind for DynamoDbTable {
             },
             &aws_ctx(cx, cx.region.as_deref().unwrap_or("us-east-1")),
         ))
+    }
+
+    fn manifest(&self) -> serde_json::Value {
+        serde_json::json!({
+            "table": self.table,
+            "hash_key": self.hash_key,
+            "ttl": self.ttl,
+        })
     }
 }
 
@@ -128,6 +148,20 @@ impl Kind for ObservabilityConfigFiles {
             },
         ))
     }
+
+    fn manifest(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scrape_host": self.scrape_host,
+            "scrape_port": self.scrape_port,
+            "cluster": self.cluster,
+            "deployment": self.deployment,
+            "mimir_remote_write": self.mimir_remote_write,
+            "loki_push": self.loki_push,
+            "mimir_http_port": self.mimir_http_port,
+            "loki_http_port": self.loki_http_port,
+            "retention_hours": self.retention_hours,
+        })
+    }
 }
 
 /// The local IaC state directory — the bootstrap module's resource. Realizes to a
@@ -140,6 +174,12 @@ impl Kind for LocalStateDir {
         Box::new(LocalStateDirResource {
             state_dir: cx.deployment_dir.join("state"),
         })
+    }
+
+    // No authored content: the kind is a marker whose realization is entirely
+    // environmental, so its desired manifest is constant.
+    fn manifest(&self) -> serde_json::Value {
+        serde_json::json!({})
     }
 }
 

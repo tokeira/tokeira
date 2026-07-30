@@ -16,6 +16,11 @@ use crate::{context::Cx, kinds::Service};
 /// / `tokeira_aws` underneath.
 pub trait Kind {
     fn realize(&self, cx: &Cx) -> Box<dyn iac::Resource>;
+
+    /// The authored desired content as a JSON value — what a desired snapshot
+    /// records for this resource. Pure kind data: realization identity comes
+    /// from `realize`; nothing environmental belongs here.
+    fn manifest(&self) -> serde_json::Value;
 }
 
 /// A handle to a declared module (carries only its name).
@@ -261,18 +266,57 @@ impl Deployment {
         // infra-graph-only and never leaks into the compose manifest.
         let config_dep = self.declared_config_files_id(cx);
         for s in self.services.iter().filter(|s| s.module == name) {
-            let mut svc = s.svc.to_compose_service(&s.name, cx);
-            if let Some(dep) = &config_dep
-                && s.svc
-                    .volumes
-                    .iter()
-                    .any(|v| matches!(v, Vol::Config { .. }))
-            {
-                svc.resource_dependencies.push(dep.clone());
-            }
-            resources.push(Box::new(svc));
+            resources.push(Box::new(self.realized_service(s, cx, config_dep.as_ref())));
         }
         Some(resources)
+    }
+
+    /// Realize one member service — the single path module realization and
+    /// the desired snapshot share, so the infra dependency wiring can never
+    /// diverge between them.
+    fn realized_service(
+        &self,
+        entry: &ServiceEntry,
+        cx: &Cx,
+        config_dep: Option<&String>,
+    ) -> ComposeService {
+        let mut svc = entry.svc.to_compose_service(&entry.name, cx);
+        if let Some(dep) = config_dep
+            && entry
+                .svc
+                .volumes
+                .iter()
+                .any(|v| matches!(v, Vol::Config { .. }))
+        {
+            svc.resource_dependencies.push(dep.clone());
+        }
+        svc
+    }
+
+    /// Canonical desired manifests for every resource this definition
+    /// realizes: ids from the same realization the engine uses; content from
+    /// the authored kind data and the canonical service manifests. Pure — no
+    /// provider, no live state, no writes.
+    pub fn desired_snapshot(
+        &self,
+        cx: &Cx,
+    ) -> std::collections::BTreeMap<iac::ResourceId, serde_json::Value> {
+        use iac::Resource as _;
+        let config_dep = self.declared_config_files_id(cx);
+        let mut snapshot = std::collections::BTreeMap::new();
+        for module in &self.modules {
+            for entry in &module.resources {
+                snapshot.insert(entry.kind.realize(cx).resource_id(), entry.kind.manifest());
+            }
+        }
+        for entry in &self.services {
+            let svc = self.realized_service(entry, cx, config_dep.as_ref());
+            snapshot.insert(
+                svc.resource_id(),
+                tokeira_compose::canonicalize_manifest(svc.to_manifest()),
+            );
+        }
+        snapshot
     }
 
     /// The engine id of the definition's config-files resource, when declared

@@ -234,7 +234,7 @@ pub struct ExplainedChange {
     pub field_diffs: Vec<FieldDiff>,
     pub refresh_status: Option<RefreshStatus>, // None ⇔ not examined
     pub semantics: ChangeSemantics,            // slot — Feature 2
-    pub cause: Cause,                          // slot — Feature 3
+    pub cause: Confidence<Cause>,              // slot — Feature 3 (amended: Unknown default)
     pub dependants: Vec<String>,               // slot — Feature 3
     pub source: Option<SourceLocation>,        // slot — Feature 4
 }
@@ -255,21 +255,16 @@ pub struct ChangeSemantics {
     pub reversibility: Confidence<Reversibility>,
 }
 
-/// A value and how firmly Tokeira holds it. `Unknown` is `Default` — the lazy
-/// path is the honest path (umbrella decision D4).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub enum Confidence<T> {
-    #[default]
-    Unknown,
-    Inference(T),
-    EngineFact(T),
-    ProviderGuarantee { value: T, citation: String },
-}
+// `Confidence<T>` is owned by the change-semantics vocabulary in
+// `tokeira-iac` (relocated by Feature 2, which also made every non-Unknown
+// tier carry a structural `Citation`) — see
+// `explanation-change-semantics/design.md` for the authoritative sketch.
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Amended by Feature 3: the former `Cause::Undetermined` default duplicated
+/// what `Confidence::Unknown` already says, so the slot is
+/// `Confidence<Cause>` and the enum carries only established causes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Cause {
-    #[default]
-    Undetermined,
     DefinitionEdit { source: Option<SourceLocation> },
     DependencyOutputChanged { dependency: String },
     ProviderDrift,

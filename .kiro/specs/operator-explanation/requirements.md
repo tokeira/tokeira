@@ -60,7 +60,10 @@ and tasks:
   blocked by it — child spec `explanation-causality`
 - **Feature 4 (Source Attribution)** — depends on Feature 3 — child spec
   `explanation-source-spans`
-- **Feature 5 (Analysis Protocol)** — depends on Feature 1 — child spec
+- **Feature 5 (Analysis Protocol)** — depends on Features 1, 3, and 4: bundles retain
+  Feature 3's desired snapshots, and revision comparison composes Feature 4's syntactic
+  diff; Feature 2 enriches bundle content but gates nothing *(dependency corrected
+  2026-07-30 to match the child's retention architecture)* — child spec
   `explanation-analysis-protocol`
 - **Feature 6 (Agent Clients)** — depends on Feature 5 — child spec
   `explanation-agent-clients`
@@ -94,7 +97,7 @@ The facts this spec builds on, verified in the tree at the time of writing:
 | `ChangeKind::is_destructive` classifies Delete and Replace; `destructive_changes`/`plan_is_destructive` expose the set | `crates/tokeira-iac/src/types.rs` | Destructiveness is engine-classified today and gates apply |
 | Every applied definition is retained per revision at `{dir}/state/config-revisions/{n}/{basename}`, with `snapshot` and `restore` | `crates/tokeira-provisioner-cli/src/config_history.rs` | Definition-vs-definition comparison is available without new storage |
 | Resources declare `dependencies()`; the engine topologically orders create and reverse-orders delete | `crates/tokeira-iac/src/engine.rs` | The dependency graph needed for cascade reasoning already exists |
-| `ResourceRecovery` reconstructs a deletable resource from recorded state | `crates/tokeira-iac/src/lib.rs`; compose-syn registration | Resources removed from the definition remain explainable, not just deletable |
+| `ResourceRecovery` reconstructs a deletable resource from recorded state | `crates/tokeira-iac/src/lib.rs`; registered by `platforms/compose/src/provisioner.rs` *(path updated 2026-07-30 with the platform rename)* | Resources removed from the definition remain explainable, not just deletable |
 | The definition is interpreted by `syn` with located parse errors; values flow through `Value<Host>` evaluation into resource structs | `crates/tokeira-tkd/src/lib.rs`, `eval.rs` | Spans exist at parse time and are **discarded during evaluation** — the gap Feature 4 closes |
 
 ## Target State
@@ -140,7 +143,7 @@ has a defined explanation obligation, so no engine outcome can silently render a
 | `Update` | Field-level evidence, cause, kind-declared disruption and data effect |
 | `Replace` | As Update, plus explicit replacement semantics, data effect, and reversibility |
 | `Delete` | Explicit destructiveness, data effect, reversibility, and the reason the resource is no longer desired |
-| `NoChange` | Counted at summary; listed at detail; never narrated as a change |
+| `NoChange` | Absent from the summary narrative; listed at detail as the `## Unchanged` section; never narrated as a change *(amended 2026-07-30: counts left the summary with D8)* |
 
 ### Refresh outcomes
 
@@ -176,8 +179,10 @@ has a defined explanation obligation, so no engine outcome can silently render a
   operation, replacement policy, disruption, data effect, reversibility, confidence.
 - **Disruption** — the expected effect on availability (none, rolling, brief interruption,
   full unavailability, unknown).
-- **Data Effect** — the expected effect on data the resource holds (preserved, migrated,
-  destroyed, unknown).
+- **Data Effect** — the expected effect on data the resource holds (none held, preserved,
+  migrated, destroyed, or policy-governed — the provider applies a documented
+  data-lifecycle policy such as TTL expiry); unknown when undeclared, via the confidence
+  wrapper. *(Policy joined 2026-07-29 with the resolved TTL vocabulary decision.)*
 - **Uncertainty** — a modelled statement that something could not be determined, carrying
   its subject, reason, consequence, and (optionally) the action that would resolve it.
 - **Impact** — an operational consequence of the plan as a whole, derived from change
@@ -290,8 +295,11 @@ any statement I make can be traced to the evidence that supports it.
 
 #### Acceptance Criteria
 
-1. THE explanation model SHALL assign each addressable fact — change, resource, service,
-   impact, uncertainty, cause, source location — a unique `EvidenceId`.
+1. THE explanation model SHALL assign each addressable fact — each explained change,
+   uncertainty, operational impact, and the deployment itself — a unique `EvidenceId`;
+   destructive actions reference their change's id, and causes and source locations ride
+   the change they annotate rather than carrying ids of their own. *(Amended 2026-07-30
+   to the natural-key identity set Feature 1 established.)*
 2. WHEN the same explanation model is constructed twice from identical inputs THE
    provisioner SHALL assign identical `EvidenceId`s.
 3. WHEN a renderer or client cites an `EvidenceId` THE explanation model SHALL resolve it
@@ -311,7 +319,11 @@ I can distinguish a quiet plan from an uninformed one.
    confirmed, and the consequence for the plan's claims about it.
 2. WHEN a resource's desired state contains a value the provider assigns during apply THE
    explanation model SHALL record an uncertainty for that value rather than presenting a
-   placeholder as fact.
+   placeholder as fact. *(Ownership assigned 2026-07-30: Feature 1 defined
+   `ProviderAssignedAtApply` and deliberately does not emit it; an
+   `explanation-change-semantics` addendum activates it — kinds declare their
+   provider-assigned fields through the declaration vocabulary. Until that addendum
+   lands, this criterion is open, not silently unmet.)*
 3. WHERE a change's semantics carry `Unknown` confidence THE explanation model SHALL
    record an uncertainty rather than omitting the field.
 4. THE uncertainty record SHALL carry its subject `EvidenceId`, its reason, its
@@ -326,11 +338,18 @@ that one product speaks with one voice.
 
 #### Acceptance Criteria
 
+*(Criteria 1–2 amended 2026-07-30, reconciled to D8/D9: the counted-summary phrasing
+predated the Markdown pivot. The document form — sections, templates, display names, the
+header assurance line — is owned by the evidence-model child's Requirement 6 as amended
+2026-07-29.)*
+
 1. WHEN rendering at summary depth THE renderer SHALL state the principal effect, the
-   change counts by kind, the destructive actions, the operational impacts, and the
-   presence of uncertainty.
+   destructive actions, the operational impacts, and the live-state assurance, and SHALL
+   NOT render change counts or per-change semantics.
 2. WHEN rendering at detail depth THE renderer SHALL additionally state per-change
-   evidence, causes, per-change semantics, and each uncertainty in full.
+   evidence, causes, and declared behaviour in the declaration's confidence voice;
+   uncertainty renders through each class's channel — live state in the header and in
+   place, undeclared semantics machine-side only (change-semantics Requirement 6.5).
 3. WHEN `--json` is requested THE renderer SHALL emit the complete explanation model
    irrespective of depth.
 4. THE renderer SHALL use only the vocabulary defined in `operator-language.md`.
@@ -464,10 +483,14 @@ caused it, so that I can go straight to the edit.
 
 #### Acceptance Criteria
 
-1. WHEN the interpreter evaluates a definition value THE interpreter SHALL retain the
-   source location of that value.
-2. WHEN an evaluated value is materialized into a resource field THE provisioner SHALL
-   retain the association between that field and its source location.
+*(Criteria 1–2 amended 2026-07-30 per `explanation-source-spans`: the originals
+prescribed interpreter value-taint; the child spec owns the mechanism decision —
+syntactic attribution — and these criteria now state the outcome.)*
+
+1. WHEN the baseline and working definitions are available THE explanation SHALL locate
+   the edits between them, each carrying a span in the working definition's coordinates.
+2. WHEN an edit explains a definition-caused change THE explanation SHALL associate the
+   change with that edit's location and SHALL state the basis of the association.
 3. WHEN a change is caused by a definition edit THE explanation model SHALL name the
    source location of the changed value.
 4. IF a value's source location cannot be established THEN THE explanation model SHALL
@@ -482,8 +505,9 @@ that explanation cannot alter what a deployment realizes.
 
 #### Acceptance Criteria
 
-1. WHEN spans are threaded through evaluation THE interpreter SHALL produce values
-   identical to those produced without span tracking.
+1. THE attribution computation SHALL NOT alter definition evaluation: values realized
+   with attribution present SHALL be identical to those realized without it. *(Amended
+   2026-07-30: rephrased mechanism-neutrally; the original presupposed span threading.)*
 2. THE realized deployment SHALL be byte-identical with and without source attribution.
 
 ## Feature 5: Analysis Protocol
@@ -531,10 +555,15 @@ and which an assistant wrote, so that I never mistake narration for fact.
    agent interpretation as visibly distinct sections.
 2. THE client SHALL NOT merge agent prose and computed fact into a single undifferentiated
    statement.
-3. WHEN an agent statement names a resource, count, consequence, or risk THE client SHALL
-   require a resolvable `EvidenceId` for it.
-4. IF an agent statement cannot be traced to evidence THEN THE client SHALL suppress that
-   statement and report the suppression.
+3. WHEN an agent statement names an identifier-shaped fact — a resource, a revision, an
+   evidence id — THE client SHALL require the statement's section to cover it with
+   resolvable citations; assessments of risk, safety, or consequence appear only inside
+   labeled interpretation, per criterion 5. *(Amended 2026-07-30 to the enforceable
+   lexical contract the child spec delivers — a guard that judges coverage, not
+   semantics.)*
+4. IF a section of an agent answer cannot be traced to evidence THEN THE client SHALL
+   suppress that section and report the suppression. *(Amended 2026-07-30: suppression
+   is section-granular — partial honesty beats plausible completeness.)*
 5. THE client SHALL NOT present an agent-originated risk assessment as a Tokeira
    determination.
 
@@ -558,7 +587,7 @@ so that comprehension is not gated on credentials.
   without apology.
 - Feature 4 is the precision upgrade to Feature 3, not a prerequisite: revision-level
   causality is computable from retained revisions today, and span-level attribution
-  refines it once the interpreter threads spans.
+  refines it once Feature 4's syntactic pass locates the edits.
 - Each child spec owns its own design and tasks, including the property-based tests for
   its correctness properties. This umbrella owns only the requirements and the boundaries
   between them.

@@ -127,9 +127,10 @@ with the named revision.
 ### C3. `tokeira-explain` — the classifier
 
 ```rust
-/// The A1–A10 algebra. Pure; order-significant exactly as the requirements
-/// table specifies. `changes` provides existence-in-plan and Replace kinds
-/// (for A6); `graph` provides edges for A6 and for output tracing (A4).
+/// The algebra (A1–A10, with A3b in the existence family). Pure;
+/// order-significant exactly as the requirements table specifies. `changes`
+/// provides existence-in-plan and Replace kinds (for A6); `graph` provides
+/// edges for A6 and for output tracing (A4).
 pub fn classify_causes(
     inputs: &CausalityView<'_>,
     changes: &[ExplainedChange],
@@ -138,14 +139,20 @@ pub fn classify_causes(
 
 Implementation notes fixed by this design:
 
-- **A4 (output tracing)** compares each differing leaf value in `D(R) − P(R)` against the
-  set of *changed* recorded outputs of R's dependencies (S.outputs keyed by the output
-  names the definition binds). The classification fires only when every differing field
-  matches exactly one changed output of exactly one dependency (Requirement 3.2);
-  otherwise fall through to A5. Matching is by value equality on canonical scalars —
-  which is why the confidence is `Inference`, and why the renderer marks it derived.
+- **A4 (output tracing)** fires per differing leaf `f` of `D(R) − P(R)` only when all of:
+  (i) a recorded dependency edge R → dep exists in G — the trace rides the dependency's
+  identity, never name or value coincidence; (ii) dep has a recorded output in S whose
+  value equals `f`'s working-side value **and** differs from `f`'s baseline-side value —
+  "changed" is established as a diff between states (P against S), not a one-ended match;
+  (iii) every differing field of R traces this way to exactly one dependency
+  (Requirements 3.2, 3.5). Otherwise fall through to A5. The residual risk — a
+  coincidental scalar equality surviving all three gates — is why the confidence is
+  `Inference` and the renderer marks it derived. *(Predicate tightened 2026-07-30,
+  operator-directed.)*
 - **A6 (cascade)** fires when R's dependency (direct, over G) has a `Replace` change in
-  this plan, and `D(R) = P(R)`. Root is the nearest replaced dependency on the path.
+  this plan, and `D(R) = P(R)`. The per-change cause names the nearest replaced
+  dependency; the group's root is the ultimate root per C4 (Requirement 4.6's bounded
+  walk) — precision lives on the change, the story lives on the group.
 - **A9 before A7/A8**: L is consulted through `RefreshCoverage`; statuses `Unknown` or
   `examined == false` short-circuit to `Confidence::Unknown` plus the uncertainty.
 - The classifier never inspects declared semantics: causality is independent of Feature 2
@@ -169,10 +176,16 @@ pub enum CausalRoot {
 
 Grouping partitions non-`NoChange` changes (Requirement 4.5): definition edits group
 under the revision comparison; output-traced changes group under their named dependency;
-cascades under the replaced root; each drifted resource is its own root (drift has no
+cascades under the **ultimate** root — the walk follows `ReplacementCascade` causes until
+the first non-cascade cause and roots there, so A(Replace) → B → C is one group under A
+rather than a chain of linked groups; each drifted resource is its own root (drift has no
 shared origin unless traced); engine-advance changes group under the provisioner advance.
-Member order: BFS from the root over G, ties broken by `EvidenceId`; unconnected members
-after connected ones, same tiebreak (Requirement 4.2).
+The walk is bounded (Requirement 4.6): it terminates at `ProvisionerAdvance` and never
+attributes across the baseline comparison — the per-change assessment still names the
+nearest replaced dependency, so precision lives on the change while the story lives on
+the group. Termination is guaranteed: dependency graphs are DAGs. Member order: BFS from
+the root over G, ties broken by `EvidenceId`; unconnected members after connected ones,
+same tiebreak (Requirement 4.2).
 
 Dependants are the reverse edges of G over the union of desired and recorded resources
 (Requirement 5.1), computed once and joined onto each explained change.
@@ -212,8 +225,8 @@ reasons: `CauseUndecidable { resource }` (A9/A10) and `BaselineUnavailable { rev
 
 **Property 2 — The algebra is followed exactly.**
 *For any* synthetic (D, P, S, L, G, changes) tuple, the classifier's output equals the
-algebra evaluated by an independent oracle implementation of the A1–A10 table, including
-precedence.
+algebra evaluated by an independent oracle implementation of the full table (A1–A10 with
+A3b), including precedence.
 **Validates: Requirements 2.2**
 
 **Property 3 — Classification is deterministic and pure.**
@@ -233,23 +246,28 @@ whether or not a refresh has since overwritten the planning context — construc
 running the classifier before and after a simulated refresh overwrite.
 **Validates: Requirements 2.3**
 
-**Property 6 — Output tracing is unambiguous or absent.**
-*For any* inputs, every `DependencyOutputChanged` assessment satisfies: each differing
-field of the resource matches exactly one changed output of exactly one dependency; and
-any constructed ambiguity (two candidate dependencies, or a partial match) yields A5, not
-A4.
-**Validates: Requirements 3.1, 3.2, 3.3**
+**Property 6 — Output tracing is unambiguous or absent, and rides identity and the state
+diff.**
+*For any* inputs, every `DependencyOutputChanged` assessment satisfies: the named
+dependency is edge-reachable in G; each differing field matches exactly one changed
+output of exactly one dependency, where "changed" means the recorded value departs from
+the baseline-side value while matching the working side; and any constructed ambiguity
+(two candidate dependencies, a partial match, a value match without the edge, or a value
+match without the state departure) yields A5, not A4.
+**Validates: Requirements 3.1, 3.2, 3.3, 3.5**
 
 **Property 7 — Snapshot canonicality.**
 *For any* definition realized twice, and *for any* semantics-preserving reordering of its
 set-valued fields, the desired snapshots are equal.
 **Validates: Requirements 1.4, 1.6**
 
-**Property 8 — Groups partition.**
+**Property 8 — Groups partition, and roots are the bounded ultimate roots.**
 *For any* explanation, the causal groups' members exactly partition the non-`NoChange`
 changes: every change in exactly one group, no group empty, member order consistent with
-BFS-from-root plus the deterministic tiebreak.
-**Validates: Requirements 4.1, 4.2, 4.5**
+BFS-from-root plus the deterministic tiebreak; and every cascade member's group root is
+the first non-cascade cause on its chain, with no root crossing the engine-version or
+baseline-revision boundary.
+**Validates: Requirements 4.1, 4.2, 4.3, 4.5, 4.6**
 
 **Property 9 — Dependants are the reverse graph, exactly.**
 *For any* explanation, each change's dependant set equals the reverse edges of the
@@ -289,7 +307,10 @@ vs retained copy of the same content → equal snapshots).
 five `ProviderDrift` assessments — the demon test, named for the hunt that motivated the
 feature); the label-migration scenario (D = P, L = S, D ≠ S → `EngineAdvance` — from the
 upgrade that recreated grafana and alloy with labels); grafana's removal (R ∈ S only →
-A3); the never-applied deployment (all creates, `DefinitionEdit`).
+A3); the interrupted apply (R ∈ D, D = P, R ∉ S → A3b, never `Unknown`); the
+never-applied deployment (all creates, `DefinitionEdit`); the transitive cascade
+(A Replace → B → C: one group rooted at A, per-change causes naming the nearest
+dependency).
 
 **Integration**: `platforms/compose/tests/exercise.rs` extends Feature 1's end-to-end
 assertion — edit the definition copy, plan, assert the edited resource classifies

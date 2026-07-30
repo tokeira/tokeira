@@ -610,6 +610,14 @@ platform-realized surface. So:
   `tkr`'s sibling artifact, or `cargo build -p tokeira-compose-syn --bin tkp-compose`. The once-bundled
   `apps/tkp` is retired.
 
+> **Amended 2026-07-30 (operator-directed):** the constructed provisioner binary is `tkp`,
+> never `tkp-<platform>` — the per-platform suffix was construction plumbing leaking into
+> operator view. The workspace-unique rationale below retired with the legacy compose
+> platform: exactly one platform ships a provisioner today, `platforms/compose-syn` became
+> `platforms/compose` (crate `tokeira-compose-deployment`), and a second provisioner-shipping
+> platform revisits collision policy when it arrives. The paragraph below records the
+> original decision.
+
 **Naming and placement.** Bin-target names are per-platform and workspace-unique (`tkp-compose`,
 `tkp-local`) because sibling artifacts share one `target/` dir; the **placed** binary is always
 `<deployment>/tkp` (Req 14.4), and each binary's own CLI reports itself as `tkp`.

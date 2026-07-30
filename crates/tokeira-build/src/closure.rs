@@ -116,7 +116,7 @@ impl ProvisionerClosure {
 }
 
 /// Resolve the source closure reachable from `seed_package` (e.g.
-/// `tokeira-compose-syn`) in the workspace at `workspace_root`.
+/// `tokeira-compose-deployment`) in the workspace at `workspace_root`.
 pub fn resolve_source_closure(
     workspace_root: &Path,
     seed_package: &str,

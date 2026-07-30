@@ -6,12 +6,12 @@
 //! value model — the seam that keeps the interpreter itself engine-agnostic
 //! (Proposal 004 §11, §19).
 //!
-//! It mirrors `platforms/compose-syn::bridge` with two deliberate simplifications
+//! It mirrors `platforms/compose::bridge` with two deliberate simplifications
 //! grounded in the EKS design:
 //! - **No `Vol` variant / no `cx.state`/`config`/`docker_sock` methods.** EKS has
 //!   no bind-mount vocabulary: Kubernetes objects are built by the kinds
 //!   (`k8s-openapi` structs), not assembled from host paths (design → `HostObj`).
-//! - **No concrete-typed workload handle.** compose-syn carries a `Service` kind
+//! - **No concrete-typed workload handle.** The compose platform carries a `Service` kind
 //!   as `HostKindVal::Service`; EKS has no `service()` builder verb — a tokeira
 //!   service Deployment is a `Box<dyn Kind>` (`ServiceDeployment`) like every
 //!   other K8s object — so the kind handle is a bare take-once `Box<dyn Kind>`.
@@ -287,7 +287,7 @@ pub(crate) fn build_pod_identity_association(
 pub(crate) fn build_dsql_cluster(f: &mut FieldMap) -> Result<DsqlCluster, EvalError> {
     // Mode is *inferred* from endpoint/arn presence in the kind's `realize`
     // (Req 5.4), so the config surface carries only the two optionals — there is
-    // no `mode` field to author (unlike compose-syn's explicit `DsqlMode`).
+    // no `mode` field to author (unlike the compose platform's explicit `DsqlMode`).
     let r = DsqlCluster {
         endpoint: f.take_opt_str("endpoint")?,
         arn: f.take_opt_str("arn")?,
@@ -437,7 +437,7 @@ fn cx_field(cx: &Cx, field: &str) -> Result<Value, EvalError> {
 // ── the bridge ──────────────────────────────────────────────────────────────
 
 /// The EKS platform's host bridge. Dispatch is direct `match` (the kind set is
-/// fixed), matching compose-syn's post-refactor shape.
+/// fixed), matching the compose platform's post-refactor shape.
 #[derive(Clone, Default, Debug)]
 pub struct EksBridge;
 
@@ -481,7 +481,7 @@ impl HostBridge for EksBridge {
     }
 
     fn kind_defaults(&self, _name: &str) -> Option<FieldMap> {
-        // No EKS kind has an `..EMPTY` spread default (compose-syn used it only
+        // No EKS kind has an `..EMPTY` spread default (the compose platform used it only
         // for `Service`, which has no EKS analog). Every field is authored.
         None
     }

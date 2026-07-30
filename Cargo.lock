@@ -7993,8 +7993,6 @@ dependencies = [
  "askama",
  "async-trait",
  "aws-config",
- "aws-sdk-sts",
- "bollard",
  "hex",
  "proptest",
  "serde",
@@ -8006,33 +8004,6 @@ dependencies = [
  "tokeira-compose",
  "tokeira-config",
  "tokeira-deploy-engine",
- "tokeira-iac",
- "tokeira-observability",
- "tokeira-orchestrator",
- "tokeira-state",
- "tokio",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "tokeira-compose-syn"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "askama",
- "async-trait",
- "aws-config",
- "hex",
- "proptest",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tokeira-aws",
- "tokeira-compose",
- "tokeira-compose-deployment",
- "tokeira-config",
- "tokeira-deploy-engine",
  "tokeira-explain",
  "tokeira-iac",
  "tokeira-orchestrator",
@@ -8040,6 +8011,7 @@ dependencies = [
  "tokeira-state",
  "tokeira-tkd",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 

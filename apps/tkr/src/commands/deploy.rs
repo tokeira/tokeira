@@ -18,8 +18,6 @@
 //! surfaced as `Stopped` even if the metadata still says `Running`.
 
 use anyhow::Result;
-use tokeira_compose_deployment::ComposeDeployment;
-use tokeira_deploy_engine::Platform;
 use tokeira_ecs_deployment::EcsDeployment;
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::{DeployEngine, PlatformKind};
@@ -44,10 +42,8 @@ pub(crate) async fn run(
                     let mut engine = DeployEngine::new(LocalDeployment, config, &ctx.path).await?;
                     print_plan(&engine.plan().await?);
                 }
-                PlatformDeploymentConfig::Compose(config) => {
-                    let mut engine =
-                        DeployEngine::new(ComposeDeployment, config, &ctx.path).await?;
-                    print_plan(&engine.plan().await?);
+                PlatformDeploymentConfig::Compose(_) => {
+                    return Err(super::compose_requires_definition().into());
                 }
                 PlatformDeploymentConfig::Ecs(config) => {
                     let mut engine =
@@ -58,7 +54,10 @@ pub(crate) async fn run(
         }
         DeployAction::Apply {
             yes,
-            force,
+            // Consumed only by the forwarded path (the deployment's own
+            // provisioner); no in-process platform reads it since the legacy
+            // compose driver retired.
+            force: _,
             explanation,
         } => {
             super::refuse_explanation(explanation.as_deref())?;
@@ -70,20 +69,8 @@ pub(crate) async fn run(
                     deployments.update_status(&ctx.name, DeploymentStatus::Stopped)?;
                     result?;
                 }
-                PlatformDeploymentConfig::Compose(config) => {
-                    let compose_file = ctx.path.join("docker-compose.yml");
-                    let deployment = ComposeDeployment;
-                    let platform =
-                        ComposeDeployment::compose_platform(&compose_file, &config.project_name)?;
-                    deployment
-                        .validate_for_deploy_apply(config, &platform)
-                        .await?;
-                    let mut engine = DeployEngine::new(deployment, config, &ctx.path).await?;
-                    if force {
-                        engine.clear_service_state().await?;
-                    }
-                    print_plan(&engine.apply(&platform as &dyn Platform).await?);
-                    deployments.update_status(&ctx.name, DeploymentStatus::Running)?;
+                PlatformDeploymentConfig::Compose(_) => {
+                    return Err(super::compose_requires_definition().into());
                 }
                 PlatformDeploymentConfig::Ecs(_) => {
                     anyhow::bail!("ECS deploy apply is not implemented yet");

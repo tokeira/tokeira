@@ -19,7 +19,7 @@ pub struct DeploymentExplanation {
     pub schema_version: u32,
     /// The deployment's identity (envelope `deployment_id`).
     pub deployment: String,
-    /// The platform label (e.g. `compose-syn`).
+    /// The platform label (e.g. `compose`).
     pub platform: String,
     /// The verb this explains: `"infra plan"`, `"infra apply"`, ….
     pub operation: String,

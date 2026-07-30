@@ -11,7 +11,7 @@
 use std::{path::PathBuf, sync::LazyLock};
 
 use proptest::{prelude::*, sample::select};
-use tokeira_compose_syn::{DEFAULT_TKD, context::Cx, interp};
+use tokeira_compose_deployment::{DEFAULT_TKD, context::Cx, interp};
 use tokeira_iac::{ChangeKind, ChangeSemantics, Citation, FieldDiff, Resource, SemanticsContext};
 
 /// Requirements-table tier (explanation-change-semantics, "Kind Inventory and

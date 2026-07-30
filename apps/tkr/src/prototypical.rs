@@ -9,7 +9,7 @@
 //! when `tokeirad` tries to start.
 
 use anyhow::{Result, bail};
-use tokeira_compose_deployment::ComposeDeployment;
+use tokeira_compose_deployment::provisioner::ComposeProvisioner;
 use tokeira_ecs_deployment::EcsDeployment;
 use tokeira_local_deployment::LocalDeployment;
 use tokeira_orchestrator::{PlatformConfig, PlatformKind, StorageKind};
@@ -24,10 +24,9 @@ use toml_edit::{DocumentMut, value};
 /// DSQL rewrites `storage: Storage::InMemory` to `Storage::Dsql { .. }` so the
 /// seeded `.tkd` (the interpreter's source of truth), `metadata.json.storage`, and
 /// the prototypical `tokeirad.toml` all agree. (Transitional: embedded from the
-/// compose-syn platform crate; once the per-platform compose `tkp` exists it
-/// should own and provide its own default definition — Proposal 005.)
+/// compose platform crate, which owns its default definition.)
 pub(crate) fn compose_definition(storage: StorageKind, region: Option<&str>) -> Result<String> {
-    const DEFAULT_TKD: &str = include_str!("../../../platforms/compose-syn/definition.tkd");
+    const DEFAULT_TKD: &str = include_str!("../../../platforms/compose/definition.tkd");
     match storage {
         StorageKind::InMemory => Ok(DEFAULT_TKD.to_string()),
         StorageKind::Dsql => {
@@ -55,7 +54,7 @@ pub(crate) fn deployment_config(
 ) -> Result<String> {
     let toml = match platform {
         PlatformKind::Local => LocalDeployment::prototypical_config(storage),
-        PlatformKind::Compose => ComposeDeployment::prototypical_config(storage),
+        PlatformKind::Compose => ComposeProvisioner::prototypical_config(storage),
         PlatformKind::Ecs => EcsDeployment::prototypical_config(storage),
     };
     if platform == PlatformKind::Compose && storage == StorageKind::Dsql {
@@ -77,7 +76,7 @@ pub(crate) fn server_config(
             toml
         }
         PlatformKind::Compose => {
-            let toml = ComposeDeployment::prototypical_server_config(storage);
+            let toml = ComposeProvisioner::prototypical_server_config(storage);
             let _: tokeira_config::TokeiraConfig = toml::from_str(&toml)?;
             toml
         }
@@ -149,8 +148,11 @@ mod tests {
         assert!(toml.contains("image = \"tokeirad:latest\""));
         assert!(toml.contains("aws_cli_image = \"public.ecr.aws/aws-cli/aws-cli:latest\""));
         assert!(toml.contains("busybox_image = \"public.ecr.aws/docker/library/busybox:latest\""));
-        assert!(toml.contains("run `tkr image build`"));
-        assert!(toml.contains("populated by `tkr image mirror`"));
+        // One annotation, tool-neutral, on the one image the operator must
+        // build locally; the ECS-only mirror notes no longer seed compose
+        // deployments (they described another platform's workflow).
+        assert!(toml.contains("build the tokeirad image locally before deploying"));
+        assert!(!toml.contains("image mirror"));
 
         let _: ComposeConfig = toml::from_str(&toml).unwrap();
     }

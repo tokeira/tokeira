@@ -7,7 +7,7 @@
 
 use crate::value::{EvalError, FieldMap, Value};
 
-/// The platform-specific host bridge. `compose-syn` and `eks` each supply one.
+/// The platform-specific host bridge. `compose` and `eks` each supply one.
 pub trait HostBridge {
     /// The platform's opaque host handle (its closed `HostObj` enum). Must be
     /// `Clone`/`Debug` because config `Value`s are cloned (retarget diff) and

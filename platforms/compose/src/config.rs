@@ -156,3 +156,37 @@ fn default_aws_cli_image() -> String {
 fn default_busybox_image() -> String {
     "public.ecr.aws/docker/library/busybox:latest".into()
 }
+
+/// The prototypical `deployment.toml` seeded at deployment create — the
+/// config above at its defaults for the requested storage, with the
+/// tokeirad image line annotated: it is the one image the operator must
+/// build locally before deploying (every other service image is pulled
+/// from its upstream registry as pinned in the definition).
+pub fn prototypical_config_toml(storage: StorageKind) -> String {
+    let mut config = ComposeConfig {
+        storage,
+        ..ComposeConfig::default()
+    };
+    if storage == StorageKind::Dsql {
+        config.dsql = Some(ComposeDsqlConfig::default());
+    }
+    tokeira_config::write_config_toml(&config)
+        .expect("the default config serializes")
+        .replace(
+            "image = \"tokeirad:latest\"",
+            "# build the tokeirad image locally before deploying\nimage = \"tokeirad:latest\"",
+        )
+}
+
+/// The prototypical `tokeirad.toml` seeded beside it.
+pub fn prototypical_server_config_toml(storage: StorageKind) -> String {
+    let mut config = tokeira_config::TokeiraConfig::default();
+    if storage == StorageKind::Dsql {
+        config.infrastructure.storage = tokeira_config::ConfigStorageKind::Dsql;
+        config.infrastructure.dsql.endpoint = Some("replace-with-dsql-endpoint".to_string());
+        config.infrastructure.dsql.region = Some("us-east-1".to_string());
+    }
+    config
+        .to_toml()
+        .expect("the default server config serializes")
+}

@@ -54,10 +54,10 @@ pub(crate) const LATEST_FILE: &str = ".latest";
 /// The provisioner's name **inside a deployment dir** — always `tkp`,
 /// regardless of which platform's binary it is (Req 14.4).
 pub(crate) const PROVISIONER_BIN: &str = "tkp";
-/// The per-platform **source** binary `create` resolves and copies in: the
-/// `tkp-compose` bin target of `platforms/compose-syn` (all forwarded
-/// deployments are compose today).
-pub(crate) const PROVISIONER_SOURCE_BIN: &str = "tkp-compose";
+/// The **source** binary `create` resolves and copies in: the `tkp` bin
+/// target of `platforms/compose` (all forwarded deployments are compose
+/// today; the constructed binary is `tkp`, never `tkp-<platform>`).
+pub(crate) const PROVISIONER_SOURCE_BIN: &str = "tkp";
 
 /// Resolves deployment names to on-disk paths and mediates the `.latest`
 /// selection sentinel.
@@ -154,8 +154,8 @@ impl DeploymentResolver {
     /// one married to it at create.
     ///
     /// Phase 0 (native-cargo dev binding, Proposal 005): resolves the
-    /// **per-platform source binary** (`tkp-compose`, a bin target of
-    /// `platforms/compose-syn` — the platform ships its own provisioner) and
+    /// **platform source binary** (`tkp`, a bin target of
+    /// `platforms/compose` — the platform ships its own provisioner) and
     /// copies its bytes in as `tkp`. Resolution order: installed on PATH,
     /// then the running `tkr`'s own directory (a dev `tkr` in `target/debug`
     /// finds its sibling from the same build), then — inside the workspace —
@@ -236,7 +236,7 @@ impl DeploymentResolver {
             .args([
                 "build",
                 "-p",
-                "tokeira-compose-syn",
+                "tokeira-compose-deployment",
                 "--bin",
                 PROVISIONER_SOURCE_BIN,
             ])
@@ -244,7 +244,7 @@ impl DeploymentResolver {
             .context("failed to run `cargo build` for the provisioner")?;
         if !status.success() {
             bail!(
-                "`cargo build -p tokeira-compose-syn --bin {PROVISIONER_SOURCE_BIN}` failed — \
+                "`cargo build -p tokeira-compose-deployment --bin {PROVISIONER_SOURCE_BIN}` failed — \
                  see the build output above"
             );
         }

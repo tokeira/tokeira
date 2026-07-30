@@ -41,7 +41,6 @@ members = [
     "crates/tokeira-edge",
     "platforms/local",
     "platforms/compose",
-    "platforms/compose-syn",
     "platforms/ecs",
     "platforms/eks",
     "apps/tkr",

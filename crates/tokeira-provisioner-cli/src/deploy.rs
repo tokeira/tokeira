@@ -2,7 +2,7 @@
 //! and outputs).
 //!
 //! The workload verbs are **conditionally realized**: a platform whose workload
-//! rides the infra universe (compose-syn models its tokeirad containers as
+//! rides the infra universe (compose models its tokeirad containers as
 //! infra resources) realizes them as the infra verbs; a platform with no
 //! workload notion answers [`Realization::NotApplicable`], which the shell turns
 //! into a typed non-zero refusal. `deploy apply` follows the same mutating-verb

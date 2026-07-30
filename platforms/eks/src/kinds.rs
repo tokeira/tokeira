@@ -70,7 +70,7 @@ const MODULE_FOUNDATION: &str = "foundation";
 const MODULE_CLUSTER: &str = "cluster";
 
 /// Fallback region when the context carries none (in-memory/plan contexts).
-/// Mirrors compose-syn's `unwrap_or("us-east-1")` so realize is total.
+/// Mirrors the compose platform's `unwrap_or("us-east-1")` so realize is total.
 const DEFAULT_REGION: &str = "us-east-1";
 
 /// The resolved AWS region for realize-time resource construction.

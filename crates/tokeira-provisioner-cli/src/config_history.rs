@@ -10,7 +10,7 @@
 //!
 //! Each snapshot is stored **under the config file's basename** for the platform
 //! it came from — `{dir}/state/config-revisions/{n}/{basename}` (a `.tkd` for
-//! compose-syn, `deployment.toml` for local); the basename comes from the
+//! compose, `deployment.toml` for local); the basename comes from the
 //! injected platform's `config_basename`. Keying by basename makes a
 //! cross-platform revert *refuse* rather than clobber: a revision retained as a
 //! `deployment.toml` is simply not present under the current `definition.tkd`
@@ -159,11 +159,11 @@ mod tests {
             "retained under the local basename"
         );
 
-        // The deployment becomes compose-syn (a `.tkd` appears with real content).
+        // The deployment becomes compose (a `.tkd` appears with real content).
         std::fs::write(tmp.path().join(TKD), b"REAL-TKD").unwrap();
         assert!(
             !is_retained(tmp.path(), TKD, 1),
-            "the local revision is not retained under the compose-syn basename"
+            "the local revision is not retained under the compose basename"
         );
 
         let err = restore(tmp.path(), TKD, 1).expect_err("cross-platform restore refuses");

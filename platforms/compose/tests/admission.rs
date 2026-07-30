@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use tokeira_compose_syn::{
+use tokeira_compose_deployment::{
     context::Cx,
     interp::{interpret, retarget_check},
 };

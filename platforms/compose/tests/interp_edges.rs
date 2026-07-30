@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use tokeira_compose_syn::{
+use tokeira_compose_deployment::{
     builder::WbValue,
     context::Cx,
     interp::{interpret, retarget_check, validate},

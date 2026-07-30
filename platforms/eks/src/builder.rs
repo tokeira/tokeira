@@ -3,7 +3,7 @@
 //! deployment shape (namespaces, modules, resources, writeback) and realizes
 //! each declared resource directly to an engine [`iac::Resource`].
 //!
-//! This mirrors `platforms/compose-syn::builder`, with two deliberate omissions:
+//! This mirrors `platforms/compose::builder`, with two deliberate omissions:
 //! there is **no `service()`/`ComposeWorkload`/`realize_workloads`** and **no
 //! `Vol`** vocabulary. EKS drives every Kubernetes object (Deployments included)
 //! through the single `InfraEngine` apply path as an `iac::Resource` kind (design

@@ -56,7 +56,7 @@ specs' amendments are commutative.
     method with the MUST-NOT purity contract; default asserted by test
   - _Requirements: 1.1, 1.2, 1.5_
 
-- [x] 2.3 compose-syn implementation
+- [x] 2.3 compose platform implementation
   - `load_tkd_config_from(dir, definition)` → realize → per-resource `to_manifest()` →
     canonicalize; a source that does not interpret returns the located verdict
   - The working definition and a retained revision go through this one path
@@ -73,7 +73,7 @@ specs' amendments are commutative.
 - [x] 2.4 **PBT: Property 7 — snapshot canonicality**
   - Realize twice → equal; permute set-valued authored order → equal; working vs retained
     copy of identical content → equal
-  - DONE (2026-07-30): `platforms/compose-syn/tests/causality_snapshot.rs` — generated
+  - DONE (2026-07-30): `platforms/compose/tests/causality_snapshot.rs` (authored pre-rename as compose-syn) — generated
     permutations of ports/volumes/needs authored order → equal snapshots; the reference
     definition deterministic; two-paths equality through the platform seam; the broken
     source returns the located verdict
@@ -192,7 +192,7 @@ specs' amendments are commutative.
   - _Requirements: 6.5_
 
 - [ ] 6.4 End-to-end integration
-  - `platforms/compose-syn/tests/exercise.rs`: edit the definition copy → plan → the
+  - `platforms/compose/tests/exercise.rs`: edit the definition copy → plan → the
     edited resource classifies `DefinitionEdit`, untouched resources classify clean;
     over the live seam chain
   - _Requirements: 1.6, 2.1, 2.2_

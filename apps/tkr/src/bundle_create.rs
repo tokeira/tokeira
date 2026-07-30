@@ -30,7 +30,7 @@ use tokeira_state::LocalBackend;
 use crate::deployment_dir::{DeploymentResolver, PROVISIONER_BIN, PROVISIONER_SOURCE_BIN};
 
 /// The platform seed the forwarded (`.tkd`) provisioner builds from.
-const SEED_PACKAGE: &str = "tokeira-compose-syn";
+const SEED_PACKAGE: &str = "tokeira-compose-deployment";
 
 /// Obtain a verified bundle for the host target and marry it to the
 /// deployment: `<deployment>/tkp` + the manifest sidecar, with the bytes

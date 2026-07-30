@@ -9,7 +9,7 @@ file that is not a description of a deployment.
 
 This guide is for the person who authors or operates such a file. It assumes little or no Rust
 experience: the dialect is small enough to learn from this page. The reference definition it walks
-through is `platforms/compose-syn/definition.tkd`, the live definition of the Docker-compose
+through is `platforms/compose/definition.tkd`, the live definition of the Docker-compose
 platform. The engine underneath (resources, plan/apply, state) is documented separately in
 [`docs/architecture/120-iac-framework.md`](../../architecture/120-iac-framework.md); deeper design
 reading is collected at the end.
@@ -210,7 +210,7 @@ macOS; a bare directory works just as well.)
 
 | Entry | Written by | What it is |
 |---|---|---|
-| `definition.tkd` | **you** | the deployment definition. Its *presence* selects the compose-syn platform; without it `tkp` treats the directory as a minimal `local` deployment configured by `deployment.toml` |
+| `definition.tkd` | **you** | the deployment definition. Its *presence* selects the compose platform; without it `tkp` treats the directory as a minimal `local` deployment configured by `deployment.toml` |
 | `deployment.toml` | `tkr deployment create`, then you | platform bootstrap config; `tkp init` reads its `project_name` as the deployment identity (default `tokeira`) |
 | `tokeirad.toml` | `tkr deployment create`; patched by writeback (today via `tkr infra apply` — `tkp apply` does not write it yet) | the *server's* config — a different file with a different owner, reached from the definition only through `d.writeback(…)` |
 | `state/envelope/` | `tkp` | the **deployment state envelope**: recorded binding, integrity manifest, `config_revision`, rollback checkpoint, operation marker |
@@ -220,11 +220,11 @@ macOS; a bare directory works just as well.)
 
 Note what's missing: `tkr deployment create` does **not** write a `definition.tkd`. Creating a
 `.tkd`-backed deployment today means placing the file yourself — start from a copy of
-`platforms/compose-syn/definition.tkd`:
+`platforms/compose/definition.tkd`:
 
 ```bash
 mkdir -p ~/deployments/dev
-cp platforms/compose-syn/definition.tkd ~/deployments/dev/
+cp platforms/compose/definition.tkd ~/deployments/dev/
 ```
 
 Every `tkp` verb picks it up by presence.
@@ -258,7 +258,7 @@ desired against live state — without touching anything (it does not even need 
 running):
 
 ```text
-platform: compose-syn
+platform: compose
 binding:  Match — apply would proceed
 infra plan: 1 change(s)
   Update [compose_service] observability::mimir
@@ -268,7 +268,7 @@ infra plan: 1 change(s)
 
 ```text
 binding: Match (authoritative) — proceeding
-[compose-syn] infra apply: 1 change(s)
+[compose] infra apply: 1 change(s)
 envelope: config_revision now 5 (config sha256:8c1d…)
 ```
 
@@ -286,7 +286,7 @@ tkp revert --deployment-dir ~/deployments/dev --to 4
 ```text
 binding: Match (authoritative) — proceeding
 restored config revision 4 → /Users/op/deployments/dev/definition.tkd
-[compose-syn] revert reconcile: 1 change(s)
+[compose] revert reconcile: 1 change(s)
 envelope: config_revision now 6 (content of revision 4)
 ```
 
@@ -577,7 +577,7 @@ confirm``). It removes the infrastructure but keeps the envelope's history — t
 
 ```text
 binding: Match (authoritative) — proceeding
-[compose-syn] infra destroy: 8 resource(s) removed
+[compose] infra destroy: 8 resource(s) removed
 envelope: torn down (config_revision 4 retained)
 ```
 
@@ -607,7 +607,7 @@ platforms directly); `tkp` never manages more than the one deployment it is poin
 | `config constraint failed: #[require] on …` | the config violates a declared invariant | read the `#[require(…)]` on that type; fix the values |
 | `binding gate refuses … (Mismatch)` | the running `tkp` is not the recorded engine | use the matching binary, or make the change deliberate with `tkp upgrade` |
 | `binding gate refuses … (Unknown)` | the deployment was never initialized | `tkp init` (or `tkr deployment apply`, which inits on first contact) |
-| `compose-syn apply/destroy needs a reachable Docker daemon` | plan works without Docker; mutation doesn't | start Docker, retry |
+| `compose apply/destroy needs a reachable Docker daemon` | plan works without Docker; mutation doesn't | start Docker, retry |
 | `config revision N was not retained …` | `revert` target predates retention or belongs to another platform's config | `ls state/config-revisions/` to see what is restorable |
 | `failed to acquire the remote operation lock …` | another mutator is (or died while) holding the lease | wait for the lease to lapse; check for a live concurrent `tkp` first |
 | a writeback key never appears in `tokeirad.toml` | `tkp apply` does not yet write back (only `tkr infra apply` patches `tokeirad.toml` today) — or the `output(…)` name isn't a recorded property of that resource | check the name against the [kinds table](#kinds-compose-platform); complete the server config by hand or via `tkr infra apply` until the wiring lands |
@@ -616,13 +616,13 @@ platforms directly); `tkp` never manages more than the one deployment it is poin
 
 | Platform | Definition | Status |
 |---|---|---|
-| `platforms/compose-syn` | `definition.tkd` (interpreted) | **live** — the reference `.tkd` platform, driven end-to-end by `tkp`; proven byte-identical to the compiled compose platform by a three-way fidelity harness |
+| `platforms/compose` | `definition.tkd` (interpreted) | **live** — the reference `.tkd` platform, driven end-to-end by `tkp`; proven byte-identical to the compiled compose platform by a three-way fidelity harness |
 | `platforms/eks` | `.tkd` (in progress) | interpreter bridge and 15 AWS/K8s kinds landed; its `definition.tkd`, adapter, and `tkp` wiring are the next blocks |
-| `platforms/compose`, `platforms/ecs` | compiled Rust | the classic pre-DSL platforms, driven by `tkr`; compose doubles as compose-syn's fidelity oracle |
+| `platforms/compose`, `platforms/ecs` | compiled Rust | the classic pre-DSL platforms, driven by `tkr`; compose doubles as compose's fidelity oracle |
 | `platforms/local` | `deployment.toml` | `tkp`'s fallback when no `definition.tkd` is present |
 
 The interpreter itself is `crates/tokeira-tkd` — platform-agnostic, one `HostBridge`
-implementation per platform (`platforms/compose-syn/src/bridge.rs` is the reference). A new
+implementation per platform (`platforms/compose/src/bridge.rs` is the reference). A new
 platform plugs in by supplying kinds and a bridge; the dialect, subset, and admission machinery
 come for free.
 

@@ -318,7 +318,7 @@ fn forwarded_infra_verb(action: &InfraAction) -> (&'static [&'static str], Vec<S
 
 /// Map a `tkr deploy` action to the forwarded `tkp` verb tokens — the same
 /// namespaced words (`tkr deploy plan` → `tkp deploy plan`). The platform
-/// decides realization: compose-syn's workload rides its infra universe.
+/// decides realization: the compose platform's workload rides its infra universe.
 fn forwarded_deploy_verb(action: &DeployAction) -> (&'static [&'static str], Vec<String>) {
     match action {
         DeployAction::Plan { explanation } => (

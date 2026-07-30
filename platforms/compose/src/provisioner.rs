@@ -1,12 +1,12 @@
-//! The compose-syn provisioner realization (Req 14): this platform's
+//! The compose provisioner realization (Req 14): this platform's
 //! [`ProvisionerPlatform`] implementation plus the engine wiring behind it.
 //!
-//! The platform ships its own provisioner: the `tkp-compose` bin target
+//! The platform ships its own provisioner: the `tkp` bin target
 //! (`src/bin/tkp.rs`) is `tokeira-provisioner-cli` — the platform-agnostic
-//! shell — composed with exactly this realization. `tkr deployment create`
-//! builds/obtains that binary and places it in the deployment dir as `tkp`.
+//! shell — composed with exactly this realization. Deployment create
+//! builds/obtains that binary and marries it to the deployment dir.
 //!
-//! A compose-syn deployment is defined by its `definition.tkd` (the interpreted
+//! A compose deployment is defined by its `definition.tkd` (the interpreted
 //! config revision, Proposal 004 §19): `tkp` loads + interprets the `.tkd`
 //! (validating it at load) and drives the engine over
 //! `tokeira_orchestrator::Deployment` — the structure is config, not compiled
@@ -29,14 +29,28 @@ use crate::{
 
 const TKD_FILE: &str = "definition.tkd";
 
-/// The compose-syn realization of the provisioner seam. One platform, no
-/// detection: a deployment operated by `tkp-compose` **is** compose-syn.
+/// The compose realization of the provisioner seam. One platform, no
+/// detection: this crate's `tkp` is the compose platform's provisioner,
+/// married to its deployment at create.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ComposeSynPlatform;
+pub struct ComposeProvisioner;
 
-impl ProvisionerPlatform for ComposeSynPlatform {
+/// The create-time templates: the platform owns its prototypical
+/// `deployment.toml` and `tokeirad.toml`, beside the default definition it
+/// already ships.
+impl tokeira_orchestrator::PlatformConfig for ComposeProvisioner {
+    fn prototypical_config(storage: tokeira_orchestrator::StorageKind) -> String {
+        crate::config::prototypical_config_toml(storage)
+    }
+
+    fn prototypical_server_config(storage: tokeira_orchestrator::StorageKind) -> String {
+        crate::config::prototypical_server_config_toml(storage)
+    }
+}
+
+impl ProvisionerPlatform for ComposeProvisioner {
     fn label(&self, _deployment_dir: &Path) -> &'static str {
-        "compose-syn"
+        "compose"
     }
 
     fn config_basename(&self, _deployment_dir: &Path) -> &'static str {
@@ -144,7 +158,7 @@ impl ProvisionerPlatform for ComposeSynPlatform {
 
     async fn scale(&self, _deployment_dir: &Path, _specs: &[String]) -> Result<Realization<usize>> {
         Ok(Realization::NotApplicable {
-            reason: "compose-syn has no scale dimension (scaling lands with ECS)",
+            reason: "the compose platform has no scale dimension (scaling lands with ECS)",
         })
     }
 }
@@ -161,7 +175,7 @@ fn project_name(deployment_dir: &Path) -> String {
         .to_string()
 }
 
-/// Load + validate the compose-syn `.tkd` config revision, seeding the
+/// Load + validate the compose `.tkd` config revision, seeding the
 /// engine-injected [`Cx`].
 ///
 /// `Cx.region` is `None`: region lives in the `.tkd`'s own `config()`
@@ -203,8 +217,8 @@ fn interpret_definition(
     Ok((source, cx, deployment))
 }
 
-/// Open the compose-syn infra engine and register the live-apply Docker handle
-/// that compose-syn's `register_infra_extensions` leaves for `tkp` to provide
+/// Open the compose infra engine and register the live-apply Docker handle
+/// that the platform's `register_infra_extensions` leaves for `tkp` to provide
 /// (its container resources read `ComposePlatform` from the context).
 ///
 /// The handle is registered only when the Docker daemon actually **responds**:
@@ -224,7 +238,7 @@ async fn open_engine(
         .await
         .context("failed to open the infrastructure engine")?;
 
-    // compose-syn assembles containers through the Docker API (Bollard) in the
+    // The platform assembles containers through the Docker API (Bollard) in the
     // `tokeira-compose` crate — there is no user-authored `docker-compose.yml`; a
     // deployment is defined by its `definition.tkd`, and the InfraEngine's own
     // state store is authoritative. `ComposePlatform::connect` still takes a path
@@ -264,8 +278,7 @@ async fn open_engine(
 /// destroy — the daemon is required) or a tolerated skip (plan).
 fn docker_or_skip(err: ComposeError, require_docker: bool) -> Result<Option<ComposePlatform>> {
     if require_docker {
-        Err(anyhow::anyhow!(err))
-            .context("compose-syn apply/destroy needs a reachable Docker daemon")
+        Err(anyhow::anyhow!(err)).context("compose apply/destroy needs a reachable Docker daemon")
     } else {
         Ok(None)
     }
@@ -313,13 +326,13 @@ mod tests {
         // resources. No Docker: container `describe` returns Unsupported, so a
         // fresh deployment still plans (all Creates).
         let tmp = reference_tkd_dir();
-        let outcome = ComposeSynPlatform
+        let outcome = ComposeProvisioner
             .infra_plan(tmp.path())
             .await
             .expect("plan");
         assert!(
             outcome.changes.len() >= 6,
-            "compose-syn plan produced only {} changes",
+            "compose plan produced only {} changes",
             outcome.changes.len()
         );
         assert!(
@@ -353,7 +366,7 @@ mod tests {
         let dir = tmp.path().join("orders-prod");
         std::fs::create_dir(&dir).unwrap();
         assert_eq!(
-            ComposeSynPlatform.deployment_id(&dir).unwrap(),
+            ComposeProvisioner.deployment_id(&dir).unwrap(),
             "orders-prod"
         );
     }

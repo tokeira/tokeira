@@ -23,7 +23,7 @@ until `tkr deployment unlock --yes`.
 
 ### Definition-driven platforms
 
-`compose-syn` and [`eks`](../eks/README.md) are authored differently: the
+`compose` and [`eks`](../eks/README.md) are authored differently: the
 whole deployment — infrastructure, services, storage, observability, wiring —
 is one `definition.tkd` file interpreted by the provisioner `tkp`
 (`init` / `plan` / `apply` / `destroy` / `revert` / `upgrade`), rather than

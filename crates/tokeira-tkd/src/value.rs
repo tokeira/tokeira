@@ -9,7 +9,7 @@
 //!
 //! This crate names no platform type: the host is the type parameter `H`, and
 //! every host operation is routed through the bridge. That is what lets a single
-//! interpreter serve every `syn` platform (`compose-syn`, `eks`, …).
+//! interpreter serve every `syn` platform (`compose`, `eks`, …).
 
 use std::collections::BTreeMap;
 

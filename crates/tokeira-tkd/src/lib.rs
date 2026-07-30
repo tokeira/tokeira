@@ -4,7 +4,7 @@
 //! (reject-by-default allow-list), and walks it into the platform's deployment
 //! type. It is generic over a platform-supplied [`HostBridge`]: the core holds
 //! host values opaquely and routes every host operation through the bridge, so it
-//! names no concrete kind and needs no `Box<dyn Any>`. `compose-syn` and `eks`
+//! names no concrete kind and needs no `Box<dyn Any>`. `compose` and `eks`
 //! each implement one bridge and share this interpreter (Proposals 003/004).
 //!
 //! The passes: [`schema`] (type/fn tables + `#[create]`/`#[require]`), [`subset`]

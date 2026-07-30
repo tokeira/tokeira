@@ -247,12 +247,12 @@ impl orchestrator::Ops for TkdDeployment {
 
 fn unsupported_day2(op: &str) -> OrchestratorError {
     OrchestratorError::Other(anyhow::anyhow!(
-        "`{op}` is not yet supported for compose-syn via tkr; drive it through the provisioner (tkp)"
+        "`{op}` is not yet supported for compose via tkr; drive it through the provisioner (tkp)"
     ))
 }
 
 impl PlatformConfig for TkdDeployment {
-    /// The "config" for compose-syn IS the `.tkd` (its `config()` + structure).
+    /// The "config" for the compose platform IS the `.tkd` (its `config()` + structure).
     fn prototypical_config(_storage: StorageKind) -> String {
         crate::DEFAULT_TKD.to_string()
     }

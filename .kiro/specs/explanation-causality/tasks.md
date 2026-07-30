@@ -110,16 +110,19 @@ specs' amendments are commutative.
 
 ## Phase 4 — The classifier
 
-- [ ] 4.1 Implement the A1–A10 algebra
+- [ ] 4.1 Implement the algebra (A1–A10 with A3b)
   - `classify_causes` in `tokeira-explain`: pure, order-significant per the requirements
-    table; A6 before A7; A9 guarding A7/A8; A10 branches from `BaselineSnapshot`
+    table; existence rows (A1–A3b) first — the never-recorded create classifies A3b,
+    never `Unknown`; A6 before A7; A9 guarding A7/A8; A10 branches from
+    `BaselineSnapshot`
   - _Requirements: 2.1, 2.2, 2.4, 2.6_
 
 - [ ] 4.2 Output tracing (A4)
-  - Differing leaves of `D(R) − P(R)` matched against changed recorded outputs of R's
-    dependencies; fires only on the exactly-one-dependency, every-field-traced condition;
-    inference confidence
-  - _Requirements: 3.1, 3.2, 3.3, 3.4_
+  - Differing leaves of `D(R) − P(R)` traced per the state-diff predicate: a recorded
+    dependency edge in G, and the output's S-value matching the working side while
+    departing from the baseline side; fires only on the exactly-one-dependency,
+    every-field-traced condition; inference confidence
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
 
 - [ ] 4.3 Uncertainties for undecidable causes
   - A9/A10 emit `CauseUndecidable` / `BaselineUnavailable` with consequence and
@@ -127,8 +130,8 @@ specs' amendments are commutative.
   - _Requirements: 2.5, 2.7_
 
 - [ ] 4.4 **PBT: Property 2 — the algebra is followed exactly**
-  - Independent table-literal oracle of A1–A10 kept test-side; generated tuples cover
-    every row and every precedence collision
+  - Independent table-literal oracle of the full table (A1–A10 with A3b) kept test-side;
+    generated tuples cover every row and every precedence collision
   - _Property 2; Requirements: 2.2_
 
 - [ ] 4.5 **PBT: Property 1 — assessment is total and unique**
@@ -140,17 +143,19 @@ specs' amendments are commutative.
 - [ ] 4.7 **PBT: Property 4 — no drift claim without a confirmed live read**
   - _Property 4; Requirements: 2.4, 2.7_
 
-- [ ] 4.8 **PBT: Property 6 — output tracing unambiguous or absent**
-  - Constructed ambiguities (two candidates; partial trace) must fall to A5
-  - _Property 6; Requirements: 3.2, 3.3_
+- [ ] 4.8 **PBT: Property 6 — output tracing unambiguous or absent, on identity + state diff**
+  - Constructed ambiguities (two candidates; partial trace; value match without the
+    edge; value match without the state departure) must fall to A5
+  - _Property 6; Requirements: 3.2, 3.3, 3.5_
 
 - [ ] 4.9 **PBT: Property 10 — unknown causes ↔ uncertainties, one-to-one**
   - _Property 10; Requirements: 2.7_
 
 - [ ] 4.10 Example tests: the named scenarios
   - The demon test (D = P, L ≠ S ×5 → five `ProviderDrift`); the label migration
-    (D = P, L = S, D ≠ S → `EngineAdvance`); grafana's removal (A3); the never-applied
-    deployment (A10 creates rule)
+    (D = P, L = S, D ≠ S → `EngineAdvance`); grafana's removal (A3); the interrupted
+    apply (R ∈ D, D = P, R ∉ S → A3b, never `Unknown`); the never-applied deployment
+    (A10 creates rule)
   - _Requirements: 2.2_
 
 - [ ] 4.11 **Checkpoint** — classifier green against oracle and scenarios.
@@ -159,16 +164,18 @@ specs' amendments are commutative.
 
 - [ ] 5.1 `CausalGroup` and `CausalRoot`; grouping per design
   - Partition; BFS-from-root member order with the deterministic tiebreak; roots per
-    Requirement 4.3
-  - _Requirements: 4.1, 4.2, 4.3, 4.5_
+    Requirement 4.3 — cascades walk to the ultimate root, bounded by the engine-version
+    and baseline boundaries (Requirement 4.6); per-change causes keep naming the nearest
+    dependency
+  - _Requirements: 4.1, 4.2, 4.3, 4.5, 4.6_
 
 - [ ] 5.2 Dependant sets
   - Reverse edges over the union of desired and recorded resources; joined onto each
     explained change; graph only, no heuristics
   - _Requirements: 5.1, 5.3_
 
-- [ ] 5.3 **PBT: Property 8 — groups partition**
-  - _Property 8; Requirements: 4.1, 4.2, 4.5_
+- [ ] 5.3 **PBT: Property 8 — groups partition; roots are the bounded ultimate roots**
+  - _Property 8; Requirements: 4.1, 4.2, 4.3, 4.5, 4.6_
 
 - [ ] 5.4 **PBT: Property 9 — dependants are the reverse graph, exactly**
   - _Property 9; Requirements: 5.1, 5.3_

@@ -146,6 +146,7 @@ Comparisons are over canonical manifests; ∉ means absent from the source.
 | A1 | R ∈ D and R ∉ P | `DefinitionEdit` (introduced) | Engine fact |
 | A2 | R ∉ D and R ∈ P | `DefinitionEdit` (removed) | Engine fact |
 | A3 | R ∉ D and R ∉ P and R ∈ S | `DefinitionEdit` (removed at or before the baseline; the reconcile is completing now) | Engine fact |
+| A3b | R ∈ D and R ∈ P and D(R) = P(R) and R ∉ S | `DefinitionEdit` (introduced at or before the baseline; the reconcile is completing now — an interrupted or partially recorded apply) | Engine fact |
 | A4 | D(R) ≠ P(R), and the difference traces unambiguously to a dependency's changed output | `DependencyOutputChanged { dependency }` | Inference |
 | A5 | D(R) ≠ P(R), otherwise | `DefinitionEdit` | Engine fact |
 | A6 | D(R) = P(R), R's dependency is planned as `Replace`, and R's own change is forced by that replacement | `ReplacementCascade { root }` | Inference |
@@ -154,9 +155,13 @@ Comparisons are over canonical manifests; ∉ means absent from the source.
 | A9 | D(R) = P(R), L(R) unconfirmed or unexamined | `Unknown` + uncertainty (a drift claim without a confirmed L would be speculation) | Unknown |
 | A10 | P unavailable (no baseline: never applied, or the retained revision is missing) | Creates on a never-applied deployment: `DefinitionEdit`, engine fact. Otherwise `Unknown` + uncertainty naming the missing revision | per case |
 
-Order is significant: A1–A3 (existence) before A4–A5 (content), A6 before A7 (a cascade
-would otherwise misread as drift), A9 guards A7–A8 (no drift claim over an unconfirmed
-live read).
+Order is significant: A1–A3b (existence, including absence from recorded state) before
+A4–A5 (content) before A6–A9 (state), A6 before A7 (a cascade would otherwise misread as
+drift), A9 guards A7–A8 (no drift claim over an unconfirmed live read). A3b sits in the
+existence family deliberately: its change is a create, so the cascade and drift rows
+cannot meaningfully apply to it. *(A3b added 2026-07-30, operator-directed: the
+never-recorded create is a fact the engine holds, and it SHALL NOT surface as a generic
+could-not-establish uncertainty.)*
 
 ## Requirements
 
@@ -222,6 +227,13 @@ symptom.
    SHALL NOT name a dependency speculatively.
 4. THE cause assessment SHALL carry inference confidence, and the renderer SHALL mark it
    as derived.
+5. THE trace SHALL be established against identity and the state diff, never bare value
+   equality: the named dependency SHALL be reachable by a recorded dependency edge from
+   the resource, and an output SHALL count as changed only when its recorded value (S)
+   departs from the value the baseline definition realized for the consuming field (P)
+   while matching the working value (D). *(Added 2026-07-30, operator-directed: the
+   change is established against the infra/service identity and an understanding of the
+   diff between states.)*
 
 ### Requirement 4: Causal grouping tells one story
 
@@ -236,13 +248,22 @@ plan reads as reasons rather than as a list.
    outward; members not connected by a path SHALL be ordered deterministically after
    path-connected members.
 3. THE roots for grouping SHALL be: the revision comparison for definition edits; the
-   named dependency for output-traced changes; the replaced resource for cascades; the
-   drifted resource itself for drift; the provisioner advance for engine-advance changes.
+   named dependency for output-traced changes; for cascades, the ultimate root — the
+   first non-cascade cause reached by walking the cascade chain — so a transitive
+   replacement reads as one story; the drifted resource itself for drift; the provisioner
+   advance for engine-advance changes. *(Amended 2026-07-30: "the replaced resource"
+   left nearest-vs-ultimate open; ultimate is chosen, bounded by criterion 6.)*
 4. WHEN rendering at summary depth THE renderer SHALL present each group as its root and
    its member count with member ids; WHEN rendering at detail depth THE renderer SHALL
    present the full chain.
 5. THE groups SHALL partition the plan's non-`NoChange` changes: every such change SHALL
    appear in exactly one group.
+6. THE root walk SHALL be bounded by the engine-version and baseline-revision
+   boundaries: a chain whose origin is an engine advance SHALL root at the provisioner
+   advance and reach no further back, and no root SHALL attribute across a revision
+   earlier than the baseline comparison. *(Added 2026-07-30, operator-directed: cause is
+   bounded by the engine-version boundary — within one plan the chain is walkable fact;
+   beyond it lies archaeology this feature refuses.)*
 
 ### Requirement 5: Dependants are stated
 
@@ -297,3 +318,7 @@ so that "why" reads as naturally as "what".
   keeps the other two categories honest.
 - Canonicalization (1.4) is non-negotiable: without it, desired-vs-desired comparison
   re-imports the port-order roulette as phantom definition edits.
+- **A3b is A3's mirror** (2026-07-30): a resource desired unchanged since the baseline
+  yet absent from recorded state is the create-side reconcile completion — an interrupted
+  apply, a partially recorded commit. The engine knows this; classifying it `Unknown`
+  would have been exactly the generic could-not-establish this table exists to prevent.

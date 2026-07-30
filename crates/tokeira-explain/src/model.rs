@@ -187,6 +187,16 @@ pub enum UncertaintyReason {
     /// be reached to declare what the delete does, and that absence is
     /// stated rather than silent (change-semantics Requirement 3.4).
     KindUnavailableForRemovedResource,
+    /// The cause algebra could not decide why this resource changed —
+    /// typically a drift-shaped condition over an unconfirmed live read,
+    /// which the algebra refuses to call drift (causality A9). Constructed
+    /// only by the cause classifier.
+    CauseUndecidable { resource: String },
+    /// The baseline revision's retained definition could not be realized
+    /// (missing or does not interpret), so revision comparison — and with it
+    /// most of the cause algebra — is unavailable (causality A10). One per
+    /// plan, naming the revision. Constructed only by the cause classifier.
+    BaselineUnavailable { revision: u64 },
 }
 
 impl UncertaintyReason {
@@ -201,6 +211,8 @@ impl UncertaintyReason {
             UncertaintyReason::KindUnavailableForRemovedResource => {
                 "kind-unavailable-for-removed-resource"
             }
+            UncertaintyReason::CauseUndecidable { .. } => "cause-undecidable",
+            UncertaintyReason::BaselineUnavailable { .. } => "baseline-unavailable",
         }
     }
 }

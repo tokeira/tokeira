@@ -55,6 +55,12 @@ pub enum Realization<T> {
     NotApplicable { reason: &'static str },
 }
 
+/// Canonical per-resource desired manifests realized from one definition
+/// source, in memory: the comparison value revision-level causality is built
+/// on. Keys are the engine's own resource identities, so a snapshot joins the
+/// plan's changes without translation.
+pub type DesiredSnapshot = std::collections::BTreeMap<tokeira_iac::ResourceId, serde_json::Value>;
+
 /// The seam a per-platform provisioner binary implements: the platform-realized
 /// verbs plus the platform properties the shell genuinely needs. Everything else
 /// — gating, locking, the envelope, revisions, describe — is the shell's.
@@ -115,6 +121,26 @@ pub trait ProvisionerPlatform {
         let _ = (deployment_dir, source);
         Ok(Realization::NotApplicable {
             reason: "this platform has no interpreted definition",
+        })
+    }
+
+    /// Realize `definition` (a path to a definition source — the working
+    /// definition or a retained revision) into canonical per-resource desired
+    /// manifests (causality Requirement 1). MUST NOT contact providers, read
+    /// live state, or write state: the snapshot is a value computed entirely
+    /// in memory, and two snapshots of semantically identical definitions
+    /// MUST be equal (canonical set-valued fields). A source that does not
+    /// interpret returns the located verdict as `Err`; the default serves
+    /// platforms with no interpreted definition, whose causality classifies
+    /// per the algebra's A10.
+    async fn desired_snapshot(
+        &self,
+        deployment_dir: &Path,
+        definition: &Path,
+    ) -> Result<Realization<DesiredSnapshot>> {
+        let _ = (deployment_dir, definition);
+        Ok(Realization::NotApplicable {
+            reason: "this platform has no interpreted definition to snapshot",
         })
     }
 
@@ -307,6 +333,18 @@ mod tests {
             resource: resource.to_string(),
             details: Vec::new(),
         }
+    }
+
+    // Causality Requirement 1.5: a platform with no interpreted definition
+    // answers the snapshot with the typed refusal, so the classifier's A10
+    // branch has a value, never a panic or a missing method.
+    #[tokio::test]
+    async fn desired_snapshot_defaults_to_not_applicable() {
+        let answer = TestPlatform
+            .desired_snapshot(Path::new("/tmp/x"), Path::new("/tmp/x/def"))
+            .await
+            .expect("the default never errors");
+        assert!(matches!(answer, Realization::NotApplicable { .. }));
     }
 
     // Task 19.2/19.3: the audit mapping — ids are the engine's ResourceId

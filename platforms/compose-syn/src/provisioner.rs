@@ -64,6 +64,18 @@ impl ProvisionerPlatform for ComposeSynPlatform {
         load_tkd_config_from(deployment_dir, &definition).map(|_| Realization::Realized(()))
     }
 
+    async fn desired_snapshot(
+        &self,
+        deployment_dir: &Path,
+        definition: &Path,
+    ) -> Result<Realization<tokeira_provisioner_cli::DesiredSnapshot>> {
+        // Interpret + realize in memory — the same path as `definition
+        // check`, so a broken source yields the located verdict, never a
+        // partial snapshot. No provider, no live state, no writes.
+        let (_source, cx, deployment) = interpret_definition(deployment_dir, definition)?;
+        Ok(Realization::Realized(deployment.desired_snapshot(&cx)))
+    }
+
     async fn infra_plan(&self, deployment_dir: &Path) -> Result<PlanOutcome> {
         let config = load_tkd_config(deployment_dir)?;
         let mut engine = open_engine(config, deployment_dir, false).await?;
@@ -163,6 +175,18 @@ pub fn load_tkd_config(deployment_dir: &Path) -> Result<TkdConfig> {
 /// check --definition` authoring path; the deployment dir still seeds the
 /// interpretation context (project name, state anchors).
 fn load_tkd_config_from(deployment_dir: &Path, path: &Path) -> Result<TkdConfig> {
+    let (source, cx, _) = interpret_definition(deployment_dir, path)?;
+    Ok(TkdConfig { source, cx })
+}
+
+/// The one interpretation path every definition consumer shares — config
+/// loading, `definition check`, and desired snapshots all verify a source
+/// through exactly this function (causality Requirement 1.6), so the located
+/// verdict and the realized shape can never diverge between them.
+fn interpret_definition(
+    deployment_dir: &Path,
+    path: &Path,
+) -> Result<(String, Cx, crate::builder::Deployment)> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let cx = Cx {
@@ -174,9 +198,9 @@ fn load_tkd_config_from(deployment_dir: &Path, path: &Path) -> Result<TkdConfig>
     // wording is the operator verdict every verb inherits ("the definition
     // does not verify: parse error at line 112, …"); `definition check`
     // renders the same interpreter error as its report payload.
-    crate::interp::interpret(&source, &cx)
+    let (deployment, _config) = crate::interp::interpret(&source, &cx)
         .map_err(|e| anyhow::anyhow!("the definition does not verify: {e}"))?;
-    Ok(TkdConfig { source, cx })
+    Ok((source, cx, deployment))
 }
 
 /// Open the compose-syn infra engine and register the live-apply Docker handle

@@ -12,47 +12,79 @@ specs' amendments are commutative.
 
 ## Phase 1 — Feature 1 amendment
 
-- [ ] 1.1 Cause slot becomes `Confidence<Cause>`
+- [x] 1.1 Cause slot becomes `Confidence<Cause>`
   - Remove `Cause::Undetermined`; `ExplainedChange.cause: Confidence<Cause>` with
     `Unknown` default
   - Update `.kiro/specs/explanation-evidence-model/design.md` so the sibling records the
     corrected shape
   - Feature 1's Property 8 (slots silent) re-run against the new default
+  - DONE (2026-07-30): the code half pre-landed with Feature 1 (the amendment was
+    applied before F1 Phase 3, per this spec's first branch) — `ExplainedChange.cause:
+    Confidence<Cause>`, no `Undetermined`. This task updated the sibling design's Data
+    Models (stale `Cause`/`Confidence` sketches → the landed shapes; `Confidence<T>`
+    pointer to the change-semantics vocabulary in `tokeira-iac`) and re-ran Property 8
   - _Requirements: amendment; 2.7_
 
-- [ ] 1.2 New uncertainty reasons
+- [x] 1.2 New uncertainty reasons
   - `CauseUndecidable { resource }` and `BaselineUnavailable { revision }` in
     `UncertaintyReason`; both constructed only by this feature
+  - DONE (2026-07-30): both variants + evidence-id tags (`cause-undecidable`,
+    `baseline-unavailable`), reserved-until doc comments naming A9/A10; inert this
+    phase — no constructor exists yet
   - _Requirements: 2.5, 2.7_
 
-- [ ] 1.3 **Checkpoint** — workspace green; explanation output unchanged (unknown cause
+- [x] 1.3 **Checkpoint** — workspace green; explanation output unchanged (unknown cause
   renders as nothing, exactly as the undetermined default did).
+  - DONE (2026-07-30): tokeira-explain + tokeira-provisioner-cli suites green with the
+    variants inert; full bar at the slice boundary.
 
 ## Phase 2 — The desired-snapshot seam
 
-- [ ] 2.1 Share the canonicalization
+- [x] 2.1 Share the canonicalization
   - Move `canonicalize_manifest` to a location shared by the compose diff boundary and
     the snapshot path, so one function — not two agreeing ones — owns canonical form
+  - DONE (2026-07-30): `canonicalize_manifest` made `pub` in its owning crate (no move
+    needed — the diff boundary lives beside it and the snapshot path imports it); doc
+    states the one-owner rule
   - _Requirements: 1.4_
 
-- [ ] 2.2 `ProvisionerPlatform::desired_snapshot`
+- [x] 2.2 `ProvisionerPlatform::desired_snapshot`
   - Trait method with the purity contract in its doc comment; default is NotApplicable
     for platforms without an interpreted definition
+  - DONE (2026-07-30): `DesiredSnapshot` type alias (BTreeMap keyed by the engine's
+    `ResourceId`, so snapshots join changes without translation) + the defaulted trait
+    method with the MUST-NOT purity contract; default asserted by test
   - _Requirements: 1.1, 1.2, 1.5_
 
-- [ ] 2.3 compose-syn implementation
+- [x] 2.3 compose-syn implementation
   - `load_tkd_config_from(dir, definition)` → realize → per-resource `to_manifest()` →
     canonicalize; a source that does not interpret returns the located verdict
   - The working definition and a retained revision go through this one path
+  - DONE (2026-07-30): the one path is `interpret_definition` — config loading,
+    `definition check`, and snapshots all verify through it. Design deviation, for the
+    better: `to_manifest()` exists only on compose services, so the platform's `Kind`
+    trait gains an explicit `manifest()` (authored desired content as JSON) and
+    `Deployment::desired_snapshot` composes kind manifests + canonical service
+    manifests (service realization factored to one helper shared with
+    `realize_module`, so infra-dependency wiring cannot diverge). The IaC framework is
+    untouched — desired content is a platform concern
   - _Requirements: 1.3, 1.6_
 
-- [ ] 2.4 **PBT: Property 7 — snapshot canonicality**
+- [x] 2.4 **PBT: Property 7 — snapshot canonicality**
   - Realize twice → equal; permute set-valued authored order → equal; working vs retained
     copy of identical content → equal
+  - DONE (2026-07-30): `platforms/compose-syn/tests/causality_snapshot.rs` — generated
+    permutations of ports/volumes/needs authored order → equal snapshots; the reference
+    definition deterministic; two-paths equality through the platform seam; the broken
+    source returns the located verdict
   - _Property 7; Requirements: 1.4, 1.6_
 
-- [ ] 2.5 **Checkpoint** — seam green; no provider calls observable from snapshot tests
+- [x] 2.5 **Checkpoint** — seam green; no provider calls observable from snapshot tests
   (test platform records and asserts zero).
+  - DONE (2026-07-30): purity is structural — the snapshot path is interpret + realize
+    with no `ProvisionContext`, so no provider handle exists to call (AWS clients and
+    the Docker platform enter only as apply-time context extensions); the suite runs
+    providerless (no daemon, no credentials) and passes.
 
 ## Phase 3 — Gathering the sources
 

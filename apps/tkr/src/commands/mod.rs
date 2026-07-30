@@ -94,10 +94,7 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_up(service, replicas, c).await,
-            // Forwarded compose deployments scale through their married
-            // provisioner and never reach this arm; only a pre-`.tkd` legacy
-            // deployment can, and its driver is retired.
-            Self::Compose(..) => Err(legacy_compose_refusal()),
+            Self::Compose(..) => Err(compose_requires_definition()),
             Self::Ecs(d, c) => d.scale_up(service, replicas, c).await,
         }
     }
@@ -109,7 +106,7 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_down(service, replicas, c).await,
-            Self::Compose(..) => Err(legacy_compose_refusal()),
+            Self::Compose(..) => Err(compose_requires_definition()),
             Self::Ecs(d, c) => d.scale_down(service, replicas, c).await,
         }
     }
@@ -136,13 +133,14 @@ impl PlatformOps {
     }
 }
 
-/// The typed refusal for a pre-`.tkd` compose deployment (a `deployment.toml`
-/// compose entry with no `definition.tkd`): its in-process driver is retired,
-/// and the honest answer names the way forward rather than failing obscurely.
-pub(crate) fn legacy_compose_refusal() -> tokeira_orchestrator::OrchestratorError {
+/// Every compose deployment is `.tkd`-defined and driven by its married
+/// provisioner; these in-process arms exist only to keep the platform match
+/// total. Reaching one means the deployment directory has no
+/// `definition.tkd` — the error names that gap.
+pub(crate) fn compose_requires_definition() -> tokeira_orchestrator::OrchestratorError {
     anyhow::anyhow!(
-        "this compose deployment predates `.tkd` definitions and its in-process driver \
-         has been retired; recreate it with `tkr deployment create --platform compose`"
+        "this compose deployment has no `definition.tkd`; compose verbs are realized by \
+         the deployment's provisioner over its definition"
     )
     .into()
 }

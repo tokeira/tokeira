@@ -44,10 +44,7 @@ pub(crate) async fn run(
         PlatformDeploymentConfig::Local(config) => {
             run_with_engine(action, deployments, &ctx, LocalDeployment, config, format).await
         }
-        // A `.tkd` compose deployment forwards to its married provisioner
-        // before reaching here; only a pre-`.tkd` legacy deployment can, and
-        // its driver is retired.
-        PlatformDeploymentConfig::Compose(_) => Err(super::legacy_compose_refusal().into()),
+        PlatformDeploymentConfig::Compose(_) => Err(super::compose_requires_definition().into()),
         PlatformDeploymentConfig::Ecs(config) => {
             if matches!(&action, InfraAction::Apply { .. }) {
                 validate_ecs_mirrors(config).await?;

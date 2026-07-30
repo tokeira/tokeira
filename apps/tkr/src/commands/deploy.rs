@@ -42,11 +42,8 @@ pub(crate) async fn run(
                     let mut engine = DeployEngine::new(LocalDeployment, config, &ctx.path).await?;
                     print_plan(&engine.plan().await?);
                 }
-                // A `.tkd` compose deployment forwards to its married
-                // provisioner before reaching here; only a pre-`.tkd` legacy
-                // deployment can, and its driver is retired.
                 PlatformDeploymentConfig::Compose(_) => {
-                    return Err(super::legacy_compose_refusal().into());
+                    return Err(super::compose_requires_definition().into());
                 }
                 PlatformDeploymentConfig::Ecs(config) => {
                     let mut engine =
@@ -73,7 +70,7 @@ pub(crate) async fn run(
                     result?;
                 }
                 PlatformDeploymentConfig::Compose(_) => {
-                    return Err(super::legacy_compose_refusal().into());
+                    return Err(super::compose_requires_definition().into());
                 }
                 PlatformDeploymentConfig::Ecs(_) => {
                     anyhow::bail!("ECS deploy apply is not implemented yet");

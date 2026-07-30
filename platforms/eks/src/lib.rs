@@ -1,7 +1,7 @@
 //! `tokeira-eks-deployment` — the `syn`-authored EKS platform for tokeira.
 //!
 //! This is the Kubernetes sibling of `platforms/ecs` and the AWS sibling of
-//! `platforms/compose-syn`: it provisions tokeira on AWS EKS with Aurora DSQL,
+//! `platforms/compose`: it provisions tokeira on AWS EKS with Aurora DSQL,
 //! authored in the `syn` deployment DSL (Proposals 003/004) and driven by `tkp`.
 //! It sits in the platform plane — it owns *what* to provision (the config, the
 //! kinds, the builder vocabulary, the `definition.tkd`, the orchestrator

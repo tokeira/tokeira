@@ -9,13 +9,13 @@
 use std::path::PathBuf;
 
 use proptest::prelude::*;
-use tokeira_compose_syn::{
+use tokeira_compose_deployment::{
     DEFAULT_TKD,
     builder::{Deployment, Vol},
     context::Cx,
     interp,
     kinds::Service,
-    provisioner::ComposeSynPlatform,
+    provisioner::ComposeProvisioner,
 };
 use tokeira_provisioner_cli::{DesiredSnapshot, ProvisionerPlatform, Realization};
 
@@ -109,11 +109,11 @@ async fn the_working_and_retained_paths_produce_one_snapshot() {
     std::fs::write(&working, DEFAULT_TKD).unwrap();
     std::fs::write(&retained, DEFAULT_TKD).unwrap();
 
-    let platform = ComposeSynPlatform;
+    let platform = ComposeProvisioner;
     let realize = |path: PathBuf| async move {
         match platform.desired_snapshot(dir, &path).await.unwrap() {
             Realization::Realized(snapshot) => snapshot,
-            Realization::NotApplicable { reason } => panic!("compose-syn snapshots: {reason}"),
+            Realization::NotApplicable { reason } => panic!("compose snapshots: {reason}"),
         }
     };
     let from_working = realize(working).await;
@@ -130,7 +130,7 @@ async fn a_broken_source_returns_the_located_verdict() {
     let broken = tmp.path().join("definition.tkd");
     std::fs::write(&broken, "this is not a definition").unwrap();
 
-    let err = ComposeSynPlatform
+    let err = ComposeProvisioner
         .desired_snapshot(tmp.path(), &broken)
         .await
         .expect_err("a broken source fails the snapshot");

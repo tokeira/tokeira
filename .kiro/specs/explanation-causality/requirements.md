@@ -62,7 +62,7 @@ if Feature 1 has already shipped; either way the JSON shape of an *undetermined*
 
 ### What This Spec Covers
 
-- The desired-snapshot seam on `ProvisionerPlatform` and its compose-syn implementation
+- The desired-snapshot seam on `ProvisionerPlatform` and its compose-platform implementation
   (reusing the `definition check` interpretation machinery).
 - The classification algebra, its implementation in `tokeira-explain`, and its confidence
   rules.
@@ -89,8 +89,8 @@ if Feature 1 has already shipped; either way the JSON shape of an *undetermined*
 |---|---|---|
 | Every applied definition is retained per revision, with `snapshot` and `restore` | `crates/tokeira-provisioner-cli/src/config_history.rs` | **P** exists for every applied revision without new storage |
 | The envelope records `config_revision` and `effective_config_ref` | `crates/tokeira-provisioner/src/*` | The baseline revision to compare against is known at plan time |
-| The definition interprets fully in memory with no provider access (`definition check`, `load_tkd_config`) | `platforms/compose-syn/src/provisioner.rs` | Realizing a retained revision is the same machinery pointed at a different file |
-| `TkdDeployment::realize` + `realize_module` produce resources whose `to_manifest()` is the desired shape | `platforms/compose-syn/src/adapter.rs`, `crates/tokeira-compose/src/lib.rs` | **D** and **P** are comparable values, not texts |
+| The definition interprets fully in memory with no provider access (`definition check`, `load_tkd_config`) | `platforms/compose/src/provisioner.rs` | Realizing a retained revision is the same machinery pointed at a different file |
+| `TkdDeployment::realize` + `realize_module` produce resources whose `to_manifest()` is the desired shape | `platforms/compose/src/adapter.rs`, `crates/tokeira-compose/src/lib.rs` | **D** and **P** are comparable values, not texts |
 | Set-valued manifest fields require canonicalization before comparison (`canonicalize_manifest`; the port-order roulette) | `crates/tokeira-compose/src/lib.rs` | Desired-vs-desired comparison MUST be canonical or it will manufacture phantom definition edits — the same demon in a new seam |
 | `InfraState` carries `resources: BTreeMap<ResourceId, ResourceState>` and `outputs: BTreeMap<String, String>` | `crates/tokeira-iac/src/document.rs` | **S** exists; recorded outputs exist for output tracing |
 | `ResourceState.dependencies` is recorded, and the engine topologically orders from it (`topological_sort_from_state`) | `crates/tokeira-iac/src/engine.rs` | The dependency graph for grouping, cascades, and dependants exists on both desired and recorded sides |

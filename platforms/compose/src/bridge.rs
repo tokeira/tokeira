@@ -1,7 +1,7 @@
 //! The compose platform's [`HostBridge`] — the host adapter the shared
 //! `tokeira-tkd` interpreter dispatches through. It owns the closed [`HostObj`]
 //! handle enum, the per-kind constructors (the reflection Rust lacks), and the
-//! builder-verb method shims. This is the only compose-syn module that both names
+//! builder-verb method shims. This is the only module here that both names
 //! `crate::builder`/`crate::kinds` *and* the interpreter's value model — the seam
 //! that keeps the interpreter itself engine-agnostic (Proposal 004 §11, §19).
 

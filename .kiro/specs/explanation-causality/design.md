@@ -10,7 +10,7 @@ the engine decided to change — causality annotates the plan, it never edits it
 
 Sources for the design: the retained-revision store
 (`crates/tokeira-provisioner-cli/src/config_history.rs`), the in-memory interpretation
-path (`platforms/compose-syn/src/provisioner.rs`, `adapter.rs`), the state document
+path (`platforms/compose/src/provisioner.rs`, `adapter.rs`), the state document
 (`crates/tokeira-iac/src/document.rs`), refresh and dependency ordering
 (`crates/tokeira-iac/src/engine.rs`), and the Feature 1 model.
 
@@ -87,7 +87,7 @@ pub trait ProvisionerPlatform {
 }
 ```
 
-compose-syn implements it as `load_tkd_config_from(deployment_dir, definition)` →
+The compose platform implements it as `load_tkd_config_from(deployment_dir, definition)` →
 `TkdDeployment::realize` → `realize_module` per module → `to_manifest()` per resource →
 **canonicalized** — the same interpretation path as `definition check` and the same
 canonical form as the diff boundary, satisfying Requirement 1.6 (one code path) and 1.4
@@ -281,7 +281,7 @@ Property 6, unconfirmed-L for Property 4. Property 2's oracle is a second, table
 implementation of A1–A10 kept test-side; divergence between implementation and oracle is
 the failure.
 
-**Property 7 lives with compose-syn**: realize the reference definition, permute
+**Property 7 lives with the compose platform**: realize the reference definition, permute
 set-valued authored orders, assert snapshot equality; plus the two-paths test (working
 vs retained copy of the same content → equal snapshots).
 
@@ -291,6 +291,6 @@ feature); the label-migration scenario (D = P, L = S, D ≠ S → `EngineAdvance
 upgrade that recreated grafana and alloy with labels); grafana's removal (R ∈ S only →
 A3); the never-applied deployment (all creates, `DefinitionEdit`).
 
-**Integration**: `platforms/compose-syn/tests/exercise.rs` extends Feature 1's end-to-end
+**Integration**: `platforms/compose/tests/exercise.rs` extends Feature 1's end-to-end
 assertion — edit the definition copy, plan, assert the edited resource classifies
 `DefinitionEdit` and the untouched resources classify clean, over the live seam chain.

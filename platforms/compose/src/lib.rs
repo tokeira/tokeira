@@ -1,595 +1,257 @@
-//! Compose platform — Docker Compose stack with observability services.
+//! `tokeira-compose-deployment` — the compose platform: a Docker Compose
+//! deployment defined by an interpreted `.tkd` and provisioned by the
+//! platform's own `tkp`.
 //!
-//! Structure follows the deploy-eks `project` pattern:
-//! - `config` — platform configuration model
-//! - `compose` — service descriptor construction
-//! - `modules` — IaC modules (remote-state, runtime, observability)
-//! - `services` — deploy-engine service and image adapters
+//! Built on the **author / operator divide** (Proposal 003):
+//!
+//! - **AUTHOR** (the Rust in this crate): the builder vocabulary ([`builder`]) +
+//!   the kinds ([`kinds`]), wired *directly* to the engine constructs. No
+//!   `Composition` IR, no `KindLibrary`, no `Realizer` trait.
+//! - **OPERATOR** ([`definition`]): `config()` + `deployment(cfg, cx)` that may
+//!   name *only* the author's vocabulary — interpreted from `definition.tkd`
+//!   by [`interp`] at every verb.
 
-pub mod compose;
+pub mod adapter;
+pub mod bridge;
+pub mod builder;
 pub mod config;
-pub mod gates;
-pub mod images;
-pub mod modules;
-pub mod observability_config;
-pub mod services;
-
-use std::path::{Path, PathBuf};
-
-use anyhow::Context;
-use async_trait::async_trait;
-use tokeira_aws::AwsClients;
-use tokeira_compose::ComposePlatform;
-use tokeira_config::{ConfigStorageKind, TokeiraConfig};
-use tokeira_deploy_engine as deploy_engine;
-use tokeira_iac as iac;
-use tokeira_iac::Module;
-use tokeira_orchestrator::{
-    Ops, PlatformConfig, PortMapping, Result, ServiceReplicas, StorageKind,
-};
-use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 pub use config::ComposeConfig;
+pub mod context;
+pub mod definition;
+pub mod images;
+pub mod interp;
+pub mod kinds;
+pub mod observability_config;
+pub mod ops;
+pub mod provisioner;
 
-use compose::compose_services;
-use config::ComposeDsqlConfig;
-use modules::{ComposeModule, DsqlModule, LocalStateModule, dsql_resource_id};
-use services::ComposeWorkload;
-
-#[derive(Clone, Default, Debug)]
-pub struct ComposeDeployment;
-
-impl ComposeDeployment {
-    pub fn compose_platform(compose_file: &Path, project_name: &str) -> Result<ComposePlatform> {
-        ComposePlatform::connect(compose_file, project_name)
-            .map_err(anyhow::Error::from)
-            .map_err(Into::into)
-    }
-
-    pub fn default_config_toml() -> String {
-        Self::config_toml_for_storage(StorageKind::InMemory)
-    }
-
-    fn config_toml_for_storage(storage: StorageKind) -> String {
-        let mut config = ComposeConfig {
-            storage,
-            ..ComposeConfig::default()
-        };
-        if storage == StorageKind::Dsql {
-            config.dsql = Some(ComposeDsqlConfig::default());
-        }
-        annotate_image_lifecycle_fields(
-            tokeira_config::write_config_toml(&config).expect("serializes"),
-        )
-    }
-
-    pub async fn validate_for_deploy_apply(
-        &self,
-        config: &ComposeConfig,
-        platform: &ComposePlatform,
-    ) -> Result<()> {
-        gates::validate_local_build(config, &gates::BollardInspector(platform.docker_client()))
-            .await
-            .map_err(anyhow::Error::from)
-            .map_err(Into::into)
-    }
-
-    fn desired_service_replicas(config: &ComposeConfig) -> Vec<ServiceReplicas> {
-        vec![
-            ServiceReplicas {
-                service: "mimir".into(),
-                replicas: config.observability.mimir_replicas,
-            },
-            ServiceReplicas {
-                service: "loki".into(),
-                replicas: config.observability.loki_replicas,
-            },
-            ServiceReplicas {
-                service: "tokeirad".into(),
-                replicas: config.tokeirad.replicas,
-            },
-            ServiceReplicas {
-                service: "grafana".into(),
-                replicas: config.observability.grafana_replicas,
-            },
-            ServiceReplicas {
-                service: "alloy".into(),
-                replicas: config.observability.alloy_replicas,
-            },
-        ]
-    }
-}
-
-fn annotate_image_lifecycle_fields(toml: String) -> String {
-    toml.replace(
-        "image = \"tokeirad:latest\"",
-        "# run `tkr image build` before `tkr deploy apply`\nimage = \"tokeirad:latest\"",
-    )
-    .replace(
-        "mimir_image = ",
-        "# populated by `tkr image mirror` for ECS deployments\nmimir_image = ",
-    )
-    .replace(
-        "grafana_image = ",
-        "# populated by `tkr image mirror` for ECS deployments\ngrafana_image = ",
-    )
-    .replace(
-        "loki_image = ",
-        "# populated by `tkr image mirror` for ECS deployments\nloki_image = ",
-    )
-    .replace(
-        "alloy_image = ",
-        "# populated by `tkr image mirror` for ECS deployments\nalloy_image = ",
-    )
-    .replace(
-        "aws_cli_image = ",
-        "# populated by `tkr image mirror` for ECS deployments\naws_cli_image = ",
-    )
-    .replace(
-        "busybox_image = ",
-        "# populated by `tkr image mirror` for ECS deployments\nbusybox_image = ",
-    )
-}
-
-impl PlatformConfig for ComposeDeployment {
-    fn prototypical_config(storage: StorageKind) -> String {
-        Self::config_toml_for_storage(storage)
-    }
-
-    fn prototypical_server_config(storage: StorageKind) -> String {
-        let mut config = TokeiraConfig::default();
-        if storage == StorageKind::Dsql {
-            config.infrastructure.storage = ConfigStorageKind::Dsql;
-            config.infrastructure.dsql.endpoint = Some("replace-with-dsql-endpoint".to_string());
-            config.infrastructure.dsql.region = Some("us-east-1".to_string());
-        }
-        config.to_toml().expect("server config serializes")
-    }
-}
-
-#[async_trait]
-impl tokeira_orchestrator::Deployment for ComposeDeployment {
-    type Config = ComposeConfig;
-
-    fn remote_state_module(
-        &self,
-        _config: &Self::Config,
-        deployment_dir: &Path,
-    ) -> Box<dyn iac::Module> {
-        Box::new(LocalStateModule {
-            state_dir: deployment_dir.join("state"),
-        })
-    }
-
-    fn infra_modules(
-        &self,
-        config: &Self::Config,
-        selection: &iac::ModuleSelection,
-    ) -> Vec<Box<dyn iac::Module>> {
-        let mut modules: Vec<Box<dyn iac::Module>> = Vec::new();
-        let runtime = ComposeModule::runtime(config);
-        let observability = ComposeModule::observability(config);
-        if config.storage == StorageKind::Dsql && selection.includes("dsql") {
-            let dsql_config = config.dsql.clone().unwrap_or_default();
-            modules.push(Box::new(DsqlModule::new(
-                dsql_config,
-                config.project_name.clone(),
-            )));
-        }
-        if selection.includes(runtime.name()) {
-            modules.push(Box::new(runtime));
-        }
-        if selection.includes(observability.name()) {
-            modules.push(Box::new(observability));
-        }
-        modules
-    }
-
-    fn services(&self, config: &Self::Config) -> Vec<Box<dyn deploy_engine::Service>> {
-        compose_services(config)
-            .into_iter()
-            .map(|service| Box::new(ComposeWorkload { service }) as Box<dyn deploy_engine::Service>)
-            .collect()
-    }
-
-    fn images(&self, _config: &Self::Config) -> Vec<Box<dyn deploy_engine::Image>> {
-        crate::images::construct()
-    }
-
-    fn required_namespaces(&self, _config: &Self::Config) -> Vec<String> {
-        vec!["default".into()]
-    }
-
-    async fn register_infra_extensions(
-        &self,
-        config: &Self::Config,
-        ctx: &mut iac::ProvisionContext,
-    ) -> Result<()> {
-        let compose_file = config.deployment_dir.join("docker-compose.yml");
-        let platform = Self::compose_platform(&compose_file, &config.project_name)?;
-        ctx.set_extension(platform);
-        if config.storage == StorageKind::Dsql {
-            let dsql_config = config.dsql.clone().unwrap_or_default();
-            let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(aws_config::Region::new(dsql_config.region))
-                .load()
-                .await;
-            let clients = AwsClients::new(&aws_config);
-            clients
-                .sts
-                .get_caller_identity()
-                .send()
-                .await
-                .context("AWS credentials required for DSQL storage; check `aws configure` or environment variables")?;
-            ctx.set_extension(clients);
-        }
-        Ok(())
-    }
-
-    async fn register_deploy_extensions(
-        &self,
-        _config: &Self::Config,
-        _ctx: &mut deploy_engine::ServiceContext,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn register_image_extensions(
-        &self,
-        config: &Self::Config,
-        ctx: &mut deploy_engine::ImageContext,
-    ) -> Result<()> {
-        ctx.set_extension(config.clone());
-        Ok(())
-    }
-
-    fn create_infra_store(
-        &self,
-        _config: &Self::Config,
-        deployment_dir: &Path,
-    ) -> Box<dyn DeploymentStore<iac::InfraState>> {
-        Box::new(CasStore::new(
-            Box::new(LocalBackend::new(deployment_dir.join("state/infra"))),
-            "infra".to_string(),
-        ))
-    }
-
-    fn create_deploy_store(
-        &self,
-        _config: &Self::Config,
-        deployment_dir: &Path,
-    ) -> Box<dyn DeploymentStore<iac::RuntimeState>> {
-        Box::new(CasStore::new(
-            Box::new(LocalBackend::new(deployment_dir.join("state/deploy"))),
-            "deploy".to_string(),
-        ))
-    }
-
-    fn hydrate_config(&self, config: &Self::Config, _state: &iac::InfraState) -> Self::Config {
-        config.clone()
-    }
-
-    fn collect_writeback(
-        &self,
-        config: &Self::Config,
-        state: &iac::InfraState,
-    ) -> Vec<(String, String)> {
-        if config.storage != StorageKind::Dsql {
-            return Vec::new();
-        }
-        let Some(resource_state) = state.resources.get(&dsql_resource_id(&config.project_name))
-        else {
-            return Vec::new();
-        };
-        let Some(endpoint) = resource_state
-            .properties
-            .get("cluster_endpoint")
-            .and_then(|value| value.as_str())
-            .filter(|endpoint| !endpoint.is_empty())
-        else {
-            return Vec::new();
-        };
-        let dsql = config.dsql.clone().unwrap_or_default();
-        let mut entries = vec![
-            ("infrastructure.storage".into(), "dsql".into()),
-            ("infrastructure.dsql.endpoint".into(), endpoint.into()),
-            ("infrastructure.dsql.region".into(), dsql.region),
-        ];
-
-        // Write back DynamoDB coordination table names so tokeirad uses the
-        // actual provisioned names rather than deriving from cluster_name.
-        let rate_limiter_id = iac::ResourceId(format!(
-            "dynamodb-{}-dsql-rate-limiter",
-            config.project_name
-        ));
-        if let Some(table_name) = state
-            .resources
-            .get(&rate_limiter_id)
-            .and_then(|rs| rs.properties.get("table_name"))
-            .and_then(|v| v.as_str())
-        {
-            entries.push((
-                "infrastructure.dsql.rate_limiter_table".into(),
-                table_name.into(),
-            ));
-        }
-        let conn_lease_id =
-            iac::ResourceId(format!("dynamodb-{}-dsql-conn-lease", config.project_name));
-        if let Some(table_name) = state
-            .resources
-            .get(&conn_lease_id)
-            .and_then(|rs| rs.properties.get("table_name"))
-            .and_then(|v| v.as_str())
-        {
-            entries.push((
-                "infrastructure.dsql.conn_lease_table".into(),
-                table_name.into(),
-            ));
-        }
-
-        entries
-    }
-}
-
-#[async_trait]
-impl Ops for ComposeDeployment {
-    type Config = ComposeConfig;
-
-    fn valid_services(&self) -> &[&str] {
-        static VALID: [&str; 5] = ["mimir", "loki", "tokeirad", "grafana", "alloy"];
-        &VALID
-    }
-
-    fn desired_replicas(&self, config: &Self::Config) -> Vec<ServiceReplicas> {
-        Self::desired_service_replicas(config)
-    }
-
-    async fn scale_up(&self, _service: &str, _replicas: u32, _config: &Self::Config) -> Result<()> {
-        Err(anyhow::anyhow!("use scale_up_with_dir for compose platform").into())
-    }
-
-    async fn scale_down(
-        &self,
-        _service: &str,
-        _replicas: u32,
-        _config: &Self::Config,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!("use scale_down_with_dir for compose platform").into())
-    }
-
-    async fn logs(&self, _service: &str, _config: &Self::Config) -> Result<Vec<String>> {
-        Err(anyhow::anyhow!("use logs_with_dir for compose platform").into())
-    }
-
-    async fn port_mappings(
-        &self,
-        _service: &str,
-        _config: &Self::Config,
-    ) -> Result<Vec<PortMapping>> {
-        Err(anyhow::anyhow!("use port_mappings_with_dir for compose platform").into())
-    }
-}
-
-/// Compose file is always at `<deployment_dir>/docker-compose.yml`.
-fn compose_file_for(deployment_dir: &Path) -> PathBuf {
-    deployment_dir.join("docker-compose.yml")
-}
-
-impl ComposeDeployment {
-    pub async fn scale_up_with_dir(
-        &self,
-        service: &str,
-        replicas: u32,
-        config: &ComposeConfig,
-        deployment_dir: &Path,
-    ) -> Result<()> {
-        let compose =
-            Self::compose_platform(&compose_file_for(deployment_dir), &config.project_name)?;
-        let desired = compose_services(config)
-            .into_iter()
-            .find(|candidate| candidate.name == service)
-            .ok_or_else(|| {
-                anyhow::anyhow!(invalid_service_message(self.valid_services(), service))
-            })?;
-        compose
-            .scale_service(&desired, replicas)
-            .await
-            .map_err(anyhow::Error::from)?;
-        Ok(())
-    }
-
-    pub async fn scale_down_with_dir(
-        &self,
-        service: &str,
-        replicas: u32,
-        config: &ComposeConfig,
-        deployment_dir: &Path,
-    ) -> Result<()> {
-        let compose =
-            Self::compose_platform(&compose_file_for(deployment_dir), &config.project_name)?;
-        for replica in 0..replicas {
-            compose
-                .remove_service(&format!("{service}-{replica}"))
-                .await
-                .map_err(anyhow::Error::from)?;
-        }
-        Ok(())
-    }
-
-    pub async fn logs_with_dir(
-        &self,
-        service: &str,
-        config: &ComposeConfig,
-        deployment_dir: &Path,
-    ) -> Result<Vec<String>> {
-        if !self.valid_services().contains(&service) {
-            return Err(
-                anyhow::anyhow!(invalid_service_message(self.valid_services(), service)).into(),
-            );
-        }
-        Self::compose_platform(&compose_file_for(deployment_dir), &config.project_name)?
-            .logs(service)
-            .await
-            .map_err(anyhow::Error::from)
-            .map_err(Into::into)
-    }
-
-    pub async fn port_mappings_with_dir(
-        &self,
-        service: &str,
-        config: &ComposeConfig,
-        deployment_dir: &Path,
-    ) -> Result<Vec<PortMapping>> {
-        if !self.valid_services().contains(&service) {
-            return Err(
-                anyhow::anyhow!(invalid_service_message(self.valid_services(), service)).into(),
-            );
-        }
-        Self::compose_platform(&compose_file_for(deployment_dir), &config.project_name)?
-            .port_mappings(service)
-            .await
-            .map(|mappings| {
-                mappings
-                    .into_iter()
-                    .map(
-                        |(host_addr, host_port, container_port, protocol)| PortMapping {
-                            host_addr,
-                            host_port,
-                            container_port,
-                            protocol,
-                        },
-                    )
-                    .collect()
-            })
-            .map_err(anyhow::Error::from)
-            .map_err(Into::into)
-    }
-}
-
-fn invalid_service_message(valid: &[&str], actual: &str) -> String {
-    format!(
-        "unknown service '{actual}'. valid services: {}",
-        valid.join(", ")
-    )
-}
+/// The default `.tkd` deployment definition this platform ships. `tkr deployment
+/// create` writes it into the deployment directory as the config revision the
+/// bound provisioner interprets; an operator edits it and re-applies.
+pub const DEFAULT_TKD: &str = include_str!("../definition.tkd");
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use proptest::prelude::*;
-    use tokeira_iac::Module;
-    use tokeira_orchestrator::Deployment;
+    use std::path::PathBuf;
 
-    fn arb_invalid_service() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9_-]{0,15}"
-            .prop_filter("must not collide with a valid service", |candidate| {
-                !["tokeirad", "mimir", "grafana", "loki", "alloy"].contains(&candidate.as_str())
-            })
-            .prop_map(|s| s.to_string())
-    }
+    use crate::{
+        builder::{Deployment, Vol, WbValue},
+        context::Cx,
+        definition::{DsqlMode as CfgMode, Storage, config, deployment},
+        kinds::{DsqlCluster, DsqlMode, DynamoDbTable, Service},
+    };
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
-
-        #[test]
-        fn p14_invalid_service_error_lists_valid_alternatives(service in arb_invalid_service()) {
-            let message = invalid_service_message(ComposeDeployment.valid_services(), &service);
-            prop_assert!(message.contains(&service));
-            for valid in ComposeDeployment.valid_services() {
-                prop_assert!(message.contains(valid));
-            }
+    fn cx() -> Cx {
+        Cx {
+            project_name: "tokeira".into(),
+            region: Some("eu-west-2".into()),
+            deployment_dir: PathBuf::from("/tmp/deploy"),
         }
     }
 
     #[test]
-    fn infra_modules_use_logical_names() {
-        let config = ComposeConfig::default();
-        let modules = ComposeDeployment.infra_modules(&config, &iac::ModuleSelection::All);
-        let names: Vec<String> = modules
-            .iter()
-            .map(|module| module.name().to_string())
-            .collect();
-        assert_eq!(names, vec!["runtime", "observability"]);
-    }
-
-    #[test]
-    fn module_selection_filters_correctly() {
-        let config = ComposeConfig::default();
-        let modules = ComposeDeployment.infra_modules(
-            &config,
-            &iac::ModuleSelection::Only(vec!["observability".into()]),
+    fn dsql_module_realizes_to_aws_resources() {
+        let mut d = Deployment::new(&["default"]);
+        let dsql = d.module("dsql", &["local_state"]);
+        let cluster = d.resource(
+            &dsql,
+            "cluster",
+            DsqlCluster {
+                region: "eu-west-2".into(),
+                mode: DsqlMode::Managed,
+                endpoint: None,
+                arn: None,
+            },
         );
-        assert_eq!(modules.len(), 1);
-        assert_eq!(modules[0].name(), "observability");
-    }
+        d.resource(
+            &dsql,
+            "rate_limiter",
+            DynamoDbTable {
+                table: "tokeira-dsql-rate-limiter".into(),
+                hash_key: "pk".into(),
+                ttl: Some("ttl_epoch".into()),
+            },
+        );
 
-    #[test]
-    fn observability_module_contains_expected_resources() {
-        let config = ComposeConfig::default();
-        let module = ComposeModule::observability(&config);
-        let state = iac::InfraState::default();
-        let extensions = std::collections::HashMap::new();
-        let ctx = iac::ModuleContext::new(&state, &extensions);
-        let resources = module.resources(&ctx).unwrap();
-        let names: Vec<String> = resources
-            .iter()
-            .map(|r| r.resource_id().0.clone())
-            .collect();
-        assert_eq!(names[0], "compose/observability-config-files");
-        assert!(names.iter().any(|n| n.contains("mimir")));
-        assert!(names.iter().any(|n| n.contains("grafana")));
-        assert!(names.iter().any(|n| n.contains("loki")));
-        assert!(names.iter().any(|n| n.contains("alloy")));
-        // All resources report the observability module
+        assert_eq!(
+            d.module_deps("dsql"),
+            Some(&["local_state".to_string()][..])
+        );
+        assert_eq!(d.resource_ids("dsql"), ["cluster", "rate_limiter"]);
+        assert_eq!(cluster.output("endpoint").resource, "cluster");
+
+        let resources = d.realize_module("dsql", &cx()).expect("dsql module");
+        assert_eq!(resources.len(), 2);
         for r in &resources {
-            assert_eq!(r.module(), "observability");
-        }
-        for resource in resources.iter().skip(1) {
-            let deps: Vec<String> = resource
-                .dependencies()
-                .into_iter()
-                .map(|dep| dep.0)
-                .collect();
-            assert!(
-                deps.iter()
-                    .any(|dep| dep == "compose/observability-config-files")
-            );
+            assert!(!r.resource_id().0.is_empty());
         }
     }
 
     #[test]
-    fn runtime_module_contains_tokeirad() {
-        let config = ComposeConfig::default();
-        let module = ComposeModule::runtime(&config);
-        let state = iac::InfraState::default();
-        let extensions = std::collections::HashMap::new();
-        let ctx = iac::ModuleContext::new(&state, &extensions);
-        let resources = module.resources(&ctx).unwrap();
-        assert_eq!(resources.len(), 1);
-        assert!(resources[0].resource_id().0.contains("tokeirad"));
-        assert_eq!(resources[0].module(), "runtime");
-        let deps: Vec<String> = resources[0]
-            .dependencies()
-            .into_iter()
-            .map(|dep| dep.0)
-            .collect();
-        assert!(
-            !deps
-                .iter()
-                .any(|dep| dep == "compose/observability-config-files")
+    fn service_realizes_to_resource_and_workload() {
+        let mut d = Deployment::new(&["default"]);
+        let obs = d.module("observability", &["local_state"]);
+        d.service(
+            &obs,
+            "mimir",
+            Service {
+                image: "grafana/mimir:3.0.6".into(),
+                replicas: 1,
+                publish: vec![9009],
+                command: vec!["--config.file=/etc/mimir/mimir.yaml".into()],
+                ..Service::EMPTY
+            },
         );
+        d.service(
+            &obs,
+            "grafana",
+            Service {
+                image: "grafana/grafana-oss:12.4.3".into(),
+                replicas: 1,
+                publish: vec![3000],
+                env: vec![("GF_SECURITY_ADMIN_USER".into(), "admin".into())],
+                needs: vec!["mimir".into()],
+                ..Service::EMPTY
+            },
+        );
+
+        let resources = d.realize_module("observability", &cx()).expect("module");
+        assert_eq!(resources.len(), 2);
+        assert_eq!(d.service_names(), ["mimir", "grafana"]);
+
+        let workloads = d.realize_workloads(&cx());
+        let names: Vec<&str> = workloads.iter().map(|w| w.name()).collect();
+        assert_eq!(names, ["mimir", "grafana"]);
+        let grafana = workloads.iter().find(|w| w.name() == "grafana").unwrap();
+        assert_eq!(grafana.module(), "observability");
+        assert_eq!(grafana.dependencies(), ["mimir"]);
     }
 
-    #[tokio::test]
-    async fn invalid_service_lists_valid_names() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = ComposeConfig::default();
-        let err = ComposeDeployment
-            .logs_with_dir("not-a-service", &config, temp.path())
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("tokeirad"));
-        assert!(err.contains("grafana"));
+    #[test]
+    fn config_uses_flat_storage() {
+        let c = config();
+        assert!(matches!(c.storage, Storage::InMemory));
+        assert_eq!(c.tokeirad.grpc_port, 7233);
+
+        // `Preexisting` carries endpoint/arn directly on the variant (flat, 003 §6).
+        let pre = Storage::Dsql {
+            region: "eu-west-2".into(),
+            mode: CfgMode::Preexisting,
+            endpoint: Some("x.dsql.eu-west-2.on.aws".into()),
+            arn: Some("arn:aws:dsql:...".into()),
+        };
+        let Storage::Dsql {
+            mode: CfgMode::Preexisting,
+            endpoint: Some(endpoint),
+            ..
+        } = pre
+        else {
+            panic!("expected preexisting dsql with an endpoint");
+        };
+        assert_eq!(endpoint, "x.dsql.eu-west-2.on.aws");
+    }
+
+    #[test]
+    fn deployment_builds_the_compose_shape() {
+        let d = deployment(&config(), &cx()); // InMemory default
+
+        assert_eq!(d.namespaces(), ["default"]);
+        let mut services = d.service_names();
+        services.sort();
+        assert_eq!(services, ["alloy", "grafana", "loki", "mimir", "tokeirad"]);
+
+        // InMemory → no dsql module and no writeback
+        assert!(!d.module_names().contains(&"dsql"));
+        assert!(d.writeback_entries().is_empty());
+
+        // grafana's deploy deps are name-based
+        let workloads = d.realize_workloads(&cx());
+        let grafana = workloads.iter().find(|w| w.name() == "grafana").unwrap();
+        assert_eq!(grafana.dependencies(), ["mimir", "loki"]);
+    }
+
+    #[test]
+    fn dsql_deployment_adds_module_and_writeback() {
+        let mut cfg = config();
+        cfg.storage = Storage::Dsql {
+            region: "eu-west-2".into(),
+            mode: CfgMode::Managed,
+            endpoint: None,
+            arn: None,
+        };
+        let d = deployment(&cfg, &cx());
+
+        assert!(d.module_names().contains(&"dsql"));
+        assert_eq!(
+            d.resource_ids("dsql"),
+            ["cluster", "rate_limiter", "conn_lease"]
+        );
+
+        let keys: Vec<&str> = d
+            .writeback_entries()
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "infrastructure.storage",
+                "infrastructure.dsql.endpoint",
+                "infrastructure.dsql.region",
+                "infrastructure.dsql.rate_limiter_table",
+                "infrastructure.dsql.conn_lease_table",
+            ]
+        );
+        // storage is a literal; endpoint is a resource output
+        assert!(matches!(d.writeback_entries()[0].1, WbValue::Const(ref s) if s == "dsql"));
+        assert!(matches!(d.writeback_entries()[1].1, WbValue::Output(_)));
+    }
+
+    #[test]
+    fn to_compose_service_orders_base_then_server_config_then_aws() {
+        // The relocated mechanics build volumes in a load-bearing order: declared
+        // (base) volumes first, then the server-config mount, then the AWS edge.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("tokeirad.toml"), "").unwrap();
+        let cx = Cx {
+            project_name: "p".into(),
+            region: None,
+            deployment_dir: tmp.path().to_path_buf(),
+        };
+        let svc = Service {
+            image: "img".into(),
+            replicas: 1,
+            publish: vec![1],
+            volumes: vec![Vol::State {
+                sub: "base".into(),
+                at: "/base".into(),
+            }],
+            server_config: true,
+            aws: Some("eu-west-2".into()),
+            ..Service::EMPTY
+        };
+        let cs = svc.to_compose_service("tokeirad", &cx);
+
+        assert!(
+            cs.volumes[0].ends_with(":/base"),
+            "base first: {:?}",
+            cs.volumes
+        );
+        assert!(
+            cs.volumes[1].contains("tokeirad.toml"),
+            "server_config second: {:?}",
+            cs.volumes
+        );
+        assert!(
+            cs.volumes[2].contains("/.aws:"),
+            "aws last: {:?}",
+            cs.volumes
+        );
+        assert_eq!(
+            cs.environment["TOKEIRA_CONFIG"],
+            "/etc/tokeira/tokeirad.toml"
+        );
+        assert_eq!(cs.environment["AWS_REGION"], "eu-west-2");
     }
 }

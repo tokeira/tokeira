@@ -27,7 +27,7 @@ The operator's nouns. Reports use these words and no synonyms.
 | **server configuration** | `tokeirad.toml` — the server's policy deviations from stock. | config (unqualified) |
 | **provisioner** | The deployment's own `tkp` binary — the engine that operates it. There is exactly one per deployment; `upgrade` replaces it. | married/bound binary, candidate, engine (in prose), tkp copy |
 | **revision** | One entry in the deployment's forward-only history of applied definitions. Numbers never rewind; reverted content returns under a new number. | config_revision, envelope revision |
-| **platform** | What realizes the deployment's resources (`compose-syn`, `local`, `ecs`). | provider, backend |
+| **platform** | What realizes the deployment's resources (`compose`, `local`, `ecs`). | provider, backend |
 | **resource** | One engine-managed unit, named `module::id` (`grafana::compose/grafana`). | physical id, state entry |
 | **service** | A resource that runs — a container, a task. | workload unit |
 | **plan** | The read-only statement of what an apply would do, counted by kind; **destructive** covers deletes and replacements. | delta, diff (as a noun in prose) |
@@ -81,7 +81,7 @@ The lexicon applied — these are the reference renderings new output imitates.
 
 ```markdown
 # Infra Plan
-**Plan for compose-syn** with *live state* confirmed
+**Plan for compose** with *live state* confirmed
 
 ## Update
 - the *tokeirad* service would be updated - `tokeirad::compose/tokeirad`
@@ -98,7 +98,7 @@ The lexicon applied — these are the reference renderings new output imitates.
 
 ```text
 # apply, closing lines
-[compose-syn] infra apply: 1 change
+[compose] infra apply: 1 change
   - compose/grafana
 revision: 3 (definition sha256:43386b5879da…)
 

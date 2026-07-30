@@ -19,7 +19,6 @@ use std::{fs, path::Path};
 
 use anyhow::Result;
 use tokeira_aws::{DefaultEcrClient, EcrClient};
-use tokeira_compose_deployment::ComposeDeployment;
 use tokeira_deploy_engine::ImageContext;
 use tokeira_ecs_deployment::{EcsConfig, EcsDeployment};
 use tokeira_iac::{Change, ChangeKind, ModuleSelection};
@@ -45,9 +44,10 @@ pub(crate) async fn run(
         PlatformDeploymentConfig::Local(config) => {
             run_with_engine(action, deployments, &ctx, LocalDeployment, config, format).await
         }
-        PlatformDeploymentConfig::Compose(config) => {
-            run_with_engine(action, deployments, &ctx, ComposeDeployment, config, format).await
-        }
+        // A `.tkd` compose deployment forwards to its married provisioner
+        // before reaching here; only a pre-`.tkd` legacy deployment can, and
+        // its driver is retired.
+        PlatformDeploymentConfig::Compose(_) => Err(super::legacy_compose_refusal().into()),
         PlatformDeploymentConfig::Ecs(config) => {
             if matches!(&action, InfraAction::Apply { .. }) {
                 validate_ecs_mirrors(config).await?;

@@ -1,6 +1,6 @@
 //! `tokeira-provisioner-cli` — the platform-agnostic `tkp` shell (Req 14.2).
 //!
-//! Every per-platform provisioner binary (`tkp-compose`, `tkp-local`, …) is this
+//! Every platform's provisioner binary (each constructed as `tkp`) is this
 //! library plus one [`ProvisionerPlatform`] implementation: the shell owns the
 //! lifecycle verbs, the binding-gate orchestration, the operation-lock wrapper,
 //! the deployment state envelope, `describe`, the Day-0 stamp, and the
@@ -70,7 +70,7 @@ pub type DesiredSnapshot = std::collections::BTreeMap<tokeira_iac::ResourceId, s
 /// free to ignore it for the property methods.
 #[allow(async_fn_in_trait)] // implementations are workspace-internal and monomorphized; no Send bound needed
 pub trait ProvisionerPlatform {
-    /// Human label for reports (e.g. `"compose-syn"`).
+    /// Human label for reports (e.g. `"compose"`).
     fn label(&self, deployment_dir: &Path) -> &'static str;
 
     /// The config **source** file's basename for this deployment (e.g.
@@ -145,7 +145,7 @@ pub trait ProvisionerPlatform {
     }
 
     /// Preview the workload Delta (read-only). A platform whose workload rides
-    /// the infra universe (compose-syn models its containers as infra
+    /// the infra universe (compose models its containers as infra
     /// resources) realizes this as the infra plan.
     async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<PlanOutcome>>;
 

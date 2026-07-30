@@ -25,7 +25,7 @@ at creation time:
 tkr deployment create --name <name> --platform <local|compose|ecs> --storage <in-memory|dsql>
 ```
 
-The definition-driven platforms (`compose-syn`, [`eks`](eks/README.md)) are
+The definition-driven platforms (`compose`, [`eks`](eks/README.md)) are
 authored as a `definition.tkd` and operated by the provisioner `tkp` instead —
 see [deployment definitions](iac/deployment-definitions.md).
 
@@ -35,7 +35,7 @@ see [deployment definitions](iac/deployment-definitions.md).
 |-------|---------|
 | `platforms/local` | Bare-process local execution — spawns `tokeirad` directly |
 | `platforms/compose` | Docker Compose stack with observability services (Mimir, Loki, Grafana, Alloy) |
-| `platforms/compose-syn` | The compose stack realized from an interpreted `definition.tkd` deployment definition — see [deployment definitions](iac/deployment-definitions.md) |
+| `platforms/compose` | The compose stack realized from an interpreted `definition.tkd` deployment definition — see [deployment definitions](iac/deployment-definitions.md) |
 | `platforms/ecs` | AWS ECS: networking, DSQL, cluster, observability, and service modules |
 | `platforms/eks` | The EKS platform, authored in the `syn` deployment DSL and driven by `tkp` — the Kubernetes sibling of `ecs` |
 

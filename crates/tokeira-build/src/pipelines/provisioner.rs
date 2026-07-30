@@ -45,9 +45,9 @@ pub struct ProvisionerBuildRequest {
     /// The repository the snapshot's objects live in (also supplies
     /// `rust-toolchain.toml` for the toolchain identity input).
     pub workspace_root: PathBuf,
-    /// The platform seed package (e.g. `tokeira-compose-syn`).
+    /// The platform seed package (e.g. `tokeira-compose-deployment`).
     pub seed_package: String,
-    /// The provisioner bin target the platform ships (e.g. `tkp-compose`).
+    /// The provisioner bin target the platform ships (`tkp`).
     pub bin_name: String,
     /// Cargo features enabling the bin target (e.g. `provisioner`).
     pub features: Vec<String>,

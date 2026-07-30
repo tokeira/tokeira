@@ -13,7 +13,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokeira_iac as iac;
 
-use crate::{compose::MODULE_OBSERVABILITY, config::ComposeConfig};
+/// The module that owns the observability config-files resource.
+const MODULE_OBSERVABILITY: &str = "observability";
 
 const CONFIG_RESOURCE_ID: &str = "compose/observability-config-files";
 const CONFIG_RESOURCE_TYPE: &str = "observability_config_files";
@@ -99,7 +100,11 @@ pub struct ObservabilityParams {
 }
 
 impl ObservabilityParams {
-    pub fn from_config(config: &ComposeConfig) -> Self {
+    /// The parameters implied by a deployment's `deployment.toml` config —
+    /// what the observability check renders the expected files from. Kept
+    /// beside the templates so the check and the platform's own rendering
+    /// can never disagree about what "expected" means.
+    pub fn from_config(config: &crate::config::ComposeConfig) -> Self {
         Self {
             metrics_target_host: "tokeirad".into(),
             metrics_target_port: config.tokeirad.metrics_port,
@@ -368,6 +373,17 @@ impl ObservabilityConfigFilesResource {
                     source,
                 })?;
             }
+            // Self-heal a Docker bind-source stub: creating a container whose
+            // bind source is missing makes the daemon manufacture an empty
+            // DIRECTORY at the file's path (the pre-dependency-edge ordering
+            // bug left these behind). `remove_dir` is non-recursive, so a
+            // non-empty directory — real data — still refuses loudly.
+            if path.is_dir() {
+                fs::remove_dir(&path).map_err(|source| ConfigGenError::WriteFailed {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+            }
             fs::write(&path, file.contents.as_bytes()).map_err(|source| {
                 ConfigGenError::WriteFailed {
                     path: path.display().to_string(),
@@ -420,11 +436,19 @@ impl ObservabilityConfigFilesResource {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     missing.push(path_key(&file.relative_path));
                 }
+                // An unreadable managed path — e.g. a Docker bind-source
+                // DIRECTORY stub squatting where a file belongs — is drift,
+                // not a refresh failure. Erroring here turns fail-closed into
+                // fail-STUCK: it blocks the very destroy/apply that would
+                // repair the corruption. Report it missing; the writer's
+                // reconcile evicts empty stubs and rewrites the file.
                 Err(error) => {
-                    return Err(iac::IacError::Other(anyhow::anyhow!(
-                        "failed to read observability config file at {}: {error}",
-                        path.display()
-                    )));
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "managed config path is unreadable — reporting as drifted/missing"
+                    );
+                    missing.push(path_key(&file.relative_path));
                 }
             }
         }
@@ -455,6 +479,10 @@ impl iac::Resource for ObservabilityConfigFilesResource {
         MODULE_OBSERVABILITY
     }
 
+    fn display_kind(&self) -> Option<&'static str> {
+        Some("configuration files")
+    }
+
     async fn create(
         &self,
         _ctx: &iac::ProvisionContext,
@@ -480,6 +508,17 @@ impl iac::Resource for ObservabilityConfigFilesResource {
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                // A Docker bind-source DIRECTORY stub where our file belongs:
+                // evict it (non-recursive — a non-empty directory is real
+                // data and still refuses) rather than wedging the destroy.
+                Err(_) if path.is_dir() => {
+                    fs::remove_dir(&path).map_err(|error| {
+                        iac::IacError::Other(anyhow::anyhow!(
+                            "failed to remove directory stub at {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                }
                 Err(error) => {
                     return Err(iac::IacError::Other(anyhow::anyhow!(
                         "failed to remove observability config file at {}: {error}",
@@ -591,6 +630,108 @@ impl iac::Resource for ObservabilityConfigFilesResource {
                 resource_type: self.resource_type(),
                 details,
             }
+        }
+    }
+
+    /// What a config-tree change does, read from this file's own lifecycle
+    /// paths (change-semantics task 4.2). Writes are in place (`write_all`
+    /// overwrites the managed set); the delete genuinely removes the managed
+    /// files — read from the delete implementation, as the spec demands —
+    /// and is still reversible because the tree is a pure function of the
+    /// definition: `create` re-renders it identically.
+    fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
+        // Cited by module identity, never repo layout; every name is a real
+        // identifier in this module.
+        const WRITE: iac::Citation = iac::Citation::code(concat!(
+            module_path!(),
+            "::ObservabilityConfigFilesResource::{create,update} — write_all renders \
+             the managed config set in place"
+        ));
+        const DELETE: iac::Citation = iac::Citation::code(concat!(
+            module_path!(),
+            "::ObservabilityConfigFilesResource::delete — fs::remove_file over \
+             managed_relative_paths(); refuses non-empty foreign directories"
+        ));
+        use iac::{
+            ChangeKind, Confidence, DataEffect, Disruption, LifecycleOperation, ReplacementPolicy,
+            Reversibility,
+        };
+        match ctx.kind {
+            ChangeKind::Create => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Created,
+                    citation: WRITE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: WRITE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: WRITE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: WRITE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: DELETE,
+                },
+                statement: None,
+            },
+            // Definition-driven and drift-driven updates share `write_all`:
+            // an in-place overwrite of the resource's own rendered
+            // artifacts, which are derived entirely from the definition —
+            // nothing operator-authored is touched, so the data is
+            // preserved in the only sense that matters.
+            ChangeKind::Update | ChangeKind::Replace => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::UpdatedInPlace,
+                    citation: WRITE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: WRITE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: WRITE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: WRITE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: WRITE,
+                },
+                statement: None,
+            },
+            ChangeKind::Delete => iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Deleted,
+                    citation: DELETE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: DELETE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: DELETE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::Destroyed,
+                    citation: DELETE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: WRITE,
+                },
+                statement: None,
+            },
+            ChangeKind::NoChange => iac::ChangeSemantics::default(),
         }
     }
 }
@@ -722,341 +863,100 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), iac::IacError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use proptest::prelude::*;
-    use serde_json::Value;
-    use tempfile::TempDir;
-    use tokeira_iac::Resource;
+mod semantics_tests {
+    use iac::{
+        ChangeKind, Confidence, DataEffect, LifecycleOperation, Resource as _, SemanticsContext,
+    };
 
     use super::*;
 
-    fn default_params() -> ObservabilityParams {
-        ObservabilityParams {
-            metrics_target_host: "tokeirad".into(),
-            metrics_target_port: 9090,
-            cluster: "tokeira".into(),
-            deployment: "tokeira".into(),
-            mimir_remote_write_url: "http://mimir:9009/api/v1/push".into(),
-            loki_push_url: "http://loki:3100/loki/api/v1/push".into(),
-            mimir_http_port: 9009,
-            loki_http_port: 3100,
-            loki_retention_hours: 168,
-        }
-    }
-
-    fn resource(temp: &TempDir) -> ObservabilityConfigFilesResource {
-        ObservabilityConfigFilesResource::new(temp.path().to_path_buf(), default_params())
-    }
-
-    proptest! {
-        #[test]
-        fn render_all_injects_parameters(
-            host in "[a-z][a-z0-9-]{0,12}",
-            metrics_port in 1u16..=65535,
-            mimir_port in 1u16..=65535,
-            loki_port in 1u16..=65535,
-            retention_hours in 1u32..=720,
-        ) {
-            let params = ObservabilityParams {
-                metrics_target_host: host.clone(),
-                metrics_target_port: metrics_port,
-                cluster: "tokeira".into(),
-                deployment: "tokeira".into(),
-                mimir_remote_write_url: format!("http://mimir:{mimir_port}/api/v1/push"),
-                loki_push_url: format!("http://loki:{loki_port}/loki/api/v1/push"),
-                mimir_http_port: mimir_port,
-                loki_http_port: loki_port,
-                loki_retention_hours: retention_hours,
-            };
-            let generator = ConfigGenerator::new(PathBuf::new());
-            let files = generator.render_all(&params)?;
-            let alloy = contents_for(&files, ALLOY_CONFIG);
-            let mimir = contents_for(&files, MIMIR_CONFIG);
-            let loki = contents_for(&files, LOKI_CONFIG);
-            let datasources = contents_for(&files, GRAFANA_DATASOURCES);
-            let metrics_target = format!("{host}:{metrics_port}");
-            let mimir_port_line = format!("http_listen_port: {mimir_port}");
-            let loki_port_line = format!("http_listen_port: {loki_port}");
-            let loki_retention_line = format!("retention_period: {retention_hours}h");
-
-            prop_assert!(alloy.contains(&metrics_target), "alloy target missing");
-            prop_assert!(alloy.contains(&params.mimir_remote_write_url), "mimir write URL missing");
-            prop_assert!(alloy.contains(&params.loki_push_url), "loki push URL missing");
-            prop_assert!(mimir.contains(&mimir_port_line), "mimir port missing");
-            prop_assert!(loki.contains(&loki_port_line), "loki port missing");
-            prop_assert!(loki.contains(&loki_retention_line), "loki retention missing");
-            prop_assert!(datasources.contains("http://mimir:9009/prometheus"), "mimir datasource URL missing");
-            prop_assert!(datasources.contains("http://loki:3100"), "loki datasource URL missing");
-        }
-
-        #[test]
-        fn render_all_rejects_invalid_parameters(case in 0u8..8) {
-            let mut params = default_params();
-            match case {
-                0 => params.metrics_target_host.clear(),
-                1 => params.metrics_target_port = 0,
-                2 => params.cluster.clear(),
-                3 => params.deployment.clear(),
-                4 => params.mimir_remote_write_url.clear(),
-                5 => params.loki_push_url.clear(),
-                6 => params.mimir_http_port = 0,
-                _ => params.loki_http_port = 0,
-            }
-            let generator = ConfigGenerator::new(PathBuf::new());
-            let rejected = matches!(
-                generator.render_all(&params),
-                Err(ConfigGenError::InvalidParameter { .. })
-            );
-            prop_assert!(rejected, "invalid parameters should be rejected");
-        }
-    }
-
-    #[test]
-    fn render_all_outputs_expected_paths() {
-        let generator = ConfigGenerator::new(PathBuf::new());
-        let files = generator.render_all(&default_params()).unwrap();
-        let actual: BTreeSet<String> = files
-            .iter()
-            .map(|file| path_key(&file.relative_path))
-            .collect();
-        let expected: BTreeSet<String> = managed_relative_paths()
-            .iter()
-            .map(|path| (*path).to_string())
-            .collect();
-        assert_eq!(actual, expected);
-    }
-
-    #[tokio::test]
-    async fn config_resource_create_writes_all_files() {
-        let temp = TempDir::new().unwrap();
-        let resource = resource(&temp);
-        let ctx = iac::ProvisionContext::default();
-        resource.create(&ctx).await.unwrap();
-
-        for relative_path in managed_relative_paths() {
-            assert!(temp.path().join(relative_path).is_file());
-        }
-    }
-
-    #[tokio::test]
-    async fn describe_returns_absent_when_all_files_are_missing() {
-        let temp = TempDir::new().unwrap();
-        let resource = resource(&temp);
-        let ctx = iac::ProvisionContext::default();
-        assert!(matches!(
-            resource.describe(&ctx).await.unwrap(),
-            iac::DescribeResult::Absent
-        ));
-    }
-
-    #[tokio::test]
-    async fn diff_tracks_matching_and_changed_files() {
-        let temp = TempDir::new().unwrap();
-        let resource = resource(&temp);
-        let ctx = iac::ProvisionContext::default();
-        let state = resource.create(&ctx).await.unwrap();
-        let no_change = resource.diff(&state, &ctx);
-        assert!(matches!(no_change, iac::InternalChange::NoChange { .. }));
-
-        fs::write(temp.path().join(ALLOY_CONFIG), "changed").unwrap();
-        let iac::DescribeResult::Present(live_state) = resource.describe(&ctx).await.unwrap()
-        else {
-            panic!("expected live config to be Present");
-        };
-        let change = resource.diff(&live_state, &ctx);
-        assert!(matches!(change, iac::InternalChange::Update { .. }));
-    }
-
-    #[tokio::test]
-    async fn delete_removes_only_managed_files_and_empty_dirs() {
-        let temp = TempDir::new().unwrap();
-        let resource = resource(&temp);
-        let ctx = iac::ProvisionContext::default();
-        let state = resource.create(&ctx).await.unwrap();
-        let unrelated = temp.path().join("config/unrelated.txt");
-        fs::write(&unrelated, "keep").unwrap();
-
-        resource.delete(&state, &ctx).await.unwrap();
-
-        for relative_path in managed_relative_paths() {
-            assert!(!temp.path().join(relative_path).exists());
-        }
-        assert!(unrelated.exists());
-    }
-
-    #[test]
-    fn storage_projection_dashboard_uses_supported_prometheus_queries() {
-        let dashboard: Value =
-            serde_json::from_str(include_str!("../dashboards/storage-projection-health.json"))
-                .unwrap();
-        for panel in dashboard["panels"].as_array().unwrap() {
-            for target in panel["targets"].as_array().into_iter().flatten() {
-                let expr = target["expr"].as_str().unwrap_or_default();
-                assert!(!expr.contains("histogram_quantile("));
-                assert!(!expr.contains("_bucket"));
-            }
-        }
-    }
-
-    #[test]
-    fn storage_projection_dashboard_uses_consistent_timeseries_style() {
-        let dashboard: Value =
-            serde_json::from_str(include_str!("../dashboards/storage-projection-health.json"))
-                .unwrap();
-        for panel in dashboard["panels"].as_array().unwrap() {
-            if panel["type"].as_str() == Some("row") {
-                continue;
-            }
-            assert_eq!(panel["datasource"]["uid"].as_str(), Some("mimir"));
-            if panel["type"].as_str() != Some("timeseries") {
-                continue;
-            }
-            assert!(!panel["description"].as_str().unwrap_or_default().is_empty());
-            let custom = &panel["fieldConfig"]["defaults"]["custom"];
-            assert_eq!(custom["lineInterpolation"].as_str(), Some("smooth"));
-            assert_eq!(custom["showPoints"].as_str(), Some("never"));
-            assert_eq!(custom["pointSize"].as_i64(), Some(0));
-            let legend = &panel["options"]["legend"];
-            assert_eq!(legend["displayMode"].as_str(), Some("table"));
-            assert_eq!(legend["placement"].as_str(), Some("bottom"));
-            assert_eq!(legend["calcs"], json!(["lastNotNull", "mean", "max"]));
-        }
-    }
-
-    #[test]
-    fn storage_projection_dashboard_uses_operator_style_contract() {
-        let dashboard: Value =
-            serde_json::from_str(include_str!("../dashboards/storage-projection-health.json"))
-                .unwrap();
-        for panel in dashboard["panels"].as_array().unwrap() {
-            let grid = &panel["gridPos"];
-            let x = grid["x"].as_i64().unwrap();
-            let w = grid["w"].as_i64().unwrap();
-            assert!(x >= 0);
-            assert!(w > 0);
-            assert!(x + w <= 24);
-            assert!(grid["h"].as_i64().unwrap() > 0);
-
-            if panel["type"].as_str() == Some("row") {
-                continue;
-            }
-            assert!(!panel["description"].as_str().unwrap_or_default().is_empty());
-
-            let title = panel["title"].as_str().unwrap_or_default();
-            let is_rate_panel = title.contains("Rate") || title.contains("/s");
-            if is_rate_panel {
-                let targets = panel["targets"].as_array().unwrap();
-                assert!(targets.iter().all(|target| {
-                    target["expr"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .contains("rate(")
-                }));
-                assert_eq!(
-                    panel["fieldConfig"]["defaults"]["unit"].as_str(),
-                    Some("ops")
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn alloy_log_labels_stay_low_cardinality() {
-        let generator = ConfigGenerator::new(PathBuf::new());
-        let files = generator.render_all(&default_params()).unwrap();
-        let alloy = contents_for(&files, ALLOY_CONFIG);
-
-        assert!(alloy.contains("target_label  = \"container\""));
-        assert!(alloy.contains("target_label  = \"service\""));
-        for forbidden in [
-            "workflow_id",
-            "run_id",
-            "request_id",
-            "trace_id",
-            "span_id",
-            "task_arn",
-        ] {
-            assert!(
-                !alloy.contains(&format!("target_label  = \"{forbidden}\"")),
-                "{forbidden} must remain a log field, not a Loki label"
-            );
-        }
-    }
-
-    #[test]
-    fn alloy_config_scrapes_process_and_infrastructure_targets() {
-        let generator = ConfigGenerator::new(PathBuf::new());
-        let files = generator.render_all(&default_params()).unwrap();
-        let alloy = contents_for(&files, ALLOY_CONFIG);
-
-        for service in ["tokeirad", "alloy", "mimir", "loki", "grafana"] {
-            assert!(
-                alloy.contains(&format!("prometheus.scrape \"{service}\"")),
-                "{service} scrape job missing"
-            );
-            assert!(
-                alloy.contains(&format!("service = \"{service}\"")),
-                "{service} scrape label missing"
-            );
-        }
-        assert!(alloy.contains("target_kind = \"process\""));
-        assert!(alloy.contains("target_kind = \"infrastructure\""));
-        assert!(alloy.contains("cluster = \"tokeira\""));
-        assert!(alloy.contains("deployment = \"tokeira\""));
-    }
-
-    #[test]
-    fn required_dashboards_are_provisioned_and_valid() {
-        let generator = ConfigGenerator::new(PathBuf::new());
-        let files = generator.render_all(&default_params()).unwrap();
-        let required = [
-            ("DSQL Connection Health", DSQL_CONNECTION_DASHBOARD),
-            ("OCC Contention", OCC_CONTENTION_DASHBOARD),
-            ("Placement Controller", PLACEMENT_CONTROLLER_DASHBOARD),
-            ("Autoscaler", AUTOSCALER_DASHBOARD),
-            ("Projection Workers", PROJECTION_WORKERS_DASHBOARD),
-            ("Infrastructure Health", INFRASTRUCTURE_HEALTH_DASHBOARD),
-        ];
-
-        for (title, path) in required {
-            let contents = contents_for(&files, path);
-            tokeira_observability::testing::DashboardValidator::validate_str(
-                Path::new(path),
-                contents,
-            )
-            .unwrap();
-            let dashboard: Value = serde_json::from_str(contents).unwrap();
-            assert_eq!(dashboard["title"].as_str(), Some(title));
-        }
-    }
-
-    #[test]
-    fn alert_rules_are_provisioned_and_valid() {
-        let generator = ConfigGenerator::new(PathBuf::new());
-        let files = generator.render_all(&default_params()).unwrap();
-        let alerts = contents_for(&files, ALERT_RULES);
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root");
-
-        tokeira_observability::testing::AlertRuleValidator::validate_str(
-            Path::new(ALERT_RULES),
-            alerts,
-            repo_root,
+    fn resource() -> ObservabilityConfigFilesResource {
+        ObservabilityConfigFilesResource::new(
+            PathBuf::from("/tmp/x"),
+            ObservabilityParams {
+                metrics_target_host: "h".into(),
+                metrics_target_port: 1,
+                cluster: "c".into(),
+                deployment: "d".into(),
+                mimir_remote_write_url: "http://m".into(),
+                loki_push_url: "http://l".into(),
+                mimir_http_port: 2,
+                loki_http_port: 3,
+                loki_retention_hours: 4,
+            },
         )
-        .unwrap();
-        assert!(alerts.contains("DsqlReservoirExhaustion"));
-        assert!(alerts.contains("ProjectionSinkErrorRate"));
     }
 
-    fn contents_for<'a>(files: &'a [RenderedConfigFile], path: &str) -> &'a str {
-        files
-            .iter()
-            .find(|file| file.relative_path == *path)
-            .map(|file| file.contents.as_str())
-            .unwrap()
+    // Golden declarations (change-semantics task 4.5): classification and
+    // confidence only. The headline pair: updates are genuinely in place
+    // (write_all), and the delete genuinely destroys the managed files —
+    // yet stays reversible because the tree re-renders identically from
+    // the definition.
+    #[test]
+    fn config_tree_declarations_match_the_write_and_delete_paths() {
+        let resource = resource();
+        let declared = |kind: ChangeKind, diffs: &[iac::FieldDiff]| {
+            resource.change_semantics(&SemanticsContext {
+                kind,
+                current: None,
+                field_diffs: diffs,
+            })
+        };
+
+        // Definition-driven and drift-driven updates share write_all.
+        let update = declared(
+            ChangeKind::Update,
+            &[iac::FieldDiff::observation("config/mimir.yaml changed")],
+        );
+        let drift = declared(
+            ChangeKind::Update,
+            &[iac::FieldDiff::observation(
+                "missing on disk: config/mimir.yaml",
+            )],
+        );
+        assert_eq!(update, drift);
+        assert!(matches!(
+            update.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::UpdatedInPlace,
+                ..
+            }
+        ));
+        assert!(matches!(
+            update.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::Preserved,
+                ..
+            }
+        ));
+
+        let delete = declared(ChangeKind::Delete, &[]);
+        assert!(matches!(
+            delete.data_effect,
+            Confidence::EngineFact {
+                value: DataEffect::Destroyed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            delete.reversibility,
+            Confidence::EngineFact {
+                value: iac::Reversibility::Reversible,
+                ..
+            }
+        ));
+
+        let create = declared(ChangeKind::Create, &[]);
+        assert!(matches!(
+            create.operation,
+            Confidence::EngineFact {
+                value: LifecycleOperation::Created,
+                ..
+            }
+        ));
+        assert_eq!(
+            declared(ChangeKind::NoChange, &[]),
+            iac::ChangeSemantics::default()
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Cheap end-to-end exercise of compose-syn — drives the REAL engine
+//! Cheap end-to-end exercise of the compose platform — drives the REAL engine
 //! (`InfraEngine`/`DeployEngine`, exactly what tkr/tkp would use) against the
 //! interpreted `.tkd`, and renders the observability stack to disk. No tkr, no
 //! tkp, no Docker, no AWS — just `cargo test`.
@@ -13,7 +13,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 use std::{fs, path::PathBuf};
 
-use tokeira_compose_syn::{
+use tokeira_compose_deployment::{
     DEFAULT_TKD,
     adapter::{TkdConfig, TkdDeployment},
     context::Cx,
@@ -32,7 +32,7 @@ fn cx(dir: PathBuf) -> Cx {
 }
 
 #[tokio::test]
-async fn exercise_compose_syn_end_to_end() {
+async fn exercise_compose_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
     let cfg = TkdConfig {
@@ -75,7 +75,7 @@ async fn exercise_compose_syn_end_to_end() {
     let explanation = tokeira_explain::explain_plan(
         tokeira_explain::DeploymentContext {
             deployment: "demo".to_string(),
-            platform: "compose-syn".to_string(),
+            platform: "compose".to_string(),
             operation: "infra plan".to_string(),
             current_revision: 0,
             proposed_revision: None,

@@ -99,5 +99,5 @@ forwards simple provider-chain environment variables.
 - [Production observability](../observability.md) — what the stack
   collects, provisions, and alerts on
 - [Compose + DSQL performance analysis](../../compose-dsql-performance.md)
-- [Deployment definitions](../iac/deployment-definitions.md) — the `compose-syn`
+- [Deployment definitions](../iac/deployment-definitions.md) — the compose platform's
   platform realizes the same stack from an interpreted `definition.tkd`

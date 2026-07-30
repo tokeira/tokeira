@@ -36,7 +36,7 @@ pub(crate) mod workstation;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use tokeira_compose_deployment::{ComposeConfig, ComposeDeployment};
+use tokeira_compose_deployment::ComposeConfig;
 use tokeira_ecs_deployment::{EcsConfig, EcsDeployment};
 use tokeira_local_deployment::{LocalConfig, LocalDeployment};
 use tokeira_orchestrator::Ops;
@@ -60,7 +60,7 @@ use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
 /// Compose ops need it to locate the generated `docker-compose.yml`.
 pub(crate) enum PlatformOps {
     Local(LocalDeployment, LocalConfig),
-    Compose(ComposeDeployment, Box<ComposeConfig>, PathBuf),
+    Compose(Box<ComposeConfig>, PathBuf),
     Ecs(EcsDeployment, Box<EcsConfig>),
 }
 
@@ -70,11 +70,9 @@ impl PlatformOps {
             PlatformDeploymentConfig::Local(config) => {
                 Ok(Self::Local(LocalDeployment, config.clone()))
             }
-            PlatformDeploymentConfig::Compose(config) => Ok(Self::Compose(
-                ComposeDeployment,
-                config.clone(),
-                ctx.path.clone(),
-            )),
+            PlatformDeploymentConfig::Compose(config) => {
+                Ok(Self::Compose(config.clone(), ctx.path.clone()))
+            }
             PlatformDeploymentConfig::Ecs(config) => {
                 Ok(Self::Ecs(EcsDeployment::new(), config.clone()))
             }
@@ -84,7 +82,7 @@ impl PlatformOps {
     pub(crate) fn desired_replicas(&self) -> Vec<tokeira_orchestrator::ServiceReplicas> {
         match self {
             Self::Local(d, c) => d.desired_replicas(c),
-            Self::Compose(d, c, _) => d.desired_replicas(c),
+            Self::Compose(c, _) => tokeira_compose_deployment::ops::desired_replicas(c),
             Self::Ecs(d, c) => d.desired_replicas(c),
         }
     }
@@ -96,7 +94,10 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_up(service, replicas, c).await,
-            Self::Compose(d, c, dir) => d.scale_up_with_dir(service, replicas, c, dir).await,
+            // Forwarded compose deployments scale through their married
+            // provisioner and never reach this arm; only a pre-`.tkd` legacy
+            // deployment can, and its driver is retired.
+            Self::Compose(..) => Err(legacy_compose_refusal()),
             Self::Ecs(d, c) => d.scale_up(service, replicas, c).await,
         }
     }
@@ -108,7 +109,7 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_down(service, replicas, c).await,
-            Self::Compose(d, c, dir) => d.scale_down_with_dir(service, replicas, c, dir).await,
+            Self::Compose(..) => Err(legacy_compose_refusal()),
             Self::Ecs(d, c) => d.scale_down(service, replicas, c).await,
         }
     }
@@ -116,7 +117,7 @@ impl PlatformOps {
     pub(crate) async fn logs(&self, service: &str) -> tokeira_orchestrator::Result<Vec<String>> {
         match self {
             Self::Local(d, c) => d.logs(service, c).await,
-            Self::Compose(d, c, dir) => d.logs_with_dir(service, c, dir).await,
+            Self::Compose(c, dir) => tokeira_compose_deployment::ops::logs(service, c, dir).await,
             Self::Ecs(d, c) => d.logs(service, c).await,
         }
     }
@@ -127,10 +128,23 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<Vec<tokeira_orchestrator::PortMapping>> {
         match self {
             Self::Local(d, c) => d.port_mappings(service, c).await,
-            Self::Compose(d, c, dir) => d.port_mappings_with_dir(service, c, dir).await,
+            Self::Compose(c, dir) => {
+                tokeira_compose_deployment::ops::port_mappings(service, c, dir).await
+            }
             Self::Ecs(d, c) => d.port_mappings(service, c).await,
         }
     }
+}
+
+/// The typed refusal for a pre-`.tkd` compose deployment (a `deployment.toml`
+/// compose entry with no `definition.tkd`): its in-process driver is retired,
+/// and the honest answer names the way forward rather than failing obscurely.
+pub(crate) fn legacy_compose_refusal() -> tokeira_orchestrator::OrchestratorError {
+    anyhow::anyhow!(
+        "this compose deployment predates `.tkd` definitions and its in-process driver \
+         has been retired; recreate it with `tkr deployment create --platform compose`"
+    )
+    .into()
 }
 
 /// Gate a destructive action behind an explicit `--yes` flag.

@@ -132,7 +132,7 @@ implementing `Kind` (`fn realize(&self, cx) -> Box<dyn iac::Resource>`), buildin
 the `tokeirad.toml` mount and the AWS credential edge (see [Security posture](#security-posture)).
 
 The canonical worked example is the shipped compose definition,
-[`platforms/compose-syn/definition.tkd`](../../../platforms/compose-syn/definition.tkd): `config()` plus a
+[`platforms/compose-syn/definition.tkd`](../../../platforms/compose/definition.tkd) *(dir renamed `platforms/compose`, 2026-07-30)*: `config()` plus a
 `deployment()` that declares `local_state`, a conditional `dsql` module (under
 `if let Storage::Dsql { .. }`), the `observability` module (config-files resource + mimir/loki/grafana/
 alloy services), the `runtime` module (`tokeirad`), and the DSQL writeback.

@@ -82,7 +82,7 @@ impl TkpBinary {
     /// Resolve the `tkp` to run, **preferring the deployment's own bound binary**
     /// (`<dir>/tkp`, placed at `tkr deployment create`) over anything else. A
     /// never-inceptioned deployment falls back to the per-platform source
-    /// binary (`tkp-compose` — all forwarded deployments are compose today): on
+    /// binary (`tkp` from the compose platform — all forwarded deployments are compose today): on
     /// PATH, beside the running `tkr`, then a `cargo run` dev build of the
     /// platform's bin target.
     fn resolve(deployment_dir: &Path) -> Self {
@@ -115,7 +115,7 @@ impl TkpBinary {
                     "run".to_string(),
                     "--quiet".to_string(),
                     "-p".to_string(),
-                    "tokeira-compose-syn".to_string(),
+                    "tokeira-compose-deployment".to_string(),
                     "--bin".to_string(),
                     crate::deployment_dir::PROVISIONER_SOURCE_BIN.to_string(),
                     "--".to_string(),

@@ -1,4 +1,4 @@
-//! Facade preserving the `compose_syn::interp` public path over the shared
+//! Facade preserving this crate's `interp` public path over the shared
 //! [`tokeira_tkd`] interpreter and the compose [`ComposeBridge`] (Requirement 14).
 //!
 //! The interpreter itself now lives in `tokeira-tkd`, generic over a platform

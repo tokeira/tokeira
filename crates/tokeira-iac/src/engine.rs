@@ -26,7 +26,7 @@
 //! crash-safety without coupling the engine to a specific store type.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     time::Instant,
@@ -107,9 +107,11 @@ impl Engine {
             refresh: RefreshCoverage {
                 status_by_id: refreshed.status_by_id,
                 examined: true,
+                live_departed: refreshed.live_departed,
             },
             semantics_by_id: delta.semantics_by_id,
             display_by_id: delta.display_by_id,
+            edges_by_id: declared_edges(known),
         })
     }
 
@@ -134,15 +136,18 @@ impl Engine {
             .collect();
         Ok(PlanOutcome {
             changes: filter_changes_by_modules(&delta.changes, &ctx.state, &active),
-            // Coverage and semantics are carried unfiltered: a resource
-            // filtered out of this plan's changes was still examined, and its
-            // declaration was still made.
+            // Coverage, semantics, and edges are carried unfiltered: a
+            // resource filtered out of this plan's changes was still
+            // examined, its declaration was still made, and its edges still
+            // point where they point.
             refresh: RefreshCoverage {
                 status_by_id: refreshed.status_by_id,
                 examined: true,
+                live_departed: refreshed.live_departed,
             },
             semantics_by_id: delta.semantics_by_id,
             display_by_id: delta.display_by_id,
+            edges_by_id: declared_edges(&known_refs),
         })
     }
 
@@ -235,9 +240,11 @@ impl Engine {
             refresh: RefreshCoverage {
                 status_by_id: refreshed.status_by_id,
                 examined: true,
+                live_departed: refreshed.live_departed,
             },
             semantics_by_id: delta.semantics_by_id,
             display_by_id: delta.display_by_id,
+            edges_by_id: declared_edges(&known_refs),
         })
     }
 
@@ -258,6 +265,7 @@ impl Engine {
             refresh: outcome.refresh,
             semantics_by_id: outcome.semantics_by_id,
             display_by_id: outcome.display_by_id,
+            edges_by_id: outcome.edges_by_id,
         })
     }
 
@@ -486,6 +494,20 @@ pub enum RefreshStatus {
 pub struct RefreshCoverage {
     pub status_by_id: BTreeMap<ResourceId, RefreshStatus>,
     pub examined: bool,
+    /// Resources whose confirmed live read departed from recorded state: a
+    /// `Present` describe whose properties differ from the recorded entry, or
+    /// a confirmed-`Absent` describe for a resource state still records.
+    ///
+    /// Computed inside the refresh pass because that is the only moment both
+    /// sides exist — refresh then overwrites the in-context recorded entry
+    /// with the live observation, after which the comparison is
+    /// unreconstructable (live-vs-live). Causality consumes this to separate
+    /// provider drift (live departed) from an engine advance (live matches
+    /// recorded, yet the plan still computed a change). Properties are the
+    /// comparison basis, not the whole `ResourceState`: `dependencies` and
+    /// `resource_type` are engine bookkeeping, not live observations.
+    #[serde(default)]
+    pub live_departed: BTreeSet<ResourceId>,
 }
 
 /// What a plan produced: the changes, what the engine could confirm about
@@ -505,12 +527,20 @@ pub struct PlanOutcome {
     /// Per-resource display nouns ([`Resource::display_kind`]), collected
     /// beside the semantics; absent where a kind declares none.
     pub display_by_id: BTreeMap<ResourceId, String>,
+    /// Dependency edges as declared by the known set
+    /// ([`Resource::dependencies`]), keyed by resource id. Carried unfiltered
+    /// by module selection, and collected over *known* rather than *desired*:
+    /// the dependants of a changed resource include unchanged resources whose
+    /// edges point at it, and filtering either way would sever exactly those
+    /// reverse edges.
+    pub edges_by_id: BTreeMap<ResourceId, Vec<ResourceId>>,
 }
 
 #[derive(Debug)]
 struct RefreshReport {
     state: crate::document::InfraState,
     status_by_id: BTreeMap<ResourceId, RefreshStatus>,
+    live_departed: BTreeSet<ResourceId>,
 }
 
 /// Refresh persisted state against live provider state for all known resources.
@@ -572,6 +602,12 @@ async fn refresh_state(
 
     let mut refreshed = ctx.state.clone();
     let mut status_by_id = BTreeMap::new();
+    // Snapshot the recorded entries before any live observation lands: the
+    // loop below progressively overwrites `ctx.state` with described values,
+    // and departure detection must compare live against what the last apply
+    // recorded, not against an earlier iteration's live read.
+    let recorded = ctx.state.clone();
+    let mut live_departed = BTreeSet::new();
 
     for resource_id in sorted {
         let resource = resource_map.get(&resource_id).ok_or_else(|| {
@@ -588,6 +624,11 @@ async fn refresh_state(
             ))
         })? {
             DescribeResult::Present(live_state) => {
+                if let Some(prior) = recorded.resources.get(&resource_id)
+                    && prior.properties != live_state.properties
+                {
+                    live_departed.insert(resource_id.clone());
+                }
                 refreshed
                     .resources
                     .insert(resource_id.clone(), live_state.clone());
@@ -602,6 +643,11 @@ async fn refresh_state(
                 );
             }
             DescribeResult::Absent => {
+                // A confirmed absence for a resource state still records is a
+                // departure by definition — the provider lost it out-of-band.
+                if recorded.resources.contains_key(&resource_id) {
+                    live_departed.insert(resource_id.clone());
+                }
                 refreshed.resources.remove(&resource_id);
                 ctx.state.resources.remove(&resource_id);
                 let status = if is_desired {
@@ -630,7 +676,16 @@ async fn refresh_state(
     Ok(RefreshReport {
         state: refreshed,
         status_by_id,
+        live_departed,
     })
+}
+
+/// Dependency edges as declared by the known set, keyed by resource id.
+fn declared_edges(known: &[&dyn Resource]) -> BTreeMap<ResourceId, Vec<ResourceId>> {
+    known
+        .iter()
+        .map(|r| (r.resource_id(), r.dependencies()))
+        .collect()
 }
 
 // ── Change computation ────────────────────────────────────────────────
@@ -2363,6 +2418,43 @@ mod tests {
             !ctx.state.resources.contains_key(&prune),
             "absent describe prunes managed state"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_records_live_departures_exactly() {
+        // The A7/A8 seam (explanation-causality): a resource is in
+        // `live_departed` iff a confirmed live read departed from recorded
+        // state — differing properties, or a confirmed absence while state
+        // still records it. Matching properties and unconfirmed describes
+        // never qualify.
+        let mut ctx = ProvisionContext::default();
+        for name in ["same", "moved", "gone", "unseen"] {
+            ctx.state
+                .resources
+                .insert(ResourceId(name.to_string()), stub_state(name, "module"));
+        }
+        let mut moved_live = stub_state("moved", "module");
+        moved_live.properties = serde_json::json!({ "endpoint": "moved" });
+        let mut moved = StubResource::live("moved", "module");
+        moved.describe_state = Some(moved_live);
+        let resources = boxed_resources(vec![
+            StubResource::live("same", "module"),
+            moved,
+            StubResource::missing("gone", "module"),
+            StubResource::live("unseen", "module").with_describe_unsupported(),
+        ]);
+        let resource_refs = refs(&resources);
+
+        let report = refresh_state(&resource_refs, &[], &mut ctx, None)
+            .await
+            .expect("refresh succeeds");
+
+        let departed: Vec<&str> = report
+            .live_departed
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect();
+        assert_eq!(departed, ["gone", "moved"]);
     }
 
     #[tokio::test]

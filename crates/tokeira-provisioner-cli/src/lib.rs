@@ -20,6 +20,7 @@ use tokeira_provisioner::DeploymentStateEnvelope;
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 mod apply;
+mod causality;
 mod cli;
 mod config_history;
 mod definition;
@@ -142,6 +143,19 @@ pub trait ProvisionerPlatform {
         Ok(Realization::NotApplicable {
             reason: "this platform has no interpreted definition to snapshot",
         })
+    }
+
+    /// The recorded infrastructure state as persisted by the last apply —
+    /// **S** in the causality algebra — loaded from the platform's own state
+    /// store, never from a planning context. Refresh overwrites in-context
+    /// resource properties with live observations before diffing, so state
+    /// obtained any other way is contaminated: drift detection over it would
+    /// silently compare live against live (causality Requirement 2.3). A
+    /// platform with no persisted engine state answers the empty state, which
+    /// is the honest S for it (nothing was ever recorded).
+    async fn recorded_state(&self, deployment_dir: &Path) -> Result<tokeira_iac::InfraState> {
+        let _ = deployment_dir;
+        Ok(tokeira_iac::InfraState::default())
     }
 
     /// Preview the workload Delta (read-only). A platform whose workload rides

@@ -141,14 +141,16 @@ Implementation notes fixed by this design:
 
 - **A4 (output tracing)** fires per differing leaf `f` of `D(R) − P(R)` only when all of:
   (i) a recorded dependency edge R → dep exists in G — the trace rides the dependency's
-  identity, never name or value coincidence; (ii) dep has a recorded output in S whose
-  value equals `f`'s working-side value **and** differs from `f`'s baseline-side value —
-  "changed" is established as a diff between states (P against S), not a one-ended match;
-  (iii) every differing field of R traces this way to exactly one dependency
-  (Requirements 3.2, 3.5). Otherwise fall through to A5. The residual risk — a
-  coincidental scalar equality surviving all three gates — is why the confidence is
-  `Inference` and the renderer marks it derived. *(Predicate tightened 2026-07-30,
-  operator-directed.)*
+  identity, never name or value coincidence; (ii) dep has a recorded output in S — a
+  scalar of its recorded **properties** document, the same values the writeback wiring
+  reads (`InfraState.outputs` has no producer; ground-truth correction 2026-07-31) —
+  whose value equals `f`'s working-side value **and** differs from `f`'s baseline-side
+  value: "changed" is established as a diff between states (P against S), not a
+  one-ended match; (iii) every differing leaf traces to exactly one (dependency, output)
+  pair, and all leaves agree on one dependency (Requirements 3.2, 3.5). Otherwise fall
+  through to A5. The residual risk — a coincidental scalar equality surviving all three
+  gates — is why the confidence is `Inference` and the renderer marks it derived.
+  *(Predicate tightened 2026-07-30, operator-directed.)*
 - **A6 (cascade)** fires when R's dependency (direct, over G) has a `Replace` change in
   this plan, and `D(R) = P(R)`. The per-change cause names the nearest replaced
   dependency; the group's root is the ultimate root per C4 (Requirement 4.6's bounded
@@ -177,9 +179,13 @@ pub enum CausalRoot {
 Grouping partitions non-`NoChange` changes (Requirement 4.5): definition edits group
 under the revision comparison; output-traced changes group under their named dependency;
 cascades under the **ultimate** root — the walk follows `ReplacementCascade` causes until
-the first non-cascade cause and roots there, so A(Replace) → B → C is one group under A
-rather than a chain of linked groups; each drifted resource is its own root (drift has no
-shared origin unless traced); engine-advance changes group under the provisioner advance.
+the first non-cascade cause and takes *that cause's* root, so an edit-driven
+A(Replace) → B → C is one group under the revision comparison: the edit, the
+replacement, and its cascade read as one story rather than a chain of linked groups
+*(sentence tightened 2026-07-31: "one group under A" understated the walk — the group
+root is the terminal cause's root, exactly as Requirement 4.3 states)*; each drifted
+resource is its own root (drift has no shared origin unless traced); engine-advance
+changes group under the provisioner advance.
 The walk is bounded (Requirement 4.6): it terminates at `ProvisionerAdvance` and never
 attributes across the baseline comparison — the per-change assessment still names the
 nearest replaced dependency, so precision lives on the change while the story lives on

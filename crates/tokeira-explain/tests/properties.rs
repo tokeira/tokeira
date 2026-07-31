@@ -189,6 +189,7 @@ fn arb_outcome() -> impl Strategy<Value = PlanOutcome> {
                 refresh: RefreshCoverage {
                     status_by_id,
                     examined,
+                    ..Default::default()
                 },
                 semantics_by_id,
                 ..Default::default()
@@ -248,6 +249,25 @@ proptest! {
                     explanation.evidence.resolve(subject).is_some(),
                     "dangling impact subject: {:?}",
                     subject
+                );
+            }
+        }
+        // Causal groups (Feature 3) are closure-bearing: the group id, every
+        // member, and a resource root must all resolve.
+        for group in &explanation.causal_groups {
+            prop_assert!(explanation.evidence.resolve(&group.evidence_id).is_some());
+            for member in &group.members {
+                prop_assert!(
+                    explanation.evidence.resolve(member).is_some(),
+                    "dangling group member: {:?}",
+                    member
+                );
+            }
+            if let tokeira_explain::CausalRoot::Resource(root) = &group.root {
+                prop_assert!(
+                    explanation.evidence.resolve(root).is_some(),
+                    "dangling group root: {:?}",
+                    root
                 );
             }
         }
@@ -594,7 +614,8 @@ proptest! {
         keys_within(&value, &[
             "schema_version", "deployment", "platform", "operation",
             "current_revision", "proposed_revision", "definition_ref",
-            "changes", "impacts", "destructive", "uncertainties", "evidence",
+            "changes", "impacts", "destructive", "uncertainties",
+            "causal_groups", "evidence",
         ])?;
         for change in value["changes"].as_array().into_iter().flatten() {
             keys_within(change, &[

@@ -141,10 +141,7 @@ impl orchestrator::Deployment for TkdDeployment {
         _config: &Self::Config,
         deployment_dir: &Path,
     ) -> Box<dyn DeploymentStore<iac::InfraState>> {
-        Box::new(CasStore::new(
-            Box::new(LocalBackend::new(deployment_dir.join("state/infra"))),
-            "infra".to_string(),
-        ))
+        infra_store(deployment_dir)
     }
 
     fn create_deploy_store(
@@ -191,6 +188,18 @@ impl orchestrator::Deployment for TkdDeployment {
             })
             .collect()
     }
+}
+
+/// The one owner of the infra-store convention (`state/infra`, key `"infra"`).
+/// The engine provisions through it (`Deployment::create_infra_store` above),
+/// and causality's recorded-state read (`ProvisionerPlatform::recorded_state`)
+/// loads the same store — one construction, so the two consumers cannot drift
+/// onto different paths.
+pub(crate) fn infra_store(deployment_dir: &Path) -> Box<dyn DeploymentStore<iac::InfraState>> {
+    Box::new(CasStore::new(
+        Box::new(LocalBackend::new(deployment_dir.join("state/infra"))),
+        "infra".to_string(),
+    ))
 }
 
 /// Day-2 ops surface. Replica intent is read from the `.tkd`; the live verbs

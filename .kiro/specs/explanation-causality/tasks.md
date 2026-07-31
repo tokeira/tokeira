@@ -88,99 +88,181 @@ specs' amendments are commutative.
 
 ## Phase 3 — Gathering the sources
 
-- [ ] 3.1 `CausalityInputs` and `BaselineSnapshot`
+- [x] 3.1 `CausalityInputs` and `BaselineSnapshot`
   - Baseline resolved from `envelope.config_revision` via `config_history`'s path;
     `NeverApplied`, `Missing { revision }`, `DoesNotInterpret { verdict }` typed, not
     stringly
+  - DONE (2026-07-31) — `causality::GatheredCausality` + `gather_causality` in
+    `tokeira-provisioner-cli`; `config_history::snapshot_path` widened to `pub(crate)`.
+    Recorded deviations: the shell reuses the classifier's `BaselineView` (one typed
+    enum, not a second agreeing shell mirror); `DoesNotInterpret` carries its
+    `revision` so the plan-level uncertainty can name it; a fifth arm
+    `NotInterpreted` types the platform-without-definitions case (the defaulted
+    snapshot seam), classifying per A10 without a `BaselineUnavailable`
   - _Requirements: 2.5_
 
-- [ ] 3.2 Read S before refresh
+- [x] 3.2 Read S before refresh
   - Recorded state loaded from the store as persisted, before the verb's refresh runs;
     WHY comment naming the contamination trap (refresh overwrites in-context properties
     with live observations — a contaminated S turns drift detection into live-vs-live)
+  - DONE (2026-07-31) — S loads through the new
+    `ProvisionerPlatform::recorded_state` seam (defaulted to the empty state; compose
+    implements it over `adapter::infra_store`, the one owner of the `state/infra`
+    convention — the engine and causality cannot drift onto different paths); gathered
+    before `infra_plan`/`deploy_plan` in both plan verbs, with the trap named at the
+    module and both call sites. Plan verbs verified store-write-free on every path
   - _Requirements: 2.3_
 
-- [ ] 3.3 **PBT: Property 5 — S-isolation**
+- [x] 3.3 **PBT: Property 5 — S-isolation**
   - Classify before and after a simulated refresh overwrite of the planning context;
     assessments must be identical
+  - DONE (2026-07-31), in two halves (recorded deviation): the shell half is
+    structural — `gather_causality` takes no planning context at all, so a
+    contaminated S is unrepresentable in the pipeline; the explain half
+    (`property_5_a_contaminated_s_would_reclassify_drift_as_clean`) demonstrates the
+    hazard the isolation prevents — the same scenario classifies `ProviderDrift` with
+    store-S and `EngineAdvance` with the live-overwritten view
   - _Property 5; Requirements: 2.3_
 
-- [ ] 3.4 **Checkpoint** — inputs gather on a live-shaped fixture deployment; baseline
+- [x] 3.4 **Checkpoint** — inputs gather on a live-shaped fixture deployment; baseline
   variants (present, never-applied, missing, broken) each produce their typed value.
+  DONE (2026-07-31) — baseline variants exercised across the property battery's
+  generated worlds (all five arms); crate suites green.
 
 ## Phase 4 — The classifier
 
-- [ ] 4.1 Implement the algebra (A1–A10 with A3b)
+- [x] 4.1 Implement the algebra (A1–A10 with A3b)
   - `classify_causes` in `tokeira-explain`: pure, order-significant per the requirements
     table; existence rows (A1–A3b) first — the never-recorded create classifies A3b,
     never `Unknown`; A6 before A7; A9 guarding A7/A8; A10 branches from
     `BaselineSnapshot`
+  - DONE (2026-07-31) — `causality::assess` + the public `apply_causality` enrichment
+    (causes, dependants, uncertainties, groups joined onto the built explanation; the
+    entry point is the join, so `classify_causes`' map never exists separately —
+    recorded naming deviation). A7/A8's `L ≠ S` operationalized by an inert engine
+    widening: `RefreshCoverage.live_departed`, computed inside `refresh_state` at the
+    only moment recorded and live both exist (properties-only comparison; confirmed
+    absence of a recorded resource is departure by definition; unit-pinned engine-side).
+    A8 takes the change's existence as the `D ≠ S` evidence — the engine's own diff,
+    not a second agreeing comparison. Off-table inputs (a change in no source;
+    non-create on a never-applied deployment) answer `Unknown` + uncertainty
   - _Requirements: 2.1, 2.2, 2.4, 2.6_
 
-- [ ] 4.2 Output tracing (A4)
+- [x] 4.2 Output tracing (A4)
   - Differing leaves of `D(R) − P(R)` traced per the state-diff predicate: a recorded
     dependency edge in G, and the output's S-value matching the working side while
     departing from the baseline side; fires only on the exactly-one-dependency,
     every-field-traced condition; inference confidence
+  - DONE (2026-07-31) — `trace_outputs` with the three gates; the output vocabulary is
+    the dependency's recorded **properties** scalars (ground-truth correction, evidence
+    table 2026-07-31: `InfraState.outputs` has no producer; properties are what the
+    writeback wiring reads). Leaf diffing recurses objects and treats arrays as one
+    leaf (can never match a scalar output — the conservative, A5-ward direction);
+    exactly-one is counted over (dependency, output) pairs, so two matching outputs
+    within one dependency are ambiguity too
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
 
-- [ ] 4.3 Uncertainties for undecidable causes
+- [x] 4.3 Uncertainties for undecidable causes
   - A9/A10 emit `CauseUndecidable` / `BaselineUnavailable` with consequence and
     resolution; one per affected change, one `BaselineUnavailable` per plan
+  - DONE (2026-07-31) — one `CauseUndecidable` per undecided change (each names its
+    resource, consequence, and — where one exists — the resolving action), reusing
+    Feature 1's `push_uncertainty` so evidence-id minting has one owner; one
+    plan-level `BaselineUnavailable` (subject: the deployment) for `Missing` **and**
+    `DoesNotInterpret` baselines, both carrying the revision
   - _Requirements: 2.5, 2.7_
 
-- [ ] 4.4 **PBT: Property 2 — the algebra is followed exactly**
+- [x] 4.4 **PBT: Property 2 — the algebra is followed exactly**
   - Independent table-literal oracle of the full table (A1–A10 with A3b) kept test-side;
     generated tuples cover every row and every precedence collision
+  - DONE (2026-07-31) — `tests/causality.rs::oracle`: a sequential row walk in the
+    requirements' own shape (A10's baseline branch, then A1→A3b→A4→A5→A6→A9→A7→A8),
+    with its own independent A4 predicate; compared shape-and-confidence against the
+    classifier over generated (D, P, S, L, G, changes) worlds spanning every row,
+    every baseline arm, and unexamined/unconfirmed L
   - _Property 2; Requirements: 2.2_
 
-- [ ] 4.5 **PBT: Property 1 — assessment is total and unique**
+- [x] 4.5 **PBT: Property 1 — assessment is total and unique**
+  - DONE (2026-07-31) — non-`NoChange`: a known cause XOR exactly one
+    `CauseUndecidable` naming it; `NoChange`: `Unknown` cause and no uncertainty
   - _Property 1; Requirements: 2.1_
 
-- [ ] 4.6 **PBT: Property 3 — deterministic and pure**
+- [x] 4.6 **PBT: Property 3 — deterministic and pure**
+  - DONE (2026-07-31) — two applications from one input serialize byte-identically;
+    purity is structural (a pure fn over refs in a crate with no I/O capability)
   - _Property 3; Requirements: 2.6_
 
-- [ ] 4.7 **PBT: Property 4 — no drift claim without a confirmed live read**
+- [x] 4.7 **PBT: Property 4 — no drift claim without a confirmed live read**
+  - DONE (2026-07-31) — unconfirmed/unexamined L never classifies `ProviderDrift` or
+    `EngineAdvance` (Property 1 supplies the paired uncertainty guarantee)
   - _Property 4; Requirements: 2.4, 2.7_
 
-- [ ] 4.8 **PBT: Property 6 — output tracing unambiguous or absent, on identity + state diff**
+- [x] 4.8 **PBT: Property 6 — output tracing unambiguous or absent, on identity + state diff**
   - Constructed ambiguities (two candidates; partial trace; value match without the
     edge; value match without the state departure) must fall to A5
+  - DONE (2026-07-31) — the clean trace fires A4; the no-edge, no-departure, and
+    two-output constructions each fall to A5
   - _Property 6; Requirements: 3.2, 3.3, 3.5_
 
-- [ ] 4.9 **PBT: Property 10 — unknown causes ↔ uncertainties, one-to-one**
+- [x] 4.9 **PBT: Property 10 — unknown causes ↔ uncertainties, one-to-one**
+  - DONE (2026-07-31) — |Unknown causes| == |`CauseUndecidable`|, and
+    `BaselineUnavailable` present exactly when the baseline is `Missing` or
+    `DoesNotInterpret`
   - _Property 10; Requirements: 2.7_
 
-- [ ] 4.10 Example tests: the named scenarios
+- [x] 4.10 Example tests: the named scenarios
   - The demon test (D = P, L ≠ S ×5 → five `ProviderDrift`); the label migration
     (D = P, L = S, D ≠ S → `EngineAdvance`); grafana's removal (A3); the interrupted
     apply (R ∈ D, D = P, R ∉ S → A3b, never `Unknown`); the never-applied deployment
     (A10 creates rule)
+  - DONE (2026-07-31) — all five as fixtures in `tests/causality.rs`, plus the
+    transitive cascade (task 5.1's one-story assertion rides it)
   - _Requirements: 2.2_
 
-- [ ] 4.11 **Checkpoint** — classifier green against oracle and scenarios.
+- [x] 4.11 **Checkpoint** — classifier green against oracle and scenarios.
+  DONE (2026-07-31) — 15/15 in `tests/causality.rs`; F1's suites green with the
+  closure walk and artifact key allow-list extended for `causal_groups`.
 
 ## Phase 5 — Grouping and dependants
 
-- [ ] 5.1 `CausalGroup` and `CausalRoot`; grouping per design
+- [x] 5.1 `CausalGroup` and `CausalRoot`; grouping per design
   - Partition; BFS-from-root member order with the deterministic tiebreak; roots per
     Requirement 4.3 — cascades walk to the ultimate root, bounded by the engine-version
     and baseline boundaries (Requirement 4.6); per-change causes keep naming the nearest
     dependency
+  - DONE (2026-07-31) — `CausalGroup`/`CausalRoot` in the model
+    (`causal_groups` serde-defaulted at the document level — the slot pattern);
+    `EvidenceId::group` + `EvidenceKind::CausalGroup`; the walk takes the terminal
+    cause's root (design C4, tightened 2026-07-31), so the edit-driven transitive
+    cascade is genuinely one group under the revision comparison; output-trace roots
+    reference the dependency's change id (`NoChange` changes carry ids, so closure
+    holds without a new identity kind); unknown-cause changes are their own roots;
+    member order is in-group BFS layering, ties and unconnected members by id
   - _Requirements: 4.1, 4.2, 4.3, 4.5, 4.6_
 
-- [ ] 5.2 Dependant sets
+- [x] 5.2 Dependant sets
   - Reverse edges over the union of desired and recorded resources; joined onto each
     explained change; graph only, no heuristics
+  - DONE (2026-07-31) — desired-side edges arrive by an inert engine widening
+    (`PlanOutcome.edges_by_id`, collected over the *known* set so unchanged
+    dependants keep their reverse edges; carried unfiltered like coverage and
+    semantics); the shell unions them with `ResourceState.dependencies` in
+    `causality_view`; reverse edges joined per non-`NoChange` change
   - _Requirements: 5.1, 5.3_
 
-- [ ] 5.3 **PBT: Property 8 — groups partition; roots are the bounded ultimate roots**
+- [x] 5.3 **PBT: Property 8 — groups partition; roots are the bounded ultimate roots**
+  - DONE (2026-07-31) — exact partition of the non-`NoChange` changes, no empty
+    group, no group rooted at a cascade member, every group id resolving
   - _Property 8; Requirements: 4.1, 4.2, 4.3, 4.5, 4.6_
 
-- [ ] 5.4 **PBT: Property 9 — dependants are the reverse graph, exactly**
+- [x] 5.4 **PBT: Property 9 — dependants are the reverse graph, exactly**
+  - DONE (2026-07-31) — set equality against the view's reverse edges, both
+    directions, over generated worlds
   - _Property 9; Requirements: 5.1, 5.3_
 
-- [ ] 5.5 **Checkpoint** — `cargo test -p tokeira-explain` green.
+- [x] 5.5 **Checkpoint** — `cargo test -p tokeira-explain` green.
+  DONE (2026-07-31) — 29 tests across the crate's suites, plus the engine's
+  live-departure unit pin and the shell's 79 green.
 
 ## Phase 6 — Rendering, lexicon, integration
 

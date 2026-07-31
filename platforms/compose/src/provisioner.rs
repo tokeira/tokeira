@@ -78,6 +78,17 @@ impl ProvisionerPlatform for ComposeProvisioner {
         load_tkd_config_from(deployment_dir, &definition).map(|_| Realization::Realized(()))
     }
 
+    async fn recorded_state(&self, deployment_dir: &Path) -> Result<tokeira_iac::InfraState> {
+        // The same store the engine provisions through (adapter::infra_store —
+        // the one owner of the convention). A missing store loads the default
+        // empty state, which is the honest S for a never-applied deployment.
+        let (state, _version) = crate::adapter::infra_store(deployment_dir)
+            .load()
+            .await
+            .context("loading recorded infrastructure state for causality")?;
+        Ok(state)
+    }
+
     async fn desired_snapshot(
         &self,
         deployment_dir: &Path,

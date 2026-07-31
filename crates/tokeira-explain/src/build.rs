@@ -211,6 +211,7 @@ fn base(context: DeploymentContext) -> DeploymentExplanation {
         impacts: Vec::new(),
         destructive: Vec::new(),
         uncertainties: Vec::new(),
+        causal_groups: Vec::new(),
         evidence,
     }
 }
@@ -421,7 +422,7 @@ impl SemanticField {
     }
 }
 
-fn push_uncertainty(
+pub(crate) fn push_uncertainty(
     explanation: &mut DeploymentExplanation,
     subject: EvidenceId,
     reason: UncertaintyReason,

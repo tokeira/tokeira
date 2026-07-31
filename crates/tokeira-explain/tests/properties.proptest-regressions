@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1d87710b095b6fa715bf9b6e7605fb53238a3442500c23b7cb35c3c8fdeafc0a # shrinks to outcome = PlanOutcome { changes: [], refresh: RefreshCoverage { status_by_id: {}, examined: false, live_departed: {} }, semantics_by_id: {}, display_by_id: {}, edges_by_id: {} }

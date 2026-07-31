@@ -33,7 +33,12 @@ pub(crate) fn config_file(deployment_dir: &Path, config_basename: &str) -> PathB
 
 /// Where a given revision's snapshot lives — under the *current platform's*
 /// config basename, so it is found only when reverting within the same platform.
-fn snapshot_path(deployment_dir: &Path, config_basename: &str, revision: u64) -> PathBuf {
+/// `pub(crate)`: causality resolves the baseline revision's definition here.
+pub(crate) fn snapshot_path(
+    deployment_dir: &Path,
+    config_basename: &str,
+    revision: u64,
+) -> PathBuf {
     revisions_root(deployment_dir)
         .join(revision.to_string())
         .join(config_basename)

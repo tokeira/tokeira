@@ -248,15 +248,20 @@ pub struct OperationalImpact {
 pub fn derive_impacts(changes: &[ExplainedChange]) -> Vec<OperationalImpact>;
 ```
 
-Derivation rules, applied in `ImpactClass` order so output ordering is severity-first:
+Derivation rules, applied in `ImpactClass` order so output ordering is severity-first.
+Two trigger families: declared semantics (confidence above `Unknown`), and the engine's
+own change classification — the floor that renders with no declaration at all:
 
-| Trigger (declared, confidence above `Unknown`) | Impact |
+| Trigger | Impact |
 |---|---|
-| `DataEffect::Destroyed` | `DataDestroyed`, naming the resources and the irreversibility |
-| `Disruption::UnavailableDuringChange` | `Unavailability`, naming the resources and the window |
-| `ReplacementPolicy` other than `NotRequired` | `Replacement`, naming the resources |
-| `Disruption::BriefInterruption` | `BriefInterruption` |
-| `Disruption::Rolling` | `RollingReplacement` |
+| declared `DataEffect::Destroyed` | `DataDestroyed`, naming the resources and the irreversibility |
+| declared `Disruption::UnavailableDuringChange` | `Unavailability`, naming the resources and the window |
+| **engine fact:** `ChangeKind::Replace` (the engine executes delete-then-create) | `Unavailability` while the change applies — lifted when the declared replacement policy establishes `CreateBeforeDestroy` above `Unknown` — and `Replacement` |
+| **engine fact:** `ChangeKind::Delete` | `Unavailability` as no-longer-available |
+| **engine fact:** the desired graph drops a recorded dependency on a deleted resource | `DependencyLoss` — the dependant would continue without it |
+| declared `ReplacementPolicy` other than `NotRequired` | `Replacement`, naming the resources |
+| declared `Disruption::BriefInterruption` | `BriefInterruption` |
+| declared `Disruption::Rolling` | `RollingReplacement` |
 
 Subjects within an impact are ordered by change `EvidenceId`. `Inference` confidence
 contributes to impacts but is marked as derived when rendered; `Unknown` contributes
@@ -332,10 +337,10 @@ the declaration exactly, field for field and confidence for confidence.
 set equals the engine's classification of the same changes.
 **Validates: Requirements 4.1, 4.2**
 
-**Property 5 — Impact derivation is a pure function of declarations.**
-*For any* two explanations whose changes carry identical declarations, the derived impacts
-are equal, including order.
-**Validates: Requirements 5.6, 5.7**
+**Property 5 — Impact derivation is a pure function of declarations and kinds.**
+*For any* two explanations whose changes carry identical declarations and change kinds,
+the derived impacts are equal, including order.
+**Validates: Requirements 5.8, 5.9**
 
 **Property 6 — Every impact is grounded.**
 *For any* derived impact, each subject resolves to a change whose declared semantics
@@ -347,7 +352,7 @@ corresponding impact.
 *For any* explanation, no narrative output asserts a field whose confidence is `Unknown`,
 and no `Unknown` field contributes to any impact. *(2026-07-29: narrative additionally
 renders no undeclared-semantics uncertainty — gaps are machine-channel only.)*
-**Validates: Requirements 5.5, 6.5, 9.4**
+**Validates: Requirements 5.7, 6.5, 9.4**
 
 **Property 8 — Uncertainty activation is exact.**
 *For any* explanation, a `SemanticsUndeclared` uncertainty exists for (resource, field) if

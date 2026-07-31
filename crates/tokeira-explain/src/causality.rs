@@ -266,12 +266,15 @@ pub(crate) fn assess(
             Some(RefreshStatus::DesiredLive) | Some(RefreshStatus::DesiredMissing)
         );
     if !confirmed {
+        // Machine-channel wording (agents, CI); narrative renders the
+        // operator form — the record-baseline provenance line. No resolution
+        // is offered: the engine does not know why the read was unsupported,
+        // and generic advice is worse than none.
         return undecided(
-            "the change's origin could not be established: live state was not confirmed, \
-             so a departure cannot be told from the provisioner realizing the definition \
-             differently"
+            "live state could not be read; the difference is measured against what the \
+             last apply recorded, and its source could not be established"
                 .to_string(),
-            Some("confirm live state for this resource and plan again".to_string()),
+            None,
         ); // A9
     }
 

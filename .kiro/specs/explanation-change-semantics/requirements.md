@@ -220,19 +220,31 @@ graph.
 
 #### Acceptance Criteria
 
-1. THE explanation model SHALL derive operational impacts from the declared semantics of
-   its changes.
+1. THE explanation model SHALL derive operational impacts from two sources: the
+   declared semantics of its changes, and the engine's own change classification.
 2. WHEN one or more changes declare a disruption other than none THE explanation SHALL
    emit one impact per distinct disruption class, naming the affected resources.
 3. WHEN one or more changes declare that data is destroyed THE explanation SHALL emit an
    impact naming those resources and the irreversibility of the loss.
 4. WHEN one or more changes declare a required replacement THE explanation SHALL emit an
    impact naming the replaced resources.
-5. WHERE every change declares unknown semantics THE explanation SHALL emit no impacts and
-   SHALL record the absence as uncertainty rather than as an absence of consequence.
-6. THE derivation SHALL be a pure function of the declared semantics: two plans with
-   identical declarations SHALL produce identical impacts.
-7. THE impacts SHALL be ordered deterministically, most consequential first.
+5. WHEN a change's kind is `Replace` THE explanation SHALL emit, as engine facts, the
+   replacement impact and unavailability while the change applies — the engine executes
+   a replace as delete-then-create — UNLESS the change's declared replacement policy
+   establishes create-before-destroy above unknown confidence, which lifts the
+   unavailability window; WHEN a change's kind is `Delete` THE explanation SHALL emit
+   the no-longer-available impact as an engine fact. Declarations refine the engine
+   floor; they are never required for it to render.
+6. WHEN a resource's desired state drops its recorded dependency on a resource being
+   deleted THE explanation SHALL emit the dependency-loss impact — the resource would
+   continue without the deleted dependency — as an engine fact from the graph delta.
+7. WHERE every change declares unknown semantics AND no change carries an engine-fact
+   impact THE explanation SHALL emit no impacts and SHALL record the absence as
+   uncertainty rather than as an absence of consequence.
+8. THE derivation SHALL be a pure function of the declared semantics, the change
+   kinds, and the dependency graphs: identical inputs SHALL produce identical impacts.
+9. THE impacts SHALL be ordered deterministically, most consequential first; within a
+   resource's merged line, permanent consequences precede transient ones.
 
 ### Requirement 6: Undeclared semantics become uncertainty
 
@@ -303,8 +315,10 @@ so that the report respects my attention.
 [output-templates.md](../operator-explanation/output-templates.md).)*
 
 1. WHEN rendering at summary depth THE renderer SHALL state the operational impacts as
-   an `## Impacts` section — one templated line per subject, severity-first, speaking
-   descriptive names only — and SHALL NOT enumerate per-change semantics.
+   an impact section — one line per resource carrying every impact on it, consequences
+   merged severity-first in the would-mood, resources ordered by their most severe
+   impact then by id, the heading pluralized by count, descriptive names only — and
+   SHALL NOT enumerate per-change semantics.
 2. WHEN rendering at detail depth THE renderer SHALL state each change's declared
    behaviour as templated would-mood prose beneath the change's line, in the
    declaration's confidence voice.

@@ -334,6 +334,23 @@ voices this spec owns.
   --no-deps --locked`.
   - DONE (2026-07-29): all five green. The feature is complete — Phases 1–7 landed.
 
+## Addenda
+
+- [ ] A.1 Engine-fact impacts (Requirement 5.5)
+  - `derive_impacts` gains the engine-classification trigger family: every `Replace`
+    emits unavailability-while-applying (lifted by a declared `CreateBeforeDestroy`
+    above `Unknown`) and the replacement impact; every `Delete` emits
+    no-longer-available — as engine facts, with no declaration required
+  - Property 5 re-anchored (pure over declarations **and** kinds); Property 6's
+    grounding extended to the engine-fact triggers; the output-templates reference
+    transcripts are the acceptance fixtures
+  - _Requirements: 5.1, 5.5, 5.7_
+
+- [ ] A.2 Activate `ProviderAssignedAtApply` (umbrella 1.3.2)
+  - Kinds declare their provider-assigned fields through the declaration vocabulary;
+    creates carry one uncertainty per such field until apply supplies the value
+  - _Requirements: umbrella 1.3.2_
+
 ## Task Dependency Graph
 
 ```text

@@ -267,15 +267,18 @@ specs' amendments are commutative.
 ## Phase 6 — Rendering, lexicon, integration
 
 - [x] 6.1 Causes on the lines; assessments, chains, dependants at detail
-  - Cause clauses join the change lines at summary (revision-attributed for edits);
-    detail adds the `why:` line in its confidence voice (derived classifications owned
-    as derived), the unknown cause's uncertainty in place, dependants split between
-    changing-with-it and continuing-unchanged (empty lines omitted), and the `chain:`
-    line once on a multi-member group's first member, root first
-  - DONE (2026-07-31) — `cause_phrase` + `change_detail` in `render.rs`; the
-    classifier's uncertainty copy reworded to the lexicon (no banned terms in prose);
-    default-cause plans render byte-identically to before, so F1/F2's pinned
-    transcripts stand untouched
+  - The clause is the concrete change per the umbrella's `output-templates.md` —
+    the operator's own diff for edits, the fields that changed outside the definition
+    for drift, never a cause category, never a revision number (the header anchors
+    the revision once); detail adds the derived `why:` voice, the unknown cause's
+    uncertainty in place, dependants split between changing-with-it and
+    continuing-unchanged (empty lines omitted), and the `chain:` line once on a
+    multi-member group's first member, root first
+  - DONE (2026-07-31, operator-reviewed twice) — `cause_phrase`/`diff_clause`/
+    `drift_clause` + `revision_anchor` + `change_detail` in `render.rs`; the
+    classifier's uncertainty copy reworded to the lexicon; the umbrella gained D10
+    and `output-templates.md`, whose reference transcripts the renderer is asserted
+    against byte-for-byte (`the_output_templates_doc_is_executable`)
   - _Requirements: 4.4, 5.2, 5.4, 6.1, 6.2, 6.3, 6.4_
 
 - [x] 6.2 Lexicon additions

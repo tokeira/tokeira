@@ -352,10 +352,11 @@ fn oracle_trace(world: &World, view: &CausalityView, i: usize) -> Option<String>
         let Some(state) = view.recorded.get(&dep_id) else {
             continue;
         };
-        if let Some(value) = state.properties.get("endpoint") {
-            if *value == after && *value != before {
-                candidates.push(dep_id.0.clone());
-            }
+        if let Some(value) = state.properties.get("endpoint")
+            && *value == after
+            && *value != before
+        {
+            candidates.push(dep_id.0.clone());
         }
     }
     if candidates.len() == 1 {

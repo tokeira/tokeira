@@ -82,17 +82,20 @@ prose may not.
 
 ## Canonical transcripts
 
-The lexicon applied — these are the reference renderings new output imitates.
+The lexicon applied — these are the reference renderings new output imitates. The
+templates themselves are owned by the umbrella spec's
+[output-templates.md](../../.kiro/specs/operator-explanation/output-templates.md),
+whose reference transcripts are asserted against the renderer.
 
 ```markdown
 # Infra Plan
-**Plan for compose** with *live state* confirmed
+**Plan for compose** at revision 4, with *live state* confirmed
 
 ## Update
-- the *tokeirad* service would be updated - the definition changed since revision 4 - `tokeirad::compose/tokeirad`
+- the *tokeirad* service would be updated - `image`: `tokeirad:v3` → `tokeirad:v4` - `tokeirad::compose/tokeirad`
 
 ## Delete
-- the *Aurora DSQL cluster* would be deleted - the definition changed since revision 4 - `dsql::dsql/monitored`
+- the *Aurora DSQL cluster* would be deleted - `dsql::dsql/monitored`
 
 ## Impacts
 - data held by the *Aurora DSQL cluster* would be destroyed, irreversibly

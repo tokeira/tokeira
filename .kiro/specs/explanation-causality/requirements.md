@@ -107,17 +107,20 @@ names what would decide it. Causes ride the change lines in the report's Markdow
 chains read as one story:
 
 ```markdown
-## Update
+# Infra Plan
+**Plan for compose** at revision 4, with *live state* confirmed
 
-- The *tokeirad* service (`compose/tokeirad`) would be updated — the definition
-  changed since revision 4.
-- The *mimir* service (`compose/mimir`) would be updated — live state departed
-  from what revision 4 applied.
+## Update
+- the *grafana* service would be updated - `image`: `12.4.3` → `12.5.0` - `observability::compose/grafana`
+- the *mimir* service would be updated - `environment` changed outside the definition - `observability::compose/mimir`
 ```
 
-At detail depth each change adds its assessment in the confidence voice, its dependants
-("the *alloy* and *grafana* services continue unchanged"), and — for an unknown cause —
-the uncertainty in place; a multi-member chain presents once, root first.
+The clause is the concrete change — the operator's own diff, or the fields that changed
+outside the definition — never a cause category, and never a revision number (the
+header anchors the revision once). At detail depth each change adds its dependants,
+derived causes owned as derived, and — for an unknown cause — the uncertainty in place;
+a multi-member chain presents once, root first. The templates are owned by
+[output-templates.md](../operator-explanation/output-templates.md).
 
 ## Glossary
 
@@ -288,13 +291,14 @@ so that "why" reads as naturally as "what".
 #### Acceptance Criteria
 
 1. WHEN rendering at summary depth THE renderer SHALL state each non-`NoChange`
-   change's established cause as a clause of its change line, in lexicon vocabulary,
-   revision-attributed where the cause is a definition edit ("the definition changed
-   since revision N"); the document form — sections, templates, display names, the
-   header assurance line — is owned by the evidence-model spec's Requirement 6.
-2. WHEN rendering at detail depth THE renderer SHALL state each change's cause in its
-   confidence voice — an engine fact plainly, a derived classification owned as derived
-   — and the change's dependants per Requirement 5.
+   change's established cause as a clause of its change line per the clause table in
+   [output-templates.md](../operator-explanation/output-templates.md): the concrete
+   change, never a cause category, and never a revision number — the header anchors
+   the revision once.
+2. WHEN rendering at detail depth THE renderer SHALL render a cause voice line only
+   where it adds information beyond the line clause — a derived classification owned
+   as derived with its citation; an unknown cause per criterion 3 — and the change's
+   dependants per Requirement 5. An engine-fact cause speaks through its line clause.
 3. WHERE a change's cause is unknown THE renderer SHALL render no cause clause at
    summary depth and SHALL render the cause's uncertainty in place with the change at
    detail depth: the consequence and, where one exists, the resolving action.

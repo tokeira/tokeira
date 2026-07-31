@@ -48,12 +48,14 @@ impl Report for ExplanationReport {
         let explanation = &self.explanation;
         // `# Infra Plan` — the operation, title-cased.
         out.push_str(&format!("# {}\n", title_case(&explanation.operation)));
-        // The header assurance line carries the live-state coverage
-        // (evidence-model Req 4.5/4.6 as amended): silence is never the
-        // signal — the header always says what the plan's claims rest on.
+        // The header assurance line anchors the deployment's revision once —
+        // no line below ever needs a revision number — and carries the
+        // live-state coverage (evidence-model Req 4.5/4.6): silence is never
+        // the signal; the header always says what the plan's claims rest on.
         out.push_str(&format!(
-            "**Plan for {}** {}\n",
+            "**Plan for {}** {}, {}\n",
             explanation.platform,
+            revision_anchor(explanation),
             coverage_clause(explanation)
         ));
         // Verdict narration is attention-only: a verdict that lets the apply
@@ -80,6 +82,15 @@ fn title_case(operation: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The header's revision anchor: the one place the document states which
+/// revision the plan compares against (`output-templates.md` §header).
+fn revision_anchor(explanation: &DeploymentExplanation) -> String {
+    match explanation.current_revision {
+        0 => "before its first apply".to_string(),
+        n => format!("at revision {n}"),
+    }
 }
 
 /// The header's coverage clause: what the plan's claims rest on. Gaps in
@@ -175,43 +186,82 @@ fn change_for<'a>(
         .find(|c| c.resource_id == resource_id)
 }
 
-/// The terse cause phrase for a change line (causality Req 6.1) — lexicon
-/// vocabulary, revision-attributed for definition edits, no confidence
-/// scaffolding (the voice speaks at detail). `None` for an unknown cause:
-/// no clause renders at summary, and detail carries the uncertainty in
-/// place (Req 6.3).
+/// The clause on a change line (causality Req 6.1; `output-templates.md`
+/// §cause-clauses): **the concrete change, never a cause category**. A
+/// definition edit puts the diff itself on the line (the changed definition
+/// is implicit — it is the operator's own edit); drift names the fields
+/// that changed outside the definition; derived causes name their concrete
+/// trigger. Creates and deletes from the operator's own edit carry no
+/// clause — the verb already states the change. `None` also for an unknown
+/// cause: detail carries its uncertainty in place (Req 6.3). No clause ever
+/// references a revision number — the header anchors the revision once.
 fn cause_phrase(explanation: &DeploymentExplanation, change: &ExplainedChange) -> Option<String> {
     use tokeira_explain::Cause;
-    let phrase = match change.cause.value()? {
-        Cause::DefinitionEdit { .. } => {
-            if explanation.current_revision == 0 {
-                "the first apply of this definition".to_string()
-            } else {
-                format!(
-                    "the definition changed since revision {}",
-                    explanation.current_revision
-                )
-            }
+    match change.cause.value()? {
+        Cause::DefinitionEdit { .. } => match change.kind {
+            ChangeKind::Update | ChangeKind::Replace => diff_clause(change),
+            _ => None,
+        },
+        Cause::ProviderDrift => match change.kind {
+            ChangeKind::Create => Some("missing from the platform".to_string()),
+            ChangeKind::Update | ChangeKind::Replace => Some(drift_clause(change)),
+            _ => None,
+        },
+        Cause::EngineAdvance => {
+            Some("this provisioner realizes the definition differently".to_string())
         }
-        Cause::ProviderDrift => format!(
-            "live state departed from what revision {} applied",
-            explanation.current_revision
-        ),
-        Cause::EngineAdvance => "this provisioner realizes the definition differently".to_string(),
-        Cause::ReplacementCascade { root } => format!(
+        Cause::ReplacementCascade { root } => Some(format!(
             "forced by the {} replacement",
             change_for(explanation, root)
                 .map(|c| noun_phrase(explanation, c))
                 .unwrap_or_else(|| code_span(root))
-        ),
-        Cause::DependencyOutputChanged { dependency } => format!(
+        )),
+        Cause::DependencyOutputChanged { dependency } => Some(format!(
             "its {} dependency's output changed",
             change_for(explanation, dependency)
                 .map(|c| noun_phrase(explanation, c))
                 .unwrap_or_else(|| code_span(dependency))
+        )),
+    }
+}
+
+/// An edit's concrete change for its line: the first field diff with its
+/// values, "and N more fields" when several. A diff observed without
+/// captured values names the field alone; a change with no field evidence
+/// carries no clause.
+fn diff_clause(change: &ExplainedChange) -> Option<String> {
+    let first = change.field_diffs.first()?;
+    let head = match (&first.before, &first.after) {
+        (Some(before), Some(after)) => format!(
+            "{}: {} → {}",
+            code_span(&first.field),
+            code_span(&truncate(before)),
+            code_span(&truncate(after)),
         ),
+        _ => code_span(&first.field),
     };
-    Some(phrase)
+    Some(more_fields(head, change.field_diffs.len() - 1))
+}
+
+/// Drift's concrete change: the field names that changed outside the
+/// definition (values are live observations; they speak at detail as the
+/// field diffs).
+fn drift_clause(change: &ExplainedChange) -> String {
+    match change.field_diffs.first() {
+        Some(first) => format!(
+            "{} changed outside the definition",
+            more_fields(code_span(&first.field), change.field_diffs.len() - 1)
+        ),
+        None => "changed outside the definition".to_string(),
+    }
+}
+
+fn more_fields(head: String, extra: usize) -> String {
+    match extra {
+        0 => head,
+        1 => format!("{head} and 1 more field"),
+        n => format!("{head} and {n} more fields"),
+    }
 }
 
 /// The engine-kind verb in would-mood.
@@ -396,10 +446,15 @@ fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, 
         ));
     }
 
-    // The cause, in its confidence voice — or its uncertainty in place.
-    if let Some(phrase) = cause_phrase(explanation, change) {
+    // The cause's voice line renders only where it adds information beyond
+    // the line clause: a derived cause owns itself with its citation
+    // (Req 6.2), and an unknown cause speaks through its uncertainty in
+    // place (Req 6.3). Engine-fact causes already state their concrete
+    // change on the line — repeating it here would be ceremony.
+    let derived = matches!(change.cause, tokeira_iac::Confidence::Inference { .. });
+    if derived && let Some(phrase) = cause_phrase(explanation, change) {
         out.push_str(&format!("  - why: {}\n", voiced(&phrase, &change.cause)));
-    } else if change.kind != ChangeKind::NoChange {
+    } else if change.cause.value().is_none() && change.kind != ChangeKind::NoChange {
         let undecidable = explanation.uncertainties.iter().find(|u| {
             u.subject == change.evidence_id
                 && matches!(
@@ -464,9 +519,8 @@ fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, 
             CausalRoot::RevisionComparison { baseline: 0 } => {
                 "the first apply of this definition".to_string()
             }
-            CausalRoot::RevisionComparison { baseline } => {
-                format!("the definition change since revision {baseline}")
-            }
+            // The header anchors the revision; the chain names the story.
+            CausalRoot::RevisionComparison { .. } => "the definition change".to_string(),
             CausalRoot::ProvisionerAdvance => "the provisioner advance".to_string(),
             CausalRoot::Resource(id) => explanation
                 .changes
@@ -767,7 +821,7 @@ mod tests {
         let r = report_for(&outcome, BindingVerdict::DevIterate, true);
         let text = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(text.contains("No changes - everything matches the definition."));
-        assert!(text.contains("**Plan for test** with *live state* confirmed"));
+        assert!(text.contains("**Plan for test** at revision 1, with *live state* confirmed"));
     }
 
     // Requirement 4.6: summary reveals uncertainty's presence by count;
@@ -872,7 +926,7 @@ mod tests {
         let summary = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(summary.contains("# Infra Plan\n"), "title: {summary}");
         assert!(
-            summary.contains("**Plan for test** with *live state* confirmed"),
+            summary.contains("**Plan for test** at revision 1, with *live state* confirmed"),
             "header assurance: {summary}"
         );
         assert!(
@@ -986,11 +1040,12 @@ mod tests {
         "ultimate root",
     ];
 
-    // Causality Req 6.1–6.4/6.7: clauses on the lines, voices and the
-    // uncertainty in place at detail, dependants stated, the chain told
-    // once, and `--json` carrying assessments, groups, and dependants.
-    #[test]
-    fn causality_renders_clauses_voices_dependants_and_the_chain() {
+    /// The reference causality fixture behind the executable transcripts in
+    /// `.kiro/specs/operator-explanation/output-templates.md`: an edited
+    /// Replace (m/alpha), a cascading Replace (m/beta), a drifted Update
+    /// (m/gamma), an undecidable Update (m/delta), and an unchanged
+    /// dependant (m/epsilon).
+    fn causality_reference_report() -> ExplanationReport {
         use std::collections::{BTreeMap, BTreeSet};
         use tokeira_explain::{BaselineView, CausalityView, apply_causality};
 
@@ -1007,11 +1062,19 @@ mod tests {
             tokeira_iac::RefreshStatus::Unknown,
         );
         live_departed.insert(ResourceId("m/gamma".into()));
+        let mut alpha = change(ChangeKind::Replace, "m/alpha");
+        alpha.details = vec![tokeira_iac::FieldDiff {
+            field: "image".into(),
+            before: Some("grafana/grafana-oss:12.4.3".into()),
+            after: Some("grafana/grafana-oss:12.5.0".into()),
+        }];
+        let mut gamma = change(ChangeKind::Update, "m/gamma");
+        gamma.details = vec![tokeira_iac::FieldDiff::observation("environment")];
         let outcome = PlanOutcome {
             changes: vec![
-                change(ChangeKind::Replace, "m/alpha"),
+                alpha,
                 change(ChangeKind::Replace, "m/beta"),
-                change(ChangeKind::Update, "m/gamma"),
+                gamma,
                 change(ChangeKind::Update, "m/delta"),
                 change(ChangeKind::NoChange, "m/epsilon"),
             ],
@@ -1077,11 +1140,19 @@ mod tests {
             refresh: outcome.refresh.clone(),
         };
         apply_causality(&mut r.explanation, &view);
+        r
+    }
 
+    // Causality Req 6.1–6.4/6.7: clauses on the lines, voices and the
+    // uncertainty in place at detail, dependants stated, the chain told
+    // once, and `--json` carrying assessments, groups, and dependants.
+    #[test]
+    fn causality_renders_clauses_voices_dependants_and_the_chain() {
+        let r = causality_reference_report();
         let summary = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(
             summary.contains(
-                "- `m::m/alpha` would be replaced - the definition changed since revision 1\n"
+                "- `m::m/alpha` would be replaced - `image`: `grafana/grafana-oss:12.4.3` → `grafana/grafana-oss:12.5.0`\n"
             ),
             "edit clause: {summary}"
         );
@@ -1093,7 +1164,7 @@ mod tests {
         );
         assert!(
             summary.contains(
-                "- `m::m/gamma` would be updated - live state departed from what revision 1 applied\n"
+                "- `m::m/gamma` would be updated - `environment` changed outside the definition\n"
             ),
             "drift clause: {summary}"
         );
@@ -1104,13 +1175,13 @@ mod tests {
 
         let detail = render(&r, Mode::resolve(false, true)).unwrap();
         assert!(
-            detail.contains(
-                "  - why: the definition changed since revision 1 - `tokeira_explain::causality`"
-            ),
-            "engine-fact voice with citation: {detail}"
+            !detail.contains("  - why: `image`"),
+            "an engine-fact cause speaks through its line clause, not a why line: {detail}"
         );
         assert!(
-            detail.contains("Tokeira derives this - per `tokeira_explain::causality`"),
+            detail.contains(
+                "  - why: forced by the `m::m/alpha` replacement; Tokeira derives this - per `tokeira_explain::causality`"
+            ),
             "cascade owned as derived: {detail}"
         );
         assert!(
@@ -1126,9 +1197,7 @@ mod tests {
             "unchanged dependant stated: {detail}"
         );
         assert!(
-            detail.contains(
-                "  - chain: the definition change since revision 1: `m::m/alpha`, then `m::m/beta`"
-            ),
+            detail.contains("  - chain: the definition change: `m::m/alpha`, then `m::m/beta`"),
             "the chain told once, root first: {detail}"
         );
 
@@ -1149,6 +1218,42 @@ mod tests {
                 .any(|c| c["cause"].get("engine-fact").is_some()),
             "assessments serialized: {json}"
         );
+    }
+
+    // The output-templates doc is executable: its reference transcripts ARE
+    // the renderer's output for the reference fixture, byte-for-byte — the
+    // managed-template guarantee (umbrella D10). A template change is an
+    // amendment to the doc first; this test is what makes that mechanical.
+    #[test]
+    fn the_output_templates_doc_is_executable() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.kiro/specs/operator-explanation/output-templates.md"
+        );
+        let doc = std::fs::read_to_string(path).expect("output-templates.md exists");
+        let r = causality_reference_report();
+        for (marker, detail) in [
+            ("<!-- reference: infra-plan-summary -->", false),
+            ("<!-- reference: infra-plan-detail -->", true),
+        ] {
+            let rendered = render(&r, Mode::resolve(false, detail)).unwrap();
+            let block = fenced_block_after(&doc, marker).unwrap_or_else(|| {
+                panic!("{marker} block missing from output-templates.md.\nRendered:\n{rendered}")
+            });
+            assert_eq!(
+                block.trim_end(),
+                rendered.trim_end(),
+                "output-templates.md and the renderer have drifted ({marker})"
+            );
+        }
+    }
+
+    fn fenced_block_after(doc: &str, marker: &str) -> Option<String> {
+        let after = &doc[doc.find(marker)? + marker.len()..];
+        let start = after.find("```markdown\n")? + "```markdown\n".len();
+        let rest = &after[start..];
+        let end = rest.find("\n```")?;
+        Some(rest[..end].to_string())
     }
 
     #[test]

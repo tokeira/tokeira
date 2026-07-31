@@ -299,9 +299,8 @@ so that the report respects my attention.
 
 #### Acceptance Criteria
 
-*(Amended 2026-07-29 to the Markdown rendering target; the document form itself —
-sections, templates, display names, the header assurance line — is owned by the
-evidence-model spec's amended Requirement 6.)*
+*(The document form and line templates are owned by
+[output-templates.md](../operator-explanation/output-templates.md).)*
 
 1. WHEN rendering at summary depth THE renderer SHALL state the operational impacts as
    an `## Impacts` section — one templated line per subject, severity-first, speaking

@@ -212,9 +212,10 @@ so that I can tell a confident plan from an uninformed one.
    would otherwise state THE explanation model SHALL record an uncertainty for that field.
 4. THE uncertainty record SHALL carry a subject that resolves in the evidence index.
 5. IF the plan contains no uncertainties THEN THE renderer SHALL state full confirmation
-   in the report's header assurance line: `**Plan for {platform}** with *live state*
-   confirmed`. *(Amended 2026-07-29, operator-directed: the assurance joins the header,
-   styled with the document, replacing the trailing fact line.)*
+   in the report's header assurance line: `**Plan for {platform}** at revision {N},
+   with *live state* confirmed` — the header also anchors the deployment's revision,
+   the one place the document states a revision number
+   ([output-templates.md](../operator-explanation/output-templates.md) §header).
 6. WHERE live-state uncertainties exist THE header SHALL state the coverage (`with *live
    state* unconfirmed for N resources` / `without *live state* examined`) and the
    affected changes SHALL carry the statement in place at detail depth; undeclared-
@@ -253,11 +254,12 @@ the counted-summary text form. Sections carry the actions; lines carry no glyphs
 counts, and no type annotation; ids appear once.)*
 
 1. WHEN rendering at summary depth THE renderer SHALL emit a Markdown document: the
-   `# {verb}` title, the header assurance line (`**Plan for {platform}** with *live
-   state* …`), one `## {Action}` section per present action listing each change as
-   templated would-mood prose ("the *{name}* {kind} would be {verb}") with its engine id
-   stated once, and the `## Impacts` section — and SHALL NOT enumerate per-change
-   semantics or render counts.
+   `# {verb}` title, the header assurance line (`**Plan for {platform}** at revision
+   {N}, with *live state* …`), one `## {Action}` section per present action listing
+   each change as templated would-mood prose ("the *{name}* {kind} would be {verb}")
+   with its engine id stated once, and the `## Impacts` section — and SHALL NOT
+   enumerate per-change semantics or render counts. The templates are owned by
+   [output-templates.md](../operator-explanation/output-templates.md).
 2. WHEN rendering at detail depth THE renderer SHALL additionally state per-change field
    evidence (as code spans), the declared behaviour in its confidence voice with
    citations, in-place live-state statements where unconfirmed, and the `## Unchanged`

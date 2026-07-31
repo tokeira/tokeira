@@ -264,6 +264,14 @@ artifact) for agents and CI, and tier coverage makes it a build failure for firs
 kinds. Authors research their contributions fully; the product never surrenders a meek
 don't-know.
 
+### D10. Output templates are managed in one executable document
+
+Templated report output is owned by [output-templates.md](output-templates.md), under
+this umbrella. A rendering change is an amendment to that document first; child specs
+reference its templates rather than restating them, and its reference transcripts are
+asserted byte-for-byte against the renderer, so the document and the product cannot
+drift.
+
 ## Requirements
 
 ## Feature 1: Evidence Model and Explanation IR

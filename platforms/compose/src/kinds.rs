@@ -428,22 +428,20 @@ impl Service {
             }
         }
 
-        // WART — DSQL AWS runtime edge (compose.rs L65-83), AFTER server_config.
+        // The DSQL AWS runtime edge, AFTER server_config. The container
+        // resolves credentials through the AWS SDK's default provider chain
+        // from the mounted profile directory — the manifest carries only the
+        // chain's non-secret selectors (region, profile). Key material never
+        // enters desired state: the manifest flows into recorded state, field
+        // evidence, and explanation artifacts, all of which must stay free of
+        // secret values (evidence-model Requirement 7.4).
         if let Some(region) = &self.aws {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
             volumes.push(format!("{home}/.aws:/home/nonroot/.aws:ro"));
             environment.insert("HOME".into(), "/home/nonroot".into());
             environment.insert("AWS_REGION".into(), region.clone());
-            for key in [
-                "AWS_PROFILE",
-                "AWS_ACCESS_KEY_ID",
-                "AWS_SECRET_ACCESS_KEY",
-                "AWS_SESSION_TOKEN",
-                "AWS_ROLE_ARN",
-            ] {
-                if let Ok(value) = std::env::var(key) {
-                    environment.insert(key.to_string(), value);
-                }
+            if let Ok(profile) = std::env::var("AWS_PROFILE") {
+                environment.insert("AWS_PROFILE".into(), profile);
             }
         }
 

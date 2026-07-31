@@ -143,14 +143,13 @@ Implementation notes fixed by this design:
   (i) a recorded dependency edge R → dep exists in G — the trace rides the dependency's
   identity, never name or value coincidence; (ii) dep has a recorded output in S — a
   scalar of its recorded **properties** document, the same values the writeback wiring
-  reads (`InfraState.outputs` has no producer; ground-truth correction 2026-07-31) —
+  reads (`InfraState.outputs` has no producer) —
   whose value equals `f`'s working-side value **and** differs from `f`'s baseline-side
-  value: "changed" is established as a diff between states (P against S), not a
+  value — "changed" is established as a diff between states (P against S), not a
   one-ended match; (iii) every differing leaf traces to exactly one (dependency, output)
   pair, and all leaves agree on one dependency (Requirements 3.2, 3.5). Otherwise fall
   through to A5. The residual risk — a coincidental scalar equality surviving all three
   gates — is why the confidence is `Inference` and the renderer marks it derived.
-  *(Predicate tightened 2026-07-30, operator-directed.)*
 - **A6 (cascade)** fires when R's dependency (direct, over G) has a `Replace` change in
   this plan, and `D(R) = P(R)`. The per-change cause names the nearest replaced
   dependency; the group's root is the ultimate root per C4 (Requirement 4.6's bounded
@@ -181,11 +180,9 @@ under the revision comparison; output-traced changes group under their named dep
 cascades under the **ultimate** root — the walk follows `ReplacementCascade` causes until
 the first non-cascade cause and takes *that cause's* root, so an edit-driven
 A(Replace) → B → C is one group under the revision comparison: the edit, the
-replacement, and its cascade read as one story rather than a chain of linked groups
-*(sentence tightened 2026-07-31: "one group under A" understated the walk — the group
-root is the terminal cause's root, exactly as Requirement 4.3 states)*; each drifted
-resource is its own root (drift has no shared origin unless traced); engine-advance
-changes group under the provisioner advance.
+replacement, and its cascade read as one story rather than a chain of linked groups;
+each drifted resource is its own root (drift has no shared origin unless traced);
+engine-advance changes group under the provisioner advance.
 The walk is bounded (Requirement 4.6): it terminates at `ProvisionerAdvance` and never
 attributes across the baseline comparison — the per-change assessment still names the
 nearest replaced dependency, so precision lives on the change while the story lives on
@@ -198,20 +195,26 @@ Dependants are the reverse edges of G over the union of desired and recorded res
 
 ### C5. Rendering
 
-Summary renders groups, not changes-with-causes:
+The document form is the evidence-model spec's (its Requirement 6): `##` action
+sections, would-mood templated lines, display names, the header assurance. Causality
+contributes the cause clause on each change line at summary depth:
 
-```text
-cause: the definition changed between revision 4 and the working definition — 1 change
-  ~ compose/tokeirad
-cause: provider drift — live state departed from what revision 4 applied — 1 change
-  ~ compose/mimir
+```markdown
+## Update
+
+- The *tokeirad* service (`compose/tokeirad`) would be updated — the definition
+  changed since revision 4.
+- The *mimir* service (`compose/mimir`) would be updated — live state departed
+  from what revision 4 applied.
 ```
 
-Detail adds per-change assessments (`cause: dependency output changed — derived from
-dsql/cluster's endpoint`), dependant lines (`dependants: compose/alloy, compose/grafana —
-unchanged`), and the full chain per group. Unknown causes render through their
-uncertainty, never as a cause line. Revision-level phrasing is mandatory until Feature 4
-supplies spans (Requirement 6.3).
+Detail adds, per change: the assessment in its confidence voice (an engine fact
+plainly; a derived classification owned as derived, with its citation), the dependants
+line (unaffected dependants stated as continuing unchanged; empty sections omitted),
+and — for an unknown cause — the `CauseUndecidable` uncertainty in place: its
+consequence and, where one exists, the resolving action. A multi-member chain presents
+once at detail, root first, members along the dependency path. Revision-level phrasing
+is mandatory until Feature 4 supplies spans (Requirement 6.5).
 
 ## Data Models
 

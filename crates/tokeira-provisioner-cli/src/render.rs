@@ -48,12 +48,14 @@ impl Report for ExplanationReport {
         let explanation = &self.explanation;
         // `# Infra Plan` — the operation, title-cased.
         out.push_str(&format!("# {}\n", title_case(&explanation.operation)));
-        // The header assurance line carries the live-state coverage
-        // (evidence-model Req 4.5/4.6 as amended): silence is never the
-        // signal — the header always says what the plan's claims rest on.
+        // The header assurance line anchors the deployment's revision once —
+        // no line below ever needs a revision number — and carries the
+        // live-state coverage (evidence-model Req 4.5/4.6): silence is never
+        // the signal; the header always says what the plan's claims rest on.
         out.push_str(&format!(
-            "**Plan for {}** {}\n",
+            "**Plan for {}** {}, {}\n",
             explanation.platform,
+            revision_anchor(explanation),
             coverage_clause(explanation)
         ));
         // Verdict narration is attention-only: a verdict that lets the apply
@@ -80,6 +82,15 @@ fn title_case(operation: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The header's revision anchor: the one place the document states which
+/// revision the plan compares against (`output-templates.md` §header).
+fn revision_anchor(explanation: &DeploymentExplanation) -> String {
+    match explanation.current_revision {
+        0 => "before its first apply".to_string(),
+        n => format!("at revision {n}"),
+    }
 }
 
 /// The header's coverage clause: what the plan's claims rest on. Gaps in
@@ -164,6 +175,95 @@ fn voiced(claim: &str, confidence_citation: &tokeira_iac::Confidence<impl Sized>
     }
 }
 
+/// The change with the given resource id, when the plan holds one.
+fn change_for<'a>(
+    explanation: &'a DeploymentExplanation,
+    resource_id: &str,
+) -> Option<&'a ExplainedChange> {
+    explanation
+        .changes
+        .iter()
+        .find(|c| c.resource_id == resource_id)
+}
+
+/// The clause on a change line (causality Req 6.1; `output-templates.md`
+/// §cause-clauses): **the concrete change, never a cause category**. A
+/// definition edit puts the diff itself on the line (the changed definition
+/// is implicit — it is the operator's own edit); drift names the fields
+/// that changed outside the definition; derived causes name their concrete
+/// trigger. Creates and deletes from the operator's own edit carry no
+/// clause — the verb already states the change. `None` also for an unknown
+/// cause: detail carries its uncertainty in place (Req 6.3). No clause ever
+/// references a revision number — the header anchors the revision once.
+fn cause_phrase(explanation: &DeploymentExplanation, change: &ExplainedChange) -> Option<String> {
+    use tokeira_explain::Cause;
+    match change.cause.value()? {
+        Cause::DefinitionEdit { .. } => match change.kind {
+            ChangeKind::Update | ChangeKind::Replace => diff_clause(change),
+            _ => None,
+        },
+        Cause::ProviderDrift => match change.kind {
+            ChangeKind::Create => Some("missing from the platform".to_string()),
+            ChangeKind::Update | ChangeKind::Replace => Some(drift_clause(change)),
+            _ => None,
+        },
+        Cause::EngineAdvance => {
+            Some("this provisioner realizes the definition differently".to_string())
+        }
+        Cause::ReplacementCascade { root } => Some(format!(
+            "forced by {} replacement",
+            change_for(explanation, root)
+                .map(|c| noun_phrase(explanation, c))
+                .unwrap_or_else(|| code_span(root))
+        )),
+        Cause::DependencyOutputChanged { dependency } => Some(format!(
+            "an output of {} changed",
+            change_for(explanation, dependency)
+                .map(|c| noun_phrase(explanation, c))
+                .unwrap_or_else(|| code_span(dependency))
+        )),
+    }
+}
+
+/// An edit's concrete change for its line: the first field diff with its
+/// values, "and N more fields" when several. A diff observed without
+/// captured values names the field alone; a change with no field evidence
+/// carries no clause.
+fn diff_clause(change: &ExplainedChange) -> Option<String> {
+    let first = change.field_diffs.first()?;
+    let head = match (&first.before, &first.after) {
+        (Some(before), Some(after)) => format!(
+            "{}: {} → {}",
+            code_span(&first.field),
+            code_span(&truncate(before)),
+            code_span(&truncate(after)),
+        ),
+        _ => code_span(&first.field),
+    };
+    Some(more_fields(head, change.field_diffs.len() - 1))
+}
+
+/// Drift's concrete change: the field names that changed outside the
+/// definition (values are live observations; they speak at detail as the
+/// field diffs).
+fn drift_clause(change: &ExplainedChange) -> String {
+    match change.field_diffs.first() {
+        Some(first) => format!(
+            "{} changed outside the definition",
+            more_fields(code_span(&first.field), change.field_diffs.len() - 1)
+        ),
+        None => "changed outside the definition".to_string(),
+    }
+}
+
+fn more_fields(head: String, extra: usize) -> String {
+    match extra {
+        0 => head,
+        1 => format!("{head} and 1 more field"),
+        n => format!("{head} and {n} more fields"),
+    }
+}
+
 /// The engine-kind verb in would-mood.
 fn kind_verb(kind: ChangeKind) -> &'static str {
     match kind {
@@ -205,9 +305,15 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
         for change in members {
             // A named resource reads as prose with its id once at the tail;
             // a kind without a noun leads with the id and never repeats it.
+            // An established cause joins the line as a clause; an unknown
+            // cause renders no clause here and speaks through its
+            // uncertainty at detail (causality Req 6.1/6.3).
+            let clause = cause_phrase(explanation, change)
+                .map(|phrase| format!(" - {phrase}"))
+                .unwrap_or_default();
             let line = if change.display.is_some() {
                 format!(
-                    "- {} would be {} - `{}::{}`\n",
+                    "- {} would be {}{clause} - `{}::{}`\n",
                     noun_phrase(explanation, change),
                     kind_verb(kind),
                     change.module,
@@ -215,7 +321,7 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
                 )
             } else {
                 format!(
-                    "- `{}::{}` would be {}\n",
+                    "- `{}::{}` would be {}{clause}\n",
                     change.module,
                     change.resource_id,
                     kind_verb(kind),
@@ -223,7 +329,7 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
             };
             out.push_str(&line);
             if depth == Depth::Detail {
-                change_detail(change, out);
+                change_detail(explanation, change, out);
             }
         }
     }
@@ -254,9 +360,13 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
 
 /// Detail sub-bullets for one change: field diffs as code spans, then the
 /// declared behaviour — mechanism, data effect, reversibility — each in its
-/// confidence voice with its citation. Unknown fields render nothing
-/// (knowledge renders; gaps enforce).
-fn change_detail(change: &ExplainedChange, out: &mut String) {
+/// confidence voice with its citation, then the cause in its voice (or its
+/// uncertainty in place, causality Req 6.2/6.3), the dependants
+/// (Req 5.2/5.4), and — on a chain's first member — the story line
+/// (Req 6.4). Unknown semantic fields render nothing (knowledge renders;
+/// gaps enforce); an unknown *cause* renders its uncertainty, because a
+/// cause gap is operator-actionable knowledge about the plan.
+fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, out: &mut String) {
     use tokeira_iac::{DataEffect, LifecycleOperation, Reversibility};
     if matches!(change.kind, ChangeKind::Update | ChangeKind::Replace) {
         for diff in &change.field_diffs {
@@ -272,9 +382,20 @@ fn change_detail(change: &ExplainedChange, out: &mut String) {
             }
         }
     }
-    // An unconfirmable live read speaks in place (Req 4.6 as amended).
+    // An unreadable live state changes what the diffs above MEAN: the engine
+    // measured desired against the record (never pruning on an unconfirmed
+    // read), so the provenance is stated with them — and when the cause is
+    // also unknown, the two facts are one statement, in operator words
+    // (output-templates.md §detail).
     if matches!(change.refresh_status, Some(RefreshStatus::Unknown)) {
-        out.push_str("  - its live state could not be confirmed\n");
+        if change.cause.value().is_none() && change.kind != ChangeKind::NoChange {
+            out.push_str(
+                "  - compared against the record - live state could not be read, so why \
+                 this differs is unknown\n",
+            );
+        } else {
+            out.push_str("  - compared against the record - live state could not be read\n");
+        }
     }
 
     let semantics = &change.semantics;
@@ -334,6 +455,106 @@ fn change_detail(change: &ExplainedChange, out: &mut String) {
             "  - {}\n",
             voiced(claim, &semantics.reversibility)
         ));
+    }
+
+    // The cause's voice line renders only where it adds information beyond
+    // the line clause: a derived cause owns itself with its citation
+    // (Req 6.2). Engine-fact causes already state their concrete change on
+    // the line, and an unknown cause under an unreadable live state spoke
+    // with the provenance line above. The remaining unknown arms (a missing
+    // or broken baseline) state their one operator-usable fact — never the
+    // machine consequence text, which stays in the model for agents and CI.
+    let derived = matches!(change.cause, tokeira_iac::Confidence::Inference { .. });
+    if derived && let Some(phrase) = cause_phrase(explanation, change) {
+        out.push_str(&format!("  - why: {}\n", voiced(&phrase, &change.cause)));
+    } else if change.cause.value().is_none()
+        && change.kind != ChangeKind::NoChange
+        && !matches!(change.refresh_status, Some(RefreshStatus::Unknown))
+    {
+        let baseline_missing = explanation
+            .uncertainties
+            .iter()
+            .find_map(|u| match &u.reason {
+                tokeira_explain::UncertaintyReason::BaselineUnavailable { revision } => {
+                    Some(*revision)
+                }
+                _ => None,
+            });
+        match baseline_missing {
+            Some(revision) => out.push_str(&format!(
+                "  - why this differs is unknown - revision {revision}'s definition is \
+                 not retained for comparison\n"
+            )),
+            None => out.push_str("  - why this differs is unknown\n"),
+        }
+    }
+
+    // Dependants: what depends on this resource, changing or not — the
+    // relationship continuing unchanged is a statement, never an omission.
+    let (changing, unchanged): (Vec<&String>, Vec<&String>) =
+        change.dependants.iter().partition(|dep| {
+            change_for(explanation, dep)
+                .map(|c| c.kind != ChangeKind::NoChange)
+                .unwrap_or(false)
+        });
+    let names = |deps: &[&String]| {
+        deps.iter()
+            .map(|dep| {
+                change_for(explanation, dep)
+                    .map(|c| noun_phrase(explanation, c))
+                    .unwrap_or_else(|| code_span(dep))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !changing.is_empty() {
+        out.push_str(&format!(
+            "  - dependants changing with it: {}\n",
+            names(&changing)
+        ));
+    }
+    if !unchanged.is_empty() {
+        out.push_str(&format!(
+            "  - dependants continuing unchanged: {}\n",
+            names(&unchanged)
+        ));
+    }
+
+    // A multi-member chain tells its story once, on its first member, root
+    // first and members along the dependency path (causality Req 6.4).
+    if let Some(group) = explanation
+        .causal_groups
+        .iter()
+        .find(|g| g.members.len() > 1 && g.members.first() == Some(&change.evidence_id))
+    {
+        use tokeira_explain::CausalRoot;
+        let root_phrase = match &group.root {
+            CausalRoot::RevisionComparison { baseline: 0 } => {
+                "the first apply of this definition".to_string()
+            }
+            // The header anchors the revision; the chain names the story.
+            CausalRoot::RevisionComparison { .. } => "the definition change".to_string(),
+            CausalRoot::ProvisionerAdvance => "the provisioner advance".to_string(),
+            CausalRoot::Resource(id) => explanation
+                .changes
+                .iter()
+                .find(|c| &c.evidence_id == id)
+                .map(|c| noun_phrase(explanation, c))
+                .unwrap_or_else(|| code_span(id.as_str())),
+        };
+        let members = group
+            .members
+            .iter()
+            .filter_map(|member| {
+                explanation
+                    .changes
+                    .iter()
+                    .find(|c| &c.evidence_id == member)
+                    .map(|c| noun_phrase(explanation, c))
+            })
+            .collect::<Vec<_>>()
+            .join(", then ");
+        out.push_str(&format!("  - chain: {root_phrase}: {members}\n"));
     }
 }
 
@@ -613,7 +834,7 @@ mod tests {
         let r = report_for(&outcome, BindingVerdict::DevIterate, true);
         let text = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(text.contains("No changes - everything matches the definition."));
-        assert!(text.contains("**Plan for test** with *live state* confirmed"));
+        assert!(text.contains("**Plan for test** at revision 1, with *live state* confirmed"));
     }
 
     // Requirement 4.6: summary reveals uncertainty's presence by count;
@@ -639,7 +860,7 @@ mod tests {
 
         let detail = render(&r, Mode::resolve(false, true)).unwrap();
         assert!(
-            detail.contains("  - its live state could not be confirmed"),
+            detail.contains("  - compared against the record - live state could not be read"),
             "in-place statement at detail: {detail}"
         );
     }
@@ -718,7 +939,7 @@ mod tests {
         let summary = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(summary.contains("# Infra Plan\n"), "title: {summary}");
         assert!(
-            summary.contains("**Plan for test** with *live state* confirmed"),
+            summary.contains("**Plan for test** at revision 1, with *live state* confirmed"),
             "header assurance: {summary}"
         );
         assert!(
@@ -823,7 +1044,330 @@ mod tests {
         "refresh status",
         "checkpoint",
         "snapshot",
+        "classification",
+        "algebra",
+        "drifted",
+        "downstream",
+        "cascade",
+        "causal group",
+        "ultimate root",
     ];
+
+    /// The reference causality fixture behind the executable transcripts in
+    /// `.kiro/specs/operator-explanation/output-templates.md` — a real-world
+    /// compose+DSQL deployment: an edited service (grafana, with its compose
+    /// declaration speaking), a replaced cluster (an edit) cascading into
+    /// tokeirad, a drifted service (mimir), a service whose live state could
+    /// not be read (loki — the diff measured against the record), and an
+    /// unchanged dependant (alloy).
+    fn causality_reference_report() -> ExplanationReport {
+        use std::collections::{BTreeMap, BTreeSet};
+        use tokeira_explain::{BaselineView, CausalityView, apply_causality};
+        use tokeira_iac::{
+            Citation, Confidence, Disruption, FieldDiff, LifecycleOperation, ReplacementPolicy,
+            ResourceState, ResourceType,
+        };
+
+        const RECONCILE: Citation = Citation::code("tokeira_compose::reconcile");
+        let service = |module: &str, id: &str, kind: ChangeKind, details: Vec<FieldDiff>| Change {
+            module: module.into(),
+            resource: id.into(),
+            resource_type: "compose_service".into(),
+            kind,
+            details,
+        };
+
+        let changes = vec![
+            service(
+                "grafana",
+                "compose/grafana",
+                ChangeKind::Update,
+                vec![FieldDiff {
+                    field: "image".into(),
+                    before: Some("grafana/grafana-oss:12.4.3".into()),
+                    after: Some("grafana/grafana-oss:12.5.0".into()),
+                }],
+            ),
+            service(
+                "mimir",
+                "compose/mimir",
+                ChangeKind::Update,
+                vec![FieldDiff::observation("environment")],
+            ),
+            service(
+                "loki",
+                "compose/loki",
+                ChangeKind::Update,
+                vec![FieldDiff {
+                    field: "image".into(),
+                    before: Some("grafana/loki:3.7.1".into()),
+                    after: Some("grafana/loki:3.8.0".into()),
+                }],
+            ),
+            service(
+                "tokeirad",
+                "compose/tokeirad",
+                ChangeKind::Replace,
+                Vec::new(),
+            ),
+            Change {
+                module: "storage".into(),
+                resource: "dsql/cluster".into(),
+                resource_type: "dsql_cluster".into(),
+                kind: ChangeKind::Replace,
+                details: vec![FieldDiff {
+                    field: "deletion_protection".into(),
+                    before: Some("enabled".into()),
+                    after: Some("disabled".into()),
+                }],
+            },
+            service("alloy", "compose/alloy", ChangeKind::NoChange, Vec::new()),
+        ];
+
+        let rid = |id: &str| ResourceId(id.to_string());
+        let mut status_by_id = BTreeMap::new();
+        for id in [
+            "compose/grafana",
+            "compose/mimir",
+            "compose/tokeirad",
+            "compose/alloy",
+            "dsql/cluster",
+        ] {
+            status_by_id.insert(rid(id), tokeira_iac::RefreshStatus::DesiredLive);
+        }
+        status_by_id.insert(rid("compose/loki"), tokeira_iac::RefreshStatus::Unknown);
+        let mut live_departed = BTreeSet::new();
+        live_departed.insert(rid("compose/mimir"));
+
+        let mut display_by_id = BTreeMap::new();
+        for id in [
+            "compose/grafana",
+            "compose/mimir",
+            "compose/loki",
+            "compose/tokeirad",
+            "compose/alloy",
+        ] {
+            display_by_id.insert(rid(id), "service".to_string());
+        }
+        display_by_id.insert(rid("dsql/cluster"), "Aurora DSQL cluster".to_string());
+
+        let mut semantics_by_id = BTreeMap::new();
+        // The real compose update declaration: effected as a
+        // destroy-before-create replacement, data preserved on bind mounts.
+        semantics_by_id.insert(
+            rid("compose/grafana"),
+            tokeira_iac::ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Replaced,
+                    citation: RECONCILE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::DestroyBeforeCreate,
+                    citation: RECONCILE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: RECONCILE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: tokeira_iac::DataEffect::Preserved,
+                    citation: RECONCILE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: tokeira_iac::Reversibility::Reversible,
+                    citation: RECONCILE,
+                },
+                statement: Some(std::borrow::Cow::Borrowed(
+                    "it would be stopped, removed, and recreated from the definition",
+                )),
+            },
+        );
+
+        let outcome = PlanOutcome {
+            changes,
+            refresh: RefreshCoverage {
+                status_by_id,
+                examined: true,
+                live_departed,
+            },
+            semantics_by_id,
+            display_by_id,
+            ..Default::default()
+        };
+        let mut r = report_for(&outcome, BindingVerdict::DevIterate, true);
+        r.explanation.current_revision = 4;
+        r.explanation.platform = "compose".to_string();
+
+        let manifest = |v: &str| serde_json::json!({ "field": v });
+        let state = |id: &str| ResourceState {
+            resource_type: ResourceType::new("compose_service"),
+            physical_id: id.to_string(),
+            properties: serde_json::json!({}),
+            dependencies: Vec::new(),
+            created_at: "t0".into(),
+            updated_at: "t0".into(),
+            module: "m".into(),
+        };
+        let same = [
+            "compose/mimir",
+            "compose/loki",
+            "compose/tokeirad",
+            "compose/alloy",
+        ];
+        let mut desired = BTreeMap::new();
+        let mut baseline = BTreeMap::new();
+        for id in same {
+            desired.insert(rid(id), manifest("same"));
+            baseline.insert(rid(id), manifest("same"));
+        }
+        desired.insert(rid("compose/grafana"), manifest("image-12.5.0"));
+        baseline.insert(rid("compose/grafana"), manifest("image-12.4.3"));
+        desired.insert(rid("dsql/cluster"), manifest("protection-off"));
+        baseline.insert(rid("dsql/cluster"), manifest("protection-on"));
+        let recorded: BTreeMap<ResourceId, ResourceState> = [
+            "compose/grafana",
+            "compose/mimir",
+            "compose/loki",
+            "compose/tokeirad",
+            "compose/alloy",
+            "dsql/cluster",
+        ]
+        .into_iter()
+        .map(|id| (rid(id), state(id)))
+        .collect();
+        let mut edges: BTreeMap<ResourceId, Vec<ResourceId>> = BTreeMap::new();
+        edges.insert(rid("compose/tokeirad"), vec![rid("dsql/cluster")]);
+        edges.insert(rid("compose/alloy"), vec![rid("compose/mimir")]);
+
+        let view = CausalityView {
+            desired: Some(desired),
+            baseline: BaselineView::Realized(baseline),
+            baseline_revision: 4,
+            recorded,
+            edges,
+            refresh: outcome.refresh.clone(),
+        };
+        apply_causality(&mut r.explanation, &view);
+        r
+    }
+
+    // Causality Req 6.1–6.4/6.7 over the real-world reference: clauses on the
+    // lines, the record-baseline provenance line, derived voices, dependants,
+    // the chain, and `--json` carrying assessments, groups, and dependants.
+    #[test]
+    fn causality_renders_clauses_voices_dependants_and_the_chain() {
+        let r = causality_reference_report();
+        let summary = render(&r, Mode::resolve(false, false)).unwrap();
+        assert!(
+            summary.contains(
+                "**Plan for compose** at revision 4, with *live state* unconfirmed for 1 resource"
+            ),
+            "header anchor + coverage: {summary}"
+        );
+        assert!(
+            summary.contains("- the *grafana* service would be updated - `image`: `grafana/grafana-oss:12.4.3` → `grafana/grafana-oss:12.5.0` - `grafana::compose/grafana`\n"),
+            "edit clause is the diff: {summary}"
+        );
+        assert!(
+            summary.contains("- the *mimir* service would be updated - `environment` changed outside the definition - `mimir::compose/mimir`\n"),
+            "drift clause names the fields: {summary}"
+        );
+        assert!(
+            summary.contains("- the *loki* service would be updated - `loki::compose/loki`\n"),
+            "an unknown cause renders no clause at summary: {summary}"
+        );
+        assert!(
+            summary.contains("- the *tokeirad* service would be replaced - forced by the *Aurora DSQL cluster* replacement - `tokeirad::compose/tokeirad`\n"),
+            "cascade clause: {summary}"
+        );
+
+        let detail = render(&r, Mode::resolve(false, true)).unwrap();
+        assert!(
+            detail.contains("  - compared against the record - live state could not be read, so why this differs is unknown"),
+            "the record-baseline provenance line: {detail}"
+        );
+        assert!(
+            !detail.contains("could not be established"),
+            "no machine voice in narrative: {detail}"
+        );
+        assert!(
+            detail.contains("  - the update replaces it - it would be stopped, removed, and recreated from the definition - `tokeira_compose::reconcile`"),
+            "the compose declaration speaks: {detail}"
+        );
+        assert!(
+            detail.contains("Tokeira derives this - per `tokeira_explain::causality`"),
+            "cascade owned as derived: {detail}"
+        );
+        assert!(
+            detail.contains("  - dependants changing with it: the *tokeirad* service"),
+            "changing dependant stated: {detail}"
+        );
+        assert!(
+            detail.contains("  - dependants continuing unchanged: the *alloy* service"),
+            "unchanged dependant stated: {detail}"
+        );
+        assert!(
+            detail.contains("  - chain: the definition change: "),
+            "the chain told once, root first: {detail}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render(&r, Mode::resolve(true, false)).unwrap()).unwrap();
+        assert!(
+            json["causal_groups"].as_array().map(Vec::len).unwrap_or(0) >= 3,
+            "groups serialized: {json}"
+        );
+        assert!(
+            json["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["cause"].get("engine-fact").is_some()),
+            "assessments serialized: {json}"
+        );
+    }
+
+    // The output-templates doc is executable: its reference transcripts ARE
+    // the renderer's output for the reference fixture, byte-for-byte — the
+    // managed-template guarantee (umbrella D10). A template change is an
+    // amendment to the doc first; this test is what makes that mechanical.
+    // Ignored while the renderer implements the agreed form (anchor-only
+    // header, `## Resource Drift`, `## Platform Issue[s]`, computed-plural
+    // headings): the doc states the agreement in its entirety, and
+    // un-ignoring this test — green — is the renderer slice's definition
+    // of done.
+    #[test]
+    #[ignore = "the renderer lags the agreed template form; un-ignore with the Resource Drift / Platform Issue renderer slice"]
+    fn the_output_templates_doc_is_executable() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.kiro/specs/operator-explanation/output-templates.md"
+        );
+        let doc = std::fs::read_to_string(path).expect("output-templates.md exists");
+        let r = causality_reference_report();
+        for (marker, detail) in [
+            ("<!-- reference: infra-plan-summary -->", false),
+            ("<!-- reference: infra-plan-detail -->", true),
+        ] {
+            let rendered = render(&r, Mode::resolve(false, detail)).unwrap();
+            let block = fenced_block_after(&doc, marker).unwrap_or_else(|| {
+                panic!("{marker} block missing from output-templates.md.\nRendered:\n{rendered}")
+            });
+            assert_eq!(
+                block.trim_end(),
+                rendered.trim_end(),
+                "output-templates.md and the renderer have drifted ({marker})"
+            );
+        }
+    }
+
+    fn fenced_block_after(doc: &str, marker: &str) -> Option<String> {
+        let after = &doc[doc.find(marker)? + marker.len()..];
+        let start = after.find("```markdown\n")? + "```markdown\n".len();
+        let rest = &after[start..];
+        let end = rest.find("\n```")?;
+        Some(rest[..end].to_string())
+    }
 
     #[test]
     fn the_banned_list_matches_the_language_doc() {

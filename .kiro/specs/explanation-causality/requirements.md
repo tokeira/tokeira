@@ -92,7 +92,7 @@ if Feature 1 has already shipped; either way the JSON shape of an *undetermined*
 | The definition interprets fully in memory with no provider access (`definition check`, `load_tkd_config`) | `platforms/compose/src/provisioner.rs` | Realizing a retained revision is the same machinery pointed at a different file |
 | `TkdDeployment::realize` + `realize_module` produce resources whose `to_manifest()` is the desired shape | `platforms/compose/src/adapter.rs`, `crates/tokeira-compose/src/lib.rs` | **D** and **P** are comparable values, not texts |
 | Set-valued manifest fields require canonicalization before comparison (`canonicalize_manifest`; the port-order roulette) | `crates/tokeira-compose/src/lib.rs` | Desired-vs-desired comparison MUST be canonical or it will manufacture phantom definition edits — the same demon in a new seam |
-| `InfraState` carries `resources: BTreeMap<ResourceId, ResourceState>`; its `outputs` map is declared but **no producer populates it** (verified 2026-07-31) | `crates/tokeira-iac/src/document.rs`; writeback reads at `platforms/compose/src/adapter.rs` | **S** exists. The de facto recorded-output channel is `ResourceState.properties` — written per resource at apply, read by name by the writeback wiring — so A4 traces through dependency **properties** *(ground-truth correction 2026-07-31; the original row asserted `outputs` carried them)* |
+| `InfraState` carries `resources: BTreeMap<ResourceId, ResourceState>`; its `outputs` map has no producer | `crates/tokeira-iac/src/document.rs`; writeback reads at `platforms/compose/src/adapter.rs` | **S** exists. The recorded-output channel is `ResourceState.properties` — written per resource at apply, read by name by the writeback wiring — so A4 traces through dependency **properties** |
 | `ResourceState.dependencies` is recorded, and the engine topologically orders from it (`topological_sort_from_state`) | `crates/tokeira-iac/src/engine.rs` | The dependency graph for grouping, cascades, and dependants exists on both desired and recorded sides |
 | Refresh classifies per-resource live status, carried by Feature 1's `RefreshCoverage` | `crates/tokeira-iac/src/engine.rs`; Feature 1 | **L**'s availability is knowable; an unconfirmed **L** must degrade drift claims |
 | Refresh overwrites in-context state properties with live describe output before diffing (`ctx.state = refreshed.state`) | `crates/tokeira-iac/src/engine.rs` | **S in the diff context is contaminated with live observations** — the classifier must read recorded state from the store, not from the post-refresh context |
@@ -103,16 +103,21 @@ if Feature 1 has already shipped; either way the JSON shape of an *undetermined*
 Every plan answers "why" for every change, at one of three honesty levels: an engine-fact
 classification from the revision algebra; a derived (inference) classification from
 output tracing or cascade analysis; or an explicit `Unknown` carrying an uncertainty that
-names what would decide it. Grouped causes read as one story:
+names what would decide it. Causes ride the change lines in the report's Markdown form;
+chains read as one story:
 
-```text
-cause: the definition changed between revision 4 and the working definition
-  ~ compose/tokeirad — image reference changed
-      └─ 2 dependants continue unchanged: compose/alloy, compose/grafana
+```markdown
+## Update
 
-cause: provider drift — live state departed from what revision 4 applied
-  ~ compose/mimir — environment differs from the applied state
+- The *tokeirad* service (`compose/tokeirad`) would be updated — the definition
+  changed since revision 4.
+- The *mimir* service (`compose/mimir`) would be updated — live state departed
+  from what revision 4 applied.
 ```
+
+At detail depth each change adds its assessment in the confidence voice, its dependants
+("the *alloy* and *grafana* services continue unchanged"), and — for an unknown cause —
+the uncertainty in place; a multi-member chain presents once, root first.
 
 ## Glossary
 
@@ -159,9 +164,8 @@ Order is significant: A1–A3b (existence, including absence from recorded state
 A4–A5 (content) before A6–A9 (state), A6 before A7 (a cascade would otherwise misread as
 drift), A9 guards A7–A8 (no drift claim over an unconfirmed live read). A3b sits in the
 existence family deliberately: its change is a create, so the cascade and drift rows
-cannot meaningfully apply to it. *(A3b added 2026-07-30, operator-directed: the
-never-recorded create is a fact the engine holds, and it SHALL NOT surface as a generic
-could-not-establish uncertainty.)*
+cannot meaningfully apply to it — the never-recorded create is a fact the engine holds,
+and it SHALL NOT surface as a generic could-not-establish uncertainty.
 
 ## Requirements
 
@@ -231,9 +235,7 @@ symptom.
    equality: the named dependency SHALL be reachable by a recorded dependency edge from
    the resource, and an output SHALL count as changed only when its recorded value (S)
    departs from the value the baseline definition realized for the consuming field (P)
-   while matching the working value (D). *(Added 2026-07-30, operator-directed: the
-   change is established against the infra/service identity and an understanding of the
-   diff between states.)*
+   while matching the working value (D).
 
 ### Requirement 4: Causal grouping tells one story
 
@@ -251,19 +253,15 @@ plan reads as reasons rather than as a list.
    named dependency for output-traced changes; for cascades, the ultimate root — the
    first non-cascade cause reached by walking the cascade chain — so a transitive
    replacement reads as one story; the drifted resource itself for drift; the provisioner
-   advance for engine-advance changes. *(Amended 2026-07-30: "the replaced resource"
-   left nearest-vs-ultimate open; ultimate is chosen, bounded by criterion 6.)*
-4. WHEN rendering at summary depth THE renderer SHALL present each group as its root and
-   its member count with member ids; WHEN rendering at detail depth THE renderer SHALL
-   present the full chain.
+   advance for engine-advance changes.
+4. THE rendering of groups SHALL follow Requirement 6: causes as clauses of the change
+   lines at summary depth, the chain told once at detail depth (Requirement 6.4).
 5. THE groups SHALL partition the plan's non-`NoChange` changes: every such change SHALL
    appear in exactly one group.
 6. THE root walk SHALL be bounded by the engine-version and baseline-revision
    boundaries: a chain whose origin is an engine advance SHALL root at the provisioner
    advance and reach no further back, and no root SHALL attribute across a revision
-   earlier than the baseline comparison. *(Added 2026-07-30, operator-directed: cause is
-   bounded by the engine-version boundary — within one plan the chain is walkable fact;
-   beyond it lies archaeology this feature refuses.)*
+   earlier than the baseline comparison.
 
 ### Requirement 5: Dependants are stated
 
@@ -289,17 +287,25 @@ so that "why" reads as naturally as "what".
 
 #### Acceptance Criteria
 
-1. WHEN rendering at summary depth THE renderer SHALL state each causal group's cause in
-   lexicon vocabulary, revision-attributed where the cause is a definition edit ("the
-   definition changed between revision N and the working definition").
-2. WHEN rendering at detail depth THE renderer SHALL state each change's cause assessment,
-   marking derived classifications as derived and unknown causes via their uncertainty.
-3. THE renderer SHALL NOT claim line-level attribution before Feature 4 populates source
+1. WHEN rendering at summary depth THE renderer SHALL state each non-`NoChange`
+   change's established cause as a clause of its change line, in lexicon vocabulary,
+   revision-attributed where the cause is a definition edit ("the definition changed
+   since revision N"); the document form — sections, templates, display names, the
+   header assurance line — is owned by the evidence-model spec's Requirement 6.
+2. WHEN rendering at detail depth THE renderer SHALL state each change's cause in its
+   confidence voice — an engine fact plainly, a derived classification owned as derived
+   — and the change's dependants per Requirement 5.
+3. WHERE a change's cause is unknown THE renderer SHALL render no cause clause at
+   summary depth and SHALL render the cause's uncertainty in place with the change at
+   detail depth: the consequence and, where one exists, the resolving action.
+4. WHEN a causal group holds more than one member THE detail rendering SHALL present
+   the chain as one story: the root stated once, members along the dependency path.
+5. THE renderer SHALL NOT claim line-level attribution before Feature 4 populates source
    locations; revision-level attribution SHALL be phrased as such.
-4. WHERE this feature introduces operator-facing vocabulary (cause, drift, dependant,
+6. WHERE this feature introduces operator-facing vocabulary (cause, drift, dependant,
    causal group, root) THE change SHALL add those terms to `operator-language.md` in the
    same change.
-5. THE `--json` rendering SHALL carry every cause assessment, group, and dependant set
+7. THE `--json` rendering SHALL carry every cause assessment, group, and dependant set
    regardless of depth.
 
 ## Notes
@@ -318,7 +324,12 @@ so that "why" reads as naturally as "what".
   keeps the other two categories honest.
 - Canonicalization (1.4) is non-negotiable: without it, desired-vs-desired comparison
   re-imports the port-order roulette as phantom definition edits.
-- **A3b is A3's mirror** (2026-07-30): a resource desired unchanged since the baseline
-  yet absent from recorded state is the create-side reconcile completion — an interrupted
-  apply, a partially recorded commit. The engine knows this; classifying it `Unknown`
-  would have been exactly the generic could-not-establish this table exists to prevent.
+- **A3b is A3's mirror**: a resource desired unchanged since the baseline yet absent
+  from recorded state is the create-side reconcile completion — an interrupted apply, a
+  partially recorded commit. The engine knows this; classifying it `Unknown` would be
+  exactly the generic could-not-establish this table exists to prevent.
+- **Cause uncertainties render in narrative** (Requirement 6.3), unlike
+  undeclared-semantics gaps (change-semantics Requirement 6.5, machine-side): a cause
+  gap is operator-actionable — confirm live state, restore a revision — and hiding it
+  would make the one change without a "why" read as quietly fine. An undecidable cause
+  is knowledge about the plan, not a missing declaration.

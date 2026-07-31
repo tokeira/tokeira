@@ -664,7 +664,7 @@ fn property_6_trace_fires_only_through_identity_and_state_diff() {
 
     // No state departure (recorded equals the baseline side too) → A5
     // (gate ii: the diff between states). The D-side matching alone is the
-    // one-ended match the amended predicate rejects.
+    // one-ended match the predicate rejects.
     let (view, mut explanation) =
         traced_world("same-endpoint", true, "same-endpoint", "same-endpoint");
     apply_causality(&mut explanation, &view);
@@ -784,7 +784,7 @@ fn a_resource_in_state_only_classifies_a3() {
     ));
 }
 
-// The interrupted apply (A3b, operator-directed 2026-07-30): desired,
+// The interrupted apply (A3b): desired,
 // unchanged since the baseline, never recorded → the create-side reconcile
 // completion, an engine fact — NEVER a generic could-not-establish.
 #[test]

@@ -240,3 +240,157 @@ async fn exercise_dsql_variant_plans_the_cluster_and_writeback() {
         dep.writeback_entries().len()
     );
 }
+
+/// Causality over the live seam chain (explanation-causality task 6.4): a
+/// real `ComposeProvisioner::infra_plan`, real desired snapshots of the
+/// working and retained definitions, and recorded state read through the
+/// platform's own store. The assertions are environment-independent — the
+/// edited resource's classification is a content row (D ≠ P needs no live
+/// read), and the untouched resources classify by whatever world runs the
+/// test (Docker present or absent), but never as the edit.
+#[tokio::test]
+async fn causality_classifies_a_definition_edit_over_the_live_seam_chain() {
+    use std::collections::BTreeMap;
+
+    use tokeira_compose_deployment::provisioner::ComposeProvisioner;
+    use tokeira_explain::{BaselineView, CausalityView, Cause, apply_causality};
+    use tokeira_iac::{InfraState, ResourceId, ResourceState, ResourceType};
+    use tokeira_provisioner_cli::{ProvisionerPlatform, Realization};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+
+    // Baseline (revision 1): the reference definition, retained where the
+    // shell keeps config revisions. Working: the same definition with the
+    // grafana image edited.
+    let baseline_dir = dir.join("state/config-revisions/1");
+    fs::create_dir_all(&baseline_dir).unwrap();
+    fs::write(baseline_dir.join("definition.tkd"), DEFAULT_TKD).unwrap();
+    let edited = DEFAULT_TKD.replace("grafana/grafana-oss:12.4.3", "grafana/grafana-oss:12.5.0");
+    assert_ne!(
+        edited, DEFAULT_TKD,
+        "the grafana image edit must hit the definition"
+    );
+    let working = dir.join("definition.tkd");
+    fs::write(&working, &edited).unwrap();
+
+    let platform = ComposeProvisioner;
+    let snapshot = |path: PathBuf| {
+        let dir = dir.clone();
+        async move {
+            match platform.desired_snapshot(&dir, &path).await.unwrap() {
+                Realization::Realized(snapshot) => snapshot,
+                Realization::NotApplicable { reason } => panic!("compose snapshots: {reason}"),
+            }
+        }
+    };
+    let desired = snapshot(working.clone()).await;
+    let baseline = snapshot(baseline_dir.join("definition.tkd")).await;
+
+    // Recorded state: every desired resource recorded (so untouched
+    // resources sit in S and cannot fall to the A3b create row), written
+    // through the same store layout the engine and `recorded_state` share.
+    let recorded_fixture = InfraState {
+        version: 1,
+        resources: desired
+            .keys()
+            .map(|id| {
+                (
+                    id.clone(),
+                    ResourceState {
+                        resource_type: ResourceType::new("fixture"),
+                        physical_id: id.0.clone(),
+                        properties: serde_json::json!({}),
+                        dependencies: Vec::new(),
+                        created_at: "t0".into(),
+                        updated_at: "t0".into(),
+                        module: "m".into(),
+                    },
+                )
+            })
+            .collect(),
+        outputs: BTreeMap::new(),
+        last_applied: "t0".into(),
+    };
+    let store_dir = dir.join("state/infra/infra");
+    fs::create_dir_all(&store_dir).unwrap();
+    fs::write(
+        store_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&recorded_fixture).unwrap(),
+    )
+    .unwrap();
+    let recorded = platform.recorded_state(&dir).await.unwrap();
+    assert_eq!(
+        recorded.resources.len(),
+        desired.len(),
+        "recorded_state reads the store the fixture wrote"
+    );
+
+    // The real plan over the edited definition, through the platform seam.
+    let outcome = platform.infra_plan(&dir).await.unwrap();
+
+    // The union graph, exactly as the shell assembles it.
+    let mut edges: BTreeMap<ResourceId, Vec<ResourceId>> = outcome
+        .edges_by_id
+        .iter()
+        .map(|(id, deps)| (id.clone(), deps.clone()))
+        .collect();
+    for (id, state) in &recorded.resources {
+        let deps = edges.entry(id.clone()).or_default();
+        for dep in &state.dependencies {
+            if !deps.contains(dep) {
+                deps.push(dep.clone());
+            }
+        }
+    }
+
+    let mut explanation = tokeira_explain::explain_plan(
+        tokeira_explain::DeploymentContext {
+            deployment: "demo".to_string(),
+            platform: "compose".to_string(),
+            operation: "infra plan".to_string(),
+            current_revision: 1,
+            proposed_revision: None,
+            definition_ref: None,
+        },
+        &outcome,
+    );
+    apply_causality(
+        &mut explanation,
+        &CausalityView {
+            desired: Some(desired),
+            baseline: BaselineView::Realized(baseline),
+            baseline_revision: 1,
+            recorded: recorded.resources,
+            edges,
+            refresh: outcome.refresh.clone(),
+        },
+    );
+
+    // The edited resource classifies as the definition edit — a content
+    // row, needing no live read.
+    let grafana = explanation
+        .changes
+        .iter()
+        .find(|c| c.resource_id == "compose/grafana")
+        .expect("the grafana service is in the plan");
+    assert!(
+        matches!(grafana.cause.value(), Some(Cause::DefinitionEdit { .. })),
+        "the edited resource classifies as the definition edit: {:?}",
+        grafana.cause
+    );
+    // Untouched resources never classify as the edit, whatever this world's
+    // live answers are (drift or an in-place uncertainty are both correct;
+    // the edit is not).
+    for change in &explanation.changes {
+        if change.kind == ChangeKind::NoChange || change.resource_id == "compose/grafana" {
+            continue;
+        }
+        assert!(
+            !matches!(change.cause.value(), Some(Cause::DefinitionEdit { .. })),
+            "untouched {} must not classify as the edit: {:?}",
+            change.resource_id,
+            change.cause
+        );
+    }
+}

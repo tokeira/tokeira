@@ -164,6 +164,56 @@ fn voiced(claim: &str, confidence_citation: &tokeira_iac::Confidence<impl Sized>
     }
 }
 
+/// The change with the given resource id, when the plan holds one.
+fn change_for<'a>(
+    explanation: &'a DeploymentExplanation,
+    resource_id: &str,
+) -> Option<&'a ExplainedChange> {
+    explanation
+        .changes
+        .iter()
+        .find(|c| c.resource_id == resource_id)
+}
+
+/// The terse cause phrase for a change line (causality Req 6.1) — lexicon
+/// vocabulary, revision-attributed for definition edits, no confidence
+/// scaffolding (the voice speaks at detail). `None` for an unknown cause:
+/// no clause renders at summary, and detail carries the uncertainty in
+/// place (Req 6.3).
+fn cause_phrase(explanation: &DeploymentExplanation, change: &ExplainedChange) -> Option<String> {
+    use tokeira_explain::Cause;
+    let phrase = match change.cause.value()? {
+        Cause::DefinitionEdit { .. } => {
+            if explanation.current_revision == 0 {
+                "the first apply of this definition".to_string()
+            } else {
+                format!(
+                    "the definition changed since revision {}",
+                    explanation.current_revision
+                )
+            }
+        }
+        Cause::ProviderDrift => format!(
+            "live state departed from what revision {} applied",
+            explanation.current_revision
+        ),
+        Cause::EngineAdvance => "this provisioner realizes the definition differently".to_string(),
+        Cause::ReplacementCascade { root } => format!(
+            "forced by the {} replacement",
+            change_for(explanation, root)
+                .map(|c| noun_phrase(explanation, c))
+                .unwrap_or_else(|| code_span(root))
+        ),
+        Cause::DependencyOutputChanged { dependency } => format!(
+            "its {} dependency's output changed",
+            change_for(explanation, dependency)
+                .map(|c| noun_phrase(explanation, c))
+                .unwrap_or_else(|| code_span(dependency))
+        ),
+    };
+    Some(phrase)
+}
+
 /// The engine-kind verb in would-mood.
 fn kind_verb(kind: ChangeKind) -> &'static str {
     match kind {
@@ -205,9 +255,15 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
         for change in members {
             // A named resource reads as prose with its id once at the tail;
             // a kind without a noun leads with the id and never repeats it.
+            // An established cause joins the line as a clause; an unknown
+            // cause renders no clause here and speaks through its
+            // uncertainty at detail (causality Req 6.1/6.3).
+            let clause = cause_phrase(explanation, change)
+                .map(|phrase| format!(" - {phrase}"))
+                .unwrap_or_default();
             let line = if change.display.is_some() {
                 format!(
-                    "- {} would be {} - `{}::{}`\n",
+                    "- {} would be {}{clause} - `{}::{}`\n",
                     noun_phrase(explanation, change),
                     kind_verb(kind),
                     change.module,
@@ -215,7 +271,7 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
                 )
             } else {
                 format!(
-                    "- `{}::{}` would be {}\n",
+                    "- `{}::{}` would be {}{clause}\n",
                     change.module,
                     change.resource_id,
                     kind_verb(kind),
@@ -223,7 +279,7 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
             };
             out.push_str(&line);
             if depth == Depth::Detail {
-                change_detail(change, out);
+                change_detail(explanation, change, out);
             }
         }
     }
@@ -254,9 +310,13 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
 
 /// Detail sub-bullets for one change: field diffs as code spans, then the
 /// declared behaviour — mechanism, data effect, reversibility — each in its
-/// confidence voice with its citation. Unknown fields render nothing
-/// (knowledge renders; gaps enforce).
-fn change_detail(change: &ExplainedChange, out: &mut String) {
+/// confidence voice with its citation, then the cause in its voice (or its
+/// uncertainty in place, causality Req 6.2/6.3), the dependants
+/// (Req 5.2/5.4), and — on a chain's first member — the story line
+/// (Req 6.4). Unknown semantic fields render nothing (knowledge renders;
+/// gaps enforce); an unknown *cause* renders its uncertainty, because a
+/// cause gap is operator-actionable knowledge about the plan.
+fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, out: &mut String) {
     use tokeira_iac::{DataEffect, LifecycleOperation, Reversibility};
     if matches!(change.kind, ChangeKind::Update | ChangeKind::Replace) {
         for diff in &change.field_diffs {
@@ -334,6 +394,100 @@ fn change_detail(change: &ExplainedChange, out: &mut String) {
             "  - {}\n",
             voiced(claim, &semantics.reversibility)
         ));
+    }
+
+    // The cause, in its confidence voice — or its uncertainty in place.
+    if let Some(phrase) = cause_phrase(explanation, change) {
+        out.push_str(&format!("  - why: {}\n", voiced(&phrase, &change.cause)));
+    } else if change.kind != ChangeKind::NoChange {
+        let undecidable = explanation.uncertainties.iter().find(|u| {
+            u.subject == change.evidence_id
+                && matches!(
+                    u.reason,
+                    tokeira_explain::UncertaintyReason::CauseUndecidable { .. }
+                )
+        });
+        if let Some(uncertainty) = undecidable {
+            match &uncertainty.resolvable_by {
+                Some(resolution) => out.push_str(&format!(
+                    "  - why: could not be established - {}; {}\n",
+                    uncertainty.consequence, resolution
+                )),
+                None => out.push_str(&format!(
+                    "  - why: could not be established - {}\n",
+                    uncertainty.consequence
+                )),
+            }
+        }
+    }
+
+    // Dependants: what depends on this resource, changing or not — the
+    // relationship continuing unchanged is a statement, never an omission.
+    let (changing, unchanged): (Vec<&String>, Vec<&String>) =
+        change.dependants.iter().partition(|dep| {
+            change_for(explanation, dep)
+                .map(|c| c.kind != ChangeKind::NoChange)
+                .unwrap_or(false)
+        });
+    let names = |deps: &[&String]| {
+        deps.iter()
+            .map(|dep| {
+                change_for(explanation, dep)
+                    .map(|c| noun_phrase(explanation, c))
+                    .unwrap_or_else(|| code_span(dep))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !changing.is_empty() {
+        out.push_str(&format!(
+            "  - dependants changing with it: {}\n",
+            names(&changing)
+        ));
+    }
+    if !unchanged.is_empty() {
+        out.push_str(&format!(
+            "  - dependants continuing unchanged: {}\n",
+            names(&unchanged)
+        ));
+    }
+
+    // A multi-member chain tells its story once, on its first member, root
+    // first and members along the dependency path (causality Req 6.4).
+    if let Some(group) = explanation
+        .causal_groups
+        .iter()
+        .find(|g| g.members.len() > 1 && g.members.first() == Some(&change.evidence_id))
+    {
+        use tokeira_explain::CausalRoot;
+        let root_phrase = match &group.root {
+            CausalRoot::RevisionComparison { baseline: 0 } => {
+                "the first apply of this definition".to_string()
+            }
+            CausalRoot::RevisionComparison { baseline } => {
+                format!("the definition change since revision {baseline}")
+            }
+            CausalRoot::ProvisionerAdvance => "the provisioner advance".to_string(),
+            CausalRoot::Resource(id) => explanation
+                .changes
+                .iter()
+                .find(|c| &c.evidence_id == id)
+                .map(|c| noun_phrase(explanation, c))
+                .unwrap_or_else(|| code_span(id.as_str())),
+        };
+        let members = group
+            .members
+            .iter()
+            .filter_map(|member| {
+                explanation
+                    .changes
+                    .iter()
+                    .find(|c| &c.evidence_id == member)
+                    .map(|c| noun_phrase(explanation, c))
+            })
+            .collect::<Vec<_>>()
+            .join(", then ");
+        out.push_str(&format!("  - chain: {root_phrase}: {members}\n"));
     }
 }
 
@@ -823,7 +977,179 @@ mod tests {
         "refresh status",
         "checkpoint",
         "snapshot",
+        "classification",
+        "algebra",
+        "drifted",
+        "downstream",
+        "cascade",
+        "causal group",
+        "ultimate root",
     ];
+
+    // Causality Req 6.1–6.4/6.7: clauses on the lines, voices and the
+    // uncertainty in place at detail, dependants stated, the chain told
+    // once, and `--json` carrying assessments, groups, and dependants.
+    #[test]
+    fn causality_renders_clauses_voices_dependants_and_the_chain() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use tokeira_explain::{BaselineView, CausalityView, apply_causality};
+
+        let mut status_by_id = BTreeMap::new();
+        let mut live_departed = BTreeSet::new();
+        for id in ["m/alpha", "m/beta", "m/gamma", "m/delta", "m/epsilon"] {
+            status_by_id.insert(
+                ResourceId(id.into()),
+                tokeira_iac::RefreshStatus::DesiredLive,
+            );
+        }
+        status_by_id.insert(
+            ResourceId("m/delta".into()),
+            tokeira_iac::RefreshStatus::Unknown,
+        );
+        live_departed.insert(ResourceId("m/gamma".into()));
+        let outcome = PlanOutcome {
+            changes: vec![
+                change(ChangeKind::Replace, "m/alpha"),
+                change(ChangeKind::Replace, "m/beta"),
+                change(ChangeKind::Update, "m/gamma"),
+                change(ChangeKind::Update, "m/delta"),
+                change(ChangeKind::NoChange, "m/epsilon"),
+            ],
+            refresh: RefreshCoverage {
+                status_by_id,
+                examined: true,
+                live_departed,
+            },
+            ..Default::default()
+        };
+        let mut r = report_for(&outcome, BindingVerdict::DevIterate, true);
+
+        let manifest = |v: &str| serde_json::json!({ "field": v });
+        let state = |i: u32| tokeira_iac::ResourceState {
+            resource_type: tokeira_iac::ResourceType::new("Stub"),
+            physical_id: format!("phys-{i}"),
+            properties: serde_json::json!({}),
+            dependencies: Vec::new(),
+            created_at: "t0".into(),
+            updated_at: "t0".into(),
+            module: "m".into(),
+        };
+        let ids = |v: &[&str]| {
+            v.iter()
+                .map(|s| ResourceId((*s).into()))
+                .collect::<Vec<_>>()
+        };
+        let view = CausalityView {
+            desired: Some(
+                [
+                    (ResourceId("m/alpha".into()), manifest("edited")),
+                    (ResourceId("m/beta".into()), manifest("same")),
+                    (ResourceId("m/gamma".into()), manifest("same")),
+                    (ResourceId("m/delta".into()), manifest("same")),
+                    (ResourceId("m/epsilon".into()), manifest("same")),
+                ]
+                .into(),
+            ),
+            baseline: BaselineView::Realized(
+                [
+                    (ResourceId("m/alpha".into()), manifest("original")),
+                    (ResourceId("m/beta".into()), manifest("same")),
+                    (ResourceId("m/gamma".into()), manifest("same")),
+                    (ResourceId("m/delta".into()), manifest("same")),
+                    (ResourceId("m/epsilon".into()), manifest("same")),
+                ]
+                .into(),
+            ),
+            baseline_revision: r.explanation.current_revision,
+            recorded: [
+                (ResourceId("m/alpha".into()), state(0)),
+                (ResourceId("m/beta".into()), state(1)),
+                (ResourceId("m/gamma".into()), state(2)),
+                (ResourceId("m/delta".into()), state(3)),
+                (ResourceId("m/epsilon".into()), state(4)),
+            ]
+            .into(),
+            edges: [
+                (ResourceId("m/beta".into()), ids(&["m/alpha"])),
+                (ResourceId("m/epsilon".into()), ids(&["m/alpha"])),
+            ]
+            .into(),
+            refresh: outcome.refresh.clone(),
+        };
+        apply_causality(&mut r.explanation, &view);
+
+        let summary = render(&r, Mode::resolve(false, false)).unwrap();
+        assert!(
+            summary.contains(
+                "- `m::m/alpha` would be replaced - the definition changed since revision 1\n"
+            ),
+            "edit clause: {summary}"
+        );
+        assert!(
+            summary.contains(
+                "- `m::m/beta` would be replaced - forced by the `m::m/alpha` replacement\n"
+            ),
+            "cascade clause names the nearest dependency: {summary}"
+        );
+        assert!(
+            summary.contains(
+                "- `m::m/gamma` would be updated - live state departed from what revision 1 applied\n"
+            ),
+            "drift clause: {summary}"
+        );
+        assert!(
+            summary.contains("- `m::m/delta` would be updated\n"),
+            "an unknown cause renders no clause at summary: {summary}"
+        );
+
+        let detail = render(&r, Mode::resolve(false, true)).unwrap();
+        assert!(
+            detail.contains(
+                "  - why: the definition changed since revision 1 - `tokeira_explain::causality`"
+            ),
+            "engine-fact voice with citation: {detail}"
+        );
+        assert!(
+            detail.contains("Tokeira derives this - per `tokeira_explain::causality`"),
+            "cascade owned as derived: {detail}"
+        );
+        assert!(
+            detail.contains("  - why: could not be established - "),
+            "unknown cause speaks through its uncertainty in place: {detail}"
+        );
+        assert!(
+            detail.contains("  - dependants changing with it: `m::m/beta`"),
+            "changing dependant stated: {detail}"
+        );
+        assert!(
+            detail.contains("  - dependants continuing unchanged: `m::m/epsilon`"),
+            "unchanged dependant stated: {detail}"
+        );
+        assert!(
+            detail.contains(
+                "  - chain: the definition change since revision 1: `m::m/alpha`, then `m::m/beta`"
+            ),
+            "the chain told once, root first: {detail}"
+        );
+
+        // Req 6.7: the structured form carries assessments, groups, and
+        // dependants at any depth.
+        let json: serde_json::Value =
+            serde_json::from_str(&render(&r, Mode::resolve(true, false)).unwrap()).unwrap();
+        assert_eq!(
+            json["causal_groups"].as_array().map(Vec::len),
+            Some(3),
+            "revision-comparison group + drift root + unknown own-root"
+        );
+        assert!(
+            json["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["cause"].get("engine-fact").is_some()),
+            "assessments serialized: {json}"
+        );
+    }
 
     #[test]
     fn the_banned_list_matches_the_language_doc() {

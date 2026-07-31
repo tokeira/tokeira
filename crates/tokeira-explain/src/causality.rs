@@ -142,9 +142,9 @@ pub(crate) fn assess(
     let Some(desired) = view.desired.as_ref() else {
         return undecided(
             "the change's origin could not be established: the working definition could \
-             not be realized into a snapshot"
+             not be interpreted for comparison"
                 .to_string(),
-            Some("repair the definition (definition check locates the verdict)".to_string()),
+            Some("repair the definition (definition check locates the failure)".to_string()),
         );
     };
 
@@ -172,8 +172,8 @@ pub(crate) fn assess(
                  definition is not retained, so no definition comparison exists"
                     .to_string(),
                 Some(format!(
-                    "restore revision {revision}'s snapshot under state/config-revisions, \
-                     or apply to establish a fresh baseline"
+                    "restore revision {revision}'s retained definition, or apply to \
+                     establish a fresh baseline"
                 )),
             );
         }
@@ -206,7 +206,7 @@ pub(crate) fn assess(
     // interrupted or partially recorded apply). A3b sits here, before the
     // state rows, deliberately: its change is a create, so cascade and
     // drift cannot meaningfully apply — and it SHALL NOT surface as a
-    // generic could-not-establish (operator-directed, 2026-07-30).
+    // generic could-not-establish.
     if in_d && !in_p {
         return definition_edit(); // A1
     }
@@ -268,13 +268,10 @@ pub(crate) fn assess(
     if !confirmed {
         return undecided(
             "the change's origin could not be established: live state was not confirmed, \
-             so provider drift cannot be separated from an engine advance"
+             so a departure cannot be told from the provisioner realizing the definition \
+             differently"
                 .to_string(),
-            Some(
-                "confirm live state for this resource (a plan that reaches it with a \
-                 supported describe) and re-plan"
-                    .to_string(),
-            ),
+            Some("confirm live state for this resource and plan again".to_string()),
         ); // A9
     }
 
@@ -300,7 +297,7 @@ pub(crate) fn assess(
     } // A8
 }
 
-/// A4's trace, all three gates (design C3, amended 2026-07-30):
+/// A4's trace, all three gates (design C3):
 /// (i) a recorded dependency edge R → dep — identity, never coincidence;
 /// (ii) a recorded output of dep whose value equals the leaf's working side
 /// **and** differs from its baseline side — "changed" as a P-vs-S state

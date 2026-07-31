@@ -266,30 +266,50 @@ specs' amendments are commutative.
 
 ## Phase 6 — Rendering, lexicon, integration
 
-- [ ] 6.1 Summary renders groups; detail renders assessments, chains, dependants
-  - Revision-level phrasing mandatory ("between revision N and the working definition");
-    derived classifications marked derived; unknown causes render via uncertainty only;
-    unaffected dependants stated at detail; empty dependant sections omitted
-  - _Requirements: 4.4, 5.2, 5.4, 6.1, 6.2, 6.3_
+- [x] 6.1 Causes on the lines; assessments, chains, dependants at detail
+  - Cause clauses join the change lines at summary (revision-attributed for edits);
+    detail adds the `why:` line in its confidence voice (derived classifications owned
+    as derived), the unknown cause's uncertainty in place, dependants split between
+    changing-with-it and continuing-unchanged (empty lines omitted), and the `chain:`
+    line once on a multi-member group's first member, root first
+  - DONE (2026-07-31) — `cause_phrase` + `change_detail` in `render.rs`; the
+    classifier's uncertainty copy reworded to the lexicon (no banned terms in prose);
+    default-cause plans render byte-identically to before, so F1/F2's pinned
+    transcripts stand untouched
+  - _Requirements: 4.4, 5.2, 5.4, 6.1, 6.2, 6.3, 6.4_
 
-- [ ] 6.2 Lexicon additions
-  - cause, drift, dependant, causal group, root added to `operator-language.md`;
+- [x] 6.2 Lexicon additions
+  - cause, drift, dependant, causal chain, root added to `operator-language.md`;
     Feature 1's lexicon-conformance property re-run
-  - _Requirements: 6.4_
+  - DONE (2026-07-31) — five rows with their banned-in-prose synonyms
+    (classification, algebra, drifted, downstream, cascade, causal group, ultimate
+    root) joined the suite's executable list; the canonical transcript carries cause
+    clauses; the doc-drift test and Property 11 green
+  - _Requirements: 6.6_
 
-- [ ] 6.3 `--json` carries assessments, groups, dependants at any depth
-  - _Requirements: 6.5_
+- [x] 6.3 `--json` carries assessments, groups, dependants at any depth
+  - DONE (2026-07-31) — asserted in the rendering test: `causal_groups` serialized,
+    engine-fact assessments present; the `Serialize` delegation is unchanged, so the
+    artifact and `--json` remain one schema
+  - _Requirements: 6.7_
 
-- [ ] 6.4 End-to-end integration
+- [x] 6.4 End-to-end integration
   - `platforms/compose/tests/exercise.rs`: edit the definition copy → plan → the
     edited resource classifies `DefinitionEdit`, untouched resources classify clean;
     over the live seam chain
+  - DONE (2026-07-31) — `causality_classifies_a_definition_edit_over_the_live_seam_chain`:
+    real `ComposeProvisioner::infra_plan`, real snapshots of the working and retained
+    definitions, recorded state written and read through the platform's own store
+    layout; assertions environment-independent (the edit is a content row needing no
+    live read; untouched resources classify by the running world — drift or an
+    in-place uncertainty — but never as the edit)
   - _Requirements: 1.6, 2.1, 2.2_
 
-- [ ] 6.5 **Final checkpoint** — full bar: `cargo +nightly fmt --all`,
+- [x] 6.5 **Final checkpoint** — full bar: `cargo +nightly fmt --all`,
   `cargo lint --locked` (zero warnings), `cargo check --workspace --locked`,
   `cargo test --workspace --locked`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
   --no-deps --locked`.
+  DONE (2026-07-31) — all five green. **Feature 3 is complete**: Phases 1–6 landed.
 
 ## Task Dependency Graph
 

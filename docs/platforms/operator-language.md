@@ -44,6 +44,11 @@ The operator's nouns. Reports use these words and no synonyms.
 | **replacement** | A change effected by destroying and recreating the resource; the plan says so even when the engine classifies it as an update. | recreate (as a label) |
 | **confidence** | How firmly a stated behaviour is held: the engine's own fact, the provider's documented guarantee, or a conclusion the engine derives — each carrying its citation. | certainty |
 | **citation** | The reference behind a stated behaviour: the engine's module identity, or a product document (title, link, and the establishing sentence). | source (as a label) |
+| **cause** | Why a change is in the plan, stated as a clause of its line ("the definition changed since revision 4") and, at detail, in its confidence voice as the `why:` line. An unknown cause speaks through its uncertainty, never as silence. | classification, algebra (in prose) |
+| **drift** | Live state departing from what an applied revision recorded — spoken as the fact ("live state departed from what revision 4 applied"), never as jargon. | drifted (as a bare verb) |
+| **dependant** | A resource that depends on a changing resource — stated at detail whether it changes with it or continues unchanged. | downstream, consumer (in prose) |
+| **causal chain** | Changes sharing one root, told once as the `chain:` line — the root first, members along the dependency path. | cascade (in prose), causal group (in prose) |
+| **root** | What a causal chain hangs from: the definition change, a resource's own change, or the provisioner advance. | ultimate root (in prose) |
 
 The operator's verbs, with their one-line meanings:
 
@@ -84,10 +89,10 @@ The lexicon applied — these are the reference renderings new output imitates.
 **Plan for compose** with *live state* confirmed
 
 ## Update
-- the *tokeirad* service would be updated - `tokeirad::compose/tokeirad`
+- the *tokeirad* service would be updated - the definition changed since revision 4 - `tokeirad::compose/tokeirad`
 
 ## Delete
-- the *Aurora DSQL cluster* would be deleted - `dsql::dsql/monitored`
+- the *Aurora DSQL cluster* would be deleted - the definition changed since revision 4 - `dsql::dsql/monitored`
 
 ## Impacts
 - data held by the *Aurora DSQL cluster* would be destroyed, irreversibly

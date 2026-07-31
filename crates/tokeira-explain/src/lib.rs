@@ -19,18 +19,20 @@
 
 pub mod artifact;
 pub mod build;
+pub mod causality;
 pub mod evidence;
 pub mod impacts;
 pub mod model;
 
 pub use artifact::ExplainError;
 pub use build::{DeploymentContext, explain_applied, explain_plan};
+pub use causality::{BaselineView, CausalityView, apply_causality};
 pub use evidence::{EvidenceId, EvidenceIndex, EvidenceKind};
 pub use impacts::derive_impacts;
 pub use model::{
-    Cause, CommittedChange, CommittedOp, DeploymentExplanation, EXPLANATION_SCHEMA_VERSION,
-    ExplainedChange, ImpactClass, OperationalImpact, SourceLocation, Uncertainty,
-    UncertaintyReason,
+    CausalGroup, CausalRoot, Cause, CommittedChange, CommittedOp, DeploymentExplanation,
+    EXPLANATION_SCHEMA_VERSION, ExplainedChange, ImpactClass, OperationalImpact, SourceLocation,
+    Uncertainty, UncertaintyReason,
 };
 // The semantics vocabulary is declared beside the `Resource` trait it
 // annotates (the Feature 1 amendment recorded in

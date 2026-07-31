@@ -37,18 +37,26 @@ pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
         .context("failed to load the deployment envelope")?;
 
     let verdict = check_binding(envelope.binding.as_ref(), &running);
+    // Causality's S is gathered before the plan runs its refresh
+    // (Requirement 2.3) — see the causality module's isolation rule.
+    let gathered = crate::causality::gather_causality(platform, deployment_dir, &envelope).await?;
     match platform.deploy_plan(deployment_dir).await? {
         Realization::NotApplicable { reason } => {
             anyhow::bail!("not applicable: {reason}");
         }
         Realization::Realized(outcome) => {
+            let mut explanation = tokeira_explain::explain_plan(
+                crate::explain_context(platform, deployment_dir, &envelope, "deploy plan"),
+                &outcome,
+            );
+            tokeira_explain::apply_causality(
+                &mut explanation,
+                &crate::causality::causality_view(gathered, &outcome),
+            );
             let report = crate::render::ExplanationReport {
                 initialized: envelope.binding.is_some(),
                 binding: verdict,
-                explanation: tokeira_explain::explain_plan(
-                    crate::explain_context(platform, deployment_dir, &envelope, "deploy plan"),
-                    &outcome,
-                ),
+                explanation,
             };
             // Artifact before report (Req 7.6): the verb fails before
             // claiming anything if the requested artifact cannot be written.

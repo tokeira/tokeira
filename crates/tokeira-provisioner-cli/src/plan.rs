@@ -23,14 +23,22 @@ pub(crate) async fn plan<P: ProvisionerPlatform>(
         .context("failed to load the deployment envelope")?;
 
     let verdict = check_binding(envelope.binding.as_ref(), &running);
+    // Causality's S is gathered before the plan runs its refresh
+    // (Requirement 2.3) — see the causality module's isolation rule.
+    let gathered = crate::causality::gather_causality(platform, deployment_dir, &envelope).await?;
     let outcome = platform.infra_plan(deployment_dir).await?;
+    let mut explanation = tokeira_explain::explain_plan(
+        crate::explain_context(platform, deployment_dir, &envelope, "infra plan"),
+        &outcome,
+    );
+    tokeira_explain::apply_causality(
+        &mut explanation,
+        &crate::causality::causality_view(gathered, &outcome),
+    );
     let report = ExplanationReport {
         initialized: envelope.binding.is_some(),
         binding: verdict,
-        explanation: tokeira_explain::explain_plan(
-            crate::explain_context(platform, deployment_dir, &envelope, "infra plan"),
-            &outcome,
-        ),
+        explanation,
     };
     // The artifact precedes the report: a verb that cannot deliver the
     // requested artifact fails before claiming anything (Req 7.6). The error

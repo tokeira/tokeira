@@ -38,6 +38,14 @@ impl EvidenceId {
         Self(format!("deployment:{name}"))
     }
 
+    /// One causal group: `group:{root_key}`, where the root key is the
+    /// group's natural root identity (`revision-comparison:{n}`,
+    /// `resource:{change id}`, `provisioner-advance`) — never a member
+    /// ordinal, for the same determinism reason as every other id here.
+    pub fn group(root_key: &str) -> Self {
+        Self(format!("group:{root_key}"))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -51,6 +59,7 @@ pub enum EvidenceKind {
     Change,
     Uncertainty,
     Impact,
+    CausalGroup,
 }
 
 /// The addressable collection of one explanation's evidence.

@@ -40,7 +40,42 @@ pub struct DeploymentExplanation {
     /// declarations (Feature 2, Requirement 4).
     pub destructive: Vec<EvidenceId>,
     pub uncertainties: Vec<Uncertainty>,
+    /// Causal groups over the non-`NoChange` changes (Feature 3,
+    /// Requirement 4): a partition, each group hanging from its bounded
+    /// ultimate root. `serde(default)` keeps pre-causality artifacts
+    /// readable — the slot pattern, applied at the document level.
+    #[serde(default)]
+    pub causal_groups: Vec<CausalGroup>,
     pub evidence: EvidenceIndex,
+}
+
+/// One causal story: the changes sharing a root, ordered along the
+/// dependency path from the root outward (Requirement 4.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalGroup {
+    pub evidence_id: EvidenceId,
+    pub root: CausalRoot,
+    /// Member change ids, dependency-path order from the root, ties and
+    /// unconnected members ordered by id.
+    pub members: Vec<EvidenceId>,
+}
+
+/// What a causal group hangs from (Requirement 4.3). Cascade chains walk to
+/// their first non-cascade cause and take *that* cause's root — one story —
+/// and the walk is bounded by the engine-version and baseline-revision
+/// boundaries (Requirement 4.6): an engine-advance origin roots here at
+/// `ProvisionerAdvance` and reaches no further back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CausalRoot {
+    /// Definition edits: the baseline-vs-working comparison itself.
+    RevisionComparison { baseline: u64 },
+    /// A resource's change: drift roots, output-trace dependencies (their
+    /// change may be `NoChange` — it still carries an id), unknown causes
+    /// (each its own root).
+    Resource(EvidenceId),
+    /// The provisioner advance: the engine-version boundary, and terminal.
+    ProvisionerAdvance,
 }
 
 /// One resource change, enriched with everything the layer knows about it.

@@ -132,7 +132,7 @@ ordered infrastructure modules, DSQL schema migrations, service rollout — with
 an explicit **plan → confirm → apply** contract: mutations are previewed, and
 destructive operations never run without `--yes` or interactive confirmation.
 Guide:
-[docs/platforms/iac/configuration.md](docs/platforms/iac/configuration.md).
+[docs/provisioning/deployment-configuration.md](docs/provisioning/deployment-configuration.md).
 
 ## Observability
 
@@ -148,7 +148,7 @@ validated by `tkr observability check`. Guide:
 Day-2 operation goes through the same tooling: scaling, log streaming,
 SSM-based port forwarding and container exec (no public endpoints), one-shot
 admin commands, and schema management. The command surface is in the
-[deployment configuration guide](docs/platforms/iac/configuration.md), and
+[deployment configuration guide](docs/provisioning/deployment-configuration.md), and
 each [platform guide](docs/platforms/README.md) shows its own operating loop.
 
 ## Security

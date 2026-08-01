@@ -4,6 +4,11 @@ The local platform runs `tokeirad` as a bare child process on the host. No
 containers, no Docker, no observability stack. This is the fastest path from
 zero to a running server for development and testing.
 
+Its current operator implementation uses `deployment.toml` and compiled in-process `tkr`
+handlers. It does not yet supply the custom TKD vocabulary and provenance-bound platform
+`tkp` required by the uniform platform architecture; this page documents the available
+current route rather than a second platform contract.
+
 ## Lifecycle
 
 ```bash
@@ -29,4 +34,4 @@ endpoint in `tokeirad.toml` before starting.
 ## See also
 
 - [Platform support matrix](../README.md)
-- [Deployment model and the `tkr` command surface](../iac/configuration.md)
+- [Deployment configuration and the `tkr` command surface](../../provisioning/deployment-configuration.md)

@@ -18,9 +18,10 @@ configuration; Ctrl-C stops the server.
 
 ## Where next
 
-- [Platform support](README.md) — `compose` adds the full observability
-  stack; `ecs` and `eks` are the production-shaped cloud platforms.
-- [Deployment configuration](iac/configuration.md) — the deployment model and
-  the full `tkr` command surface.
+- [Platform support](README.md) — Local, Compose, and ECS operator paths, plus
+  the implementation status of the EKS components.
+- [Provisioning](../provisioning/README.md) — the `tkr`/`tkp`/`tkd` triad.
+- [Deployment configuration](../provisioning/deployment-configuration.md) — the
+  deployment model and `tkr` command surface.
 - [Development guide](../development.md) — prerequisites and the build/test
   loop for working on Tokeira itself.

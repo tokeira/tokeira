@@ -5,6 +5,11 @@ DSQL persistence, and a full observability stack (Mimir, Loki, Grafana, Alloy).
 All services run in private subnets with no public ingress — operator access is
 via SSM Session Manager port forwarding and ECS Exec.
 
+Its current operator implementation uses `deployment.toml` and compiled in-process `tkr`
+handlers. It does not yet supply the custom TKD vocabulary and provenance-bound platform
+`tkp` required by the uniform platform architecture; this page documents the available
+current route rather than a second platform contract.
+
 ## Lifecycle
 
 ```bash
@@ -61,7 +66,7 @@ tkr observability check
 # Tear down
 tkr scale down
 tkr infra destroy --yes
-tkr deployment destroy prod --yes
+tkr deployment destroy --name prod --yes
 ```
 
 ## Infrastructure modules
@@ -159,4 +164,4 @@ tkr admin diagnostics runtime
 
 - [Platform support matrix](../README.md)
 - [Production observability](../observability.md)
-- [Deployment model and the `tkr` command surface](../iac/configuration.md)
+- [Deployment configuration and the `tkr` command surface](../../provisioning/deployment-configuration.md)

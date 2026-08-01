@@ -1,103 +1,134 @@
-# Compose Platform
+# Compose platform
 
-The compose platform runs a full Docker Compose stack: `tokeirad` plus an
-observability suite (Mimir, Loki, Grafana, Alloy). Requires Docker.
+Compose is the current complete custom-TKD platform chain. Its `definition.tkd`
+vocabulary, bridge, adapter, lifecycle implementation, Docker realization, and shared
+interpreter and transition machinery are compiled into the platform-owned Compose `tkp`.
+That deployment-local engine gives the definition its meaning; `tkr` owns its
+construction or discovery, placement, binding initialization, and launch verification.
+
+The default create path copies a native development binary and records a pre-identity
+stamp. Add `--bundle --build-image IMAGE@sha256:DIGEST` to request the current versioned
+path: `tkr` freezes the Compose seed package's reachable closure, derives
+`EngineIdentity`, obtains a tested and attested target artifact, and places both `tkp` and
+`tkp.manifest.json`. The [provisioning guide](../../provisioning/README.md) distinguishes
+these guarantees in detail.
+
+Compose runs `tokeirad` and the observability stack as Docker containers. A reachable
+Docker daemon is required for apply and destroy. Plan can still report desired changes
+when live Docker description is unavailable.
 
 ## Lifecycle
 
 ```bash
-# Create
-tkr deployment create --name dev-compose --platform compose --storage in-memory
+# Create definition.tkd, tokeirad.toml, metadata, state/, and a local tkp
+tkr deployment create \
+  --name dev-compose \
+  --platform compose \
+  --storage in-memory
 
-# Build the tokeirad image (compose reads it from the local Docker image store)
+# Build the runtime image referenced by the seeded definition
 tkr image build
 
-# Provision infrastructure (creates containers via bollard)
+# Check, review, and apply through the bound provisioner
+tkr definition check
 tkr infra plan
-tkr infra apply --yes
+tkr infra apply
 
-# Deploy services
-tkr deploy apply --yes
+# Inspect provisioner identity, binding, revision, and state facts
+tkr deployment describe --detail
 
-# Operations
-tkr scale status
-tkr logs tokeirad --follow --tail 50
-tkr logs grafana --tail 20
-tkr port-forward grafana
-
-# Module-scoped operations
-tkr infra apply --yes --module observability
-tkr infra destroy --yes --module observability
-
-# Tear down
+# Tear down provider resources before deleting the registry directory
 tkr infra destroy --yes
-tkr deployment destroy dev-compose --yes
+tkr deployment destroy --name dev-compose --yes
 ```
 
-## Modules
+The first apply runs the hidden Day-0 initialization before provider mutation. It stamps
+the envelope and retains `definition.tkd` as revision 0, then performs `tkp infra apply`.
+A non-destructive plan does not require `--yes`; deletes and replacements do.
 
-The compose platform organizes services into two modules:
+`tkr deploy plan/apply` is also forwarded, but Compose models containers as
+infrastructure resources, so those verbs realize the same desired universe as the infra
+verbs. Prefer the infra spelling when reasoning about the complete Compose stack.
 
-- **runtime** — `tokeirad`
-- **observability** — `mimir`, `loki`, `grafana`, `alloy` (pinned to
-  `grafana/mimir:3.0.6`, `grafana/loki:3.7.1`, `grafana/grafana-oss:12.4.3`,
-  `grafana/alloy:v1.16.0`)
+## Definition and modules
 
-## Why the build step is separate
+The seeded `definition.tkd` contains both operator config and deployment structure. The
+canonical definition organizes the desired model into:
 
-`tkr deploy apply` does not invoke the image builder — it requires
-`tokeirad:latest` to already exist in the local Docker image store. This keeps
-the deploy path deterministic and fast: a repeat deploy does not rebuild.
-Re-run `tkr image build` whenever you want a fresh `tokeirad` binary in the
-compose stack, then `tkr deploy apply --yes --force` to recreate services that
-sit behind an unchanged tag.
+- **`local_state`** — deployment-local state and rendered configuration roots;
+- **`dsql`** — conditional Aurora DSQL and coordination resources;
+- **`observability`** — Mimir, Loki, Grafana, Alloy, and their rendered config; and
+- **`runtime`** — `tokeirad` containers and their dependencies.
 
-## Storage and schema
+The `dsql` module exists only when the definition's `Storage` config selects DSQL. Module
+and resource ordering is evaluated by the convergence engine after interpretation.
 
-The lifecycle above uses `--storage in-memory`, which needs no schema setup.
-Compose also supports Aurora DSQL through the `dsql` infrastructure module.
-DSQL deployments use `deployment.toml` for platform storage intent and
-`tokeirad.toml` writeback for the server runtime endpoint/region.
+Forwarded Compose operations currently apply `ModuleSelection::All`. Although the shared
+`tkr infra` parser exposes `--module`, that option has no TKP counterpart and is not a
+Compose scoping mechanism.
 
-### Recommended compose + DSQL lifecycle
+Read the
+[deployment definition programming guide](../../provisioning/deployment-definitions.md)
+for the admitted language and interpreter model. See
+[definition patterns and current practice](../../provisioning/deployment-definition-patterns.md)
+for the source-backed Compose builder and module idioms.
+
+## Image changes
+
+Image building is separate from convergence. `tkr image build` does not require an
+active deployment and does not edit `definition.tkd`.
+
+A definition identifies the desired image by tag. Rebuilding different bytes behind the
+same tag does not change that desired value, and the forwarded TKP surface has no
+`--force` flag. To make an image change explicit, build a new tag and update the image
+field in `definition.tkd`, then plan and apply.
 
 ```bash
-# Create DSQL-backed compose config. Region defaults to us-east-1.
-tkr deployment create --name dev-dsql --platform compose --storage dsql --region us-east-1
-
-# Build the local runtime image used by compose.
-tkr image build
-
-# Provision or adopt only the DSQL cluster first.
-tkr infra apply --yes --module dsql
-
-# Apply all DSQL migrations against the written-back endpoint.
-tkr schema setup --yes
-
-# Provision observability/runtime resources and deploy services.
-tkr infra apply --yes
-tkr deploy apply --yes
+tkr image build --tag dev-2
+# Edit definition.tkd: image: "tokeirad:dev-2".into()
+tkr definition check
+tkr infra plan
+tkr infra apply
 ```
 
-The two-phase infra flow keeps storage provisioning separate from service
-startup: `tokeirad` connects to DSQL during boot and will fail fast if the
-endpoint or schema is missing. A one-shot `tkr infra apply --yes` also works,
-but run `tkr schema setup --yes` before `tkr deploy apply`.
+## DSQL configuration
 
-### Preexisting clusters
+Select DSQL through the `Storage::Dsql` value in `definition.tkd`; a Compose deployment
+created with `--storage dsql --region REGION` receives that shape in its seeded
+`config()` literal. The definition can request a managed cluster or describe a
+preexisting cluster using its endpoint and ARN fields.
 
-For preexisting clusters, set `[dsql] mode = "preexisting"` and
-`endpoint = "...dsql.<region>.on.aws"` in `deployment.toml` before
-`tkr infra apply --module dsql`. The module records the endpoint and skips
-provider deletion. AWS credentials must be available through the standard local
-provider chain; compose mounts `~/.aws` into the `tokeirad` container and
-forwards simple provider-chain environment variables.
+A DSQL definition declares deferred writeback from resource outputs to server config,
+and the Compose adapter can calculate those values from applied infrastructure state.
+The TKP platform seam returns committed change identities rather than a writeback payload,
+so the forwarded apply does not persist calculated updates into `tokeirad.toml`. Verify
+and complete the server runtime config before starting a DSQL-backed server.
+
+The `tkr schema` commands are in-process handlers and are not forwarded for a
+`definition.tkd` deployment. Do not use the in-process Compose/DSQL sequence from an
+older `deployment.toml` deployment as an operator recipe for this path.
+
+## Operations available through `tkr`
+
+| Command | Compose behavior |
+|---|---|
+| `tkr definition check` | Fully parses and interprets the definition in memory. |
+| `tkr infra plan/apply/destroy` | Forwards to the deployment-local TKP and its Compose `ProvisionerPlatform`. |
+| `tkr deploy plan/apply` | Forwards to TKP; delegates to the same infrastructure universe. |
+| `tkr deployment describe/apply/upgrade/rollback` | Uses the trust-aware provisioner launcher. |
+| `tkr scale up/down` | Forwards to TKP, which returns `NotApplicable` because Compose exposes no scale dimension. |
+| `tkr infra status`, `deploy status`, `scale status` | Render TKP `describe`. |
+| `tkr logs`, `port-forward`, `exec`, `schema` | In-process-only; no forwarded Compose path. |
 
 ## See also
 
 - [Platform support matrix](../README.md)
-- [Production observability](../observability.md) — what the stack
-  collects, provisions, and alerts on
+- [Provisioning](../../provisioning/README.md) — the `tkr`/`tkp`/`tkd` triad
+- [Deployment definition programming guide](../../provisioning/deployment-definitions.md) —
+  abstract language and authoring rules.
+- [Definition patterns and current practice](../../provisioning/deployment-definition-patterns.md) —
+  Compose source, bridge, and adapter idioms.
+- [`tkr` and `tkp`](../../provisioning/tkr-and-tkp.md) — forwarding, launch trust,
+  upgrade, and rollback
+- [Production observability](../observability.md) — what the stack collects and alerts on
 - [Compose + DSQL performance analysis](../../compose-dsql-performance.md)
-- [Deployment definitions](../iac/deployment-definitions.md) — the compose platform's
-  platform realizes the same stack from an interpreted `definition.tkd`

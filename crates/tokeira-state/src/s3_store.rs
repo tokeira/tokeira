@@ -92,23 +92,19 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         }
     }
 
-    /// Persist a new state snapshot and atomically move the manifest head.
+    /// Persist a new state snapshot if the manifest still has `expected_version`.
     ///
-    /// Returns the manifest ETag after the successful commit so callers that
-    /// coordinate multiple writes can carry the latest version forward.
-    pub async fn save(&self, state: &T) -> Result<String, StateError> {
-        let bytes = serde_json::to_vec_pretty(state)
-            .map_err(|e| StateError::Corrupted(format!("failed to serialize state: {e}")))?;
+    /// An empty expected version permits only the first write. The returned ETag
+    /// belongs to the exact manifest CAS that committed this document and must
+    /// be passed to the next save derived from it.
+    pub async fn save(&self, state: &T, expected_version: &str) -> Result<String, StateError> {
+        let bytes = serialize_validated_state(state)?;
         let guard = self
-            .acquire_lock(self.owner_id.clone(), Self::DEFAULT_LEASE_DURATION)
+            .acquire_save_lock(expected_version, Self::DEFAULT_LEASE_DURATION)
             .await?;
 
-        match self.write_snapshot(&guard, &bytes).await {
-            Ok(_) => self
-                .get_manifest()
-                .await?
-                .map(|manifest| manifest.etag)
-                .ok_or_else(|| StateError::Corrupted("manifest missing after save".into())),
+        match self.write_snapshot_with_version(&guard, &bytes).await {
+            Ok((_, version)) => Ok(version),
             Err(err @ StateError::Conflict(_))
             | Err(err @ StateError::LockLost(_))
             | Err(err @ StateError::Locked(_)) => Err(err),
@@ -119,6 +115,60 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
                 Err(err)
             }
         }
+    }
+
+    /// Acquire the save lease only if the caller's document version is current.
+    async fn acquire_save_lock(
+        &self,
+        expected_version: &str,
+        lease_duration: Duration,
+    ) -> Result<LockGuard, StateError> {
+        let current = self.get_manifest().await?;
+        verify_expected_manifest_version(current.as_ref(), expected_version)?;
+
+        let lease_delta = ChronoDuration::from_std(lease_duration)
+            .map_err(|e| StateError::Other(anyhow::anyhow!("invalid lease duration: {e}")))?;
+        let now = Utc::now();
+
+        if let Some(existing) = current
+            .as_ref()
+            .and_then(|state| state.manifest.lock.as_ref())
+            && !Self::lock_has_expired(existing.expires_at, now)
+        {
+            return Err(StateError::Locked(format!(
+                "state is locked by {} until {}",
+                existing.owner_id, existing.expires_at
+            )));
+        }
+
+        let lock = StateLeaseLock {
+            owner_id: self.owner_id.clone(),
+            token: Uuid::new_v4().to_string(),
+            acquired_at: now,
+            expires_at: now + lease_delta,
+        };
+        let mut next = current
+            .as_ref()
+            .map_or_else(StateManifest::empty, |state| state.manifest.clone());
+        next.lock = Some(lock.clone());
+
+        // The conditional write combines stale-document rejection with lease
+        // acquisition. A separate version check followed by an unconditional
+        // lock acquisition would recreate the check-to-use race this CAS closes.
+        match current {
+            Some(_) => {
+                self.put_manifest_if_match(expected_version, &next).await?;
+            }
+            None => {
+                self.put_manifest_if_absent(&next).await?;
+            }
+        }
+
+        Ok(LockGuard {
+            owner_id: lock.owner_id,
+            token: lock.token,
+            expires_at: lock.expires_at,
+        })
     }
 
     /// Like [`load`](Self::load) but also returns the manifest ETag as an opaque
@@ -228,6 +278,16 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         guard: &LockGuard,
         state_bytes: &[u8],
     ) -> Result<SnapshotRef, StateError> {
+        self.write_snapshot_with_version(guard, state_bytes)
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    async fn write_snapshot_with_version(
+        &self,
+        guard: &LockGuard,
+        state_bytes: &[u8],
+    ) -> Result<(SnapshotRef, String), StateError> {
         let current = self.ensure_manifest().await?;
         let current_lock = current
             .manifest
@@ -255,7 +315,9 @@ impl<T: Serialize + DeserializeOwned + Default + Validate> S3StateStore<T> {
         next.lock = None;
 
         match self.put_manifest_if_match(&current.etag, &next).await {
-            Ok(_) => Ok(snapshot),
+            // A follow-up GET could observe a later writer and pair its ETag
+            // with this caller's document. Only this CAS result is its version.
+            Ok(committed) => Ok((snapshot, committed.etag)),
             Err(StateError::Conflict(_)) => Err(StateError::Conflict(
                 "manifest changed during commit; snapshot was uploaded but not committed".into(),
             )),
@@ -560,6 +622,33 @@ fn sha256_base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
+fn serialize_validated_state<T: Serialize + Validate>(state: &T) -> Result<Vec<u8>, StateError> {
+    state.validate()?;
+    serde_json::to_vec_pretty(state)
+        .map_err(|e| StateError::Corrupted(format!("failed to serialize state: {e}")))
+}
+
+fn verify_expected_manifest_version(
+    current: Option<&ManifestState>,
+    expected_version: &str,
+) -> Result<(), StateError> {
+    match current {
+        None if expected_version.is_empty() => Ok(()),
+        None => Err(StateError::Conflict(format!(
+            "manifest does not exist but expected version {expected_version}"
+        ))),
+        Some(current) if expected_version.is_empty() => Err(StateError::Conflict(format!(
+            "manifest already exists (version {}); expected empty version for first write",
+            current.etag
+        ))),
+        Some(current) if current.etag != expected_version => Err(StateError::Conflict(format!(
+            "manifest version mismatch: expected {expected_version}, got {}",
+            current.etag
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
 fn is_missing<E: ProvideErrorMetadata>(err: &E) -> bool {
     matches!(
         err.code(),
@@ -601,4 +690,55 @@ fn is_cas_conflict<E: ProvideErrorMetadata>(err: &E) -> bool {
         err.code(),
         Some("PreconditionFailed") | Some("ConditionalRequestConflict")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    struct TestDoc {
+        valid: bool,
+    }
+
+    impl Validate for TestDoc {
+        fn validate(&self) -> Result<(), StateError> {
+            if self.valid {
+                Ok(())
+            } else {
+                Err(StateError::Corrupted("invalid test document".into()))
+            }
+        }
+    }
+
+    fn manifest_state(etag: &str) -> ManifestState {
+        ManifestState {
+            manifest: StateManifest::empty(),
+            etag: etag.to_string(),
+            version_id: None,
+        }
+    }
+
+    #[test]
+    fn save_boundary_validates_before_serialization() {
+        let err = serialize_validated_state(&TestDoc { valid: false }).unwrap_err();
+        assert!(matches!(err, StateError::Corrupted(_)));
+    }
+
+    #[test]
+    fn stale_manifest_version_is_a_conflict() {
+        let current = manifest_state("current");
+        let err = verify_expected_manifest_version(Some(&current), "stale").unwrap_err();
+        assert!(matches!(err, StateError::Conflict(_)));
+    }
+
+    #[test]
+    fn empty_version_only_allows_an_absent_manifest() {
+        verify_expected_manifest_version(None, "").unwrap();
+
+        let current = manifest_state("current");
+        let err = verify_expected_manifest_version(Some(&current), "").unwrap_err();
+        assert!(matches!(err, StateError::Conflict(_)));
+    }
 }

@@ -16,10 +16,8 @@ use crate::{CasStore, S3StateStore, StateError, Validate};
 /// A deployment state store, abstracting over [`CasStore`] and [`S3StateStore`].
 ///
 /// `load` returns the current document plus an opaque version tag; pass that tag
-/// back to `save` (empty string on first write). The CAS store uses the tag for
-/// optimistic compare-and-swap; the S3-native store self-manages CAS through its
-/// lease and manifest ETag, so for it the tag is advisory (higher-level mutual
-/// exclusion is the remote operation lock).
+/// back to `save` (empty string on first write). Both stores use the tag for
+/// optimistic compare-and-swap and reject a save derived from stale state.
 #[async_trait]
 pub trait DeploymentStore<T>: Send + Sync {
     /// Load the current document and an opaque version tag for CAS on save.
@@ -53,11 +51,8 @@ where
         S3StateStore::load_with_version(self).await
     }
 
-    async fn save(&self, doc: &T, _expected_version: &str) -> Result<String, StateError> {
-        // The S3-native store self-manages CAS via its lease + manifest ETag, so
-        // the caller's expected version is advisory. The returned manifest ETag
-        // is the new version tag.
-        S3StateStore::save(self, doc).await
+    async fn save(&self, doc: &T, expected_version: &str) -> Result<String, StateError> {
+        S3StateStore::save(self, doc, expected_version).await
     }
 }
 

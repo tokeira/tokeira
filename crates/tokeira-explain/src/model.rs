@@ -294,19 +294,38 @@ impl UncertaintyReason {
     }
 }
 
-/// One committed change from an apply — the model's own copy of the
-/// ids-only audit entry, so this crate does not depend on the provisioner
-/// domain crate (Requirement 9.1); the shell maps at its boundary.
+/// One committed change from an apply, in the model's own vocabulary so
+/// this crate depends on no engine or provisioner types (Requirement 9.1);
+/// the shell maps at its boundary. Identity only — id, operation, the
+/// module/type halves of the natural key, and the operator noun — never
+/// before-images (Proposal 002).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedChange {
     pub id: String,
     pub op: CommittedOp,
+    /// The definition-side module name; empty when the apply's source could
+    /// not name one (the evidence id then omits the module half rather than
+    /// inventing it).
+    #[serde(default)]
+    pub module: String,
+    #[serde(default)]
+    pub resource_type: String,
+    /// The operator noun (`"service"`, `"Aurora DSQL cluster"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
+/// What an apply did to one resource. `Replaced` is the engine's own
+/// classification — the persisted audit log folds it to updated (identities,
+/// not mechanics), but the applied report states the mechanics. `Unchanged`
+/// rows are the census: they render no line, and they are why a noun like
+/// "service" can be told ambiguous without re-reading the definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CommittedOp {
     Created,
     Updated,
+    Replaced,
     Deleted,
+    Unchanged,
 }

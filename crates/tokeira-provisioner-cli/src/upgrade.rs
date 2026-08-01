@@ -62,7 +62,8 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         // Idempotent remainder: drift gate, apply B's plan, record the audit
         // log, close the marker — the same tail the fresh path runs.
         check_baseline_drift(&envelope)?;
-        let applied = platform.infra_apply(deployment_dir).await?;
+        let applied =
+            crate::change_log_entries(&platform.infra_apply(deployment_dir).await?.changes);
         println!(
             "infra apply: {}",
             tokeira_report::counted(applied.len(), "change")
@@ -153,7 +154,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     check_baseline_drift(&envelope)?;
 
     // ── Apply B's plan (realized by the injected platform) ──
-    let applied = platform.infra_apply(deployment_dir).await?;
+    let applied = crate::change_log_entries(&platform.infra_apply(deployment_dir).await?.changes);
     println!(
         "infra apply: {}",
         tokeira_report::counted(applied.len(), "change")

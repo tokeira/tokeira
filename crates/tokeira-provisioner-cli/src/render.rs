@@ -46,8 +46,16 @@ impl serde::Serialize for ExplanationReport {
 impl Report for ExplanationReport {
     fn narrative(&self, depth: Depth, out: &mut String) {
         let explanation = &self.explanation;
-        // `# Infra Plan` — the operation, title-cased.
+        // `# Infra Plan` / `# Infra Apply` — the operation, title-cased.
         out.push_str(&format!("# {}\n", title_case(&explanation.operation)));
+        // The apply document is its own form (output-templates §The apply
+        // document): a past-tense record with the revision-advance header
+        // and no binding framing — the gate already spoke by letting the
+        // verb run.
+        if explanation.operation.ends_with("apply") {
+            applied_narrative(explanation, out);
+            return;
+        }
         // The header anchors the deployment's revision once — the one place
         // the document states a revision number, and no coverage clause: a
         // plan only renders what could execute (output-templates §header).
@@ -72,6 +80,73 @@ impl Report for ExplanationReport {
         drift_section(explanation, depth, out);
         unchanged_section(explanation, depth, out);
         impacts_section(explanation, out);
+    }
+}
+
+/// The apply document (`output-templates.md` §The apply document): the
+/// revision-advance header — the document's one revision statement — then
+/// past-tense action sections recording what committed, each line the
+/// identity with the gating plan's field evidence where ids matched. An
+/// apply that ran without a gating plan states the absence once, in the
+/// header; the per-change gaps stay machine-side as field-evidence
+/// uncertainties. The unchanged census renders no line. Both depths render
+/// the same document — an apply's evidence is what it reused, already on
+/// the lines.
+fn applied_narrative(explanation: &DeploymentExplanation, out: &mut String) {
+    let advance = match explanation.proposed_revision {
+        Some(to) => format!("revision {} → {to}", explanation.current_revision),
+        None => format!("revision {}", explanation.current_revision),
+    };
+    let unevidenced = explanation.uncertainties.iter().any(|u| {
+        matches!(
+            u.reason,
+            tokeira_explain::UncertaintyReason::FieldEvidenceUnavailable
+        )
+    });
+    let qualifier = if unevidenced {
+        ", without a gating plan's evidence"
+    } else {
+        ""
+    };
+    out.push_str(&format!(
+        "**Applied to {}** — {advance}{qualifier}\n",
+        explanation.platform,
+    ));
+    for (kind, section) in [
+        (ChangeKind::Create, "## Created"),
+        (ChangeKind::Update, "## Updated"),
+        (ChangeKind::Replace, "## Replaced"),
+        (ChangeKind::Delete, "## Deleted"),
+    ] {
+        let members: Vec<&ExplainedChange> = explanation
+            .changes
+            .iter()
+            .filter(|c| c.kind == kind)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n{section}\n"));
+        for change in members {
+            let clause = diff_clause(change)
+                .map(|phrase| format!(" - {phrase}"))
+                .unwrap_or_default();
+            let line = if change.display.is_some() {
+                format!(
+                    "- {}{clause} - `{}::{}`\n",
+                    noun_phrase(explanation, change),
+                    change.module,
+                    change.resource_id,
+                )
+            } else if change.module.is_empty() {
+                // A source that could not name the module states the bare
+                // resource id rather than a dangling `::`.
+                format!("- {}{clause}\n", code_span(&change.resource_id))
+            } else {
+                format!("- `{}::{}`{clause}\n", change.module, change.resource_id)
+            };
+            out.push_str(&line);
+        }
     }
 }
 
@@ -1263,7 +1338,7 @@ mod tests {
                 resource: "dsql/cluster".into(),
                 resource_type: "dsql_cluster".into(),
                 kind: ChangeKind::Replace,
-                details: vec![FieldDiff {
+                details: vec![tokeira_iac::FieldDiff {
                     field: "deletion_protection".into(),
                     before: Some("enabled".into()),
                     after: Some("disabled".into()),
@@ -1491,6 +1566,112 @@ mod tests {
                 block.trim_end(),
                 rendered.trim_end(),
                 "output-templates.md and the renderer have drifted ({marker})"
+            );
+        }
+    }
+
+    /// The apply reference worlds from `output-templates.md` §The apply
+    /// document. Gated: grafana's image edit applied with its diff reused
+    /// from the gating plan, the cluster replaced without reusable field
+    /// evidence (its plan row carried none), the unchanged services along
+    /// as the census. Ungated (`--yes`): the same grafana update with no
+    /// plan in the run — identity alone, the absence stated in the header.
+    fn applied_reference_report(gated: bool) -> ExplanationReport {
+        use tokeira_explain::{CommittedChange, CommittedOp};
+
+        let service = |id: &str, module: &str, op: CommittedOp| CommittedChange {
+            id: id.to_string(),
+            op,
+            module: module.to_string(),
+            resource_type: "compose_service".to_string(),
+            display: Some("service".to_string()),
+        };
+        let mut committed = vec![
+            service("compose/grafana", "grafana", CommittedOp::Updated),
+            service("compose/mimir", "mimir", CommittedOp::Unchanged),
+            service("compose/alloy", "alloy", CommittedOp::Unchanged),
+        ];
+        if gated {
+            committed.push(CommittedChange {
+                id: "dsql/cluster".to_string(),
+                op: CommittedOp::Replaced,
+                module: "storage".to_string(),
+                resource_type: "dsql_cluster".to_string(),
+                display: Some("Aurora DSQL cluster".to_string()),
+            });
+        }
+
+        let preceding = gated.then(|| PlanOutcome {
+            changes: vec![
+                Change {
+                    kind: ChangeKind::Update,
+                    resource_type: "compose_service".to_string(),
+                    module: "grafana".to_string(),
+                    resource: "compose/grafana".to_string(),
+                    details: vec![tokeira_iac::FieldDiff {
+                        field: "image".to_string(),
+                        before: Some("grafana/grafana-oss:12.4.3".to_string()),
+                        after: Some("grafana/grafana-oss:12.5.0".to_string()),
+                    }],
+                },
+                Change {
+                    kind: ChangeKind::Replace,
+                    resource_type: "dsql_cluster".to_string(),
+                    module: "storage".to_string(),
+                    resource: "dsql/cluster".to_string(),
+                    details: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        });
+
+        let explanation = tokeira_explain::explain_applied(
+            tokeira_explain::DeploymentContext {
+                deployment: "test-deployment".to_string(),
+                platform: "compose".to_string(),
+                operation: "infra apply".to_string(),
+                current_revision: 4,
+                proposed_revision: Some(5),
+                definition_ref: None,
+            },
+            &committed,
+            preceding.as_ref(),
+        );
+        ExplanationReport {
+            initialized: true,
+            binding: BindingVerdict::DevIterate,
+            explanation,
+        }
+    }
+
+    // The apply transcripts are executable like the plan's: the doc's two
+    // reference blocks ARE the renderer's output for their fixtures,
+    // byte-for-byte (umbrella D10).
+    #[test]
+    fn the_apply_transcripts_are_executable() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.kiro/specs/operator-explanation/output-templates.md"
+        );
+        let doc = std::fs::read_to_string(path).expect("output-templates.md exists");
+        for (marker, gated) in [
+            ("<!-- reference: infra-apply-after-plan -->", true),
+            ("<!-- reference: infra-apply-no-plan -->", false),
+        ] {
+            let r = applied_reference_report(gated);
+            let rendered = render(&r, Mode::resolve(false, false)).unwrap();
+            let block = fenced_block_after(&doc, marker).unwrap_or_else(|| {
+                panic!("{marker} block missing from output-templates.md.\nRendered:\n{rendered}")
+            });
+            assert_eq!(
+                block.trim_end(),
+                rendered.trim_end(),
+                "output-templates.md and the renderer have drifted ({marker})"
+            );
+            let detail = render(&r, Mode::resolve(false, true)).unwrap();
+            assert_eq!(
+                rendered, detail,
+                "the apply document is depth-invariant ({marker})"
             );
         }
     }

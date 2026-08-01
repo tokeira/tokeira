@@ -107,16 +107,20 @@ pub fn explain_applied(
     let mut explanation = base(context);
 
     for entry in committed {
-        // The audit log records bare engine ResourceIds; the module half of
-        // the natural key is unknown here, and inventing one would collide
-        // with plan-side ids dishonestly. The id form is
-        // `change:{resource_id}` alone — stable, and distinct by
-        // construction from plan-side ids.
-        let evidence_id = EvidenceId::change("", &entry.id);
+        // The committed identity is the apply's own: the shell maps what the
+        // engine executed (module, type, noun, a true `Replaced`) at its
+        // boundary. With the module known, the evidence id matches the
+        // plan-side id for the same resource (Requirement 3.5 — same
+        // resource, same id); a source that cannot name the module leaves it
+        // empty rather than inventing one, and the id degrades to
+        // `change:::{resource_id}` — still stable, still distinct.
+        let evidence_id = EvidenceId::change(&entry.module, &entry.id);
         let kind = match entry.op {
             CommittedOp::Created => ChangeKind::Create,
             CommittedOp::Updated => ChangeKind::Update,
+            CommittedOp::Replaced => ChangeKind::Replace,
             CommittedOp::Deleted => ChangeKind::Delete,
+            CommittedOp::Unchanged => ChangeKind::NoChange,
         };
         let planned = preceding.and_then(|plan| {
             plan.changes
@@ -139,11 +143,16 @@ pub fn explain_applied(
         explanation.changes.push(ExplainedChange {
             evidence_id: evidence_id.clone(),
             resource_id: entry.id.clone(),
-            display: preceding
-                .and_then(|plan| plan.display_by_id.get(&ResourceId(entry.id.clone())))
-                .cloned(),
-            module: String::new(),
-            resource_type: String::new(),
+            // The apply's own noun first; a preceding plan's map fills in
+            // only where the apply's source carried none (reuse, never
+            // invent — Req 2).
+            display: entry.display.clone().or_else(|| {
+                preceding
+                    .and_then(|plan| plan.display_by_id.get(&ResourceId(entry.id.clone())))
+                    .cloned()
+            }),
+            module: entry.module.clone(),
+            resource_type: entry.resource_type.clone(),
             kind,
             field_diffs,
             refresh_status,
@@ -165,7 +174,9 @@ pub fn explain_applied(
             explanation.destructive.push(evidence_id.clone());
         }
 
-        if preceding.is_none() {
+        // The census makes no claims, so it opens no gaps: only an acting
+        // change without a gating plan is missing evidence it should have.
+        if preceding.is_none() && kind != ChangeKind::NoChange {
             push_uncertainty(
                 &mut explanation,
                 evidence_id,

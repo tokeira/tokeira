@@ -376,6 +376,16 @@ impl<D: Deployment> InfraEngine<D> {
         Ok(changes)
     }
 
+    /// The composition's operator nouns, per resource — the identity half an
+    /// applied report renders (see [`iac::Engine::display_map`]). Pure over
+    /// the composed definition; no state load, no I/O.
+    pub fn display_map(
+        &self,
+        composition: &iac::InfraComposition,
+    ) -> Result<std::collections::BTreeMap<iac::ResourceId, String>> {
+        Ok(self.engine.display_map(composition, &self.ctx)?)
+    }
+
     /// Destroy the resources in the supplied composition and persist state.
     pub async fn destroy(
         &mut self,

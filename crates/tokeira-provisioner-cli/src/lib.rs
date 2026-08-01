@@ -62,6 +62,20 @@ pub enum Realization<T> {
 /// plan's changes without translation.
 pub type DesiredSnapshot = std::collections::BTreeMap<tokeira_iac::ResourceId, serde_json::Value>;
 
+/// What an apply committed, under the identity the engine executed it with.
+///
+/// The persisted audit vocabulary stays ids-only (Proposal 002) —
+/// [`change_log_entries`] distills `changes` wherever an audit record is
+/// needed. The full engine identity (module, resource type, a `Replace`
+/// kind the audit log folds away) and the operator nouns exist here because
+/// the applied report states what committed in the operator's language, and
+/// reading them back from anywhere else would be re-derivation or invention.
+#[derive(Debug, Clone, Default)]
+pub struct AppliedOutcome {
+    pub changes: Vec<tokeira_iac::Change>,
+    pub display_by_id: std::collections::BTreeMap<tokeira_iac::ResourceId, String>,
+}
+
 /// The seam a per-platform provisioner binary implements: the platform-realized
 /// verbs plus the platform properties the shell genuinely needs. Everything else
 /// — gating, locking, the envelope, revisions, describe — is the shell's.
@@ -88,11 +102,12 @@ pub trait ProvisionerPlatform {
     /// unconditional, unlike the workload verbs below.
     async fn infra_plan(&self, deployment_dir: &Path) -> Result<PlanOutcome>;
 
-    /// Reconcile infrastructure to desired. Returns the **identities** of the
-    /// changes committed (ids-only — never before-images, Proposal 002): the
-    /// shell prints the count and `upgrade` records them as the audit change
-    /// log (task 19.2). [`change_log_entries`] maps an engine Delta.
-    async fn infra_apply(&self, deployment_dir: &Path) -> Result<Vec<ChangeLogEntry>>;
+    /// Reconcile infrastructure to desired. Returns the committed changes
+    /// with their engine identity and operator nouns — never before-images
+    /// (Proposal 002): the applied report renders identity, and `upgrade`
+    /// records the [`change_log_entries`] distillation as the audit change
+    /// log (task 19.2).
+    async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome>;
 
     /// Tear down the deployment's infrastructure. Returns the removed count.
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize>;
@@ -163,10 +178,9 @@ pub trait ProvisionerPlatform {
     /// resources) realizes this as the infra plan.
     async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<PlanOutcome>>;
 
-    /// Reconcile the workload to desired. Returns the committed change
-    /// identities, like [`infra_apply`](Self::infra_apply).
-    async fn deploy_apply(&self, deployment_dir: &Path)
-    -> Result<Realization<Vec<ChangeLogEntry>>>;
+    /// Reconcile the workload to desired. Returns the committed changes
+    /// with their identity, like [`infra_apply`](Self::infra_apply).
+    async fn deploy_apply(&self, deployment_dir: &Path) -> Result<Realization<AppliedOutcome>>;
 
     /// Change workload capacity (`<dim>=<n>` specs). `NotApplicable` where the
     /// platform has no scale dimension. Returns the change count.
@@ -232,23 +246,35 @@ pub(crate) fn emit_report(text: &str, mode: tokeira_report::Mode) {
     }
 }
 
-/// Map audit entries to the explanation's committed changes at the shell
-/// boundary (evidence-model C3): the model crate must not depend on
-/// `tokeira-provisioner` (Req 9.1), so the audit type crosses into the
-/// model's own vocabulary here — ids and operations only, exactly what the
-/// audit log records (Proposal 002).
-pub(crate) fn committed_changes(
-    entries: &[ChangeLogEntry],
-) -> Vec<tokeira_explain::CommittedChange> {
-    entries
+/// Map an apply's committed changes into the explanation's vocabulary at the
+/// shell boundary (evidence-model C3): the model crate must not depend on
+/// the engine types (Req 9.1), so identity crosses here — ids, operations,
+/// the module/type halves of the natural key, and the operator noun. Never
+/// before-images (Proposal 002). `NoChange` rows cross as the unchanged
+/// census — they render nothing, but they carry the noun ambiguity the
+/// renderer needs.
+pub(crate) fn committed_changes(applied: &AppliedOutcome) -> Vec<tokeira_explain::CommittedChange> {
+    applied
+        .changes
         .iter()
-        .map(|entry| tokeira_explain::CommittedChange {
-            id: entry.id.clone(),
-            op: match entry.op {
-                ChangeOp::Created => tokeira_explain::CommittedOp::Created,
-                ChangeOp::Updated => tokeira_explain::CommittedOp::Updated,
-                ChangeOp::Deleted => tokeira_explain::CommittedOp::Deleted,
-            },
+        .map(|change| {
+            let op = match change.kind {
+                tokeira_iac::ChangeKind::Create => tokeira_explain::CommittedOp::Created,
+                tokeira_iac::ChangeKind::Update => tokeira_explain::CommittedOp::Updated,
+                tokeira_iac::ChangeKind::Replace => tokeira_explain::CommittedOp::Replaced,
+                tokeira_iac::ChangeKind::Delete => tokeira_explain::CommittedOp::Deleted,
+                tokeira_iac::ChangeKind::NoChange => tokeira_explain::CommittedOp::Unchanged,
+            };
+            tokeira_explain::CommittedChange {
+                id: change.resource.clone(),
+                op,
+                module: change.module.clone(),
+                resource_type: change.resource_type.clone(),
+                display: applied
+                    .display_by_id
+                    .get(&tokeira_iac::ResourceId(change.resource.clone()))
+                    .cloned(),
+            }
         })
         .collect()
 }
@@ -292,8 +318,8 @@ impl ProvisionerPlatform for TestPlatform {
         Ok(PlanOutcome::default())
     }
 
-    async fn infra_apply(&self, _deployment_dir: &Path) -> Result<Vec<ChangeLogEntry>> {
-        Ok(Vec::new())
+    async fn infra_apply(&self, _deployment_dir: &Path) -> Result<AppliedOutcome> {
+        Ok(AppliedOutcome::default())
     }
 
     async fn infra_destroy(&self, _deployment_dir: &Path) -> Result<usize> {
@@ -320,11 +346,8 @@ impl ProvisionerPlatform for TestPlatform {
         Ok(Realization::Realized(PlanOutcome::default()))
     }
 
-    async fn deploy_apply(
-        &self,
-        _deployment_dir: &Path,
-    ) -> Result<Realization<Vec<ChangeLogEntry>>> {
-        Ok(Realization::Realized(Vec::new()))
+    async fn deploy_apply(&self, _deployment_dir: &Path) -> Result<Realization<AppliedOutcome>> {
+        Ok(Realization::Realized(AppliedOutcome::default()))
     }
 
     async fn scale(&self, _deployment_dir: &Path, _specs: &[String]) -> Result<Realization<usize>> {

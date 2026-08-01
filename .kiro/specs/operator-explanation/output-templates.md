@@ -483,6 +483,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 
 ### Apply after its gating plan
 
+<!-- reference: infra-apply-after-plan -->
 ```markdown
 # Infra Apply
 **Applied to compose** — revision 4 → 5
@@ -502,6 +503,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 
 ### Apply with no preceding plan in the run
 
+<!-- reference: infra-apply-no-plan -->
 ```markdown
 # Infra Apply
 **Applied to compose** — revision 4 → 5, without a gating plan's evidence

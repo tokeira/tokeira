@@ -240,7 +240,7 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
             let yes = args.yes;
             let explanation = args.explanation;
             lock::with_operation_lock(&dir, "apply", || {
-                apply::apply(&platform, &dir, yes, explanation.as_deref())
+                apply::apply(&platform, &dir, yes, mode, explanation.as_deref())
             })
             .await
         }
@@ -255,7 +255,7 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
             let yes = args.yes;
             let explanation = args.explanation;
             lock::with_operation_lock(&dir, "deploy-apply", || {
-                deploy::deploy_apply(&platform, &dir, yes, explanation.as_deref())
+                deploy::deploy_apply(&platform, &dir, yes, mode, explanation.as_deref())
             })
             .await
         }

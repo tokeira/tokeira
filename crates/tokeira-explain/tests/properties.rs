@@ -313,12 +313,13 @@ proptest! {
     // Property 9 — apply-side explanation invents nothing: every field diff
     // in the model appears in the preceding plan for the same id; with no
     // preceding plan there are no field diffs and exactly one
-    // FieldEvidenceUnavailable per committed change.
+    // FieldEvidenceUnavailable per committed *acting* change — the unchanged
+    // census makes no claims, so it opens no gaps.
     #[test]
     fn property_9_apply_invents_nothing(
         outcome in arb_outcome(),
         with_preceding in any::<bool>(),
-        ops in proptest::collection::vec(0u8..3, 0..6),
+        ops in proptest::collection::vec(0u8..5, 0..6),
     ) {
         let committed: Vec<CommittedChange> = ops
             .iter()
@@ -328,8 +329,13 @@ proptest! {
                 op: match op {
                     0 => CommittedOp::Created,
                     1 => CommittedOp::Updated,
-                    _ => CommittedOp::Deleted,
+                    2 => CommittedOp::Replaced,
+                    3 => CommittedOp::Deleted,
+                    _ => CommittedOp::Unchanged,
                 },
+                module: format!("m{index}"),
+                resource_type: "compose_service".to_string(),
+                display: None,
             })
             .collect();
         let preceding = with_preceding.then_some(&outcome);
@@ -353,10 +359,14 @@ proptest! {
             .iter()
             .filter(|u| matches!(u.reason, UncertaintyReason::FieldEvidenceUnavailable))
             .count();
+        let acting = committed
+            .iter()
+            .filter(|c| c.op != CommittedOp::Unchanged)
+            .count();
         if with_preceding {
             prop_assert_eq!(unavailable, 0);
         } else {
-            prop_assert_eq!(unavailable, committed.len());
+            prop_assert_eq!(unavailable, acting);
         }
     }
 

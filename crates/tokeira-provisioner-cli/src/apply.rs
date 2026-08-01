@@ -10,16 +10,19 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
+use tokeira_report::Mode;
 
 use crate::{
     ProvisionerPlatform, config_history, envelope_store,
     gate::{GateOutcome, evaluate_gate},
+    render::ExplanationReport,
 };
 
 pub(crate) async fn apply<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
     yes: bool,
+    mode: Mode,
     explanation_path: Option<&Path>,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -34,15 +37,15 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     crate::marker::refuse_if_marked(&envelope, "apply")?;
 
     // ── Gate before any mutation ──
-    match evaluate_gate(envelope.binding.as_ref(), &running) {
+    let verdict = match evaluate_gate(envelope.binding.as_ref(), &running) {
         GateOutcome::Refuse { verdict, reason } => {
             anyhow::bail!("binding gate refuses `apply` ({verdict:?}): {reason}");
         }
         // Proceeding verdicts are silent: the gate regime is a standing fact
         // of the deployment (describe's story), not news on every verb. Only
         // a refusal earns narration — and it is the error above.
-        GateOutcome::Proceed { .. } => {}
-    }
+        GateOutcome::Proceed { verdict, .. } => verdict,
+    };
 
     // ── Destructive gate (§4, Proposal 002): the engine classifies, the
     // shell confirms. Skipped under `--yes` — the operator has already
@@ -63,14 +66,9 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     let project_name = deployment_identity(&envelope.deployment_id);
     let applied = platform.infra_apply(deployment_dir).await?;
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
-    // — the set the rollback B-delete pass consumes (task 19.3).
-    envelope.record_post_checkpoint_changes(&applied);
-    println!(
-        "[{}] infra apply: {}",
-        platform.label(deployment_dir),
-        tokeira_report::counted(applied.len(), "change")
-    );
-    crate::render::print_applied(&applied);
+    // — the set the rollback B-delete pass consumes (task 19.3). The
+    // checkpoint consumes the audit vocabulary, not the report identity.
+    envelope.record_post_checkpoint_changes(&crate::change_log_entries(&applied.changes));
 
     // ── Re-stamp the envelope ──
     // A config apply keeps the engine identity and advances the config revision
@@ -78,6 +76,10 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     if envelope.deployment_id.is_empty() {
         envelope.deployment_id = project_name;
     }
+    // The advance the report states: the revision the verb started from and
+    // the one the re-stamp commits (evidence-model field policy —
+    // `proposed_revision` is `current + 1` for a mutating verb).
+    let from_revision = envelope.config_revision;
     restamp_applied_revision(
         &mut envelope,
         running,
@@ -89,27 +91,28 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after apply")?;
+    let mut context = crate::explain_context(platform, deployment_dir, &envelope, "infra apply");
+    context.current_revision = from_revision;
+    context.proposed_revision = Some(envelope.config_revision);
+    let explanation = tokeira_explain::explain_applied(
+        context,
+        &crate::committed_changes(&applied),
+        preceding.as_ref(),
+    );
     // The artifact is written only after the state record is safe: a failed
     // write must fail the verb (Req 7.6) without ever costing the envelope
     // its revision advance. The context states the one fact the operator
     // must not misread — the apply itself is committed and recorded.
     if let Some(path) = explanation_path {
-        let explanation = tokeira_explain::explain_applied(
-            crate::explain_context(platform, deployment_dir, &envelope, "infra apply"),
-            &crate::committed_changes(&applied),
-            preceding.as_ref(),
-        );
         tokeira_explain::artifact::write(path, &explanation)
             .context("the apply is committed and recorded; only the explanation artifact failed")?;
     }
-    println!(
-        "envelope: config_revision now {} (config {})",
-        envelope.config_revision,
-        envelope
-            .effective_config_ref
-            .as_deref()
-            .unwrap_or("default")
-    );
+    let report = ExplanationReport {
+        initialized: true,
+        binding: verdict,
+        explanation,
+    };
+    crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
     Ok(())
 }
 
@@ -205,9 +208,15 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = apply(&TestPlatform, tmp.path(), false, None)
-            .await
-            .expect_err("the open marker gates apply");
+        let err = apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect_err("the open marker gates apply");
         assert!(err.to_string().contains("in flight"), "unexpected: {err}");
     }
 
@@ -249,9 +258,15 @@ mod tests {
         // stamping happens at `create`, so an unstamped deployment at apply time
         // is unverifiable).
         let tmp = tempfile::tempdir().unwrap();
-        let err = apply(&TestPlatform, tmp.path(), false, None)
-            .await
-            .expect_err("an unstamped deployment refuses");
+        let err = apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect_err("an unstamped deployment refuses");
         assert!(
             err.to_string().contains("binding gate refuses"),
             "unexpected error: {err}"
@@ -259,8 +274,10 @@ mod tests {
     }
 
     // Req 7.1 on the apply side: the artifact is the applied explanation,
-    // revision already advanced, field evidence from the gate's own plan
-    // pass (never invented — Property 9).
+    // revision advance recorded as the field policy states it (current = the
+    // revision the verb started from, proposed = the one it committed),
+    // field evidence from the gate's own plan pass (never invented —
+    // Property 9).
     #[tokio::test]
     async fn apply_writes_the_applied_explanation_artifact() {
         let tmp = tempfile::tempdir().unwrap();
@@ -274,15 +291,26 @@ mod tests {
         store.save(&env, &v).await.unwrap();
 
         let path = tmp.path().join("explanation.json");
-        apply(&TestPlatform, tmp.path(), false, Some(&path))
-            .await
-            .expect("apply succeeds and writes the artifact");
+        apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            Mode::resolve(false, false),
+            Some(&path),
+        )
+        .await
+        .expect("apply succeeds and writes the artifact");
 
         let model = tokeira_explain::artifact::read(&path).expect("artifact parses alone");
         assert_eq!(model.operation, "infra apply");
         assert_eq!(
-            model.current_revision, 5,
-            "the artifact records the advanced revision"
+            model.current_revision, 4,
+            "the revision the verb started from"
+        );
+        assert_eq!(
+            model.proposed_revision,
+            Some(5),
+            "the artifact records the committed advance"
         );
     }
 
@@ -302,9 +330,15 @@ mod tests {
         store.save(&env, &v).await.unwrap();
 
         let path = tmp.path().join("no-such-dir").join("explanation.json");
-        let err = apply(&TestPlatform, tmp.path(), false, Some(&path))
-            .await
-            .expect_err("an unwritable artifact path fails the verb");
+        let err = apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            Mode::resolve(false, false),
+            Some(&path),
+        )
+        .await
+        .expect_err("an unwritable artifact path fails the verb");
         let message = format!("{err:#}");
         assert!(
             message.contains("committed and recorded"),
@@ -334,9 +368,15 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        apply(&TestPlatform, tmp.path(), false, None)
-            .await
-            .expect("apply proceeds under DevIterate");
+        apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect("apply proceeds under DevIterate");
 
         let (after, _) = store.load().await.unwrap();
         assert_eq!(after.config_revision, 5, "config_revision advanced by one");

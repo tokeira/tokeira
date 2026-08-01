@@ -167,6 +167,27 @@ impl Engine {
             .await
     }
 
+    /// The composition's operator nouns, per resource: what each desired
+    /// resource asks to be called in narrative output
+    /// ([`Resource::display_kind`]). A pure realization of the composed
+    /// definition — no I/O, no state read — so callers on the apply path can
+    /// report identity without paying a plan pass.
+    pub fn display_map(
+        &self,
+        composition: &InfraComposition,
+        ctx: &ProvisionContext,
+    ) -> Result<BTreeMap<ResourceId, String>, IacError> {
+        let desired = collect_resources_from(&composition.desired_modules, ctx)?;
+        Ok(desired
+            .iter()
+            .filter_map(|resource| {
+                resource
+                    .display_kind()
+                    .map(|noun| (resource.resource_id(), noun.to_string()))
+            })
+            .collect())
+    }
+
     /// Apply using a separate known-managed resource set.
     ///
     /// `known` must be a superset of `desired`. Resources in `known` but not

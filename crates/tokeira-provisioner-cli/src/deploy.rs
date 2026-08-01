@@ -74,6 +74,7 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
     yes: bool,
+    mode: tokeira_report::Mode,
     explanation_path: Option<&Path>,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -88,15 +89,15 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
     crate::marker::refuse_if_marked(&envelope, "deploy apply")?;
 
     // ── Gate before any mutation ──
-    match evaluate_gate(envelope.binding.as_ref(), &running) {
+    let verdict = match evaluate_gate(envelope.binding.as_ref(), &running) {
         GateOutcome::Refuse { verdict, reason } => {
             anyhow::bail!("binding gate refuses `deploy apply` ({verdict:?}): {reason}");
         }
         // Proceeding verdicts are silent: the gate regime is a standing fact
         // of the deployment (describe's story), not news on every verb. Only
         // a refusal earns narration — and it is the error above.
-        GateOutcome::Proceed { .. } => {}
-    }
+        GateOutcome::Proceed { verdict, .. } => verdict,
+    };
 
     // ── Destructive gate (§4): identical contract to `infra apply`. The
     // gate's plan doubles as the applied explanation's field evidence
@@ -118,18 +119,15 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
         Realization::NotApplicable { reason } => {
             anyhow::bail!("not applicable: {reason}");
         }
-        Realization::Realized(entries) => entries,
+        Realization::Realized(outcome) => outcome,
     };
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
-    // — the set the rollback B-delete pass consumes (task 19.3).
-    envelope.record_post_checkpoint_changes(&applied);
-    println!(
-        "[{}] deploy apply: {}",
-        platform.label(deployment_dir),
-        tokeira_report::counted(applied.len(), "change")
-    );
+    // — the set the rollback B-delete pass consumes (task 19.3). The
+    // checkpoint consumes the audit vocabulary, not the report identity.
+    envelope.record_post_checkpoint_changes(&crate::change_log_entries(&applied.changes));
 
     // ── Re-stamp: a workload apply advances the config revision like any apply ──
+    let from_revision = envelope.config_revision;
     restamp_applied_revision(
         &mut envelope,
         running,
@@ -141,25 +139,26 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after deploy apply")?;
+    let mut context = crate::explain_context(platform, deployment_dir, &envelope, "deploy apply");
+    context.current_revision = from_revision;
+    context.proposed_revision = Some(envelope.config_revision);
+    let explanation = tokeira_explain::explain_applied(
+        context,
+        &crate::committed_changes(&applied),
+        preceding.as_ref(),
+    );
     // Artifact after the state record is safe, before the verb claims
     // success — same contract as `infra apply` (Req 7.6).
     if let Some(path) = explanation_path {
-        let explanation = tokeira_explain::explain_applied(
-            crate::explain_context(platform, deployment_dir, &envelope, "deploy apply"),
-            &crate::committed_changes(&applied),
-            preceding.as_ref(),
-        );
         tokeira_explain::artifact::write(path, &explanation)
             .context("the apply is committed and recorded; only the explanation artifact failed")?;
     }
-    println!(
-        "envelope: config_revision now {} (config {})",
-        envelope.config_revision,
-        envelope
-            .effective_config_ref
-            .as_deref()
-            .unwrap_or("default")
-    );
+    let report = crate::render::ExplanationReport {
+        initialized: true,
+        binding: verdict,
+        explanation,
+    };
+    crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
     Ok(())
 }
 
@@ -172,9 +171,15 @@ mod tests {
     #[tokio::test]
     async fn deploy_apply_refuses_an_unstamped_deployment() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = deploy_apply(&TestPlatform, tmp.path(), false, None)
-            .await
-            .expect_err("an unstamped deployment refuses");
+        let err = deploy_apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            tokeira_report::Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect_err("an unstamped deployment refuses");
         assert!(
             err.to_string().contains("binding gate refuses"),
             "unexpected: {err}"
@@ -193,9 +198,15 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        deploy_apply(&TestPlatform, tmp.path(), false, None)
-            .await
-            .expect("deploy apply proceeds under DevIterate");
+        deploy_apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            tokeira_report::Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect("deploy apply proceeds under DevIterate");
 
         let (after, _) = store.load().await.unwrap();
         assert_eq!(after.config_revision, 2, "workload apply is a config apply");

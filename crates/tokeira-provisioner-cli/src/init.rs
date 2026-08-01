@@ -291,12 +291,24 @@ mod tests {
             .clone();
 
         // Two successive config applies (same binary → same engine).
-        crate::apply::apply(&TestPlatform, tmp.path(), false, None)
-            .await
-            .expect("apply 1");
-        crate::apply::apply(&TestPlatform, tmp.path(), false, None)
-            .await
-            .expect("apply 2");
+        crate::apply::apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            tokeira_report::Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect("apply 1");
+        crate::apply::apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            tokeira_report::Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect("apply 2");
 
         let (after, _) = envelope_store(tmp.path()).load().await.unwrap();
         assert_eq!(

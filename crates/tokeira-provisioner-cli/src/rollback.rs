@@ -96,7 +96,8 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
             "resuming interrupted rollback {} from phase '{}'",
             operation.operation_id, operation.phase
         );
-        let applied = platform.infra_apply(deployment_dir).await?;
+        let applied =
+            crate::change_log_entries(&platform.infra_apply(deployment_dir).await?.changes);
         println!(
             "A reconcile (re-apply retained revision): {}",
             tokeira_report::counted(applied.len(), "change")
@@ -208,7 +209,7 @@ pub(crate) async fn rollback<P: ProvisionerPlatform>(
     }
 
     // ── A forward-reconciles toward its retained prior configuration revision ──
-    let applied = platform.infra_apply(deployment_dir).await?;
+    let applied = crate::change_log_entries(&platform.infra_apply(deployment_dir).await?.changes);
     println!(
         "A reconcile (re-apply retained revision): {}",
         tokeira_report::counted(applied.len(), "change")

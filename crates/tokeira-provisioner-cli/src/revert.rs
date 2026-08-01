@@ -76,7 +76,7 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
         config_history::config_file(deployment_dir, config_basename).display()
     );
 
-    let applied = platform.infra_apply(deployment_dir).await?;
+    let applied = crate::change_log_entries(&platform.infra_apply(deployment_dir).await?.changes);
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
     // — the set the rollback B-delete pass consumes (task 19.3).
     envelope.record_post_checkpoint_changes(&applied);
@@ -166,9 +166,15 @@ mod tests {
             "project_name = \"one\"\n",
         )
         .unwrap();
-        crate::apply::apply(&TestPlatform, tmp.path(), false, None)
-            .await
-            .expect("apply rev 1");
+        crate::apply::apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            tokeira_report::Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect("apply rev 1");
 
         // Revision 2: change the config source.
         std::fs::write(
@@ -176,9 +182,15 @@ mod tests {
             "project_name = \"two\"\n",
         )
         .unwrap();
-        crate::apply::apply(&TestPlatform, tmp.path(), false, None)
-            .await
-            .expect("apply rev 2");
+        crate::apply::apply(
+            &TestPlatform,
+            tmp.path(),
+            false,
+            tokeira_report::Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect("apply rev 2");
 
         let (before, _) = envelope_store(tmp.path()).load().await.unwrap();
         assert_eq!(before.config_revision, 2);

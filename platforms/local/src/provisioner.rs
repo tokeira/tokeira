@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use tokeira_iac::{ModuleSelection, PlanOutcome, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_provisioner_cli::{
-    ChangeLogEntry, ProvisionerPlatform, Realization, change_log_entries,
+    AppliedOutcome, ChangeLogEntry, ProvisionerPlatform, Realization, change_log_entries,
 };
 
 use crate::{LocalConfig, LocalDeployment};
@@ -43,14 +43,18 @@ impl ProvisionerPlatform for LocalPlatform {
             .context("infrastructure plan failed")
     }
 
-    async fn infra_apply(&self, deployment_dir: &Path) -> Result<Vec<ChangeLogEntry>> {
+    async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
         let mut engine = open_engine(deployment_dir).await?;
         let composition = engine.compose(ModuleSelection::All)?;
         let changes = engine
             .apply(&composition, ModuleSelection::All)
             .await
             .context("infrastructure apply failed")?;
-        Ok(change_log_entries(&changes))
+        let display_by_id = engine.display_map(&composition)?;
+        Ok(AppliedOutcome {
+            changes,
+            display_by_id,
+        })
     }
 
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
@@ -86,10 +90,7 @@ impl ProvisionerPlatform for LocalPlatform {
         ))
     }
 
-    async fn deploy_apply(
-        &self,
-        deployment_dir: &Path,
-    ) -> Result<Realization<Vec<ChangeLogEntry>>> {
+    async fn deploy_apply(&self, deployment_dir: &Path) -> Result<Realization<AppliedOutcome>> {
         Ok(Realization::Realized(
             self.infra_apply(deployment_dir).await?,
         ))

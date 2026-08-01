@@ -223,7 +223,11 @@ fn build(world: &World) -> (CausalityView, DeploymentExplanation) {
             _ => 4,
         },
         recorded,
-        edges,
+        edges: edges.clone(),
+        // The union graph doubles as the desired graph here: these fixtures
+        // exercise classification, not dependency loss, and a desired graph
+        // covering every recorded edge derives none.
+        desired_edges: edges,
         refresh: outcome.refresh.clone(),
     };
     (view, explanation)
@@ -618,7 +622,11 @@ fn traced_world(
         baseline: BaselineView::Realized(baseline),
         baseline_revision: 4,
         recorded,
-        edges,
+        edges: edges.clone(),
+        // The union graph doubles as the desired graph here: these fixtures
+        // exercise classification, not dependency loss, and a desired graph
+        // covering every recorded edge derives none.
+        desired_edges: edges,
         refresh: outcome.refresh.clone(),
     };
     (view, explanation)

@@ -437,20 +437,33 @@ proptest! {
     #[test]
     fn semantics_property_6_every_impact_is_grounded(outcome in arb_outcome()) {
         use tokeira_explain::ImpactClass;
-        use tokeira_iac::{DataEffect, Disruption, ReplacementPolicy};
+        use tokeira_iac::{ChangeKind, DataEffect, Disruption, ReplacementPolicy};
 
         let explanation = explain_plan(context(), &outcome);
+        // Mirrors the two-source contract (Requirements 5.4/5.5): a class is
+        // justified by the declared semantics or by the engine-fact floor.
         let qualifies = |change: &tokeira_explain::ExplainedChange, class: ImpactClass| {
             let s = &change.semantics;
             match class {
                 ImpactClass::DataDestroyed =>
                     s.data_effect.value() == Some(&DataEffect::Destroyed),
-                ImpactClass::Unavailability =>
-                    s.disruption.value() == Some(&Disruption::UnavailableDuringChange),
+                ImpactClass::Unavailability => {
+                    let declared =
+                        s.disruption.value() == Some(&Disruption::UnavailableDuringChange);
+                    let floor = match change.kind {
+                        ChangeKind::Delete => true,
+                        ChangeKind::Replace =>
+                            s.replacement.value() != Some(&ReplacementPolicy::CreateBeforeDestroy),
+                        _ => false,
+                    };
+                    declared || floor
+                }
                 ImpactClass::Replacement => matches!(
                     s.replacement.value(),
                     Some(policy) if *policy != ReplacementPolicy::NotRequired
-                ),
+                ) || change.kind == ChangeKind::Replace,
+                // Derived from the graph by causality, never by explain_plan.
+                ImpactClass::DependencyLoss => false,
                 ImpactClass::BriefInterruption =>
                     s.disruption.value() == Some(&Disruption::BriefInterruption),
                 ImpactClass::RollingReplacement =>
@@ -479,6 +492,7 @@ proptest! {
                 ImpactClass::DataDestroyed,
                 ImpactClass::Unavailability,
                 ImpactClass::Replacement,
+                ImpactClass::DependencyLoss,
                 ImpactClass::BriefInterruption,
                 ImpactClass::RollingReplacement,
             ] {
@@ -499,27 +513,54 @@ proptest! {
         }
     }
 
-    // Change-semantics Property 7 — Unknown never becomes a claim: a change
-    // declaring nothing joins no impact, and a class nobody triggers emits
-    // no impact.
+    // Change-semantics Property 7 — Unknown never becomes a claim
+    // (Requirement 5.7): a change declaring nothing joins no impact except
+    // one the engine floor grounds in its kind — a Replace floors
+    // replacement and unavailability (the all-Unknown policy cannot lift
+    // it), a Delete floors unavailability. Declarations are the only other
+    // path into an impact.
     #[test]
     fn semantics_property_7_unknown_never_becomes_a_claim(outcome in arb_outcome()) {
+        use tokeira_explain::ImpactClass;
+
         let explanation = explain_plan(context(), &outcome);
+        let floor_grounds = |kind: ChangeKind, class: ImpactClass| match class {
+            ImpactClass::Unavailability => {
+                matches!(kind, ChangeKind::Delete | ChangeKind::Replace)
+            }
+            ImpactClass::Replacement => kind == ChangeKind::Replace,
+            _ => false,
+        };
         for change in &explanation.changes {
             if change.semantics == ChangeSemantics::default() {
                 for impact in &explanation.impacts {
                     prop_assert!(
-                        !impact.subjects.contains(&change.evidence_id),
-                        "an all-Unknown change joined {:?}",
+                        !impact.subjects.contains(&change.evidence_id)
+                            || floor_grounds(change.kind, impact.class),
+                        "an all-Unknown change joined {:?} without an engine fact",
                         impact.class
                     );
                 }
             }
         }
-        // With NO declarations anywhere, there are no impacts at all — the
-        // absence is recorded as uncertainty, never as consequence-free.
+        // With NO declarations anywhere, only the engine floor may speak —
+        // and where even it is silent, the absence is recorded as
+        // uncertainty, never as consequence-free.
         if outcome.semantics_by_id.is_empty() {
-            prop_assert!(explanation.impacts.is_empty());
+            for impact in &explanation.impacts {
+                for subject in &impact.subjects {
+                    let change = explanation
+                        .changes
+                        .iter()
+                        .find(|c| &c.evidence_id == subject)
+                        .expect("impact subject is a change");
+                    prop_assert!(
+                        floor_grounds(change.kind, impact.class),
+                        "declaration-free impact {:?} lacks an engine fact",
+                        impact.class
+                    );
+                }
+            }
             let acting = explanation
                 .changes
                 .iter()
@@ -615,13 +656,13 @@ proptest! {
             "schema_version", "deployment", "platform", "operation",
             "current_revision", "proposed_revision", "definition_ref",
             "changes", "impacts", "destructive", "uncertainties",
-            "causal_groups", "evidence",
+            "causal_groups", "platform_issues", "evidence",
         ])?;
         for change in value["changes"].as_array().into_iter().flatten() {
             keys_within(change, &[
                 "evidence_id", "resource_id", "display", "module", "resource_type",
                 "kind", "field_diffs", "refresh_status", "semantics", "cause",
-                "dependants", "source",
+                "dependants", "departed_fields", "source",
             ])?;
             for diff in change["field_diffs"].as_array().into_iter().flatten() {
                 keys_within(diff, &["field", "before", "after"])?;
@@ -633,7 +674,7 @@ proptest! {
             ])?;
         }
         for impact in value["impacts"].as_array().into_iter().flatten() {
-            keys_within(impact, &["evidence_id", "class", "subjects", "statement"])?;
+            keys_within(impact, &["evidence_id", "class", "subjects", "statement", "lost"])?;
         }
     }
 }

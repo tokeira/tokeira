@@ -80,6 +80,11 @@ pub struct CausalityView {
     /// the desired (engine-declared) and recorded sides, so dependants of a
     /// change include unchanged resources (Requirement 5.1).
     pub edges: BTreeMap<ResourceId, Vec<ResourceId>>,
+    /// The desired side alone (`PlanOutcome::edges_by_id`) — the graph-delta
+    /// half DependencyLoss needs: a recorded edge absent here, whose target
+    /// this plan deletes, is a dependant continuing without its dependency
+    /// (change-semantics Requirement 5.6).
+    pub desired_edges: BTreeMap<ResourceId, Vec<ResourceId>>,
     /// L — per-resource confirmation statuses plus the live-departure set.
     pub refresh: RefreshCoverage,
 }
@@ -503,6 +508,120 @@ pub fn apply_causality(explanation: &mut DeploymentExplanation, view: &Causality
             .get(&rid)
             .map(|set| set.iter().map(|id| id.0.clone()).collect())
             .unwrap_or_default();
+    }
+
+    // ── Per-field departure flags (output-templates §detail, item 1) ──
+    // A confirmed live read means each diff's `before` IS the live value;
+    // comparing it against the store-read record marks the fields the world
+    // moved — visible per diff even when the operator's edit owns the
+    // change. No confirmed read, no flags: the comparison would be against
+    // the very values the diff already carries.
+    for change in &mut explanation.changes {
+        if change.kind == ChangeKind::NoChange
+            || !matches!(change.refresh_status, Some(RefreshStatus::DesiredLive))
+        {
+            continue;
+        }
+        let rid = ResourceId(change.resource_id.clone());
+        let Some(record) = view.recorded.get(&rid) else {
+            continue;
+        };
+        change.departed_fields = change
+            .field_diffs
+            .iter()
+            .filter(|diff| {
+                let live = diff.before.as_deref();
+                match record.properties.get(&diff.field) {
+                    Some(recorded) => {
+                        let canonical = recorded
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| recorded.to_string());
+                        live != Some(canonical.as_str())
+                    }
+                    // No recorded value, no departure claim: departure is a
+                    // recorded value the live read moved away from, never an
+                    // absence.
+                    None => false,
+                }
+            })
+            .map(|diff| diff.field.clone())
+            .collect();
+    }
+
+    // ── DependencyLoss impacts (change-semantics Requirement 5.6) ─────
+    // An engine fact from the graph delta: a recorded edge the desired
+    // graph dropped, whose target this plan deletes. The dependant's change
+    // may be `NoChange` (edges are not manifest content) — it still carries
+    // an id, so the impact resolves.
+    let deleted: BTreeSet<ResourceId> = explanation
+        .changes
+        .iter()
+        .filter(|c| c.kind == ChangeKind::Delete)
+        .map(|c| ResourceId(c.resource_id.clone()))
+        .collect();
+    if !deleted.is_empty() {
+        let change_ids: BTreeMap<&str, &EvidenceId> = explanation
+            .changes
+            .iter()
+            .map(|c| (c.resource_id.as_str(), &c.evidence_id))
+            .collect();
+        let mut losses: Vec<(EvidenceId, EvidenceId, String, String)> = Vec::new();
+        for (dependant, state) in &view.recorded {
+            for dep in &state.dependencies {
+                if !deleted.contains(dep) {
+                    continue;
+                }
+                let still_desired = view
+                    .desired_edges
+                    .get(dependant)
+                    .map(|deps| deps.contains(dep))
+                    .unwrap_or(false);
+                if still_desired {
+                    continue;
+                }
+                let (Some(subject), Some(lost)) = (
+                    change_ids.get(dependant.0.as_str()),
+                    change_ids.get(dep.0.as_str()),
+                ) else {
+                    continue;
+                };
+                losses.push((
+                    (*subject).clone(),
+                    (*lost).clone(),
+                    dependant.0.clone(),
+                    dep.0.clone(),
+                ));
+            }
+        }
+        losses.sort();
+        for (subject, lost, dependant, dep) in losses {
+            let impact = crate::model::OperationalImpact {
+                evidence_id: EvidenceId::impact(
+                    &format!(
+                        "{}:{}",
+                        crate::model::ImpactClass::DependencyLoss.tag(),
+                        dependant
+                    ),
+                    &EvidenceId::deployment(&explanation.deployment),
+                ),
+                class: crate::model::ImpactClass::DependencyLoss,
+                subjects: vec![subject],
+                statement: format!("{dependant} continues without {dep}, which this plan deletes"),
+                lost: Some(lost),
+            };
+            explanation
+                .evidence
+                .insert(impact.evidence_id.clone(), EvidenceKind::Impact);
+            explanation.impacts.push(impact);
+        }
+        // Severity order holds across both derivation sites (the class enum
+        // is the order); a stable sort keeps subjects deterministic.
+        explanation.impacts.sort_by(|a, b| {
+            a.class
+                .cmp(&b.class)
+                .then_with(|| a.evidence_id.cmp(&b.evidence_id))
+        });
     }
 
     // ── Causal groups ─────────────────────────────────────────────────

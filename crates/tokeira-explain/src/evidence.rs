@@ -38,6 +38,12 @@ impl EvidenceId {
         Self(format!("deployment:{name}"))
     }
 
+    /// One platform issue: `issue:{component}` — the component name is the
+    /// natural key (one issue per component per plan).
+    pub fn issue(component: &str) -> Self {
+        Self(format!("issue:{component}"))
+    }
+
     /// One causal group: `group:{root_key}`, where the root key is the
     /// group's natural root identity (`revision-comparison:{n}`,
     /// `resource:{change id}`, `provisioner-advance`) — never a member
@@ -60,6 +66,7 @@ pub enum EvidenceKind {
     Uncertainty,
     Impact,
     CausalGroup,
+    PlatformIssue,
 }
 
 /// The addressable collection of one explanation's evidence.

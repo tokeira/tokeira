@@ -133,6 +133,11 @@ pub(crate) fn causality_view(gathered: GatheredCausality, outcome: &PlanOutcome)
         baseline_revision: gathered.baseline_revision,
         recorded: gathered.recorded.resources,
         edges,
+        desired_edges: outcome
+            .edges_by_id
+            .iter()
+            .map(|(id, deps)| (id.clone(), deps.clone()))
+            .collect(),
         refresh: outcome.refresh.clone(),
     }
 }

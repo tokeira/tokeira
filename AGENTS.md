@@ -574,8 +574,8 @@ carries the full agreement, including the baseline-cut signal.
 ### Pointers
 
 - `.kiro/specs/*/` — feature specs.
-- [deployment-definitions.md](docs/platforms/iac/deployment-definitions.md) — authoring and
-  operating `.tkd` deployment definitions (the rust-syn DSL and `tkp` lifecycle).
+- [deployment-definitions.md](docs/provisioning/deployment-definitions.md) — programming
+  `.tkd` deployment definitions and understanding the `tkp` interpretation contract.
 - Temporal ground truth (§8): `proto/upstream/` (API `v1.62.11`) and the server source
   at tag `v1.31.0` — the local reference checkout (sibling of the main checkout, §8), or
   [github.com/temporalio/temporal @ v1.31.0](https://github.com/temporalio/temporal/tree/v1.31.0).

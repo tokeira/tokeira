@@ -1,53 +1,65 @@
-# EKS Platform
+# EKS platform components
 
-The EKS platform provisions Tokeira on AWS EKS with Aurora DSQL. It deploys
-the same decomposed service topology as the [ECS platform](../ecs/README.md), but it is
-authored and driven differently: the entire deployment — infrastructure,
-services, storage, observability, wiring — is described by one
-`definition.tkd` file in the `syn` deployment DSL and operated end to end by
-the deployment provisioner `tkp`. See
-[deployment definitions](../iac/deployment-definitions.md) for the dialect and the
-provisioner lifecycle.
+A complete EKS platform must ship its custom TKD vocabulary as a platform-owned,
+identity-bearing `tkp` and make that engine available to TKR's construction, admission,
+placement, and launch-verification path. `platforms/eks` currently contains only the EKS
+deployment-definition bridge and a closed vocabulary of AWS and Kubernetes kinds. These
+components establish how an EKS-shaped `definition.tkd` can be parsed and evaluated into
+platform builder values; they do not form a complete engine or operator provisioning
+path.
 
-## Shape
+In particular, the EKS platform does not provide:
 
-- **EKS Auto Mode** cluster (Kubernetes 1.36 by default, operator-
-  configurable) with a `karpenter.sh/v1` NodePool referencing the EKS-managed
-  default NodeClass, pinned to arm64 — services run on Graviton
-  (`m8g`/`c8g`/`r8g` families) with explicit node affinity.
-- **Private-only AWS foundation**: VPC with private subnets and interface
-  endpoints, security groups, IAM roles, ECR, DynamoDB coordination tables,
-  Secrets Manager, and S3 deployment state — no public ingress.
-- **Aurora DSQL** persistence (managed, or adopted preexisting), reached
-  through a PrivateLink connection endpoint with IAM-token authentication.
-- **Pod Identity** ServiceAccounts for AWS access from pods — no static
-  credentials in the cluster.
-- The Tokeira service set — `edge-api`, `edge-poll`, `runtime`, `projection`,
-  `controller`, `autoscaler`, `admin` — plus the observability stack
-  (`mimir`, `loki`, `grafana`), with **Alloy running as a native sidecar** in
-  each pod.
+- a complete builder-to-`tokeira_orchestrator::Deployment` adapter;
+- a `tokeira_provisioner_cli::ProvisionerPlatform` implementation;
+- a platform `tkp` binary target; or
+- a `tkr deployment create --platform eks` route.
 
-## Lifecycle
+Do not use the presence of `HostBridge` or kind implementations as evidence that `tkr`
+or `tkp` can provision an EKS deployment end to end. Compose is the current complete
+reference for that assembly.
 
-An operator edits the `.tkd` definition and re-applies; the provisioner owns
-the whole loop:
+## Modeled deployment shape
 
-```bash
-tkp init --deployment-dir ~/deployments/prod-eks    # bind the definition, create revision 1
-tkp plan --deployment-dir ~/deployments/prod-eks    # read-only preview of what would change
-tkp apply --deployment-dir ~/deployments/prod-eks   # provision AWS, server-side apply to EKS
+The EKS vocabulary models a production-shaped Kubernetes target, including:
+
+- an EKS Auto Mode cluster and arm64-oriented node placement;
+- private AWS networking and endpoints;
+- Aurora DSQL and coordination resources;
+- IAM and Pod Identity integration;
+- ECR, Secrets Manager, and S3-backed platform resources;
+- Kubernetes workloads for Tokeira services; and
+- Mimir, Loki, Grafana, and Alloy observability components.
+
+These are platform capabilities exposed to the interpreted authoring model. Making them
+operator-available also requires the adapter, provisioner seam, binary assembly, state
+selection, provider wiring, and launcher route described in
+[how a platform supplies a custom TKD](../../provisioning/deployment-definition-patterns.md#how-a-platform-supplies-a-custom-tkd).
+
+## Where the pieces fit
+
+```mermaid
+flowchart LR
+    Definition["EKS-shaped definition.tkd"] --> Core["tokeira-tkd interpreter"]
+    Core --> Bridge["EKS HostBridge"]
+    Bridge --> Kinds["AWS and Kubernetes kind values"]
+    Kinds --> Missing["Required completion boundary"]
+    Missing --> Adapter["Deployment adapter"]
+    Adapter --> Seam["ProvisionerPlatform"]
+    Seam --> Binary["EKS tkp binary"]
+    Binary --> Route["tkr operator route"]
 ```
 
-`tkp` carries the full lifecycle — `init` / `plan` / `apply` / `destroy` /
-`revert` / `upgrade` / `rollback` — with every applied definition retained as
-a config revision that `revert` can restore. Day-2 `scale` (respecting
-Tokeira's startup order), `logs`, and `port-forward` run live against the
-cluster.
+The left-hand path exists as implementation components. The completion boundary and the
+operator route are not present, so there is no EKS lifecycle command sequence to follow.
 
 ## See also
 
 - [Platform support matrix](../README.md)
-- [Deployment definitions](../iac/deployment-definitions.md) — the `.tkd` dialect
-  and the `tkp` provisioner lifecycle
-- [ECS platform](../ecs/README.md) — the same topology on ECS, `tkr`-driven
-- [Production observability](../observability.md)
+- [Provisioning](../../provisioning/README.md) — complete triad and platform status
+- [Deployment definition programming guide](../../provisioning/deployment-definitions.md) —
+  abstract language and authoring rules.
+- [Definition patterns and current practice](../../provisioning/deployment-definition-patterns.md) —
+  EKS bridge/kind idioms and their completion boundary.
+- [Compose platform](../compose/README.md) — complete definition-backed realization
+- [ECS platform](../ecs/README.md) — available AWS deployment through in-process `tkr`

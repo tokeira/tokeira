@@ -46,7 +46,31 @@ pub struct DeploymentExplanation {
     /// readable — the slot pattern, applied at the document level.
     #[serde(default)]
     pub causal_groups: Vec<CausalGroup>,
+    /// Platform issues (output-templates §Platform Issue lines): the fact,
+    /// the SDK error verbatim as evidence, and a direction only where the
+    /// error itself establishes one. When present, no change sections render
+    /// and the verb exits non-zero — a plan only renders what could execute.
+    /// Populated by the platform-issue seam at the describe boundary.
+    #[serde(default)]
+    pub platform_issues: Vec<PlatformIssue>,
     pub evidence: EvidenceIndex,
+}
+
+/// One platform issue: the fact, the platform's own answer, and — only
+/// where the error itself establishes one — a factually grounded direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformIssue {
+    pub evidence_id: EvidenceId,
+    /// The fact, naming the platform component ("Unable to connect to
+    /// Docker").
+    pub fact: String,
+    /// The SDK error verbatim — the platform's words, rendered as evidence,
+    /// never blended into Tokeira's own sentence.
+    pub evidence: String,
+    /// Direction the error establishes; `None` when it establishes none —
+    /// direction is never assumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
 /// One causal story: the changes sharing a root, ordered along the
@@ -104,6 +128,13 @@ pub struct ExplainedChange {
     pub cause: Confidence<Cause>,
     #[serde(default)]
     pub dependants: Vec<String>,
+    /// Fields of this change whose live value departed from the record —
+    /// the per-diff drift annotation on an edited-and-drifted resource (the
+    /// edit owns the change; the drift fact stays visible per field).
+    /// Computed by causality against the store-read record; empty when live
+    /// was not confirmed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub departed_fields: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceLocation>,
 }
@@ -149,6 +180,11 @@ pub struct OperationalImpact {
     pub subjects: Vec<EvidenceId>,
     /// A deterministic template rendering — never free prose.
     pub statement: String,
+    /// For [`ImpactClass::DependencyLoss`]: the deleted dependency's change,
+    /// so a renderer names what is lost by resolving evidence — never by
+    /// echoing free prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lost: Option<EvidenceId>,
 }
 
 /// Impact classes, ordered most consequential first; the ordering is the
@@ -157,6 +193,11 @@ pub struct OperationalImpact {
 #[serde(rename_all = "kebab-case")]
 pub enum ImpactClass {
     DataDestroyed,
+    /// A resource continues without a dependency this plan deletes — the
+    /// desired graph dropped a recorded edge whose target is being removed.
+    /// Permanent, so it outranks the transient classes below (the enum order
+    /// is the severity order).
+    DependencyLoss,
     Unavailability,
     Replacement,
     BriefInterruption,
@@ -168,6 +209,7 @@ impl ImpactClass {
     pub fn tag(&self) -> &'static str {
         match self {
             ImpactClass::DataDestroyed => "data-destroyed",
+            ImpactClass::DependencyLoss => "dependency-loss",
             ImpactClass::Unavailability => "unavailability",
             ImpactClass::Replacement => "replacement",
             ImpactClass::BriefInterruption => "brief-interruption",

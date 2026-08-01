@@ -48,15 +48,13 @@ impl Report for ExplanationReport {
         let explanation = &self.explanation;
         // `# Infra Plan` — the operation, title-cased.
         out.push_str(&format!("# {}\n", title_case(&explanation.operation)));
-        // The header assurance line anchors the deployment's revision once —
-        // no line below ever needs a revision number — and carries the
-        // live-state coverage (evidence-model Req 4.5/4.6): silence is never
-        // the signal; the header always says what the plan's claims rest on.
+        // The header anchors the deployment's revision once — the one place
+        // the document states a revision number, and no coverage clause: a
+        // plan only renders what could execute (output-templates §header).
         out.push_str(&format!(
-            "**Plan for {}** {}, {}\n",
+            "**Plan for {}** {}\n",
             explanation.platform,
             revision_anchor(explanation),
-            coverage_clause(explanation)
         ));
         // Verdict narration is attention-only: a verdict that lets the apply
         // proceed is a standing fact (describe's story), not news on every
@@ -64,8 +62,43 @@ impl Report for ExplanationReport {
         if let Some(line) = binding_attention(self.initialized, self.binding) {
             out.push_str(&format!("\n**binding:** {line}\n"));
         }
+        // A platform issue suppresses every section below it: nothing that
+        // could not execute is rendered (output-templates rule 1).
+        if !explanation.platform_issues.is_empty() {
+            platform_issues_section(explanation, out);
+            return;
+        }
         action_sections(explanation, depth, out);
+        drift_section(explanation, depth, out);
+        unchanged_section(explanation, depth, out);
         impacts_section(explanation, out);
+    }
+}
+
+/// The `## Platform Issue[s]` section: the fact, the SDK error verbatim as
+/// evidence (the platform's words, never blended into Tokeira's sentence),
+/// and a direction only where the error itself establishes one.
+fn platform_issues_section(explanation: &DeploymentExplanation, out: &mut String) {
+    out.push_str(&format!(
+        "\n## {}\n",
+        counted_heading("Platform Issue", explanation.platform_issues.len())
+    ));
+    for issue in &explanation.platform_issues {
+        out.push_str(&format!("- {}:\n", issue.fact));
+        out.push_str(&format!("  - {}\n", code_span(&issue.evidence)));
+        if let Some(direction) = &issue.direction {
+            out.push_str(&format!("  - **{direction}**\n"));
+        }
+    }
+}
+
+/// A heading pluralized by count — the computed-plural rule applied to
+/// headings (output-templates rule 3).
+fn counted_heading(noun: &str, count: usize) -> String {
+    if count == 1 {
+        noun.to_string()
+    } else {
+        format!("{noun}s")
     }
 }
 
@@ -90,31 +123,6 @@ fn revision_anchor(explanation: &DeploymentExplanation) -> String {
     match explanation.current_revision {
         0 => "before its first apply".to_string(),
         n => format!("at revision {n}"),
-    }
-}
-
-/// The header's coverage clause: what the plan's claims rest on. Gaps in
-/// live state speak here (and in place at detail); declared behaviour is
-/// the sections' business. Undeclared-semantics entries are machine-channel
-/// only and never render (change-semantics Req 6.5).
-fn coverage_clause(explanation: &DeploymentExplanation) -> String {
-    use tokeira_explain::UncertaintyReason;
-    if explanation
-        .uncertainties
-        .iter()
-        .any(|u| matches!(u.reason, UncertaintyReason::LiveStateNotExamined))
-    {
-        return "without *live state* examined".to_string();
-    }
-    let unconfirmed = explanation
-        .uncertainties
-        .iter()
-        .filter(|u| matches!(u.reason, UncertaintyReason::LiveStateUnconfirmed))
-        .count();
-    match unconfirmed {
-        0 => "with *live state* confirmed".to_string(),
-        1 => "with *live state* unconfirmed for 1 resource".to_string(),
-        n => format!("with *live state* unconfirmed for {n} resources"),
     }
 }
 
@@ -202,11 +210,9 @@ fn cause_phrase(explanation: &DeploymentExplanation, change: &ExplainedChange) -
             ChangeKind::Update | ChangeKind::Replace => diff_clause(change),
             _ => None,
         },
-        Cause::ProviderDrift => match change.kind {
-            ChangeKind::Create => Some("missing from the platform".to_string()),
-            ChangeKind::Update | ChangeKind::Replace => Some(drift_clause(change)),
-            _ => None,
-        },
+        // Drift never renders as a clause: drifted resources have their own
+        // section with their own grammar (output-templates rule 2).
+        Cause::ProviderDrift => None,
         Cause::EngineAdvance => {
             Some("this provisioner realizes the definition differently".to_string())
         }
@@ -243,19 +249,6 @@ fn diff_clause(change: &ExplainedChange) -> Option<String> {
     Some(more_fields(head, change.field_diffs.len() - 1))
 }
 
-/// Drift's concrete change: the field names that changed outside the
-/// definition (values are live observations; they speak at detail as the
-/// field diffs).
-fn drift_clause(change: &ExplainedChange) -> String {
-    match change.field_diffs.first() {
-        Some(first) => format!(
-            "{} changed outside the definition",
-            more_fields(code_span(&first.field), change.field_diffs.len() - 1)
-        ),
-        None => "changed outside the definition".to_string(),
-    }
-}
-
 fn more_fields(head: String, extra: usize) -> String {
     match extra {
         0 => head,
@@ -279,6 +272,17 @@ fn kind_verb(kind: ChangeKind) -> &'static str {
 /// templated would-mood prose with its engine id stated once. Detail adds
 /// field evidence, the declared behaviour in its confidence voice, and the
 /// in-place live-state statement.
+/// Whether a change renders in `## Resource Drift` rather than an action
+/// section: the world moved it, the definition did not (output-templates
+/// rule 2). An edited-and-drifted resource stays in its action section —
+/// the edit owns the change — with its drifted fields annotated per diff.
+fn is_drift(change: &ExplainedChange) -> bool {
+    matches!(
+        change.cause.value(),
+        Some(tokeira_explain::Cause::ProviderDrift)
+    )
+}
+
 fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut String) {
     let acting_exists = explanation
         .changes
@@ -296,7 +300,7 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
         let members: Vec<&ExplainedChange> = explanation
             .changes
             .iter()
-            .filter(|c| c.kind == kind)
+            .filter(|c| c.kind == kind && !is_drift(c))
             .collect();
         if members.is_empty() {
             continue;
@@ -333,28 +337,77 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
             }
         }
     }
-    if depth == Depth::Detail {
-        let unchanged: Vec<&ExplainedChange> = explanation
-            .changes
-            .iter()
-            .filter(|c| c.kind == ChangeKind::NoChange)
-            .collect();
-        if !unchanged.is_empty() {
-            out.push_str("\n## Unchanged\n");
-            for change in unchanged {
-                let line = if change.display.is_some() {
-                    format!(
-                        "- {} - `{}::{}`\n",
-                        noun_phrase(explanation, change),
-                        change.module,
-                        change.resource_id,
-                    )
-                } else {
-                    format!("- `{}::{}`\n", change.module, change.resource_id)
+}
+
+/// The `## Resource Drift` section: what the world did, then what the plan
+/// does about it — one line per drifted resource, definition-driven
+/// sections kept clean of it (output-templates §Resource Drift lines).
+fn drift_section(explanation: &DeploymentExplanation, depth: Depth, out: &mut String) {
+    let members: Vec<&ExplainedChange> = explanation
+        .changes
+        .iter()
+        .filter(|c| c.kind != ChangeKind::NoChange && is_drift(c))
+        .collect();
+    if members.is_empty() {
+        return;
+    }
+    out.push_str("\n## Resource Drift\n");
+    for change in members {
+        let noun = noun_phrase(explanation, change);
+        let line = match change.kind {
+            // A confirmed absence: the world lost it; the plan restores it.
+            ChangeKind::Create => format!(
+                "- {noun} could not be found - it would be recreated - `{}::{}`\n",
+                change.module, change.resource_id,
+            ),
+            _ => {
+                let fields = match change.field_diffs.first() {
+                    Some(first) => {
+                        more_fields(code_span(&first.field), change.field_diffs.len() - 1)
+                    }
+                    None => "live state".to_string(),
                 };
-                out.push_str(&line);
+                format!(
+                    "- {noun}'s {fields} changed outside the definition - it would be {} - `{}::{}`\n",
+                    kind_verb(change.kind),
+                    change.module,
+                    change.resource_id,
+                )
             }
+        };
+        out.push_str(&line);
+        if depth == Depth::Detail {
+            change_detail(explanation, change, out);
         }
+    }
+}
+
+/// The `## Unchanged` section, detail depth only.
+fn unchanged_section(explanation: &DeploymentExplanation, depth: Depth, out: &mut String) {
+    if depth != Depth::Detail {
+        return;
+    }
+    let unchanged: Vec<&ExplainedChange> = explanation
+        .changes
+        .iter()
+        .filter(|c| c.kind == ChangeKind::NoChange)
+        .collect();
+    if unchanged.is_empty() {
+        return;
+    }
+    out.push_str("\n## Unchanged\n");
+    for change in unchanged {
+        let line = if change.display.is_some() {
+            format!(
+                "- {} - `{}::{}`\n",
+                noun_phrase(explanation, change),
+                change.module,
+                change.resource_id,
+            )
+        } else {
+            format!("- `{}::{}`\n", change.module, change.resource_id)
+        };
+        out.push_str(&line);
     }
 }
 
@@ -370,11 +423,21 @@ fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, 
     use tokeira_iac::{DataEffect, LifecycleOperation, Reversibility};
     if matches!(change.kind, ChangeKind::Update | ChangeKind::Replace) {
         for diff in &change.field_diffs {
+            // A field whose live value departed from the record carries its
+            // annotation in place — the edit owns the change; the drift fact
+            // stays visible per field (output-templates §detail, item 1).
+            // Redundant on a drift-section line, whose fields are the story.
+            let departed = !is_drift(change) && change.departed_fields.contains(&diff.field);
+            let annotation = if departed {
+                " - changed outside the definition"
+            } else {
+                ""
+            };
             if diff.before.is_none() && diff.after.is_none() {
-                out.push_str(&format!("  - {}\n", diff.field));
+                out.push_str(&format!("  - {}{annotation}\n", diff.field));
             } else {
                 out.push_str(&format!(
-                    "  - {}: {} → {}\n",
+                    "  - {}: {} → {}{annotation}\n",
                     code_span(&diff.field),
                     code_span(&truncate(diff.before.as_deref().unwrap_or("(none)"))),
                     code_span(&truncate(diff.after.as_deref().unwrap_or("(none)"))),
@@ -382,11 +445,10 @@ fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, 
             }
         }
     }
-    // An unreadable live state changes what the diffs above MEAN: the engine
-    // measured desired against the record (never pruning on an unconfirmed
-    // read), so the provenance is stated with them — and when the cause is
-    // also unknown, the two facts are one statement, in operator words
-    // (output-templates.md §detail).
+    // Interim latitude until the platform-issue seam lands: an unreadable
+    // live read still states the diffs' provenance in place. The agreement's
+    // worlds never reach here (rule 1 turns unreachability into a Platform
+    // Issue); this line covers the transitional gap honestly.
     if matches!(change.refresh_status, Some(RefreshStatus::Unknown)) {
         if change.cause.value().is_none() && change.kind != ChangeKind::NoChange {
             out.push_str(
@@ -558,18 +620,28 @@ fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, 
     }
 }
 
-/// The `## Impacts` section: one templated line per subject, severity-first
-/// (the model's own order), speaking descriptive names only — ids live in
-/// the action sections. Templates specialize on the subject's change kind,
-/// and data destruction states irreversibility where the subject declares
-/// it (change-semantics Req 9.1/9.8).
+/// The impact section: **one line per resource**, carrying every impact on
+/// it — consequences merged permanent-first (data destruction, dependency
+/// loss, unavailability, replacement, then the transients), the would-mood
+/// shared, data destruction leading its line with further consequences
+/// back-referencing. Resources ordered by their most severe impact, ties by
+/// id; the heading pluralized by count (output-templates §Impact lines).
 fn impacts_section(explanation: &DeploymentExplanation, out: &mut String) {
-    use tokeira_explain::ImpactClass;
+    use std::collections::BTreeMap;
+    use tokeira_explain::{EvidenceId, ImpactClass};
     use tokeira_iac::Reversibility;
     if explanation.impacts.is_empty() {
         return;
     }
-    out.push_str("\n## Impacts\n");
+
+    // Collect per resource: its classes (BTreeSet keeps severity order —
+    // the enum order is the severity order) and any lost dependency.
+    struct ResourceImpacts<'a> {
+        change: &'a ExplainedChange,
+        classes: std::collections::BTreeSet<ImpactClass>,
+        lost: Vec<&'a EvidenceId>,
+    }
+    let mut by_resource: BTreeMap<&EvidenceId, ResourceImpacts<'_>> = BTreeMap::new();
     for impact in &explanation.impacts {
         for subject in &impact.subjects {
             let Some(change) = explanation
@@ -579,33 +651,115 @@ fn impacts_section(explanation: &DeploymentExplanation, out: &mut String) {
             else {
                 continue;
             };
-            let phrase = noun_phrase(explanation, change);
-            let line = match impact.class {
-                ImpactClass::DataDestroyed => {
-                    let irreversibly = change.semantics.reversibility.value()
-                        == Some(&Reversibility::Irreversible);
-                    if irreversibly {
-                        format!("data held by {phrase} would be destroyed, irreversibly")
-                    } else {
-                        format!("data held by {phrase} would be destroyed")
+            let entry = by_resource
+                .entry(subject)
+                .or_insert_with(|| ResourceImpacts {
+                    change,
+                    classes: std::collections::BTreeSet::new(),
+                    lost: Vec::new(),
+                });
+            entry.classes.insert(impact.class);
+            if impact.class == ImpactClass::DependencyLoss
+                && let Some(lost) = &impact.lost
+            {
+                entry.lost.push(lost);
+            }
+        }
+    }
+
+    // Resources ordered by their most severe impact, ties by id.
+    let mut resources: Vec<&ResourceImpacts<'_>> = by_resource.values().collect();
+    resources.sort_by(|a, b| {
+        let sa = a.classes.iter().next();
+        let sb = b.classes.iter().next();
+        sa.cmp(&sb)
+            .then_with(|| a.change.evidence_id.cmp(&b.change.evidence_id))
+    });
+
+    out.push_str(&format!(
+        "\n## {}\n",
+        counted_heading("Impact", resources.len())
+    ));
+    for resource in resources {
+        let change = resource.change;
+        let noun = noun_phrase(explanation, change);
+        // The verb phrases after the shared "would", in severity order. The
+        // first `be`-phrase keeps its "be"; later ones elide it.
+        let mut phrases: Vec<(bool, String)> = Vec::new();
+        let mut data_destroyed = false;
+        for class in &resource.classes {
+            match class {
+                ImpactClass::DataDestroyed => data_destroyed = true,
+                ImpactClass::DependencyLoss => {
+                    for lost in &resource.lost {
+                        let lost_noun = explanation
+                            .changes
+                            .iter()
+                            .find(|c| &&c.evidence_id == lost)
+                            .map(|c| noun_phrase(explanation, c))
+                            .unwrap_or_else(|| "a deleted dependency".to_string());
+                        phrases.push((false, format!("continue without {lost_noun}")));
                     }
                 }
                 ImpactClass::Unavailability => {
                     if change.kind == ChangeKind::Delete {
-                        format!("{phrase} would no longer be available")
+                        phrases.push((false, "no longer be available".to_string()));
                     } else {
-                        format!("{phrase} would be unavailable while the change applies")
+                        phrases.push((true, "unavailable while the change applies".to_string()));
                     }
                 }
-                ImpactClass::Replacement => format!("{phrase} would be replaced"),
+                ImpactClass::Replacement => phrases.push((true, "replaced".to_string())),
                 ImpactClass::BriefInterruption => {
-                    format!("{phrase} would be briefly interrupted")
+                    phrases.push((true, "briefly interrupted".to_string()));
                 }
                 ImpactClass::RollingReplacement => {
-                    format!("{phrase} would be replaced one at a time")
+                    phrases.push((true, "replaced one at a time".to_string()));
                 }
+            }
+        }
+        let joined = join_would_phrases(&phrases);
+        let line = if data_destroyed {
+            let irreversibly =
+                change.semantics.reversibility.value() == Some(&Reversibility::Irreversible);
+            let lead = if irreversibly {
+                format!("data held by {noun} would be destroyed, irreversibly")
+            } else {
+                format!("data held by {noun} would be destroyed")
             };
-            out.push_str(&format!("- {line}\n"));
+            if joined.is_empty() {
+                lead
+            } else {
+                format!("{lead}, and it would {joined}")
+            }
+        } else {
+            format!("{noun} would {joined}")
+        };
+        out.push_str(&format!("- {line}\n"));
+    }
+}
+
+/// Join would-mood verb phrases: the first `be`-phrase keeps its "be",
+/// later ones elide it; comma-joined with "and" before the last.
+fn join_would_phrases(phrases: &[(bool, String)]) -> String {
+    let mut be_spoken = false;
+    let rendered: Vec<String> = phrases
+        .iter()
+        .map(|(needs_be, text)| {
+            if *needs_be && !be_spoken {
+                be_spoken = true;
+                format!("be {text}")
+            } else {
+                text.clone()
+            }
+        })
+        .collect();
+    match rendered.len() {
+        0 => String::new(),
+        1 => rendered.into_iter().next().expect("one phrase"),
+        2 => format!("{}, and {}", rendered[0], rendered[1]),
+        _ => {
+            let (last, rest) = rendered.split_last().expect("non-empty");
+            format!("{}, and {last}", rest.join(", "))
         }
     }
 }
@@ -827,18 +981,22 @@ mod tests {
         );
     }
 
-    // Requirement 4.5: no uncertainties is a statement, not a silence.
+    // Requirement 4.5: no changes is a statement, not a silence — and the
+    // header is the plan's anchor alone (the templates agreement: coverage
+    // never rides the header).
     #[test]
     fn a_quiet_plan_states_full_confirmation() {
         let outcome = examined(Vec::new());
         let r = report_for(&outcome, BindingVerdict::DevIterate, true);
         let text = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(text.contains("No changes - everything matches the definition."));
-        assert!(text.contains("**Plan for test** at revision 1, with *live state* confirmed"));
+        assert!(text.contains("**Plan for test** at revision 1\n"));
     }
 
-    // Requirement 4.6: summary reveals uncertainty's presence by count;
-    // detail lists each with its consequence and resolution.
+    // The templates agreement on an unread resource: the summary line still
+    // states only the concrete change, and the detail carries the
+    // record-baseline provenance (the transitional line until the
+    // platform-issue seam reports what the describe answered).
     #[test]
     fn uncertainty_presence_at_summary_members_at_detail() {
         let mut outcome = examined(vec![change(ChangeKind::Update, "r")]);
@@ -850,26 +1008,27 @@ mod tests {
 
         let summary = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(
-            summary.contains("with *live state* unconfirmed for 1 resource"),
-            "the header carries the coverage: {summary}"
+            !summary.contains("unconfirmed"),
+            "coverage prose never rides the summary: {summary}"
         );
         assert!(
-            !summary.contains("could not be confirmed"),
-            "the in-place statement is detail-tier: {summary}"
+            summary.contains("- `m::r` would be updated\n"),
+            "the line stays the concrete change: {summary}"
         );
 
         let detail = render(&r, Mode::resolve(false, true)).unwrap();
         assert!(
             detail.contains("  - compared against the record - live state could not be read"),
-            "in-place statement at detail: {detail}"
+            "record-baseline provenance at detail: {detail}"
         );
     }
 
     // Phase 6 checkpoint (task 6.7, in-crate half): the storage plan renders
     // the Markdown target — declared behaviour in confidence voices with
-    // citations, impacts severity-first in kind-specialized templates, and
-    // NO gap prose: the undeclared DSQL fields stay machine-channel (model
-    // and artifact) under the knowledge-renders doctrine.
+    // citations, impacts per resource with consequences merged
+    // permanent-first, and NO gap prose: the undeclared DSQL fields stay
+    // machine-channel (model and artifact) under the knowledge-renders
+    // doctrine.
     #[test]
     fn a_storage_plan_renders_knowledge_and_keeps_gaps_machine_side() {
         use tokeira_iac::{Citation, Confidence, Disruption, LifecycleOperation};
@@ -939,8 +1098,8 @@ mod tests {
         let summary = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(summary.contains("# Infra Plan\n"), "title: {summary}");
         assert!(
-            summary.contains("**Plan for test** at revision 1, with *live state* confirmed"),
-            "header assurance: {summary}"
+            summary.contains("**Plan for test** at revision 1\n"),
+            "header anchor: {summary}"
         );
         assert!(
             summary.contains("## Update\n- `m::compose/tokeirad` would be updated\n"),
@@ -952,9 +1111,9 @@ mod tests {
         );
         assert!(
             summary.contains(
-                "## Impacts\n- `m::compose/tokeirad` would be unavailable while the change applies\n- `m::dsql/monitored` would no longer be available\n- `m::compose/tokeirad` would be replaced\n"
+                "## Impacts\n- `m::compose/tokeirad` would be unavailable while the change applies, and replaced\n- `m::dsql/monitored` would no longer be available\n"
             ),
-            "impacts severity-first, kind-specialized: {summary}"
+            "impacts per resource, severity-first, consequences merged: {summary}"
         );
 
         let detail = render(&r, Mode::resolve(false, true)).unwrap();
@@ -1057,9 +1216,8 @@ mod tests {
     /// `.kiro/specs/operator-explanation/output-templates.md` — a real-world
     /// compose+DSQL deployment: an edited service (grafana, with its compose
     /// declaration speaking), a replaced cluster (an edit) cascading into
-    /// tokeirad, a drifted service (mimir), a service whose live state could
-    /// not be read (loki — the diff measured against the record), and an
-    /// unchanged dependant (alloy).
+    /// tokeirad, a drifted service (mimir), and an unchanged dependant
+    /// (alloy).
     fn causality_reference_report() -> ExplanationReport {
         use std::collections::{BTreeMap, BTreeSet};
         use tokeira_explain::{BaselineView, CausalityView, apply_causality};
@@ -1095,16 +1253,6 @@ mod tests {
                 vec![FieldDiff::observation("environment")],
             ),
             service(
-                "loki",
-                "compose/loki",
-                ChangeKind::Update,
-                vec![FieldDiff {
-                    field: "image".into(),
-                    before: Some("grafana/loki:3.7.1".into()),
-                    after: Some("grafana/loki:3.8.0".into()),
-                }],
-            ),
-            service(
                 "tokeirad",
                 "compose/tokeirad",
                 ChangeKind::Replace,
@@ -1135,7 +1283,6 @@ mod tests {
         ] {
             status_by_id.insert(rid(id), tokeira_iac::RefreshStatus::DesiredLive);
         }
-        status_by_id.insert(rid("compose/loki"), tokeira_iac::RefreshStatus::Unknown);
         let mut live_departed = BTreeSet::new();
         live_departed.insert(rid("compose/mimir"));
 
@@ -1143,7 +1290,6 @@ mod tests {
         for id in [
             "compose/grafana",
             "compose/mimir",
-            "compose/loki",
             "compose/tokeirad",
             "compose/alloy",
         ] {
@@ -1227,7 +1373,6 @@ mod tests {
         let recorded: BTreeMap<ResourceId, ResourceState> = [
             "compose/grafana",
             "compose/mimir",
-            "compose/loki",
             "compose/tokeirad",
             "compose/alloy",
             "dsql/cluster",
@@ -1238,6 +1383,7 @@ mod tests {
         let mut edges: BTreeMap<ResourceId, Vec<ResourceId>> = BTreeMap::new();
         edges.insert(rid("compose/tokeirad"), vec![rid("dsql/cluster")]);
         edges.insert(rid("compose/alloy"), vec![rid("compose/mimir")]);
+        let desired_edges = edges.clone();
 
         let view = CausalityView {
             desired: Some(desired),
@@ -1245,6 +1391,7 @@ mod tests {
             baseline_revision: 4,
             recorded,
             edges,
+            desired_edges,
             refresh: outcome.refresh.clone(),
         };
         apply_causality(&mut r.explanation, &view);
@@ -1259,22 +1406,16 @@ mod tests {
         let r = causality_reference_report();
         let summary = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(
-            summary.contains(
-                "**Plan for compose** at revision 4, with *live state* unconfirmed for 1 resource"
-            ),
-            "header anchor + coverage: {summary}"
+            summary.contains("**Plan for compose** at revision 4\n"),
+            "header anchor: {summary}"
         );
         assert!(
             summary.contains("- the *grafana* service would be updated - `image`: `grafana/grafana-oss:12.4.3` → `grafana/grafana-oss:12.5.0` - `grafana::compose/grafana`\n"),
             "edit clause is the diff: {summary}"
         );
         assert!(
-            summary.contains("- the *mimir* service would be updated - `environment` changed outside the definition - `mimir::compose/mimir`\n"),
-            "drift clause names the fields: {summary}"
-        );
-        assert!(
-            summary.contains("- the *loki* service would be updated - `loki::compose/loki`\n"),
-            "an unknown cause renders no clause at summary: {summary}"
+            summary.contains("## Resource Drift\n- the *mimir* service's `environment` changed outside the definition - it would be updated - `mimir::compose/mimir`\n"),
+            "drift speaks in its own section, fields named: {summary}"
         );
         assert!(
             summary.contains("- the *tokeirad* service would be replaced - forced by the *Aurora DSQL cluster* replacement - `tokeirad::compose/tokeirad`\n"),
@@ -1282,10 +1423,6 @@ mod tests {
         );
 
         let detail = render(&r, Mode::resolve(false, true)).unwrap();
-        assert!(
-            detail.contains("  - compared against the record - live state could not be read, so why this differs is unknown"),
-            "the record-baseline provenance line: {detail}"
-        );
         assert!(
             !detail.contains("could not be established"),
             "no machine voice in narrative: {detail}"
@@ -1313,8 +1450,11 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&render(&r, Mode::resolve(true, false)).unwrap()).unwrap();
-        assert!(
-            json["causal_groups"].as_array().map(Vec::len).unwrap_or(0) >= 3,
+        // The reference world groups exactly twice: the revision-comparison
+        // root (grafana, the cluster, tokeirad) and mimir's own drift root.
+        assert_eq!(
+            json["causal_groups"].as_array().map(Vec::len).unwrap_or(0),
+            2,
             "groups serialized: {json}"
         );
         assert!(
@@ -1331,13 +1471,7 @@ mod tests {
     // the renderer's output for the reference fixture, byte-for-byte — the
     // managed-template guarantee (umbrella D10). A template change is an
     // amendment to the doc first; this test is what makes that mechanical.
-    // Ignored while the renderer implements the agreed form (anchor-only
-    // header, `## Resource Drift`, `## Platform Issue[s]`, computed-plural
-    // headings): the doc states the agreement in its entirety, and
-    // un-ignoring this test — green — is the renderer slice's definition
-    // of done.
     #[test]
-    #[ignore = "the renderer lags the agreed template form; un-ignore with the Resource Drift / Platform Issue renderer slice"]
     fn the_output_templates_doc_is_executable() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1489,11 +1623,12 @@ mod tests {
             prop_assert_eq!(&back, &report.explanation, "JSON must round-trip to an equal model");
         }
 
-        // Property 8 — not-determined slots make no claims. Evolved with
-        // change-semantics Phase 5: an undeclared field may now appear as a
-        // *gap* (a SemanticsUndeclared uncertainty naming it), but never as
-        // a consequence — with every declaration defaulted there are no
-        // impacts, so no impact-statement vocabulary can appear, and the
+        // Property 8 — not-determined slots make no claims. Evolved twice:
+        // an undeclared field may appear as a *gap* (a SemanticsUndeclared
+        // uncertainty naming it), and the engine floor (Requirement 5.5) may
+        // state unavailability/replacement for Replace and Delete kinds —
+        // those are grounded in the kind, which is never Unknown. What can
+        // never appear is a declaration-only consequence, and the
         // still-dormant slots (cause, dependants, source) stay wholly
         // silent.
         #[test]
@@ -1501,7 +1636,6 @@ mod tests {
             for detail in [false, true] {
                 let text = render(&report, Mode::resolve(false, detail)).unwrap().to_lowercase();
                 for claim in ["would be destroyed",
-                              "unavailable while the change applies",
                               "would be briefly interrupted",
                               "one at a time"] {
                     prop_assert!(

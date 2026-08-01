@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 1d87710b095b6fa715bf9b6e7605fb53238a3442500c23b7cb35c3c8fdeafc0a # shrinks to outcome = PlanOutcome { changes: [], refresh: RefreshCoverage { status_by_id: {}, examined: false, live_departed: {} }, semantics_by_id: {}, display_by_id: {}, edges_by_id: {} }
+cc e8a0a2c743dbbc3a73c326f4119ae7ea248b0794dff50de35604034e89a33b96 # shrinks to outcome = PlanOutcome { changes: [Change { kind: Replace, resource_type: "compose_service", module: "m0", resource: "compose/r0", details: [] }], refresh: RefreshCoverage { status_by_id: {}, examined: false, live_departed: {} }, semantics_by_id: {}, display_by_id: {}, edges_by_id: {} }

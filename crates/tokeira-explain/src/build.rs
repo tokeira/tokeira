@@ -68,6 +68,7 @@ pub fn explain_plan(context: DeploymentContext, outcome: &PlanOutcome) -> Deploy
                 .unwrap_or_default(),
             cause: Default::default(),
             dependants: Vec::new(),
+            departed_fields: Vec::new(),
             source: None,
         });
         explanation
@@ -154,6 +155,7 @@ pub fn explain_applied(
                 .unwrap_or_default(),
             cause: Default::default(),
             dependants: Vec::new(),
+            departed_fields: Vec::new(),
             source: None,
         });
         explanation
@@ -212,6 +214,7 @@ fn base(context: DeploymentContext) -> DeploymentExplanation {
         destructive: Vec::new(),
         uncertainties: Vec::new(),
         causal_groups: Vec::new(),
+        platform_issues: Vec::new(),
         evidence,
     }
 }

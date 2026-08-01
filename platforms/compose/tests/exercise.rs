@@ -362,7 +362,8 @@ async fn causality_classifies_a_definition_edit_over_the_live_seam_chain() {
             baseline: BaselineView::Realized(baseline),
             baseline_revision: 1,
             recorded: recorded.resources,
-            edges,
+            edges: edges.clone(),
+            desired_edges: edges,
             refresh: outcome.refresh.clone(),
         },
     );

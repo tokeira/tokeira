@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    fs::OpenOptions,
+    path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
 
@@ -21,9 +24,9 @@ use crate::{StateError, backend::StateBackend};
 ///
 /// ## Atomicity
 ///
-/// Writes use a unique temp file (PID + random suffix) and `rename()` for
-/// atomic replacement. Concurrent writers cannot clobber each other's temp
-/// files.
+/// Writers hold an exclusive sidecar-file lock across the version check and a
+/// unique-temp-file `rename()`. This makes the full read/check/replace sequence
+/// one single-host critical section while keeping publication atomic for readers.
 ///
 /// ## Limitations
 ///
@@ -59,6 +62,85 @@ fn unique_tmp_name() -> String {
     format!("manifest.json.{pid}.{seq}.tmp")
 }
 
+fn write_manifest_locked(
+    dir: &Path,
+    path: &Path,
+    data: &[u8],
+    expected_version: &str,
+) -> Result<(), StateError> {
+    let lock_path = dir.join("manifest.lock");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| StateError::Backend(format!("open {}: {e}", lock_path.display())))?;
+
+    // A separate inode is load-bearing: renaming the manifest replaces its
+    // inode, so locking the manifest itself would let a later opener bypass a
+    // waiter still holding a lock on the pre-rename file.
+    lock_file
+        .lock()
+        .map_err(|e| StateError::Backend(format!("lock {}: {e}", lock_path.display())))?;
+
+    verify_expected_version(path, expected_version)?;
+
+    let tmp = dir.join(unique_tmp_name());
+    if let Err(err) = std::fs::write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(StateError::Backend(format!(
+            "write {}: {err}",
+            tmp.display()
+        )));
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(StateError::Backend(format!(
+            "rename {}: {err}",
+            path.display()
+        )));
+    }
+
+    // Dropping the file releases the advisory lock after the rename commits.
+    drop(lock_file);
+    Ok(())
+}
+
+fn verify_expected_version(path: &Path, expected_version: &str) -> Result<(), StateError> {
+    match std::fs::read(path) {
+        Ok(existing) => {
+            let current_version = content_hash(&existing);
+            if expected_version.is_empty() {
+                return Err(StateError::Conflict(format!(
+                    "manifest already exists (version {current_version}); \
+                     expected empty version for first write"
+                )));
+            }
+            if current_version != expected_version {
+                return Err(StateError::Conflict(format!(
+                    "manifest version mismatch: expected {expected_version}, \
+                     got {current_version}"
+                )));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if expected_version.is_empty() {
+                Ok(())
+            } else {
+                Err(StateError::Conflict(format!(
+                    "manifest does not exist but expected version {expected_version}"
+                )))
+            }
+        }
+        Err(err) => Err(StateError::Backend(format!(
+            "read {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
 #[async_trait]
 impl StateBackend for LocalBackend {
     async fn read_manifest(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, StateError> {
@@ -85,54 +167,13 @@ impl StateBackend for LocalBackend {
             .map_err(|e| StateError::Backend(format!("mkdir {}: {e}", dir.display())))?;
 
         let path = dir.join("manifest.json");
-
-        if expected_version.is_empty() {
-            // Create-only: fail if manifest already exists
-            if path.exists() {
-                let existing = tokio::fs::read(&path)
-                    .await
-                    .map_err(|e| StateError::Backend(format!("read {}: {e}", path.display())))?;
-                let current_version = content_hash(&existing);
-                return Err(StateError::Conflict(format!(
-                    "manifest already exists (version {current_version}); \
-                     expected empty version for first write"
-                )));
-            }
-        } else {
-            // Update: verify current content hash matches expected
-            match tokio::fs::read(&path).await {
-                Ok(existing) => {
-                    let current_version = content_hash(&existing);
-                    if current_version != expected_version {
-                        return Err(StateError::Conflict(format!(
-                            "manifest version mismatch: expected {expected_version}, \
-                             got {current_version}"
-                        )));
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(StateError::Conflict(format!(
-                        "manifest does not exist but expected version {expected_version}"
-                    )));
-                }
-                Err(e) => {
-                    return Err(StateError::Backend(format!("read {}: {e}", path.display())));
-                }
-            }
-        }
-
-        // Atomic write: unique temp file + rename
-        let tmp = dir.join(unique_tmp_name());
-        tokio::fs::write(&tmp, data)
-            .await
-            .map_err(|e| StateError::Backend(format!("write {}: {e}", tmp.display())))?;
-        tokio::fs::rename(&tmp, &path).await.map_err(|e| {
-            // Clean up temp file on rename failure
-            let _ = std::fs::remove_file(&tmp);
-            StateError::Backend(format!("rename {}: {e}", path.display()))
-        })?;
-
-        Ok(())
+        let data = data.to_vec();
+        let expected_version = expected_version.to_string();
+        tokio::task::spawn_blocking(move || {
+            write_manifest_locked(&dir, &path, &data, &expected_version)
+        })
+        .await
+        .map_err(|e| StateError::Backend(format!("local manifest writer failed: {e}")))?
     }
 
     async fn read_snapshot(&self, key: &str) -> Result<Vec<u8>, StateError> {
@@ -188,6 +229,8 @@ impl StateBackend for LocalBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     // The read_snapshot contract: an absent key is NotFound (an honest miss),
@@ -271,6 +314,40 @@ mod tests {
             matches!(err, StateError::Conflict(_)),
             "expected Conflict, got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_version_admits_exactly_one_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(LocalBackend::new(tmp.path()));
+        backend.write_manifest("test", b"v1", "").await.unwrap();
+        let (_, version) = backend.read_manifest("test").await.unwrap().unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(9));
+        let mut writers = Vec::new();
+        for value in 0..8_u8 {
+            let backend = Arc::clone(&backend);
+            let barrier = Arc::clone(&barrier);
+            let version = version.clone();
+            writers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                backend.write_manifest("test", &[value], &version).await
+            }));
+        }
+        barrier.wait().await;
+
+        let mut successes = 0;
+        let mut conflicts = 0;
+        for writer in writers {
+            match writer.await.unwrap() {
+                Ok(()) => successes += 1,
+                Err(StateError::Conflict(_)) => conflicts += 1,
+                Err(err) => panic!("unexpected writer error: {err}"),
+            }
+        }
+
+        assert_eq!(successes, 1);
+        assert_eq!(conflicts, 7);
     }
 
     #[tokio::test]

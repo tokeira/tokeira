@@ -153,12 +153,21 @@ reported as least-privilege findings; they do not compensate for missing require
 
 ### AWS physical-name policy
 
+Every Tokeira-managed physical name follows the conceptual form
+`<sanitized-project-name>-<resource-role>-<short-stable-digest>`, normalized to the target provider's
+syntax. The digest covers the canonical tuple `(deployment UUID, environment, AWS account id, AWS
+region, logical resource id)`. It is the uniqueness component; `project_name` and the resource role are
+the human-readable components. Operator-configured names are readable prefixes/aliases, not exact managed
+physical names. An exact provider-facing name is accepted only through a supported preexisting-resource
+adoption contract.
+
 | Name class | Examples | Policy |
 |---|---|---|
-| Operator-explicit, account/region namespace | ECS cluster, ALB | Validate provider syntax/length and prove the candidate is unused or owned by this deployment; deterministic identity scoping may be applied and must be shown in plan |
-| Operator-explicit DNS namespace | Service Connect namespace, private DNS zone | Validate DNS semantics and reject a conflicting namespace/zone not recorded as owned or explicitly preexisting |
-| Derived account/region resources | IAM roles/profiles, launch templates, ASGs, capacity providers, DynamoDB tables, SSM paths | Derive from deployment identity; preserve a stable hash when truncation is needed |
-| Globally named resources | S3 remote-state bucket | Include account and region plus a stable deployment discriminator; validate global availability before mutation |
+| Operator-configured managed prefix | ECS cluster, ALB | Sanitize the configured/project prefix, add the resource role and deployment-identity digest, validate provider constraints, and show configured plus final names in plan |
+| Operator-configured managed DNS prefix | Service Connect namespace, private DNS zone | Normalize the configured prefix as DNS labels, add a bounded deployment-identity digest, and reject an invalid or conflicting final namespace/zone |
+| Fully derived account/region resources | IAM roles/profiles, launch templates, ASGs, capacity providers, DynamoDB tables, SSM paths | Use `project_name`, resource role, and the deployment-identity digest; preserve the digest when truncation is needed |
+| Globally named resources | S3 remote-state bucket | Use the same scheme with account and region in the digest input; validate global availability before mutation |
+| Adopted preexisting resources | Operator-supplied cluster, role, endpoint, namespace, or zone identity | Preserve the exact configured physical name only through an explicit adoption contract and verify ownership/existence without renaming |
 | Provider-assigned ids | VPC ids, endpoint ids, task-definition revisions | Record returned ids in state; never guess or reuse them as ownership evidence |
 
 ### ECS provisioner-bundle policy
@@ -270,20 +279,22 @@ fails before deployment.
 ### Requirement 5: Deterministic and collision-safe AWS physical names
 
 **User Story:** As an operator running multiple deployments, accounts, and regions, I want every
-provider-facing name to be predictable and ownership-safe, so that a default such as `tokeira` cannot bind
-to or collide with another environment's resources.
+Tokeira-managed name derived from a readable project prefix and the stable deployment identity, so that a
+default such as `tokeira` cannot bind to or collide with another environment's resources.
 
 #### Acceptance Criteria
 
-1. WHEN ECS configuration is admitted, THE provisioner SHALL resolve and record the AWS account id and region that form the deployment's naming identity.
-2. WHEN a derived physical name is produced, THE naming function SHALL include a stable deployment discriminator plus the account/region scope required by its name class.
-3. WHEN provider length limits require truncation, THE naming function SHALL retain a stable collision-resistant suffix and produce the same result for the same deployment identity.
-4. WHEN any physical-name candidate is produced, THE provisioner SHALL validate the provider's character, prefix, suffix, reserved-name, and length constraints before provider mutation.
-5. WHEN an operator-explicit cluster, ALB, namespace, or private-zone name is used, THE plan SHALL show the final candidate and whether it was retained verbatim, deterministically scoped, or rejected.
-6. IF a candidate already exists but is absent from this deployment's recorded state and is not declared through a supported preexisting-resource contract, THEN the operation SHALL fail closed with the conflicting identity.
-7. WHEN an existing candidate is treated as owned, THE provisioner SHALL corroborate ownership from recorded physical id plus deployment identity rather than name or tags alone.
-8. IF ambient AWS account or region differs from the recorded naming identity, THEN the provisioner SHALL report a retarget and refuse silent renaming or cross-account reconciliation.
-9. WHEN a plan is emitted as JSON, THE output SHALL include logical resource id, physical-name candidate, name class, scope inputs, and ownership/adoption verdict.
+1. WHEN ECS configuration is admitted, THE provisioner SHALL resolve and record `project_name`, deployment UUID, environment, AWS account id, and AWS region as the deployment's naming identity.
+2. WHEN uniqueness input is assembled, THE provisioner SHALL read the deployment UUID from recorded deployment identity rather than operator-editable definition data.
+3. WHEN a managed physical name is produced, THE naming function SHALL combine sanitized `project_name`, the logical resource role, and a stable digest of `(deployment UUID, environment, AWS account id, AWS region, logical resource id)`.
+4. WHEN an operator configures a cluster, ALB, namespace, or private-zone name, THE naming function SHALL treat that value as a readable prefix/alias and append the managed resource role and deployment-identity digest.
+5. WHEN an exact provider-facing name is required, THE platform SHALL permit it only through a supported preexisting-resource adoption contract rather than for a Tokeira-managed resource.
+6. WHEN provider length limits require truncation, THE naming function SHALL retain the complete collision-resistant suffix and produce the same result for the same naming identity.
+7. WHEN any physical-name candidate is produced, THE provisioner SHALL validate the provider's character, prefix, suffix, reserved-name, and length constraints before provider mutation.
+8. IF a candidate already exists but is absent from this deployment's recorded state and is not declared through a supported preexisting-resource contract, THEN the operation SHALL fail closed with the conflicting identity.
+9. WHEN an existing candidate is treated as owned, THE provisioner SHALL corroborate ownership from recorded physical id plus deployment identity rather than name or tags alone.
+10. IF ambient AWS account or region differs from the recorded naming identity, THEN the provisioner SHALL report a retarget and refuse silent renaming or cross-account reconciliation.
+11. WHEN a plan is emitted, THE output SHALL show the configured/project prefix, logical resource id, final physical-name candidate, digest scope inputs, truncation decision, and ownership/adoption verdict in human and JSON views.
 
 ### Requirement 6: Hermetic and versioned ECS provisioner bundles
 

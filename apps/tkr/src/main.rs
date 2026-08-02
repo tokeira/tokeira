@@ -45,6 +45,7 @@ use anyhow::Result;
 use clap::Parser;
 
 mod bundle_create;
+pub mod catalog;
 mod cli;
 mod commands;
 mod deployment_dir;

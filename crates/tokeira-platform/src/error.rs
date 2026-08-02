@@ -407,6 +407,40 @@ pub struct DeliveryError {
     pub message: String,
 }
 
+/// Failure while preparing or invoking one provider-owned runtime capability.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("provider execution `{provider}` failed: {message}")]
+pub struct ProviderExecutionError {
+    /// Stable provider registration identity.
+    pub provider: String,
+    /// Provider-owned actionable failure detail.
+    pub message: String,
+}
+
+impl ProviderExecutionError {
+    /// Construct a provider-owned runtime failure without rewriting its detail.
+    pub fn new(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Failure to bind a verified definition to the generic engine adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum FrameworkError {
+    /// The completed definition omitted the binding's required state-bootstrap module.
+    #[error("verified definition omits required bootstrap module `{0}`")]
+    MissingBootstrap(String),
+    /// A workload could not be projected by its selected provider delivery.
+    #[error(transparent)]
+    Delivery(#[from] DeliveryError),
+    /// More than one provider offered the single deploy-engine executor.
+    #[error("multiple provider executions offer a deploy-engine platform: {0}")]
+    AmbiguousDeployPlatform(String),
+}
+
 impl DeliveryError {
     /// Construct a provider delivery failure.
     pub fn new(message: impl Into<String>) -> Self {

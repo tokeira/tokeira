@@ -25,6 +25,7 @@ tokeira-orchestrator = { path = "../tokeira-orchestrator" }
 termimad = { workspace = true }
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 proptest.workspace = true
 

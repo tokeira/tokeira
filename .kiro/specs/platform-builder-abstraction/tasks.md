@@ -89,7 +89,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       dangling dependency and non-describing resource in deterministic order.
     - Withhold a kind until its resource truthfully performs live description once prerequisites exist.
     - _Requirements: 3.34–3.39, 4.16–4.18, 9.17, 14.27–14.28_
-  - [ ] 4.3 Implement `FrameworkDeployment<P>` and logical-to-physical placement
+  - [x] 4.3 Implement `FrameworkDeployment<P>` and logical-to-physical placement
     - Realize resources in definition order, inject realized dependency ids, preserve namespaces, and
       project workloads only when their provider uses a separate deploy-engine universe.
     - Keep EKS manifest bundles on the infrastructure path and delegate clients, stores, hydration,
@@ -219,7 +219,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - _Requirements: 3.12–3.15, 3.24–3.26, 3.45, 3.47–3.48, 8.12, 14.15, 14.46, 14.49_
 
 - [ ] 10. Wire the generic Bound Provisioner and deployment-directory lifecycle
-  - [ ] 10.1 Make `tokeira-provisioner-cli` a platform/frontend-neutral library entrypoint
+  - [x] 10.1 Make `tokeira-provisioner-cli` a platform/frontend-neutral library entrypoint
     - Implement `BoundPlatform<P, F>`, `run`, and `bound_provisioner_main!`; statically accept one binding
       and one frontend while retaining lifecycle parsing, binding gates, locks, state envelopes,
       reports, upgrade, rollback, describe, and exit behavior in the shell.

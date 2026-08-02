@@ -1,9 +1,11 @@
 //! Static adapter from one platform binding and one frontend to the lifecycle shell.
 
-use std::{path::Path, sync::Arc};
+use std::{collections::HashSet, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use tokeira_orchestrator::{DefinitionFormatId, PlatformId, PlatformLaunchClass};
+use tokeira_orchestrator::{
+    DefinitionFormatId, DeployEngine, Deployment as _, InfraEngine, PlatformId, PlatformLaunchClass,
+};
 use tokeira_platform::{
     binding::{Platform, PlatformBinding},
     context::InvocationContext,
@@ -11,6 +13,7 @@ use tokeira_platform::{
         DefinitionEngine, DefinitionFrontend, DefinitionRequest, DefinitionSource,
         DefinitionSourceName,
     },
+    projection::FrameworkDeployment,
 };
 use tokeira_provisioner::DeploymentBindingMetadata;
 
@@ -139,6 +142,21 @@ where
         Ok(metadata)
     }
 
+    fn invocation_input(
+        &self,
+        deployment_dir: &Path,
+        metadata: &DeploymentBindingMetadata,
+    ) -> InvocationContext {
+        InvocationContext {
+            deployment_id: metadata.name.clone(),
+            deployment_uuid: metadata.id,
+            environment: None,
+            region: None,
+            account_id: None,
+            deployment_dir: deployment_dir.to_path_buf(),
+        }
+    }
+
     fn invocation(
         &self,
         deployment_dir: &Path,
@@ -146,14 +164,7 @@ where
     ) -> Result<P::Context> {
         self.binding
             .context
-            .construct(&InvocationContext {
-                deployment_id: metadata.name.clone(),
-                deployment_uuid: metadata.id,
-                environment: None,
-                region: None,
-                account_id: None,
-                deployment_dir: deployment_dir.to_path_buf(),
-            })
+            .construct(&self.invocation_input(deployment_dir, metadata))
             .map_err(Into::into)
     }
 
@@ -208,12 +219,57 @@ where
         Ok(definition)
     }
 
-    fn execution_not_ready<T>(&self) -> Result<T> {
-        bail!(
-            "platform `{}` is bound for definition evaluation, but its provider execution registrations are not complete",
-            self.expected_platform
+    fn framework(&self, deployment_dir: &Path) -> Result<FrameworkDeployment<P>> {
+        let metadata = self.metadata(deployment_dir)?;
+        let definition = metadata
+            .definition
+            .as_ref()
+            .expect("metadata admission requires a definition");
+        let source_path = deployment_dir.join(definition.path.as_path());
+        let evaluated = self.verified_definition(deployment_dir, &source_path, false)?;
+        FrameworkDeployment::new(
+            evaluated,
+            self.binding.clone(),
+            self.invocation_input(deployment_dir, &metadata),
         )
+        .map_err(Into::into)
     }
+
+    async fn infra_engine(
+        &self,
+        deployment_dir: &Path,
+    ) -> Result<(
+        InfraEngine<FrameworkDeployment<P>>,
+        tokeira_iac::InfraComposition,
+    )> {
+        let framework = self.framework(deployment_dir)?;
+        let config = framework.engine_config();
+        let engine = InfraEngine::new(framework, &config, deployment_dir)
+            .await
+            .context("failed to open the generic infrastructure engine")?;
+        let composition = engine.compose(tokeira_iac::ModuleSelection::All)?;
+        Ok((engine, composition))
+    }
+}
+
+fn service_changes(changes: Vec<tokeira_orchestrator::ServiceChange>) -> Vec<tokeira_iac::Change> {
+    changes
+        .into_iter()
+        .map(|change| tokeira_iac::Change {
+            kind: match change.kind {
+                tokeira_orchestrator::ServiceChangeKind::Create => tokeira_iac::ChangeKind::Create,
+                tokeira_orchestrator::ServiceChangeKind::Update => tokeira_iac::ChangeKind::Update,
+                tokeira_orchestrator::ServiceChangeKind::Delete => tokeira_iac::ChangeKind::Delete,
+                tokeira_orchestrator::ServiceChangeKind::NoChange => {
+                    tokeira_iac::ChangeKind::NoChange
+                }
+            },
+            resource_type: "service".to_string(),
+            module: change.module,
+            resource: change.service,
+            details: Vec::new(),
+        })
+        .collect()
 }
 
 impl<P, F> ProvisionerPlatform for BoundPlatform<P, F>
@@ -245,24 +301,51 @@ where
         Ok(self.metadata(deployment_dir)?.name)
     }
 
-    async fn infra_plan(&self, _deployment_dir: &Path) -> Result<tokeira_iac::PlanOutcome> {
-        self.execution_not_ready()
+    async fn infra_plan(&self, deployment_dir: &Path) -> Result<tokeira_iac::PlanOutcome> {
+        let (mut engine, composition) = self.infra_engine(deployment_dir).await?;
+        engine
+            .plan(&composition, tokeira_iac::ModuleSelection::All)
+            .await
+            .context("infrastructure plan failed")
     }
 
-    async fn infra_apply(&self, _deployment_dir: &Path) -> Result<AppliedOutcome> {
-        self.execution_not_ready()
+    async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
+        let (mut engine, composition) = self.infra_engine(deployment_dir).await?;
+        let changes = engine
+            .apply(&composition, tokeira_iac::ModuleSelection::All)
+            .await
+            .context("infrastructure apply failed")?;
+        Ok(AppliedOutcome {
+            display_by_id: engine.display_map(&composition)?,
+            changes,
+        })
     }
 
-    async fn infra_destroy(&self, _deployment_dir: &Path) -> Result<usize> {
-        self.execution_not_ready()
+    async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
+        let (mut engine, composition) = self.infra_engine(deployment_dir).await?;
+        Ok(engine
+            .destroy(&composition, tokeira_iac::ModuleSelection::All)
+            .await
+            .context("infrastructure destroy failed")?
+            .len())
     }
 
     async fn infra_destroy_selected(
         &self,
-        _deployment_dir: &Path,
-        _ids: &[String],
+        deployment_dir: &Path,
+        ids: &[String],
     ) -> Result<Vec<ChangeLogEntry>> {
-        self.execution_not_ready()
+        let (mut engine, composition) = self.infra_engine(deployment_dir).await?;
+        let ids = ids
+            .iter()
+            .cloned()
+            .map(tokeira_iac::ResourceId)
+            .collect::<HashSet<_>>();
+        let changes = engine
+            .destroy_selected(&composition, &ids)
+            .await
+            .context("selected infrastructure destroy failed")?;
+        Ok(crate::change_log_entries(&changes))
     }
 
     async fn definition_check(
@@ -300,15 +383,84 @@ where
         Ok(Realization::Realized(snapshot))
     }
 
-    async fn deploy_plan(
-        &self,
-        _deployment_dir: &Path,
-    ) -> Result<Realization<tokeira_iac::PlanOutcome>> {
-        self.execution_not_ready()
+    async fn recorded_state(&self, deployment_dir: &Path) -> Result<tokeira_iac::InfraState> {
+        let framework = self.framework(deployment_dir)?;
+        let config = framework.engine_config();
+        let (state, _) = framework
+            .create_infra_store(&config, deployment_dir)
+            .load()
+            .await
+            .context("failed to load recorded infrastructure state")?;
+        Ok(state)
     }
 
-    async fn deploy_apply(&self, _deployment_dir: &Path) -> Result<Realization<AppliedOutcome>> {
-        self.execution_not_ready()
+    async fn deploy_plan(
+        &self,
+        deployment_dir: &Path,
+    ) -> Result<Realization<tokeira_iac::PlanOutcome>> {
+        let framework = self.framework(deployment_dir)?;
+        if !framework.has_runtime_workloads() {
+            return if framework.has_workloads() {
+                Ok(Realization::Realized(
+                    self.infra_plan(deployment_dir).await?,
+                ))
+            } else {
+                Ok(Realization::NotApplicable {
+                    reason: "the definition declares no runtime workloads",
+                })
+            };
+        }
+        let config = framework.engine_config();
+        let mut engine = DeployEngine::new(framework, &config, deployment_dir)
+            .await
+            .context("failed to open the generic deploy engine")?;
+        Ok(Realization::Realized(tokeira_iac::PlanOutcome {
+            changes: service_changes(engine.plan().await.context("workload plan failed")?),
+            ..Default::default()
+        }))
+    }
+
+    async fn deploy_apply(&self, deployment_dir: &Path) -> Result<Realization<AppliedOutcome>> {
+        let framework = self.framework(deployment_dir)?;
+        if !framework.has_runtime_workloads() {
+            return if framework.has_workloads() {
+                Ok(Realization::Realized(
+                    self.infra_apply(deployment_dir).await?,
+                ))
+            } else {
+                Ok(Realization::NotApplicable {
+                    reason: "the definition declares no runtime workloads",
+                })
+            };
+        }
+        let platform = framework.deploy_platform()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime workloads are declared but no selected provider supplies a deploy executor"
+            )
+        })?;
+        let config = framework.engine_config();
+        let mut engine = DeployEngine::new(framework, &config, deployment_dir)
+            .await
+            .context("failed to open the generic deploy engine")?;
+        let changes = service_changes(
+            engine
+                .apply(platform.as_ref())
+                .await
+                .context("workload apply failed")?,
+        );
+        let display_by_id = changes
+            .iter()
+            .map(|change| {
+                (
+                    tokeira_iac::ResourceId(format!("service/{}", change.resource)),
+                    change.resource.clone(),
+                )
+            })
+            .collect();
+        Ok(Realization::Realized(AppliedOutcome {
+            changes,
+            display_by_id,
+        }))
     }
 
     async fn scale(&self, _deployment_dir: &Path, _specs: &[String]) -> Result<Realization<usize>> {
@@ -322,15 +474,28 @@ where
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
     use tokeira_platform::{
-        artifact::ArtifactCatalog,
-        author::AuthorSession,
+        artifact::{
+            ArtifactCatalog, CanonicalDocument, ContentIdentitySet, DeliveryKey, DesiredDocument,
+            OperationalArtifactReceipt, OperationalArtifactRequest,
+        },
+        author::{
+            AuthorArgument, AuthorHandle, AuthorNode, AuthorResult, AuthorSession, AuthorValue,
+        },
         binding::{StateBinding, StatePolicy},
-        catalog::{ImageCatalog, KindSet, ProviderSet, ServiceCatalog},
+        catalog::{
+            DeliveryProjection, HealthDeclaration, ImageCatalog, ImageSelection, KindSet,
+            PlacementContext, PlacementDeclaration, PlatformService, ProviderDelivery,
+            ProviderExecution, ProviderSet, ServiceCatalog,
+        },
         config::{ConfigContract, PlatformConfig},
         context::{ContextArgument, ContextContract, ContextProjection, PlatformContext},
-        error::{ConfigError, ContextError, FrontendDiagnostic},
+        error::{ConfigError, ContextError, DeliveryError, FrontendDiagnostic},
+        graph::WorkloadDeclaration,
         ops::PlatformOps,
     };
 
@@ -392,16 +557,31 @@ mod tests {
     }
 
     fn fake_binding(id: &str) -> PlatformBinding<FakePlatform> {
+        fake_binding_with(id, ServiceCatalog::default(), ProviderSet::default())
+    }
+
+    fn fake_binding_with(
+        id: &str,
+        services: ServiceCatalog<FakePlatform>,
+        providers: ProviderSet<FakePlatform>,
+    ) -> PlatformBinding<FakePlatform> {
+        let images = ImageCatalog::new(
+            services
+                .entries()
+                .iter()
+                .map(|service| service.image.logical_id.clone())
+                .collect(),
+        );
         PlatformBinding::new(
             PlatformId::new(id).expect("platform id"),
             "bootstrap",
             ConfigContract::new(),
             ContextContract::new(fake_context, authoring_context),
             KindSet::default(),
-            ServiceCatalog::default(),
+            services,
             ArtifactCatalog::default(),
-            ImageCatalog::default(),
-            ProviderSet::default(),
+            images,
+            providers,
             StateBinding::new(StatePolicy::LocalCas),
             PlatformOps::default(),
             Vec::new(),
@@ -410,24 +590,205 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
-    struct FakeFrontend(DefinitionFormatId);
+    struct FakeFrontend {
+        format: DefinitionFormatId,
+        workload: bool,
+    }
 
     impl DefinitionFrontend<FakePlatform> for FakeFrontend {
         fn format(&self) -> &DefinitionFormatId {
-            &self.0
+            &self.format
         }
 
         fn evaluate(
             &self,
             _source: tokeira_platform::definition::FrontendSource<'_>,
-            _author: &mut AuthorSession<FakePlatform>,
+            author: &mut AuthorSession<FakePlatform>,
         ) -> Result<tokeira_platform::definition::FrontendOutput, FrontendDiagnostic> {
-            unreachable!("identity tests refuse before frontend evaluation")
+            let AuthorResult::Handle(AuthorHandle::Deployment(deployment)) = author
+                .associated("Deployment.new", Vec::new())
+                .expect("deployment constructor")
+            else {
+                panic!("Deployment.new returns a deployment handle");
+            };
+            let AuthorResult::Handle(AuthorHandle::Module(bootstrap)) = author
+                .call(
+                    AuthorHandle::Deployment(deployment.clone()),
+                    "module",
+                    vec![AuthorArgument::Value(AuthorNode::string("bootstrap"))],
+                )
+                .expect("bootstrap module")
+            else {
+                panic!("Deployment.module returns a module handle");
+            };
+            if self.workload {
+                author
+                    .call(
+                        AuthorHandle::Module(bootstrap),
+                        "workload",
+                        vec![
+                            AuthorArgument::Value(AuthorNode::string("server")),
+                            AuthorArgument::Value(AuthorNode::new(AuthorValue::Integer(1))),
+                        ],
+                    )
+                    .expect("runtime workload");
+            }
+            Ok(tokeira_platform::definition::FrontendOutput {
+                config: AuthorNode::new(AuthorValue::Unit),
+                deployment,
+            })
         }
     }
 
     fn fake_frontend() -> FakeFrontend {
-        FakeFrontend(DefinitionFormatId::new("tkd").expect("format"))
+        FakeFrontend {
+            format: DefinitionFormatId::new("tkd").expect("format"),
+            workload: false,
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestService {
+        name: String,
+        module: String,
+        dependencies: Vec<String>,
+        document: serde_json::Value,
+    }
+
+    impl tokeira_orchestrator::DeployService for TestService {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn module(&self) -> &str {
+            &self.module
+        }
+
+        fn dependencies(&self) -> Vec<&str> {
+            self.dependencies.iter().map(String::as_str).collect()
+        }
+
+        fn manifests(
+            &self,
+            _context: &tokeira_orchestrator::ServiceContext,
+        ) -> Result<Vec<serde_json::Value>, tokeira_orchestrator::DeployRuntimeError> {
+            Ok(vec![self.document.clone()])
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestDelivery {
+        key: DeliveryKey,
+    }
+
+    #[async_trait]
+    impl ProviderDelivery for TestDelivery {
+        fn key(&self) -> &DeliveryKey {
+            &self.key
+        }
+
+        fn canonicalize(
+            &self,
+            document: &DesiredDocument,
+        ) -> Result<CanonicalDocument, DeliveryError> {
+            Ok(CanonicalDocument {
+                bytes: serde_json::to_vec(&document.value)
+                    .map_err(|error| DeliveryError::new(error.to_string()))?,
+            })
+        }
+
+        fn realize(
+            &self,
+            declaration: &WorkloadDeclaration,
+            placement: &PlacementContext,
+            _content: &ContentIdentitySet,
+        ) -> Result<DeliveryProjection, DeliveryError> {
+            Ok(DeliveryProjection::Workload(Box::new(TestService {
+                name: declaration.service.clone(),
+                module: placement.module.clone(),
+                dependencies: declaration.dependencies.clone(),
+                document: declaration.document.value.clone(),
+            })))
+        }
+
+        async fn materialize_operational(
+            &self,
+            _request: OperationalArtifactRequest<'_>,
+            _context: &tokeira_iac::ProvisionContext,
+        ) -> Result<OperationalArtifactReceipt, DeliveryError> {
+            Err(DeliveryError::new(
+                "the test provider has no operational artifacts",
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestRuntimePlatform {
+        applies: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl tokeira_orchestrator::DeployPlatform for TestRuntimePlatform {
+        async fn apply_manifests(
+            &self,
+            manifests: &[serde_json::Value],
+        ) -> Result<usize, tokeira_orchestrator::DeployRuntimeError> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            Ok(manifests.len())
+        }
+    }
+
+    struct TestExecution {
+        platform: Arc<dyn tokeira_orchestrator::DeployPlatform>,
+    }
+
+    impl std::fmt::Debug for TestExecution {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TestExecution").finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl ProviderExecution<FakePlatform> for TestExecution {
+        fn provider(&self) -> &str {
+            "test"
+        }
+
+        fn deploy_platform(&self) -> Option<Arc<dyn tokeira_orchestrator::DeployPlatform>> {
+            Some(Arc::clone(&self.platform))
+        }
+    }
+
+    fn fake_runtime_binding(applies: Arc<AtomicUsize>) -> PlatformBinding<FakePlatform> {
+        let delivery = Arc::new(TestDelivery {
+            key: DeliveryKey::new("test").expect("delivery key"),
+        });
+        let service = PlatformService {
+            logical_id: "server".into(),
+            image: ImageSelection {
+                logical_id: "server".into(),
+            },
+            command: Vec::new(),
+            ports: Vec::new(),
+            health: HealthDeclaration::default(),
+            placement: PlacementDeclaration::default(),
+            configuration: Vec::new(),
+            delivery: delivery.key().clone(),
+            document: DesiredDocument {
+                schema: "test-service-v1".into(),
+                value: serde_json::json!({"service": "server"}),
+            },
+        };
+        fake_binding_with(
+            "compose",
+            ServiceCatalog::new(vec![service]),
+            ProviderSet::with_executions(
+                vec![delivery],
+                vec![Arc::new(TestExecution {
+                    platform: Arc::new(TestRuntimePlatform { applies }),
+                })],
+            ),
+        )
     }
 
     #[test]
@@ -485,5 +846,86 @@ mod tests {
                 .to_string()
                 .contains("selects definition format `tkdp`")
         );
+    }
+
+    #[tokio::test]
+    async fn bound_platform_executes_the_generic_engine_lifecycle() {
+        let root = tempfile::tempdir().expect("deployment");
+        write_metadata(root.path(), "compose", "tkd");
+        std::fs::write(root.path().join("definition.tkd"), "definition").expect("definition");
+        let platform =
+            BoundPlatform::new("compose", "tkd", fake_binding("compose"), fake_frontend())
+                .expect("bound platform");
+
+        let plan = platform.infra_plan(root.path()).await.expect("plan");
+        assert!(plan.changes.is_empty());
+        let applied = platform.infra_apply(root.path()).await.expect("apply");
+        assert!(applied.changes.is_empty());
+        assert!(
+            platform
+                .recorded_state(root.path())
+                .await
+                .expect("recorded state")
+                .resources
+                .is_empty()
+        );
+        assert_eq!(
+            platform.infra_destroy(root.path()).await.expect("destroy"),
+            0
+        );
+        assert!(matches!(
+            platform
+                .deploy_plan(root.path())
+                .await
+                .expect("deploy plan"),
+            Realization::NotApplicable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn bound_platform_delegates_runtime_workloads_to_the_selected_provider() {
+        let root = tempfile::tempdir().expect("deployment");
+        write_metadata(root.path(), "compose", "tkd");
+        std::fs::write(root.path().join("definition.tkd"), "definition").expect("definition");
+        let applies = Arc::new(AtomicUsize::new(0));
+        let platform = BoundPlatform::new(
+            "compose",
+            "tkd",
+            fake_runtime_binding(Arc::clone(&applies)),
+            FakeFrontend {
+                format: DefinitionFormatId::new("tkd").expect("format"),
+                workload: true,
+            },
+        )
+        .expect("bound platform");
+
+        let Realization::Realized(plan) = platform
+            .deploy_plan(root.path())
+            .await
+            .expect("deploy plan")
+        else {
+            panic!("runtime workload is realized");
+        };
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].kind, tokeira_iac::ChangeKind::Create);
+
+        let Realization::Realized(applied) = platform
+            .deploy_apply(root.path())
+            .await
+            .expect("deploy apply")
+        else {
+            panic!("runtime workload is applied");
+        };
+        assert_eq!(applied.changes.len(), 1);
+        assert_eq!(applies.load(Ordering::SeqCst), 1);
+
+        let Realization::Realized(after) = platform
+            .deploy_plan(root.path())
+            .await
+            .expect("second plan")
+        else {
+            panic!("runtime workload remains realized");
+        };
+        assert_eq!(after.changes[0].kind, tokeira_iac::ChangeKind::NoChange);
     }
 }

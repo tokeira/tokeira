@@ -1,12 +1,15 @@
 //! Deterministic logical-to-physical provider projection and explicit writeback.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
+
+use async_trait::async_trait;
 
 use crate::{
-    binding::Platform,
+    binding::{Platform, PlatformBinding},
     catalog::{DeliveryProjection, PlacementContext, ProviderSet},
+    context::InvocationContext,
     definition::EvaluatedDefinition,
-    error::ProjectionError,
+    error::{FrameworkError, ProjectionError},
     graph::{VerifiedGraph, WritebackValue},
     selection::{EffectiveSelection, SelectionDirection, select_modules},
 };
@@ -157,16 +160,57 @@ pub fn replace_selected_state(
 #[derive(Debug)]
 pub struct FrameworkDeployment<P: Platform> {
     definition: Arc<EvaluatedDefinition<P>>,
-    providers: ProviderSet<P>,
+    binding: PlatformBinding<P>,
+    invocation: InvocationContext,
+    bootstrap_index: usize,
+}
+
+/// Cloneable engine input pairing immutable desired structure with runtime-hydrated config.
+#[derive(Debug, Clone)]
+pub struct FrameworkConfig<P: Platform> {
+    definition: Arc<EvaluatedDefinition<P>>,
+    platform: P::Config,
+}
+
+impl<P: Platform> FrameworkConfig<P> {
+    /// Borrow the platform-owned typed runtime configuration.
+    pub fn platform(&self) -> &P::Config {
+        &self.platform
+    }
+
+    /// Borrow the immutable admitted definition behind this engine input.
+    pub fn definition(&self) -> &EvaluatedDefinition<P> {
+        self.definition.as_ref()
+    }
 }
 
 impl<P: Platform> FrameworkDeployment<P> {
-    /// Bind an evaluated definition to the selected provider registrations.
-    pub fn new(definition: EvaluatedDefinition<P>, providers: ProviderSet<P>) -> Self {
-        Self {
+    /// Bind an evaluated definition to its selected provider/runtime registrations.
+    pub fn new(
+        definition: EvaluatedDefinition<P>,
+        binding: PlatformBinding<P>,
+        invocation: InvocationContext,
+    ) -> Result<Self, FrameworkError> {
+        let bootstrap_index = definition
+            .graph
+            .modules()
+            .iter()
+            .position(|module| module.name() == binding.bootstrap_module)
+            .ok_or_else(|| FrameworkError::MissingBootstrap(binding.bootstrap_module.clone()))?;
+        let deployment = Self {
             definition: Arc::new(definition),
-            providers,
+            binding,
+            invocation,
+            bootstrap_index,
+        };
+        // Delivery projection is pure and deterministic. Running it once here
+        // turns a provider-document failure into ordinary construction refusal;
+        // engine callbacks may then rely on the verified projection invariant.
+        for workload in deployment.definition.graph.workloads() {
+            let _ = deployment.project_workload(workload)?;
         }
+        let _ = deployment.binding.providers.deploy_platform()?;
+        Ok(deployment)
     }
 
     /// Borrow the admitted definition.
@@ -176,7 +220,37 @@ impl<P: Platform> FrameworkDeployment<P> {
 
     /// Borrow the selected provider capabilities.
     pub fn providers(&self) -> &ProviderSet<P> {
-        &self.providers
+        &self.binding.providers
+    }
+
+    /// Clone the engine configuration handle without copying provider-kind values.
+    pub fn engine_config(&self) -> FrameworkConfig<P> {
+        FrameworkConfig {
+            definition: Arc::clone(&self.definition),
+            platform: self.definition.config.clone(),
+        }
+    }
+
+    /// Resolve the single provider executor for a separate workload universe.
+    pub fn deploy_platform(
+        &self,
+    ) -> Result<Option<Arc<dyn tokeira_deploy_engine::Platform>>, FrameworkError> {
+        self.binding.providers.deploy_platform()
+    }
+
+    /// Whether at least one declared workload uses the separate deploy engine.
+    pub fn has_runtime_workloads(&self) -> bool {
+        self.definition.graph.workloads().iter().any(|workload| {
+            matches!(
+                self.project_workload(workload),
+                Ok(DeliveryProjection::Workload(_))
+            )
+        })
+    }
+
+    /// Whether the definition declares any provider-delivered workload.
+    pub fn has_workloads(&self) -> bool {
+        !self.definition.graph.workloads().is_empty()
     }
 
     /// Project workloads only for providers that use the deploy-engine universe.
@@ -187,27 +261,9 @@ impl<P: Platform> FrameworkDeployment<P> {
     ) -> Result<Vec<Box<dyn tokeira_deploy_engine::Service>>, crate::error::DeliveryError> {
         let mut services = Vec::new();
         for workload in self.definition.graph.workloads() {
-            let delivery = self
-                .providers
-                .delivery(&workload.declaration().delivery)
-                .ok_or_else(|| {
-                    crate::error::DeliveryError::new(format!(
-                        "delivery `{}` is absent from the selected provider set",
-                        workload.declaration().delivery.as_str()
-                    ))
-                })?;
-            let content = crate::artifact::ContentIdentitySet::default();
-            if let DeliveryProjection::Workload(service) = delivery.realize(
-                workload.declaration(),
-                &PlacementContext {
-                    deployment_id: deployment_id.to_string(),
-                    module: workload.module().to_string(),
-                    logical_id: workload.declaration().service.clone(),
-                    dependencies: Vec::new(),
-                    tags: tags.clone(),
-                },
-                &content,
-            )? {
+            if let DeliveryProjection::Workload(service) =
+                self.project_workload_with(workload, deployment_id, tags)?
+            {
                 services.push(service);
             }
         }
@@ -244,13 +300,225 @@ impl<P: Platform> FrameworkDeployment<P> {
             .map(|(index, _)| {
                 Box::new(FrameworkModule {
                     definition: Arc::clone(&self.definition),
-                    providers: self.providers.clone(),
+                    providers: self.binding.providers.clone(),
                     module_index: index,
                     deployment_id: deployment_id.to_string(),
                     tags: tags.clone(),
                 }) as Box<dyn tokeira_iac::Module>
             })
             .collect()
+    }
+
+    fn project_workload(
+        &self,
+        workload: &crate::graph::WorkloadNode,
+    ) -> Result<DeliveryProjection, crate::error::DeliveryError> {
+        self.project_workload_with(workload, &self.invocation.deployment_id, &BTreeMap::new())
+    }
+
+    fn project_workload_with(
+        &self,
+        workload: &crate::graph::WorkloadNode,
+        deployment_id: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<DeliveryProjection, crate::error::DeliveryError> {
+        let delivery = self
+            .binding
+            .providers
+            .delivery(&workload.declaration().delivery)
+            .ok_or_else(|| {
+                crate::error::DeliveryError::new(format!(
+                    "delivery `{}` is absent from the selected provider set",
+                    workload.declaration().delivery.as_str()
+                ))
+            })?;
+        delivery.realize(
+            workload.declaration(),
+            &PlacementContext {
+                deployment_id: deployment_id.to_string(),
+                module: workload.module().to_string(),
+                logical_id: workload.declaration().service.clone(),
+                dependencies: Vec::new(),
+                tags: tags.clone(),
+            },
+            &crate::artifact::ContentIdentitySet::default(),
+        )
+    }
+
+    fn module_box(
+        &self,
+        module_index: usize,
+        deployment_id: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Box<dyn tokeira_iac::Module> {
+        Box::new(FrameworkModule {
+            definition: Arc::clone(&self.definition),
+            providers: self.binding.providers.clone(),
+            module_index,
+            deployment_id: deployment_id.to_string(),
+            tags: tags.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl<P: Platform> tokeira_orchestrator::Deployment for FrameworkDeployment<P> {
+    type Config = FrameworkConfig<P>;
+
+    fn remote_state_module(
+        &self,
+        _config: &Self::Config,
+        _deployment_dir: &Path,
+    ) -> Box<dyn tokeira_iac::Module> {
+        self.module_box(
+            self.bootstrap_index,
+            &self.invocation.deployment_id,
+            &BTreeMap::new(),
+        )
+    }
+
+    fn infra_modules(
+        &self,
+        _config: &Self::Config,
+        selection: &tokeira_iac::ModuleSelection,
+    ) -> Vec<Box<dyn tokeira_iac::Module>> {
+        self.definition
+            .graph
+            .modules()
+            .iter()
+            .enumerate()
+            .filter(|(index, module)| {
+                *index != self.bootstrap_index && selection.includes(module.name())
+            })
+            .map(|(index, _)| {
+                self.module_box(index, &self.invocation.deployment_id, &BTreeMap::new())
+            })
+            .collect()
+    }
+
+    fn services(&self, _config: &Self::Config) -> Vec<Box<dyn tokeira_deploy_engine::Service>> {
+        self.services(&self.invocation.deployment_id, &BTreeMap::new())
+            .expect("framework construction preflights deterministic workload projection")
+    }
+
+    fn images(&self, config: &Self::Config) -> Vec<Box<dyn tokeira_deploy_engine::Image>> {
+        self.binding
+            .providers
+            .executions()
+            .iter()
+            .flat_map(|execution| execution.images(&config.platform, &self.binding.images))
+            .collect()
+    }
+
+    fn required_namespaces(&self, _config: &Self::Config) -> Vec<String> {
+        self.definition.graph.namespaces().to_vec()
+    }
+
+    async fn register_infra_extensions(
+        &self,
+        config: &Self::Config,
+        context: &mut tokeira_iac::ProvisionContext,
+    ) -> tokeira_orchestrator::Result<()> {
+        for execution in self.binding.providers.executions() {
+            execution
+                .register_infra_extensions(&config.platform, &self.invocation, context)
+                .await
+                .map_err(|error| {
+                    tokeira_orchestrator::OrchestratorError::Iac(tokeira_iac::IacError::Provider(
+                        error.to_string(),
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn register_deploy_extensions(
+        &self,
+        config: &Self::Config,
+        context: &mut tokeira_deploy_engine::ServiceContext,
+    ) -> tokeira_orchestrator::Result<()> {
+        for execution in self.binding.providers.executions() {
+            execution
+                .register_deploy_extensions(&config.platform, &self.invocation, context)
+                .await
+                .map_err(|error| {
+                    tokeira_orchestrator::OrchestratorError::Deploy(
+                        tokeira_deploy_engine::RuntimeError::Platform(error.to_string()),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn register_image_extensions(
+        &self,
+        config: &Self::Config,
+        context: &mut tokeira_deploy_engine::ImageContext,
+    ) -> tokeira_orchestrator::Result<()> {
+        for execution in self.binding.providers.executions() {
+            execution
+                .register_image_extensions(&config.platform, &self.invocation, context)
+                .await
+                .map_err(|error| {
+                    tokeira_orchestrator::OrchestratorError::Deploy(
+                        tokeira_deploy_engine::RuntimeError::Platform(error.to_string()),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn create_infra_store(
+        &self,
+        config: &Self::Config,
+        deployment_dir: &Path,
+    ) -> Box<dyn tokeira_state::DeploymentStore<tokeira_iac::InfraState>> {
+        self.binding
+            .state
+            .infra_store(&config.platform, &self.invocation, deployment_dir)
+    }
+
+    fn create_deploy_store(
+        &self,
+        config: &Self::Config,
+        deployment_dir: &Path,
+    ) -> Box<dyn tokeira_state::DeploymentStore<tokeira_iac::RuntimeState>> {
+        self.binding
+            .state
+            .deploy_store(&config.platform, &self.invocation, deployment_dir)
+    }
+
+    fn hydrate_config(
+        &self,
+        config: &Self::Config,
+        state: &tokeira_iac::InfraState,
+    ) -> Self::Config {
+        let platform = self
+            .binding
+            .providers
+            .executions()
+            .iter()
+            .fold(config.platform.clone(), |platform, execution| {
+                execution.hydrate_config(&platform, state)
+            });
+        FrameworkConfig {
+            definition: Arc::clone(&config.definition),
+            platform,
+        }
+    }
+
+    fn collect_writeback(
+        &self,
+        _config: &Self::Config,
+        state: &tokeira_iac::InfraState,
+    ) -> Vec<(String, String)> {
+        let realized = realize_resources(
+            &self.definition.graph,
+            &self.invocation.deployment_id,
+            &BTreeMap::new(),
+        )
+        .expect("verified provider kinds realize deterministically after framework construction");
+        resolve_writeback(&self.definition.graph, &realized.index, state)
     }
 }
 

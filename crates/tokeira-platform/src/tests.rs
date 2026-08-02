@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use proptest::prelude::*;
@@ -9,7 +12,7 @@ use crate::{
     author::{AuthorArgument, AuthorHandle, AuthorNode, AuthorResult, AuthorValue},
     binding::{Platform, PlatformBinding, StateBinding, StatePolicy},
     catalog::{
-        ImageCatalog, KindRegistration, KindSet, PlacementContext, ProviderKind,
+        ImageCatalog, KindRegistration, KindSet, PlacementContext, ProviderExecution, ProviderKind,
         ProviderKindCatalog, ProviderSet, ServiceCatalog,
     },
     config::{ConfigContract, PlatformConfig},
@@ -271,6 +274,12 @@ fn test_kinds() -> KindSet {
 }
 
 fn test_binding() -> PlatformBinding<TestPlatform> {
+    test_binding_with_providers(ProviderSet::default())
+}
+
+fn test_binding_with_providers(
+    providers: ProviderSet<TestPlatform>,
+) -> PlatformBinding<TestPlatform> {
     PlatformBinding::new(
         tokeira_orchestrator::PlatformId::new("test").expect("canonical platform id"),
         "state",
@@ -280,12 +289,57 @@ fn test_binding() -> PlatformBinding<TestPlatform> {
         ServiceCatalog::default(),
         ArtifactCatalog::default(),
         ImageCatalog::default(),
-        ProviderSet::default(),
+        providers,
         StateBinding::new(StatePolicy::LocalCas),
         PlatformOps::default(),
         Vec::new(),
     )
     .expect("test binding is valid")
+}
+
+struct TestProviderExecution {
+    deploy_platform: Arc<dyn tokeira_deploy_engine::Platform>,
+}
+
+impl std::fmt::Debug for TestProviderExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestProviderExecution")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderExecution<TestPlatform> for TestProviderExecution {
+    fn provider(&self) -> &str {
+        "test"
+    }
+
+    fn deploy_platform(&self) -> Option<Arc<dyn tokeira_deploy_engine::Platform>> {
+        Some(Arc::clone(&self.deploy_platform))
+    }
+
+    fn hydrate_config(
+        &self,
+        config: &TestConfig,
+        _state: &tokeira_iac::InfraState,
+    ) -> TestConfig {
+        let mut hydrated = config.clone();
+        hydrated.replicas += 1;
+        hydrated
+    }
+}
+
+#[derive(Debug)]
+struct TestDeployPlatform;
+
+#[async_trait]
+impl tokeira_deploy_engine::Platform for TestDeployPlatform {
+    async fn apply_manifests(
+        &self,
+        manifests: &[serde_json::Value],
+    ) -> Result<usize, tokeira_deploy_engine::RuntimeError> {
+        Ok(manifests.len())
+    }
 }
 
 fn test_kind(suffix: impl Into<String>, describes: bool) -> Box<dyn ProviderKind> {
@@ -1137,7 +1191,19 @@ fn framework_modules_preserve_dynamic_dependency_names_without_leaking() {
             b"definition",
         ),
     };
-    let framework = FrameworkDeployment::new(definition, ProviderSet::default());
+    let framework = FrameworkDeployment::new(
+        definition,
+        test_binding(),
+        InvocationContext {
+            deployment_id: "deployment".into(),
+            deployment_uuid: uuid::Uuid::nil(),
+            environment: None,
+            region: None,
+            account_id: None,
+            deployment_dir: std::path::PathBuf::from("deployment"),
+        },
+    )
+    .expect("framework deployment");
     let selection = framework
         .select(None, SelectionDirection::Prerequisites)
         .expect("all modules");
@@ -1148,4 +1214,58 @@ fn framework_modules_preserve_dynamic_dependency_names_without_leaking() {
     let context = tokeira_iac::ModuleContext::new(&state, &extensions);
     let resources = modules[1].resources(&context).expect("resources realize");
     assert_eq!(resources[0].resource_id().0, "runtime/server-one");
+}
+
+#[test]
+fn framework_resolves_the_provider_owned_deploy_executor() {
+    let mut graph = DeploymentGraphBuilder::new();
+    let deployment = graph.deployment_handle();
+    graph
+        .add_module(&deployment, "state".into(), Vec::new())
+        .expect("state module");
+    let definition = EvaluatedDefinition {
+        config: TestConfig {
+            storage: TestStorage::Memory,
+            replicas: 1,
+        },
+        graph: graph.finish().expect("graph"),
+        configuration_identity: ConfigurationIdentity::compute(
+            &tokeira_orchestrator::DefinitionFormatId::new("test").expect("format"),
+            b"definition",
+        ),
+    };
+    let providers = ProviderSet::with_executions(
+        Vec::new(),
+        vec![Arc::new(TestProviderExecution {
+            deploy_platform: Arc::new(TestDeployPlatform),
+        })],
+    );
+    let invocation = InvocationContext {
+        deployment_id: "deployment".into(),
+        deployment_uuid: uuid::Uuid::nil(),
+        environment: None,
+        region: None,
+        account_id: None,
+        deployment_dir: std::path::PathBuf::from("deployment"),
+    };
+    let framework = FrameworkDeployment::new(
+        definition,
+        test_binding_with_providers(providers),
+        invocation,
+    )
+    .expect("framework deployment");
+
+    assert!(
+        framework
+            .deploy_platform()
+            .expect("one selected executor")
+            .is_some()
+    );
+    let config = framework.engine_config();
+    let hydrated = tokeira_orchestrator::Deployment::hydrate_config(
+        &framework,
+        &config,
+        &tokeira_iac::InfraState::default(),
+    );
+    assert_eq!(hydrated.platform().replicas, 2);
 }

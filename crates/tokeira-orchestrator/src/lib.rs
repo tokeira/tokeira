@@ -31,6 +31,11 @@ use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac as iac;
 use tokeira_state::{DeploymentStore, StateError};
 
+pub use tokeira_deploy_engine::{
+    Platform as DeployPlatform, RuntimeError as DeployRuntimeError, Service as DeployService,
+    ServiceChange, ServiceChangeKind, ServiceContext,
+};
+
 /// Why a platform or definition-format identifier is not canonical lower-kebab case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentifierProblem {

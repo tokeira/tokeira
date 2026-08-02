@@ -1,12 +1,17 @@
 //! Typed platform identity, catalogs, context/config contracts, and provider selection.
 
-use std::{collections::BTreeSet, marker::PhantomData, path::Component};
+use std::{
+    collections::BTreeSet,
+    marker::PhantomData,
+    path::{Component, Path},
+    sync::Arc,
+};
 
 use crate::{
     artifact::{ArtifactCatalog, ArtifactClass, InspectionSpec},
     catalog::{ImageCatalog, KindSet, ProviderSet, ServiceCatalog},
     config::{ConfigContract, PlatformConfig},
-    context::{ContextContract, PlatformContext},
+    context::{ContextContract, InvocationContext, PlatformContext},
     error::BindingError,
     ops::PlatformOps,
 };
@@ -31,20 +36,119 @@ pub enum StatePolicy {
     S3Bootstrap,
 }
 
+/// Provider-owned construction of a non-local infrastructure/runtime state pair.
+///
+/// The framework owns the bootstrap ordering; the provider owns credentials,
+/// client construction, namespaces, and the concrete store implementation.
+pub trait ProviderStateStores<P: Platform>: std::fmt::Debug + Send + Sync {
+    /// Construct the infrastructure store selected for this invocation.
+    fn infra_store(
+        &self,
+        config: &P::Config,
+        invocation: &InvocationContext,
+        deployment_dir: &Path,
+    ) -> Box<dyn tokeira_state::DeploymentStore<tokeira_iac::InfraState>>;
+
+    /// Construct the runtime-service store selected for this invocation.
+    fn deploy_store(
+        &self,
+        config: &P::Config,
+        invocation: &InvocationContext,
+        deployment_dir: &Path,
+    ) -> Box<dyn tokeira_state::DeploymentStore<tokeira_iac::RuntimeState>>;
+}
+
 /// Typed state policy declaration; store implementations remain in their owning crates.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StateBinding<P> {
     /// Existing store/bootstrap policy selected for this platform.
     pub policy: StatePolicy,
+    provider: Option<Arc<dyn ProviderStateStores<P>>>,
     marker: PhantomData<fn() -> P>,
 }
 
-impl<P> StateBinding<P> {
-    /// Construct a state declaration.
-    pub const fn new(policy: StatePolicy) -> Self {
+impl<P> std::fmt::Debug for StateBinding<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateBinding")
+            .field("policy", &self.policy)
+            .field("has_provider_stores", &self.provider.is_some())
+            .finish()
+    }
+}
+
+impl<P: Platform> StateBinding<P> {
+    /// Construct a local-CAS state declaration.
+    ///
+    /// `S3Bootstrap` requires [`Self::with_provider`] so the AWS-owned store
+    /// implementation remains outside the framework crate.
+    pub fn new(policy: StatePolicy) -> Self {
         Self {
             policy,
+            provider: None,
             marker: PhantomData,
+        }
+    }
+
+    /// Construct a provider-owned non-local state declaration.
+    pub fn with_provider(policy: StatePolicy, provider: Arc<dyn ProviderStateStores<P>>) -> Self {
+        Self {
+            policy,
+            provider: Some(provider),
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), BindingError> {
+        match (self.policy, self.provider.is_some()) {
+            (StatePolicy::LocalCas, false) | (StatePolicy::S3Bootstrap, true) => Ok(()),
+            (StatePolicy::LocalCas, true) => Err(BindingError::new(
+                "local CAS state must not install a provider-owned store factory",
+            )),
+            (StatePolicy::S3Bootstrap, false) => Err(BindingError::new(
+                "S3 bootstrap state requires a provider-owned store factory",
+            )),
+        }
+    }
+
+    pub(crate) fn infra_store(
+        &self,
+        config: &P::Config,
+        invocation: &InvocationContext,
+        deployment_dir: &Path,
+    ) -> Box<dyn tokeira_state::DeploymentStore<tokeira_iac::InfraState>> {
+        match self.policy {
+            StatePolicy::LocalCas => Box::new(tokeira_state::CasStore::new(
+                Box::new(tokeira_state::LocalBackend::new(
+                    deployment_dir.join("state/infra"),
+                )),
+                "infra".to_string(),
+            )),
+            StatePolicy::S3Bootstrap => self
+                .provider
+                .as_ref()
+                .expect("binding validation requires provider stores for S3 bootstrap")
+                .infra_store(config, invocation, deployment_dir),
+        }
+    }
+
+    pub(crate) fn deploy_store(
+        &self,
+        config: &P::Config,
+        invocation: &InvocationContext,
+        deployment_dir: &Path,
+    ) -> Box<dyn tokeira_state::DeploymentStore<tokeira_iac::RuntimeState>> {
+        match self.policy {
+            StatePolicy::LocalCas => Box::new(tokeira_state::CasStore::new(
+                Box::new(tokeira_state::LocalBackend::new(
+                    deployment_dir.join("state/deploy"),
+                )),
+                "deploy".to_string(),
+            )),
+            StatePolicy::S3Bootstrap => self
+                .provider
+                .as_ref()
+                .expect("binding validation requires provider stores for S3 bootstrap")
+                .deploy_store(config, invocation, deployment_dir),
         }
     }
 }
@@ -137,6 +241,11 @@ impl<P: Platform> PlatformBinding<P> {
         if delivery_keys.len() != self.providers.deliveries().len() {
             return Err(BindingError::new("duplicate provider delivery key"));
         }
+        let execution_keys = self.providers.execution_keys();
+        if execution_keys.len() != self.providers.executions().len() {
+            return Err(BindingError::new("duplicate provider execution key"));
+        }
+        self.state.validate()?;
 
         let mut images = BTreeSet::new();
         for image in self.images.identities() {

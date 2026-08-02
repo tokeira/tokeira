@@ -5,7 +5,7 @@ the workspace-standard `proptest` infrastructure, runs at least 100 cases, and c
 and property tag shown below. Checkpoints are mandatory completion gates for the preceding slice.
 
 - [ ] 1. Establish the shared vocabulary and `tokeira-platform` crate boundary
-  - [ ] 1.1 Add `crates/tokeira-platform` to the workspace with the documented module surface
+  - [x] 1.1 Add `crates/tokeira-platform` to the workspace with the documented module surface
     - Add module documentation and public-item contracts for `artifact`, `author`, `binding`, `catalog`,
       `config`, `context`, `definition`, `error`, `graph`, `ops`, `projection`, and `selection`.
     - Add only the approved provider- and frontend-neutral dependencies; do not add Monty or depend on
@@ -17,47 +17,47 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - Preserve any legacy `PlatformKind` use only behind the out-of-scope Local launch path until its
       later migration; do not introduce a new compiled platform or format inventory.
     - _Requirements: 3.9, 3.24–3.26, 3.45, 3.47–3.48, 8.12, 14.46–14.49_
-  - [ ] 1.3 Add format-neutral source and diagnostic models
+  - [x] 1.3 Add format-neutral source and diagnostic models
     - Implement `RelativeDefinitionPath`, `DefinitionSourceName`, `DefinitionSource`, `SourceRange`,
       `FrontendDiagnostic`, and format-aware configuration identity inputs.
     - Reject escaping/non-canonical deployment-relative paths while permitting an explicitly selected
       authoring path that is never persisted as deployment metadata.
     - _Requirements: 3.4, 3.9, 3.17–3.20, 3.33, 3.40, 3.45–3.48, 14.12–14.14, 14.46–14.49_
 
-- [ ] 2. Implement the language-neutral Authoring Contract and graph core
-  - [ ] 2.1 Implement host-free author values and located Serde admission
+- [x] 2. Implement the language-neutral Authoring Contract and graph core
+  - [x] 2.1 Implement host-free author values and located Serde admission
     - Add `AuthorNode`, `AuthorValue`, enum-body shapes, opaque context tokens, and the Serde deserializer
       used by `ConfigContract` and typed provider-kind admission.
     - Preserve source ranges through field/variant/range failures without retaining any frontend runtime
       value or introducing another `Box<dyn Any>`.
     - _Requirements: 1.10–1.12, 2.1–2.4, 4.2–4.6, 8.4, 8.6–8.7, 8.10–8.11_
-  - [ ] 2.2 Implement owned graph handles and immutable graph completion
+  - [x] 2.2 Implement owned graph handles and immutable graph completion
     - Add deployment, module, resource, output, kind, context, and context-value handles with unforgeable
       owner identity, take-once kind cells, deterministic declaration order, and read-only inspection.
     - Implement namespaces, modules, resources, workloads, writeback, output validation, identity
       uniqueness, known-target validation, and module-cycle detection.
     - _Requirements: 7.1–7.11, 8.1–8.3, 14.5, 14.7_
-  - [ ] 2.3 Implement `AuthorSession<P>` and its discoverable schema
+  - [x] 2.3 Implement `AuthorSession<P>` and its discoverable schema
     - Add standard associated functions, receiver methods, field dispatch, kind construction, context
       access, frontend results, final deployment-handle admission, and complete supported-name errors.
     - Ensure the session exposes no provider client, state store, filesystem writer, or arbitrary
       platform callback and performs no I/O.
     - _Requirements: 8.1–8.3, 8.5–8.11, 14.10–14.11_
-  - [ ] 2.4 Implement typed `PlatformConfig`, `PlatformContext`, and `PlatformBinding` contracts
+  - [x] 2.4 Implement typed `PlatformConfig`, `PlatformContext`, and `PlatformBinding` contracts
     - Support platform-supplied validation, deterministic placeholder facts for authoring checks, typed
       context projections/tokens, selected first-party catalogs, state policy, services, artifacts,
       images, inspection renderers, and ops declarations.
     - Validate binding/catalog/service/artifact/provider/bootstrap/inspection identity uniqueness once.
     - Keep the binding independent of Definition Format and Definition Frontend.
     - _Requirements: 2.1–2.10, 4.15, 6.1–6.6, 8.5, 8.9, 8.12, 14.9–14.10_
-  - [ ] 2.5 Add the static `DefinitionFrontend<P>` and `DefinitionEngine<P, F>` contracts
+  - [x] 2.5 Add the static `DefinitionFrontend<P>` and `DefinitionEngine<P, F>` contracts
     - Admit the frontend's config `AuthorNode` and returned deployment handle, finish the graph, compute
       format-plus-source configuration identity, and expose the pure verification entrypoint.
     - Reject a source/frontend format mismatch before parsing, provider access, or state access.
     - _Requirements: 1.10–1.14, 3.18, 3.34–3.40, 3.45–3.48, 8.10–8.12_
 
 - [ ] 3. Add required Authoring Contract and graph property tests
-  - [ ] 3.1 Property test: Property 1 — graph declarations preserve order and reject foreign handles
+  - [x] 3.1 Property test: Property 1 — graph declarations preserve order and reject foreign handles
     - Generate declaration sequences and cross-graph handle substitutions; assert order and unchanged
       graphs on rejection for at least 100 cases.
     - Tag: `// Feature: platform-builder-abstraction, Property 1: graph declarations preserve order and reject foreign handles`
@@ -72,19 +72,19 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       frontend-neutral `AuthorNode` admission and no graph/provider effect on rejection.
     - Tag: `// Feature: platform-builder-abstraction, Property 5: platform config admission round-trips and rejects surplus input`
     - _Requirements: 2.1–2.4, 8.4, 14.9_
-  - [ ] 3.4 Property test: Property 6 — platform context exposure is immutable and allow-listed
+  - [x] 3.4 Property test: Property 6 — platform context exposure is immutable and allow-listed
     - Generate contexts and access sequences; prove repeatable typed projections, immutable state, and
       rejection of undeclared names without exposing paths, clients, credentials, or provider handles.
     - Tag: `// Feature: platform-builder-abstraction, Property 6: platform context exposure is immutable and allow-listed`
     - _Requirements: 2.5–2.8, 8.5, 8.9, 14.10_
 
 - [ ] 4. Implement canonical provider kinds, verification, projection, selection, and writeback
-  - [ ] 4.1 Add the provider-owned kind and delivery registration seams
+  - [x] 4.1 Add the provider-owned kind and delivery registration seams
     - Implement `ProviderKind`, `KindRegistration::typed`, `ProviderKindCatalog`, placement, declared
       outputs, desired manifests, realization, and closed first-party selection without dynamic loading.
     - Keep provider inputs free of frontend hosts/values and platform topology names.
     - _Requirements: 4.1–4.15, 5.1–5.5, 8.3, 14.11, 14.22_
-  - [ ] 4.2 Implement complete pure definition verification
+  - [x] 4.2 Implement complete pure definition verification
     - Realize the full resource set without clients/state and call `verify_resources`; accumulate every
       dangling dependency and non-describing resource in deterministic order.
     - Withhold a kind until its resource truthfully performs live description once prerequisites exist.
@@ -95,13 +95,13 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - Keep EKS manifest bundles on the infrastructure path and delegate clients, stores, hydration,
       images, provider refresh, mutation, and artifact delivery through registered provider contracts.
     - _Requirements: 7.3–7.5, 7.9–7.10, 9.1, 9.9, 9.11–9.16_
-  - [ ] 4.4 Implement shared module selection and selected-state isolation
+  - [x] 4.4 Implement shared module selection and selected-state isolation
     - Compute all/prerequisite/dependent closure with deterministic definition order; reject empty,
       unknown, or unrepresentable selection before execution.
     - Scope infrastructure, workload, writeback, reporting, and state replacement to one effective
       selection while retaining unrelated state.
     - _Requirements: 9.2–9.8, 14.8_
-  - [ ] 4.5 Implement explicit writeback resolution
+  - [x] 4.5 Implement explicit writeback resolution
     - Resolve literals and outputs through the realized physical-resource index, preserve declaration
       order, emit only declared keys, and apply the accepted omission behavior for absent values.
     - _Requirements: 7.5–7.6, 9.10–9.15, 14.6_
@@ -118,22 +118,22 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       validation, context-token exclusion, and declared-output reference models.
     - Tag: `// Feature: platform-builder-abstraction, Property 3: typed kind admission is schema-total`
     - _Requirements: 4.1–4.8, 8.3, 8.6–8.7, 14.11, 14.22_
-  - [ ] 5.2 Property test: Property 4 — provider realization preserves logical placement
+  - [x] 5.2 Property test: Property 4 — provider realization preserves logical placement
     - Generate verified resource DAGs and assert deterministic traversal plus exact logical identity,
       owning module, dependency ids, and naming inputs at every provider realization.
     - Tag: `// Feature: platform-builder-abstraction, Property 4: provider realization preserves logical placement`
     - _Requirements: 4.5, 4.7–4.9, 7.3–7.5, 14.5, 14.11_
-  - [ ] 5.3 Property test: Property 8 — definition verification is complete and pure
+  - [x] 5.3 Property test: Property 8 — definition verification is complete and pure
     - Generate complete describing sets and one-fault resource sets; assert all-and-only findings,
       deterministic order, and zero provider/state/filesystem calls.
     - Tag: `// Feature: platform-builder-abstraction, Property 8: definition verification is complete and pure`
     - _Requirements: 3.34–3.39, 4.16–4.18, 9.17, 14.27–14.28_
-  - [ ] 5.4 Property test: Property 9 — module selection computes the required closure
+  - [x] 5.4 Property test: Property 9 — module selection computes the required closure
     - Compare plan/apply and destroy selection against a reference graph closure over generated DAGs,
       including no selector, invalid selector, deduplication, and order.
     - Tag: `// Feature: platform-builder-abstraction, Property 9: module selection computes the required closure`
     - _Requirements: 9.1–9.8, 14.8_
-  - [ ] 5.5 Property test: Property 10 — writeback is explicit, ordered, and physically resolved
+  - [x] 5.5 Property test: Property 10 — writeback is explicit, ordered, and physically resolved
     - Generate writebacks and state maps; compare literals, physical output resolution, omission cases,
       order, and the exact declared key set against a reference model.
     - Tag: `// Feature: platform-builder-abstraction, Property 10: writeback is explicit, ordered, and resolved through physical state`
@@ -143,7 +143,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       one complete report, and a bare non-zero process result.
     - Tag: `// Feature: platform-builder-abstraction, Property 13: reachability issues are lossless no-change outcomes`
     - _Requirements: 9.18–9.24, 11.22, 12.22, 13.19, 14.30–14.32_
-  - [ ] 5.7 Property test: Property 14 — partial reconciliation preserves unrelated state
+  - [x] 5.7 Property test: Property 14 — partial reconciliation preserves unrelated state
     - Generate graphs, state maps, and effective selections; assert byte-equal unrelated entries after
       selected replacement.
     - Tag: `// Feature: platform-builder-abstraction, Property 14: partial reconciliation preserves unrelated state`
@@ -162,7 +162,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - Implement one adapter from `tokeira_tkd::Value`/`HostObj` to `AuthorNode`, `AuthorHandle`,
       `AuthorSession<P>`, and `FrontendDiagnostic`; do not leave standard platform bridges behind.
     - _Requirements: 1.10–1.12, 8.1–8.11, 14.44–14.45_
-  - [ ] 7.2 Publish the trusted `tkd` frontend descriptor and conventional export
+  - [x] 7.2 Publish the trusted `tkd` frontend descriptor and conventional export
     - Add `package.metadata.tokeira.definition-frontend` with format `tkd`, contract version, extension,
       and safe `definition.tkd` convention plus `lib.rs::frontend()`.
     - Do not publish or admit `tkdp`, add Monty, or encode a platform name in the descriptor.
@@ -186,7 +186,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       precedence.
     - Keep platform descriptors independent of formats and frontend descriptors independent of platforms.
     - _Requirements: 1.12–1.14, 3.24–3.26, 3.40, 3.47–3.48, 8.12, 14.46, 14.48–14.49_
-  - [ ] 8.3 Generate the disposable one-platform, one-frontend composition root
+  - [x] 8.3 Generate the disposable one-platform, one-frontend composition root
     - Make `tokeira-build` generate deterministic `Cargo.toml` and `main.rs` using the conventional
       platform binding, frontend export, and `tokeira-provisioner-cli` macro.
     - Resolve the source/lock closure from exactly CLI + selected platform + selected frontend, include

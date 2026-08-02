@@ -155,7 +155,9 @@ pub fn discover_workspace_descriptors(
     descriptors_from_metadata(&metadata)
 }
 
-fn descriptors_from_metadata(metadata: &Metadata) -> Result<WorkspaceDescriptors, DiscoveryError> {
+pub(crate) fn descriptors_from_metadata(
+    metadata: &Metadata,
+) -> Result<WorkspaceDescriptors, DiscoveryError> {
     let workspace_members = metadata.workspace_members.iter().collect::<BTreeSet<_>>();
     let mut packages = metadata
         .packages
@@ -273,7 +275,7 @@ fn decode_frontend(
     })
 }
 
-fn package_coordinates(
+pub(crate) fn package_coordinates(
     package: &Package,
     descriptor: &'static str,
 ) -> Result<PackageCoordinates, DiscoveryError> {

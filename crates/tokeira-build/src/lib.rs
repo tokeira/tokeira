@@ -1,10 +1,11 @@
-//! Image build, publish, and mirror pipelines.
+//! Build, source-assembly, publish, and mirror pipelines.
 //!
 //! The crate is intentionally platform-independent. Platform crates decide
 //! which images exist and what remote references they should use.
 
 mod arch;
 mod closure;
+mod composition;
 mod dagger;
 mod dagger_default;
 mod discovery;
@@ -18,7 +19,14 @@ pub mod pipelines;
 pub(crate) mod testing;
 
 pub use arch::Arch;
-pub use closure::{ClosureError, LockedDependency, ProvisionerClosure, resolve_source_closure};
+pub use closure::{
+    ClosureError, LockedDependency, ProvisionerClosure, resolve_source_closure,
+    resolve_source_closure_for_packages,
+};
+pub use composition::{
+    BoundProvisionerSource, CompositionError, GENERATED_PROVISIONER_BIN,
+    GENERATED_ROOT_RELATIVE_PATH, PROVISIONER_CLI_PACKAGE, assemble_bound_provisioner,
+};
 pub use dagger::{ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
 pub use dagger_default::DefaultDaggerClient;
 pub use discovery::{

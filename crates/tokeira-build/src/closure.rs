@@ -1,10 +1,12 @@
 //! Provisioner source-closure resolution (task 17.1's "the closure").
 //!
-//! The closure is the set of workspace crates **reachable from a provisioner
-//! seed package** (a platform crate carrying a `tkp-*` bin target), resolved
-//! from `cargo metadata` so it cannot rot as crates move — plus the workspace
-//! files that shape every build (`Cargo.toml`, `Cargo.lock`,
-//! `rust-toolchain.toml`, `.cargo/config.toml`).
+//! The closure is the union of workspace crates reachable from one or more
+//! provisioner roots, resolved from `cargo metadata` so it cannot rot as
+//! crates move — plus the workspace files that shape every build
+//! (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml`).
+//! Legacy callers still resolve one platform seed; statically assembled
+//! provisioners resolve exactly the shell, selected platform, and selected
+//! frontend roots.
 //!
 //! Resolution runs with **all features enabled**, which over-approximates the
 //! closure (an optional dep never built may still join it). Over-approximation
@@ -66,8 +68,11 @@ pub struct LockedDependency {
 pub enum ClosureError {
     #[error("cargo metadata failed: {0}")]
     Metadata(#[from] cargo_metadata::Error),
-    #[error("seed package '{0}' is not in the workspace dependency graph")]
+    #[error("root package '{0}' is not in the workspace dependency graph")]
     SeedNotFound(String),
+    /// A composition root without dependency roots cannot produce an engine.
+    #[error("at least one source-closure root package is required")]
+    NoRoots,
     #[error("cargo metadata returned no resolve graph")]
     NoResolveGraph,
     #[error("failed to read {path}: {source}")]
@@ -121,6 +126,21 @@ pub fn resolve_source_closure(
     workspace_root: &Path,
     seed_package: &str,
 ) -> Result<ProvisionerClosure, ClosureError> {
+    resolve_source_closure_for_packages(workspace_root, &[seed_package])
+}
+
+/// Resolve the union source closure reachable from the named workspace roots.
+///
+/// Root order and duplicates do not affect the result. Every named root must
+/// be a workspace member; silently dropping one could build a provisioner
+/// whose recorded closure omits executable source.
+pub fn resolve_source_closure_for_packages(
+    workspace_root: &Path,
+    root_packages: &[&str],
+) -> Result<ProvisionerClosure, ClosureError> {
+    if root_packages.is_empty() {
+        return Err(ClosureError::NoRoots);
+    }
     let metadata = MetadataCommand::new()
         .manifest_path(workspace_root.join("Cargo.toml"))
         .features(CargoOpt::AllFeatures)
@@ -130,17 +150,22 @@ pub fn resolve_source_closure(
         .as_ref()
         .ok_or(ClosureError::NoResolveGraph)?;
 
-    // BFS over the resolve graph from the seed.
+    // BFS over the resolve graph from every admitted root.
     let nodes: BTreeMap<&cargo_metadata::PackageId, &cargo_metadata::Node> =
         resolve.nodes.iter().map(|n| (&n.id, n)).collect();
-    let seed_id = metadata
-        .packages
-        .iter()
-        .find(|p| p.name.as_str() == seed_package && metadata.workspace_members.contains(&p.id))
-        .map(|p| &p.id)
-        .ok_or_else(|| ClosureError::SeedNotFound(seed_package.to_string()))?;
     let mut reachable: BTreeSet<&cargo_metadata::PackageId> = BTreeSet::new();
-    let mut queue = VecDeque::from([seed_id]);
+    let mut queue = VecDeque::new();
+    for root in root_packages.iter().copied().collect::<BTreeSet<_>>() {
+        let root_id = metadata
+            .packages
+            .iter()
+            .find(|package| {
+                package.name.as_str() == root && metadata.workspace_members.contains(&package.id)
+            })
+            .map(|package| &package.id)
+            .ok_or_else(|| ClosureError::SeedNotFound(root.to_string()))?;
+        queue.push_back(root_id);
+    }
     while let Some(id) = queue.pop_front() {
         if !reachable.insert(id) {
             continue;

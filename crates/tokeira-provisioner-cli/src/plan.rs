@@ -47,7 +47,13 @@ pub(crate) async fn plan<P: ProvisionerPlatform>(
         tokeira_explain::artifact::write(path, &report.explanation)?;
     }
     crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
-    Ok(())
+    // The verb exits non-zero on a platform issue (output-templates §The
+    // platform cannot be reached); the document above is the whole report.
+    if report.explanation.platform_issues.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::PlatformBlocked.into())
+    }
 }
 
 #[cfg(test)]
@@ -76,6 +82,107 @@ mod tests {
             tokeira_explain::EXPLANATION_SCHEMA_VERSION
         );
         assert_eq!(model.operation, "infra plan");
+    }
+
+    /// The no-op platform with an unreachable world: `infra_plan` answers
+    /// the typed issue and nothing else, exactly as a platform refusing at
+    /// its describe boundary does. The fixture evidence is a class the
+    /// direction table establishes nothing from, so `direction: None` is a
+    /// world the real table produces.
+    struct BlockedPlatform;
+
+    impl crate::ProvisionerPlatform for BlockedPlatform {
+        fn label(&self, _deployment_dir: &std::path::Path) -> &'static str {
+            "test"
+        }
+
+        fn config_basename(&self, _deployment_dir: &std::path::Path) -> &'static str {
+            "deployment.toml"
+        }
+
+        fn deployment_id(&self, _deployment_dir: &std::path::Path) -> anyhow::Result<String> {
+            Ok("tokeira".to_string())
+        }
+
+        async fn infra_plan(
+            &self,
+            _deployment_dir: &std::path::Path,
+        ) -> anyhow::Result<tokeira_iac::PlanOutcome> {
+            Ok(tokeira_iac::PlanOutcome {
+                platform_issues: vec![tokeira_iac::PlatformIssue {
+                    component: "Docker".to_string(),
+                    fact: "Unable to connect to Docker".to_string(),
+                    evidence: "error trying to connect: operation timed out".to_string(),
+                    direction: None,
+                }],
+                ..Default::default()
+            })
+        }
+
+        async fn infra_apply(&self, _d: &std::path::Path) -> anyhow::Result<crate::AppliedOutcome> {
+            unreachable!("the blocked platform never applies")
+        }
+
+        async fn infra_destroy(&self, _d: &std::path::Path) -> anyhow::Result<usize> {
+            unreachable!()
+        }
+
+        async fn infra_destroy_selected(
+            &self,
+            _d: &std::path::Path,
+            _ids: &[String],
+        ) -> anyhow::Result<Vec<tokeira_provisioner::ChangeLogEntry>> {
+            unreachable!()
+        }
+
+        async fn deploy_plan(
+            &self,
+            _d: &std::path::Path,
+        ) -> anyhow::Result<crate::Realization<tokeira_iac::PlanOutcome>> {
+            unreachable!()
+        }
+
+        async fn deploy_apply(
+            &self,
+            _d: &std::path::Path,
+        ) -> anyhow::Result<crate::Realization<crate::AppliedOutcome>> {
+            unreachable!()
+        }
+
+        async fn scale(
+            &self,
+            _d: &std::path::Path,
+            _specs: &[String],
+        ) -> anyhow::Result<crate::Realization<usize>> {
+            unreachable!()
+        }
+    }
+
+    // The platform-issue refusal: the verb exits non-zero through the typed
+    // error `cli::run` maps to a bare exit code, and the artifact still
+    // carries the issue for machines (output-templates §The platform cannot
+    // be reached).
+    #[tokio::test]
+    async fn a_platform_issue_refuses_the_verb_and_the_artifact_carries_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("explanation.json");
+        let err = plan(
+            &BlockedPlatform,
+            tmp.path(),
+            Mode::resolve(false, false),
+            Some(&path),
+        )
+        .await
+        .expect_err("a platform issue exits the verb non-zero");
+        assert!(
+            err.downcast_ref::<crate::PlatformBlocked>().is_some(),
+            "the typed refusal, not a prose error: {err:#}"
+        );
+
+        let model = tokeira_explain::artifact::read(&path).expect("artifact parses alone");
+        assert_eq!(model.platform_issues.len(), 1);
+        assert_eq!(model.platform_issues[0].fact, "Unable to connect to Docker");
+        assert!(model.changes.is_empty(), "no record-based plan");
     }
 
     // Req 7.6: an unwritable artifact path fails the verb, naming the path

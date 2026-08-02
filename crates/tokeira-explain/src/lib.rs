@@ -31,8 +31,8 @@ pub use evidence::{EvidenceId, EvidenceIndex, EvidenceKind};
 pub use impacts::derive_impacts;
 pub use model::{
     CausalGroup, CausalRoot, Cause, CommittedChange, CommittedOp, DeploymentExplanation,
-    EXPLANATION_SCHEMA_VERSION, ExplainedChange, ImpactClass, OperationalImpact, SourceLocation,
-    Uncertainty, UncertaintyReason,
+    EXPLANATION_SCHEMA_VERSION, ExplainedChange, ImpactClass, OperationalImpact, PlatformIssue,
+    SourceLocation, Uncertainty, UncertaintyReason,
 };
 // The semantics vocabulary is declared beside the `Resource` trait it
 // annotates (the Feature 1 amendment recorded in

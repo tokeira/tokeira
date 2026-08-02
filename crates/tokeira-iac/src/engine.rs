@@ -112,6 +112,7 @@ impl Engine {
             semantics_by_id: delta.semantics_by_id,
             display_by_id: delta.display_by_id,
             edges_by_id: declared_edges(known),
+            platform_issues: Vec::new(),
         })
     }
 
@@ -148,6 +149,7 @@ impl Engine {
             semantics_by_id: delta.semantics_by_id,
             display_by_id: delta.display_by_id,
             edges_by_id: declared_edges(&known_refs),
+            platform_issues: Vec::new(),
         })
     }
 
@@ -266,6 +268,7 @@ impl Engine {
             semantics_by_id: delta.semantics_by_id,
             display_by_id: delta.display_by_id,
             edges_by_id: declared_edges(&known_refs),
+            platform_issues: Vec::new(),
         })
     }
 
@@ -287,6 +290,7 @@ impl Engine {
             semantics_by_id: outcome.semantics_by_id,
             display_by_id: outcome.display_by_id,
             edges_by_id: outcome.edges_by_id,
+            platform_issues: Vec::new(),
         })
     }
 
@@ -555,6 +559,32 @@ pub struct PlanOutcome {
     /// edges point at it, and filtering either way would sever exactly those
     /// reverse edges.
     pub edges_by_id: BTreeMap<ResourceId, Vec<ResourceId>>,
+    /// Platform-level failures that blocked the plan. Non-empty means the
+    /// outcome carries **no** planned changes: updating a recorded resource
+    /// presupposes describing it, so a plan that cannot reach its platform
+    /// refuses rather than comparing against the record.
+    pub platform_issues: Vec<PlatformIssue>,
+}
+
+/// A platform-level failure that blocks a verb, typed at the owning
+/// platform's SDK seam and transported untouched. The fact and any direction
+/// are the platform's own declarations — provider knowledge belongs to the
+/// layer that owns the provider — and the evidence is the SDK's error in the
+/// SDK's words, never blended into another sentence. `direction` is present
+/// only where the error itself establishes one; absent is the honest
+/// default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformIssue {
+    /// The platform component that failed (`"Docker"`).
+    pub component: String,
+    /// The operator-facing statement of what failed
+    /// (`"Unable to connect to Docker"`).
+    pub fact: String,
+    /// The SDK error, verbatim.
+    pub evidence: String,
+    /// A factually grounded next step, only where the evidence establishes
+    /// one.
+    pub direction: Option<String>,
 }
 
 #[derive(Debug)]
@@ -570,6 +600,36 @@ struct RefreshReport {
 /// potentially stale persisted state. Resources that exist in the provider
 /// but not in persisted state are added. Resources that are absent from the
 /// provider but present in persisted state are removed.
+/// Definition-verification findings over a realized resource set — the two
+/// conditions `definition check` refuses so they never reach a plan
+/// (operator-explanation `output-templates.md` §The rules): a kind that
+/// cannot describe (updating presupposes describing), and a dangling
+/// dependency (a kept dependant of a removed resource would run against
+/// nothing). Pure over the realization; empty means the set verifies.
+pub fn verify_resources(resources: &[&dyn Resource]) -> Vec<String> {
+    let ids: HashSet<ResourceId> = resources.iter().map(|r| r.resource_id()).collect();
+    let mut findings = Vec::new();
+    for resource in resources {
+        let id = resource.resource_id();
+        if !resource.describes() {
+            findings.push(format!(
+                "`{}`: the `{}` kind implements no `describe` - a plan could never confirm                  its live state",
+                id.0,
+                resource.resource_type().0,
+            ));
+        }
+        for dep in resource.dependencies() {
+            if !ids.contains(&dep) {
+                findings.push(format!(
+                    "`{}` depends on `{}`, which this definition does not declare",
+                    id.0, dep.0,
+                ));
+            }
+        }
+    }
+    findings
+}
+
 /// Validate a composition before any Delta (Property 12): unique module ids,
 /// every desired module present in `known`, no module dependency cycle, and
 /// unique resource ids across the known set. A duplicate resource id would let
@@ -1661,6 +1721,102 @@ mod tests {
             stubs.push(stub);
         }
         (stubs, ctx)
+    }
+
+    /// The minimal resource the verification tests probe: identity, edges,
+    /// and the describe capability — nothing else is reachable.
+    #[derive(Debug)]
+    struct VerifyProbe {
+        id: &'static str,
+        deps: Vec<&'static str>,
+        describes: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Resource for VerifyProbe {
+        fn resource_id(&self) -> ResourceId {
+            ResourceId(self.id.to_string())
+        }
+        fn resource_type(&self) -> crate::ResourceType {
+            crate::ResourceType("probe".to_string())
+        }
+        fn dependencies(&self) -> Vec<ResourceId> {
+            self.deps
+                .iter()
+                .map(|d| ResourceId(d.to_string()))
+                .collect()
+        }
+        fn describes(&self) -> bool {
+            self.describes
+        }
+        fn module(&self) -> &str {
+            "probe"
+        }
+        async fn create(&self, _ctx: &ProvisionContext) -> Result<crate::ResourceState, IacError> {
+            unreachable!("verification never provisions")
+        }
+        async fn update(
+            &self,
+            _current: &crate::ResourceState,
+            _ctx: &ProvisionContext,
+        ) -> Result<crate::ResourceState, IacError> {
+            unreachable!()
+        }
+        async fn delete(
+            &self,
+            _current: &crate::ResourceState,
+            _ctx: &ProvisionContext,
+        ) -> Result<(), IacError> {
+            unreachable!()
+        }
+        async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
+            unreachable!("verification is static; describe is never called")
+        }
+        fn diff(&self, _current: &crate::ResourceState, _ctx: &ProvisionContext) -> InternalChange {
+            unreachable!()
+        }
+    }
+
+    // The two definition-verification refusals (output-templates §The
+    // rules), and the clean case: a resolvable, describing set verifies.
+    #[test]
+    fn verify_resources_refuses_stub_describes_and_dangling_edges() {
+        let a = VerifyProbe {
+            id: "probe/a",
+            deps: vec!["probe/b", "probe/ghost"],
+            describes: true,
+        };
+        let b = VerifyProbe {
+            id: "probe/b",
+            deps: vec![],
+            describes: false,
+        };
+        let findings = verify_resources(&[&a, &b]);
+        assert_eq!(findings.len(), 2, "one per condition: {findings:?}");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("`probe/a` depends on `probe/ghost`")),
+            "dangling edge named: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("`probe/b`") && f.contains("no `describe`")),
+            "non-describing kind named: {findings:?}"
+        );
+
+        let clean = VerifyProbe {
+            id: "probe/a",
+            deps: vec!["probe/b"],
+            describes: true,
+        };
+        let dep = VerifyProbe {
+            id: "probe/b",
+            deps: vec![],
+            describes: true,
+        };
+        assert!(verify_resources(&[&clean, &dep]).is_empty());
     }
 
     // Property 1 (change-semantics): the default declares nothing — and

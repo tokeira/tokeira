@@ -98,6 +98,13 @@ impl Resource for S3Object {
         Ok(DescribeResult::Unsupported)
     }
 
+    // The stub above can never confirm live state, and `describes` says so —
+    // definition verification refuses compositions carrying this kind until
+    // a real HeadObject-backed describe lands.
+    fn describes(&self) -> bool {
+        false
+    }
+
     fn diff(&self, current: &ResourceState, _ctx: &ProvisionContext) -> InternalChange {
         let checksum = current
             .properties

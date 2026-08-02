@@ -64,6 +64,11 @@ pub(crate) async fn deploy_plan<P: ProvisionerPlatform>(
                 tokeira_explain::artifact::write(path, &report.explanation)?;
             }
             crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
+            // Non-zero on a platform issue, like `infra plan` — the document
+            // is the whole report.
+            if !report.explanation.platform_issues.is_empty() {
+                return Err(crate::PlatformBlocked.into());
+            }
         }
     }
     Ok(())

@@ -11,6 +11,14 @@ use tokeira_iac as iac;
 
 use crate::{context::Cx, kinds::Service};
 
+/// The definition's config-files declaration as its consumers need it: the
+/// engine id (the dependency edge) and the canonical-manifest digest (the
+/// content coupling).
+struct DeclaredConfigFiles {
+    id: String,
+    digest: String,
+}
+
 /// An author-defined kind: a typed struct that realizes to a concrete engine
 /// resource. The operator names the struct; `realize` maps it to `tokeira_compose`
 /// / `tokeira_aws` underneath.
@@ -264,9 +272,9 @@ impl Deployment {
         // Wired automatically from the typed volume anchor whenever the
         // definition declares the config-files resource; the edge is
         // infra-graph-only and never leaks into the compose manifest.
-        let config_dep = self.declared_config_files_id(cx);
+        let config = self.declared_config_files(cx);
         for s in self.services.iter().filter(|s| s.module == name) {
-            resources.push(Box::new(self.realized_service(s, cx, config_dep.as_ref())));
+            resources.push(Box::new(self.realized_service(s, cx, config.as_ref())));
         }
         Some(resources)
     }
@@ -278,17 +286,25 @@ impl Deployment {
         &self,
         entry: &ServiceEntry,
         cx: &Cx,
-        config_dep: Option<&String>,
+        config: Option<&DeclaredConfigFiles>,
     ) -> ComposeService {
         let mut svc = entry.svc.to_compose_service(&entry.name, cx);
-        if let Some(dep) = config_dep
+        if let Some(config) = config
             && entry
                 .svc
                 .volumes
                 .iter()
                 .any(|v| matches!(v, Vol::Config { .. }))
         {
-            svc.resource_dependencies.push(dep.clone());
+            svc.resource_dependencies.push(config.id.clone());
+            // The content half of the coupling: the consumer's manifest
+            // carries the config declaration's digest, so a config-parameter
+            // edit diffs the consuming service too — the plan states the
+            // update and the apply recreates the container onto the
+            // rewritten files. The edge alone only orders creation; it
+            // cannot restart a running consumer.
+            svc.environment
+                .insert("TOKEIRA_CONFIG_DIGEST".into(), config.digest.clone());
         }
         svc
     }
@@ -302,7 +318,7 @@ impl Deployment {
         cx: &Cx,
     ) -> std::collections::BTreeMap<iac::ResourceId, serde_json::Value> {
         use iac::Resource as _;
-        let config_dep = self.declared_config_files_id(cx);
+        let config = self.declared_config_files(cx);
         let mut snapshot = std::collections::BTreeMap::new();
         for module in &self.modules {
             for entry in &module.resources {
@@ -310,7 +326,7 @@ impl Deployment {
             }
         }
         for entry in &self.services {
-            let svc = self.realized_service(entry, cx, config_dep.as_ref());
+            let svc = self.realized_service(entry, cx, config.as_ref());
             snapshot.insert(
                 svc.resource_id(),
                 tokeira_compose::canonicalize_manifest(svc.to_manifest()),
@@ -319,17 +335,45 @@ impl Deployment {
         snapshot
     }
 
-    /// The engine id of the definition's config-files resource, when declared
-    /// in any module (services elsewhere still mount its outputs).
-    fn declared_config_files_id(&self, cx: &Cx) -> Option<String> {
+    /// The definition's config-files declaration, when any module carries it
+    /// (services elsewhere still mount its outputs): the engine id for the
+    /// dependency edge, and the digest of the declaration's canonical
+    /// manifest for the consumers' content coupling. The digest moves with
+    /// any authored parameter — a template change without a parameter change
+    /// (an engine upgrade) is the engine-version boundary's business, not a
+    /// definition diff.
+    fn declared_config_files(&self, cx: &Cx) -> Option<DeclaredConfigFiles> {
+        use sha2::{Digest, Sha256};
         let target =
             crate::observability_config::ObservabilityConfigFilesResource::resource_id_value();
         self.modules
             .iter()
             .flat_map(|m| m.resources.iter())
-            .map(|r| r.kind.realize(cx).resource_id())
-            .find(|id| *id == target)
-            .map(|id| id.0)
+            .find(|r| r.kind.realize(cx).resource_id() == target)
+            .map(|r| DeclaredConfigFiles {
+                id: target.0.clone(),
+                digest: format!(
+                    "sha256:{}",
+                    hex::encode(Sha256::digest(r.kind.manifest().to_string().as_bytes()))
+                ),
+            })
+    }
+
+    /// Every resource this definition realizes — all modules plus member
+    /// services, the same realization the engine composes. The verification
+    /// pass runs over this set; pure, like `desired_snapshot`.
+    pub fn realized_resources(&self, cx: &Cx) -> Vec<Box<dyn iac::Resource>> {
+        let config = self.declared_config_files(cx);
+        let mut resources: Vec<Box<dyn iac::Resource>> = self
+            .modules
+            .iter()
+            .flat_map(|m| m.resources.iter())
+            .map(|r| r.kind.realize(cx))
+            .collect();
+        for entry in &self.services {
+            resources.push(Box::new(self.realized_service(entry, cx, config.as_ref())));
+        }
+        resources
     }
 
     /// The `(service name, replicas)` pairs declared in this deployment, in

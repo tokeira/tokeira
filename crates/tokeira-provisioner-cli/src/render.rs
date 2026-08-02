@@ -1570,6 +1570,52 @@ mod tests {
         }
     }
 
+    /// The unreachable-platform reference world from `output-templates.md`
+    /// §The platform cannot be reached: the compose platform's typed issue,
+    /// its direction from the compose-owned table, and nothing else — the
+    /// issue suppresses every section.
+    fn platform_issue_reference_report() -> ExplanationReport {
+        let outcome = PlanOutcome {
+            platform_issues: vec![tokeira_iac::PlatformIssue {
+                component: "Docker".to_string(),
+                fact: "Unable to connect to Docker".to_string(),
+                evidence: "connect ECONNREFUSED /var/run/docker.sock".to_string(),
+                direction: Some(
+                    "nothing accepted connections at `/var/run/docker.sock` - verify Docker is listening there"
+                        .to_string(),
+                ),
+            }],
+            ..Default::default()
+        };
+        let mut r = report_for(&outcome, BindingVerdict::DevIterate, true);
+        r.explanation.current_revision = 4;
+        r.explanation.platform = "compose".to_string();
+        r
+    }
+
+    // The unreachable transcript is executable like the others: the doc's
+    // reference block IS the renderer's output for the issue-carrying
+    // fixture, byte-for-byte (umbrella D10).
+    #[test]
+    fn the_platform_issue_transcript_is_executable() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.kiro/specs/operator-explanation/output-templates.md"
+        );
+        let doc = std::fs::read_to_string(path).expect("output-templates.md exists");
+        let r = platform_issue_reference_report();
+        let rendered = render(&r, Mode::resolve(false, false)).unwrap();
+        let block = fenced_block_after(&doc, "<!-- reference: infra-plan-platform-issue -->")
+            .unwrap_or_else(|| panic!("reference block missing.\nRendered:\n{rendered}"));
+        assert_eq!(
+            block.trim_end(),
+            rendered.trim_end(),
+            "output-templates.md and the renderer have drifted (platform issue)"
+        );
+        let detail = render(&r, Mode::resolve(false, true)).unwrap();
+        assert_eq!(rendered, detail, "the issue document is depth-invariant");
+    }
+
     /// The apply reference worlds from `output-templates.md` §The apply
     /// document. Gated: grafana's image edit applied with its diff reused
     /// from the gating plan, the cluster replaced without reusable field

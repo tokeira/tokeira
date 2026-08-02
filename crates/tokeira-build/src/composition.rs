@@ -14,7 +14,7 @@ use std::{
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use thiserror::Error;
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
-use tokeira_provisioner::Sha256Digest;
+use tokeira_provisioner::{BoundProvisionerEvidence, Sha256Digest};
 
 use crate::{
     ClosureError, DEFINITION_FRONTEND_CONTRACT, DefinitionFrontendPackageDescriptor,
@@ -81,6 +81,32 @@ impl BoundProvisionerSource {
         &self.closure
     }
 
+    /// Digest the deterministic generated package and every selection fact
+    /// that determines its meaning.
+    ///
+    /// Contract versions are included explicitly even though the generated
+    /// Rust source contains only the selected identifiers and conventional
+    /// exports. Advancing either private contract must therefore re-key the
+    /// engine instead of reusing an artifact assembled under older semantics.
+    pub fn generated_root_digest(&self) -> Sha256Digest {
+        let mut bytes = b"tokeira-bound-provisioner-root/v1\n".to_vec();
+        framed_field(&mut bytes, "platform", self.platform.as_str().as_bytes());
+        framed_field(&mut bytes, "format", self.format.as_str().as_bytes());
+        framed_field(
+            &mut bytes,
+            "binding-contract",
+            self.binding_contract.to_string().as_bytes(),
+        );
+        framed_field(
+            &mut bytes,
+            "frontend-contract",
+            self.frontend_contract.to_string().as_bytes(),
+        );
+        framed_field(&mut bytes, "Cargo.toml", self.cargo_toml.as_bytes());
+        framed_field(&mut bytes, "src/main.rs", self.main_rs.as_bytes());
+        Sha256Digest::from_bytes(&bytes)
+    }
+
     /// Digest the frozen source tree together with the generated overlay.
     ///
     /// The generated files are not committed workspace source, so the git
@@ -89,32 +115,31 @@ impl BoundProvisionerSource {
     /// input without making the deployment definition itself executable
     /// source.
     pub fn source_closure_digest(&self, snapshot_tree_oid: &str) -> Sha256Digest {
-        fn field(buffer: &mut Vec<u8>, tag: &str, value: &[u8]) {
-            buffer.extend_from_slice(tag.as_bytes());
-            buffer.push(b'=');
-            buffer.extend_from_slice(value.len().to_string().as_bytes());
-            buffer.push(b':');
-            buffer.extend_from_slice(value);
-            buffer.push(b'\n');
-        }
-
-        let mut bytes = b"tokeira-bound-provisioner-source/v1\n".to_vec();
-        field(&mut bytes, "snapshot-tree", snapshot_tree_oid.as_bytes());
-        field(&mut bytes, "platform", self.platform.as_str().as_bytes());
-        field(&mut bytes, "format", self.format.as_str().as_bytes());
-        field(
+        let mut bytes = b"tokeira-bound-provisioner-source/v2\n".to_vec();
+        framed_field(&mut bytes, "snapshot-tree", snapshot_tree_oid.as_bytes());
+        framed_field(
             &mut bytes,
-            "binding-contract",
-            self.binding_contract.to_string().as_bytes(),
+            "generated-root",
+            self.generated_root_digest().to_hex().as_bytes(),
         );
-        field(
-            &mut bytes,
-            "frontend-contract",
-            self.frontend_contract.to_string().as_bytes(),
-        );
-        field(&mut bytes, "Cargo.toml", self.cargo_toml.as_bytes());
-        field(&mut bytes, "src/main.rs", self.main_rs.as_bytes());
         Sha256Digest::from_bytes(&bytes)
+    }
+
+    /// Produce the complete build/admission evidence for a frozen source tree.
+    ///
+    /// This is the sole derivation used by native and hermetic bound builds:
+    /// the selected descriptors, generated root, source closure, and lock
+    /// closure cannot be populated independently and silently disagree.
+    pub fn evidence(&self, snapshot_tree_oid: &str) -> BoundProvisionerEvidence {
+        BoundProvisionerEvidence {
+            platform: self.platform.clone(),
+            format: self.format.clone(),
+            binding_contract: self.binding_contract,
+            frontend_contract: self.frontend_contract,
+            generated_root: self.generated_root_digest(),
+            source_closure: self.source_closure_digest(snapshot_tree_oid),
+            lock_closure: Sha256Digest::from_bytes(&self.closure.canonical_lock_bytes()),
+        }
     }
 
     /// Materialize the generated package inside one frozen source staging tree.
@@ -131,6 +156,15 @@ impl BoundProvisionerSource {
         write_generated(&source_dir.join("main.rs"), self.main_rs.as_bytes())?;
         Ok(root)
     }
+}
+
+fn framed_field(buffer: &mut Vec<u8>, tag: &str, value: &[u8]) {
+    buffer.extend_from_slice(tag.as_bytes());
+    buffer.push(b'=');
+    buffer.extend_from_slice(value.len().to_string().as_bytes());
+    buffer.push(b':');
+    buffer.extend_from_slice(value);
+    buffer.push(b'\n');
 }
 
 /// Refusal to assemble or materialize a static provisioner root.
@@ -501,6 +535,41 @@ macro_rules! bound_provisioner_main {
             tkd.source_closure_digest("tree-a"),
             tkdp.source_closure_digest("tree-a")
         );
+
+        let evidence = tkd.evidence("tree-a");
+        assert_eq!(evidence.platform, *tkd.platform());
+        assert_eq!(evidence.format, *tkd.format());
+        assert_eq!(evidence.binding_contract, tkd.binding_contract());
+        assert_eq!(evidence.frontend_contract, tkd.frontend_contract());
+        assert_eq!(evidence.generated_root, tkd.generated_root_digest());
+        assert_eq!(evidence.source_closure, tkd.source_closure_digest("tree-a"));
+        assert_eq!(
+            evidence.lock_closure,
+            Sha256Digest::from_bytes(&tkd.closure().canonical_lock_bytes())
+        );
+    }
+
+    #[test]
+    fn generated_root_digest_covers_contracts_and_exact_generated_bytes() {
+        let fixture = Fixture::new();
+        let source = fixture.assemble("tkd");
+        let digest = source.generated_root_digest();
+
+        let mut binding_contract = source.clone();
+        binding_contract.binding_contract += 1;
+        assert_ne!(binding_contract.generated_root_digest(), digest);
+
+        let mut frontend_contract = source.clone();
+        frontend_contract.frontend_contract += 1;
+        assert_ne!(frontend_contract.generated_root_digest(), digest);
+
+        let mut manifest = source.clone();
+        manifest.cargo_toml.push_str("# changed\n");
+        assert_ne!(manifest.generated_root_digest(), digest);
+
+        let mut main = source;
+        main.main_rs.push_str("// changed\n");
+        assert_ne!(main.generated_root_digest(), digest);
     }
 
     #[test]

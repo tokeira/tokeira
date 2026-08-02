@@ -192,7 +192,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - Resolve the source/lock closure from exactly CLI + selected platform + selected frontend, include
       generated overlays in engine identity, and reject missing/ambiguous/bin-owning packages.
     - _Requirements: 3.12–3.15, 3.24–3.26, 14.15, 14.49_
-  - [ ] 8.4 Extend bundle descriptors and admission evidence
+  - [x] 8.4 Extend bundle descriptors and admission evidence
     - Record selected platform, Definition Format, both private contract versions, generated-root digest,
       and source/lock closure evidence in source and published bundle paths.
     - Reject request/catalog/seed/bundle/generated-root identity disagreement before placement.

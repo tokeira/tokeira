@@ -28,8 +28,8 @@ use std::collections::BTreeMap;
 use tokeira_state::{StateBackend, StateError};
 
 use crate::{
-    AdmissionError, AuthorityTier, EngineIdentity, ProvisionerBundle, RevocationList, Target,
-    admission::admit_artifact,
+    AdmissionError, AuthorityTier, BoundProvisionerAdmissionError, EngineIdentity,
+    ProvisionerBundle, RevocationList, Target, admission::admit_artifact,
 };
 
 /// A resolved cache hit: the bundle and the (admission-verified) bytes for
@@ -53,6 +53,9 @@ pub enum BundleStoreError {
     /// must see (Property 3), not a reason to quietly rebuild.
     #[error(transparent)]
     Admission(#[from] AdmissionError),
+    /// Assembly evidence disagrees with the bundle identity or selected root.
+    #[error(transparent)]
+    Evidence(#[from] BoundProvisionerAdmissionError),
     /// Publish refused: the offered bytes do not match the bundle's own
     /// descriptors, carry no descriptor, or the bundle's tests did not pass.
     #[error("refusing to publish: {0}")]
@@ -152,6 +155,7 @@ impl BundleStore {
         bundle: &ProvisionerBundle,
         artifacts: &BTreeMap<Target, Vec<u8>>,
     ) -> Result<(), BundleStoreError> {
+        bundle.validate_bound_evidence()?;
         if !bundle.tests.passed {
             return Err(BundleStoreError::PublishRefused(
                 "the bundle's tests did not pass".to_string(),
@@ -208,6 +212,7 @@ impl BundleStore {
                 Err(StateError::NotFound(_)) => continue,
                 Err(other) => return Err(other.into()),
             };
+            bundle.admit_engine_identity(identity)?;
             let bytes = match self
                 .backend
                 .read_snapshot(&self.artifact_key(tier, identity, target))
@@ -240,10 +245,12 @@ impl BundleStore {
 mod tests {
     use super::*;
     use crate::{
-        BinaryArtifactDescriptor, BuildAuthority, BuildProfile, Sha256Digest,
+        BinaryArtifactDescriptor, BoundProvisionerEvidence, BuildAuthority, BuildProfile,
+        Sha256Digest,
         bundle::{BuildManifest, TestEvidence},
         sha256_hex,
     };
+    use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
     use tokeira_state::LocalBackend;
 
     fn store(root: &std::path::Path) -> BundleStore {
@@ -268,6 +275,7 @@ mod tests {
     fn bundle(marker: &[u8], authority: BuildAuthority, bytes: &[u8]) -> ProvisionerBundle {
         ProvisionerBundle {
             identity: identity(marker),
+            bound: None,
             authority,
             provisioner_version: "0.1.0".into(),
             artifacts: vec![BinaryArtifactDescriptor {
@@ -302,6 +310,18 @@ mod tests {
         [(target(), bytes.to_vec())].into()
     }
 
+    fn evidence(bundle: &ProvisionerBundle) -> BoundProvisionerEvidence {
+        BoundProvisionerEvidence {
+            platform: PlatformId::new("compose").expect("canonical platform"),
+            format: DefinitionFormatId::new("tkd").expect("canonical format"),
+            binding_contract: 1,
+            frontend_contract: 1,
+            generated_root: Sha256Digest::from_bytes(b"generated-root"),
+            source_closure: bundle.identity.source_closure,
+            lock_closure: bundle.identity.lock_closure,
+        }
+    }
+
     #[tokio::test]
     async fn publish_then_resolve_round_trips_verified() {
         let tmp = tempfile::tempdir().unwrap();
@@ -317,6 +337,52 @@ mod tests {
         assert_eq!(hit.bytes, b"tkp-bytes");
         assert_eq!(hit.bundle, b);
         assert_eq!(hit.tier, AuthorityTier::LocalDeveloper);
+    }
+
+    #[tokio::test]
+    async fn bound_evidence_survives_published_bundle_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let base = bundle(b"e1", BuildAuthority::LocalDeveloper, b"tkp-bytes");
+        let expected = evidence(&base);
+        let bound = base
+            .with_bound_evidence(expected.clone())
+            .expect("consistent evidence");
+
+        store
+            .publish(&bound, &artifacts(b"tkp-bytes"))
+            .await
+            .expect("publish bound bundle");
+        let hit = store
+            .resolve(&bound.identity, AuthorityTier::LocalDeveloper, &target())
+            .await
+            .expect("resolve bundle")
+            .expect("published hit");
+        hit.bundle
+            .admit_bound(&expected)
+            .expect("published evidence remains exact");
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_evidence_that_disagrees_with_engine_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let mut bound = bundle(b"e1", BuildAuthority::LocalDeveloper, b"tkp-bytes");
+        let mut wrong = evidence(&bound);
+        wrong.lock_closure = Sha256Digest::from_bytes(b"wrong-lock");
+        bound.bound = Some(wrong);
+
+        let error = store
+            .publish(&bound, &artifacts(b"tkp-bytes"))
+            .await
+            .expect_err("inconsistent evidence must not be published");
+        assert!(matches!(
+            error,
+            BundleStoreError::Evidence(BoundProvisionerAdmissionError::Mismatch {
+                field: "lock_closure",
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

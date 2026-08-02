@@ -36,7 +36,10 @@ mod version;
 pub use admission::{AdmissionError, RevocationList, admit_artifact};
 pub use binary_store::{BinaryError, BinaryStore};
 pub use binding::{BindingVerdict, check_binding};
-pub use bundle::{BUNDLE_MANIFEST_BASENAME, BuildManifest, ProvisionerBundle, TestEvidence};
+pub use bundle::{
+    BUNDLE_MANIFEST_BASENAME, BoundProvisionerAdmissionError, BoundProvisionerEvidence,
+    BuildManifest, ProvisionerBundle, TestEvidence,
+};
 pub use bundle_store::{BundleStore, BundleStoreError, ResolvedBundle};
 pub use identity::{AuthorityTier, BuildAuthority, BuildProfile, EngineIdentity};
 pub use integrity::{ChecksumFormatError, IntegrityError, Sha256Digest, sha256_hex};

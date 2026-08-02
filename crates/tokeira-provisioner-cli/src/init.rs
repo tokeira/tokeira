@@ -180,6 +180,7 @@ mod tests {
                 features: ["provisioner".to_string()].into(),
                 profile: BuildProfile::Dist,
             },
+            bound: None,
             authority: BuildAuthority::LocalDeveloper,
             provisioner_version: "0.1.0".into(),
             artifacts: vec![BinaryArtifactDescriptor {

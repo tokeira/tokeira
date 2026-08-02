@@ -287,7 +287,7 @@ fn ordered_services(services: &[Box<dyn Service>]) -> Result<Vec<&dyn Service>, 
                 let service = services[*index].as_ref();
                 blocked.insert(service.name().to_string());
                 for dep in service.dependencies() {
-                    if !all_names.contains(*dep) {
+                    if !all_names.contains(dep) {
                         missing.insert((*dep).to_string());
                     }
                 }
@@ -356,8 +356,8 @@ mod tests {
         fn module(&self) -> &str {
             "test"
         }
-        fn dependencies(&self) -> &[&str] {
-            self.deps
+        fn dependencies(&self) -> Vec<&str> {
+            self.deps.to_vec()
         }
         fn manifests(&self, _ctx: &ServiceContext) -> Result<Vec<serde_json::Value>, RuntimeError> {
             Ok(vec![])

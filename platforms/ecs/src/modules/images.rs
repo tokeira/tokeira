@@ -20,8 +20,8 @@ impl Module for ImagesModule {
         "images"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &[]
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {

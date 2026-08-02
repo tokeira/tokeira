@@ -226,13 +226,15 @@ impl deploy_engine::Service for EcsWorkload {
         "services"
     }
 
-    fn dependencies(&self) -> &[&str] {
+    fn dependencies(&self) -> Vec<&str> {
         match self.name.as_str() {
-            "tokeira-edge-api" | "tokeira-edge-poll" => &["tokeira-runtime", "tokeira-controller"],
-            "tokeira-runtime" => &["tokeira-controller"],
-            "tokeira-projection" => &["tokeira-runtime"],
-            "tokeira-autoscaler" => &["tokeira-controller", "tokeira-mimir"],
-            _ => &[],
+            "tokeira-edge-api" | "tokeira-edge-poll" => {
+                vec!["tokeira-runtime", "tokeira-controller"]
+            }
+            "tokeira-runtime" => vec!["tokeira-controller"],
+            "tokeira-projection" => vec!["tokeira-runtime"],
+            "tokeira-autoscaler" => vec!["tokeira-controller", "tokeira-mimir"],
+            _ => Vec::new(),
         }
     }
 

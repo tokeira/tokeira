@@ -54,8 +54,8 @@ impl Module for IdentityModule {
         "identity"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &[]
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
@@ -113,8 +113,8 @@ impl Module for NetworkModule {
         "network"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &[]
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
@@ -162,8 +162,8 @@ impl Module for StorageModule {
         "storage"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &[]
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {
@@ -210,8 +210,8 @@ impl Module for ComputeModule {
         "compute"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &["identity", "network", "storage"]
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["identity", "network", "storage"]
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {

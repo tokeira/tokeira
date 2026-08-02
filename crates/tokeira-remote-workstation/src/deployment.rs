@@ -204,8 +204,8 @@ impl iac::Module for LocalStateModule {
         "remote-state"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &[]
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
     }
 
     fn resources(&self, _ctx: &ModuleContext<'_>) -> Result<Vec<Box<dyn Resource>>, iac::IacError> {

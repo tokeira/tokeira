@@ -31,8 +31,8 @@ impl Module for ObservabilityModule {
         "observability"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &["cluster"]
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["cluster"]
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {

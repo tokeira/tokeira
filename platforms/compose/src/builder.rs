@@ -422,21 +422,15 @@ impl Deployment {
 struct ComposeWorkload {
     service: ComposeService,
     module: String,
-    deps: Vec<&'static str>,
+    deps: Vec<String>,
 }
 
 impl ComposeWorkload {
     fn new(service: ComposeService, module: String, needs: Vec<String>) -> Self {
-        // The deploy-engine `dependencies()` returns `&[&str]`; leak the deploy
-        // deps to `'static` so the slice can be returned (a playground shortcut).
-        let deps = needs
-            .into_iter()
-            .map(|s| &*Box::leak(s.into_boxed_str()))
-            .collect();
         Self {
             service,
             module,
-            deps,
+            deps: needs,
         }
     }
 }
@@ -450,8 +444,8 @@ impl deploy_engine::Service for ComposeWorkload {
         &self.module
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &self.deps
+    fn dependencies(&self) -> Vec<&str> {
+        self.deps.iter().map(String::as_str).collect()
     }
 
     fn manifests(&self, _ctx: &ServiceContext) -> Result<Vec<serde_json::Value>, RuntimeError> {

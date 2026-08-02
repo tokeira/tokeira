@@ -28,8 +28,8 @@ impl Module for ClusterModule {
         "cluster"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &["dsql"]
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["dsql"]
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {

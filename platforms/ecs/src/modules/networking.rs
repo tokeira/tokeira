@@ -27,8 +27,8 @@ impl Module for NetworkingModule {
         "networking"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &["remote-state"]
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["remote-state"]
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {

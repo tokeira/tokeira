@@ -54,8 +54,8 @@ impl iac::Module for LocalStateModule {
         "remote-state"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &[]
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
     }
 
     fn resources(

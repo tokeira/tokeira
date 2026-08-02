@@ -59,14 +59,10 @@ impl TkdDeployment {
     }
 
     fn module_box(cfg: &TkdConfig, name: &str, deps: &[String]) -> Box<dyn iac::Module> {
-        let deps: Vec<&'static str> = deps
-            .iter()
-            .map(|d| &*Box::leak(d.clone().into_boxed_str()))
-            .collect();
         Box::new(TkdModule {
             cfg: cfg.clone(),
             name: name.to_string(),
-            deps,
+            deps: deps.to_vec(),
         })
     }
 }
@@ -285,7 +281,7 @@ impl PlatformConfig for TkdDeployment {
 struct TkdModule {
     cfg: TkdConfig,
     name: String,
-    deps: Vec<&'static str>,
+    deps: Vec<String>,
 }
 
 impl iac::Module for TkdModule {
@@ -293,8 +289,8 @@ impl iac::Module for TkdModule {
         &self.name
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &self.deps
+    fn dependencies(&self) -> Vec<&str> {
+        self.deps.iter().map(String::as_str).collect()
     }
 
     fn resources(

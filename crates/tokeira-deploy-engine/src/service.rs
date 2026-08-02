@@ -86,7 +86,7 @@ pub trait Service: Debug + Send + Sync {
     /// These names should refer to other [`Service::name`] values. The current
     /// facade records the dependency intent for specializations and tests; a
     /// platform implementation may also use it when ordering manifest apply.
-    fn dependencies(&self) -> &[&str];
+    fn dependencies(&self) -> Vec<&str>;
 
     /// Produce the deployment manifests for this service.
     ///

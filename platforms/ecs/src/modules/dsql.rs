@@ -38,8 +38,8 @@ impl Module for DsqlModule {
         "dsql"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &["networking"]
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["networking"]
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {

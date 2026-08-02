@@ -17,6 +17,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokeira-provisioner.workspace = true
+tokeira-orchestrator = { path = "../tokeira-orchestrator" }
+tokeira-platform.workspace = true
 toml.workspace = true
 tracing.workspace = true
 

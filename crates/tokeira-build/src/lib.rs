@@ -7,6 +7,7 @@ mod arch;
 mod closure;
 mod dagger;
 mod dagger_default;
+mod discovery;
 mod error;
 mod snapshot;
 mod toolchain;
@@ -20,6 +21,11 @@ pub use arch::Arch;
 pub use closure::{ClosureError, LockedDependency, ProvisionerClosure, resolve_source_closure};
 pub use dagger::{ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
 pub use dagger_default::DefaultDaggerClient;
+pub use discovery::{
+    DEFINITION_FRONTEND_CONTRACT, DefinitionFrontendPackageDescriptor, DefinitionSourceExtension,
+    DiscoveryError, PLATFORM_BINDING_CONTRACT, PackageCoordinates, PlatformLaunchClass,
+    PlatformPackageDescriptor, WorkspaceDescriptors, discover_workspace_descriptors,
+};
 pub use error::BuildError;
 pub use pipelines::{
     build::{TokeiradBuildRequest, TokeiradBuildResult, build_tokeirad_image},

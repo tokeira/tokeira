@@ -378,6 +378,7 @@ fn write_generated(path: &Path, bytes: &[u8]) -> Result<(), CompositionError> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use std::process::Command;
 
     use super::*;
@@ -570,6 +571,115 @@ macro_rules! bound_provisioner_main {
         let mut main = source;
         main.main_rs.push_str("// changed\n");
         assert_ne!(main.generated_root_digest(), digest);
+    }
+
+    proptest! {
+        // Property 22 assembly half: one selected platform and frontend determine the complete root.
+        #[test]
+        fn generated_assembly_matches_the_three_root_reference_model(
+            platform_segment in "[a-z][a-z0-9]{0,10}",
+            format_segment in "[a-z][a-z0-9]{0,10}",
+            snapshot in "[a-f0-9]{8,40}",
+            definition_bytes in prop::collection::vec(any::<u8>(), 0..128),
+        ) {
+            let platform_id = PlatformId::new(&platform_segment)
+                .expect("generated platform id is canonical");
+            let format_id = DefinitionFormatId::new(&format_segment)
+                .expect("generated format id is canonical");
+            let cli = PackageCoordinates {
+                package_id: "cli-id".to_string(),
+                package_name: PROVISIONER_CLI_PACKAGE.to_string(),
+                library_target: "tokeira_provisioner_cli".to_string(),
+                manifest_path: PathBuf::from("/workspace/crates/cli/Cargo.toml"),
+            };
+            let platform = PackageCoordinates {
+                package_id: "platform-id".to_string(),
+                package_name: format!("{platform_segment}-platform"),
+                library_target: format!("{platform_segment}_platform"),
+                manifest_path: PathBuf::from(format!(
+                    "/workspace/platforms/{platform_segment}/Cargo.toml"
+                )),
+            };
+            let frontend = PackageCoordinates {
+                package_id: "frontend-id".to_string(),
+                package_name: format!("{format_segment}-frontend"),
+                library_target: format!("{format_segment}_frontend"),
+                manifest_path: PathBuf::from(format!(
+                    "/workspace/frontends/{format_segment}/Cargo.toml"
+                )),
+            };
+            let cargo_toml = render_manifest(
+                &cli,
+                "../../crates/cli",
+                &platform,
+                &format!("../../platforms/{platform_segment}"),
+                &frontend,
+                &format!("../../frontends/{format_segment}"),
+            );
+            let main_rs = render_main(&platform_id, &format_id);
+            let source = BoundProvisionerSource {
+                platform: platform_id,
+                format: format_id,
+                binding_contract: PLATFORM_BINDING_CONTRACT,
+                frontend_contract: DEFINITION_FRONTEND_CONTRACT,
+                cargo_toml,
+                main_rs,
+                closure: ProvisionerClosure {
+                    crate_dirs: Vec::new(),
+                    crate_names: vec![
+                        PROVISIONER_CLI_PACKAGE.to_string(),
+                        platform.package_name.clone(),
+                        frontend.package_name.clone(),
+                    ],
+                    workspace_files: Vec::new(),
+                    locked: Vec::new(),
+                },
+            };
+
+            let manifest: toml::Value = toml::from_str(source.cargo_toml())
+                .expect("generated manifest parses");
+            let roots = manifest["dependencies"]
+                .as_table()
+                .expect("dependency table")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            prop_assert_eq!(
+                roots,
+                vec!["selected_frontend", "selected_platform", "tokeira_provisioner_cli"]
+            );
+            prop_assert_eq!(source.generated_root_digest(), source.clone().generated_root_digest());
+            prop_assert_eq!(source.evidence(&snapshot), source.clone().evidence(&snapshot));
+
+            let mut changed_contract = source.clone();
+            changed_contract.frontend_contract += 1;
+            prop_assert_ne!(
+                source.generated_root_digest(),
+                changed_contract.generated_root_digest()
+            );
+            let mut changed_generated_source = source.clone();
+            changed_generated_source.main_rs.push_str("// changed\n");
+            prop_assert_ne!(
+                source.generated_root_digest(),
+                changed_generated_source.generated_root_digest()
+            );
+            let mut changed_format = source.clone();
+            changed_format.format = DefinitionFormatId::new(format!("{format_segment}-other"))
+                .expect("derived format is canonical");
+            changed_format.main_rs = render_main(&changed_format.platform, &changed_format.format);
+            prop_assert_ne!(
+                source.generated_root_digest(),
+                changed_format.generated_root_digest()
+            );
+
+            // Deployment definitions are interpreted data, not executable
+            // closure input: arbitrary definition bytes cannot re-key this
+            // already selected platform/frontend engine.
+            let mut edited_definition = definition_bytes.clone();
+            edited_definition.push(0);
+            prop_assert_ne!(definition_bytes, edited_definition);
+            prop_assert_eq!(source.evidence(&snapshot), source.clone().evidence(&snapshot));
+        }
     }
 
     #[test]

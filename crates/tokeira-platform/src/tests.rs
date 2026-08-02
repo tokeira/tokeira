@@ -1058,6 +1058,56 @@ fn definition_engine_admits_config_and_bootstrap_graph_in_memory() {
     );
 }
 
+proptest! {
+    // Feature: platform-builder-abstraction, Property 7: configuration identity follows admitted semantics
+    #[test]
+    fn configuration_identity_depends_only_on_format_and_exact_bytes(
+        format_segment in "[a-z][a-z0-9]{0,10}",
+        bytes in prop::collection::vec(any::<u8>(), 0..256),
+        edit in any::<u8>(),
+        path_segment in "[a-z][a-z0-9]{0,10}",
+        project in ".{0,64}",
+        timestamp in any::<i64>(),
+    ) {
+        let format = tokeira_orchestrator::DefinitionFormatId::new(&format_segment)
+            .expect("generated format is canonical");
+        let other_format = tokeira_orchestrator::DefinitionFormatId::new(format!(
+            "{format_segment}-other"
+        ))
+        .expect("derived format is canonical and unequal");
+        let first = ConfigurationIdentity::compute(&format, &bytes);
+        let repeated = ConfigurationIdentity::compute(&format, &bytes);
+        prop_assert_eq!(&first, &repeated);
+
+        let mut edited = bytes.clone();
+        edited.push(edit);
+        prop_assert_ne!(
+            &first,
+            &ConfigurationIdentity::compute(&format, &edited)
+        );
+        prop_assert_ne!(
+            &first,
+            &ConfigurationIdentity::compute(&other_format, &bytes)
+        );
+
+        // Paths, context facts, timestamps, state, and inspection bytes are
+        // deliberately absent from the identity input. Constructing arbitrary
+        // values for them cannot perturb the repeated result or the binding id.
+        let _unrelated_path = RelativeDefinitionPath::new(format!(
+            "definitions/{path_segment}.tkd"
+        ))
+        .expect("generated path is safe");
+        let _unrelated_context = TestContext { project };
+        let _unrelated_timestamp = timestamp;
+        let binding_id = test_binding().id;
+        prop_assert_eq!(
+            ConfigurationIdentity::compute(&format, &bytes),
+            repeated
+        );
+        prop_assert_eq!(binding_id.as_str(), "test");
+    }
+}
+
 #[test]
 fn framework_modules_preserve_dynamic_dependency_names_without_leaking() {
     let mut graph = DeploymentGraphBuilder::new();

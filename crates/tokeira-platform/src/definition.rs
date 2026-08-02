@@ -25,6 +25,48 @@ use crate::{
 #[serde(transparent)]
 pub struct RelativeDefinitionPath(String);
 
+/// Canonical source-file extension without a leading dot.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DefinitionSourceExtension(String);
+
+impl DefinitionSourceExtension {
+    /// Validate a portable lower-kebab source extension.
+    pub fn new(value: impl Into<String>) -> Result<Self, DefinitionSourceExtensionError> {
+        let value = value.into();
+        DefinitionFormatId::new(value.clone()).map_err(|source| {
+            DefinitionSourceExtensionError {
+                value: value.clone(),
+                source,
+            }
+        })?;
+        Ok(Self(value))
+    }
+
+    /// Borrow the extension without a leading dot.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DefinitionSourceExtension {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Rejection of a non-portable definition source extension.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid source extension `{value}`: {source}")]
+pub struct DefinitionSourceExtensionError {
+    value: String,
+    source: tokeira_orchestrator::IdentifierError,
+}
+
 impl RelativeDefinitionPath {
     /// Validate a portable deployment-relative definition path.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, DefinitionPathError> {

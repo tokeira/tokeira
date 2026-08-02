@@ -12,24 +12,14 @@ use std::{
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use serde::Deserialize;
 use thiserror::Error;
-use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
-use tokeira_platform::definition::RelativeDefinitionPath;
+use tokeira_orchestrator::{DefinitionFormatId, PlatformId, PlatformLaunchClass};
+use tokeira_platform::definition::{DefinitionSourceExtension, RelativeDefinitionPath};
 
 /// Private platform binding contract understood by this workspace.
 pub const PLATFORM_BINDING_CONTRACT: u32 = 1;
 
 /// Private definition-frontend contract understood by this workspace.
 pub const DEFINITION_FRONTEND_CONTRACT: u32 = 1;
-
-/// A platform's generic launch mechanism.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PlatformLaunchClass {
-    /// Launch a provisioner statically assembled with one platform and frontend.
-    BoundProvisioner,
-    /// Retained adapter for the out-of-scope Local platform.
-    LegacyInProcess,
-}
 
 /// Cargo coordinates for one trusted conventional library export.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -57,25 +47,6 @@ pub struct PlatformPackageDescriptor {
     pub binding_contract: u32,
     /// Conventional source-library coordinates.
     pub package: PackageCoordinates,
-}
-
-/// Canonical source-file extension without a leading dot.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DefinitionSourceExtension(String);
-
-impl DefinitionSourceExtension {
-    /// Validate a portable lower-kebab source extension.
-    pub fn new(value: impl Into<String>) -> Result<Self, String> {
-        let value = value.into();
-        DefinitionFormatId::new(value.clone())
-            .map_err(|error| format!("invalid source extension `{value}`: {error}"))?;
-        Ok(Self(value))
-    }
-
-    /// Borrow the extension without a leading dot.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// Validated metadata for one source definition-frontend package.
@@ -247,7 +218,7 @@ fn decode_frontend(
     let format = DefinitionFormatId::new(raw.format)
         .map_err(|error| invalid(package, "definition-frontend", error.to_string()))?;
     let source_extension = DefinitionSourceExtension::new(raw.source_extension)
-        .map_err(|error| invalid(package, "definition-frontend", error))?;
+        .map_err(|error| invalid(package, "definition-frontend", error.to_string()))?;
     let default_relative_path = RelativeDefinitionPath::new(raw.default_relative_path)
         .map_err(|error| invalid(package, "definition-frontend", error.to_string()))?;
     let path_extension = default_relative_path
@@ -345,6 +316,8 @@ fn invalid(package: &Package, descriptor: &'static str, message: String) -> Disc
 mod tests {
     use std::fs;
 
+    use proptest::prelude::*;
+
     use super::*;
 
     fn write_package(root: &Path, name: &str, metadata: &str, binary: bool) {
@@ -377,6 +350,32 @@ mod tests {
         )
         .expect("write workspace manifest");
         root
+    }
+
+    fn write_shaped_package(root: &Path, has_library: bool, has_binary: bool) {
+        let package = root.join("descriptor");
+        fs::create_dir_all(package.join("src")).expect("create package source directory");
+        if has_library {
+            fs::write(package.join("src/lib.rs"), "pub fn binding() {}\n").expect("write library");
+        }
+        if has_binary {
+            fs::write(package.join("src/main.rs"), "fn main() {}\n").expect("write binary");
+        }
+        fs::write(
+            package.join("Cargo.toml"),
+            r#"[package]
+name = "descriptor"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.tokeira.platform]
+id = "synthetic"
+binding-contract = 1
+launch-class = "bound-provisioner"
+default = true
+"#,
+        )
+        .expect("write package manifest");
     }
 
     #[test]
@@ -489,5 +488,20 @@ default-relative-path = "definition.py"
             .expect("tkd descriptor");
         assert_eq!(frontend.package.package_name, "tokeira-tkd");
         assert_eq!(frontend.package.library_target, "tokeira_tkd");
+    }
+
+    proptest! {
+        // Property 22 package-shape half: descriptor packages are conventional libraries only.
+        #[test]
+        fn descriptor_target_admission_matches_the_reference_shape(
+            has_library in any::<bool>(),
+            has_binary in any::<bool>(),
+        ) {
+            let root = workspace(&["descriptor"]);
+            write_shaped_package(root.path(), has_library, has_binary);
+
+            let admitted = discover_workspace_descriptors(root.path()).is_ok();
+            prop_assert_eq!(admitted, has_library && !has_binary);
+        }
     }
 }

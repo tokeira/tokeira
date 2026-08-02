@@ -12,6 +12,7 @@
 //! `deployment destroy` never orphans AWS resources.
 
 use anyhow::Result;
+use tokeira_orchestrator::{PlatformKind, PlatformLaunchClass};
 
 use crate::{
     cli::DeploymentAction,
@@ -38,13 +39,23 @@ pub(crate) async fn run(
             build_image,
         } => {
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let metadata =
-                deployments.create(&resolved_name, platform.into(), storage.into(), region)?;
+            let platform: PlatformKind = platform.into();
+            let storage = storage.into();
+            let seed = if platform == PlatformKind::Compose {
+                Some(crate::deployment_dir::compose_definition_seed(
+                    storage,
+                    region.as_deref(),
+                )?)
+            } else {
+                None
+            };
+            let pending =
+                deployments.begin_create(&resolved_name, platform, storage, region, seed)?;
             // Forwarded (`.tkd`) platforms carry their own bound provisioner —
             // introduce `tkp` into the deployment at create: the verified
             // hermetic bundle when `--bundle` opts in (task 18.3), else the
             // Phase-0 native dev copy.
-            if deployments.is_forwarded(Some(&metadata.name))? {
+            if pending.metadata().launch_class == Some(PlatformLaunchClass::BoundProvisioner) {
                 if bundle {
                     let image = build_image.as_deref().ok_or_else(|| {
                         anyhow::anyhow!(
@@ -52,22 +63,24 @@ pub(crate) async fn run(
                              digest-pinned build container is an engine-identity input)"
                         )
                     })?;
-                    crate::bundle_create::place_bundle_provisioner(
+                    crate::bundle_create::place_bundle_provisioner_at(
                         deployments,
-                        &metadata.name,
+                        pending.path(),
                         image,
                     )
                     .await?;
                 } else {
                     // (place_provisioner reports the resolution leg + digest.)
-                    deployments.place_provisioner(&metadata.name)?;
+                    deployments.place_provisioner_at(pending.path())?;
                 }
+                launcher::validate_staged_definition(pending.path()).await?;
             } else if bundle {
                 anyhow::bail!(
                     "`--bundle` applies only to forwarded (`.tkd`) platforms — this deployment \
                      is driven in-process"
                 );
             }
+            let metadata = pending.publish()?;
             print_metadata(&metadata, json)?;
         }
         DeploymentAction::List => {

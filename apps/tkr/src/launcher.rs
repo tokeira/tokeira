@@ -425,18 +425,21 @@ pub(crate) async fn launch_upgrade(deployment_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `tkr definition check --path <p>`: check a definition anywhere on disk —
-/// authoring mode, no deployment involved. The interpreter lives in `tkp`, so
-/// resolve one from the Phase-0 source pool (the same leg `create` and
-/// `upgrade` use) and hand it the file: a directory means its
-/// `definition.tkd`; a file is taken as given.
+/// `tkr definition check --definition <p> --format <id>`: check a definition
+/// anywhere on disk without deployment state. The interpreter lives in `tkp`,
+/// so resolve one from the Phase-0 source pool and hand it the file; a
+/// directory uses the format's conventional basename.
 pub(crate) async fn launch_definition_check_at_path(
     path: &Path,
+    format: &str,
     json: bool,
     detail: bool,
 ) -> Result<()> {
     let (definition, dir) = if path.is_dir() {
-        (path.join("definition.tkd"), path.to_path_buf())
+        (
+            path.join(format!("definition.{format}")),
+            path.to_path_buf(),
+        )
     } else {
         let dir = path
             .parent()
@@ -457,6 +460,8 @@ pub(crate) async fn launch_definition_check_at_path(
         dir.display().to_string(),
         "--definition".to_string(),
         definition.display().to_string(),
+        "--format".to_string(),
+        format.to_string(),
     ];
     if json {
         args.push("--json".to_string());
@@ -474,6 +479,35 @@ pub(crate) async fn launch_definition_check_at_path(
         .with_context(|| format!("failed to launch `{}`", candidate.display()))?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Validate a staged deployment through the exact provisioner bytes that will
+/// be published with it. Staging remains invisible if the check fails.
+pub(crate) async fn validate_staged_definition(deployment_dir: &Path) -> Result<()> {
+    let provisioner = deployment_dir.join(crate::deployment_dir::PROVISIONER_BIN);
+    if !provisioner.is_file() {
+        bail!(
+            "staged deployment has no provisioner at {}",
+            provisioner.display()
+        );
+    }
+    let status = tokio::process::Command::new(&provisioner)
+        .args([
+            "definition",
+            "check",
+            "--deployment-dir",
+            &deployment_dir.display().to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| format!("failed to launch staged `{}`", provisioner.display()))?;
+    if !status.success() {
+        bail!("staged provisioner refused the deployment definition");
     }
     Ok(())
 }

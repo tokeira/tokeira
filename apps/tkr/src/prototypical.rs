@@ -25,13 +25,16 @@ use toml_edit::{DocumentMut, value};
 /// seeded `.tkd` (the interpreter's source of truth), `metadata.json.storage`, and
 /// the prototypical `tokeirad.toml` all agree. (Transitional: embedded from the
 /// compose platform crate, which owns its default definition.)
-pub(crate) fn compose_definition(storage: StorageKind, region: Option<&str>) -> Result<String> {
-    const DEFAULT_TKD: &str = include_str!("../../../platforms/compose/definition.tkd");
+pub(crate) fn compose_definition(
+    seed: &str,
+    storage: StorageKind,
+    region: Option<&str>,
+) -> Result<String> {
     match storage {
-        StorageKind::InMemory => Ok(DEFAULT_TKD.to_string()),
+        StorageKind::InMemory => Ok(seed.to_string()),
         StorageKind::Dsql => {
             const MARKER: &str = "storage: Storage::InMemory,";
-            if !DEFAULT_TKD.contains(MARKER) {
+            if !seed.contains(MARKER) {
                 bail!(
                     "compose definition.tkd no longer contains `{MARKER}`; the `--storage dsql` \
                      bake-in in prototypical.rs needs updating"
@@ -42,7 +45,7 @@ pub(crate) fn compose_definition(storage: StorageKind, region: Option<&str>) -> 
                 "storage: Storage::Dsql {{ region: \"{region}\".into(), mode: DsqlMode::Managed, \
                  endpoint: None, arn: None }},"
             );
-            Ok(DEFAULT_TKD.replacen(MARKER, &dsql, 1))
+            Ok(seed.replacen(MARKER, &dsql, 1))
         }
     }
 }
@@ -117,9 +120,17 @@ mod tests {
     use tokeira_compose_deployment::ComposeConfig;
     use tokeira_ecs_deployment::EcsConfig;
 
+    fn compose_seed() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../platforms/compose/definition.tkd"),
+        )
+        .expect("workspace Compose definition seed")
+    }
+
     #[test]
     fn compose_definition_in_memory_keeps_the_shipped_default() {
-        let tkd = compose_definition(StorageKind::InMemory, None).unwrap();
+        let tkd = compose_definition(&compose_seed(), StorageKind::InMemory, None).unwrap();
         assert!(
             tkd.contains("storage: Storage::InMemory,"),
             "config() default is in-memory"
@@ -128,7 +139,8 @@ mod tests {
 
     #[test]
     fn compose_definition_dsql_bakes_storage_and_region_into_config() {
-        let tkd = compose_definition(StorageKind::Dsql, Some("eu-west-1")).unwrap();
+        let tkd =
+            compose_definition(&compose_seed(), StorageKind::Dsql, Some("eu-west-1")).unwrap();
         // config()'s storage line is rewritten to Dsql with the requested region;
         // the deployment() destructure (`Storage::Dsql { .. }`) is untouched.
         assert!(

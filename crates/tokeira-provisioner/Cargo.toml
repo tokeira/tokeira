@@ -17,6 +17,7 @@ tokeira-orchestrator = { path = "../tokeira-orchestrator" }
 tokeira-platform = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

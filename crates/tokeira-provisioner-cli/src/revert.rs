@@ -53,7 +53,7 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
     }
 
     // ── Target must be a prior, retained revision ──
-    let config_basename = platform.config_basename(deployment_dir);
+    let config_source = platform.config_source(deployment_dir)?;
     if to_revision >= envelope.config_revision {
         anyhow::bail!(
             "cannot revert to config revision {to_revision}: the current revision is {} \
@@ -61,7 +61,7 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
             envelope.config_revision
         );
     }
-    if !config_history::is_retained(deployment_dir, config_basename, to_revision) {
+    if !config_history::is_retained(deployment_dir, &config_source, to_revision) {
         anyhow::bail!(
             "config revision {to_revision} was not retained; only revisions produced by a prior \
              `init`/`apply` can be reverted to"
@@ -69,11 +69,11 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
     }
 
     // ── Restore the retained revision's config source, then reconcile ──
-    config_history::restore(deployment_dir, config_basename, to_revision)
+    config_history::restore(deployment_dir, &config_source, to_revision)
         .context("failed to restore the target config revision")?;
     println!(
         "restored config revision {to_revision} → {}",
-        config_history::config_file(deployment_dir, config_basename).display()
+        config_history::config_file(deployment_dir, &config_source).display()
     );
 
     let applied = crate::change_log_entries(&platform.infra_apply(deployment_dir).await?.changes);
@@ -89,8 +89,8 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
     // ── Re-stamp: a forward config revision whose content equals `to_revision` ──
     envelope.binding = Some(running);
     envelope.config_revision += 1;
-    envelope.effective_config_ref = Some(config_ref(deployment_dir, config_basename));
-    config_history::snapshot(deployment_dir, config_basename, envelope.config_revision)
+    envelope.effective_config_ref = Some(config_ref(deployment_dir, &config_source));
+    config_history::snapshot(deployment_dir, &config_source, envelope.config_revision)
         .context("failed to retain the reverted config revision")?;
     envelope.stamp_current_schema();
     store

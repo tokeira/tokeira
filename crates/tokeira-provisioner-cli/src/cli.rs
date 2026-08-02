@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use tokeira_orchestrator::DefinitionFormatId;
 
 use crate::{
     ProvisionerPlatform, apply, definition, deploy, describe, destroy, init, lock, plan, revert,
@@ -70,6 +71,31 @@ enum Command {
     Rollback(RollbackArgs),
 }
 
+impl Command {
+    /// Deployment identity admission precedes even the operation lock. A
+    /// standalone authored source has no deployment metadata to admit.
+    fn admission_dir(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Init(args) | Self::Upgrade(args) => Some(&args.deployment_dir),
+            Self::Describe(args) => Some(&args.deployment_dir),
+            Self::Definition(DefinitionCommand::Check(args)) => args
+                .definition
+                .is_none()
+                .then_some(args.deployment_dir.as_path()),
+            Self::Infra(InfraCommand::Plan(args)) | Self::Deploy(DeployCommand::Plan(args)) => {
+                Some(&args.deployment_dir)
+            }
+            Self::Infra(InfraCommand::Apply(args)) | Self::Deploy(DeployCommand::Apply(args)) => {
+                Some(&args.deployment_dir)
+            }
+            Self::Infra(InfraCommand::Destroy(args)) => Some(&args.deployment_dir),
+            Self::Scale(args) => Some(&args.deployment_dir),
+            Self::Revert(args) => Some(&args.deployment_dir),
+            Self::Rollback(args) => Some(&args.deployment_dir),
+        }
+    }
+}
+
 #[derive(Args)]
 struct RollbackArgs {
     /// Deployment directory holding the state envelope.
@@ -100,6 +126,10 @@ struct CheckArgs {
     /// mode: the report carries no deployment context, only the path.
     #[arg(long)]
     definition: Option<PathBuf>,
+    /// Definition format selected through the trusted frontend catalog.
+    /// Required with `--definition`; deployment mode reads the recorded value.
+    #[arg(long, requires = "definition")]
+    format: Option<DefinitionFormatId>,
 }
 
 #[derive(Subcommand)]
@@ -200,6 +230,9 @@ struct RevertArgs {
 /// error reporting.
 pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
+    if let Some(deployment_dir) = cli.command.admission_dir() {
+        platform.admit_deployment(deployment_dir)?;
+    }
     // One resolution of the output contract's global flags; the collapse rule
     // (`--json` is depth-blind) is enforced inside `Mode::resolve`.
     let mode = tokeira_report::Mode::resolve(cli.json, cli.detail);
@@ -213,6 +246,7 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
                 &platform,
                 &args.deployment_dir,
                 args.definition.as_deref(),
+                args.format.as_ref(),
                 mode,
             )
             .await

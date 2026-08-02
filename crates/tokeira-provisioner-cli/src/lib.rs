@@ -16,10 +16,13 @@ use std::path::Path;
 
 use anyhow::Result;
 use tokeira_iac::{Change, ChangeKind, PlanOutcome};
+use tokeira_orchestrator::DefinitionFormatId;
+use tokeira_platform::definition::RelativeDefinitionPath;
 use tokeira_provisioner::DeploymentStateEnvelope;
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
 mod apply;
+mod bound;
 mod causality;
 mod cli;
 mod config_history;
@@ -38,10 +41,64 @@ mod rollback;
 mod scale;
 mod upgrade;
 
+pub use bound::BoundPlatform;
 pub use cli::run;
 // The seam's audit vocabulary travels with the seam: platform realizations
 // return these from their applying verbs (task 19.2).
 pub use tokeira_provisioner::{ChangeLogEntry, ChangeOp};
+
+/// Generate the disposable `tkp` entrypoint for one statically selected
+/// platform binding and one Definition Frontend.
+#[macro_export]
+macro_rules! bound_provisioner_main {
+    (
+        expected_platform: $platform:literal,
+        binding: $binding:path,
+        expected_format: $format:literal,
+        frontend: $frontend:path $(,)?
+    ) => {
+        fn main() -> std::process::ExitCode {
+            $crate::run_bound_provisioner($platform, $format, $binding(), $frontend())
+        }
+    };
+}
+
+/// Synchronous process boundary used only by generated composition roots.
+pub fn run_bound_provisioner<P, F>(
+    expected_platform: &'static str,
+    expected_format: &'static str,
+    binding: tokeira_platform::binding::PlatformBinding<P>,
+    frontend: F,
+) -> std::process::ExitCode
+where
+    P: tokeira_platform::binding::Platform,
+    F: tokeira_platform::definition::DefinitionFrontend<P>,
+{
+    let platform = match BoundPlatform::new(expected_platform, expected_format, binding, frontend) {
+        Ok(platform) => platform,
+        Err(error) => {
+            eprintln!("{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("failed to start provisioner runtime: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run(platform)) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
 /// The outcome of a **conditionally realized** platform verb (design §"Command
 /// behaviour and outputs"): the surface is the same for every platform, and
@@ -92,6 +149,41 @@ pub struct AppliedOutcome {
     pub display_by_id: std::collections::BTreeMap<tokeira_iac::ResourceId, String>,
 }
 
+/// Recorded desired-source identity used by shell history and evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSource {
+    /// Definition format for interpreted sources; absent only for retained
+    /// legacy configuration files outside the bound-provisioner path.
+    pub format: Option<DefinitionFormatId>,
+    /// Canonical path relative to the deployment root.
+    pub path: RelativeDefinitionPath,
+}
+
+impl ConfigSource {
+    /// Construct a recorded interpreted definition source.
+    pub fn definition(format: &str, path: &str) -> Result<Self> {
+        Ok(Self::recorded(
+            DefinitionFormatId::new(format)?,
+            RelativeDefinitionPath::new(path)?,
+        ))
+    }
+
+    pub(crate) fn recorded(format: DefinitionFormatId, path: RelativeDefinitionPath) -> Self {
+        Self {
+            format: Some(format),
+            path,
+        }
+    }
+
+    /// Construct a retained legacy configuration source.
+    pub fn legacy(path: &str) -> Result<Self> {
+        Ok(Self {
+            format: None,
+            path: RelativeDefinitionPath::new(path)?,
+        })
+    }
+}
+
 /// The seam a per-platform provisioner binary implements: the platform-realized
 /// verbs plus the platform properties the shell genuinely needs. Everything else
 /// — gating, locking, the envelope, revisions, describe — is the shell's.
@@ -101,13 +193,23 @@ pub struct AppliedOutcome {
 /// free to ignore it for the property methods.
 #[allow(async_fn_in_trait)] // implementations are workspace-internal and monomorphized; no Send bound needed
 pub trait ProvisionerPlatform {
+    /// Admit the deployment's immutable platform/frontend/bundle identity
+    /// before the shell acquires a lock or reads any state. Legacy in-process
+    /// adapters have no static assembly evidence and retain the no-op default.
+    fn admit_deployment(&self, _deployment_dir: &Path) -> Result<()> {
+        Ok(())
+    }
+
     /// Human label for reports (e.g. `"compose"`).
     fn label(&self, deployment_dir: &Path) -> &'static str;
 
-    /// The config **source** file's basename for this deployment (e.g.
-    /// `"definition.tkd"`). The shell keys config-revision snapshots and the
-    /// `effective_config_ref` digest on this file.
-    fn config_basename(&self, deployment_dir: &Path) -> &'static str;
+    /// Recorded desired source used for evaluation, identity, and revisions.
+    fn config_source(&self, deployment_dir: &Path) -> Result<ConfigSource>;
+
+    /// Definition format compiled into this provisioner, when interpreted.
+    fn definition_format(&self) -> Option<&'static str> {
+        None
+    }
 
     /// The deployment identity recorded at Day-0 stamp time.
     fn deployment_id(&self, deployment_dir: &Path) -> Result<String>;
@@ -322,8 +424,8 @@ impl ProvisionerPlatform for TestPlatform {
         "test"
     }
 
-    fn config_basename(&self, _deployment_dir: &Path) -> &'static str {
-        "deployment.toml"
+    fn config_source(&self, _deployment_dir: &Path) -> Result<ConfigSource> {
+        ConfigSource::legacy("deployment.toml")
     }
 
     fn deployment_id(&self, _deployment_dir: &Path) -> Result<String> {

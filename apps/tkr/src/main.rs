@@ -107,16 +107,25 @@ async fn main() -> Result<()> {
             commands::image::run(args.command, deployment, format).await
         }
         Command::Definition { action } => {
-            let cli::DefinitionAction::Check { path } = action;
-            if let Some(path) = path {
+            let cli::DefinitionAction::Check { definition, format } = action;
+            if let Some(path) = definition {
                 // Authoring mode: the definition needs no deployment. One
                 // subject per check — a named path and a named deployment
                 // cannot both be it.
                 if selected.is_some() {
-                    anyhow::bail!("pass either `--path` or `--deployment`, not both");
+                    anyhow::bail!("pass either `--definition` or `--deployment`, not both");
                 }
-                launcher::launch_definition_check_at_path(&path, cli.json, cli.detail).await
-            } else if deployments.is_forwarded(selected)? {
+                let format = format.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("standalone definition checking requires `--format <id>`")
+                })?;
+                launcher::launch_definition_check_at_path(
+                    &path,
+                    format.as_str(),
+                    cli.json,
+                    cli.detail,
+                )
+                .await
+            } else if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 launcher::launch(
                     &dir,
@@ -137,7 +146,7 @@ async fn main() -> Result<()> {
         Command::Infra { action } => {
             // A `.tkd` deployment is forwarded to its bound `tkp`; only the legacy
             // in-process platforms run through `commands::infra`.
-            if deployments.is_forwarded(selected)? {
+            if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 // `infra apply` is the same coherent one-command flow as
                 // `deployment apply` (Req 6.5): a never-stamped deployment is
@@ -169,7 +178,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Deploy { action } => {
-            if deployments.is_forwarded(selected)? {
+            if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 let (verb, mut extra) = forwarded_deploy_verb(&action);
                 if matches!(action, DeployAction::Plan { .. } | DeployAction::Status) {
@@ -186,7 +195,7 @@ async fn main() -> Result<()> {
             commands::schema::run(action, ctx).await
         }
         Command::Scale { action } => {
-            if deployments.is_forwarded(selected)? {
+            if deployments.uses_bound_provisioner(selected)? {
                 let dir = deployments.resolve_dir(selected)?;
                 match forwarded_scale_verb(&action) {
                     Some(specs) => launcher::launch(&dir, &["scale"], &specs).await,
@@ -402,6 +411,7 @@ mod tests {
         },
         deployment_dir::{DEPLOYMENT_TOML, METADATA_JSON, TOKEIRAD_TOML},
     };
+    use proptest::prelude::*;
     use serde_json::json;
     use tokeira_local_deployment::LocalConfig;
     use tokeira_orchestrator::{PlatformConfig, PlatformKind, StorageKind};
@@ -788,14 +798,25 @@ mod tests {
                 action: cli::DefinitionAction::Check { .. }
             }
         ));
-        // Authoring mode: --path parses; global --deployment parses after the
+        // Authoring mode: source + explicit format parse; global --deployment parses after the
         // subcommand (Ian-grammar: flags where the operator's hands already are).
         assert!(matches!(
-            Cli::try_parse_from(["tkr", "definition", "check", "--path", "defs/staging.tkd"])
-                .unwrap()
-                .command,
+            Cli::try_parse_from([
+                "tkr",
+                "definition",
+                "check",
+                "--definition",
+                "defs/staging.tkd",
+                "--format",
+                "tkd"
+            ])
+            .unwrap()
+            .command,
             Command::Definition {
-                action: cli::DefinitionAction::Check { path: Some(_) }
+                action: cli::DefinitionAction::Check {
+                    definition: Some(_),
+                    format: Some(_)
+                }
             }
         ));
         let parsed =
@@ -912,6 +933,98 @@ mod tests {
         assert!(deployment_path.join(METADATA_JSON).exists());
         assert!(deployment_path.join("state").exists());
         assert_eq!(deployments.resolve_name(None).unwrap(), "my-dev");
+    }
+
+    proptest! {
+        #[test]
+        fn creation_transaction_hides_staging_and_rolls_back_latest_failure(
+            suffix in "[a-z0-9]{1,12}",
+            failure_point in 0_u8..3,
+        ) {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
+            let name = format!("txn-{suffix}");
+            let pending = deployments
+                .begin_create(
+                    &name,
+                    PlatformKind::Local,
+                    StorageKind::InMemory,
+                    None,
+                    None,
+                )
+                .expect("stage");
+
+            match failure_point {
+                0 => drop(pending),
+                1 => {
+                    fs::create_dir(deployments.latest_path()).expect("block latest rename");
+                    let error = pending.publish().expect_err("publication must fail");
+                    prop_assert!(error.to_string().contains(".latest"));
+                }
+                _ => {
+                    let metadata = pending.publish().expect("publish");
+                    prop_assert_eq!(metadata.name, name.clone());
+                }
+            }
+
+            let final_path = deployments.path(&name);
+            if failure_point < 2 {
+                prop_assert!(!final_path.exists());
+                prop_assert!(!deployments.latest_path().is_file());
+            } else {
+                prop_assert!(final_path.join(METADATA_JSON).is_file());
+                prop_assert!(final_path.join(DEPLOYMENT_TOML).is_file());
+                prop_assert!(final_path.join(TOKEIRAD_TOML).is_file());
+                prop_assert_eq!(
+                    fs::read_to_string(deployments.latest_path()).expect("latest"),
+                    name
+                );
+            }
+            let staging_remains = fs::read_dir(deployments.root())
+                .expect("root")
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".create-"));
+            prop_assert!(!staging_remains);
+        }
+    }
+
+    #[test]
+    fn launch_routing_uses_metadata_not_definition_file_presence() {
+        let temp = tempfile::tempdir().unwrap();
+        let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
+        deployments
+            .create(
+                "compose-route",
+                PlatformKind::Compose,
+                StorageKind::InMemory,
+                None,
+            )
+            .unwrap();
+        fs::remove_file(deployments.path("compose-route").join("definition.tkd")).unwrap();
+        assert!(
+            deployments
+                .uses_bound_provisioner(Some("compose-route"))
+                .unwrap()
+        );
+
+        deployments
+            .create(
+                "local-route",
+                PlatformKind::Local,
+                StorageKind::InMemory,
+                None,
+            )
+            .unwrap();
+        fs::write(
+            deployments.path("local-route").join("definition.tkd"),
+            "not routing metadata",
+        )
+        .unwrap();
+        assert!(
+            !deployments
+                .uses_bound_provisioner(Some("local-route"))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1059,6 +1172,8 @@ mod tests {
             name: "dev".into(),
             id: Uuid::nil(),
             platform: PlatformKind::Local,
+            launch_class: Some(tokeira_orchestrator::PlatformLaunchClass::LegacyInProcess),
+            definition: None,
             storage: StorageKind::InMemory,
             status: metadata::DeploymentStatus::Created,
             created_at: "now".into(),
@@ -1076,6 +1191,12 @@ mod tests {
             name: "dev".into(),
             id: Uuid::nil(),
             platform: PlatformKind::Compose,
+            launch_class: Some(tokeira_orchestrator::PlatformLaunchClass::BoundProvisioner),
+            definition: Some(tokeira_provisioner::RecordedDefinition {
+                format: tokeira_orchestrator::DefinitionFormatId::new("tkd").unwrap(),
+                path: tokeira_platform::definition::RelativeDefinitionPath::new("definition.tkd")
+                    .unwrap(),
+            }),
             storage: StorageKind::Dsql,
             status: metadata::DeploymentStatus::Running,
             created_at: "2026-04-24T00:00:00Z".into(),

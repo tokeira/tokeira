@@ -31,10 +31,8 @@ pub(crate) async fn describe<P: ProvisionerPlatform>(
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
     let (envelope, _version) = envelope_store(deployment_dir).load().await?;
-    let retained = config_history::retained_revisions(
-        deployment_dir,
-        platform.config_basename(deployment_dir),
-    );
+    let source = platform.config_source(deployment_dir)?;
+    let retained = config_history::retained_revisions(deployment_dir, &source);
     let report = DescribeReport::build(
         &running,
         &envelope,

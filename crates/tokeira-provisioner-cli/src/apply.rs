@@ -80,12 +80,8 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     // the one the re-stamp commits (evidence-model field policy —
     // `proposed_revision` is `current + 1` for a mutating verb).
     let from_revision = envelope.config_revision;
-    restamp_applied_revision(
-        &mut envelope,
-        running,
-        deployment_dir,
-        platform.config_basename(deployment_dir),
-    )?;
+    let config_source = platform.config_source(deployment_dir)?;
+    restamp_applied_revision(&mut envelope, running, deployment_dir, &config_source)?;
     envelope.stamp_current_schema();
     store
         .save(&envelope, &version)
@@ -151,13 +147,13 @@ pub(crate) fn restamp_applied_revision(
     envelope: &mut tokeira_provisioner::DeploymentStateEnvelope,
     running: ProvenanceStamp,
     deployment_dir: &Path,
-    config_basename: &str,
+    config_source: &crate::ConfigSource,
 ) -> Result<()> {
     envelope.binding = Some(running);
     envelope.config_revision += 1;
-    envelope.effective_config_ref = Some(config_ref(deployment_dir, config_basename));
+    envelope.effective_config_ref = Some(config_ref(deployment_dir, config_source));
     // Best-effort retention: a config-less local deployment has nothing to keep.
-    config_history::snapshot(deployment_dir, config_basename, envelope.config_revision)
+    config_history::snapshot(deployment_dir, config_source, envelope.config_revision)
         .context("failed to retain the applied config revision")
 }
 
@@ -172,11 +168,11 @@ pub(crate) fn deployment_identity(recorded: &str) -> String {
 }
 
 /// A content ref for the effective configuration — a SHA-256 of the deployment's
-/// config source (the platform's `config_basename`), so a given config revision
+/// recorded config source (format plus safe deployment-relative path), so a given config revision
 /// is identifiable (and revertable to; task 14.3). Absent config falls back to
 /// `"default"`.
-pub(crate) fn config_ref(deployment_dir: &Path, config_basename: &str) -> String {
-    let config_file = deployment_dir.join(config_basename);
+pub(crate) fn config_ref(deployment_dir: &Path, config_source: &crate::ConfigSource) -> String {
+    let config_file = config_history::config_file(deployment_dir, config_source);
     match std::fs::read(&config_file) {
         Ok(bytes) => format!("sha256:{}", tokeira_provisioner::sha256_hex(&bytes)),
         Err(_) => "default".to_string(),

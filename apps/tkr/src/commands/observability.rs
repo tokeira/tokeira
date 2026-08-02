@@ -251,6 +251,8 @@ mod tests {
                 name: "test".into(),
                 id: Uuid::nil(),
                 platform: PlatformKind::Local,
+                launch_class: Some(tokeira_orchestrator::PlatformLaunchClass::LegacyInProcess),
+                definition: None,
                 storage: StorageKind::InMemory,
                 status: DeploymentStatus::Created,
                 created_at: "2026-01-01T00:00:00Z".into(),

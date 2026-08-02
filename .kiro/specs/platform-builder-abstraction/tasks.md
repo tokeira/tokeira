@@ -225,7 +225,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       reports, upgrade, rollback, describe, and exit behavior in the shell.
     - Remove central platform/frontend features, concrete imports, and any committed central `tkp.rs`.
     - _Requirements: 3.12–3.26, 3.33–3.40, 9.23–9.24, 14.15, 14.20–14.21_
-  - [ ] 10.2 Persist format and live relative path in deployment metadata
+  - [x] 10.2 Persist format and live relative path in deployment metadata
     - Extend `metadata.json`, bundle admission, and `tkp.manifest.json` checks with Definition Format and
       the safe live relative path without treating registry metadata as desired topology.
     - Verify platform/format/engine agreement before definition evaluation, state access, or provider I/O.
@@ -236,7 +236,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       validate through staged `tkp`, and publish the complete directory and `.latest` as one boundary.
     - Remove embedded definition constants and `include_str!` seed paths from the creation/build flow.
     - _Requirements: 3.3–3.6, 3.27–3.33, 11.15–11.16, 14.13–14.15, 14.19_
-  - [ ] 10.4 Load, digest, snapshot, and restore the recorded live definition
+  - [x] 10.4 Load, digest, snapshot, and restore the recorded live definition
     - On each definition-aware command, read only the recorded deployment-root source or explicitly
       selected retained revision, evaluate through the selected frontend, and preserve format/path in
       configuration history.
@@ -247,7 +247,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - Support `definition check --definition <path> --format <id>` without deployment state; resolve the
       format through the trusted catalog and run the same frontend/framework verification path.
     - _Requirements: 3.34–3.40, 3.47–3.48_
-  - [ ] 10.6 Forward lifecycle commands through verified deployment-local bytes
+  - [x] 10.6 Forward lifecycle commands through verified deployment-local bytes
     - Make `tkr` own command parsing, selection, confirmation, local locking, verified launch, and
       argument forwarding while performing no convergence or definition interpretation in process.
     - Replace definition-file-presence forwarding inference with recorded platform launch class and

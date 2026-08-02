@@ -96,8 +96,11 @@ mod tests {
             "test"
         }
 
-        fn config_basename(&self, _deployment_dir: &std::path::Path) -> &'static str {
-            "deployment.toml"
+        fn config_source(
+            &self,
+            _deployment_dir: &std::path::Path,
+        ) -> anyhow::Result<crate::ConfigSource> {
+            crate::ConfigSource::legacy("deployment.toml")
         }
 
         fn deployment_id(&self, _deployment_dir: &std::path::Path) -> anyhow::Result<String> {

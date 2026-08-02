@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_report::{Depth, Mode, Report};
 
 use crate::{ProvisionerPlatform, Realization};
@@ -54,8 +55,22 @@ pub(crate) async fn check<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
     source: Option<&Path>,
+    requested_format: Option<&DefinitionFormatId>,
     mode: Mode,
 ) -> Result<()> {
+    if source.is_some() && requested_format.is_none() {
+        anyhow::bail!("standalone definition checking requires `--format <id>`");
+    }
+    if let Some(requested) = requested_format {
+        let supported = platform.definition_format().ok_or_else(|| {
+            anyhow::anyhow!("this provisioner has no interpreted definition frontend")
+        })?;
+        if requested.as_str() != supported {
+            anyhow::bail!(
+                "definition format `{requested}` does not match this provisioner's `{supported}` frontend"
+            );
+        }
+    }
     // A failed check IS the report: catch the platform's located error rather
     // than crashing through anyhow (which would double-print and break the
     // `--json`-stdout-purity rule).
@@ -72,7 +87,11 @@ pub(crate) async fn check<P: ProvisionerPlatform>(
         Some(path) => (None, path.display().to_string()),
         None => (
             platform.deployment_id(deployment_dir).ok(),
-            platform.config_basename(deployment_dir).to_string(),
+            platform
+                .config_source(deployment_dir)?
+                .path
+                .as_str()
+                .to_string(),
         ),
     };
     let report = CheckReport {
@@ -100,7 +119,7 @@ mod tests {
     #[tokio::test]
     async fn platforms_without_a_definition_refuse_as_not_applicable() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = check(&TestPlatform, tmp.path(), None, Mode::default())
+        let err = check(&TestPlatform, tmp.path(), None, None, Mode::default())
             .await
             .expect_err("no interpreted definition");
         assert!(

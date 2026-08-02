@@ -47,8 +47,8 @@ pub(crate) async fn gather_causality<P: ProvisionerPlatform>(
     // S first, from the store as persisted (Requirement 2.3).
     let recorded = platform.recorded_state(deployment_dir).await?;
 
-    let basename = platform.config_basename(deployment_dir);
-    let working = config_history::config_file(deployment_dir, basename);
+    let source = platform.config_source(deployment_dir)?;
+    let working = config_history::config_file(deployment_dir, &source);
     let baseline_revision = envelope.config_revision;
 
     // D — the working definition, realized. A platform with no interpreted
@@ -76,7 +76,7 @@ pub(crate) async fn gather_causality<P: ProvisionerPlatform>(
     let baseline = match baseline_revision {
         0 => BaselineView::NeverApplied,
         revision => {
-            let retained = config_history::snapshot_path(deployment_dir, basename, revision);
+            let retained = config_history::snapshot_path(deployment_dir, &source, revision);
             if !retained.exists() {
                 BaselineView::Missing { revision }
             } else {

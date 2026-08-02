@@ -1,103 +1,176 @@
-//! Per-revision configuration snapshots (task 14.3).
+//! Format-bearing per-revision desired-source snapshots.
 //!
-//! Config-revision revert is a *same-engine* apply of a **prior recorded config
-//! revision** (Req 13.3) — not an `upgrade` (the engine identity is unchanged),
-//! not a two-binary `rollback` (Proposal 002). For a prior revision to be
-//! re-applicable, its config **source** must have been retained: each applying
-//! verb snapshots the live config source keyed by the `config_revision` it
-//! produced, and `revert` restores that snapshot into the live config file
-//! before the ordinary gated apply reconciles toward it.
-//!
-//! Each snapshot is stored **under the config file's basename** for the platform
-//! it came from — `{dir}/state/config-revisions/{n}/{basename}` (a `.tkd` for
-//! compose, `deployment.toml` for local); the basename comes from the
-//! injected platform's `config_basename`. Keying by basename makes a
-//! cross-platform revert *refuse* rather than clobber: a revision retained as a
-//! `deployment.toml` is simply not present under the current `definition.tkd`
-//! basename, so `restore` errors instead of overwriting the live `.tkd` with the
-//! wrong format. The config source *is* the desired-state definition, so
-//! retaining the source is sufficient — no engine rebuild, no before-images.
+//! Each revision retains the exact source bytes plus an identity sidecar. A
+//! restore compares format and safe relative path before replacing the live
+//! source, so equal filenames under different frontends cannot cross formats.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use tokeira_orchestrator::DefinitionFormatId;
+use tokeira_platform::definition::RelativeDefinitionPath;
+
+use crate::ConfigSource;
+
+const SOURCE_METADATA: &str = "source.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedSourceIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format: Option<DefinitionFormatId>,
+    path: RelativeDefinitionPath,
+}
+
+impl From<&ConfigSource> for RetainedSourceIdentity {
+    fn from(source: &ConfigSource) -> Self {
+        Self {
+            format: source.format.clone(),
+            path: source.path.clone(),
+        }
+    }
+}
 
 fn revisions_root(deployment_dir: &Path) -> PathBuf {
     deployment_dir.join("state").join("config-revisions")
 }
 
-/// The live config source file for the platform's `config_basename`.
-pub(crate) fn config_file(deployment_dir: &Path, config_basename: &str) -> PathBuf {
-    deployment_dir.join(config_basename)
+fn revision_root(deployment_dir: &Path, revision: u64) -> PathBuf {
+    revisions_root(deployment_dir).join(revision.to_string())
 }
 
-/// Where a given revision's snapshot lives — under the *current platform's*
-/// config basename, so it is found only when reverting within the same platform.
-/// `pub(crate)`: causality resolves the baseline revision's definition here.
+/// The sole live source recorded for this deployment.
+pub(crate) fn config_file(deployment_dir: &Path, source: &ConfigSource) -> PathBuf {
+    deployment_dir.join(source.path.as_path())
+}
+
+/// Retained source bytes for one revision.
 pub(crate) fn snapshot_path(
     deployment_dir: &Path,
-    config_basename: &str,
+    source: &ConfigSource,
     revision: u64,
 ) -> PathBuf {
-    revisions_root(deployment_dir)
-        .join(revision.to_string())
-        .join(config_basename)
+    revision_root(deployment_dir, revision).join(source.path.as_path())
 }
 
-/// Retain the current config source as `revision`. Idempotent (a re-snapshot of
-/// the same revision overwrites). A deployment with no config file yet (local
-/// defaults) has nothing to retain — that is not an error.
-pub(crate) fn snapshot(deployment_dir: &Path, config_basename: &str, revision: u64) -> Result<()> {
-    let src = config_file(deployment_dir, config_basename);
-    let bytes = match std::fs::read(&src) {
+fn identity_path(deployment_dir: &Path, revision: u64) -> PathBuf {
+    revision_root(deployment_dir, revision).join(SOURCE_METADATA)
+}
+
+/// Retain exact live bytes and their independently admitted format/path.
+pub(crate) fn snapshot(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> Result<()> {
+    let live = config_file(deployment_dir, source);
+    let bytes = match std::fs::read(&live) {
         Ok(bytes) => bytes,
-        Err(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && source.format.is_none() => {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read recorded source {}", live.display()));
+        }
     };
-    let dst = snapshot_path(deployment_dir, config_basename, revision);
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    std::fs::write(&dst, &bytes).with_context(|| format!("failed to write {}", dst.display()))?;
+    let destination = snapshot_path(deployment_dir, source, revision);
+    let parent = destination
+        .parent()
+        .expect("a retained deployment-relative path has a revision parent");
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    std::fs::write(&destination, bytes)
+        .with_context(|| format!("failed to write {}", destination.display()))?;
+    let identity = serde_json::to_vec_pretty(&RetainedSourceIdentity::from(source))?;
+    let identity_path = identity_path(deployment_dir, revision);
+    std::fs::write(&identity_path, identity)
+        .with_context(|| format!("failed to write {}", identity_path.display()))?;
     Ok(())
 }
 
-/// Whether `revision`'s config source was retained **for the current platform**
-/// (revertable). A revision snapshotted under a different platform is not
-/// retained under this basename and reports `false`.
-pub(crate) fn is_retained(deployment_dir: &Path, config_basename: &str, revision: u64) -> bool {
-    snapshot_path(deployment_dir, config_basename, revision).exists()
+fn retained_identity(
+    deployment_dir: &Path,
+    revision: u64,
+) -> Result<Option<RetainedSourceIdentity>> {
+    let path = identity_path(deployment_dir, revision);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to decode {}", path.display()))
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
 }
 
-/// Every revision retained **for the current platform** (its basename), sorted
-/// ascending — the revertable set `describe` reports.
-pub(crate) fn retained_revisions(deployment_dir: &Path, config_basename: &str) -> Vec<u64> {
+fn identity_matches(retained: &RetainedSourceIdentity, source: &ConfigSource) -> bool {
+    retained.format == source.format && retained.path == source.path
+}
+
+/// Whether a revision carries bytes under the exact current format/path.
+pub(crate) fn is_retained(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> bool {
+    let bytes_exist = snapshot_path(deployment_dir, source, revision).is_file();
+    if !bytes_exist {
+        return false;
+    }
+    match retained_identity(deployment_dir, revision) {
+        Ok(Some(retained)) => identity_matches(&retained, source),
+        // Pre-sidecar history is admitted only for legacy, format-less paths.
+        Ok(None) => source.format.is_none(),
+        Err(_) => false,
+    }
+}
+
+/// Every revision retained for the exact current format/path, ascending.
+pub(crate) fn retained_revisions(deployment_dir: &Path, source: &ConfigSource) -> Vec<u64> {
     let Ok(entries) = std::fs::read_dir(revisions_root(deployment_dir)) else {
         return Vec::new();
     };
-    let mut revisions: Vec<u64> = entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().to_str().and_then(|n| n.parse().ok()))
-        .filter(|revision| is_retained(deployment_dir, config_basename, *revision))
-        .collect();
+    let mut revisions = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+        })
+        .filter(|revision| is_retained(deployment_dir, source, *revision))
+        .collect::<Vec<_>>();
     revisions.sort_unstable();
     revisions
 }
 
-/// Restore a retained revision's config source into the live config file. Errors
-/// if the revision was never snapshotted for this platform — never overwriting
-/// the live config with a foreign-format or absent snapshot.
-pub(crate) fn restore(deployment_dir: &Path, config_basename: &str, revision: u64) -> Result<()> {
-    let snap = snapshot_path(deployment_dir, config_basename, revision);
-    let bytes = std::fs::read(&snap).with_context(|| {
+/// Restore one same-format, same-path revision into the recorded live source.
+pub(crate) fn restore(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> Result<()> {
+    let retained = retained_identity(deployment_dir, revision)?;
+    match retained {
+        Some(retained) if identity_matches(&retained, source) => {}
+        Some(retained) => bail!(
+            "config revision {revision} records format/path {:?}/{}; current source is {:?}/{}",
+            retained.format,
+            retained.path.as_str(),
+            source.format,
+            source.path.as_str()
+        ),
+        None if source.format.is_none() => {}
+        None => bail!(
+            "config revision {revision} has no format-bearing source identity; refusing restore"
+        ),
+    }
+
+    let snapshot = snapshot_path(deployment_dir, source, revision);
+    let bytes = std::fs::read(&snapshot).with_context(|| {
         format!(
-            "config revision {revision} has no retained {config_basename} snapshot ({}); only \
-             same-platform revisions produced by a prior `init`/`apply` can be reverted to",
-            snap.display()
+            "config revision {revision} has no retained {} snapshot ({})",
+            source.path.as_str(),
+            snapshot.display()
         )
     })?;
-    let dst = config_file(deployment_dir, config_basename);
-    std::fs::write(&dst, &bytes).with_context(|| format!("failed to write {}", dst.display()))?;
+    let live = config_file(deployment_dir, source);
+    let temporary = live.with_extension(format!("restore-{}", std::process::id()));
+    std::fs::write(&temporary, bytes)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    if let Err(error) = std::fs::rename(&temporary, &live) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("failed to replace {}", live.display()));
+    }
     Ok(())
 }
 
@@ -105,75 +178,33 @@ pub(crate) fn restore(deployment_dir: &Path, config_basename: &str, revision: u6
 mod tests {
     use super::*;
 
-    const TKD: &str = "definition.tkd";
-    const TOML: &str = "deployment.toml";
-
-    #[test]
-    fn snapshot_then_restore_round_trips_the_config_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(TKD), b"REV-ONE").unwrap();
-        let cfg = config_file(tmp.path(), TKD);
-        assert!(cfg.ends_with(TKD));
-
-        snapshot(tmp.path(), TKD, 1).unwrap();
-        assert!(is_retained(tmp.path(), TKD, 1));
-        assert!(!is_retained(tmp.path(), TKD, 2));
-
-        // Advance the live config, then revert to revision 1's retained source.
-        std::fs::write(&cfg, b"REV-TWO").unwrap();
-        restore(tmp.path(), TKD, 1).unwrap();
-        assert_eq!(std::fs::read(&cfg).unwrap(), b"REV-ONE");
+    fn tkd() -> ConfigSource {
+        ConfigSource::definition("tkd", "definition.tkd").expect("source")
     }
 
     #[test]
-    fn restore_of_an_unretained_revision_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(TKD), b"x").unwrap();
-        let err = restore(tmp.path(), TKD, 7).expect_err("no snapshot → error");
-        assert!(err.to_string().contains("no retained"), "unexpected: {err}");
-    }
-
-    #[test]
-    fn retained_revisions_lists_the_platform_keyed_set_sorted() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(TKD), b"cfg").unwrap();
-        snapshot(tmp.path(), TKD, 2).unwrap();
-        snapshot(tmp.path(), TKD, 0).unwrap();
-        // A revision retained under the OTHER platform's basename is not listed.
-        std::fs::write(tmp.path().join(TOML), b"toml").unwrap();
-        snapshot(tmp.path(), TOML, 1).unwrap();
-
-        assert_eq!(retained_revisions(tmp.path(), TKD), vec![0, 2]);
-        assert_eq!(retained_revisions(tmp.path(), TOML), vec![1]);
-        // No history at all → empty, not an error.
-        let empty = tempfile::tempdir().unwrap();
-        assert!(retained_revisions(empty.path(), TKD).is_empty());
-    }
-
-    // Regression for the cross-platform clobber: a revision retained while the
-    // deployment was local (keyed `deployment.toml`) must NOT overwrite a later
-    // `definition.tkd`.
-    #[test]
-    fn cross_platform_revision_is_refused_not_clobbered() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Snapshot revision 1 as a LOCAL deployment (deployment.toml).
-        std::fs::write(tmp.path().join(TOML), b"LOCAL-TOML").unwrap();
-        snapshot(tmp.path(), TOML, 1).unwrap();
-        assert!(
-            is_retained(tmp.path(), TOML, 1),
-            "retained under the local basename"
+    fn snapshot_and_restore_round_trip_format_bearing_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = tkd();
+        std::fs::write(config_file(temp.path(), &source), b"one").expect("write live");
+        snapshot(temp.path(), &source, 1).expect("snapshot");
+        std::fs::write(config_file(temp.path(), &source), b"two").expect("edit live");
+        restore(temp.path(), &source, 1).expect("restore");
+        assert_eq!(
+            std::fs::read(config_file(temp.path(), &source)).expect("read live"),
+            b"one"
         );
+    }
 
-        // The deployment becomes compose (a `.tkd` appears with real content).
-        std::fs::write(tmp.path().join(TKD), b"REAL-TKD").unwrap();
-        assert!(
-            !is_retained(tmp.path(), TKD, 1),
-            "the local revision is not retained under the compose basename"
-        );
-
-        let err = restore(tmp.path(), TKD, 1).expect_err("cross-platform restore refuses");
-        assert!(err.to_string().contains("no retained"), "unexpected: {err}");
-        // The live `.tkd` is untouched — no clobber.
-        assert_eq!(std::fs::read(tmp.path().join(TKD)).unwrap(), b"REAL-TKD");
+    #[test]
+    fn equal_path_under_another_format_cannot_restore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = tkd();
+        std::fs::write(config_file(temp.path(), &source), b"tkd").expect("write live");
+        snapshot(temp.path(), &source, 2).expect("snapshot");
+        let other = ConfigSource::definition("tkdp", "definition.tkd").expect("source");
+        assert!(!is_retained(temp.path(), &other, 2));
+        let error = restore(temp.path(), &other, 2).expect_err("cross-format restore");
+        assert!(error.to_string().contains("current source"));
     }
 }

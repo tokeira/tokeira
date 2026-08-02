@@ -5,10 +5,12 @@
 //! forwarded), so this binary's role is exercising the real shell end to end
 //! without Docker — the Day-0/dev-loop substrate.
 
+use std::process::ExitCode;
+
 use anyhow::Result;
 use tokeira_local_deployment::provisioner::LocalPlatform;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     tokeira_provisioner_cli::run(LocalPlatform).await
 }

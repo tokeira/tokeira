@@ -62,6 +62,22 @@ pub enum Realization<T> {
 /// plan's changes without translation.
 pub type DesiredSnapshot = std::collections::BTreeMap<tokeira_iac::ResourceId, serde_json::Value>;
 
+/// The typed refusal a verb returns after emitting a platform-issue
+/// document: the document already said everything (output-templates §The
+/// platform cannot be reached — "The verb exits non-zero"), so [`cli::run`]
+/// turns this into a bare non-zero exit instead of an error line that would
+/// restate the report. The message exists for any other caller.
+#[derive(Debug)]
+pub(crate) struct PlatformBlocked;
+
+impl std::fmt::Display for PlatformBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the platform reported an issue; the report carries it")
+    }
+}
+
+impl std::error::Error for PlatformBlocked {}
+
 /// What an apply committed, under the identity the engine executed it with.
 ///
 /// The persisted audit vocabulary stays ids-only (Proposal 002) —

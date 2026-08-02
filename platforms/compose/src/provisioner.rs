@@ -69,13 +69,23 @@ impl ProvisionerPlatform for ComposeProvisioner {
         deployment_dir: &Path,
         source: Option<&Path>,
     ) -> Result<Realization<()>> {
-        // The whole check IS the load: parse + subset + interpret, in memory —
-        // the loader touches no provider and writes no state. `source` is
-        // authoring mode: any `.tkd` on disk, no deployment required.
+        // The check is the load plus the verification pass: parse + subset +
+        // interpret in memory, then verify the realization — no provider, no
+        // state. `source` is authoring mode: any `.tkd` on disk, no
+        // deployment required.
         let definition = source
             .map(Path::to_path_buf)
             .unwrap_or_else(|| deployment_dir.join(TKD_FILE));
-        load_tkd_config_from(deployment_dir, &definition).map(|_| Realization::Realized(()))
+        let config = load_tkd_config_from(deployment_dir, &definition)?;
+        let resources =
+            crate::adapter::TkdDeployment::realize(&config).realized_resources(&config.cx);
+        let refs: Vec<&dyn tokeira_iac::Resource> = resources.iter().map(|r| r.as_ref()).collect();
+        let findings = tokeira_iac::verify_resources(&refs);
+        if findings.is_empty() {
+            Ok(Realization::Realized(()))
+        } else {
+            anyhow::bail!("the definition does not verify: {}", findings.join("; "));
+        }
     }
 
     async fn recorded_state(&self, deployment_dir: &Path) -> Result<tokeira_iac::InfraState> {
@@ -103,7 +113,17 @@ impl ProvisionerPlatform for ComposeProvisioner {
 
     async fn infra_plan(&self, deployment_dir: &Path) -> Result<PlanOutcome> {
         let config = load_tkd_config(deployment_dir)?;
-        let mut engine = open_engine(config, deployment_dir, false).await?;
+        let (mut engine, issue) = open_engine(config, deployment_dir, false).await?;
+        // A plan only renders what could execute (output-templates rule 1):
+        // updating a recorded resource presupposes describing it, so an
+        // unreachable platform refuses with its typed issue — never a
+        // record-based plan.
+        if let Some(issue) = issue {
+            return Ok(PlanOutcome {
+                platform_issues: vec![issue],
+                ..Default::default()
+            });
+        }
         let composition = engine.compose(ModuleSelection::All)?;
         engine
             .plan(&composition, ModuleSelection::All)
@@ -113,7 +133,7 @@ impl ProvisionerPlatform for ComposeProvisioner {
 
     async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
         let config = load_tkd_config(deployment_dir)?;
-        let mut engine = open_engine(config, deployment_dir, true).await?;
+        let (mut engine, _) = open_engine(config, deployment_dir, true).await?;
         let composition = engine.compose(ModuleSelection::All)?;
         let changes = engine
             .apply(&composition, ModuleSelection::All)
@@ -128,7 +148,7 @@ impl ProvisionerPlatform for ComposeProvisioner {
 
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
         let config = load_tkd_config(deployment_dir)?;
-        let mut engine = open_engine(config, deployment_dir, true).await?;
+        let (mut engine, _) = open_engine(config, deployment_dir, true).await?;
         let composition = engine.compose(ModuleSelection::All)?;
         let removed = engine
             .destroy(&composition, ModuleSelection::All)
@@ -144,7 +164,7 @@ impl ProvisionerPlatform for ComposeProvisioner {
     ) -> Result<Vec<ChangeLogEntry>> {
         let config = load_tkd_config(deployment_dir)?;
         // Deleting live containers needs the Docker handle, like destroy.
-        let mut engine = open_engine(config, deployment_dir, true).await?;
+        let (mut engine, _) = open_engine(config, deployment_dir, true).await?;
         let composition = engine.compose(ModuleSelection::All)?;
         let id_set: HashSet<ResourceId> = ids.iter().cloned().map(ResourceId).collect();
         let deleted = engine
@@ -241,11 +261,20 @@ fn interpret_definition(
 /// unreachable; otherwise (plan) its absence is tolerated — an unregistered
 /// platform makes container `describe` return `Unsupported`, so a fresh
 /// deployment still plans.
+/// Open the engine, connecting the Docker seam. With `require_docker` the
+/// daemon is mandatory and an unreachable one is a hard error (apply /
+/// destroy mutate through it); without it (plan), an unreachable daemon
+/// comes back as the platform's typed issue — the caller refuses with the
+/// issue rather than planning against the record, and the returned `Option`
+/// is always `None` when `require_docker` held.
 async fn open_engine(
     config: TkdConfig,
     dir: &Path,
     require_docker: bool,
-) -> Result<InfraEngine<TkdDeployment>> {
+) -> Result<(
+    InfraEngine<TkdDeployment>,
+    Option<tokeira_iac::PlatformIssue>,
+)> {
     let mut engine = InfraEngine::new(TkdDeployment, &config, dir)
         .await
         .context("failed to open the infrastructure engine")?;
@@ -258,13 +287,14 @@ async fn open_engine(
     // state directory rather than a root compose file that would misrepresent the
     // model. (`describe` reads live Docker, not this ledger.)
     let compose_state_ledger = dir.join("state").join("compose-services.yaml");
-    let platform = match ComposePlatform::connect(compose_state_ledger, &config.cx.project_name) {
-        Ok(platform) => match platform.ensure_reachable().await {
-            Ok(()) => Some(platform),
-            Err(err) => docker_or_skip(err, require_docker)?,
-        },
-        Err(err) => docker_or_skip(err, require_docker)?,
-    };
+    let (platform, issue) =
+        match ComposePlatform::connect(compose_state_ledger, &config.cx.project_name) {
+            Ok(platform) => match platform.ensure_reachable().await {
+                Ok(()) => (Some(platform), None),
+                Err(err) => (None, Some(docker_issue(err, require_docker)?)),
+            },
+            Err(err) => (None, Some(docker_issue(err, require_docker)?)),
+        };
     if let Some(platform) = platform {
         engine.provision_context_mut().set_extension(platform);
     }
@@ -283,16 +313,30 @@ async fn open_engine(
                 .ok()
                 .map(|service| Box::new(service) as Box<dyn tokeira_iac::Resource>)
         }));
-    Ok(engine)
+    Ok((engine, issue))
 }
 
 /// Turn a Docker connect/reachability failure into either a hard error (apply /
 /// destroy — the daemon is required) or a tolerated skip (plan).
-fn docker_or_skip(err: ComposeError, require_docker: bool) -> Result<Option<ComposePlatform>> {
+/// Classify a Docker seam failure. With `require_docker` (apply / destroy)
+/// the daemon is mandatory: hard error. Otherwise an unreachable daemon
+/// becomes the platform's typed issue through the compose-owned direction
+/// table; any non-reachability failure (a broken service-state ledger) stays
+/// a hard error — it is not the platform being away.
+fn docker_issue(err: ComposeError, require_docker: bool) -> Result<tokeira_iac::PlatformIssue> {
     if require_docker {
-        Err(anyhow::anyhow!(err)).context("compose apply/destroy needs a reachable Docker daemon")
-    } else {
-        Ok(None)
+        return Err(anyhow::anyhow!(err))
+            .context("compose apply/destroy needs a reachable Docker daemon");
+    }
+    match err {
+        ComposeError::DockerNotAvailable {
+            socket_path,
+            evidence,
+        } => Ok(tokeira_compose::docker_unreachable_issue(
+            &socket_path,
+            &evidence,
+        )),
+        other => Err(anyhow::anyhow!(other)).context("the compose platform failed to open"),
     }
 }
 
@@ -332,16 +376,62 @@ mod tests {
         );
     }
 
+    // The content half of the config coupling: every `Vol::Config` consumer
+    // carries the declaration's digest in its manifest, so an authored
+    // config-parameter edit diffs the consumers too — the edge alone only
+    // orders creation; it cannot restart a running consumer.
+    #[test]
+    fn config_consumers_carry_the_config_content_digest() {
+        use tokeira_iac::ResourceId;
+
+        let tmp = reference_tkd_dir();
+        let config = load_tkd_config(tmp.path()).expect("load");
+        let snapshot = crate::adapter::TkdDeployment::realize(&config).desired_snapshot(&config.cx);
+
+        let digest_of = |snapshot: &std::collections::BTreeMap<ResourceId, serde_json::Value>,
+                         id: &str| {
+            snapshot[&ResourceId(id.to_string())]["environment"]["TOKEIRA_CONFIG_DIGEST"]
+                .as_str()
+                .map(str::to_string)
+        };
+        let mimir = digest_of(&snapshot, "compose/mimir").expect("mimir consumes config");
+        assert!(mimir.starts_with("sha256:"), "digest form: {mimir}");
+        assert_eq!(
+            digest_of(&snapshot, "compose/tokeirad"),
+            None,
+            "a service without `Vol::Config` carries no config digest"
+        );
+
+        // An authored parameter move moves every consumer's digest.
+        let edited = crate::DEFAULT_TKD.replace("retention_hours: 168", "retention_hours: 24");
+        assert_ne!(edited, crate::DEFAULT_TKD, "the reference param exists");
+        std::fs::write(tmp.path().join(TKD_FILE), edited).unwrap();
+        let config = load_tkd_config(tmp.path()).expect("load edited");
+        let snapshot = crate::adapter::TkdDeployment::realize(&config).desired_snapshot(&config.cx);
+        let moved = digest_of(&snapshot, "compose/mimir").expect("mimir still consumes config");
+        assert_ne!(mimir, moved, "a config-parameter edit moves the digest");
+    }
+
     #[tokio::test]
     async fn plan_interprets_the_reference_tkd() {
         // Plan interprets the `.tkd` into the container + observability + state
-        // resources. No Docker: container `describe` returns Unsupported, so a
-        // fresh deployment still plans (all Creates).
+        // resources. Runs in whichever world hosts the test: with Docker away
+        // the platform refuses with its typed issue (output-templates rule 1)
+        // — assert the refusal and end; a reachable Docker carries on into
+        // the interpretation assertions.
         let tmp = reference_tkd_dir();
         let outcome = ComposeProvisioner
             .infra_plan(tmp.path())
             .await
             .expect("plan");
+        if !outcome.platform_issues.is_empty() {
+            assert!(
+                outcome.changes.is_empty(),
+                "an issue-carrying outcome never plans against the record"
+            );
+            assert_eq!(outcome.platform_issues[0].component, "Docker");
+            return;
+        }
         assert!(
             outcome.changes.len() >= 6,
             "compose plan produced only {} changes",
@@ -362,6 +452,42 @@ mod tests {
         assert!(
             !outcome.refresh.status_by_id.is_empty(),
             "refresh covered the known resources"
+        );
+    }
+
+    // The verification pass behind `definition check` (output-templates §The
+    // rules): the reference definition verifies; a dangling `needs` — a kept
+    // dependant of a service this definition does not declare — refuses,
+    // naming both ends of the broken edge.
+    #[tokio::test]
+    async fn definition_check_verifies_the_reference_and_refuses_dangling_needs() {
+        let tmp = reference_tkd_dir();
+        assert!(matches!(
+            ComposeProvisioner
+                .definition_check(tmp.path(), None)
+                .await
+                .expect("the reference definition verifies"),
+            Realization::Realized(())
+        ));
+
+        let dangling = crate::DEFAULT_TKD.replace(
+            "needs: vec![\"tokeirad\".into(), \"mimir\".into(), \"loki\".into()]",
+            "needs: vec![\"tokeirad\".into(), \"mimir\".into(), \"ghost\".into()]",
+        );
+        assert_ne!(dangling, crate::DEFAULT_TKD, "the reference needs exist");
+        std::fs::write(tmp.path().join(TKD_FILE), dangling).unwrap();
+        let err = ComposeProvisioner
+            .definition_check(tmp.path(), None)
+            .await
+            .expect_err("a dangling dependency refuses verification");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("`compose/alloy` depends on `compose/ghost`"),
+            "both ends named: {message}"
+        );
+        assert!(
+            message.contains("does not verify"),
+            "the check frame: {message}"
         );
     }
 

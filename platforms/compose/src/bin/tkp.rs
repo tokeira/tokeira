@@ -5,10 +5,12 @@
 //! binary is named `tkp`; deployment create marries a copy into the
 //! deployment directory as `tkp`, where the launcher runs it.
 
+use std::process::ExitCode;
+
 use anyhow::Result;
 use tokeira_compose_deployment::provisioner::ComposeProvisioner;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     tokeira_provisioner_cli::run(ComposeProvisioner).await
 }

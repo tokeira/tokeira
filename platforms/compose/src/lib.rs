@@ -254,4 +254,47 @@ mod tests {
         );
         assert_eq!(cs.environment["AWS_REGION"], "eu-west-2");
     }
+
+    // The server-config content coupling: the manifest digests the file's
+    // bytes, so an operator edit of `tokeirad.toml` is a manifest diff — the
+    // plan states the update and the apply recreates the container onto the
+    // new content. Absent file, absent mount, absent digest.
+    #[test]
+    fn server_config_digest_moves_with_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cx = Cx {
+            project_name: "p".into(),
+            region: None,
+            deployment_dir: tmp.path().to_path_buf(),
+        };
+        let svc = Service {
+            image: "img".into(),
+            replicas: 1,
+            server_config: true,
+            ..Service::EMPTY
+        };
+
+        std::fs::write(tmp.path().join("tokeirad.toml"), "a = 1\n").unwrap();
+        let first =
+            svc.to_compose_service("tokeirad", &cx).environment["TOKEIRA_SERVER_CONFIG_DIGEST"]
+                .clone();
+        assert!(first.starts_with("sha256:"), "digest form: {first}");
+
+        std::fs::write(tmp.path().join("tokeirad.toml"), "a = 2\n").unwrap();
+        let second =
+            svc.to_compose_service("tokeirad", &cx).environment["TOKEIRA_SERVER_CONFIG_DIGEST"]
+                .clone();
+        assert_ne!(first, second, "an edit moves the digest");
+
+        std::fs::remove_file(tmp.path().join("tokeirad.toml")).unwrap();
+        let absent = svc.to_compose_service("tokeirad", &cx);
+        assert!(
+            !absent
+                .environment
+                .contains_key("TOKEIRA_SERVER_CONFIG_DIGEST")
+                && !absent.environment.contains_key("TOKEIRA_CONFIG"),
+            "absent file, absent coupling: {:?}",
+            absent.environment
+        );
+    }
 }

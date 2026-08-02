@@ -31,9 +31,24 @@ pub struct DeploymentContext {
 
 /// Explain a plan: one explained change per engine change (`NoChange`
 /// included), the destructive set from the engine's own classification, and
-/// uncertainty derived from refresh coverage.
+/// uncertainty derived from refresh coverage. Platform issues cross
+/// verbatim — an issue-carrying outcome holds no changes (the platform
+/// refused before planning), and the model preserves that shape.
 pub fn explain_plan(context: DeploymentContext, outcome: &PlanOutcome) -> DeploymentExplanation {
     let mut explanation = base(context);
+
+    for issue in &outcome.platform_issues {
+        let evidence_id = EvidenceId::issue(&issue.component);
+        explanation.platform_issues.push(crate::PlatformIssue {
+            evidence_id: evidence_id.clone(),
+            fact: issue.fact.clone(),
+            evidence: issue.evidence.clone(),
+            direction: issue.direction.clone(),
+        });
+        explanation
+            .evidence
+            .insert(evidence_id, EvidenceKind::PlatformIssue);
+    }
 
     for change in &outcome.changes {
         let evidence_id = EvidenceId::change(&change.module, &change.resource);

@@ -258,6 +258,7 @@ Every example is a **complete output**, never a snippet.
 
 ### The platform cannot be reached
 
+<!-- reference: infra-plan-platform-issue -->
 ```markdown
 # Infra Plan
 **Plan for compose** at revision 4

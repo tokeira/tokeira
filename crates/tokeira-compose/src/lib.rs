@@ -48,8 +48,13 @@ use tokeira_iac as iac;
 
 #[derive(Debug, Error)]
 pub enum ComposeError {
-    #[error("docker is not available at {socket_path}")]
-    DockerNotAvailable { socket_path: String },
+    #[error("docker is not available at {socket_path}: {evidence}")]
+    DockerNotAvailable {
+        socket_path: String,
+        /// The SDK's own error, verbatim — the evidence a platform issue
+        /// carries unblended.
+        evidence: String,
+    },
     #[error("container operation failed for '{container}': {source}")]
     ContainerFailed {
         container: String,
@@ -68,6 +73,34 @@ pub enum ComposeError {
     DockerIo(#[source] bollard::errors::Error),
     #[error("local image '{image}' is missing; {remediation}")]
     LocalBuildMissing { image: String, remediation: String },
+}
+
+/// The compose platform's typed issue for an unreachable Docker daemon —
+/// the platform-owned half of `## Platform Issue` rendering
+/// (operator-explanation `output-templates.md`, platform row): the fact and
+/// any direction are declared here, by the layer that owns the Docker SDK;
+/// the evidence passes through verbatim, never blended into another
+/// sentence.
+///
+/// The direction table admits only error classes whose text establishes the
+/// direction — absent is the honest default (umbrella D4). A
+/// connection-refused error establishes that nothing accepted connections at
+/// the socket path, not that the daemon is stopped. The provider-SDK error
+/// audit extends this table class by class.
+pub fn docker_unreachable_issue(socket_path: &str, evidence: &str) -> iac::PlatformIssue {
+    // Both spellings of the same errno class: bollard/hyper say
+    // "Connection refused"; other SDK stacks say "ECONNREFUSED".
+    let refused = evidence.contains("ECONNREFUSED") || evidence.contains("Connection refused");
+    iac::PlatformIssue {
+        component: "Docker".to_string(),
+        fact: "Unable to connect to Docker".to_string(),
+        evidence: evidence.to_string(),
+        direction: refused.then(|| {
+            format!(
+                "nothing accepted connections at `{socket_path}` - verify Docker is listening there"
+            )
+        }),
+    }
 }
 
 impl From<ComposeError> for iac::IacError {
@@ -448,9 +481,10 @@ impl ComposePlatform {
         compose_file: impl Into<PathBuf>,
         project_name: impl Into<String>,
     ) -> Result<Self, ComposeError> {
-        let docker = Docker::connect_with_local_defaults().map_err(|_| {
+        let docker = Docker::connect_with_local_defaults().map_err(|error| {
             ComposeError::DockerNotAvailable {
                 socket_path: "local-default".into(),
+                evidence: error.to_string(),
             }
         })?;
         Ok(Self {
@@ -469,8 +503,9 @@ impl ComposePlatform {
     ) -> Result<Self, ComposeError> {
         let socket_path = socket_path.into();
         let docker = Docker::connect_with_unix(&socket_path, 120, bollard::API_DEFAULT_VERSION)
-            .map_err(|_| ComposeError::DockerNotAvailable {
+            .map_err(|error| ComposeError::DockerNotAvailable {
                 socket_path: socket_path.clone(),
+                evidence: error.to_string(),
             })?;
         Ok(Self {
             docker,
@@ -487,7 +522,8 @@ impl ComposePlatform {
             .await
             .map(|_| ())
             .map_err(|error| ComposeError::DockerNotAvailable {
-                socket_path: format!("{} ({error})", self.socket_path),
+                socket_path: self.socket_path.clone(),
+                evidence: error.to_string(),
             })
     }
 
@@ -1554,5 +1590,36 @@ mod tests {
     #[test]
     fn extracts_port_mapping() {
         assert_eq!(parse_port_mapping("3000:3000"), Some((3000, 3000)));
+    }
+
+    // The direction table admits both spellings of connection-refused and
+    // establishes exactly the socket-level claim — never "the daemon is
+    // stopped" (umbrella D4: direction only where the error establishes it).
+    #[test]
+    fn connection_refused_establishes_the_socket_direction() {
+        for evidence in [
+            "connect ECONNREFUSED /var/run/docker.sock",
+            "error trying to connect: Connection refused (os error 61)",
+        ] {
+            let issue = docker_unreachable_issue("/var/run/docker.sock", evidence);
+            assert_eq!(issue.component, "Docker");
+            assert_eq!(issue.fact, "Unable to connect to Docker");
+            assert_eq!(issue.evidence, evidence, "evidence passes through verbatim");
+            assert_eq!(
+                issue.direction.as_deref(),
+                Some(
+                    "nothing accepted connections at `/var/run/docker.sock` - verify Docker is listening there"
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_error_class_establishes_no_direction() {
+        let issue = docker_unreachable_issue(
+            "/var/run/docker.sock",
+            "error trying to connect: operation timed out",
+        );
+        assert_eq!(issue.direction, None, "absent is the honest default");
     }
 }

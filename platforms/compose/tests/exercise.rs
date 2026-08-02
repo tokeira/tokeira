@@ -327,7 +327,24 @@ async fn causality_classifies_a_definition_edit_over_the_live_seam_chain() {
     );
 
     // The real plan over the edited definition, through the platform seam.
+    // This runs in whichever world hosts the test: with Docker away, the
+    // platform refuses with its typed issue instead of planning against the
+    // record (output-templates rule 1) — that IS the seam behaving, so the
+    // refusal world asserts the issue and ends here; the reachable world
+    // carries on into classification.
     let outcome = platform.infra_plan(&dir).await.unwrap();
+    if !outcome.platform_issues.is_empty() {
+        assert!(
+            outcome.changes.is_empty(),
+            "an issue-carrying outcome never plans against the record"
+        );
+        assert_eq!(outcome.platform_issues[0].component, "Docker");
+        assert_eq!(
+            outcome.platform_issues[0].fact,
+            "Unable to connect to Docker"
+        );
+        return;
+    }
 
     // The union graph, exactly as the shell assembles it.
     let mut edges: BTreeMap<ResourceId, Vec<ResourceId>> = outcome

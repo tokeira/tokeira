@@ -6,6 +6,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokeira_aws::{
     ResourceContext,
     resources::{
@@ -419,12 +420,23 @@ impl Service {
         let mut volumes: Vec<String> = self.volumes.iter().map(|v| realize_vol(v, cx)).collect();
         let mut environment: HashMap<String, String> = self.env.iter().cloned().collect();
 
-        // WART — conditional server-config mount (compose.rs L56-63), BEFORE aws.
+        // Conditional server-config mount, BEFORE aws. The manifest carries
+        // a digest of the file's bytes beside the mount: the mount alone is
+        // path-only, and a path-only manifest never changes when the
+        // operator edits `tokeirad.toml` — the running container would keep
+        // its loaded config silently. The digest makes the edit a manifest
+        // diff, so the plan states the update and the apply recreates the
+        // container onto the new content. Reading the file here is the same
+        // deployment-dir input the old existence probe was — not live state.
         if self.server_config {
             let toml = cx.deployment_dir.join("tokeirad.toml");
-            if toml.exists() {
+            if let Ok(bytes) = std::fs::read(&toml) {
                 volumes.push(format!("{}:/etc/tokeira/tokeirad.toml:ro", toml.display()));
                 environment.insert("TOKEIRA_CONFIG".into(), "/etc/tokeira/tokeirad.toml".into());
+                environment.insert(
+                    "TOKEIRA_SERVER_CONFIG_DIGEST".into(),
+                    format!("sha256:{}", hex::encode(Sha256::digest(&bytes))),
+                );
             }
         }
 

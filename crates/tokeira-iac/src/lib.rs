@@ -33,7 +33,10 @@ pub use document::{
     ImageSource, ImageState, InfraState, InfraStateStore, RuntimeState, RuntimeStateStore,
     ServiceState,
 };
-pub use engine::{Engine, PlanOutcome, RefreshCoverage, RefreshStatus, StateSaver};
+pub use engine::{
+    Engine, PlanOutcome, PlatformIssue, RefreshCoverage, RefreshStatus, StateSaver,
+    verify_resources,
+};
 pub use error::IacError;
 pub use module::{Module, ModuleContext};
 pub use semantics::{
@@ -458,6 +461,18 @@ pub trait Resource: Send + Sync {
 
     /// IDs of resources this resource depends on.
     fn dependencies(&self) -> Vec<ResourceId>;
+
+    /// Whether this kind's `describe` performs a live provider query when its
+    /// prerequisites are present. A kind whose `describe` is a stub — it can
+    /// only ever answer [`DescribeResult::Unsupported`] — declares `false`,
+    /// and definition verification refuses to admit it: updating a resource
+    /// presupposes describing it, so a plan over such a kind could never
+    /// confirm live state. Defaulted `true` because every current in-tree
+    /// kind queries its provider; a new kind stubbing `describe` MUST
+    /// override this alongside the stub.
+    fn describes(&self) -> bool {
+        true
+    }
 
     /// Module that owns this resource.
     fn module(&self) -> &str;

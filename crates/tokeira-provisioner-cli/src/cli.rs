@@ -192,12 +192,18 @@ struct RevertArgs {
 
 /// Parse the CLI and run the selected verb with `platform` supplying the
 /// resource realization. This is the per-platform binary's entire `main`.
-pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
+///
+/// The exit code is part of the output contract: a verb refused by a
+/// platform issue has already emitted the document that says everything, so
+/// that refusal becomes a bare non-zero exit — never an error line
+/// restating the report. Every other error propagates for the binary's
+/// error reporting.
+pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     // One resolution of the output contract's global flags; the collapse rule
     // (`--json` is depth-blind) is enforced inside `Mode::resolve`.
     let mode = tokeira_report::Mode::resolve(cli.json, cli.detail);
-    match cli.command {
+    let outcome: Result<()> = match cli.command {
         // Read-only: never gates, never locks.
         Command::Describe(args) => {
             describe::describe(&platform, &args.deployment_dir, cli.json, cli.detail).await
@@ -281,5 +287,12 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<()> {
             })
             .await
         }
+    };
+    match outcome {
+        Ok(()) => Ok(std::process::ExitCode::SUCCESS),
+        Err(err) => match err.downcast::<crate::PlatformBlocked>() {
+            Ok(_) => Ok(std::process::ExitCode::FAILURE),
+            Err(err) => Err(err),
+        },
     }
 }

@@ -1,13 +1,13 @@
-//! The `HostBridge` seam — the reflection Rust lacks, implemented once per `syn`
-//! platform. The interpreter core holds host values opaquely (`Value<Self::Host>`)
+//! The interpreter's host-object seam, implemented by the standard `.tkd`
+//! frontend adapter. The interpreter core holds host values opaquely (`Value<Self::Host>`)
 //! and routes *every* host operation through this trait: construct a kind,
 //! dispatch a builder verb, read a context field, unwrap the final deployment.
-//! The platform keeps its closed `HostObj` enum and method tables behind the
-//! trait, so the core names no concrete kind and needs no `Box<dyn Any>`.
+//! This keeps the parser/evaluator independent of framework handle types and
+//! needs no `Box<dyn Any>`.
 
 use crate::value::{EvalError, FieldMap, Value};
 
-/// The platform-specific host bridge. `compose` and `eks` each supply one.
+/// Opaque host operations required by the sandboxed interpreter.
 pub trait HostBridge {
     /// The platform's opaque host handle (its closed `HostObj` enum). Must be
     /// `Clone`/`Debug` because config `Value`s are cloned (retarget diff) and

@@ -1,25 +1,25 @@
-//! `tokeira-tkd` — the platform-agnostic `syn` deployment-definition interpreter.
+//! `tokeira-tkd` — the `.tkd` definition frontend and its sandboxed `syn` interpreter.
 //!
 //! Parses a `.tkd` (Rust syntax, via `syn`), enforces the interpreted subset
-//! (reject-by-default allow-list), and walks it into the platform's deployment
-//! type. It is generic over a platform-supplied [`HostBridge`]: the core holds
-//! host values opaquely and routes every host operation through the bridge, so it
-//! names no concrete kind and needs no `Box<dyn Any>`. `compose` and `eks`
-//! each implement one bridge and share this interpreter (Proposals 003/004).
+//! (reject-by-default allow-list), and drives the language-neutral
+//! [`TkdFrontend`] adapter. The interpreter remains generic over [`HostBridge`]
+//! so its runtime holds author handles opaquely; the standard bridge now lives in
+//! this crate and delegates every operation to `tokeira-platform`.
 //!
 //! The passes: [`schema`] (type/fn tables + `#[create]`/`#[require]`), [`subset`]
 //! (the allow-list), [`eval`] (the tree walk), [`admission`] (retarget + require).
-//! Only the *platform's* bridge names platform types; every module here is
-//! engine-agnostic.
+//! Platform crates supply bindings and never receive parser or runtime values.
 
 pub mod admission;
 pub mod bridge;
 pub mod eval;
+mod framework;
 pub mod schema;
 pub mod subset;
 pub mod value;
 
 pub use bridge::HostBridge;
+pub use framework::{TkdFrontend, frontend};
 pub use subset::{Diagnostic, Diagnostics};
 pub use value::{EnumPath, EvalError, FieldMap, FieldMapExt, Value, VariantBody};
 
@@ -35,9 +35,11 @@ pub fn interpret<B: HostBridge>(
     let file = syn::parse_file(src).map_err(|e| EvalError::new(located_parse_error(&e)))?;
     let (types, fns) = schema::collect(&file)?;
     subset::check(&file, bridge, &types).map_err(|d| {
+        let span = d.0.first().map(|diagnostic| diagnostic.span);
         EvalError::new(format!(
             "definition is outside the interpreted subset:\n{d}"
         ))
+        .with_optional_span(span)
     })?;
     let interp = eval::Interp {
         bridge,

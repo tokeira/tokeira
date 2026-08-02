@@ -8612,7 +8612,12 @@ name = "tokeira-tkd"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
+ "serde",
+ "serde_json",
  "syn",
+ "tokeira-iac",
+ "tokeira-orchestrator",
+ "tokeira-platform",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use syn::{Expr, Pat, punctuated::Punctuated, token::Comma};
+use syn::{Expr, Pat, punctuated::Punctuated, spanned::Spanned, token::Comma};
 
 use crate::{
     bridge::HostBridge,
@@ -150,7 +150,7 @@ impl<B: HostBridge> Interp<'_, B> {
     }
 
     fn eval_expr(&self, e: &Expr, env: &mut Env<B::Host>) -> Result<Value<B::Host>, EvalError> {
-        match e {
+        let result = match e {
             Expr::Lit(el) => eval_lit(&el.lit),
             Expr::Path(ep) => self.eval_path(&ep.path, env),
             Expr::Reference(er) => self.eval_expr(&er.expr, env),
@@ -186,7 +186,8 @@ impl<B: HostBridge> Interp<'_, B> {
                 "unsupported expression `{}`",
                 expr_kind(other)
             ))),
-        }
+        };
+        result.map_err(|error| error.at_if_missing(e.span()))
     }
 
     fn eval_path(&self, path: &syn::Path, env: &Env<B::Host>) -> Result<Value<B::Host>, EvalError> {

@@ -758,16 +758,18 @@ pub struct ReceiverSchema {
 }
 
 /// Schema for one selected provider kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KindSchema {
     /// Stable kind name.
     pub name: String,
+    /// Provider-owned default field values used by frontends for `..EMPTY` syntax.
+    pub defaults: Option<AuthorNode>,
     /// Declared output names.
     pub outputs: Vec<String>,
 }
 
 /// Discoverable, frontend-neutral authoring vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuthorSchema {
     /// Standard associated functions.
     pub associated_functions: Vec<AssociatedFunctionSchema>,

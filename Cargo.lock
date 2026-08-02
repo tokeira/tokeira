@@ -7704,6 +7704,7 @@ dependencies = [
  "tokeira-iac",
  "tokeira-local-deployment",
  "tokeira-orchestrator",
+ "tokeira-platform",
  "tokeira-provisioner",
  "tokeira-remote-workstation",
  "tokeira-state",
@@ -8447,6 +8448,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokeira-build-info",
  "tokeira-orchestrator",
+ "tokeira-platform",
  "tokeira-state",
  "tokio",
 ]

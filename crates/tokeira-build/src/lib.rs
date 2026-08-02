@@ -30,9 +30,9 @@ pub use composition::{
 pub use dagger::{ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
 pub use dagger_default::DefaultDaggerClient;
 pub use discovery::{
-    DEFINITION_FRONTEND_CONTRACT, DefinitionFrontendPackageDescriptor, DefinitionSourceExtension,
-    DiscoveryError, PLATFORM_BINDING_CONTRACT, PackageCoordinates, PlatformLaunchClass,
-    PlatformPackageDescriptor, WorkspaceDescriptors, discover_workspace_descriptors,
+    DEFINITION_FRONTEND_CONTRACT, DefinitionFrontendPackageDescriptor, DiscoveryError,
+    PLATFORM_BINDING_CONTRACT, PackageCoordinates, PlatformPackageDescriptor, WorkspaceDescriptors,
+    discover_workspace_descriptors,
 };
 pub use error::BuildError;
 pub use pipelines::{
@@ -45,4 +45,6 @@ pub use pipelines::{
 pub use snapshot::{
     SnapshotError, SnapshotRequest, SourceSnapshot, materialize_snapshot, snapshot_source_closure,
 };
+pub use tokeira_orchestrator::PlatformLaunchClass;
+pub use tokeira_platform::definition::DefinitionSourceExtension;
 pub use toolchain::rust_toolchain_version;

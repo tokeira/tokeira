@@ -176,6 +176,20 @@ open_identifier!(
     "Validated, inventory-free identity of a deployment-definition format."
 );
 
+/// Generic launch mechanism selected by trusted platform catalog metadata.
+///
+/// This vocabulary describes how `tkr` launches a platform without naming
+/// any platform. The legacy variant exists only while the out-of-scope Local
+/// platform remains in-process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlatformLaunchClass {
+    /// Launch a provisioner statically assembled with one platform and frontend.
+    BoundProvisioner,
+    /// Retained adapter for the out-of-scope Local platform.
+    LegacyInProcess,
+}
+
 /// Legacy closed platform vocabulary retained only for the not-yet-migrated Local launch path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

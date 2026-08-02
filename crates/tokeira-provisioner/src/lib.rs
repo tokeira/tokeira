@@ -28,6 +28,7 @@ pub mod binary_store;
 pub mod binding;
 pub mod bundle;
 pub mod bundle_store;
+pub mod catalog;
 pub mod identity;
 pub mod integrity;
 pub mod migration;
@@ -41,6 +42,10 @@ pub use bundle::{
     BuildManifest, ProvisionerBundle, TestEvidence,
 };
 pub use bundle_store::{BundleStore, BundleStoreError, ResolvedBundle};
+pub use catalog::{
+    PublishedDefinitionFrontendDescriptor, PublishedPlatformDescriptor,
+    PublishedProvisionerCatalog, PublishedProvisionerLocator,
+};
 pub use identity::{AuthorityTier, BuildAuthority, BuildProfile, EngineIdentity};
 pub use integrity::{ChecksumFormatError, IntegrityError, Sha256Digest, sha256_hex};
 pub use migration::{MigrationError, MigrationRegistry, envelope_migrations};

@@ -19,7 +19,8 @@ use tokeira_compose::{ComposeError, ComposePlatform};
 use tokeira_iac::{ModuleSelection, PlanOutcome, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_provisioner_cli::{
-    AppliedOutcome, ChangeLogEntry, ProvisionerPlatform, Realization, change_log_entries,
+    AppliedOutcome, ChangeLogEntry, ConfigSource, ProvisionerPlatform, Realization,
+    change_log_entries,
 };
 
 use crate::{
@@ -53,8 +54,12 @@ impl ProvisionerPlatform for ComposeProvisioner {
         "compose"
     }
 
-    fn config_basename(&self, _deployment_dir: &Path) -> &'static str {
-        TKD_FILE
+    fn config_source(&self, _deployment_dir: &Path) -> Result<ConfigSource> {
+        ConfigSource::definition("tkd", TKD_FILE)
+    }
+
+    fn definition_format(&self) -> Option<&'static str> {
+        Some("tkd")
     }
 
     fn deployment_id(&self, deployment_dir: &Path) -> Result<String> {

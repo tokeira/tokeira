@@ -39,7 +39,9 @@ use directories::ProjectDirs;
 use tokeira_compose_deployment::ComposeConfig;
 use tokeira_ecs_deployment::EcsConfig;
 use tokeira_local_deployment::LocalConfig;
-use tokeira_orchestrator::{PlatformKind, StorageKind};
+use tokeira_orchestrator::{DefinitionFormatId, PlatformKind, PlatformLaunchClass, StorageKind};
+use tokeira_platform::definition::RelativeDefinitionPath;
+use tokeira_provisioner::RecordedDefinition;
 use uuid::Uuid;
 
 use crate::metadata::{self, DeploymentMetadata, DeploymentStatus};
@@ -58,6 +60,76 @@ pub(crate) const PROVISIONER_BIN: &str = "tkp";
 /// target of `platforms/compose` (all forwarded deployments are compose
 /// today; the constructed binary is `tkp`, never `tkp-<platform>`).
 pub(crate) const PROVISIONER_SOURCE_BIN: &str = "tkp";
+
+/// External definition source selected before deployment staging begins.
+#[derive(Debug, Clone)]
+pub(crate) struct DefinitionSeed {
+    pub(crate) definition: RecordedDefinition,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// Incomplete deployment held away from its final name until every staged
+/// artifact and definition check succeeds.
+#[derive(Debug)]
+pub(crate) struct PendingDeployment {
+    final_path: PathBuf,
+    staging_path: PathBuf,
+    latest_path: PathBuf,
+    metadata: DeploymentMetadata,
+    published: bool,
+}
+
+impl PendingDeployment {
+    pub(crate) fn path(&self) -> &Path {
+        &self.staging_path
+    }
+
+    pub(crate) fn metadata(&self) -> &DeploymentMetadata {
+        &self.metadata
+    }
+
+    /// Publish the complete directory, then atomically replace `.latest`.
+    /// If targeting publication fails, the just-published directory is
+    /// removed so callers never observe a half-created deployment.
+    pub(crate) fn publish(mut self) -> Result<DeploymentMetadata> {
+        fs::rename(&self.staging_path, &self.final_path).with_context(|| {
+            format!(
+                "failed to publish staged deployment {} as {}",
+                self.staging_path.display(),
+                self.final_path.display()
+            )
+        })?;
+
+        let latest_tmp = self
+            .latest_path
+            .with_extension(format!("latest-{}", Uuid::new_v4().simple()));
+        let latest_result = fs::write(&latest_tmp, &self.metadata.name)
+            .and_then(|()| fs::rename(&latest_tmp, &self.latest_path));
+        if let Err(error) = latest_result {
+            let _ = fs::remove_file(&latest_tmp);
+            let rollback = fs::remove_dir_all(&self.final_path);
+            if let Err(rollback) = rollback {
+                return Err(anyhow!(
+                    "failed to publish {}: {error}; rollback of {} also failed: {rollback}",
+                    self.latest_path.display(),
+                    self.final_path.display()
+                ));
+            }
+            return Err(error)
+                .with_context(|| format!("failed to publish {}", self.latest_path.display()));
+        }
+        self.published = true;
+        Ok(self.metadata.clone())
+    }
+}
+
+impl Drop for PendingDeployment {
+    fn drop(&mut self) {
+        if !self.published && self.staging_path.is_dir() {
+            let _ = fs::remove_dir_all(&self.staging_path);
+        }
+    }
+}
 
 /// Resolves deployment names to on-disk paths and mediates the `.latest`
 /// selection sentinel.
@@ -140,11 +212,20 @@ impl DeploymentResolver {
         Ok(path)
     }
 
-    /// Whether the resolved deployment is a **`.tkd`/forwarded** deployment —
-    /// provisioned by the bound `tkp`, not the legacy in-process engine. Detected
-    /// by the presence of `definition.tkd`, mirroring `tkp`'s own `platform::detect`.
-    pub(crate) fn is_forwarded(&self, requested: Option<&str>) -> Result<bool> {
-        Ok(self.resolve_dir(requested)?.join(DEFINITION_TKD).exists())
+    /// Whether the resolved deployment uses its bound provisioner.
+    ///
+    /// Routing is admitted metadata, never inferred from source-file presence.
+    pub(crate) fn uses_bound_provisioner(&self, requested: Option<&str>) -> Result<bool> {
+        let path = self.resolve_dir(requested)?;
+        let metadata = metadata::read(&path)?;
+        match metadata.launch_class {
+            Some(PlatformLaunchClass::BoundProvisioner) => Ok(true),
+            Some(PlatformLaunchClass::LegacyInProcess) => Ok(false),
+            None => bail!(
+                "deployment '{}' predates recorded launch-class metadata; recreate or migrate it before running lifecycle commands",
+                metadata.name
+            ),
+        }
     }
 
     /// Introduce the deployment's bound provisioner — copy `tkp` into `<name>/` so
@@ -185,14 +266,14 @@ impl DeploymentResolver {
         ))
     }
 
-    pub(crate) fn place_provisioner(&self, name: &str) -> Result<()> {
+    pub(crate) fn place_provisioner_at(&self, deployment_dir: &Path) -> Result<()> {
         // Resolution is labeled: placement is a provenance event, and the
         // operator report says which leg supplied the bytes and from where.
         let (source, how) = Self::resolve_provisioner_source()?;
         let bytes =
             fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
         let sha256 = tokeira_provisioner::sha256_hex(&bytes);
-        let dest = self.path(name).join(PROVISIONER_BIN);
+        let dest = deployment_dir.join(PROVISIONER_BIN);
         fs::write(&dest, &bytes).with_context(|| format!("failed to place {}", dest.display()))?;
         #[cfg(unix)]
         {
@@ -258,24 +339,47 @@ impl DeploymentResolver {
         Ok(artifact)
     }
 
-    /// Create a fresh deployment: writes the two TOML files, the metadata
-    /// JSON, an empty `state/` subdir, and flips `.latest` to the new name.
-    ///
-    /// Fails fast if a directory with the same normalised name already
-    /// exists so we never silently clobber operator state.
-    pub(crate) fn create(
+    /// Stage a complete deployment away from its operator-visible final path.
+    pub(crate) fn begin_create(
         &self,
         name: &str,
         platform: PlatformKind,
         storage: StorageKind,
         region: Option<String>,
-    ) -> Result<DeploymentMetadata> {
+        definition_seed: Option<DefinitionSeed>,
+    ) -> Result<PendingDeployment> {
         let name = normalize_name(name);
-        let path = self.path(&name);
-        if path.exists() {
-            bail!("deployment '{name}' already exists at {}", path.display());
+        let final_path = self.path(&name);
+        if final_path.exists() {
+            bail!(
+                "deployment '{name}' already exists at {}",
+                final_path.display()
+            );
         }
+        fs::create_dir_all(&self.root)?;
+        let path = self
+            .root
+            .join(format!(".{name}.create-{}", Uuid::new_v4().simple()));
+        let mut pending = PendingDeployment {
+            final_path,
+            staging_path: path.clone(),
+            latest_path: self.latest_path(),
+            metadata: DeploymentMetadata {
+                name: String::new(),
+                id: Uuid::nil(),
+                platform,
+                launch_class: None,
+                definition: None,
+                storage,
+                status: DeploymentStatus::Created,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            published: false,
+        };
         fs::create_dir_all(path.join("state"))?;
+
+        let recorded_definition = definition_seed.as_ref().map(|seed| seed.definition.clone());
         match platform {
             // The compose platform is `.tkd`-defined and provisioned by a
             // forwarded compose `tkp`: seed its definition (storage/region baked
@@ -283,10 +387,15 @@ impl DeploymentResolver {
             // edit before the first apply (writeback-updated at apply). No legacy
             // in-process `deployment.toml`.
             PlatformKind::Compose => {
-                fs::write(
-                    path.join(DEFINITION_TKD),
-                    crate::prototypical::compose_definition(storage, region.as_deref())?,
-                )?;
+                let seed = definition_seed.ok_or_else(|| {
+                    anyhow!("the Compose deployment requires an external definition seed")
+                })?;
+                let definition_path = path.join(seed.definition.path.as_path());
+                let definition_parent = definition_path
+                    .parent()
+                    .expect("a deployment-relative definition has a parent");
+                fs::create_dir_all(definition_parent)?;
+                fs::write(definition_path, seed.bytes)?;
                 fs::write(
                     path.join(TOKEIRAD_TOML),
                     crate::prototypical::server_config(platform, storage, region.as_deref())?,
@@ -309,15 +418,39 @@ impl DeploymentResolver {
             name: name.clone(),
             id: Uuid::new_v4(),
             platform,
+            launch_class: Some(match platform {
+                PlatformKind::Compose => PlatformLaunchClass::BoundProvisioner,
+                PlatformKind::Local | PlatformKind::Ecs => PlatformLaunchClass::LegacyInProcess,
+            }),
+            definition: recorded_definition,
             storage,
             status: DeploymentStatus::Created,
             created_at: now.clone(),
             updated_at: now,
         };
         metadata::write(&path, &metadata)?;
-        fs::create_dir_all(&self.root)?;
-        fs::write(self.latest_path(), &name)?;
-        Ok(metadata)
+        pending.metadata = metadata;
+        Ok(pending)
+    }
+
+    /// Transitional convenience used by legacy call sites and tests.
+    /// Bound creation commands use [`begin_create`](Self::begin_create) so
+    /// the provisioner and its validation join the same transaction.
+    #[cfg(test)]
+    pub(crate) fn create(
+        &self,
+        name: &str,
+        platform: PlatformKind,
+        storage: StorageKind,
+        region: Option<String>,
+    ) -> Result<DeploymentMetadata> {
+        let seed = if platform == PlatformKind::Compose {
+            Some(compose_definition_seed(storage, region.as_deref())?)
+        } else {
+            None
+        };
+        self.begin_create(name, platform, storage, region, seed)?
+            .publish()
     }
 
     pub(crate) fn list(&self) -> Result<Vec<DeploymentMetadata>> {
@@ -400,6 +533,35 @@ impl DeploymentResolver {
     }
 }
 
+/// Resolve the current workspace's Compose seed as an ordinary artifact.
+/// Installed operation retains the existing embedded fallback until the
+/// admitted published-seed transport completes task 10.3.
+pub(crate) fn compose_definition_seed(
+    storage: StorageKind,
+    region: Option<&str>,
+) -> Result<DefinitionSeed> {
+    let cwd = std::env::current_dir().context("cannot determine the current directory")?;
+    let source = match crate::bundle_create::workspace_root_from(&cwd) {
+        Ok(workspace) => {
+            let seed_path = workspace.join("platforms/compose/definition.tkd");
+            fs::read_to_string(&seed_path).with_context(|| {
+                format!("failed to read definition seed {}", seed_path.display())
+            })?
+        }
+        Err(_) => tokeira_compose_deployment::DEFAULT_TKD.to_string(),
+    };
+    let source = crate::prototypical::compose_definition(&source, storage, region)?;
+    Ok(DefinitionSeed {
+        definition: RecordedDefinition {
+            format: DefinitionFormatId::new("tkd")
+                .expect("the built-in tkd format id is canonical"),
+            path: RelativeDefinitionPath::new(DEFINITION_TKD)
+                .expect("the built-in definition path is safe"),
+        },
+        bytes: source.into_bytes(),
+    })
+}
+
 /// Platform-specific config loaded from deployment.toml.
 ///
 /// Each variant carries the fully parsed config for that platform so
@@ -449,9 +611,14 @@ pub(crate) fn load_context(
     // file" for a file the deployment was never meant to have. (Which
     // operational verbs the forwarded surface grows is a design decision, not
     // this error's business — the message states the contract, not a roadmap.)
-    if !deployment_config_path.exists() && path.join(DEFINITION_TKD).exists() {
+    if metadata.launch_class == Some(PlatformLaunchClass::BoundProvisioner) {
+        let definition = metadata
+            .definition
+            .as_ref()
+            .map(|definition| definition.path.as_str())
+            .unwrap_or("recorded definition");
         bail!(
-            "deployment '{name}' is defined by `{DEFINITION_TKD}` and operated through its bound \
+            "deployment '{name}' is defined by `{definition}` and operated through its bound \
              `{PROVISIONER_BIN}`; this command drives in-process (`{DEPLOYMENT_TOML}`) platforms"
         );
     }

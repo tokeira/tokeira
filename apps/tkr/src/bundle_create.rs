@@ -6,7 +6,7 @@
 //! Dagger build, published back) → retain it in the deployment → place
 //! `tkp` and the manifest sidecar** that `tkp init` records as the Day-0
 //! stamp after verifying itself against it. The Phase-0 native copy
-//! ([`place_provisioner`](crate::deployment_dir::DeploymentResolver::place_provisioner))
+//! ([`place_provisioner_at`](crate::deployment_dir::DeploymentResolver::place_provisioner_at))
 //! stays the default — the dev loop never pays a hermetic build.
 //!
 //! The CAS lives under the deployments root (`.bundle-cas/`, a
@@ -35,9 +35,9 @@ const SEED_PACKAGE: &str = "tokeira-compose-deployment";
 /// Obtain a verified bundle for the host target and marry it to the
 /// deployment: `<deployment>/tkp` + the manifest sidecar, with the bytes
 /// retained under the deployment's state for self-contained rollback.
-pub(crate) async fn place_bundle_provisioner(
+pub(crate) async fn place_bundle_provisioner_at(
     deployments: &DeploymentResolver,
-    name: &str,
+    deployment_dir: &std::path::Path,
     build_image: &str,
 ) -> Result<()> {
     // The bundle path builds from source: it needs the workspace and a
@@ -88,7 +88,6 @@ pub(crate) async fn place_bundle_provisioner(
 
     // Retain under the deployment's own state (self-contained rollback,
     // Proposal 002/005), and record where in the manifest we place.
-    let deployment_dir = deployments.path(name);
     let retention = BinaryStore::new(
         Box::new(LocalBackend::new(deployment_dir.join("state"))),
         "binaries",

@@ -63,7 +63,8 @@ pub(crate) async fn init<P: ProvisionerPlatform>(
         .await
         .context("failed to write the Day-0 stamp")?;
     // Retain the Day-0 config source as revision 0 so it is revertable (task 14.3).
-    config_history::snapshot(deployment_dir, platform.config_basename(deployment_dir), 0)
+    let config_source = platform.config_source(deployment_dir)?;
+    config_history::snapshot(deployment_dir, &config_source, 0)
         .context("failed to retain the Day-0 config revision")?;
 
     println!(

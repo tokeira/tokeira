@@ -12,7 +12,8 @@ use anyhow::{Context, Result};
 use tokeira_iac::{ModuleSelection, PlanOutcome, ResourceId};
 use tokeira_orchestrator::InfraEngine;
 use tokeira_provisioner_cli::{
-    AppliedOutcome, ChangeLogEntry, ProvisionerPlatform, Realization, change_log_entries,
+    AppliedOutcome, ChangeLogEntry, ConfigSource, ProvisionerPlatform, Realization,
+    change_log_entries,
 };
 
 use crate::{LocalConfig, LocalDeployment};
@@ -26,8 +27,8 @@ impl ProvisionerPlatform for LocalPlatform {
         "local"
     }
 
-    fn config_basename(&self, _deployment_dir: &Path) -> &'static str {
-        "deployment.toml"
+    fn config_source(&self, _deployment_dir: &Path) -> Result<ConfigSource> {
+        ConfigSource::legacy("deployment.toml")
     }
 
     fn deployment_id(&self, deployment_dir: &Path) -> Result<String> {

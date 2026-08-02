@@ -64,12 +64,8 @@ pub(crate) async fn scale<P: ProvisionerPlatform>(
 
     // ── Re-stamp: a capacity change is a config revision ──
     let from_revision = envelope.config_revision;
-    restamp_applied_revision(
-        &mut envelope,
-        running,
-        deployment_dir,
-        platform.config_basename(deployment_dir),
-    )?;
+    let config_source = platform.config_source(deployment_dir)?;
+    restamp_applied_revision(&mut envelope, running, deployment_dir, &config_source)?;
     envelope.stamp_current_schema();
     store
         .save(&envelope, &version)

@@ -166,14 +166,16 @@ pub(crate) enum DevAction {
 pub(crate) enum DefinitionAction {
     /// Check a definition: parse + interpret it in memory — no providers
     /// touched, nothing changes. Checks the selected deployment's
-    /// `definition.tkd` (or `--deployment <name>`'s); `--path` checks a
-    /// definition anywhere on disk instead — a `.tkd` file, or a directory
-    /// holding a `definition.tkd`.
+    /// recorded definition (or `--deployment <name>`'s); `--definition`
+    /// checks a source anywhere on disk through an explicit frontend format.
     Check {
         /// Check the definition at this path instead of a deployment's:
         /// authoring mode — the definition needs no deployment to exist yet.
-        #[arg(long)]
-        path: Option<std::path::PathBuf>,
+        #[arg(long, alias = "path")]
+        definition: Option<std::path::PathBuf>,
+        /// Definition format resolved through the trusted frontend catalog.
+        #[arg(long, requires = "definition")]
+        format: Option<tokeira_orchestrator::DefinitionFormatId>,
     },
 }
 

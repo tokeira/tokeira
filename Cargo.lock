@@ -8451,6 +8451,7 @@ dependencies = [
  "tokeira-platform",
  "tokeira-state",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -8468,6 +8469,8 @@ dependencies = [
  "tokeira-build-info",
  "tokeira-explain",
  "tokeira-iac",
+ "tokeira-orchestrator",
+ "tokeira-platform",
  "tokeira-provisioner",
  "tokeira-report",
  "tokeira-state",

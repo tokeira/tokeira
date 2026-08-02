@@ -59,7 +59,7 @@ pub trait Module: Debug + Send + Sync {
     /// These are module names from [`name`](Self::name), not resource IDs. The
     /// engine uses them to order module expansion before it evaluates resource
     /// dependencies.
-    fn dependencies(&self) -> &[&str];
+    fn dependencies(&self) -> Vec<&str>;
 
     /// Enumerate desired resources for this module.
     ///

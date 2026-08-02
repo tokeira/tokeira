@@ -33,8 +33,8 @@ impl Module for ServicesModule {
         "services"
     }
 
-    fn dependencies(&self) -> &[&str] {
-        &["observability"]
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["observability"]
     }
 
     fn resources(&self, _ctx: &ModuleContext) -> Result<Vec<Box<dyn Resource>>, IacError> {

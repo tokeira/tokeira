@@ -25,12 +25,158 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac as iac;
 use tokeira_state::{DeploymentStore, StateError};
 
+/// Why a platform or definition-format identifier is not canonical lower-kebab case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentifierProblem {
+    /// The identifier contains no characters.
+    Empty,
+    /// The identifier begins or ends with a hyphen.
+    EdgeHyphen,
+    /// The identifier contains adjacent hyphens.
+    RepeatedHyphen,
+    /// The identifier contains a character outside lowercase ASCII letters, digits, and hyphens.
+    InvalidCharacter,
+}
+
+impl std::fmt::Display for IdentifierProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "it is empty",
+            Self::EdgeHyphen => "it begins or ends with '-'",
+            Self::RepeatedHyphen => "it contains adjacent '-' characters",
+            Self::InvalidCharacter => {
+                "it contains a character other than lowercase ASCII letters, digits, or '-'"
+            }
+        })
+    }
+}
+
+/// Error returned when an open platform or definition-format identifier is invalid.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid {kind} identifier `{value}`: {problem}; use canonical lower-kebab case")]
+pub struct IdentifierError {
+    kind: &'static str,
+    value: String,
+    problem: IdentifierProblem,
+}
+
+impl IdentifierError {
+    /// The vocabulary in which validation failed.
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    /// The rejected identifier.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// The precise canonicalization rule that was violated.
+    pub fn problem(&self) -> IdentifierProblem {
+        self.problem
+    }
+}
+
+fn validate_identifier(
+    kind: &'static str,
+    value: String,
+) -> std::result::Result<String, IdentifierError> {
+    let problem = if value.is_empty() {
+        Some(IdentifierProblem::Empty)
+    } else if value.starts_with('-') || value.ends_with('-') {
+        Some(IdentifierProblem::EdgeHyphen)
+    } else if value.contains("--") {
+        Some(IdentifierProblem::RepeatedHyphen)
+    } else if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        Some(IdentifierProblem::InvalidCharacter)
+    } else {
+        None
+    };
+
+    match problem {
+        Some(problem) => Err(IdentifierError {
+            kind,
+            value,
+            problem,
+        }),
+        None => Ok(value),
+    }
+}
+
+macro_rules! open_identifier {
+    ($name:ident, $kind:literal, $docs:literal) => {
+        #[doc = $docs]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            /// Validate and construct an identifier.
+            pub fn new(value: impl Into<String>) -> std::result::Result<Self, IdentifierError> {
+                validate_identifier($kind, value.into()).map(Self)
+            }
+
+            /// Borrow the canonical identifier text.
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = IdentifierError;
+
+            fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = IdentifierError;
+
+            fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+open_identifier!(
+    PlatformId,
+    "platform",
+    "Validated, inventory-free identity of a deployment platform."
+);
+open_identifier!(
+    DefinitionFormatId,
+    "definition format",
+    "Validated, inventory-free identity of a deployment-definition format."
+);
+
+/// Legacy closed platform vocabulary retained only for the not-yet-migrated Local launch path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlatformKind {
@@ -557,8 +703,49 @@ impl<D: Deployment> DeployEngine<D> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use proptest::prelude::*;
     use std::sync::{Arc, Mutex};
     use tokeira_state::{CasStore, LocalBackend, StateBackend, StateError};
+
+    proptest! {
+        #[test]
+        fn open_identifiers_round_trip_canonical_segments(
+            segments in prop::collection::vec("[a-z0-9]+", 1..6),
+        ) {
+            let value = segments.join("-");
+            let platform = PlatformId::new(value.clone()).expect("generated id is canonical");
+            let format = DefinitionFormatId::new(value.clone()).expect("generated id is canonical");
+
+            prop_assert_eq!(
+                serde_json::from_str::<PlatformId>(&serde_json::to_string(&platform).expect("serialize"))
+                    .expect("deserialize"),
+                platform,
+            );
+            prop_assert_eq!(
+                serde_json::from_str::<DefinitionFormatId>(
+                    &serde_json::to_string(&format).expect("serialize")
+                ).expect("deserialize"),
+                format,
+            );
+        }
+    }
+
+    #[test]
+    fn open_identifiers_reject_non_canonical_text_during_deserialization() {
+        for value in [
+            "",
+            "Compose",
+            "-compose",
+            "compose-",
+            "ecs--blue",
+            "eks_blue",
+        ] {
+            let encoded = serde_json::to_string(value).expect("serialize test string");
+            let error = serde_json::from_str::<PlatformId>(&encoded)
+                .expect_err("non-canonical platform id must be rejected");
+            assert!(error.to_string().contains("canonical lower-kebab case"));
+        }
+    }
 
     #[derive(Clone)]
     struct TestConfig;
@@ -641,8 +828,8 @@ mod tests {
             self.0
         }
 
-        fn dependencies(&self) -> &[&str] {
-            &[]
+        fn dependencies(&self) -> Vec<&str> {
+            Vec::new()
         }
 
         fn resources(
@@ -664,8 +851,8 @@ mod tests {
             self.name
         }
 
-        fn dependencies(&self) -> &[&str] {
-            &[]
+        fn dependencies(&self) -> Vec<&str> {
+            Vec::new()
         }
 
         fn resources(
@@ -718,8 +905,8 @@ mod tests {
             "module"
         }
 
-        fn dependencies(&self) -> &[&str] {
-            &[]
+        fn dependencies(&self) -> Vec<&str> {
+            Vec::new()
         }
 
         fn manifests(
@@ -924,8 +1111,8 @@ mod tests {
             "three"
         }
 
-        fn dependencies(&self) -> &[&str] {
-            &[]
+        fn dependencies(&self) -> Vec<&str> {
+            Vec::new()
         }
 
         fn resources(

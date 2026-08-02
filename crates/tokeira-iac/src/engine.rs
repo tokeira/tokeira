@@ -1483,8 +1483,8 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        fn dependencies(&self) -> &[&str] {
-            self.deps
+        fn dependencies(&self) -> Vec<&str> {
+            self.deps.to_vec()
         }
         fn resources(
             &self,
@@ -2192,8 +2192,8 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        fn dependencies(&self) -> &[&str] {
-            &[]
+        fn dependencies(&self) -> Vec<&str> {
+            Vec::new()
         }
         fn resources(
             &self,

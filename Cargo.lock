@@ -8351,6 +8351,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",
@@ -8360,6 +8361,24 @@ dependencies = [
  "tokeira-iac",
  "tokeira-state",
  "tokio",
+]
+
+[[package]]
+name = "tokeira-platform"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokeira-deploy-engine",
+ "tokeira-iac",
+ "tokeira-orchestrator",
+ "tokeira-state",
+ "uuid",
 ]
 
 [[package]]

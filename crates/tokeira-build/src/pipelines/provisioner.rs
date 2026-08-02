@@ -178,6 +178,7 @@ pub fn build_provisioner(
 
     Ok(ProvisionerBundle {
         identity,
+        bound: None,
         authority: request.authority.clone(),
         provisioner_version: request.version.clone(),
         artifacts,

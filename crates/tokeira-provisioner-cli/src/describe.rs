@@ -622,6 +622,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bundle = ProvisionerBundle {
             identity: identity.clone(),
+            bound: None,
             authority: tokeira_provisioner::BuildAuthority::LocalDeveloper,
             provisioner_version: "1.0.0".into(),
             artifacts: vec![],

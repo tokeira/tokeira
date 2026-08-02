@@ -8446,6 +8446,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokeira-build-info",
+ "tokeira-orchestrator",
  "tokeira-state",
  "tokio",
 ]

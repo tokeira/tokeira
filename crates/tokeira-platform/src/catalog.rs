@@ -180,6 +180,15 @@ impl KindSet {
             .flat_map(|catalog| catalog.entries)
             .map(|registration| KindSchema {
                 name: registration.name.to_string(),
+                defaults: registration.defaults.map(|defaults| {
+                    AuthorNode::new(crate::author::AuthorValue::Struct {
+                        name: registration.name.to_string(),
+                        fields: defaults()
+                            .into_iter()
+                            .map(|(name, value)| (name, json_to_author_node(value)))
+                            .collect(),
+                    })
+                }),
                 outputs: registration
                     .declared_outputs
                     .iter()
@@ -219,6 +228,39 @@ impl KindSet {
         }
         Ok(())
     }
+}
+
+fn json_to_author_node(value: serde_json::Value) -> AuthorNode {
+    use crate::author::AuthorValue;
+
+    let value = match value {
+        serde_json::Value::Null => AuthorValue::Option(None),
+        serde_json::Value::Bool(value) => AuthorValue::Bool(value),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                AuthorValue::Integer(i128::from(value))
+            } else if let Some(value) = value.as_u64() {
+                AuthorValue::Integer(i128::from(value))
+            } else {
+                AuthorValue::Float(
+                    value
+                        .as_f64()
+                        .expect("a serde_json number is representable as i64, u64, or f64"),
+                )
+            }
+        }
+        serde_json::Value::String(value) => AuthorValue::String(value),
+        serde_json::Value::Array(values) => {
+            AuthorValue::Sequence(values.into_iter().map(json_to_author_node).collect())
+        }
+        serde_json::Value::Object(fields) => AuthorValue::Map(
+            fields
+                .into_iter()
+                .map(|(name, value)| (AuthorNode::string(name), json_to_author_node(value)))
+                .collect(),
+        ),
+    };
+    AuthorNode::new(value)
 }
 
 /// Desired image selected by a platform service.

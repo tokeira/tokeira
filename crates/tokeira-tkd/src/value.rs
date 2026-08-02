@@ -179,6 +179,22 @@ impl EvalError {
             span: Some(span),
         }
     }
+
+    /// Attach an evaluator span only when a lower layer did not locate the failure.
+    pub fn at_if_missing(mut self, span: proc_macro2::Span) -> Self {
+        if self.span.is_none() {
+            self.span = Some(span);
+        }
+        self
+    }
+
+    /// Attach an optional parser/checker span without discarding an existing location.
+    pub fn with_optional_span(mut self, span: Option<proc_macro2::Span>) -> Self {
+        if self.span.is_none() {
+            self.span = span;
+        }
+        self
+    }
 }
 
 impl std::fmt::Display for EvalError {

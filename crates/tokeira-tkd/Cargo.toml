@@ -7,7 +7,15 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[package.metadata.tokeira.definition-frontend]
+format = "tkd"
+frontend-contract = 1
+source-extension = "tkd"
+default-relative-path = "definition.tkd"
+
 [dependencies]
+tokeira-orchestrator = { path = "../tokeira-orchestrator" }
+tokeira-platform.workspace = true
 # The `.tkd` interpreter front-end: `syn` parses the definition (Rust syntax),
 # the interpreter walks it. `full` is mandatory — default features are
 # derive-input-only and lack ItemFn/Block/Stmt/statement-Expr nodes. We parse +
@@ -17,6 +25,11 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 # `span-locations` gives parse errors a line/column on stable — an operator
 # fixing a 200-line definition needs "line 112", not just "expected `,`".
 proc-macro2 = { version = "1", features = ["span-locations"] }
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokeira-iac.workspace = true
 
 [lints]
 workspace = true

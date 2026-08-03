@@ -379,7 +379,7 @@ fn forwarded_deploy_verb(action: &DeployAction) -> (&'static [&'static str], Vec
 
 /// Re-spell a requested explanation-artifact path for a forwarded `tkp`
 /// invocation. The path crosses as given: `tkp` owns the write and the
-/// failure report (evidence-model Req 7.6).
+/// failure report (operator-explanation Req 3.1).
 fn explanation_flag(explanation: Option<&std::path::Path>) -> Vec<String> {
     explanation
         .map(|path| vec!["--explanation".to_string(), path.display().to_string()])
@@ -683,7 +683,7 @@ mod tests {
     }
 
     // The explanation-artifact path crosses the forwarding boundary verbatim
-    // (evidence-model Req 7.1): `tkp` owns the write and the failure report,
+    // (operator-explanation Req 3.1): `tkp` owns the write and the failure report,
     // so the token mapping is the whole of `tkr`'s responsibility here.
     #[test]
     fn forwarding_carries_the_explanation_path() {

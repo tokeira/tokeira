@@ -1,4 +1,4 @@
-//! Causality properties (explanation-causality Phases 4–5) plus the named
+//! Causality properties (operator-explanation §Causality) plus the named
 //! example scenarios. The load-bearing test is Property 2: the shipping
 //! classifier is checked against an independent, table-literal oracle of the
 //! requirements' algebra (A1–A10 with A3b), so the implementation is verified
@@ -395,7 +395,7 @@ fn verdict_of(cause: &Confidence<Cause>) -> Verdict {
 // ── Properties ───────────────────────────────────────────────────────────
 
 proptest! {
-    // Feature: explanation-causality, Property 2 — the algebra is followed
+    // Feature: operator-explanation §Causality, Property 2 — the algebra is followed
     // exactly: the classifier equals the table-literal oracle on every
     // generated tuple, including precedence collisions.
     #[test]
@@ -414,7 +414,7 @@ proptest! {
         }
     }
 
-    // Feature: explanation-causality, Property 1 — assessment is total and
+    // Feature: operator-explanation §Causality, Property 1 — assessment is total and
     // unique: every non-NoChange change is assessed (a known cause, or an
     // uncertainty naming it), and no NoChange change carries either.
     #[test]
@@ -437,7 +437,7 @@ proptest! {
         }
     }
 
-    // Feature: explanation-causality, Property 3 — classification is
+    // Feature: operator-explanation §Causality, Property 3 — classification is
     // deterministic and pure: two applications from one input serialize
     // byte-identically.
     #[test]
@@ -453,7 +453,7 @@ proptest! {
         );
     }
 
-    // Feature: explanation-causality, Property 4 — no drift claim without a
+    // Feature: operator-explanation §Causality, Property 4 — no drift claim without a
     // confirmed live read: unconfirmed or unexamined L never classifies
     // ProviderDrift or EngineAdvance, and an uncertainty exists for it.
     #[test]
@@ -478,7 +478,7 @@ proptest! {
         }
     }
 
-    // Feature: explanation-causality, Property 10 — unknown causes and
+    // Feature: operator-explanation §Causality, Property 10 — unknown causes and
     // cause-undecidable uncertainties correspond one-to-one; the plan-level
     // BaselineUnavailable exists exactly when a retained baseline is missing
     // or broken.
@@ -503,7 +503,7 @@ proptest! {
         prop_assert_eq!(baseline_unavailable, expected);
     }
 
-    // Feature: explanation-causality, Property 8 — groups partition the
+    // Feature: operator-explanation §Causality, Property 8 — groups partition the
     // non-NoChange changes under bounded ultimate roots: every such change
     // in exactly one group, no group empty, and no group rooted at a cascade
     // (the walk always terminates at a non-cascade cause's root).
@@ -539,7 +539,7 @@ proptest! {
         prop_assert_eq!(seen, expected, "groups do not partition the changes");
     }
 
-    // Feature: explanation-causality, Property 9 — dependants are the
+    // Feature: operator-explanation §Causality, Property 9 — dependants are the
     // reverse edges of the union graph, exactly: no heuristics, no misses.
     #[test]
     fn property_9_dependants_are_the_reverse_graph(world in arb_world()) {
@@ -642,7 +642,7 @@ fn beta_cause(explanation: &DeploymentExplanation) -> Confidence<Cause> {
         .clone()
 }
 
-// Feature: explanation-causality, Property 6 — output tracing rides identity
+// Feature: operator-explanation §Causality, Property 6 — output tracing rides identity
 // and the state diff, or does not fire at all.
 #[test]
 fn property_6_trace_fires_only_through_identity_and_state_diff() {
@@ -920,7 +920,7 @@ fn a_transitive_cascade_is_one_story() {
     assert_eq!(order, vec!["m/alpha", "m/beta", "m/gamma"]);
 }
 
-// Feature: explanation-causality, Property 5 (S-isolation), explain-side
+// Feature: operator-explanation §Causality, Property 5 (S-isolation), explain-side
 // half: the same scenario classifies drift with S from the store and would
 // classify clean with S contaminated by the live overwrite — the exact
 // reclassification hazard Requirement 2.3 exists to prevent. (The

@@ -273,10 +273,15 @@ impl RealizedResources {
 
 impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
     /// Realize the verified set once with real invocation identity and placement.
+    /// `definition_dir` names where the interpreted source was read from —
+    /// the deployment root for a working realization, a retained revision
+    /// folder for a baseline — so kinds resolve desired-source companions
+    /// against the source set actually being realized.
     pub fn realize(
         &self,
         deployment_id: &str,
         deployment_dir: &std::path::Path,
+        definition_dir: &std::path::Path,
         tags: &BTreeMap<String, String>,
     ) -> Result<RealizedResources, ProjectionError> {
         let nodes = self.definition.graph.resources();
@@ -325,6 +330,7 @@ impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
             let placement = PlacementContext {
                 deployment_id: deployment_id.to_string(),
                 deployment_dir: deployment_dir.to_path_buf(),
+                definition_dir: definition_dir.to_path_buf(),
                 module: node.module().to_string(),
                 logical_id: node.logical_id().to_string(),
                 dependencies,

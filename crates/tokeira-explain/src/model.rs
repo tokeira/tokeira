@@ -1,5 +1,5 @@
 //! The explanation model's types, mirroring the field policy in
-//! `.kiro/specs/explanation-evidence-model/requirements.md`: every field
+//! `.kiro/specs/operator-explanation/requirements.md`: every field
 //! names its source of truth there, and its documented fallback when the
 //! source cannot supply it. No field is silently omitted — the policy is the
 //! schema's contract, and construction (`build`) honors it.
@@ -10,7 +10,7 @@ use tokeira_iac::{ChangeKind, ChangeSemantics, Confidence, FieldDiff, RefreshSta
 use crate::evidence::{EvidenceId, EvidenceIndex};
 
 /// The artifact schema version. Bumped only for breaking shape changes;
-/// slot population (Features 2–4) is additive by design (Requirement 8.3).
+/// slot population is additive by design (operator-explanation Req 1.3).
 pub const EXPLANATION_SCHEMA_VERSION: u32 = 1;
 
 /// One operation's complete explanation.
@@ -37,11 +37,11 @@ pub struct DeploymentExplanation {
     pub impacts: Vec<OperationalImpact>,
     /// References into `changes`, derived from the engine's own
     /// classification (`ChangeKind::is_destructive`) — never from
-    /// declarations (Feature 2, Requirement 4).
+    /// declarations (operator-explanation Req 1.5).
     pub destructive: Vec<EvidenceId>,
     pub uncertainties: Vec<Uncertainty>,
     /// Causal groups over the non-`NoChange` changes (Feature 3,
-    /// Requirement 4): a partition, each group hanging from its bounded
+    /// operator-explanation Req 5.3): a partition, each group hanging from its bounded
     /// ultimate root. `serde(default)` keeps pre-causality artifacts
     /// readable — the slot pattern, applied at the document level.
     #[serde(default)]
@@ -74,7 +74,7 @@ pub struct PlatformIssue {
 }
 
 /// One causal story: the changes sharing a root, ordered along the
-/// dependency path from the root outward (Requirement 4.2).
+/// dependency path from the root outward (Req 5.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CausalGroup {
     pub evidence_id: EvidenceId,
@@ -84,10 +84,10 @@ pub struct CausalGroup {
     pub members: Vec<EvidenceId>,
 }
 
-/// What a causal group hangs from (Requirement 4.3). Cascade chains walk to
+/// What a causal group hangs from (Req 5.3). Cascade chains walk to
 /// their first non-cascade cause and take *that* cause's root — one story —
 /// and the walk is bounded by the engine-version and baseline-revision
-/// boundaries (Requirement 4.6): an engine-advance origin roots here at
+/// boundaries (Req 5.3): an engine-advance origin roots here at
 /// `ProvisionerAdvance` and reaches no further back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -105,7 +105,7 @@ pub enum CausalRoot {
 /// One resource change, enriched with everything the layer knows about it.
 /// The `semantics`, `cause`, `dependants`, and `source` fields are slots:
 /// present from schema v1, populated by Features 2–4, rendered as nothing
-/// while not determined (Requirement 8).
+/// while not determined (operator-explanation Req 4.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExplainedChange {
     pub evidence_id: EvidenceId,
@@ -188,7 +188,7 @@ pub struct OperationalImpact {
 }
 
 /// Impact classes, ordered most consequential first; the ordering is the
-/// rendering order (Feature 2, Requirement 5.7).
+/// rendering order (operator-explanation Req 6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImpactClass {
@@ -220,12 +220,12 @@ impl ImpactClass {
 
 /// A modelled statement that something could not be determined — the
 /// feature that makes a quiet plan distinguishable from an uninformed one
-/// (Requirement 4).
+/// (operator-explanation Req 2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Uncertainty {
     pub evidence_id: EvidenceId,
     /// What the uncertainty qualifies; always resolvable in the index
-    /// (Property 3).
+    /// (§Evidence, Property 3).
     pub subject: EvidenceId,
     pub reason: UncertaintyReason,
     /// What the operator cannot rely on as a result.
@@ -262,7 +262,7 @@ pub enum UncertaintyReason {
     ProviderAssignedAtApply { field: String },
     /// A deletion whose resource type no recoverer claims: the kind cannot
     /// be reached to declare what the delete does, and that absence is
-    /// stated rather than silent (change-semantics Requirement 3.4).
+    /// stated rather than silent (operator-explanation Req 4.3).
     KindUnavailableForRemovedResource,
     /// The cause algebra could not decide why this resource changed —
     /// typically a drift-shaped condition over an unconfirmed live read,
@@ -295,7 +295,7 @@ impl UncertaintyReason {
 }
 
 /// One committed change from an apply, in the model's own vocabulary so
-/// this crate depends on no engine or provisioner types (Requirement 9.1);
+/// this crate depends on no engine or provisioner types (operator-explanation Req 1.2);
 /// the shell maps at its boundary. Identity only — id, operation, the
 /// module/type halves of the natural key, and the operator noun — never
 /// before-images (Proposal 002).

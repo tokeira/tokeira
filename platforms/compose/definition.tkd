@@ -140,19 +140,20 @@ fn deployment(cfg: Compose, cx: Context) -> Deployment {
     }
 
     let runtime = d.module("runtime", vec![local_state]);
+    let server_config = runtime.resource("server_config", ServerConfig {});
     runtime.resource(
         "tokeirad",
         Service {
             image: cfg.tokeirad.image.clone(),
             replicas: cfg.tokeirad.replicas,
             publish: vec![cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
-            server_config: true,
             aws_region: match &cfg.storage {
                 Storage::Dsql(storage) => Some(storage.region.clone()),
                 _ => None,
             },
             ..Service::EMPTY
         },
+        vec![server_config],
     );
 
     let observability = d.module("observability", vec![local_state, runtime]);

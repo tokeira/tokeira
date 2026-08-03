@@ -1740,7 +1740,7 @@ mod tests {
     }
 
     /// The pre-widening plan computation, retained verbatim as the Property 7
-    /// oracle (evidence-model spec): the widened surface must return exactly
+    /// oracle (operator-explanation Req 2.1): the widened surface must return exactly
     /// these changes and leave exactly this state — the coverage it adds is
     /// additive, never behaviour-changing.
     async fn legacy_plan_changes(
@@ -1898,7 +1898,7 @@ mod tests {
         assert!(verify_resources(&[&clean, &dep]).is_empty());
     }
 
-    // Property 1 (change-semantics): the default declares nothing — and
+    // Feature: operator-explanation §Semantics, Property 1: the default declares nothing — and
     // Property 2: it is total. Over every ChangeKind, diff shape, and
     // state presence, a kind that does not override `change_semantics`
     // returns all-Unknown, for every input, without panicking. Declaring
@@ -1953,7 +1953,7 @@ mod tests {
             .expect("default declaration property");
     }
 
-    // Property 7 (evidence-model): widening preserves planning. For any
+    // Feature: operator-explanation §Evidence, Property 7: widening preserves planning. For any
     // generated world, `plan_with_known` returns exactly the changes the
     // legacy computation produces, in order, leaving identical state — and
     // its coverage covers exactly the refreshed resources with `examined`.
@@ -2758,7 +2758,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_records_live_departures_exactly() {
-        // The A7/A8 seam (explanation-causality): a resource is in
+        // The A7/A8 seam (operator-explanation §Causality): a resource is in
         // `live_departed` iff a confirmed live read departed from recorded
         // state — differing properties, or a confirmed absence while state
         // still records it. Matching properties and unconfirmed describes

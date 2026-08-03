@@ -343,7 +343,7 @@ proptest! {
             "real".to_string(),
         )]);
         let realized = verified
-            .realize("real-deployment", directory.path(), &tags)
+            .realize("real-deployment", directory.path(), directory.path(), &tags)
             .expect("realize verified set");
         prop_assert_eq!(realized.iter().len(), resource_count);
         prop_assert_eq!(manifests.load(Ordering::SeqCst), resource_count);

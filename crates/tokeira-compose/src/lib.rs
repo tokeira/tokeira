@@ -307,6 +307,7 @@ impl iac::Resource for ComposeService {
                     citation: REMOVE,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             // Update and Replace share one provider path — reconcile — and
             // therefore one truth: destroy-before-create, unavailable while
@@ -336,6 +337,7 @@ impl iac::Resource for ComposeService {
                 statement: Some(std::borrow::Cow::Borrowed(
                     "it would be stopped, removed, and recreated from the definition",
                 )),
+                provider_assigned: Vec::new(),
             },
             ChangeKind::Delete => iac::ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -359,6 +361,7 @@ impl iac::Resource for ComposeService {
                     citation: RECONCILE,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             // The engine never asks about NoChange; totality answers anyway,
             // with nothing.
@@ -1254,7 +1257,7 @@ mod tests {
 
     use super::*;
 
-    // Golden declarations (change-semantics task 4.5): the six scenarios,
+    // Golden declarations (operator-explanation Req 4.5): the six scenarios,
     // asserting classification and confidence — never prose. The pivotal
     // row: an engine Update is *effected* as a replacement with the service
     // unavailable — the in-place reading of `~` was wrong, and this is where

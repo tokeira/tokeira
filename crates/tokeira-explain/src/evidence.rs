@@ -7,7 +7,7 @@
 //! and the model's determinism property (identical inputs → byte-identical
 //! serialization) demands identity that survives any construction order.
 //! Natural keys also satisfy "same resource, same deployment and revision →
-//! same id" by construction rather than by bookkeeping (Requirement 3.5).
+//! same id" by construction rather than by bookkeeping (operator-explanation Req 1.4).
 
 use std::collections::BTreeMap;
 
@@ -73,7 +73,7 @@ pub enum EvidenceKind {
 ///
 /// `BTreeMap` for the same reason as everywhere in this layer: iteration and
 /// serialization order are functions of the keys, so construction order can
-/// never leak into the artifact (Property 2).
+/// never leak into the artifact (§Evidence, Property 2).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceIndex(BTreeMap<EvidenceId, EvidenceKind>);
 
@@ -83,7 +83,7 @@ impl EvidenceIndex {
     }
 
     /// Resolve an id to its kind. `None` is the caller's cue to treat a
-    /// citation as invalid — never to render it anyway (Requirement 3.3).
+    /// citation as invalid — never to render it anyway (operator-explanation Req 1.4).
     pub fn resolve(&self, id: &EvidenceId) -> Option<EvidenceKind> {
         self.0.get(id).copied()
     }

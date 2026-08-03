@@ -149,8 +149,7 @@ impl Resource for DsqlCluster {
     /// protection, then deletes the cluster. Data fate and recoverability are
     /// declared from AWS's documented recovery model — restores require a
     /// pre-existing recovery point and only ever create a *new* cluster — as
-    /// a cited inference and a cited provider guarantee respectively
-    /// (researched 2026-07-29).
+    /// a cited inference and a cited provider guarantee respectively.
     fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
         // Cited by module identity, never repo layout — these resources are
         // usable outside this workspace, and their citations must stay true
@@ -214,6 +213,7 @@ impl Resource for DsqlCluster {
                     citation: PREEXISTING,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             ChangeKind::Create => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -241,6 +241,13 @@ impl Resource for DsqlCluster {
                     citation: RESTORE_DOC,
                 },
                 statement: None,
+                // dsql:CreateCluster assigns all three; the recorded state
+                // holds them post-create (see `create`, Managed arm).
+                provider_assigned: vec![
+                    "cluster_id".into(),
+                    "cluster_endpoint".into(),
+                    "cluster_arn".into(),
+                ],
             },
             ChangeKind::Update | ChangeKind::Replace if preexisting => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -264,6 +271,7 @@ impl Resource for DsqlCluster {
                     citation: PREEXISTING,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             ChangeKind::Update | ChangeKind::Replace => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -292,6 +300,7 @@ impl Resource for DsqlCluster {
                     citation: UPDATE_MANAGED,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             ChangeKind::Delete if preexisting => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -315,6 +324,7 @@ impl Resource for DsqlCluster {
                     citation: PREEXISTING,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             ChangeKind::Delete => ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -344,6 +354,7 @@ impl Resource for DsqlCluster {
                 statement: Some(std::borrow::Cow::Borrowed(
                     "deletion protection would be disabled first, then the cluster deleted",
                 )),
+                provider_assigned: Vec::new(),
             },
             ChangeKind::NoChange => ChangeSemantics::default(),
         }
@@ -826,9 +837,8 @@ fn prop_str(rs: &ResourceState, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    // Golden declarations (change-semantics tasks 4.5 + 6.2): classification
-    // and confidence only. The 2026-07-29 research closed Phase 4's
-    // deliberate Unknowns: a managed delete's recoverability is now a cited
+    // Golden declarations (operator-explanation Req 4.5): classification
+    // and confidence only. A managed delete's recoverability is now a cited
     // provider guarantee (restores only ever create a new cluster) and its
     // data fate a cited inference from the documented recovery model — while
     // a preexisting cluster's whole lifecycle remains an engine fact about

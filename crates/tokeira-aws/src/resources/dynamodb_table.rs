@@ -371,6 +371,9 @@ impl Resource for DynamoDbTable {
                     citation: DELETE_TABLE_DOC,
                 },
                 statement: None,
+                // dynamodb:CreateTable assigns the ARN; recorded as the
+                // physical id post-create (see `create`).
+                provider_assigned: vec!["table_arn".into()],
             },
             ChangeKind::Update => {
                 // The only updates this kind's diff produces are tags and the
@@ -399,8 +402,7 @@ impl Resource for DynamoDbTable {
                     },
                     // A TTL change enacts a data policy: the apply deletes
                     // nothing, and thereafter the provider deletes expired
-                    // items on its own schedule (the 6.7 vocabulary decision,
-                    // resolved 2026-07-29: the general `Policy` value with the
+                    // items on its own schedule (the general `Policy` value with the
                     // statement carrying the specific meaning).
                     data_effect: if ttl_involved {
                         Confidence::ProviderGuarantee {
@@ -435,6 +437,7 @@ impl Resource for DynamoDbTable {
                     } else {
                         None
                     },
+                    provider_assigned: Vec::new(),
                 }
             }
             ChangeKind::Delete => ChangeSemantics {
@@ -463,6 +466,7 @@ impl Resource for DynamoDbTable {
                     citation: PITR_DOC,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             // The diff never produces a replacement; reported inapplicable
             // via the all-Unknown default, kept total.
@@ -865,9 +869,9 @@ impl Resource for DynamoDbTable {
 mod tests {
     use super::*;
 
-    // Golden declarations (change-semantics tasks 4.5 + 6.2): classification
+    // Golden declarations (operator-explanation Req 4.5): classification
     // and confidence only. A delete carries AWS's own words — the table and
-    // all its items are deleted — and, since the 2026-07-29 research, its
+    // all its items are deleted — and its
     // recoverability is a cited provider guarantee (the system backup exists
     // only under PITR, which this engine's create leaves at its documented
     // default). A TTL-bearing update's data effect stays Unknown: per-item

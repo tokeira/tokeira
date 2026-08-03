@@ -736,7 +736,7 @@ impl iac::Resource for ObservabilityConfigFilesResource {
     }
 
     /// What a config-tree change does, read from this file's own lifecycle
-    /// paths (change-semantics task 4.2). Writes are in place (`write_all`
+    /// paths (operator-explanation Req 4.2). Writes are in place (`write_all`
     /// overwrites the managed set); the delete genuinely removes the managed
     /// files — read from the delete implementation, as the spec demands —
     /// and is still reversible because the tree is a pure function of the
@@ -781,6 +781,7 @@ impl iac::Resource for ObservabilityConfigFilesResource {
                     citation: DELETE,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             // Definition-driven and drift-driven updates share `write_all`:
             // an in-place overwrite of the resource's own rendered
@@ -809,6 +810,7 @@ impl iac::Resource for ObservabilityConfigFilesResource {
                     citation: WRITE,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             ChangeKind::Delete => iac::ChangeSemantics {
                 operation: Confidence::EngineFact {
@@ -832,6 +834,7 @@ impl iac::Resource for ObservabilityConfigFilesResource {
                     citation: WRITE,
                 },
                 statement: None,
+                provider_assigned: Vec::new(),
             },
             ChangeKind::NoChange => iac::ChangeSemantics::default(),
         }
@@ -979,7 +982,7 @@ mod semantics_tests {
         )
     }
 
-    // Golden declarations (change-semantics task 4.5): classification and
+    // Golden declarations (operator-explanation Req 4.5): classification and
     // confidence only. The headline pair: updates are genuinely in place
     // (write_all), and the delete genuinely destroys the managed files —
     // yet stays reversible because the tree re-renders identically from

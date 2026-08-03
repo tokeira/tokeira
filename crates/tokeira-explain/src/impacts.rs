@@ -1,5 +1,5 @@
 //! Deterministic impact derivation: declared semantics in, operational
-//! consequences out (change-semantics Requirement 5).
+//! consequences out (operator-explanation Req 6).
 //!
 //! A pure function of the declarations: two plans with identical
 //! declarations produce identical impacts, in identical order — most
@@ -7,7 +7,7 @@
 //! confidence contributes — a renderer marks such impacts as derived by
 //! inspecting the subjects' declarations — while `Unknown` contributes
 //! nothing: an unknown never becomes a claim, it becomes uncertainty
-//! (Requirement 6, activated in [`crate::build`]).
+//! (operator-explanation Req 2.3, activated in [`crate::build`]).
 
 use tokeira_iac::{ChangeKind, DataEffect, Disruption, ReplacementPolicy};
 
@@ -68,7 +68,7 @@ fn triggers(change: &ExplainedChange, class: ImpactClass) -> bool {
     match class {
         ImpactClass::DataDestroyed => semantics.data_effect.value() == Some(&DataEffect::Destroyed),
         ImpactClass::Unavailability => {
-            // Two trigger families (Requirement 5.2/5.5): the declared
+            // Two trigger families (Req 6.1): the declared
             // disruption, and the engine's own classification — a delete
             // removes the resource, and the engine executes a replace as
             // delete-then-create, so unavailability is the floor with no
@@ -87,7 +87,7 @@ fn triggers(change: &ExplainedChange, class: ImpactClass) -> bool {
         }
         ImpactClass::Replacement => {
             // Declared, or the engine's own Replace classification
-            // (Requirement 5.5) — the floor renders undeclared.
+            // (Req 6.1) — the floor renders undeclared.
             matches!(
                 semantics.replacement.value(),
                 Some(policy) if *policy != ReplacementPolicy::NotRequired

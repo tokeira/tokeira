@@ -1,4 +1,4 @@
-//! Write and read the explanation artifact (Requirement 7).
+//! Write and read the explanation artifact (operator-explanation Req 3).
 //!
 //! The artifact is the complete [`DeploymentExplanation`] as JSON in a file —
 //! the form a CI system gates on without scraping terminal output. It is
@@ -73,7 +73,7 @@ pub fn write(path: &Path, explanation: &DeploymentExplanation) -> Result<(), Exp
 /// Read an explanation artifact back into the model.
 ///
 /// Takes only the file: no deployment directory, no platform, no live state —
-/// the artifact must stand alone (Req 7.3), and this signature is what holds
+/// the artifact must stand alone (Req 3.3), and this signature is what holds
 /// that line.
 pub fn read(path: &Path) -> Result<DeploymentExplanation, ExplainError> {
     let bytes = std::fs::read(path).map_err(|source| ExplainError::ArtifactRead {

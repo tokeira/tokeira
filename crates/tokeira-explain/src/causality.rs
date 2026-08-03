@@ -1,5 +1,5 @@
 //! Cause classification: the (D, P, S, L) algebra, grouping, and dependants
-//! (explanation-causality Requirements 2–5).
+//! (operator-explanation Req 5).
 //!
 //! The classifier is a **pure function over four snapshots and a graph**. It
 //! decides why each change is present — definition edit, dependency output
@@ -59,7 +59,7 @@ pub enum BaselineView {
 /// Everything the algebra consumes. Owned values, assembled by the shell
 /// from sources gathered under its isolation rules — most importantly S
 /// read from the state store as persisted, never from a planning context
-/// (Requirement 2.3: refresh overwrites in-context properties with live
+/// (Req 5.1: refresh overwrites in-context properties with live
 /// observations, and a contaminated S turns drift detection into
 /// live-vs-live).
 #[derive(Debug, Clone)]
@@ -78,19 +78,19 @@ pub struct CausalityView {
     pub recorded: BTreeMap<ResourceId, ResourceState>,
     /// The dependency graph: resource → its dependencies, over the union of
     /// the desired (engine-declared) and recorded sides, so dependants of a
-    /// change include unchanged resources (Requirement 5.1).
+    /// change include unchanged resources (Req 5.4).
     pub edges: BTreeMap<ResourceId, Vec<ResourceId>>,
     /// The desired side alone (`PlanOutcome::edges_by_id`) — the graph-delta
     /// half DependencyLoss needs: a recorded edge absent here, whose target
     /// this plan deletes, is a dependant continuing without its dependency
-    /// (change-semantics Requirement 5.6).
+    /// (operator-explanation Req 6.2).
     pub desired_edges: BTreeMap<ResourceId, Vec<ResourceId>>,
     /// L — per-resource confirmation statuses plus the live-departure set.
     pub refresh: RefreshCoverage,
 }
 
 /// The classifier's verdict for one change: the assessment, plus the
-/// uncertainty text when the cause is `Unknown` (Requirement 2.7 — an
+/// uncertainty text when the cause is `Unknown` (Req 5.2 — an
 /// unknown cause always explains itself).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Assessment {
@@ -239,7 +239,7 @@ pub(crate) fn assess(
     if !d_eq_p {
         // A4: the desired difference traces to a dependency's changed
         // recorded output — identity + state diff, never bare value
-        // equality (Requirement 3.5). Ambiguous or partial → A5.
+        // equality (the A4 gates). Ambiguous or partial → A5.
         if let Some(dependency) = trace_outputs(rid, desired, baseline, view) {
             return Assessment {
                 cause: inference(Cause::DependencyOutputChanged {
@@ -255,7 +255,7 @@ pub(crate) fn assess(
     // A6 before A7: a change forced by a replacing dependency would
     // otherwise misread as drift. The per-change cause names the *nearest*
     // replaced dependency; the group root walks to the ultimate root
-    // (Requirement 4.6) at grouping time.
+    // (Req 5.3) at grouping time.
     if let Some(root) = nearest_replaced_dependency(rid, view, replaced) {
         return Assessment {
             cause: inference(Cause::ReplacementCascade { root: root.0 }),
@@ -349,7 +349,7 @@ fn trace_outputs(
             }
         }
         if pair_count != 1 {
-            return None; // ambiguous or untraced leaf → A5 (Requirement 3.3)
+            return None; // ambiguous or untraced leaf → A5 (the A4 gates)
         }
         let dep = leaf_dep
             .expect("pair_count == 1 implies a candidate")
@@ -549,7 +549,7 @@ pub fn apply_causality(explanation: &mut DeploymentExplanation, view: &Causality
             .collect();
     }
 
-    // ── DependencyLoss impacts (change-semantics Requirement 5.6) ─────
+    // ── DependencyLoss impacts (operator-explanation Req 6.2) ─────
     // An engine fact from the graph delta: a recorded edge the desired
     // graph dropped, whose target this plan deletes. The dependant's change
     // may be `NoChange` (edges are not manifest content) — it still carries
@@ -637,9 +637,9 @@ pub fn apply_causality(explanation: &mut DeploymentExplanation, view: &Causality
 }
 
 /// Grouping: every non-`NoChange` change lands in exactly one group
-/// (Requirement 4.5). Cascade chains walk `ReplacementCascade` causes to
+/// (Req 5.3). Cascade chains walk `ReplacementCascade` causes to
 /// the first non-cascade cause — bounded by the engine-version and
-/// baseline-revision boundaries (Requirement 4.6) — and take *that* cause's
+/// baseline-revision boundaries (Req 5.3) — and take *that* cause's
 /// root, so a definition edit that replaces A and drags B and C reads as
 /// one story rather than a chain of linked groups. Termination: dependency
 /// graphs are DAGs, and a visited set guards the walk against malformed
@@ -736,7 +736,7 @@ fn root_key(root: &CausalRoot) -> String {
     }
 }
 
-/// Requirement 4.2: members ordered along the dependency path from the root
+/// Req 5.3: members ordered along the dependency path from the root
 /// outward — in-group BFS layering over the dependency edges (a dependency
 /// precedes its dependants), ties and path-unconnected members by id.
 fn order_members(

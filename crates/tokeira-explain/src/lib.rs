@@ -6,7 +6,7 @@
 //! verbatim; construction adds structure (evidence identity, uncertainty)
 //! and nothing else. The crate's dependency list is its contract: engine
 //! types and serialization — no network, no provider, no model client, no
-//! provisioner shell (evidence-model Requirement 9).
+//! provisioner shell (operator-explanation Req 1.2).
 //!
 //! The governing principle (umbrella `operator-explanation`): *the engine
 //! establishes truth; the explanation layer establishes meaning; an agent
@@ -15,7 +15,7 @@
 //! Slots for later features (`semantics`, `cause`, `dependants`, `source`)
 //! exist from this crate's first version, carrying explicit not-determined
 //! defaults, so Features 2–4 populate data without reshaping the schema
-//! (Requirement 8).
+//! (operator-explanation Req 1.3).
 
 pub mod artifact;
 pub mod build;
@@ -36,7 +36,7 @@ pub use model::{
 };
 // The semantics vocabulary is declared beside the `Resource` trait it
 // annotates (the Feature 1 amendment recorded in
-// `.kiro/specs/explanation-change-semantics`); re-exported here so
+// `.kiro/specs/operator-explanation`); re-exported here so
 // explanation consumers see one surface.
 pub use tokeira_iac::{
     ChangeSemantics, Citation, Confidence, DataEffect, Disruption, LifecycleOperation,

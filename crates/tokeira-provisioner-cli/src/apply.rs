@@ -77,7 +77,7 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         envelope.deployment_id = project_name;
     }
     // The advance the report states: the revision the verb started from and
-    // the one the re-stamp commits (evidence-model field policy —
+    // the one the re-stamp commits (operator-explanation Req 1 —
     // `proposed_revision` is `current + 1` for a mutating verb).
     let from_revision = envelope.config_revision;
     let config_source = platform.config_source(deployment_dir)?;
@@ -103,6 +103,8 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     // write must fail the verb (Req 7.6) without ever costing the envelope
     // its revision advance. The context states the one fact the operator
     // must not misread — the apply itself is committed and recorded.
+    config_history::retain_explanation(deployment_dir, envelope.config_revision, &explanation)
+        .context("the apply is committed and recorded; only explanation retention failed")?;
     if let Some(path) = explanation_path {
         tokeira_explain::artifact::write(path, &explanation)
             .context("the apply is committed and recorded; only the explanation artifact failed")?;
@@ -374,6 +376,14 @@ mod tests {
             Some(5),
             "the artifact records the committed advance"
         );
+
+        // Retention needs no flag: the committed revision's folder holds the
+        // same explanation, readable after the fact with no serving process.
+        let retained = tokeira_explain::artifact::read(
+            &tmp.path().join("state/config-revisions/5/explanation.json"),
+        )
+        .expect("the revision retains its explanation");
+        assert_eq!(retained, model);
     }
 
     // Req 7.6 without state damage: a failed artifact write fails the verb,

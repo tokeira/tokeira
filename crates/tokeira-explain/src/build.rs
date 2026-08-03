@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// The deployment facts the engine does not know; the shell supplies them
-/// from the envelope and the platform (evidence-model field policy).
+/// from the envelope and the platform (operator-explanation Req 1).
 #[derive(Debug, Clone)]
 pub struct DeploymentContext {
     pub deployment: String,
@@ -73,7 +73,7 @@ pub fn explain_plan(context: DeploymentContext, outcome: &PlanOutcome) -> Deploy
             kind: change.kind,
             field_diffs: change.details.clone(),
             refresh_status,
-            // Verbatim from the kind's declaration (change-semantics
+            // Verbatim from the kind's declaration (operator-explanation §Semantics,
             // Property 3): the explanation transports, it never amends. An
             // absent id declares nothing — all fields Unknown.
             semantics: outcome
@@ -107,13 +107,14 @@ pub fn explain_plan(context: DeploymentContext, outcome: &PlanOutcome) -> Deploy
     derive_refresh_uncertainties(&mut explanation, outcome);
     derive_semantics_uncertainties(&mut explanation, outcome);
     derive_semantics_undeclared(&mut explanation);
+    derive_provider_assigned(&mut explanation);
     explanation
 }
 
 /// Explain an apply from its committed entries, within Proposal 002's
 /// ids-only constraint: field evidence comes only from a preceding plan of
 /// the same invocation, and its absence is an uncertainty, never a
-/// fabricated before-image (Requirement 2).
+/// fabricated before-image (operator-explanation Req 1.2).
 pub fn explain_applied(
     context: DeploymentContext,
     committed: &[CommittedChange],
@@ -125,7 +126,7 @@ pub fn explain_applied(
         // The committed identity is the apply's own: the shell maps what the
         // engine executed (module, type, noun, a true `Replaced`) at its
         // boundary. With the module known, the evidence id matches the
-        // plan-side id for the same resource (Requirement 3.5 — same
+        // plan-side id for the same resource (operator-explanation Req 1.4 — same
         // resource, same id); a source that cannot name the module leaves it
         // empty rather than inventing one, and the id degrades to
         // `change:::{resource_id}` — still stable, still distinct.
@@ -172,7 +173,7 @@ pub fn explain_applied(
             field_diffs,
             refresh_status,
             // Reused from the preceding plan's declarations when one exists
-            // — the same reuse-never-invent rule as field evidence (Req 2).
+            // — the same reuse-never-invent rule as field evidence (Req 1.2).
             semantics: preceding
                 .and_then(|plan| plan.semantics_by_id.get(&ResourceId(entry.id.clone())))
                 .cloned()
@@ -206,7 +207,7 @@ pub fn explain_applied(
 
     // Impacts derive from the reused declarations — a pure function of the
     // changes, identical rules to the plan side. Undeclared-semantics
-    // uncertainty stays plan-scoped (Requirement 6 speaks of the plan; an
+    // uncertainty stays plan-scoped (Req 2.1 speaks of the plan; an
     // apply reports what happened, and gap-hunting a done thing is noise).
     explanation.impacts = crate::impacts::derive_impacts(
         &EvidenceId::deployment(&explanation.deployment),
@@ -245,7 +246,7 @@ fn base(context: DeploymentContext) -> DeploymentExplanation {
     }
 }
 
-/// Requirement 4: `RefreshStatus::Unknown` on a planned resource is an
+/// Operator-explanation Req 2.1: `RefreshStatus::Unknown` on a planned resource is an
 /// uncertainty; an unexamined verb is exactly one plan-level uncertainty —
 /// "no check happened" is a different statement from "everything confirmed",
 /// and both differ from silence.
@@ -282,7 +283,7 @@ fn derive_refresh_uncertainties(explanation: &mut DeploymentExplanation, outcome
     }
 }
 
-/// Change-semantics Requirement 3.4: a deletion whose id is absent from the
+/// Operator-explanation Req 4.3: a deletion whose id is absent from the
 /// declaration map means no recoverer claimed the resource's type — the kind
 /// could not be reached to say what the delete does. Stated as uncertainty,
 /// never silence. Non-deletions are always reachable (they sit in the
@@ -314,7 +315,7 @@ fn derive_semantics_uncertainties(explanation: &mut DeploymentExplanation, outco
     }
 }
 
-/// Requirement 6: undeclared semantics become uncertainty — a gap, never
+/// Operator-explanation Req 2.3: undeclared semantics become uncertainty — a gap, never
 /// silence. Per field: a change whose field is `Unknown` while the field is
 /// stated for another change in the plan gets its own uncertainty; a field
 /// `Unknown` across every applicable change collapses to one plan-level
@@ -397,6 +398,47 @@ fn derive_semantics_undeclared(explanation: &mut DeploymentExplanation) {
     }
 }
 
+/// Operator-explanation Req 2.2: a creation's provider-assigned values are unknown at plan
+/// time by construction — writeback defers every consumer reference until
+/// the recorded state holds the value — so the plan's silence about them is
+/// stated as uncertainty, never left to read as oversight. One per declared
+/// name, machine-channel only (the narrative has no value to qualify).
+fn derive_provider_assigned(explanation: &mut DeploymentExplanation) {
+    // One uncertainty per assigned *name*: the declaration is a set, and a
+    // duplicated name must not mint two facts under one evidence id.
+    let assigned: Vec<(EvidenceId, std::collections::BTreeSet<String>)> = explanation
+        .changes
+        .iter()
+        .filter(|change| change.kind == ChangeKind::Create)
+        .map(|change| {
+            (
+                change.evidence_id.clone(),
+                change
+                    .semantics
+                    .provider_assigned
+                    .iter()
+                    .map(|field| field.to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    for (subject, fields) in assigned {
+        for field in fields {
+            push_uncertainty(
+                explanation,
+                subject.clone(),
+                UncertaintyReason::ProviderAssignedAtApply {
+                    field: field.clone(),
+                },
+                format!("the plan cannot state `{field}`; the provider assigns it during apply"),
+                Some(
+                    "apply the plan; the recorded state then holds the assigned value".to_string(),
+                ),
+            );
+        }
+    }
+}
+
 /// The five declared fields, iterated in one fixed order so uncertainty
 /// output is deterministic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,10 +501,12 @@ pub(crate) fn push_uncertainty(
     resolvable_by: Option<String>,
 ) {
     // The natural key must distinguish facts: five plan-level undeclared
-    // fields on one subject are five uncertainties, so the field joins the
-    // tag for that reason.
+    // fields on one subject are five uncertainties, and one creation may
+    // carry several provider-assigned values — the field joins the tag for
+    // both reasons.
     let evidence_id = match &reason {
-        UncertaintyReason::SemanticsUndeclared { field } => {
+        UncertaintyReason::SemanticsUndeclared { field }
+        | UncertaintyReason::ProviderAssignedAtApply { field } => {
             EvidenceId::uncertainty(&format!("{}:{field}", reason.tag()), &subject)
         }
         _ => EvidenceId::uncertainty(reason.tag(), &subject),

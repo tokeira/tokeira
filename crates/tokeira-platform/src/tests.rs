@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -8,12 +8,18 @@ use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    artifact::{ArtifactCatalog, DeliveryKey},
+    artifact::{
+        ArtifactCatalog, ArtifactClass, ArtifactUse, CanonicalDocument, ContentIdentity,
+        ContentIdentitySet, DeliveryKey, DesiredContent, DesiredDocument,
+        OperationalArtifactReceipt, OperationalArtifactReceipts, OperationalArtifactRequest,
+        OperationalArtifactStage, PlatformArtifact, RelativeArtifactPath,
+    },
     author::{AuthorArgument, AuthorHandle, AuthorNode, AuthorResult, AuthorValue},
     binding::{Platform, PlatformBinding, StateBinding, StatePolicy},
     catalog::{
-        ImageCatalog, KindRegistration, KindSet, PlacementContext, ProviderExecution, ProviderKind,
-        ProviderKindCatalog, ProviderSet, ServiceCatalog,
+        DeliveryProjection, HealthDeclaration, ImageCatalog, ImageSelection, KindRegistration,
+        KindSet, PlacementContext, PlacementDeclaration, PlatformService, ProviderDelivery,
+        ProviderExecution, ProviderKind, ProviderKindCatalog, ProviderSet, ServiceCatalog,
     },
     config::{ConfigContract, PlatformConfig},
     context::{
@@ -24,7 +30,10 @@ use crate::{
         DefinitionSource, DefinitionSourceName, EvaluatedDefinition, FrontendOutput,
         FrontendSource, RelativeDefinitionPath,
     },
-    error::{ConfigError, ContextError, FrontendDiagnostic, GraphError, VerificationFinding},
+    error::{
+        ConfigError, ContextError, DeliveryError, FrontendDiagnostic, GraphError,
+        VerificationFinding,
+    },
     graph::{DeploymentGraphBuilder, WorkloadDeclaration, WritebackValue},
     ops::PlatformOps,
     projection::{
@@ -335,6 +344,227 @@ impl tokeira_deploy_engine::Platform for TestDeployPlatform {
         manifests: &[serde_json::Value],
     ) -> Result<usize, tokeira_deploy_engine::RuntimeError> {
         Ok(manifests.len())
+    }
+}
+
+#[derive(Debug)]
+struct CoupledService {
+    manifest: serde_json::Value,
+}
+
+impl tokeira_deploy_engine::Service for CoupledService {
+    fn name(&self) -> &str {
+        "server"
+    }
+
+    fn module(&self) -> &str {
+        "state"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    fn manifests(
+        &self,
+        _context: &tokeira_deploy_engine::ServiceContext,
+    ) -> Result<Vec<serde_json::Value>, tokeira_deploy_engine::RuntimeError> {
+        Ok(vec![self.manifest.clone()])
+    }
+}
+
+#[derive(Debug)]
+struct CoupledDelivery {
+    key: DeliveryKey,
+    credential: String,
+    published: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+#[async_trait]
+impl ProviderDelivery for CoupledDelivery {
+    fn key(&self) -> &DeliveryKey {
+        &self.key
+    }
+
+    fn canonicalize(&self, document: &DesiredDocument) -> Result<CanonicalDocument, DeliveryError> {
+        Ok(CanonicalDocument {
+            bytes: serde_json::to_vec(&document.value)
+                .map_err(|error| DeliveryError::new(error.to_string()))?,
+        })
+    }
+
+    fn realize(
+        &self,
+        declaration: &WorkloadDeclaration,
+        _placement: &PlacementContext,
+        content: &ContentIdentitySet,
+    ) -> Result<DeliveryProjection, DeliveryError> {
+        // Provider credentials are runtime authority, never desired content.
+        // Keeping the field live in this implementation makes accidental use
+        // visible to the secret-mutation property below.
+        let _credential = &self.credential;
+        let identities = content
+            .iter()
+            .map(|(use_, identity)| {
+                serde_json::json!({
+                    "artifact": use_.artifact,
+                    "role": use_.role,
+                    "domain": identity.domain,
+                    "sha256": identity.sha256,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(DeliveryProjection::Workload(Box::new(CoupledService {
+            manifest: serde_json::json!({
+                "service": declaration.service,
+                "content": identities,
+            }),
+        })))
+    }
+
+    async fn materialize_operational(
+        &self,
+        request: OperationalArtifactRequest<'_>,
+        _context: &tokeira_iac::ProvisionContext,
+    ) -> Result<OperationalArtifactReceipt, DeliveryError> {
+        self.published
+            .lock()
+            .expect("publication recorder lock")
+            .push(request.content.to_vec());
+        Ok(OperationalArtifactReceipt {
+            artifact: request.artifact.logical_id.clone(),
+            provider_reference: format!("generated/{}", request.artifact.logical_id),
+            identity: request.identity.clone(),
+            consumers: request.artifact.consumers.clone(),
+        })
+    }
+}
+
+fn coupled_binding(
+    content: DesiredContent,
+    credential: String,
+    published: Arc<Mutex<Vec<Vec<u8>>>>,
+) -> PlatformBinding<TestPlatform> {
+    let delivery = DeliveryKey::new("test-delivery").expect("delivery key");
+    PlatformBinding::new(
+        tokeira_orchestrator::PlatformId::new("test").expect("platform id"),
+        "state",
+        ConfigContract::new(),
+        ContextContract::new(context_from_invocation, authoring_context),
+        test_kinds(),
+        ServiceCatalog::new(vec![PlatformService {
+            logical_id: "server".into(),
+            image: ImageSelection {
+                logical_id: "server-image".into(),
+            },
+            command: vec!["serve".into()],
+            ports: Vec::new(),
+            health: HealthDeclaration::default(),
+            placement: PlacementDeclaration::default(),
+            configuration: vec![ArtifactUse {
+                artifact: "runtime-config".into(),
+                role: "server-config".into(),
+            }],
+            delivery: delivery.clone(),
+            document: DesiredDocument {
+                schema: "test.service.v1".into(),
+                value: serde_json::json!({"image": "server-image"}),
+            },
+        }]),
+        ArtifactCatalog::new(vec![PlatformArtifact {
+            logical_id: "runtime-config".into(),
+            class: ArtifactClass::Operational,
+            content,
+            consumers: vec!["server".into()],
+            delivery: delivery.clone(),
+        }]),
+        ImageCatalog::new(vec!["server-image".into()]),
+        ProviderSet::new(vec![Arc::new(CoupledDelivery {
+            key: delivery,
+            credential,
+            published,
+        })]),
+        StateBinding::new(StatePolicy::LocalCas),
+        PlatformOps::default(),
+        Vec::new(),
+    )
+    .expect("coupled binding")
+}
+
+fn coupled_framework(
+    content: DesiredContent,
+    credential: String,
+    published: Arc<Mutex<Vec<Vec<u8>>>>,
+    deployment_dir: std::path::PathBuf,
+) -> FrameworkDeployment<TestPlatform> {
+    let binding = coupled_binding(content, credential, published);
+    let mut graph = DeploymentGraphBuilder::with_catalogs(
+        binding.services.identities(),
+        binding.providers.delivery_keys(),
+    )
+    .require_bootstrap("state");
+    let deployment = graph.deployment_handle();
+    let state = graph
+        .add_module(&deployment, "state".into(), Vec::new())
+        .expect("state module");
+    let service = binding
+        .services
+        .get("server")
+        .expect("server catalog entry");
+    graph
+        .add_workload(
+            &state,
+            WorkloadDeclaration {
+                service: service.logical_id.clone(),
+                dependencies: service.placement.needs.clone(),
+                desired_capacity: 1,
+                delivery: service.delivery.clone(),
+                document: service.document.clone(),
+            },
+        )
+        .expect("workload");
+    FrameworkDeployment::new(
+        EvaluatedDefinition {
+            config: TestConfig {
+                storage: TestStorage::Memory,
+                replicas: 1,
+            },
+            graph: graph.finish().expect("graph"),
+            configuration_identity: ConfigurationIdentity::compute(
+                &tokeira_orchestrator::DefinitionFormatId::new("test").expect("format"),
+                b"definition",
+            ),
+        },
+        binding,
+        InvocationContext {
+            deployment_id: "deployment".into(),
+            deployment_uuid: uuid::Uuid::nil(),
+            environment: None,
+            region: None,
+            account_id: None,
+            deployment_dir,
+        },
+    )
+    .expect("coupled framework")
+}
+
+fn coupled_manifest(framework: &FrameworkDeployment<TestPlatform>) -> serde_json::Value {
+    framework
+        .services("deployment", &BTreeMap::new())
+        .expect("service projection")
+        .remove(0)
+        .manifests(&tokeira_deploy_engine::ServiceContext::default())
+        .expect("service manifest")
+        .remove(0)
+}
+
+fn complete_immediate<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::noop();
+    let mut task_context = std::task::Context::from_waker(waker);
+    match std::future::Future::poll(future.as_mut(), &mut task_context) {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => panic!("test future must complete without external I/O"),
     }
 }
 
@@ -1264,4 +1494,121 @@ fn framework_resolves_the_provider_owned_deploy_executor() {
         &tokeira_iac::InfraState::default(),
     );
     assert_eq!(hydrated.platform().replicas, 2);
+}
+
+proptest! {
+    // Feature: platform-builder-abstraction, Property 11: content coupling is deterministic, sensitive, and secret-free
+    #[test]
+    fn content_coupling_is_deterministic_sensitive_and_secret_free(
+        content in prop::collection::vec(any::<u8>(), 0..256),
+        edit in any::<u8>(),
+        credential in "[G-Z]{8,32}",
+        other_credential in "[G-Z]{8,32}",
+    ) {
+        let first = coupled_framework(
+            DesiredContent::Bytes(content.clone()),
+            credential.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            "unused".into(),
+        );
+        let repeated = coupled_framework(
+            DesiredContent::Bytes(content.clone()),
+            credential.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            "unused".into(),
+        );
+        let secret_mutation = coupled_framework(
+            DesiredContent::Bytes(content.clone()),
+            other_credential.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            "unused".into(),
+        );
+        let mut changed = content.clone();
+        changed.push(edit);
+        let changed = coupled_framework(
+            DesiredContent::Bytes(changed),
+            credential.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            "unused".into(),
+        );
+
+        let first = coupled_manifest(&first);
+        prop_assert_eq!(&first, &coupled_manifest(&repeated));
+        prop_assert_eq!(&first, &coupled_manifest(&secret_mutation));
+        prop_assert_ne!(&first, &coupled_manifest(&changed));
+
+        let identity = ContentIdentity::new("platform-artifact/runtime-config", &content);
+        prop_assert_eq!(first["content"][0]["sha256"].as_str(), Some(identity.sha256.as_str()));
+        let rendered = serde_json::to_string(&first).expect("manifest serialization");
+        prop_assert!(!rendered.contains(&credential));
+        prop_assert!(!rendered.contains(&other_credential));
+    }
+}
+
+#[test]
+fn operational_materialization_uses_cached_bytes_and_installs_validated_receipts() {
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let framework = coupled_framework(
+        DesiredContent::Text("authoritative = true\n".into()),
+        "CREDENTIAL".into(),
+        Arc::clone(&published),
+        "unused".into(),
+    );
+    let mut context = tokeira_iac::ProvisionContext::default();
+
+    let receipts = complete_immediate(
+        framework
+            .materialize_operational_artifacts(OperationalArtifactStage::Workload, &mut context),
+    )
+    .expect("operational publication");
+
+    assert_eq!(
+        published.lock().expect("publication recorder").as_slice(),
+        &[b"authoritative = true\n".to_vec()]
+    );
+    assert_eq!(receipts.iter().len(), 1);
+    assert_eq!(
+        receipts.iter().next().expect("receipt").artifact,
+        "runtime-config"
+    );
+    assert_eq!(
+        context
+            .extension::<OperationalArtifactReceipts>()
+            .expect("consumer receipts")
+            .iter()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn deployment_file_content_is_resolved_once_per_framework_invocation() {
+    let root =
+        std::env::temp_dir().join(format!("tokeira-platform-content-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("temporary deployment root");
+    let source = root.join("tokeirad.toml");
+    std::fs::write(&source, "first\n").expect("initial runtime configuration");
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let framework = coupled_framework(
+        DesiredContent::DeploymentFile(
+            RelativeArtifactPath::new("tokeirad.toml").expect("relative artifact path"),
+        ),
+        "CREDENTIAL".into(),
+        Arc::clone(&published),
+        root.clone(),
+    );
+    let first_manifest = coupled_manifest(&framework);
+
+    std::fs::write(&source, "second\n").expect("edited runtime configuration");
+    assert_eq!(first_manifest, coupled_manifest(&framework));
+    let next = coupled_framework(
+        DesiredContent::DeploymentFile(
+            RelativeArtifactPath::new("tokeirad.toml").expect("relative artifact path"),
+        ),
+        "CREDENTIAL".into(),
+        Arc::new(Mutex::new(Vec::new())),
+        root.clone(),
+    );
+    assert_ne!(first_manifest, coupled_manifest(&next));
+    std::fs::remove_dir_all(root).expect("remove temporary deployment root");
 }

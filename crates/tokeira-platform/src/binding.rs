@@ -277,6 +277,27 @@ impl<P: Platform> PlatformBinding<P> {
                     service.delivery.as_str()
                 )));
             }
+            if service.document.schema.is_empty() {
+                return Err(BindingError::new(format!(
+                    "service `{}` has an empty provider document schema",
+                    service.logical_id
+                )));
+            }
+            let mut port_names = BTreeSet::new();
+            for port in &service.ports {
+                if port.name.is_empty() || !port_names.insert(port.name.as_str()) {
+                    return Err(BindingError::new(format!(
+                        "service `{}` has duplicate or empty port identity `{}`",
+                        service.logical_id, port.name
+                    )));
+                }
+                if port.protocol.is_empty() {
+                    return Err(BindingError::new(format!(
+                        "service `{}` port `{}` has an empty protocol",
+                        service.logical_id, port.name
+                    )));
+                }
+            }
             let delivery = self
                 .providers
                 .delivery(&service.delivery)
@@ -289,6 +310,7 @@ impl<P: Platform> PlatformBinding<P> {
             })?;
         }
         for service in self.services.entries() {
+            let mut dependencies = BTreeSet::new();
             for dependency in &service.placement.needs {
                 if !service_ids.contains(dependency) {
                     return Err(BindingError::new(format!(
@@ -296,7 +318,19 @@ impl<P: Platform> PlatformBinding<P> {
                         service.logical_id
                     )));
                 }
+                if !dependencies.insert(dependency.as_str()) {
+                    return Err(BindingError::new(format!(
+                        "service `{}` declares duplicate dependency `{dependency}`",
+                        service.logical_id
+                    )));
+                }
             }
+        }
+        if let Some(cycle) = service_cycle(&self.services) {
+            return Err(BindingError::new(format!(
+                "service placement cycle involving {}",
+                cycle.join(", ")
+            )));
         }
 
         let mut artifact_ids = BTreeSet::new();
@@ -322,6 +356,13 @@ impl<P: Platform> PlatformBinding<P> {
                     )));
                 }
             }
+            let consumer_count = artifact.consumers.iter().collect::<BTreeSet<_>>().len();
+            if consumer_count != artifact.consumers.len() {
+                return Err(BindingError::new(format!(
+                    "artifact `{}` contains duplicate consumers",
+                    artifact.logical_id
+                )));
+            }
             if artifact.class == ArtifactClass::Inspection && !artifact.consumers.is_empty() {
                 return Err(BindingError::new(format!(
                     "inspection artifact `{}` cannot have operational consumers",
@@ -330,10 +371,31 @@ impl<P: Platform> PlatformBinding<P> {
             }
         }
         for service in self.services.entries() {
+            let mut uses = BTreeSet::new();
             for use_ in &service.configuration {
-                if !artifact_ids.contains(&use_.artifact) {
+                if use_.role.is_empty()
+                    || !uses.insert((use_.artifact.as_str(), use_.role.as_str()))
+                {
+                    return Err(BindingError::new(format!(
+                        "service `{}` has a duplicate or empty artifact role for `{}`",
+                        service.logical_id, use_.artifact
+                    )));
+                }
+                let Some(artifact) = self.artifacts.get(&use_.artifact) else {
                     return Err(BindingError::new(format!(
                         "service `{}` references unknown artifact `{}`",
+                        service.logical_id, use_.artifact
+                    )));
+                };
+                if artifact.class != ArtifactClass::Operational {
+                    return Err(BindingError::new(format!(
+                        "service `{}` cannot consume inspection artifact `{}`",
+                        service.logical_id, use_.artifact
+                    )));
+                }
+                if !artifact.consumers.contains(&service.logical_id) {
+                    return Err(BindingError::new(format!(
+                        "service `{}` is not an authorized consumer of artifact `{}`",
                         service.logical_id, use_.artifact
                     )));
                 }
@@ -362,7 +424,50 @@ impl<P: Platform> PlatformBinding<P> {
                     inspection.path.display()
                 )));
             }
+            if inspection.renderer.is_empty() {
+                return Err(BindingError::new(format!(
+                    "inspection path `{}` has an empty renderer identity",
+                    inspection.path.display()
+                )));
+            }
         }
         Ok(())
     }
+}
+
+fn service_cycle<P>(services: &ServiceCatalog<P>) -> Option<Vec<String>> {
+    fn visit<P>(
+        service: &str,
+        services: &ServiceCatalog<P>,
+        visiting: &mut Vec<String>,
+        visited: &mut BTreeSet<String>,
+    ) -> Option<Vec<String>> {
+        if let Some(index) = visiting.iter().position(|candidate| candidate == service) {
+            return Some(visiting[index..].to_vec());
+        }
+        if visited.contains(service) {
+            return None;
+        }
+        visiting.push(service.to_string());
+        let declaration = services
+            .get(service)
+            .expect("binding validation calls cycle detection only for known services");
+        for dependency in &declaration.placement.needs {
+            if let Some(cycle) = visit(dependency, services, visiting, visited) {
+                return Some(cycle);
+            }
+        }
+        let completed = visiting.pop().expect("visited service is on the DFS stack");
+        visited.insert(completed);
+        None
+    }
+
+    let mut visiting = Vec::new();
+    let mut visited = BTreeSet::new();
+    for service in services.entries() {
+        if let Some(cycle) = visit(&service.logical_id, services, &mut visiting, &mut visited) {
+            return Some(cycle);
+        }
+    }
+    None
 }

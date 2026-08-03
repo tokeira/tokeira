@@ -64,7 +64,7 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     // ── Engine apply (realized by the injected platform) ──
     // The deployment identity seeds the platform context; it was set at `init`.
     let project_name = deployment_identity(&envelope.deployment_id);
-    let applied = platform.infra_apply(deployment_dir).await?;
+    let applied = platform.infra_apply_with_artifacts(deployment_dir).await?;
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
     // — the set the rollback B-delete pass consumes (task 19.3). The
     // checkpoint consumes the audit vocabulary, not the report identity.

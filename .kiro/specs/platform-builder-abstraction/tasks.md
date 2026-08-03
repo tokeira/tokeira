@@ -268,12 +268,12 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - _Requirements: 3.1–3.48, 9.1–9.26, 14.13–14.15, 14.30–14.32, 14.46_
 
 - [ ] 12. Implement shared service/artifact delivery, content coupling, operations, and inspection
-  - [ ] 12.1 Implement platform-owned service and artifact catalogs
+  - [x] 12.1 Implement platform-owned service and artifact catalogs
     - Add immutable service/image/command/port/health/placement/configuration/delivery documents and
       operational/inspection artifact declarations without moving product content into the framework or
       provider crates.
     - _Requirements: 6.1–6.15, 14.36–14.39_
-  - [ ] 12.2 Implement provider delivery and deterministic content coupling
+  - [x] 12.2 Implement provider delivery and deterministic content coupling
     - Add typed document validation/canonicalization, provider realization, operational materialization,
       consumer receipts, and domain-separated identities over consumed non-secret content.
     - Couple authoritative `tokeirad.toml` and other consumed content to workload desired state while
@@ -294,7 +294,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - _Requirements: 3.21, 3.41–3.44, 6.21–6.23, 11.25–11.33, 14.40–14.43_
 
 - [ ] 13. Add required content, canonicalization, operations, and write-boundary property tests
-  - [ ] 13.1 Property test: Property 11 — content coupling is deterministic, sensitive, and secret-free
+  - [x] 13.1 Property test: Property 11 — content coupling is deterministic, sensitive, and secret-free
     - Generate consumed content and secret mutations; assert stable equal identities, changed desired
       state for changed non-secret bytes, and total secret exclusion.
     - Tag: `// Feature: platform-builder-abstraction, Property 11: content coupling is deterministic, sensitive, and secret-free`

@@ -434,6 +434,47 @@ pub struct ProviderExecutionError {
     pub message: String,
 }
 
+/// Failure while resolving or publishing one platform-owned operational artifact.
+#[derive(Debug, Error)]
+pub enum ArtifactError {
+    /// An authoritative deployment-local content source could not be read.
+    #[error("cannot read source `{path}` for operational artifact `{artifact}`: {source}")]
+    SourceRead {
+        /// Logical artifact identity.
+        artifact: String,
+        /// Deployment-local source path.
+        path: std::path::PathBuf,
+        /// Host filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A provider runtime registration needed for publication failed.
+    #[error(transparent)]
+    ProviderExecution(#[from] ProviderExecutionError),
+    /// Recorded infrastructure state needed by provider publication could not be loaded.
+    #[error("cannot load infrastructure state before operational artifact publication: {0}")]
+    State(#[from] tokeira_state::StateError),
+    /// Selected provider delivery rejected publication.
+    #[error("cannot publish operational artifact `{artifact}`: {source}")]
+    Delivery {
+        /// Logical artifact identity.
+        artifact: String,
+        /// Provider-owned publication failure.
+        #[source]
+        source: DeliveryError,
+    },
+    /// Provider publication evidence disagreed with the admitted declaration.
+    #[error(
+        "provider returned an invalid receipt for operational artifact `{artifact}`: {message}"
+    )]
+    InvalidReceipt {
+        /// Logical artifact identity.
+        artifact: String,
+        /// Exact receipt invariant that failed.
+        message: String,
+    },
+}
+
 impl ProviderExecutionError {
     /// Construct a provider-owned runtime failure without rewriting its detail.
     pub fn new(provider: impl Into<String>, message: impl Into<String>) -> Self {
@@ -445,7 +486,7 @@ impl ProviderExecutionError {
 }
 
 /// Failure to bind a verified definition to the generic engine adapter.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Error)]
 pub enum FrameworkError {
     /// The completed definition omitted the binding's required state-bootstrap module.
     #[error("verified definition omits required bootstrap module `{0}`")]
@@ -453,6 +494,9 @@ pub enum FrameworkError {
     /// A workload could not be projected by its selected provider delivery.
     #[error(transparent)]
     Delivery(#[from] DeliveryError),
+    /// Platform-owned content could not be resolved for deterministic projection.
+    #[error(transparent)]
+    Artifact(#[from] ArtifactError),
     /// More than one provider offered the single deploy-engine executor.
     #[error("multiple provider executions offer a deploy-engine platform: {0}")]
     AmbiguousDeployPlatform(String),

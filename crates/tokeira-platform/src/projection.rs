@@ -5,11 +5,16 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 use async_trait::async_trait;
 
 use crate::{
+    artifact::{
+        ArtifactClass, ContentIdentity, ContentIdentitySet, DesiredContent,
+        OperationalArtifactReceipt, OperationalArtifactReceipts, OperationalArtifactRequest,
+        OperationalArtifactStage,
+    },
     binding::{Platform, PlatformBinding},
     catalog::{DeliveryProjection, PlacementContext, ProviderSet},
     context::InvocationContext,
     definition::EvaluatedDefinition,
-    error::{FrameworkError, ProjectionError},
+    error::{ArtifactError, FrameworkError, ProjectionError},
     graph::{VerifiedGraph, WritebackValue},
     selection::{EffectiveSelection, SelectionDirection, select_modules},
 };
@@ -163,6 +168,14 @@ pub struct FrameworkDeployment<P: Platform> {
     binding: PlatformBinding<P>,
     invocation: InvocationContext,
     bootstrap_index: usize,
+    content_by_service: Arc<BTreeMap<String, ContentIdentitySet>>,
+    operational_content: BTreeMap<String, ResolvedOperationalContent>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedOperationalContent {
+    bytes: Arc<[u8]>,
+    identity: ContentIdentity,
 }
 
 /// Cloneable engine input pairing immutable desired structure with runtime-hydrated config.
@@ -197,11 +210,20 @@ impl<P: Platform> FrameworkDeployment<P> {
             .iter()
             .position(|module| module.name() == binding.bootstrap_module)
             .ok_or_else(|| FrameworkError::MissingBootstrap(binding.bootstrap_module.clone()))?;
+        let operational_content =
+            resolve_operational_content(&definition.graph, &binding, &invocation)?;
+        let content_by_service = Arc::new(content_identities_by_service(
+            &definition.graph,
+            &binding,
+            &operational_content,
+        ));
         let deployment = Self {
             definition: Arc::new(definition),
             binding,
             invocation,
             bootstrap_index,
+            content_by_service,
+            operational_content,
         };
         // Delivery projection is pure and deterministic. Running it once here
         // turns a provider-document failure into ordinary construction refusal;
@@ -253,6 +275,100 @@ impl<P: Platform> FrameworkDeployment<P> {
         !self.definition.graph.workloads().is_empty()
     }
 
+    /// Build the provider context used to publish artifacts before workload convergence.
+    pub async fn prepare_operational_context(
+        &self,
+    ) -> Result<tokeira_iac::ProvisionContext, ArtifactError> {
+        let mut context = tokeira_iac::ProvisionContext::default();
+        for execution in self.binding.providers.executions() {
+            execution
+                .register_infra_extensions(&self.definition.config, &self.invocation, &mut context)
+                .await?;
+        }
+        let store = self.binding.state.infra_store(
+            &self.definition.config,
+            &self.invocation,
+            &self.invocation.deployment_dir,
+        );
+        let (state, _) = store.load().await?;
+        context.state = state;
+        Ok(context)
+    }
+
+    /// Publish declared operational artifacts and admit exact provider receipts.
+    ///
+    /// Resolved bytes are cached when this invocation is constructed. Provider
+    /// publication therefore cannot turn its own output into desired input.
+    pub async fn materialize_operational_artifacts(
+        &self,
+        stage: OperationalArtifactStage,
+        context: &mut tokeira_iac::ProvisionContext,
+    ) -> Result<OperationalArtifactReceipts, ArtifactError> {
+        let mut receipts = Vec::new();
+        for artifact in self
+            .binding
+            .artifacts
+            .entries()
+            .iter()
+            .filter(|artifact| artifact.class == ArtifactClass::Operational)
+            .filter(|artifact| self.artifact_is_used_at_stage(&artifact.logical_id, stage))
+        {
+            let resolved = self
+                .operational_content
+                .get(&artifact.logical_id)
+                .expect("framework construction resolves every operational artifact");
+            let delivery = self
+                .binding
+                .providers
+                .delivery(&artifact.delivery)
+                .expect("binding validation admits every artifact delivery");
+            let receipt = delivery
+                .materialize_operational(
+                    OperationalArtifactRequest {
+                        artifact,
+                        content: &resolved.bytes,
+                        identity: &resolved.identity,
+                    },
+                    context,
+                )
+                .await
+                .map_err(|source| ArtifactError::Delivery {
+                    artifact: artifact.logical_id.clone(),
+                    source,
+                })?;
+            validate_receipt(artifact, &resolved.identity, &receipt)?;
+            receipts.push(receipt);
+        }
+        let receipts = OperationalArtifactReceipts::new(receipts);
+        context.set_extension(receipts.clone());
+        Ok(receipts)
+    }
+
+    fn artifact_is_used_at_stage(&self, artifact: &str, stage: OperationalArtifactStage) -> bool {
+        self.definition.graph.workloads().iter().any(|workload| {
+            let service = self
+                .binding
+                .services
+                .get(&workload.declaration().service)
+                .expect("binding validation admits every workload service");
+            let consumes = service
+                .configuration
+                .iter()
+                .any(|use_| use_.artifact == artifact);
+            let matches_stage = matches!(
+                (self.project_workload(workload), stage),
+                (
+                    Ok(DeliveryProjection::Infrastructure(_)),
+                    OperationalArtifactStage::Infrastructure
+                ) | (
+                    Ok(DeliveryProjection::Workload(_)),
+                    OperationalArtifactStage::Workload
+                )
+            );
+            consumes && matches_stage
+        })
+    }
+
     /// Project workloads only for providers that use the deploy-engine universe.
     pub fn services(
         &self,
@@ -301,6 +417,7 @@ impl<P: Platform> FrameworkDeployment<P> {
                 Box::new(FrameworkModule {
                     definition: Arc::clone(&self.definition),
                     providers: self.binding.providers.clone(),
+                    content_by_service: Arc::clone(&self.content_by_service),
                     module_index: index,
                     deployment_id: deployment_id.to_string(),
                     tags: tags.clone(),
@@ -341,7 +458,9 @@ impl<P: Platform> FrameworkDeployment<P> {
                 dependencies: Vec::new(),
                 tags: tags.clone(),
             },
-            &crate::artifact::ContentIdentitySet::default(),
+            self.content_by_service
+                .get(&workload.declaration().service)
+                .expect("binding validation admits every workload service"),
         )
     }
 
@@ -354,6 +473,7 @@ impl<P: Platform> FrameworkDeployment<P> {
         Box::new(FrameworkModule {
             definition: Arc::clone(&self.definition),
             providers: self.binding.providers.clone(),
+            content_by_service: Arc::clone(&self.content_by_service),
             module_index,
             deployment_id: deployment_id.to_string(),
             tags: tags.clone(),
@@ -525,6 +645,7 @@ impl<P: Platform> tokeira_orchestrator::Deployment for FrameworkDeployment<P> {
 struct FrameworkModule<P: Platform> {
     definition: Arc<EvaluatedDefinition<P>>,
     providers: ProviderSet<P>,
+    content_by_service: Arc<BTreeMap<String, ContentIdentitySet>>,
     module_index: usize,
     deployment_id: String,
     tags: BTreeMap<String, String>,
@@ -594,7 +715,9 @@ impl<P: Platform> tokeira_iac::Module for FrameworkModule<P> {
                         dependencies: Vec::new(),
                         tags: self.tags.clone(),
                     },
-                    &crate::artifact::ContentIdentitySet::default(),
+                    self.content_by_service
+                        .get(&workload.declaration().service)
+                        .expect("binding validation admits every workload service"),
                 )
                 .map_err(|error| tokeira_iac::IacError::CompositionInvalid(error.to_string()))?;
             if let DeliveryProjection::Infrastructure(resource) = projection {
@@ -603,4 +726,114 @@ impl<P: Platform> tokeira_iac::Module for FrameworkModule<P> {
         }
         Ok(resources)
     }
+}
+
+fn resolve_operational_content<P: Platform>(
+    graph: &VerifiedGraph,
+    binding: &PlatformBinding<P>,
+    invocation: &InvocationContext,
+) -> Result<BTreeMap<String, ResolvedOperationalContent>, ArtifactError> {
+    let active_artifacts = graph
+        .workloads()
+        .iter()
+        .flat_map(|workload| {
+            binding
+                .services
+                .get(&workload.declaration().service)
+                .expect("binding validation admits every workload service")
+                .configuration
+                .iter()
+                .map(|use_| use_.artifact.as_str())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    binding
+        .artifacts
+        .entries()
+        .iter()
+        .filter(|artifact| artifact.class == ArtifactClass::Operational)
+        .filter(|artifact| active_artifacts.contains(artifact.logical_id.as_str()))
+        .map(|artifact| {
+            let bytes = match &artifact.content {
+                DesiredContent::Text(value) => value.as_bytes().to_vec(),
+                DesiredContent::Bytes(value) => value.clone(),
+                DesiredContent::DeploymentFile(relative) => {
+                    let path = invocation.deployment_dir.join(relative.as_path());
+                    std::fs::read(&path).map_err(|source| ArtifactError::SourceRead {
+                        artifact: artifact.logical_id.clone(),
+                        path,
+                        source,
+                    })?
+                }
+            };
+            let identity = ContentIdentity::new(
+                &format!("platform-artifact/{}", artifact.logical_id),
+                &bytes,
+            );
+            Ok((
+                artifact.logical_id.clone(),
+                ResolvedOperationalContent {
+                    bytes: Arc::from(bytes),
+                    identity,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn content_identities_by_service<P: Platform>(
+    graph: &VerifiedGraph,
+    binding: &PlatformBinding<P>,
+    operational: &BTreeMap<String, ResolvedOperationalContent>,
+) -> BTreeMap<String, ContentIdentitySet> {
+    let active_services = graph
+        .workloads()
+        .iter()
+        .map(|workload| workload.declaration().service.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    binding
+        .services
+        .entries()
+        .iter()
+        .filter(|service| active_services.contains(service.logical_id.as_str()))
+        .map(|service| {
+            let identities = service
+                .configuration
+                .iter()
+                .map(|use_| {
+                    let resolved = operational
+                        .get(&use_.artifact)
+                        .expect("binding validation permits only operational artifact uses");
+                    (use_.clone(), resolved.identity.clone())
+                })
+                .collect();
+            let identities = ContentIdentitySet::new(identities)
+                .expect("binding validation rejects duplicate service artifact uses");
+            (service.logical_id.clone(), identities)
+        })
+        .collect()
+}
+
+fn validate_receipt(
+    artifact: &crate::artifact::PlatformArtifact,
+    identity: &ContentIdentity,
+    receipt: &OperationalArtifactReceipt,
+) -> Result<(), ArtifactError> {
+    let message = if receipt.artifact != artifact.logical_id {
+        Some(format!("receipt names artifact `{}`", receipt.artifact))
+    } else if receipt.provider_reference.is_empty() {
+        Some("provider reference is empty".to_string())
+    } else if &receipt.identity != identity {
+        Some("receipt content identity differs from the published bytes".to_string())
+    } else if receipt.consumers != artifact.consumers {
+        Some("receipt consumers differ from the platform declaration".to_string())
+    } else {
+        None
+    };
+    if let Some(message) = message {
+        return Err(ArtifactError::InvalidReceipt {
+            artifact: artifact.logical_id.clone(),
+            message,
+        });
+    }
+    Ok(())
 }

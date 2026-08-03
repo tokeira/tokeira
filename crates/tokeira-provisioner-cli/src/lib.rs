@@ -227,6 +227,17 @@ pub trait ProvisionerPlatform {
     /// log (task 19.2).
     async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome>;
 
+    /// Reconcile infrastructure after publishing declared operational artifacts.
+    ///
+    /// Ordinary apply, upgrade, and explicit definition reversion use this
+    /// entrypoint. Automated engine rollback deliberately calls
+    /// [`infra_apply`](Self::infra_apply) so it cannot publish artifacts while
+    /// restoring the retained engine. Legacy adapters have no artifact catalog
+    /// and retain their existing apply behavior through this default.
+    async fn infra_apply_with_artifacts(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
+        self.infra_apply(deployment_dir).await
+    }
+
     /// Tear down the deployment's infrastructure. Returns the removed count.
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize>;
 

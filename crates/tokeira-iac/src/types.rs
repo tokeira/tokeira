@@ -1,5 +1,7 @@
 //! Public types for plan output and module selection.
 
+use std::collections::{BTreeSet, HashMap, VecDeque};
+
 use crate::Module;
 
 /// Controls which modules are included in a composition.
@@ -17,6 +19,196 @@ impl ModuleSelection {
             ModuleSelection::Only(names) => names.iter().any(|n| n == name),
             ModuleSelection::Except(names) => !names.iter().any(|n| n == name),
         }
+    }
+}
+
+/// Direction in which an explicit module selection expands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionDirection {
+    /// Plan/apply include transitive prerequisites.
+    Prerequisites,
+    /// Destroy includes transitive dependants.
+    Dependants,
+}
+
+/// Expand an explicit selection over real infrastructure modules.
+pub fn expand_module_selection(
+    modules: &[Box<dyn Module>],
+    selection: &ModuleSelection,
+    direction: SelectionDirection,
+) -> Result<ModuleSelection, crate::IacError> {
+    let ModuleSelection::Only(requested) = selection else {
+        return Ok(selection.clone());
+    };
+    if requested.is_empty() {
+        return Err(crate::IacError::CompositionInvalid(
+            "module selection cannot be empty".to_string(),
+        ));
+    }
+    let supported = modules
+        .iter()
+        .map(|module| module.name().to_string())
+        .collect::<Vec<_>>();
+    let known = supported
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let unknown = requested
+        .iter()
+        .filter(|name| !known.contains(name.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !unknown.is_empty() {
+        return Err(crate::IacError::CompositionInvalid(format!(
+            "unknown modules: {}; supported modules: {}",
+            unknown.into_iter().collect::<Vec<_>>().join(", "),
+            supported.join(", ")
+        )));
+    }
+
+    let prerequisites = modules
+        .iter()
+        .map(|module| {
+            (
+                module.name().to_string(),
+                module
+                    .dependencies()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut dependants = HashMap::<String, Vec<String>>::new();
+    for (module, dependencies) in &prerequisites {
+        for dependency in dependencies {
+            dependants
+                .entry(dependency.clone())
+                .or_default()
+                .push(module.clone());
+        }
+    }
+    let mut selected = requested.iter().cloned().collect::<BTreeSet<_>>();
+    let mut queue = requested.iter().cloned().collect::<VecDeque<_>>();
+    while let Some(module) = queue.pop_front() {
+        let adjacent = match direction {
+            SelectionDirection::Prerequisites => prerequisites.get(&module),
+            SelectionDirection::Dependants => dependants.get(&module),
+        };
+        for adjacent in adjacent.into_iter().flatten() {
+            if selected.insert(adjacent.clone()) {
+                queue.push_back(adjacent.clone());
+            }
+        }
+    }
+    Ok(ModuleSelection::Only(
+        supported
+            .into_iter()
+            .filter(|module| selected.contains(module))
+            .collect(),
+    ))
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestModule {
+        name: &'static str,
+        dependencies: Vec<&'static str>,
+    }
+
+    impl Module for TestModule {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn dependencies(&self) -> Vec<&str> {
+            self.dependencies.clone()
+        }
+
+        fn resources(
+            &self,
+            _context: &crate::ModuleContext<'_>,
+        ) -> Result<Vec<Box<dyn crate::Resource>>, crate::IacError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn modules() -> Vec<Box<dyn Module>> {
+        vec![
+            Box::new(TestModule {
+                name: "state",
+                dependencies: Vec::new(),
+            }),
+            Box::new(TestModule {
+                name: "database",
+                dependencies: vec!["state"],
+            }),
+            Box::new(TestModule {
+                name: "service",
+                dependencies: vec!["database"],
+            }),
+            Box::new(TestModule {
+                name: "metrics",
+                dependencies: vec!["state"],
+            }),
+        ]
+    }
+
+    fn selected(selection: ModuleSelection) -> Vec<String> {
+        let ModuleSelection::Only(selected) = selection else {
+            panic!("explicit selection remains explicit");
+        };
+        selected
+    }
+
+    #[test]
+    // Feature: platform-builder-abstraction, Property 9: module selection is the required closure.
+    fn module_selection_expands_the_directional_transitive_closure() {
+        assert_eq!(
+            selected(
+                expand_module_selection(
+                    &modules(),
+                    &ModuleSelection::Only(vec!["service".to_string()]),
+                    SelectionDirection::Prerequisites,
+                )
+                .expect("prerequisite closure"),
+            ),
+            ["state", "database", "service"]
+        );
+        assert_eq!(
+            selected(
+                expand_module_selection(
+                    &modules(),
+                    &ModuleSelection::Only(vec!["state".to_string()]),
+                    SelectionDirection::Dependants,
+                )
+                .expect("dependant closure"),
+            ),
+            ["state", "database", "service", "metrics"]
+        );
+    }
+
+    #[test]
+    fn module_selection_rejects_empty_and_unknown_requests() {
+        assert!(
+            expand_module_selection(
+                &modules(),
+                &ModuleSelection::Only(Vec::new()),
+                SelectionDirection::Prerequisites,
+            )
+            .is_err()
+        );
+        assert!(
+            expand_module_selection(
+                &modules(),
+                &ModuleSelection::Only(vec!["unknown".to_string()]),
+                SelectionDirection::Prerequisites,
+            )
+            .is_err()
+        );
     }
 }
 

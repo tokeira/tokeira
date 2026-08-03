@@ -2,9 +2,9 @@
 //!
 //! Every `tkr` command that targets a specific deployment ends up here to
 //! turn a `--deployment <name>` flag (or the `.latest` sentinel) into a
-//! fully-loaded [`DeploymentContext`]. The context bundles the deployment's
-//! on-disk path, its metadata, and its parsed platform config so downstream
-//! handlers can dispatch off `metadata.platform` without re-reading TOML.
+//! fully-loaded [`DeploymentContext`] for legacy in-process platforms. A
+//! definition-bound platform is resolved from admitted metadata and operated by
+//! the provisioner married into its directory.
 //!
 //! # On-disk layout
 //!
@@ -12,9 +12,11 @@
 //!
 //! ```text
 //! ~/Library/Application Support/tokeira/tkr/<name>/
-//!   deployment.toml   # platform-specific config (LocalConfig | ComposeConfig | EcsConfig)
+//!   definition.<fmt>  # definition-bound platform source, when recorded
+//!   deployment.toml   # legacy Local/ECS platform config, otherwise
 //!   tokeirad.toml     # TokeiraConfig consumed by the tokeirad server binary
 //!   metadata.json     # identity + status tracked by the CLI
+//!   tkp               # generated platform/frontend provisioner, when bound
 //!   state/            # infra + deploy engine state (single-doc CAS files)
 //!   tokeirad.pid      # written while `tkr deploy apply` runs against local platform
 //! ```
@@ -36,11 +38,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
-use tokeira_compose_deployment::ComposeConfig;
 use tokeira_ecs_deployment::EcsConfig;
 use tokeira_local_deployment::LocalConfig;
-use tokeira_orchestrator::{DefinitionFormatId, PlatformKind, PlatformLaunchClass, StorageKind};
-use tokeira_platform::definition::RelativeDefinitionPath;
+use tokeira_orchestrator::{PlatformId, StorageKind};
 use tokeira_provisioner::RecordedDefinition;
 use uuid::Uuid;
 
@@ -48,18 +48,13 @@ use crate::metadata::{self, DeploymentMetadata, DeploymentStatus};
 
 pub(crate) const DEPLOYMENT_TOML: &str = "deployment.toml";
 pub(crate) const TOKEIRAD_TOML: &str = "tokeirad.toml";
-pub(crate) const DEFINITION_TKD: &str = "definition.tkd";
 pub(crate) const METADATA_JSON: &str = "metadata.json";
 pub(crate) const LATEST_FILE: &str = ".latest";
 /// The deployment-local provisioner binary — the `tkp` married to this
-/// deployment, placed at create and preferred by the launcher over any on `PATH`.
+/// deployment, placed at create and required by the launcher.
 /// The provisioner's name **inside a deployment dir** — always `tkp`,
 /// regardless of which platform's binary it is (Req 14.4).
 pub(crate) const PROVISIONER_BIN: &str = "tkp";
-/// The **source** binary `create` resolves and copies in: the `tkp` bin
-/// target of `platforms/compose` (all forwarded deployments are compose
-/// today; the constructed binary is `tkp`, never `tkp-<platform>`).
-pub(crate) const PROVISIONER_SOURCE_BIN: &str = "tkp";
 
 /// External definition source selected before deployment staging begins.
 #[derive(Debug, Clone)]
@@ -82,10 +77,6 @@ pub(crate) struct PendingDeployment {
 impl PendingDeployment {
     pub(crate) fn path(&self) -> &Path {
         &self.staging_path
-    }
-
-    pub(crate) fn metadata(&self) -> &DeploymentMetadata {
-        &self.metadata
     }
 
     /// Publish the complete directory, then atomically replace `.latest`.
@@ -199,10 +190,8 @@ impl DeploymentResolver {
 
     /// Resolve a deployment to its on-disk directory, verifying it exists.
     ///
-    /// Unlike [`load_context`], this parses **no** in-process platform config —
-    /// it is the entry point for **forwarded** (`.tkd`) deployments, which the
-    /// bound `tkp` drives from the directory alone (the launcher needs only the
-    /// path).
+    /// Unlike [`load_context`], this parses no legacy in-process platform config.
+    /// A bound `tkp` drives a definition-bound deployment from this directory.
     pub(crate) fn resolve_dir(&self, requested: Option<&str>) -> Result<PathBuf> {
         let name = self.resolve_name(requested)?;
         let path = self.path(&name);
@@ -212,64 +201,25 @@ impl DeploymentResolver {
         Ok(path)
     }
 
-    /// Whether the resolved deployment uses its bound provisioner.
+    /// Whether the resolved deployment records a bound definition.
     ///
-    /// Routing is admitted metadata, never inferred from source-file presence.
+    /// Routing uses admitted metadata, never source-file presence or extension.
     pub(crate) fn uses_bound_provisioner(&self, requested: Option<&str>) -> Result<bool> {
         let path = self.resolve_dir(requested)?;
         let metadata = metadata::read(&path)?;
-        match metadata.launch_class {
-            Some(PlatformLaunchClass::BoundProvisioner) => Ok(true),
-            Some(PlatformLaunchClass::LegacyInProcess) => Ok(false),
-            None => bail!(
-                "deployment '{}' predates recorded launch-class metadata; recreate or migrate it before running lifecycle commands",
-                metadata.name
-            ),
-        }
+        Ok(metadata.definition.is_some())
     }
 
-    /// Introduce the deployment's bound provisioner — copy `tkp` into `<name>/` so
-    /// the deployment carries its own binary (the deployment-married provisioner,
-    /// Proposal 005). The launcher prefers this deployment-local copy over any
-    /// `tkp` on `PATH`, so the binary that mutates the deployment is exactly the
-    /// one married to it at create.
-    ///
-    /// Phase 0 (native-cargo dev binding, Proposal 005): resolves the
-    /// **platform source binary** (`tkp`, a bin target of
-    /// `platforms/compose` — the platform ships its own provisioner) and
-    /// copies its bytes in as `tkp`. Resolution order: installed on PATH,
-    /// then the running `tkr`'s own directory (a dev `tkr` in `target/debug`
-    /// finds its sibling from the same build), then — inside the workspace —
-    /// **`tkr` builds it from the platform crate** (15.5's "tkr compiles tkp
-    /// from `platforms/<platform>`", the create-time leg). The hermetic
-    /// build/obtain + bundle verification supersede this (tasks 16-18).
-    /// Resolve the per-platform provisioner **source** binary from the
-    /// Phase-0 pool, labeled for provenance reporting: installed on PATH →
-    /// beside the running `tkr` → built from the workspace. The pool is
-    /// where fresh bytes come from — placement at create and the upgrade
-    /// re-marry both draw from it (the deployment's married copy is
-    /// definitionally the *old* engine and never a candidate).
-    pub(crate) fn resolve_provisioner_source() -> Result<(PathBuf, &'static str)> {
-        if let Ok(path) = which::which(PROVISIONER_SOURCE_BIN) {
-            return Ok((path, "installed on PATH"));
-        }
-        if let Some(sibling) = std::env::current_exe()
-            .ok()
-            .and_then(|exe| Some(exe.parent()?.join(PROVISIONER_SOURCE_BIN)))
-            .filter(|sibling| sibling.is_file())
-        {
-            return Ok((sibling, "beside this tkr"));
-        }
-        Ok((
-            Self::build_provisioner_from_workspace()?,
-            "built from the workspace",
-        ))
-    }
-
-    pub(crate) fn place_provisioner_at(&self, deployment_dir: &Path) -> Result<()> {
-        // Resolution is labeled: placement is a provenance event, and the
-        // operator report says which leg supplied the bytes and from where.
-        let (source, how) = Self::resolve_provisioner_source()?;
+    /// Build the catalog-selected composition root and marry its exact `tkp`
+    /// bytes to the staged deployment.
+    pub(crate) fn place_provisioner_at(
+        &self,
+        deployment_dir: &Path,
+        workspace: &Path,
+        platform: &tokeira_build::PlatformPackageDescriptor,
+        frontend: &tokeira_build::DefinitionFrontendPackageDescriptor,
+    ) -> Result<()> {
+        let source = Self::build_provisioner_from_workspace(workspace, platform, frontend)?;
         let bytes =
             fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
         let sha256 = tokeira_provisioner::sha256_hex(&bytes);
@@ -283,53 +233,42 @@ impl DeploymentResolver {
             fs::set_permissions(&dest, perms)?;
         }
         println!(
-            "provisioner: placed `tkp` ({how}: {}, sha256 {}…)",
-            source.display(),
+            "provisioner: placed generated `{}/{}` tkp (sha256 {}…)",
+            platform.id,
+            frontend.format,
             &sha256[..12]
         );
         Ok(())
     }
 
-    /// The create-time build leg (task 15.5): inside the workspace, `tkr`
-    /// compiles the platform's provisioner bin and returns the built
-    /// artifact — "tkr compiles tkp from `platforms/<platform>`", literally.
-    /// Outside a workspace (an installed `tkr` with no source tree),
-    /// resolution has honestly run out and the error names everything tried.
-    ///
-    /// (An associated function, not a method: the resolver's root plays no
-    /// part in where the provisioner is built from.)
-    fn build_provisioner_from_workspace() -> Result<PathBuf> {
-        let cwd = std::env::current_dir().context("cannot determine the current directory")?;
-        let Ok(workspace) = crate::bundle_create::workspace_root_from(&cwd) else {
-            bail!(
-                "cannot introduce the compose provisioner: no `{PROVISIONER_SOURCE_BIN}` on \
-                 PATH, none beside this `tkr`, and no tokeira workspace above {} to build one \
-                 from — install `{PROVISIONER_SOURCE_BIN}` or run from inside the workspace",
-                cwd.display()
-            );
-        };
+    pub(crate) fn build_provisioner_from_workspace(
+        workspace: &Path,
+        platform: &tokeira_build::PlatformPackageDescriptor,
+        frontend: &tokeira_build::DefinitionFrontendPackageDescriptor,
+    ) -> Result<PathBuf> {
+        let source = tokeira_build::assemble_bound_provisioner(workspace, platform, frontend)
+            .context("failed to assemble the bound provisioner source")?;
+        let generated = source
+            .materialize_in(workspace)
+            .context("failed to materialize the bound provisioner source")?;
         eprintln!(
-            "provisioner: building `{PROVISIONER_SOURCE_BIN}` from the workspace (Phase 0 dev \
-             binding)…"
+            "provisioner: building generated `{}/{}` root {}…",
+            source.platform(),
+            source.format(),
+            &source.generated_root_digest().to_hex()[..12]
         );
         let status = std::process::Command::new("cargo")
-            .current_dir(&workspace)
-            .args([
-                "build",
-                "-p",
-                "tokeira-compose-deployment",
-                "--bin",
-                PROVISIONER_SOURCE_BIN,
-            ])
+            .current_dir(workspace)
+            .args(["build", "--locked", "--manifest-path"])
+            .arg(generated.join("Cargo.toml"))
             .status()
-            .context("failed to run `cargo build` for the provisioner")?;
+            .context("failed to run Cargo for the generated provisioner")?;
         if !status.success() {
-            bail!(
-                "`cargo build -p tokeira-compose-deployment --bin {PROVISIONER_SOURCE_BIN}` failed — \
-                 see the build output above"
-            );
+            bail!("the generated bound-provisioner build failed; see Cargo output above");
         }
-        let artifact = workspace.join("target/debug").join(PROVISIONER_SOURCE_BIN);
+        let artifact = generated
+            .join("target/debug")
+            .join(tokeira_build::GENERATED_PROVISIONER_BIN);
         if !artifact.is_file() {
             bail!(
                 "the provisioner build succeeded but {} is missing",
@@ -343,7 +282,7 @@ impl DeploymentResolver {
     pub(crate) fn begin_create(
         &self,
         name: &str,
-        platform: PlatformKind,
+        platform: PlatformId,
         storage: StorageKind,
         region: Option<String>,
         definition_seed: Option<DefinitionSeed>,
@@ -367,8 +306,7 @@ impl DeploymentResolver {
             metadata: DeploymentMetadata {
                 name: String::new(),
                 id: Uuid::nil(),
-                platform,
-                launch_class: None,
+                platform: platform.clone(),
                 definition: None,
                 storage,
                 status: DeploymentStatus::Created,
@@ -380,48 +318,35 @@ impl DeploymentResolver {
         fs::create_dir_all(path.join("state"))?;
 
         let recorded_definition = definition_seed.as_ref().map(|seed| seed.definition.clone());
-        match platform {
-            // The compose platform is `.tkd`-defined and provisioned by a
-            // forwarded compose `tkp`: seed its definition (storage/region baked
-            // into `config()`) plus a prototypical `tokeirad.toml` the operator can
-            // edit before the first apply (writeback-updated at apply). No legacy
-            // in-process `deployment.toml`.
-            PlatformKind::Compose => {
-                let seed = definition_seed.ok_or_else(|| {
-                    anyhow!("the Compose deployment requires an external definition seed")
-                })?;
-                let definition_path = path.join(seed.definition.path.as_path());
-                let definition_parent = definition_path
-                    .parent()
-                    .expect("a deployment-relative definition has a parent");
-                fs::create_dir_all(definition_parent)?;
-                fs::write(definition_path, seed.bytes)?;
-                fs::write(
-                    path.join(TOKEIRAD_TOML),
-                    crate::prototypical::server_config(platform, storage, region.as_deref())?,
-                )?;
-            }
-            // Legacy in-process platforms (`local`; `ecs` still in-process for now).
-            PlatformKind::Local | PlatformKind::Ecs => {
-                fs::write(
-                    path.join(DEPLOYMENT_TOML),
-                    crate::prototypical::deployment_config(platform, storage, region.as_deref())?,
-                )?;
-                fs::write(
-                    path.join(TOKEIRAD_TOML),
-                    crate::prototypical::server_config(platform, storage, region.as_deref())?,
-                )?;
-            }
+        if let Some(seed) = definition_seed {
+            let definition_path = path.join(seed.definition.path.as_path());
+            let definition_parent = definition_path
+                .parent()
+                .expect("a deployment-relative definition has a parent");
+            fs::create_dir_all(definition_parent)?;
+            fs::write(definition_path, seed.bytes)?;
+            fs::write(
+                path.join(TOKEIRAD_TOML),
+                tokeira_config::TokeiraConfig::default().to_toml()?,
+            )?;
+        } else {
+            let legacy = crate::legacy::LegacyPlatform::from_id(&platform).ok_or_else(|| {
+                anyhow!("platform `{platform}` has neither a catalog seed nor a legacy adapter")
+            })?;
+            fs::write(
+                path.join(DEPLOYMENT_TOML),
+                legacy.deployment_config(storage),
+            )?;
+            fs::write(
+                path.join(TOKEIRAD_TOML),
+                legacy.server_config(storage, region.as_deref())?,
+            )?;
         }
         let now = timestamp();
         let metadata = DeploymentMetadata {
             name: name.clone(),
             id: Uuid::new_v4(),
             platform,
-            launch_class: Some(match platform {
-                PlatformKind::Compose => PlatformLaunchClass::BoundProvisioner,
-                PlatformKind::Local | PlatformKind::Ecs => PlatformLaunchClass::LegacyInProcess,
-            }),
             definition: recorded_definition,
             storage,
             status: DeploymentStatus::Created,
@@ -440,14 +365,24 @@ impl DeploymentResolver {
     pub(crate) fn create(
         &self,
         name: &str,
-        platform: PlatformKind,
+        platform: PlatformId,
         storage: StorageKind,
         region: Option<String>,
     ) -> Result<DeploymentMetadata> {
-        let seed = if platform == PlatformKind::Compose {
-            Some(compose_definition_seed(storage, region.as_deref())?)
-        } else {
+        let seed = if crate::legacy::LegacyPlatform::from_id(&platform).is_some() {
             None
+        } else {
+            let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let catalog = crate::catalog::PlatformCatalog::from_workspace(&workspace)?;
+            let platform_descriptor = catalog.platform(&platform)?;
+            let (frontend, path) = catalog.workspace_frontend(platform_descriptor, None)?;
+            Some(DefinitionSeed {
+                definition: RecordedDefinition {
+                    format: frontend.format.clone(),
+                    path: frontend.default_relative_path.clone(),
+                },
+                bytes: fs::read(path)?,
+            })
         };
         self.begin_create(name, platform, storage, region, seed)?
             .publish()
@@ -533,45 +468,12 @@ impl DeploymentResolver {
     }
 }
 
-/// Resolve the current workspace's Compose seed as an ordinary artifact.
-/// Installed operation retains the existing embedded fallback until the
-/// admitted published-seed transport completes task 10.3.
-pub(crate) fn compose_definition_seed(
-    storage: StorageKind,
-    region: Option<&str>,
-) -> Result<DefinitionSeed> {
-    let cwd = std::env::current_dir().context("cannot determine the current directory")?;
-    let source = match crate::bundle_create::workspace_root_from(&cwd) {
-        Ok(workspace) => {
-            let seed_path = workspace.join("platforms/compose/definition.tkd");
-            fs::read_to_string(&seed_path).with_context(|| {
-                format!("failed to read definition seed {}", seed_path.display())
-            })?
-        }
-        Err(_) => tokeira_compose_deployment::DEFAULT_TKD.to_string(),
-    };
-    let source = crate::prototypical::compose_definition(&source, storage, region)?;
-    Ok(DefinitionSeed {
-        definition: RecordedDefinition {
-            format: DefinitionFormatId::new("tkd")
-                .expect("the built-in tkd format id is canonical"),
-            path: RelativeDefinitionPath::new(DEFINITION_TKD)
-                .expect("the built-in definition path is safe"),
-        },
-        bytes: source.into_bytes(),
-    })
-}
-
 /// Platform-specific config loaded from deployment.toml.
 ///
-/// Each variant carries the fully parsed config for that platform so
-/// handlers can branch on the deployment's platform kind without
-/// re-reading files from disk. `Compose` and `Ecs` configs are boxed
-/// because they're significantly larger than `LocalConfig` (observability
-/// stacks, ECR mirror lists, etc.).
+/// Each variant carries the fully parsed config for a legacy in-process
+/// platform. Definition-bound platform config is owned by its provisioner.
 pub(crate) enum PlatformDeploymentConfig {
     Local(LocalConfig),
-    Compose(Box<ComposeConfig>),
     Ecs(Box<EcsConfig>),
 }
 
@@ -604,14 +506,10 @@ pub(crate) fn load_context(
     }
     let metadata = metadata::read(&path)?;
     let deployment_config_path = path.join(DEPLOYMENT_TOML);
-    // A forwarded (`.tkd`) deployment has no in-process platform config — its
-    // definition IS `definition.tkd`, interpreted by the married `tkp`. Every
-    // caller of this function speaks the in-process dialect, so refuse in
-    // domain terms: without this guard each caller surfaces a bare "no such
-    // file" for a file the deployment was never meant to have. (Which
-    // operational verbs the forwarded surface grows is a design decision, not
-    // this error's business — the message states the contract, not a roadmap.)
-    if metadata.launch_class == Some(PlatformLaunchClass::BoundProvisioner) {
+    // A definition-bound deployment has no in-process platform config. Every
+    // caller of this function speaks the legacy dialect, so refuse in domain
+    // terms instead of surfacing a missing `deployment.toml`.
+    if metadata.definition.is_some() {
         let definition = metadata
             .definition
             .as_ref()
@@ -622,24 +520,19 @@ pub(crate) fn load_context(
              `{PROVISIONER_BIN}`; this command drives in-process (`{DEPLOYMENT_TOML}`) platforms"
         );
     }
-    let platform_config = match metadata.platform {
-        PlatformKind::Local => {
+    let platform_config = match metadata.platform.as_str() {
+        "local" => {
             let config: LocalConfig = tokeira_config::load_config(&deployment_config_path, None)
                 .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
             PlatformDeploymentConfig::Local(config)
         }
-        PlatformKind::Compose => {
-            let mut config: ComposeConfig =
-                tokeira_config::load_config(&deployment_config_path, None).with_context(|| {
-                    format!("failed to load {}", deployment_config_path.display())
-                })?;
-            config.deployment_dir = path.clone();
-            PlatformDeploymentConfig::Compose(Box::new(config))
-        }
-        PlatformKind::Ecs => {
+        "ecs" => {
             let config: EcsConfig = tokeira_config::load_config(&deployment_config_path, None)
                 .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
             PlatformDeploymentConfig::Ecs(Box::new(config))
+        }
+        platform => {
+            bail!("deployment '{name}' records unsupported in-process platform `{platform}`")
         }
     };
     Ok(DeploymentContext {

@@ -1,24 +1,20 @@
-//! Definition-language-neutral platform authoring and projection framework.
+//! Minimal language-neutral boundary for deployment-definition frontends.
 //!
-//! This crate owns the common in-memory contract driven by definition
-//! frontends and selected by first-party platform bindings. It deliberately
-//! contains no parser, provider implementation, platform inventory, CLI, or
-//! provisioner entrypoint. Frontends translate their runtime values into
-//! [`author::AuthorNode`]; provider crates supply typed registrations through
-//! [`catalog`]; platform crates assemble immutable values through [`binding`].
+//! This crate owns transient located values, structural graph validation,
+//! provider-kind placement, source diagnostics, content identity, and safe
+//! inspection publication. Concrete platforms own services, images, provider
+//! calls, operations, and inspection rendering. The orchestration layer retains
+//! state-store lifecycle and its existing concrete-store selection seam.
 
-pub mod artifact;
 pub mod author;
-pub mod binding;
-pub mod catalog;
 pub mod config;
+pub mod content;
 pub mod context;
 pub mod definition;
 pub mod error;
 pub mod graph;
-pub mod ops;
-pub mod projection;
-pub mod selection;
+pub mod inspection;
+pub mod kind;
 
 #[cfg(test)]
 mod tests;

@@ -1,29 +1,25 @@
-//! Day-2 operator helpers over a running compose deployment — log and
-//! port-mapping lookups plus declared replicas, keyed on the deployment
-//! directory and the `deployment.toml` config. Read-only by construction:
-//! the mutating verbs reach the deployment through its married provisioner
-//! and are deliberately not here.
+//! Compose-owned logs and port-forwarding support.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use tokeira_compose::ComposePlatform;
-use tokeira_orchestrator::{PortMapping, Result, ServiceReplicas};
+use tokeira_compose::{ComposePlatform, LogStream};
+use tokeira_orchestrator::{PortMapping, Result};
+use tokeira_provisioner::DeploymentBindingMetadata;
 
-use crate::config::ComposeConfig;
-
-/// The services a compose deployment runs. Fixed by the reference definition;
-/// used to answer an unknown service name with the valid set.
+/// Services in the reference Compose deployment.
 pub const VALID_SERVICES: [&str; 5] = ["mimir", "loki", "tokeirad", "grafana", "alloy"];
 
-/// Compose file is always at `<deployment_dir>/docker-compose.yml`.
-fn compose_file_for(deployment_dir: &Path) -> PathBuf {
-    deployment_dir.join("docker-compose.yml")
-}
-
-fn platform(deployment_dir: &Path, config: &ComposeConfig) -> Result<ComposePlatform> {
-    ComposePlatform::connect(compose_file_for(deployment_dir), &config.project_name)
-        .map_err(anyhow::Error::from)
-        .map_err(Into::into)
+fn platform(deployment_dir: &Path) -> Result<ComposePlatform> {
+    let metadata_path = deployment_dir.join("metadata.json");
+    let metadata: DeploymentBindingMetadata =
+        serde_json::from_slice(&std::fs::read(&metadata_path).map_err(anyhow::Error::from)?)
+            .map_err(anyhow::Error::from)?;
+    ComposePlatform::connect(
+        deployment_dir.join("state/compose-services.yaml"),
+        &metadata.name,
+    )
+    .map_err(anyhow::Error::from)
+    .map_err(Into::into)
 }
 
 fn known_service(service: &str) -> Result<()> {
@@ -38,54 +34,25 @@ fn known_service(service: &str) -> Result<()> {
     }
 }
 
-/// The replica counts the deployment's config declares.
-pub fn desired_replicas(config: &ComposeConfig) -> Vec<ServiceReplicas> {
-    vec![
-        ServiceReplicas {
-            service: "mimir".into(),
-            replicas: config.observability.mimir_replicas,
-        },
-        ServiceReplicas {
-            service: "loki".into(),
-            replicas: config.observability.loki_replicas,
-        },
-        ServiceReplicas {
-            service: "tokeirad".into(),
-            replicas: config.tokeirad.replicas,
-        },
-        ServiceReplicas {
-            service: "grafana".into(),
-            replicas: config.observability.grafana_replicas,
-        },
-        ServiceReplicas {
-            service: "alloy".into(),
-            replicas: config.observability.alloy_replicas,
-        },
-    ]
-}
-
-/// Tail a service's container logs.
-pub async fn logs(
+/// Open incremental logs for one Compose service.
+pub async fn log_stream(
     service: &str,
-    config: &ComposeConfig,
     deployment_dir: &Path,
-) -> Result<Vec<String>> {
+    follow: bool,
+    tail: Option<u32>,
+) -> Result<LogStream> {
     known_service(service)?;
-    platform(deployment_dir, config)?
-        .logs(service)
+    platform(deployment_dir)?
+        .log_stream(service, follow, tail)
         .await
         .map_err(anyhow::Error::from)
         .map_err(Into::into)
 }
 
-/// The service's live host-port mappings.
-pub async fn port_mappings(
-    service: &str,
-    config: &ComposeConfig,
-    deployment_dir: &Path,
-) -> Result<Vec<PortMapping>> {
+/// Resolve the service's live host/container port mappings.
+pub async fn port_mappings(service: &str, deployment_dir: &Path) -> Result<Vec<PortMapping>> {
     known_service(service)?;
-    platform(deployment_dir, config)?
+    platform(deployment_dir)?
         .port_mappings(service)
         .await
         .map(|mappings| {

@@ -1,4 +1,4 @@
-//! Generated observability configuration managed as IaC state.
+//! Compose-owned observability configuration and dashboards.
 
 use std::{
     collections::BTreeMap,
@@ -8,10 +8,15 @@ use std::{
 
 use askama::Template;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokeira_iac as iac;
+use tokeira_platform::{
+    error::KindError,
+    kind::{PlacementContext, ProviderKind},
+};
 
 /// The module that owns the observability config-files resource.
 const MODULE_OBSERVABILITY: &str = "observability";
@@ -99,17 +104,114 @@ pub struct ObservabilityParams {
     pub loki_retention_hours: u32,
 }
 
+/// Authored parameters for the ordinary configuration-files resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfiguration {
+    /// Metrics scrape host.
+    pub scrape_host: String,
+    /// Metrics scrape port.
+    pub scrape_port: u16,
+    /// Cluster label.
+    pub cluster: String,
+    /// Deployment label.
+    pub deployment: String,
+    /// Mimir remote-write endpoint.
+    pub mimir_remote_write: String,
+    /// Loki push endpoint.
+    pub loki_push: String,
+    /// Mimir HTTP port.
+    pub mimir_http_port: u16,
+    /// Loki HTTP port.
+    pub loki_http_port: u16,
+    /// Loki retention period.
+    pub retention_hours: u32,
+}
+
+impl ObservabilityConfiguration {
+    fn params(&self) -> ObservabilityParams {
+        ObservabilityParams {
+            metrics_target_host: self.scrape_host.clone(),
+            metrics_target_port: self.scrape_port,
+            cluster: self.cluster.clone(),
+            deployment: self.deployment.clone(),
+            mimir_remote_write_url: self.mimir_remote_write.clone(),
+            loki_push_url: self.loki_push.clone(),
+            mimir_http_port: self.mimir_http_port,
+            loki_http_port: self.loki_http_port,
+            loki_retention_hours: self.retention_hours,
+        }
+    }
+}
+
+impl ProviderKind for ObservabilityConfiguration {
+    fn kind_name(&self) -> &'static str {
+        "ObservabilityConfiguration"
+    }
+
+    fn validate_input(&self) -> Result<(), KindError> {
+        ConfigGenerator::new(PathBuf::new())
+            .render_all(&self.params())
+            .map(|_| ())
+            .map_err(|error| KindError::new(error.to_string()))
+    }
+
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn desired_manifest(&self, _placement: &PlacementContext) -> serde_json::Value {
+        let files = ConfigGenerator::new(PathBuf::new())
+            .render_all(&self.params())
+            .expect("validated observability parameters render")
+            .into_iter()
+            .map(|file| {
+                (
+                    path_key(&file.relative_path),
+                    file_property(file.contents.as_bytes()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        json!({ "files": files })
+    }
+
+    fn realize(&self, placement: &PlacementContext) -> Result<Box<dyn iac::Resource>, KindError> {
+        self.validate_input()?;
+        Ok(Box::new(ObservabilityConfigFilesResource::new(
+            placement.deployment_dir.clone(),
+            self.params(),
+        )))
+    }
+}
+
+/// Engine identity of the rendered-configuration resource.
+pub fn configuration_resource_id() -> iac::ResourceId {
+    ObservabilityConfigFilesResource::resource_id_value()
+}
+
 impl ObservabilityParams {
-    /// The parameters implied by a deployment's `deployment.toml` config —
-    /// what the observability check renders the expected files from. Kept
-    /// beside the templates so the check and the platform's own rendering
-    /// can never disagree about what "expected" means.
-    pub fn from_config(config: &crate::config::ComposeConfig) -> Self {
+    /// Parameters derived from typed Compose config and runtime deployment identity.
+    pub fn from_config(config: &crate::config::ComposeConfig, deployment: &str) -> Self {
         Self {
             metrics_target_host: "tokeirad".into(),
             metrics_target_port: config.tokeirad.metrics_port,
-            cluster: config.project_name.clone(),
-            deployment: config.project_name.clone(),
+            cluster: deployment.to_string(),
+            deployment: deployment.to_string(),
+            mimir_remote_write_url: "http://mimir:9009/api/v1/push".into(),
+            loki_push_url: "http://loki:3100/loki/api/v1/push".into(),
+            mimir_http_port: 9009,
+            loki_http_port: 3100,
+            loki_retention_hours: 168,
+        }
+    }
+
+    #[cfg(test)]
+    fn reference() -> Self {
+        Self {
+            metrics_target_host: "tokeirad".into(),
+            metrics_target_port: 9090,
+            cluster: "tokeira".into(),
+            deployment: "tokeira".into(),
             mimir_remote_write_url: "http://mimir:9009/api/v1/push".into(),
             loki_push_url: "http://loki:3100/loki/api/v1/push".into(),
             mimir_http_port: 9009,
@@ -248,77 +350,77 @@ impl ConfigGenerator {
     fn alert_rules(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(ALERT_RULES),
-            contents: include_str!("../alerts/observability-alerts.yaml").to_string(),
+            contents: include_str!("../../alerts/observability-alerts.yaml").to_string(),
         }
     }
 
     fn grpc_edge_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(GRPC_EDGE_DASHBOARD),
-            contents: include_str!("../dashboards/grpc-edge-health.json").to_string(),
+            contents: include_str!("../../dashboards/grpc-edge-health.json").to_string(),
         }
     }
 
     fn broker_runtime_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(BROKER_RUNTIME_DASHBOARD),
-            contents: include_str!("../dashboards/broker-runtime-health.json").to_string(),
+            contents: include_str!("../../dashboards/broker-runtime-health.json").to_string(),
         }
     }
 
     fn storage_projection_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(STORAGE_PROJECTION_DASHBOARD),
-            contents: include_str!("../dashboards/storage-projection-health.json").to_string(),
+            contents: include_str!("../../dashboards/storage-projection-health.json").to_string(),
         }
     }
 
     fn log_exploration_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(LOG_EXPLORATION_DASHBOARD),
-            contents: include_str!("../dashboards/log-exploration.json").to_string(),
+            contents: include_str!("../../dashboards/log-exploration.json").to_string(),
         }
     }
 
     fn dsql_connection_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(DSQL_CONNECTION_DASHBOARD),
-            contents: include_str!("../dashboards/dsql-connection-health.json").to_string(),
+            contents: include_str!("../../dashboards/dsql-connection-health.json").to_string(),
         }
     }
 
     fn occ_contention_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(OCC_CONTENTION_DASHBOARD),
-            contents: include_str!("../dashboards/occ-contention.json").to_string(),
+            contents: include_str!("../../dashboards/occ-contention.json").to_string(),
         }
     }
 
     fn placement_controller_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(PLACEMENT_CONTROLLER_DASHBOARD),
-            contents: include_str!("../dashboards/placement-controller.json").to_string(),
+            contents: include_str!("../../dashboards/placement-controller.json").to_string(),
         }
     }
 
     fn autoscaler_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(AUTOSCALER_DASHBOARD),
-            contents: include_str!("../dashboards/autoscaler.json").to_string(),
+            contents: include_str!("../../dashboards/autoscaler.json").to_string(),
         }
     }
 
     fn projection_workers_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(PROJECTION_WORKERS_DASHBOARD),
-            contents: include_str!("../dashboards/projection-workers.json").to_string(),
+            contents: include_str!("../../dashboards/projection-workers.json").to_string(),
         }
     }
 
     fn infrastructure_health_dashboard(&self) -> RenderedConfigFile {
         RenderedConfigFile {
             relative_path: PathBuf::from(INFRASTRUCTURE_HEALTH_DASHBOARD),
-            contents: include_str!("../dashboards/infrastructure-health.json").to_string(),
+            contents: include_str!("../../dashboards/infrastructure-health.json").to_string(),
         }
     }
 }
@@ -873,17 +975,7 @@ mod semantics_tests {
     fn resource() -> ObservabilityConfigFilesResource {
         ObservabilityConfigFilesResource::new(
             PathBuf::from("/tmp/x"),
-            ObservabilityParams {
-                metrics_target_host: "h".into(),
-                metrics_target_port: 1,
-                cluster: "c".into(),
-                deployment: "d".into(),
-                mimir_remote_write_url: "http://m".into(),
-                loki_push_url: "http://l".into(),
-                mimir_http_port: 2,
-                loki_http_port: 3,
-                loki_retention_hours: 4,
-            },
+            ObservabilityParams::reference(),
         )
     }
 

@@ -56,6 +56,9 @@ tokeirad.log
 # transient files. Nothing in this directory is ever committed.
 /artifacts/
 
+# Disposable catalog-selected provisioner composition roots.
+/.tokeira-build/
+
 # VS Code multi-root workspace file. Pre-existing commits contain this file;
 # `git rm --cached tokeira.code-workspace` stopped tracking it at commit
 # <SHA after next commit>.

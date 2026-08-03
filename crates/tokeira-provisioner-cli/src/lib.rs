@@ -12,12 +12,11 @@
 // CLI shell: stdout/stderr are the operator interface.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::path::Path;
+use std::{path::Path, pin::Pin};
 
 use anyhow::Result;
 use tokeira_iac::{Change, ChangeKind, PlanOutcome};
-use tokeira_orchestrator::DefinitionFormatId;
-use tokeira_platform::definition::RelativeDefinitionPath;
+use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 use tokeira_provisioner::DeploymentStateEnvelope;
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
@@ -48,33 +47,31 @@ pub use cli::run;
 pub use tokeira_provisioner::{ChangeLogEntry, ChangeOp};
 
 /// Generate the disposable `tkp` entrypoint for one statically selected
-/// platform binding and one Definition Frontend.
+/// concrete platform provisioner and one definition frontend.
 #[macro_export]
 macro_rules! bound_provisioner_main {
     (
         expected_platform: $platform:literal,
-        binding: $binding:path,
+        platform: $platform_factory:path,
         expected_format: $format:literal,
         frontend: $frontend:path $(,)?
     ) => {
         fn main() -> std::process::ExitCode {
-            $crate::run_bound_provisioner($platform, $format, $binding(), $frontend())
+            $crate::run_bound_provisioner($platform, $format, $platform_factory($frontend()))
         }
     };
 }
 
 /// Synchronous process boundary used only by generated composition roots.
-pub fn run_bound_provisioner<P, F>(
+pub fn run_bound_provisioner<P>(
     expected_platform: &'static str,
     expected_format: &'static str,
-    binding: tokeira_platform::binding::PlatformBinding<P>,
-    frontend: F,
+    platform: P,
 ) -> std::process::ExitCode
 where
-    P: tokeira_platform::binding::Platform,
-    F: tokeira_platform::definition::DefinitionFrontend<P>,
+    P: ProvisionerPlatform,
 {
-    let platform = match BoundPlatform::new(expected_platform, expected_format, binding, frontend) {
+    let platform = match BoundPlatform::new(expected_platform, expected_format, platform) {
         Ok(platform) => platform,
         Err(error) => {
             eprintln!("{error:#}");
@@ -118,6 +115,10 @@ pub enum Realization<T> {
 /// on. Keys are the engine's own resource identities, so a snapshot joins the
 /// plan's changes without translation.
 pub type DesiredSnapshot = std::collections::BTreeMap<tokeira_iac::ResourceId, serde_json::Value>;
+
+/// Incremental operator log output. Providers retain their native streaming
+/// behavior; the shell never collects logs into an in-memory snapshot.
+pub type LogStream = Pin<Box<dyn futures_util::Stream<Item = Result<String>> + Send>>;
 
 /// The typed refusal a verb returns after emitting a platform-issue
 /// document: the document already said everything (output-templates §The
@@ -207,7 +208,7 @@ pub trait ProvisionerPlatform {
     fn config_source(&self, deployment_dir: &Path) -> Result<ConfigSource>;
 
     /// Definition format compiled into this provisioner, when interpreted.
-    fn definition_format(&self) -> Option<&'static str> {
+    fn definition_format(&self) -> Option<&str> {
         None
     }
 
@@ -275,6 +276,30 @@ pub trait ProvisionerPlatform {
         let _ = (deployment_dir, source);
         Ok(Realization::NotApplicable {
             reason: "this platform has no interpreted definition",
+        })
+    }
+
+    /// Open a platform-native stream for one logical service.
+    async fn log_stream(
+        &self,
+        _deployment_dir: &Path,
+        _service: &str,
+        _follow: bool,
+        _tail: Option<u32>,
+    ) -> Result<Realization<LogStream>> {
+        Ok(Realization::NotApplicable {
+            reason: "this platform exposes no service logs",
+        })
+    }
+
+    /// Resolve live host/container mappings for one logical service.
+    async fn port_mappings(
+        &self,
+        _deployment_dir: &Path,
+        _service: &str,
+    ) -> Result<Realization<Vec<tokeira_orchestrator::PortMapping>>> {
+        Ok(Realization::NotApplicable {
+            reason: "this platform exposes no published port mappings",
         })
     }
 

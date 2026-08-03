@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use tokeira_orchestrator::{PlatformKind, StorageKind};
+use tokeira_orchestrator::{DefinitionFormatId, PlatformId, StorageKind};
 
 #[derive(Parser)]
 #[command(name = "tkr")]
@@ -176,6 +176,9 @@ pub(crate) enum DefinitionAction {
         /// Definition format resolved through the trusted frontend catalog.
         #[arg(long, requires = "definition")]
         format: Option<tokeira_orchestrator::DefinitionFormatId>,
+        /// Platform whose typed config, context, and kinds admit the source.
+        #[arg(long, requires = "definition")]
+        platform: Option<tokeira_orchestrator::PlatformId>,
     },
 }
 
@@ -188,7 +191,11 @@ pub(crate) enum DeploymentAction {
         /// with `in-memory` storage — `tkr deployment create` alone always
         /// works on a fresh machine.
         #[arg(long, default_value = "local")]
-        platform: CliPlatformKind,
+        platform: PlatformId,
+        /// Definition frontend format. Omit when the selected platform package
+        /// supplies exactly one recognized seed.
+        #[arg(long)]
+        format: Option<DefinitionFormatId>,
         #[arg(long, default_value = "in-memory")]
         storage: CliStorageKind,
         #[arg(long)]
@@ -545,27 +552,10 @@ pub(crate) enum GithubKeyAction {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CliPlatformKind {
-    Local,
-    Compose,
-    Ecs,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliStorageKind {
     #[value(name = "in-memory")]
     InMemory,
     Dsql,
-}
-
-impl From<CliPlatformKind> for PlatformKind {
-    fn from(value: CliPlatformKind) -> Self {
-        match value {
-            CliPlatformKind::Local => PlatformKind::Local,
-            CliPlatformKind::Compose => PlatformKind::Compose,
-            CliPlatformKind::Ecs => PlatformKind::Ecs,
-        }
-    }
 }
 
 impl From<CliStorageKind> for StorageKind {

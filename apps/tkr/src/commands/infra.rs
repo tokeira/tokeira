@@ -44,7 +44,6 @@ pub(crate) async fn run(
         PlatformDeploymentConfig::Local(config) => {
             run_with_engine(action, deployments, &ctx, LocalDeployment, config, format).await
         }
-        PlatformDeploymentConfig::Compose(_) => Err(super::compose_requires_definition().into()),
         PlatformDeploymentConfig::Ecs(config) => {
             if matches!(&action, InfraAction::Apply { .. }) {
                 validate_ecs_mirrors(config).await?;

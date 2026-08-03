@@ -1,9 +1,8 @@
 //! The launch seam (Requirement 7, task 9.1).
 //!
-//! `tkr` never mutates a deployment itself — for a lifecycle verb it resolves the
-//! deployment's provisioner binary **by launch class**, checksum-verifies it, and
-//! executes it, forwarding the verb to the bound `tkp`. The mutating binary is
-//! therefore always the exact stamped binary married to the deployment.
+//! `tkr` never mutates a definition-bound deployment itself. It executes the
+//! `tkp` married to that deployment, applying the appropriate binding and
+//! integrity gate before a lifecycle mutation.
 //!
 //! | Class | When | Binary | Verified against |
 //! |-------|------|--------|------------------|
@@ -12,9 +11,8 @@
 //! | **Dev-candidate** | apply to a `dev` deployment | the current local dev build | gate permits `DevIterate` |
 //! | **Rollback** | `rollback` | bound B (undo), then retained A (reconcile) | B from the manifest; A from the checkpoint |
 //!
-//! This first increment resolves `tkp` (an installed binary on `PATH`, else a
-//! `cargo run --bin tkp` dev build), enforces the **Bound** and **Rollback**
-//! classes' checksum against the recorded manifest (abort on mismatch, Req 7.2 —
+//! The launcher requires the deployment-local `tkp` and enforces the **Bound**
+//! and **Rollback** classes' checksum against the recorded manifest (abort on mismatch, Req 7.2 —
 //! rollback launches `B`, which the envelope's manifest still records at launch
 //! time), and execs `tkp <verb> --deployment-dir <dir>`. The candidate-upgrade
 //! external-metadata verification is a follow-on; the two-binary rollback
@@ -59,7 +57,9 @@ pub(crate) enum LaunchClass {
 /// to `init` is treated the same).
 pub(crate) fn resolve_class(verb: &[&str], envelope: &DeploymentStateEnvelope) -> LaunchClass {
     match verb {
-        ["describe"] | ["definition", "check"] | [_, "plan"] => LaunchClass::ReadOnly,
+        ["describe"] | ["definition", "check"] | ["logs"] | ["port-mappings"] | [_, "plan"] => {
+            LaunchClass::ReadOnly
+        }
         ["upgrade"] => LaunchClass::CandidateUpgrade,
         ["rollback"] => LaunchClass::Rollback,
         _ => match envelope.binding.as_ref().map(|b| b.build_mode) {
@@ -69,59 +69,24 @@ pub(crate) fn resolve_class(verb: &[&str], envelope: &DeploymentStateEnvelope) -
     }
 }
 
-/// The resolved provisioner binary.
-enum TkpBinary {
-    /// A concrete installed `tkp` (checksum-verifiable).
-    Installed(PathBuf),
-    /// `cargo run --bin tkp` — a dev build; not checksum-verifiable, so it can
-    /// only serve dev/candidate classes, never **bound**.
-    Cargo,
-}
+/// The deployment-married provisioner binary.
+struct TkpBinary(PathBuf);
 
 impl TkpBinary {
-    /// Resolve the `tkp` to run, **preferring the deployment's own bound binary**
-    /// (`<dir>/tkp`, placed at `tkr deployment create`) over anything else. A
-    /// never-inceptioned deployment falls back to the per-platform source
-    /// binary (`tkp` from the compose platform — all forwarded deployments are compose today): on
-    /// PATH, beside the running `tkr`, then a `cargo run` dev build of the
-    /// platform's bin target.
-    fn resolve(deployment_dir: &Path) -> Self {
+    /// Resolve the exact binary married at deployment creation.
+    fn resolve(deployment_dir: &Path) -> Result<Self> {
         let bound = deployment_dir.join(crate::deployment_dir::PROVISIONER_BIN);
         if bound.is_file() {
-            return TkpBinary::Installed(bound);
+            return Ok(Self(bound));
         }
-        let source = crate::deployment_dir::PROVISIONER_SOURCE_BIN;
-        if let Ok(path) = which::which(source) {
-            return TkpBinary::Installed(path);
-        }
-        if let Some(sibling) = std::env::current_exe()
-            .ok()
-            .and_then(|exe| Some(exe.parent()?.join(source)))
-            .filter(|sibling| sibling.is_file())
-        {
-            return TkpBinary::Installed(sibling);
-        }
-        TkpBinary::Cargo
+        bail!(
+            "deployment has no married provisioner at {}; recreate it through catalog-driven deployment creation",
+            bound.display()
+        )
     }
 
     fn command(&self) -> (String, Vec<String>) {
-        match self {
-            TkpBinary::Installed(path) => (path.display().to_string(), Vec::new()),
-            // The platform ships its own provisioner: build/run the compose
-            // platform's bin target from source (dev fallback).
-            TkpBinary::Cargo => (
-                "cargo".to_string(),
-                vec![
-                    "run".to_string(),
-                    "--quiet".to_string(),
-                    "-p".to_string(),
-                    "tokeira-compose-deployment".to_string(),
-                    "--bin".to_string(),
-                    crate::deployment_dir::PROVISIONER_SOURCE_BIN.to_string(),
-                    "--".to_string(),
-                ],
-            ),
-        }
+        (self.0.display().to_string(), Vec::new())
     }
 }
 
@@ -210,18 +175,9 @@ async fn launch_with_envs(
 ) -> Result<()> {
     let envelope = load_envelope(deployment_dir).await?;
     let class = resolve_class(verb, &envelope);
-    let binary = TkpBinary::resolve(deployment_dir);
-    let verb_label = verb.join(" ");
-
+    let binary = TkpBinary::resolve(deployment_dir)?;
     if requires_manifest_verification(class, &envelope) {
-        match &binary {
-            TkpBinary::Installed(path) => verify_against_manifest(path, &envelope)?,
-            TkpBinary::Cargo => bail!(
-                "deployment is bound to a versioned engine but no installed `tkp` was found on \
-                 PATH; refusing to drive `{verb_label}` with a `cargo run` dev build — install \
-                 the recorded `tkp`"
-            ),
-        }
+        verify_against_manifest(&binary.0, &envelope)?;
     }
 
     let (program, mut args) = binary.command();
@@ -234,7 +190,7 @@ async fn launch_with_envs(
     // answer; *which binary executed it* is evidence, not answer — it joins
     // the `--detail`/`--json` surface when mutating verbs migrate onto the
     // output contract (docs/platforms/operator-output-contract.md). The
-    // launch-class taxonomy stays internal either way.
+    // Launch provenance remains internal either way.
     let status = tokio::process::Command::new(&program)
         .args(&args)
         .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
@@ -363,7 +319,7 @@ async fn orchestrate_rollback(
 /// definition change is idempotent; the *binary* advances whenever the
 /// implementation changed):
 ///
-/// 1. resolve the **candidate** from the Phase-0 source pool — never the
+/// 1. resolve the **candidate** from the recorded catalog selection — never the
 ///    married copy, which is definitionally the engine being upgraded FROM
 ///    (resolving it as its own candidate is how `upgrade` was wedged: A
 ///    evaluated `upgrade(A, A)` and refused forever);
@@ -377,12 +333,25 @@ async fn orchestrate_rollback(
 ///    the physical half of the re-marry (the envelope re-bound inside the
 ///    verb; the file must follow it).
 pub(crate) async fn launch_upgrade(deployment_dir: &Path) -> Result<()> {
-    // The resolution leg (`_how`: PATH / sibling / workspace build) is
-    // evidence for the detail surface once mutating verbs carry the output
-    // contract's flags — the summary transcript opens with the verb's own
-    // report instead.
-    let (candidate, _how) =
-        crate::deployment_dir::DeploymentResolver::resolve_provisioner_source()?;
+    let metadata = crate::metadata::read(deployment_dir)?;
+    let definition = metadata
+        .definition
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("legacy in-process deployments have no bound upgrade"))?;
+    let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let workspace = crate::bundle_create::workspace_root_from(&cwd)?;
+    let catalog = crate::catalog::PlatformCatalog::from_workspace(&workspace)?;
+    let platform = catalog.platform(&metadata.platform)?;
+    let frontend = catalog.frontend(&definition.format)?;
+    let crate::catalog::PlatformSource::Workspace(platform) = &platform.source else {
+        unreachable!("workspace catalog returned published platform coordinates");
+    };
+    let crate::catalog::FrontendSource::Workspace(frontend) = &frontend.source else {
+        unreachable!("workspace catalog returned published frontend coordinates");
+    };
+    let candidate = crate::deployment_dir::DeploymentResolver::build_provisioner_from_workspace(
+        &workspace, platform, frontend,
+    )?;
     let candidate_bytes = std::fs::read(&candidate)
         .with_context(|| format!("failed to read the candidate at {}", candidate.display()))?;
     let bound_path = deployment_dir.join(PROVISIONER_BIN);
@@ -425,13 +394,13 @@ pub(crate) async fn launch_upgrade(deployment_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `tkr definition check --definition <p> --format <id>`: check a definition
-/// anywhere on disk without deployment state. The interpreter lives in `tkp`,
-/// so resolve one from the Phase-0 source pool and hand it the file; a
-/// directory uses the format's conventional basename.
+/// Check a named platform/format definition anywhere on disk without deployment
+/// state. Catalog selection generates the same static composition root used at
+/// deployment creation; a directory uses the format's conventional basename.
 pub(crate) async fn launch_definition_check_at_path(
     path: &Path,
-    format: &str,
+    platform: &tokeira_orchestrator::PlatformId,
+    format: &tokeira_orchestrator::DefinitionFormatId,
     json: bool,
     detail: bool,
 ) -> Result<()> {
@@ -451,8 +420,20 @@ pub(crate) async fn launch_definition_check_at_path(
     if !definition.exists() {
         bail!("no definition found at {}", definition.display());
     }
-    let (candidate, _how) =
-        crate::deployment_dir::DeploymentResolver::resolve_provisioner_source()?;
+    let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let workspace = crate::bundle_create::workspace_root_from(&cwd)?;
+    let catalog = crate::catalog::PlatformCatalog::from_workspace(&workspace)?;
+    let platform = catalog.platform(platform)?;
+    let frontend = catalog.frontend(format)?;
+    let crate::catalog::PlatformSource::Workspace(platform) = &platform.source else {
+        unreachable!("workspace catalog returned published platform coordinates");
+    };
+    let crate::catalog::FrontendSource::Workspace(frontend) = &frontend.source else {
+        unreachable!("workspace catalog returned published frontend coordinates");
+    };
+    let candidate = crate::deployment_dir::DeploymentResolver::build_provisioner_from_workspace(
+        &workspace, platform, frontend,
+    )?;
     let mut args = vec![
         "definition".to_string(),
         "check".to_string(),

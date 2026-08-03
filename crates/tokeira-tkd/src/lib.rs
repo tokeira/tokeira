@@ -2,9 +2,8 @@
 //!
 //! Parses a `.tkd` (Rust syntax, via `syn`), enforces the interpreted subset
 //! (reject-by-default allow-list), and drives the language-neutral
-//! [`TkdFrontend`] adapter. The interpreter remains generic over [`HostBridge`]
-//! so its runtime holds author handles opaquely; the standard bridge now lives in
-//! this crate and delegates every operation to `tokeira-platform`.
+//! [`TkdFrontend`] adapter. Evaluator handles remain private to this crate; the
+//! shared platform boundary receives one completed transient definition.
 //!
 //! The passes: [`schema`] (type/fn tables + `#[create]`/`#[require]`), [`subset`]
 //! (the allow-list), [`eval`] (the tree walk), [`admission`] (retarget + require).

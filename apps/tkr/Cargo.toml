@@ -39,7 +39,6 @@ tokeira-build.workspace = true
 tokeira-deploy-engine = { path = "../../crates/tokeira-deploy-engine" }
 tokeira-iac = { path = "../../crates/tokeira-iac" }
 tokeira-local-deployment = { path = "../../platforms/local" }
-tokeira-compose-deployment = { path = "../../platforms/compose" }
 tokeira-ecs-deployment = { path = "../../platforms/ecs" }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokeira-platform.workspace = true

@@ -11,12 +11,14 @@
 //! destroy` first; this ordering is deliberate so a misplaced
 //! `deployment destroy` never orphans AWS resources.
 
-use anyhow::Result;
-use tokeira_orchestrator::{PlatformKind, PlatformLaunchClass};
+use anyhow::{Context, Result, bail};
+use tokeira_orchestrator::StorageKind;
+use tokeira_provisioner::RecordedDefinition;
 
 use crate::{
+    catalog::{FrontendSource, PlatformCatalog, PlatformSource},
     cli::DeploymentAction,
-    deployment_dir::{DeploymentResolver, normalize_name},
+    deployment_dir::{DefinitionSeed, DeploymentResolver, normalize_name},
     deployment_lock, launcher,
     metadata::DeploymentMetadata,
     output::OutputFormatter,
@@ -33,29 +35,57 @@ pub(crate) async fn run(
         DeploymentAction::Create {
             name,
             platform,
+            format,
             storage,
             region,
             bundle,
             build_image,
         } => {
             let resolved_name = name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let platform: PlatformKind = platform.into();
             let storage = storage.into();
-            let seed = if platform == PlatformKind::Compose {
-                Some(crate::deployment_dir::compose_definition_seed(
-                    storage,
-                    region.as_deref(),
-                )?)
-            } else {
-                None
+            if crate::legacy::LegacyPlatform::from_id(&platform).is_some() {
+                if format.is_some() {
+                    bail!("legacy platform `{platform}` does not use a definition frontend");
+                }
+                if bundle {
+                    bail!("`--bundle` applies only to catalog-discovered platforms");
+                }
+                let pending =
+                    deployments.begin_create(&resolved_name, platform, storage, region, None)?;
+                let metadata = pending.publish()?;
+                print_metadata(&metadata, json)?;
+                return Ok(());
+            }
+
+            if storage != StorageKind::InMemory || region.is_some() {
+                bail!(
+                    "catalog-defined platforms take initial provider choices from their definition seed; create the deployment with defaults, then edit the recorded definition before first apply"
+                );
+            }
+            let cwd = std::env::current_dir().context("cannot determine current directory")?;
+            let workspace = crate::bundle_create::workspace_root_from(&cwd)?;
+            let catalog = PlatformCatalog::from_workspace(&workspace)?;
+            let platform_descriptor = catalog.platform(&platform)?;
+            let (frontend_descriptor, seed_path) =
+                catalog.workspace_frontend(platform_descriptor, format.as_ref())?;
+            let PlatformSource::Workspace(platform_package) = &platform_descriptor.source else {
+                unreachable!("workspace catalog returned published platform coordinates");
+            };
+            let FrontendSource::Workspace(frontend_package) = &frontend_descriptor.source else {
+                unreachable!("workspace catalog returned published frontend coordinates");
+            };
+            let seed = DefinitionSeed {
+                definition: RecordedDefinition {
+                    format: frontend_descriptor.format.clone(),
+                    path: frontend_descriptor.default_relative_path.clone(),
+                },
+                bytes: std::fs::read(&seed_path).with_context(|| {
+                    format!("failed to read definition seed {}", seed_path.display())
+                })?,
             };
             let pending =
-                deployments.begin_create(&resolved_name, platform, storage, region, seed)?;
-            // Forwarded (`.tkd`) platforms carry their own bound provisioner —
-            // introduce `tkp` into the deployment at create: the verified
-            // hermetic bundle when `--bundle` opts in (task 18.3), else the
-            // Phase-0 native dev copy.
-            if pending.metadata().launch_class == Some(PlatformLaunchClass::BoundProvisioner) {
+                deployments.begin_create(&resolved_name, platform, storage, region, Some(seed))?;
+            {
                 if bundle {
                     let image = build_image.as_deref().ok_or_else(|| {
                         anyhow::anyhow!(
@@ -67,18 +97,20 @@ pub(crate) async fn run(
                         deployments,
                         pending.path(),
                         image,
+                        &workspace,
+                        platform_package,
+                        frontend_package,
                     )
                     .await?;
                 } else {
-                    // (place_provisioner reports the resolution leg + digest.)
-                    deployments.place_provisioner_at(pending.path())?;
+                    deployments.place_provisioner_at(
+                        pending.path(),
+                        &workspace,
+                        platform_package,
+                        frontend_package,
+                    )?;
                 }
                 launcher::validate_staged_definition(pending.path()).await?;
-            } else if bundle {
-                anyhow::bail!(
-                    "`--bundle` applies only to forwarded (`.tkd`) platforms — this deployment \
-                     is driven in-process"
-                );
             }
             let metadata = pending.publish()?;
             print_metadata(&metadata, json)?;
@@ -106,7 +138,7 @@ pub(crate) async fn run(
                         vec![
                             marker.to_string(),
                             item.name,
-                            format!("{:?}", item.platform),
+                            item.platform.to_string(),
                             format!("{:?}", item.storage),
                             format!("{:?}", item.status),
                             item.updated_at,
@@ -177,7 +209,7 @@ fn print_metadata(metadata: &DeploymentMetadata, as_json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(metadata)?);
     } else {
         println!(
-            "{}\t{:?}\t{:?}\t{:?}",
+            "{}\t{}\t{:?}\t{:?}",
             metadata.name, metadata.platform, metadata.storage, metadata.status
         );
     }

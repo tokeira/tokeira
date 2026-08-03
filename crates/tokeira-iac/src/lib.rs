@@ -45,7 +45,7 @@ pub use semantics::{
 };
 pub use types::{
     Change, ChangeKind, FieldDiff, InfraComposition, ModuleSelection, ResourceDiff,
-    destructive_changes, plan_is_destructive,
+    SelectionDirection, destructive_changes, expand_module_selection, plan_is_destructive,
 };
 pub use writeback::{WritebackError, write_config_values};
 

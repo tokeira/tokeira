@@ -22,13 +22,12 @@
 //!
 //! - **`cli`** defines the clap surface. Adding a subcommand starts here.
 //! - **`deployment_dir`** owns how deployments are resolved, loaded, and persisted.
-//! - **`commands`** contains one module per top-level subcommand; each module
-//!   receives a `DeploymentContext` (when needed) and dispatches through
-//!   `commands::PlatformOps` for platform-agnostic operations.
+//! - **`commands`** contains one module per top-level subcommand. Definition-bound
+//!   deployments execute through their married provisioner; Local/ECS retain
+//!   the legacy in-process handlers.
 //! - **`tui`** wires engine progress events to spinners (human mode) or JSON
 //!   lines (`--json` mode).
-//! - **`prototypical`** generates the template TOML written when a deployment
-//!   is created.
+//! - **`catalog`** resolves platform/front-end source used to create bound deployments.
 //!
 //! # Working assumptions
 //!
@@ -51,10 +50,10 @@ mod commands;
 mod deployment_dir;
 mod deployment_lock;
 mod launcher;
+mod legacy;
 mod metadata;
 mod output;
 mod process;
-mod prototypical;
 mod tui;
 
 use cli::{
@@ -107,7 +106,11 @@ async fn main() -> Result<()> {
             commands::image::run(args.command, deployment, format).await
         }
         Command::Definition { action } => {
-            let cli::DefinitionAction::Check { definition, format } = action;
+            let cli::DefinitionAction::Check {
+                definition,
+                format,
+                platform,
+            } = action;
             if let Some(path) = definition {
                 // Authoring mode: the definition needs no deployment. One
                 // subject per check — a named path and a named deployment
@@ -118,11 +121,11 @@ async fn main() -> Result<()> {
                 let format = format.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("standalone definition checking requires `--format <id>`")
                 })?;
+                let platform = platform.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("standalone definition checking requires `--platform <id>`")
+                })?;
                 launcher::launch_definition_check_at_path(
-                    &path,
-                    format.as_str(),
-                    cli.json,
-                    cli.detail,
+                    &path, platform, format, cli.json, cli.detail,
                 )
                 .await
             } else if deployments.uses_bound_provisioner(selected)? {
@@ -214,15 +217,38 @@ async fn main() -> Result<()> {
             follow,
             tail,
         } => {
-            let ctx = load_context(&deployments, selected)?;
-            commands::logs::run(&service, follow, tail, ctx).await
+            if deployments.uses_bound_provisioner(selected)? {
+                let dir = deployments.resolve_dir(selected)?;
+                let mut extra = vec![service];
+                if follow {
+                    extra.push("--follow".to_string());
+                }
+                if let Some(tail) = tail {
+                    extra.push("--tail".to_string());
+                    extra.push(tail.to_string());
+                }
+                launcher::launch(&dir, &["logs"], &extra).await
+            } else {
+                let ctx = load_context(&deployments, selected)?;
+                commands::logs::run(&service, follow, tail, ctx).await
+            }
         }
         Command::PortForward {
             service,
             local_port,
         } => {
-            let ctx = load_context(&deployments, selected)?;
-            commands::port_forward::run(&service, local_port, ctx).await
+            if deployments.uses_bound_provisioner(selected)? {
+                if local_port.is_some() {
+                    anyhow::bail!(
+                        "bound platforms report provider-published mappings; `--local-port` is only available to legacy tunnel adapters"
+                    );
+                }
+                let dir = deployments.resolve_dir(selected)?;
+                launcher::launch(&dir, &["port-mappings"], &[service]).await
+            } else {
+                let ctx = load_context(&deployments, selected)?;
+                commands::port_forward::run(&service, local_port, ctx).await
+            }
         }
         Command::Exec {
             service,
@@ -302,9 +328,6 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
     }
 }
 
-/// Map a `tkr infra` action to the `tkp` verb (+ args) the launcher forwards for a
-/// `.tkd`/forwarded deployment. `tkp`'s surface is currently flat (`tkp plan`);
-/// once it is namespaced (`tkp infra plan`) this maps to the namespaced form.
 /// Map a `tkr infra` action to the forwarded `tkp` verb tokens — the same
 /// namespaced words the operator typed (`tkr infra plan` → `tkp infra plan`),
 /// so forwarding is a transparent pass-through (Req 7.3).
@@ -406,16 +429,20 @@ mod tests {
     use super::*;
     use crate::{
         cli::{
-            CliPlatformKind, CliStorageKind, ConfigAction, DeployAction, DeploymentAction,
-            DevAction, DiagnosticsAction, InfraAction, ObservabilityAction, ScaleAction,
+            CliStorageKind, ConfigAction, DeployAction, DeploymentAction, DevAction,
+            DiagnosticsAction, InfraAction, ObservabilityAction, ScaleAction,
         },
         deployment_dir::{DEPLOYMENT_TOML, METADATA_JSON, TOKEIRAD_TOML},
     };
     use proptest::prelude::*;
     use serde_json::json;
     use tokeira_local_deployment::LocalConfig;
-    use tokeira_orchestrator::{PlatformConfig, PlatformKind, StorageKind};
+    use tokeira_orchestrator::{PlatformConfig, PlatformId, StorageKind};
     use uuid::Uuid;
+
+    fn platform(value: &str) -> PlatformId {
+        PlatformId::new(value).expect("test platform id")
+    }
 
     #[test]
     fn parses_create_with_cli_enums() {
@@ -445,14 +472,17 @@ mod tests {
     fn create_defaults_to_local_platform_with_in_memory_storage() {
         let cli = Cli::try_parse_from(["tkr", "deployment", "create", "--name", "dev"]).unwrap();
         let Command::Deployment {
-            action: DeploymentAction::Create {
-                platform, storage, ..
-            },
+            action:
+                DeploymentAction::Create {
+                    platform: selected_platform,
+                    storage,
+                    ..
+                },
         } = cli.command
         else {
             panic!("expected a create action");
         };
-        assert!(matches!(platform, CliPlatformKind::Local));
+        assert_eq!(selected_platform, platform("local"));
         assert!(matches!(storage, CliStorageKind::InMemory));
     }
 
@@ -808,14 +838,17 @@ mod tests {
                 "--definition",
                 "defs/staging.tkd",
                 "--format",
-                "tkd"
+                "tkd",
+                "--platform",
+                "compose"
             ])
             .unwrap()
             .command,
             Command::Definition {
                 action: cli::DefinitionAction::Check {
                     definition: Some(_),
-                    format: Some(_)
+                    format: Some(_),
+                    platform: Some(_)
                 }
             }
         ));
@@ -910,7 +943,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("dev", PlatformKind::Local, StorageKind::InMemory, None)
+            .create("dev", platform("local"), StorageKind::InMemory, None)
             .unwrap();
         let deployment_path = deployments.path("dev");
         let _: LocalConfig =
@@ -925,7 +958,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("My Dev", PlatformKind::Local, StorageKind::InMemory, None)
+            .create("My Dev", platform("local"), StorageKind::InMemory, None)
             .unwrap();
         let deployment_path = deployments.path("my-dev");
         assert!(deployment_path.join(DEPLOYMENT_TOML).exists());
@@ -936,6 +969,7 @@ mod tests {
     }
 
     proptest! {
+        // Feature: platform-builder-abstraction, Property 23: deployment publication is all-or-nothing.
         #[test]
         fn creation_transaction_hides_staging_and_rolls_back_latest_failure(
             suffix in "[a-z0-9]{1,12}",
@@ -947,7 +981,7 @@ mod tests {
             let pending = deployments
                 .begin_create(
                     &name,
-                    PlatformKind::Local,
+                    platform("local"),
                     StorageKind::InMemory,
                     None,
                     None,
@@ -995,7 +1029,7 @@ mod tests {
         deployments
             .create(
                 "compose-route",
-                PlatformKind::Compose,
+                platform("compose"),
                 StorageKind::InMemory,
                 None,
             )
@@ -1010,7 +1044,7 @@ mod tests {
         deployments
             .create(
                 "local-route",
-                PlatformKind::Local,
+                platform("local"),
                 StorageKind::InMemory,
                 None,
             )
@@ -1044,10 +1078,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("dev", PlatformKind::Local, StorageKind::InMemory, None)
+            .create("dev", platform("local"), StorageKind::InMemory, None)
             .unwrap();
         let err = deployments
-            .create("DEV", PlatformKind::Local, StorageKind::InMemory, None)
+            .create("DEV", platform("local"), StorageKind::InMemory, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"));
@@ -1058,7 +1092,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("dev", PlatformKind::Local, StorageKind::InMemory, None)
+            .create("dev", platform("local"), StorageKind::InMemory, None)
             .unwrap();
         let path = deployments.path("dev");
         assert!(path.exists());
@@ -1072,10 +1106,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("alpha", PlatformKind::Local, StorageKind::InMemory, None)
+            .create("alpha", platform("local"), StorageKind::InMemory, None)
             .unwrap();
         deployments
-            .create("beta", PlatformKind::Local, StorageKind::InMemory, None)
+            .create("beta", platform("local"), StorageKind::InMemory, None)
             .unwrap();
         let error = deployments.not_found_message("gamma").unwrap();
         assert!(error.contains("alpha"));
@@ -1090,7 +1124,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create("fwd", PlatformKind::Compose, StorageKind::InMemory, None)
+            .create("fwd", platform("compose"), StorageKind::InMemory, None)
             .unwrap();
         let Err(err) = load_context(&deployments, Some("fwd")) else {
             panic!("a forwarded deployment must refuse the in-process context");
@@ -1105,38 +1139,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_platform_storage_combination() {
-        // Currently all platform × storage combinations are valid.
-        // This test documents that deployment creation succeeds for
-        // each supported combination.
+    fn legacy_config_seeding_accepts_local_storage_modes() {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create(
-                "local-mem",
-                PlatformKind::Local,
-                StorageKind::InMemory,
-                None,
-            )
+            .create("local-mem", platform("local"), StorageKind::InMemory, None)
             .unwrap();
         deployments
-            .create("local-dsql", PlatformKind::Local, StorageKind::Dsql, None)
-            .unwrap();
-        deployments
-            .create(
-                "compose-mem",
-                PlatformKind::Compose,
-                StorageKind::InMemory,
-                None,
-            )
-            .unwrap();
-        deployments
-            .create(
-                "compose-dsql",
-                PlatformKind::Compose,
-                StorageKind::Dsql,
-                None,
-            )
+            .create("local-dsql", platform("local"), StorageKind::Dsql, None)
             .unwrap();
     }
 
@@ -1171,8 +1181,7 @@ mod tests {
         let metadata = metadata::DeploymentMetadata {
             name: "dev".into(),
             id: Uuid::nil(),
-            platform: PlatformKind::Local,
-            launch_class: Some(tokeira_orchestrator::PlatformLaunchClass::LegacyInProcess),
+            platform: platform("local"),
             definition: None,
             storage: StorageKind::InMemory,
             status: metadata::DeploymentStatus::Created,
@@ -1190,12 +1199,10 @@ mod tests {
         let metadata = metadata::DeploymentMetadata {
             name: "dev".into(),
             id: Uuid::nil(),
-            platform: PlatformKind::Compose,
-            launch_class: Some(tokeira_orchestrator::PlatformLaunchClass::BoundProvisioner),
+            platform: platform("compose"),
             definition: Some(tokeira_provisioner::RecordedDefinition {
                 format: tokeira_orchestrator::DefinitionFormatId::new("tkd").unwrap(),
-                path: tokeira_platform::definition::RelativeDefinitionPath::new("definition.tkd")
-                    .unwrap(),
+                path: tokeira_orchestrator::RelativeDefinitionPath::new("definition.tkd").unwrap(),
             }),
             storage: StorageKind::Dsql,
             status: metadata::DeploymentStatus::Running,
@@ -1218,12 +1225,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
         deployments
-            .create(
-                "test-local",
-                PlatformKind::Local,
-                StorageKind::InMemory,
-                None,
-            )
+            .create("test-local", platform("local"), StorageKind::InMemory, None)
             .unwrap();
         let toml_content =
             fs::read_to_string(deployments.path("test-local").join(DEPLOYMENT_TOML)).unwrap();
@@ -1244,7 +1246,7 @@ mod tests {
         deployments
             .create(
                 "test-compose",
-                PlatformKind::Compose,
+                platform("compose"),
                 StorageKind::InMemory,
                 None,
             )
@@ -1272,5 +1274,55 @@ mod tests {
             "no legacy deployment.toml"
         );
         assert!(dir.join("state").exists(), "state dir created");
+    }
+
+    #[tokio::test]
+    // Feature: platform-builder-abstraction, Property 23: deployment publication is all-or-nothing.
+    async fn catalog_selection_creates_and_checks_with_the_generated_compose_provisioner() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = catalog::PlatformCatalog::from_workspace(&workspace).expect("catalog");
+        let descriptor = catalog
+            .platform(&platform("compose"))
+            .expect("Compose descriptor");
+        let (frontend, seed) = catalog
+            .workspace_frontend(descriptor, None)
+            .expect("Compose seed frontend");
+        let catalog::PlatformSource::Workspace(platform_package) = &descriptor.source else {
+            panic!("expected workspace platform");
+        };
+        let catalog::FrontendSource::Workspace(frontend_package) = &frontend.source else {
+            panic!("expected workspace frontend");
+        };
+        let temp = tempfile::tempdir().expect("deployment root");
+        let deployments = DeploymentResolver::with_root(temp.path().to_path_buf());
+        let pending = deployments
+            .begin_create(
+                "generated-compose",
+                platform("compose"),
+                StorageKind::InMemory,
+                None,
+                Some(deployment_dir::DefinitionSeed {
+                    definition: tokeira_provisioner::RecordedDefinition {
+                        format: frontend.format.clone(),
+                        path: frontend.default_relative_path.clone(),
+                    },
+                    bytes: fs::read(seed).expect("platform-owned seed"),
+                }),
+            )
+            .expect("stage deployment");
+        deployments
+            .place_provisioner_at(
+                pending.path(),
+                &workspace,
+                platform_package,
+                frontend_package,
+            )
+            .expect("generated provisioner compiles and is placed");
+        launcher::validate_staged_definition(pending.path())
+            .await
+            .expect("generated provisioner validates its seed");
+        let metadata = pending.publish().expect("publish checked deployment");
+        assert_eq!(metadata.platform.as_str(), "compose");
+        assert!(deployments.path("generated-compose").join("tkp").is_file());
     }
 }

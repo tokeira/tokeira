@@ -1,13 +1,9 @@
-//! Hermetic bundle placement at deployment create (task 18.3; Proposal 005
-//! §Creation flow, Phase 2 — opt-in via `--bundle`).
+//! Optional hermetic bundle placement for a catalog-selected provisioner.
 //!
-//! The canonical inception: **snapshot the source closure → resolve
-//! `EngineIdentity` → obtain a verified bundle (CAS hit, else one hermetic
-//! Dagger build, published back) → retain it in the deployment → place
-//! `tkp` and the manifest sidecar** that `tkp init` records as the Day-0
-//! stamp after verifying itself against it. The Phase-0 native copy
-//! ([`place_provisioner_at`](crate::deployment_dir::DeploymentResolver::place_provisioner_at))
-//! stays the default — the dev loop never pays a hermetic build.
+//! The flow snapshots the selected source closure, resolves `EngineIdentity`,
+//! obtains a verified bundle (CAS hit or one Dagger build), retains it in the
+//! deployment, and places `tkp` with its manifest sidecar. The native generated
+//! build remains the default development path.
 //!
 //! The CAS lives under the deployments root (`.bundle-cas/`, a
 //! `LocalBackend`) — the `LocalDeveloper` tier's store. Trusted tiers ride
@@ -18,8 +14,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokeira_build::{
-    DefaultDaggerClient, ProvisionerBuildRequest, SnapshotRequest, obtain_provisioner,
-    resolve_source_closure, snapshot_source_closure,
+    DefaultDaggerClient, DefinitionFrontendPackageDescriptor, PlatformPackageDescriptor,
+    ProvisionerBuildRequest, SnapshotRequest, assemble_bound_provisioner, obtain_provisioner,
+    snapshot_source_closure,
 };
 use tokeira_provisioner::{
     AuthorityTier, BUNDLE_MANIFEST_BASENAME, BinaryStore, BuildAuthority, BuildProfile,
@@ -27,10 +24,7 @@ use tokeira_provisioner::{
 };
 use tokeira_state::LocalBackend;
 
-use crate::deployment_dir::{DeploymentResolver, PROVISIONER_BIN, PROVISIONER_SOURCE_BIN};
-
-/// The platform seed the forwarded (`.tkd`) provisioner builds from.
-const SEED_PACKAGE: &str = "tokeira-compose-deployment";
+use crate::deployment_dir::{DeploymentResolver, PROVISIONER_BIN};
 
 /// Obtain a verified bundle for the host target and marry it to the
 /// deployment: `<deployment>/tkp` + the manifest sidecar, with the bytes
@@ -39,18 +33,17 @@ pub(crate) async fn place_bundle_provisioner_at(
     deployments: &DeploymentResolver,
     deployment_dir: &std::path::Path,
     build_image: &str,
+    workspace_root: &std::path::Path,
+    platform: &PlatformPackageDescriptor,
+    frontend: &DefinitionFrontendPackageDescriptor,
 ) -> Result<()> {
-    // The bundle path builds from source: it needs the workspace and a
-    // Dagger engine. Refuse early and clearly when either is absent.
-    let workspace_root = workspace_root_from(&std::env::current_dir()?)?;
     let dagger = DefaultDaggerClient::from_env()
         .map_err(|e| anyhow!("`--bundle` needs a running Dagger engine: {e}"))?;
-
-    let closure = resolve_source_closure(&workspace_root, SEED_PACKAGE)
-        .context("failed to resolve the provisioner source closure")?;
+    let bound_source = assemble_bound_provisioner(workspace_root, platform, frontend)
+        .context("failed to assemble the bound provisioner source")?;
     let snapshot = snapshot_source_closure(&SnapshotRequest {
-        repo_root: workspace_root.clone(),
-        closure_paths: closure.closure_paths(),
+        repo_root: workspace_root.to_path_buf(),
+        closure_paths: bound_source.closure().closure_paths(),
         include_untracked: false,
     })
     .context("failed to freeze the source snapshot")?;
@@ -58,16 +51,13 @@ pub(crate) async fn place_bundle_provisioner_at(
     let host_target = Target(env!("TKR_TARGET").to_string());
     let request_id = uuid::Uuid::new_v4().to_string();
     let request = ProvisionerBuildRequest {
-        workspace_root,
-        seed_package: SEED_PACKAGE.to_string(),
-        bin_name: PROVISIONER_SOURCE_BIN.to_string(),
-        features: vec!["provisioner".to_string()],
+        workspace_root: workspace_root.to_path_buf(),
+        bound_source,
         targets: vec![host_target.clone()],
         profile: BuildProfile::Dist,
         authority: BuildAuthority::LocalDeveloper,
         build_image: build_image.to_string(),
         snapshot,
-        closure,
         version: tokeira_build_info::TOKEIRA_VERSION.to_string(),
         request_id: request_id.clone(),
         output_dir: deployments.root().join(".bundle-work").join(&request_id),
@@ -132,9 +122,8 @@ pub(crate) async fn place_bundle_provisioner_at(
     Ok(())
 }
 
-/// Walk up from `start` to the workspace root (`Cargo.lock` +
-/// `rust-toolchain.toml` together mark it). Shared with the create-time
-/// Phase-0 build leg (`deployment_dir::place_provisioner`).
+/// Walk up from `start` to the workspace root (`Cargo.lock` and
+/// `rust-toolchain.toml` together mark it).
 pub(crate) fn workspace_root_from(start: &std::path::Path) -> Result<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {

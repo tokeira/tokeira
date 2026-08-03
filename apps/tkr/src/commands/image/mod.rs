@@ -338,12 +338,6 @@ async fn run_list(
              \ttkr --deployment <name> image list",
             ctx.name
         ),
-        PlatformDeploymentConfig::Compose(config) => {
-            // The image inventory reads the deployment config from the
-            // context; the retired engine-drive registered it the same way.
-            image_ctx.set_extension(config.as_ref().clone());
-            tokeira_compose_deployment::images::all(&image_ctx)?
-        }
         PlatformDeploymentConfig::Ecs(config) => {
             let deployment = tokeira_ecs_deployment::EcsDeployment::new();
             deployment

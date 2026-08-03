@@ -158,11 +158,16 @@ pub(crate) fn enforce_mutation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokeira_orchestrator::{PlatformKind, StorageKind};
+    use tokeira_orchestrator::{PlatformId, StorageKind};
 
     fn seed(resolver: &DeploymentResolver, name: &str) -> DeploymentMetadata {
         resolver
-            .create(name, PlatformKind::Local, StorageKind::InMemory, None)
+            .create(
+                name,
+                PlatformId::new("local").expect("platform"),
+                StorageKind::InMemory,
+                None,
+            )
             .unwrap()
     }
 

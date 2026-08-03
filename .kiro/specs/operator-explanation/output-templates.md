@@ -15,15 +15,15 @@ Umbrella decision D10 records this document as the output authority.
 ## The delivery map
 
 Every example carries a *what's speaking* list attributing each narrative element to
-its feature and the **responsible module**, so realisability is checkable, never
-assumed.
+its area of the umbrella ([requirements.md](requirements.md)) and the **responsible
+module**, so realisability is checkable, never assumed.
 
-| Key | Spec | Narrative aspects | Responsible modules |
+| Key | Umbrella area | Narrative aspects | Responsible modules |
 |---|---|---|---|
-| **F1** | `explanation-evidence-model` | the document frame: title, header + revision anchor, action sections, would-mood lines with ids once, field diffs, `## Unchanged`, `--json`/artifact parity | model + construction: `tokeira_explain::{model, build, evidence, artifact}` · field-evidence transport: `tokeira_iac::engine` (`compute_changes` → `Change::details`) · rendering: `tokeira_provisioner_cli::render` |
-| **F2** | `explanation-change-semantics` | declared behaviour, kind-authored statements, confidence voices, impacts, display nouns | declarations live with their owning kinds: `tokeira_compose` (the compose service), `tokeira_aws::resources::{dsql_cluster, dynamodb_table}`, `tokeira_compose_deployment::{kinds, observability_config}` · vocabulary: `tokeira_iac::semantics` · impact derivation: `tokeira_explain::impacts` · voices: `tokeira_provisioner_cli::render` (`voiced`) |
-| **F3** | `explanation-causality` | cause clauses, drift lines, per-diff drift annotations, dependants, chains, why-unknown | classifier, grouping, dependants, per-field departure (each diff checked against the record): `tokeira_explain::causality` (the algebra) · live-departure + edge seams: `tokeira_iac::engine` (`refresh_state`, `PlanOutcome`) · clause and detail rendering: `tokeira_provisioner_cli::render` (`cause_phrase`, `change_detail`) |
-| **platform** | this document + the SDK-error audit | `## Platform Issue[s]`: the typed issue, verbatim SDK evidence, established-only directions | the typed issue at the describe boundary: `tokeira_iac` (describe surface) and each platform's SDK seam (`tokeira_compose` for Docker) · carried through `PlanOutcome` into `tokeira_explain::model` · section rendering: `tokeira_provisioner_cli::render` · per-error-class direction tables declared by the owning platform under D3/D4 discipline |
+| **F1** | the model (Reqs 1–3, 9) | the document frame: title, header + revision anchor, action sections, would-mood lines with ids once, field diffs, `## Unchanged`, `--json`/artifact parity | model + construction: `tokeira_explain::{model, build, evidence, artifact}` · field-evidence transport: `tokeira_iac::engine` (`compute_changes` → `Change::details`) · rendering: `tokeira_provisioner_cli::render` |
+| **F2** | declarations (Reqs 4, 6) | declared behaviour, kind-authored statements, confidence voices, impacts, display nouns | declarations live with their owning kinds: `tokeira_compose` (the compose service), `tokeira_aws::resources::{dsql_cluster, dynamodb_table}`, `tokeira_compose_deployment::{kinds, observability_config}` · vocabulary: `tokeira_iac::semantics` · impact derivation: `tokeira_explain::impacts` · voices: `tokeira_provisioner_cli::render` (`voiced`) |
+| **F3** | causality (Req 5) | cause clauses, drift lines, per-diff drift annotations, dependants, chains, why-unknown | classifier, grouping, dependants, per-field departure (each diff checked against the record): `tokeira_explain::causality` (the algebra) · live-departure + edge seams: `tokeira_iac::engine` (`refresh_state`, `PlanOutcome`) · clause and detail rendering: `tokeira_provisioner_cli::render` (`cause_phrase`, `change_detail`) |
+| **platform** | platform issues (Req 7) | `## Platform Issue[s]`: the typed issue, verbatim SDK evidence, established-only directions | the typed issue at the describe boundary: `tokeira_iac` (describe surface) and each platform's SDK seam (`tokeira_compose` for Docker) · carried through `PlanOutcome` into `tokeira_explain::model` · section rendering: `tokeira_provisioner_cli::render` · per-error-class direction tables declared by the owning platform under D3/D4 discipline |
 
 ## The rules
 
@@ -113,7 +113,7 @@ drifted fields annotated per diff at detail.
    annotated in place: `` - `field`: `a` → `b` - changed outside the definition `` —
    the edit owns the change; the drift fact stays visible per field.
 2. Declared behaviour in its voice: mechanism (or the kind-authored statement), data
-   effect, reversibility (change-semantics spec, Requirement 9).
+   effect, reversibility (the voices below).
 3. The cause's voice line, **only where it adds information beyond the line clause**:
    - derived causes: `- why: {clause}; Tokeira derives this - per {cite}`
    - unknown cause with a missing/broken baseline: `- why this differs is unknown -
@@ -140,8 +140,9 @@ Heading pluralized by count. One templated line per subject, severity-first,
 descriptive names only (ids live in the action sections):
 `data held by {noun} would be destroyed[, irreversibly]` ·
 `{noun} would be unavailable while the change applies` / `would no longer be available`
-(deletes) · `{noun} would be replaced` · brief-interruption and rolling forms per the
-change-semantics spec, Requirement 9.8.
+(deletes) · `{noun} would be replaced` · `would be briefly interrupted` ·
+`would be replaced one at a time` (rolling). Irreversibility is stated only where every
+contributing declaration establishes it.
 
 Impacts derive from **two sources**: declared semantics, and the engine's own change
 classification — every `Replace` carries unavailability-during-the-change and the

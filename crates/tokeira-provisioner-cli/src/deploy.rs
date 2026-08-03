@@ -154,6 +154,12 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
     );
     // Artifact after the state record is safe, before the verb claims
     // success — same contract as `infra apply` (Req 7.6).
+    crate::config_history::retain_explanation(
+        deployment_dir,
+        envelope.config_revision,
+        &explanation,
+    )
+    .context("the apply is committed and recorded; only explanation retention failed")?;
     if let Some(path) = explanation_path {
         tokeira_explain::artifact::write(path, &explanation)
             .context("the apply is committed and recorded; only the explanation artifact failed")?;

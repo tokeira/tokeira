@@ -11,6 +11,12 @@ pub struct PlacementContext {
     pub deployment_id: String,
     /// Deployment root admitted by the shell for platform-local resources.
     pub deployment_dir: std::path::PathBuf,
+    /// Directory the interpreted definition source was read from — the
+    /// deployment root for a working realization, a retained revision folder
+    /// for a baseline. Kinds that read desired-source companion files
+    /// resolve them here, so a baseline realization digests the retained
+    /// companion rather than the live one.
+    pub definition_dir: std::path::PathBuf,
     /// Owning logical module.
     pub module: String,
     /// Logical id within the module.

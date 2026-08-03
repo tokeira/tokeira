@@ -210,6 +210,13 @@ pub struct ChangeSemantics {
     /// research obligation as the fields above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statement: Option<Cow<'static, str>>,
+    /// Names of state values the provider assigns during apply — unknown at
+    /// plan time by construction, so a creation's silence about them must
+    /// read as "not yet assigned", never as oversight. Declared on creation
+    /// semantics only (other change kinds act on state that already holds
+    /// the assigned values); consumers record one uncertainty per name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_assigned: Vec<Cow<'static, str>>,
 }
 
 /// What a kind needs in order to declare — the declaration point's input.
@@ -242,6 +249,7 @@ mod tests {
         assert!(!semantics.disruption.is_known());
         assert!(!semantics.data_effect.is_known());
         assert!(!semantics.reversibility.is_known());
+        assert!(semantics.provider_assigned.is_empty());
     }
 
     // A cited claim survives the JSON round trip with content equality —

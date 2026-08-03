@@ -135,7 +135,6 @@ Service {
     image: cfg.tokeirad.image.clone(),
     replicas: cfg.tokeirad.replicas,
     publish: vec![cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
-    server_config: true,
     aws_region: match &cfg.storage {
         Storage::Dsql(storage) => Some(storage.region.clone()),
         _ => None,

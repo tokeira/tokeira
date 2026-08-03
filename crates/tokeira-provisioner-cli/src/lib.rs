@@ -305,7 +305,7 @@ pub trait ProvisionerPlatform {
 
     /// Realize `definition` (a path to a definition source — the working
     /// definition or a retained revision) into canonical per-resource desired
-    /// manifests (causality Requirement 1). MUST NOT contact providers, read
+    /// manifests (operator-explanation Req 5.1). MUST NOT contact providers, read
     /// live state, or write state: the snapshot is a value computed entirely
     /// in memory, and two snapshots of semantically identical definitions
     /// MUST be equal (canonical set-valued fields). A source that does not
@@ -328,7 +328,7 @@ pub trait ProvisionerPlatform {
     /// store, never from a planning context. Refresh overwrites in-context
     /// resource properties with live observations before diffing, so state
     /// obtained any other way is contaminated: drift detection over it would
-    /// silently compare live against live (causality Requirement 2.3). A
+    /// silently compare live against live (operator-explanation Req 5.1). A
     /// platform with no persisted engine state answers the empty state, which
     /// is the honest S for it (nothing was ever recorded).
     async fn recorded_state(&self, deployment_dir: &Path) -> Result<tokeira_iac::InfraState> {
@@ -351,7 +351,7 @@ pub trait ProvisionerPlatform {
 }
 
 /// The explanation's deployment context, assembled from what the envelope
-/// records and the platform knows (evidence-model field policy). Read-only
+/// records and the platform knows (operator-explanation Req 1). Read-only
 /// verbs pass no proposed revision — the plan proposes nothing by itself.
 pub(crate) fn explain_context<P: ProvisionerPlatform>(
     platform: &P,
@@ -410,7 +410,7 @@ pub(crate) fn emit_report(text: &str, mode: tokeira_report::Mode) {
 }
 
 /// Map an apply's committed changes into the explanation's vocabulary at the
-/// shell boundary (evidence-model C3): the model crate must not depend on
+/// shell boundary (operator-explanation Req 1): the model crate must not depend on
 /// the engine types (Req 9.1), so identity crosses here — ids, operations,
 /// the module/type halves of the natural key, and the operator noun. Never
 /// before-images (Proposal 002). `NoChange` rows cross as the unchanged

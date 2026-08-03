@@ -18,12 +18,12 @@ use tokeira_report::{Depth, Report, symbol};
 /// The read-only plan report: the deployment explanation, framed by the
 /// verb-level annotations (platform line, attention-only binding).
 ///
-/// `--json` emits the **explanation model alone** (evidence-model Req 6.3):
+/// `--json` emits the **explanation model alone** (operator-explanation Req 9.3):
 /// the manual `Serialize` delegates to it, so the artifact and the `--json`
 /// output are one schema. The binding verdict is verb framing, not model
 /// content — `describe` owns it.
 ///
-/// C5 migration note (evidence-model design): if a consumer outside `tkp`
+/// C5 migration note (operator-explanation §Rendering): if a consumer outside `tkp`
 /// ever needs to render an explanation — an artifact viewer, Feature 5's
 /// analysis bundles — this `Report` impl moves into `tokeira-explain` and
 /// that crate takes `tokeira-report` (a serde-only crate) as a dependency.
@@ -233,7 +233,7 @@ fn code_span(value: &str) -> String {
 }
 
 /// Render a citation for detail depth: documentation as a link, code by
-/// module identity as a code span (change-semantics Req 9.7).
+/// module identity as a code span (output-templates.md §Voices).
 fn cite(citation: &tokeira_iac::Citation) -> String {
     match citation {
         tokeira_iac::Citation::Code(reference) => code_span(reference),
@@ -269,7 +269,7 @@ fn change_for<'a>(
         .find(|c| c.resource_id == resource_id)
 }
 
-/// The clause on a change line (causality Req 6.1; `output-templates.md`
+/// The clause on a change line (output-templates.md §Change lines; `output-templates.md`
 /// §cause-clauses): **the concrete change, never a cause category**. A
 /// definition edit puts the diff itself on the line (the changed definition
 /// is implicit — it is the operator's own edit); drift names the fields
@@ -386,7 +386,7 @@ fn action_sections(explanation: &DeploymentExplanation, depth: Depth, out: &mut 
             // a kind without a noun leads with the id and never repeats it.
             // An established cause joins the line as a clause; an unknown
             // cause renders no clause here and speaks through its
-            // uncertainty at detail (causality Req 6.1/6.3).
+            // uncertainty at detail (output-templates.md §Detail sub-bullets).
             let clause = cause_phrase(explanation, change)
                 .map(|phrase| format!(" - {phrase}"))
                 .unwrap_or_default();
@@ -489,7 +489,7 @@ fn unchanged_section(explanation: &DeploymentExplanation, depth: Depth, out: &mu
 /// Detail sub-bullets for one change: field diffs as code spans, then the
 /// declared behaviour — mechanism, data effect, reversibility — each in its
 /// confidence voice with its citation, then the cause in its voice (or its
-/// uncertainty in place, causality Req 6.2/6.3), the dependants
+/// uncertainty in place, output-templates.md §Detail sub-bullets), the dependants
 /// (Req 5.2/5.4), and — on a chain's first member — the story line
 /// (Req 6.4). Unknown semantic fields render nothing (knowledge renders;
 /// gaps enforce); an unknown *cause* renders its uncertainty, because a
@@ -658,7 +658,7 @@ fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, 
     }
 
     // A multi-member chain tells its story once, on its first member, root
-    // first and members along the dependency path (causality Req 6.4).
+    // first and members along the dependency path (output-templates.md §Detail sub-bullets).
     if let Some(group) = explanation
         .causal_groups
         .iter()
@@ -972,6 +972,7 @@ mod tests {
                 citation: CITE,
             },
             statement: None,
+            provider_assigned: Vec::new(),
         }
     }
 
@@ -1141,6 +1142,7 @@ mod tests {
                 statement: Some(std::borrow::Cow::Borrowed(
                     "it would be stopped, removed, and recreated from the definition",
                 )),
+                provider_assigned: Vec::new(),
             },
         );
         // Mirror the real DsqlCluster managed-delete declaration shape with
@@ -1166,6 +1168,7 @@ mod tests {
                 statement: Some(std::borrow::Cow::Borrowed(
                     "deletion protection would be disabled first, then the cluster deleted",
                 )),
+                provider_assigned: Vec::new(),
             },
         );
         let r = report_for(&outcome, BindingVerdict::DevIterate, true);
@@ -1232,7 +1235,7 @@ mod tests {
         );
     }
 
-    // ---- Property suite (evidence-model Properties 5, 6, 8, 11) ----
+    // ---- Property suite (operator-explanation §Evidence, Properties 5, 6, 8, 11) ----
     //
     // These bind the shipped renderer itself — the same `ExplanationReport`
     // the binary prints, binding lines included — so a copy change that leaks
@@ -1401,6 +1404,7 @@ mod tests {
                 statement: Some(std::borrow::Cow::Borrowed(
                     "it would be stopped, removed, and recreated from the definition",
                 )),
+                provider_assigned: Vec::new(),
             },
         );
 

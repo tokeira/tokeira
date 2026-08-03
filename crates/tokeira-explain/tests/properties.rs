@@ -1,8 +1,8 @@
-//! The evidence-model correctness properties (Feature 1, Properties 1–4, 9,
-//! 10): construction is total over changes, deterministic, closed over
+//! The evidence correctness properties (operator-explanation §Evidence,
+//! Properties 1–4, 9, 10): construction is total over changes, deterministic, closed over
 //! evidence, exhaustive over unconfirmed state, incapable of inventing
 //! apply-side evidence — and the written artifact stands alone within the
-//! field policy. Plus the change-semantics transport properties (Feature 2,
+//! field policy. Plus the semantics transport properties (§Semantics,
 //! Properties 3–4): declarations cross verbatim, and no declaration can move
 //! the destructive set.
 
@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use tokeira_explain::{
-    CommittedChange, CommittedOp, DeploymentContext, UncertaintyReason, explain_applied,
-    explain_plan,
+    CommittedChange, CommittedOp, DeploymentContext, EvidenceId, UncertaintyReason,
+    explain_applied, explain_plan,
 };
 use tokeira_iac::{
     Change, ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, Disruption, FieldDiff,
@@ -124,21 +124,31 @@ fn arb_semantics() -> impl Strategy<Value = ChangeSemantics> {
             citation: CITE,
         }),
     ];
+    let provider_assigned = proptest::collection::vec(0u8..3, 0..3);
     (
         operation,
         replacement,
         disruption,
         data_effect,
         reversibility,
+        provider_assigned,
     )
         .prop_map(
-            |(operation, replacement, disruption, data_effect, reversibility)| ChangeSemantics {
-                operation,
-                replacement,
-                disruption,
-                data_effect,
-                reversibility,
-                statement: None,
+            |(operation, replacement, disruption, data_effect, reversibility, assigned)| {
+                ChangeSemantics {
+                    operation,
+                    replacement,
+                    disruption,
+                    data_effect,
+                    reversibility,
+                    statement: None,
+                    // Possibly-duplicated names, deliberately: the model owes
+                    // one uncertainty per unique name however a kind declares.
+                    provider_assigned: assigned
+                        .into_iter()
+                        .map(|n| format!("f{n}").into())
+                        .collect(),
+                }
             },
         )
 }
@@ -370,7 +380,40 @@ proptest! {
         }
     }
 
-    // Change-semantics Property 3 — transport is verbatim: every explained
+    // Operator-explanation Req 2.2 — a creation's provider-assigned values become
+    // uncertainty, exhaustively: one per unique declared name on every
+    // Create, none anywhere else.
+    #[test]
+    fn provider_assigned_names_become_create_uncertainties(outcome in arb_outcome()) {
+        let explanation = explain_plan(context(), &outcome);
+        let expected: Vec<(EvidenceId, String)> = explanation
+            .changes
+            .iter()
+            .filter(|c| c.kind == ChangeKind::Create)
+            .flat_map(|c| {
+                c.semantics
+                    .provider_assigned
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .map(|f| (c.evidence_id.clone(), f))
+            })
+            .collect();
+        let actual: Vec<(EvidenceId, String)> = explanation
+            .uncertainties
+            .iter()
+            .filter_map(|u| match &u.reason {
+                UncertaintyReason::ProviderAssignedAtApply { field } => {
+                    Some((u.subject.clone(), field.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(actual, expected);
+    }
+
+    // Operator-explanation §Semantics, Property 3 — transport is verbatim: every explained
     // change carries exactly the declaration the map holds for its id (or
     // declares nothing when absent), and a declaration-less deletion is
     // stated as uncertainty, never silence (Req 3.4/3.5/3.6).
@@ -406,7 +449,7 @@ proptest! {
         prop_assert_eq!(actual_undeclared, expected_undeclared);
     }
 
-    // Change-semantics Property 4 — declarations cannot move the destructive
+    // Operator-explanation §Semantics, Property 4 — declarations cannot move the destructive
     // set: whatever any kind declares (fuzzed across every confidence tier),
     // the destructive set equals the engine's own classification. The safety
     // property of the feature: a wrong declaration can mislead a reader, but
@@ -425,7 +468,7 @@ proptest! {
         prop_assert_eq!(&explanation.destructive, &engine_classification);
     }
 
-    // Change-semantics Property 5 — impact derivation is a pure function of
+    // Operator-explanation §Semantics, Property 5 — impact derivation is a pure function of
     // the declarations: identical declarations yield byte-identical impacts,
     // whatever the refresh coverage said.
     #[test]
@@ -441,7 +484,7 @@ proptest! {
             "impacts are a function of declarations, never of coverage");
     }
 
-    // Change-semantics Property 6 — every impact is grounded, both ways:
+    // Operator-explanation §Semantics, Property 6 — every impact is grounded, both ways:
     // each subject's declaration justifies the class, and every qualifying
     // change appears in its class's impact.
     #[test]
@@ -523,7 +566,7 @@ proptest! {
         }
     }
 
-    // Change-semantics Property 7 — Unknown never becomes a claim
+    // Operator-explanation §Semantics, Property 7 — Unknown never becomes a claim
     // (Requirement 5.7): a change declaring nothing joins no impact except
     // one the engine floor grounds in its kind — a Replace floors
     // replacement and unavailability (the all-Unknown policy cannot lift
@@ -587,7 +630,7 @@ proptest! {
         }
     }
 
-    // Change-semantics Property 8 — uncertainty activation is exact, both
+    // Operator-explanation §Semantics, Property 8 — uncertainty activation is exact, both
     // directions: per-change iff Unknown-while-stated-elsewhere, one
     // plan-level entry iff Unknown everywhere applicable, and never for a
     // kind the field does not apply to.
@@ -691,7 +734,7 @@ proptest! {
 
 /// Assert every key of a JSON object is in the field policy's allowed set.
 /// Slot interiors (`semantics`, `cause`) are deliberately unbounded here —
-/// their shape belongs to the change-semantics and causality specs.
+/// their shape belongs to the umbrella's semantics and causality areas.
 fn keys_within(
     value: &serde_json::Value,
     allowed: &[&str],

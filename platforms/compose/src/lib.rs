@@ -38,6 +38,8 @@ pub mod context;
 pub mod images;
 pub mod observability;
 pub mod ops;
+#[cfg(test)]
+mod semantics_registry;
 pub mod services;
 
 pub use config::ComposeConfig;
@@ -448,11 +450,20 @@ impl<F: DefinitionFrontend> ComposeProvisioner<F> {
         deployment_dir: &Path,
         definition_path: Option<&Path>,
     ) -> Result<ExecutionConfig> {
+        // Desired-source companions resolve against the interpreted source's
+        // own directory: a baseline realization from a retained revision
+        // folder digests that folder's companions, not the live ones.
+        let definition_dir = definition_path
+            .and_then(Path::parent)
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(deployment_dir)
+            .to_path_buf();
         let (invocation, evaluated) = self.evaluate_recorded(deployment_dir, definition_path)?;
         let verified = verify_definition(&evaluated).map_err(anyhow::Error::from)?;
         let realized = verified.realize(
             &invocation.deployment_id,
             &invocation.deployment_dir,
+            &definition_dir,
             &BTreeMap::new(),
         )?;
         let resource_refs = realized.iter().collect::<Vec<_>>();
@@ -879,6 +890,115 @@ mod tests {
                 second.manifests[&ResourceId(format!("compose/{name}"))]["environment"]["TOKEIRA_CONFIG_DIGEST"]
             );
         }
+    }
+
+    #[test]
+    // The server-config coupling (operator-explanation Req 8): the
+    // realization carries the node, the declared consumer carries the typed
+    // edge, the mount, and the content digest — and a realization whose
+    // definition source sits in a retained revision folder digests THAT
+    // folder's `tokeirad.toml`, so a live edit diffs against the retained
+    // content and reads as the operator's own edit, never as a provisioner
+    // advance.
+    fn server_config_couples_the_declared_consumer_and_follows_the_source_set() {
+        let directory = deployment(reference_source());
+        std::fs::write(directory.path().join("tokeirad.toml"), "port = 1\n")
+            .expect("write server config");
+        let node_id = services::server_config_resource_id();
+        let tokeirad = ResourceId("compose/tokeirad".to_string());
+
+        let first = provisioner()
+            .execution(directory.path(), None)
+            .expect("realize reference definition");
+        assert_eq!(first.manifests[&node_id]["path"], "tokeirad.toml");
+        let resource = first
+            .resources
+            .values()
+            .flatten()
+            .find(|resource| resource.resource_id() == tokeirad)
+            .expect("tokeirad realizes");
+        assert!(resource.dependencies().contains(&node_id));
+        assert_eq!(
+            first.manifests[&tokeirad]["environment"]["TOKEIRA_CONFIG"],
+            "/etc/tokeira/tokeirad.toml"
+        );
+        assert!(
+            first.manifests[&tokeirad]["volumes"]
+                .as_array()
+                .expect("volumes")
+                .iter()
+                .any(|volume| {
+                    volume
+                        .as_str()
+                        .is_some_and(|mount| mount.contains("tokeirad.toml"))
+                })
+        );
+        let first_digest =
+            first.manifests[&tokeirad]["environment"]["TOKEIRA_SERVER_CONFIG_DIGEST"]
+                .as_str()
+                .expect("server-config digest")
+                .to_string();
+
+        std::fs::write(directory.path().join("tokeirad.toml"), "port = 2\n")
+            .expect("edit server config");
+        let second = provisioner()
+            .execution(directory.path(), None)
+            .expect("realize after the edit");
+        assert_ne!(
+            first_digest,
+            second.manifests[&tokeirad]["environment"]["TOKEIRA_SERVER_CONFIG_DIGEST"],
+            "an edit moves the digest"
+        );
+
+        // The baseline seam: a revision folder retaining the pre-edit
+        // source set realizes to the pre-edit digest while the live file
+        // holds the edit.
+        let retained = directory.path().join("state/config-revisions/3");
+        std::fs::create_dir_all(&retained).expect("revision dir");
+        std::fs::write(retained.join("definition.tkd"), reference_source())
+            .expect("retain definition");
+        std::fs::write(retained.join("tokeirad.toml"), "port = 1\n").expect("retain toml");
+        let baseline = provisioner()
+            .execution(directory.path(), Some(&retained.join("definition.tkd")))
+            .expect("baseline realizes");
+        assert_eq!(
+            baseline.manifests[&tokeirad]["environment"]["TOKEIRA_SERVER_CONFIG_DIGEST"]
+                .as_str()
+                .expect("baseline digest"),
+            first_digest,
+            "the baseline digests the retained bytes, not the live file"
+        );
+    }
+
+    #[tokio::test]
+    // An absent `tokeirad.toml` states itself: the declared node's manifest
+    // carries no content, and its create refuses with the missing path —
+    // the definition said the deployment carries a server configuration, so
+    // absence is an error to fix, never a file silently not mounted. The
+    // dependency edge orders the node first, so no consumer container is
+    // ever created against the missing bind source.
+    async fn server_config_absence_is_stated_and_refused() {
+        let directory = deployment(reference_source());
+        let execution = provisioner()
+            .execution(directory.path(), None)
+            .expect("realize without a server config");
+        let node_id = services::server_config_resource_id();
+        assert!(execution.manifests[&node_id]["content_digest"].is_null());
+
+        let node = execution
+            .resources
+            .values()
+            .flatten()
+            .find(|resource| resource.resource_id() == node_id)
+            .expect("the node realizes");
+        let error = node
+            .create(&iac::ProvisionContext::default())
+            .await
+            .expect_err("an absent file refuses to record");
+        assert!(
+            error.to_string().contains("tokeirad.toml"),
+            "the refusal names the missing file: {error}"
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! Gathering the causality sources (explanation-causality Phase 3): D, P, S,
+//! Gathering the causality sources (operator-explanation §Causality): D, P, S,
 //! and the union dependency graph, assembled for the classifier's
 //! [`CausalityView`].
 //!

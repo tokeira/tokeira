@@ -14,6 +14,13 @@ use crate::ConfigSource;
 
 const SOURCE_METADATA: &str = "source.json";
 
+/// The server configuration retained beside the definition source. A revision
+/// folder holds the whole desired-source set: a baseline realization that
+/// resolves companions against it (rather than the live deployment dir) can
+/// then attribute a `tokeirad.toml` edit to the operator instead of
+/// misreading it as a provisioner advance.
+const SERVER_CONFIG: &str = "tokeirad.toml";
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RetainedSourceIdentity {
@@ -82,6 +89,39 @@ pub(crate) fn snapshot(deployment_dir: &Path, source: &ConfigSource, revision: u
     let identity_path = identity_path(deployment_dir, revision);
     std::fs::write(&identity_path, identity)
         .with_context(|| format!("failed to write {}", identity_path.display()))?;
+    // The desired-source companion, when the deployment carries one. Retained
+    // only — `restore` deliberately leaves it alone: reverting the definition
+    // does not rewrite the live server configuration.
+    let server_config = deployment_dir.join(SERVER_CONFIG);
+    match std::fs::read(&server_config) {
+        Ok(bytes) => {
+            let retained = revision_root(deployment_dir, revision).join(SERVER_CONFIG);
+            std::fs::write(&retained, bytes)
+                .with_context(|| format!("failed to write {}", retained.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read server config {}", server_config.display())
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Retain an applied revision's explanation beside its retained sources.
+/// The revision folder is the deployment's own record of what each apply
+/// meant — `state/config-revisions/{n}/explanation.json` is readable by
+/// operators (`jq`) and agents alike, with no serving process in between.
+pub(crate) fn retain_explanation(
+    deployment_dir: &Path,
+    revision: u64,
+    explanation: &tokeira_explain::DeploymentExplanation,
+) -> Result<()> {
+    let root = revision_root(deployment_dir, revision);
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create {}", root.display()))?;
+    tokeira_explain::artifact::write(&root.join("explanation.json"), explanation)?;
     Ok(())
 }
 
@@ -192,6 +232,27 @@ mod tests {
         assert_eq!(
             std::fs::read(config_file(temp.path(), &source)).expect("read live"),
             b"one"
+        );
+    }
+
+    #[test]
+    fn snapshot_retains_the_server_config_beside_the_definition() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = tkd();
+        std::fs::write(config_file(temp.path(), &source), b"def").expect("write live");
+        std::fs::write(temp.path().join(SERVER_CONFIG), b"port = 1\n").expect("write toml");
+        snapshot(temp.path(), &source, 4).expect("snapshot");
+        assert_eq!(
+            std::fs::read(revision_root(temp.path(), 4).join(SERVER_CONFIG)).expect("retained"),
+            b"port = 1\n"
+        );
+        // Restore rewrites only the definition source; the live server
+        // config is the operator's file and stays theirs.
+        std::fs::write(temp.path().join(SERVER_CONFIG), b"port = 2\n").expect("edit toml");
+        restore(temp.path(), &source, 4).expect("restore");
+        assert_eq!(
+            std::fs::read(temp.path().join(SERVER_CONFIG)).expect("live toml"),
+            b"port = 2\n"
         );
     }
 

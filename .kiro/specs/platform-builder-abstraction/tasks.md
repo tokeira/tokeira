@@ -285,7 +285,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - Keep process/session lifecycle in `tkr`, ECS Exec separate, and desired capacity changes in
       definition plus plan/apply; add no direct scaling method.
     - _Requirements: 6.14, 10.1–10.19, 14.16–14.17, 14.38_
-  - [ ] 12.4 Implement atomic inspection publication with disjoint write boundaries
+  - [x] 12.4 Implement atomic inspection publication with disjoint write boundaries
     - Validate deployment-relative targets, render without reading the prior output, use same-directory
       safe temporary files and atomic replacement, and distinguish post-commit publication failure from
       convergence failure.
@@ -293,23 +293,23 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       inspection read in any lifecycle/provider path.
     - _Requirements: 3.21, 3.41–3.44, 6.21–6.23, 11.25–11.33, 14.40–14.43_
 
-- [ ] 13. Add required content, canonicalization, operations, and write-boundary property tests
+- [x] 13. Add required content, canonicalization, operations, and write-boundary property tests
   - [x] 13.1 Property test: Property 11 — content coupling is deterministic, sensitive, and secret-free
     - Generate consumed content and secret mutations; assert stable equal identities, changed desired
       state for changed non-secret bytes, and total secret exclusion.
     - Tag: `// Feature: platform-builder-abstraction, Property 11: content coupling is deterministic, sensitive, and secret-free`
     - _Requirements: 6.16–6.20, 11.5, 11.20–11.21, 12.20–12.21, 13.18, 14.29_
-  - [ ] 13.2 Property test: Property 12 — provider canonicalization preserves platform semantic content
+  - [x] 13.2 Property test: Property 12 — provider canonicalization preserves platform semantic content
     - Generate valid provider documents and assert idempotent canonicalization plus semantic equality with
       platform-owned input; reject semantic additions/removals/substitutions.
     - Tag: `// Feature: platform-builder-abstraction, Property 12: provider canonicalization preserves platform semantic content`
     - _Requirements: 6.1–6.13, 6.21–6.23, 14.39_
-  - [ ] 13.3 Property test: Property 15 — operations declarations are catalog-bound and deterministic
+  - [x] 13.3 Property test: Property 15 — operations declarations are catalog-bound and deterministic
     - Generate platform service/ops catalogs and local overrides; assert membership, duplicate-free stable
       inventory, unknown-name reporting, and unchanged remote targets.
     - Tag: `// Feature: platform-builder-abstraction, Property 15: operations declarations are catalog-bound and deterministic`
     - _Requirements: 6.14, 10.2, 10.6–10.16, 14.16–14.17, 14.38_
-  - [ ] 13.4 Property test: Property 24 — artifact write boundaries are disjoint
+  - [x] 13.4 Property test: Property 24 — artifact write boundaries are disjoint
     - Generate lifecycle verbs and artifact declarations; assert exact permitted publications/consumers
       and that inspection bytes are never lifecycle/provider input.
     - Tag: `// Feature: platform-builder-abstraction, Property 24: artifact write boundaries are disjoint`

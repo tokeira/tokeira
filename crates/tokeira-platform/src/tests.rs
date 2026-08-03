@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -10,9 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     artifact::{
         ArtifactCatalog, ArtifactClass, ArtifactUse, CanonicalDocument, ContentIdentity,
-        ContentIdentitySet, DeliveryKey, DesiredContent, DesiredDocument,
-        OperationalArtifactReceipt, OperationalArtifactReceipts, OperationalArtifactRequest,
-        OperationalArtifactStage, PlatformArtifact, RelativeArtifactPath,
+        ContentIdentitySet, DeliveryKey, DesiredContent, DesiredDocument, InspectionRenderRequest,
+        InspectionRenderer, InspectionSpec, OperationalArtifactReceipt,
+        OperationalArtifactReceipts, OperationalArtifactRequest, OperationalArtifactStage,
+        PlatformArtifact, RelativeArtifactPath,
     },
     author::{AuthorArgument, AuthorHandle, AuthorNode, AuthorResult, AuthorValue},
     binding::{Platform, PlatformBinding, StateBinding, StatePolicy},
@@ -32,10 +36,14 @@ use crate::{
     },
     error::{
         ConfigError, ContextError, DeliveryError, FrontendDiagnostic, GraphError,
-        VerificationFinding,
+        InspectionRenderError, OpsError, VerificationFinding,
     },
     graph::{DeploymentGraphBuilder, WorkloadDeclaration, WritebackValue},
-    ops::PlatformOps,
+    ops::{
+        OperationInvocation, OperationKind, OperationOutput, OperationRegistration,
+        OperationRequest, OperationalEndpoint, PlatformOps, ProviderOperation, ServiceOps,
+        SessionPlan,
+    },
     projection::{
         FrameworkDeployment, no_change_issue_outcome, realize_resources, replace_selected_state,
         resolve_writeback,
@@ -440,10 +448,170 @@ impl ProviderDelivery for CoupledDelivery {
     }
 }
 
-fn coupled_binding(
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticDocument {
+    image: String,
+    command: Vec<String>,
+    replicas: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestPortTarget {
+    remote_host: String,
+    remote_port: u16,
+    protocol: String,
+    access_mode: String,
+    default_local_port: u16,
+}
+
+static TEST_PORT_OPERATION: OperationRegistration<TestPortTarget> =
+    OperationRegistration::new("test-provider", "port-forward");
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestLogTarget {
+    source: String,
+}
+
+static TEST_LOG_OPERATION: OperationRegistration<TestLogTarget> =
+    OperationRegistration::new("test-provider", "logs");
+
+#[derive(Debug)]
+struct TestProviderOperation {
+    operation: &'static str,
+}
+
+#[async_trait]
+impl ProviderOperation for TestProviderOperation {
+    fn provider(&self) -> &str {
+        "test-provider"
+    }
+
+    fn operation(&self) -> &str {
+        self.operation
+    }
+
+    fn validate_target(&self, target: &serde_json::Value) -> Result<(), OpsError> {
+        match self.operation {
+            "logs" => TEST_LOG_OPERATION.decode(target.clone()).map(|_| ()),
+            "port-forward" => TEST_PORT_OPERATION
+                .decode(target.clone())
+                .and_then(|target| {
+                    if target.remote_host.is_empty()
+                        || target.remote_port == 0
+                        || target.protocol.is_empty()
+                        || target.access_mode.is_empty()
+                        || target.default_local_port == 0
+                    {
+                        return Err(OpsError::InvalidTarget {
+                            provider: self.provider().into(),
+                            operation: self.operation.into(),
+                            message: "endpoint fields and ports must be non-empty".into(),
+                        });
+                    }
+                    Ok(())
+                }),
+            other => Err(OpsError::InvalidRegistration(format!(
+                "unexpected test operation `{other}`"
+            ))),
+        }
+    }
+
+    async fn execute(
+        &self,
+        invocation: &OperationInvocation,
+        _context: &tokeira_iac::ProvisionContext,
+    ) -> Result<OperationOutput, OpsError> {
+        match self.operation {
+            "logs" => {
+                let target = TEST_LOG_OPERATION.decode(invocation.request().target().clone())?;
+                Ok(OperationOutput::Logs(vec![target.source]))
+            }
+            "port-forward" => {
+                let target = TEST_PORT_OPERATION.decode(invocation.request().target().clone())?;
+                let session = (target.access_mode != "published").then(|| SessionPlan {
+                    program: "provider-session".into(),
+                    arguments: vec![target.remote_host.clone(), target.remote_port.to_string()],
+                });
+                Ok(OperationOutput::PortForward {
+                    endpoint: OperationalEndpoint {
+                        local_host: "127.0.0.1".into(),
+                        local_port: invocation.local_port().unwrap_or(target.default_local_port),
+                        remote_host: target.remote_host,
+                        remote_port: target.remote_port,
+                        protocol: target.protocol,
+                        access_mode: target.access_mode,
+                    },
+                    session,
+                })
+            }
+            other => Err(OpsError::Provider {
+                provider: self.provider().into(),
+                operation: other.into(),
+                message: "unexpected test operation".into(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TestInspectionRenderer {
+    renders: Arc<AtomicUsize>,
+    fail: bool,
+}
+
+impl InspectionRenderer<TestPlatform> for TestInspectionRenderer {
+    fn key(&self) -> &str {
+        "test-inspection"
+    }
+
+    fn render(
+        &self,
+        request: InspectionRenderRequest<'_, TestPlatform>,
+    ) -> Result<Vec<u8>, InspectionRenderError> {
+        self.renders.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            return Err(InspectionRenderError::new("injected renderer failure"));
+        }
+        let content = request
+            .content_for("server")
+            .and_then(|identities| identities.iter().next())
+            .map(|(_, identity)| identity.sha256.as_str())
+            .unwrap_or("none");
+        Ok(format!(
+            "deployment={}\nmodules={}\ncontent={content}\n",
+            request.invocation.deployment_id,
+            request.graph.modules().len(),
+        )
+        .into_bytes())
+    }
+}
+
+fn coupled_binding_with_inspection(
     content: DesiredContent,
     credential: String,
     published: Arc<Mutex<Vec<Vec<u8>>>>,
+    inspection: Vec<InspectionSpec<TestPlatform>>,
+) -> PlatformBinding<TestPlatform> {
+    coupled_binding_with_capabilities(
+        content,
+        credential,
+        published,
+        PlatformOps::default(),
+        Vec::new(),
+        inspection,
+    )
+}
+
+fn coupled_binding_with_capabilities(
+    content: DesiredContent,
+    credential: String,
+    published: Arc<Mutex<Vec<Vec<u8>>>>,
+    ops: PlatformOps,
+    provider_operations: Vec<Arc<dyn ProviderOperation>>,
+    inspection: Vec<InspectionSpec<TestPlatform>>,
 ) -> PlatformBinding<TestPlatform> {
     let delivery = DeliveryKey::new("test-delivery").expect("delivery key");
     PlatformBinding::new(
@@ -479,14 +647,18 @@ fn coupled_binding(
             delivery: delivery.clone(),
         }]),
         ImageCatalog::new(vec!["server-image".into()]),
-        ProviderSet::new(vec![Arc::new(CoupledDelivery {
-            key: delivery,
-            credential,
-            published,
-        })]),
+        ProviderSet::with_capabilities(
+            vec![Arc::new(CoupledDelivery {
+                key: delivery,
+                credential,
+                published,
+            })],
+            Vec::new(),
+            provider_operations,
+        ),
         StateBinding::new(StatePolicy::LocalCas),
-        PlatformOps::default(),
-        Vec::new(),
+        ops,
+        inspection,
     )
     .expect("coupled binding")
 }
@@ -497,7 +669,24 @@ fn coupled_framework(
     published: Arc<Mutex<Vec<Vec<u8>>>>,
     deployment_dir: std::path::PathBuf,
 ) -> FrameworkDeployment<TestPlatform> {
-    let binding = coupled_binding(content, credential, published);
+    coupled_framework_with_inspection(content, credential, published, deployment_dir, Vec::new())
+}
+
+fn coupled_framework_with_inspection(
+    content: DesiredContent,
+    credential: String,
+    published: Arc<Mutex<Vec<Vec<u8>>>>,
+    deployment_dir: std::path::PathBuf,
+    inspection: Vec<InspectionSpec<TestPlatform>>,
+) -> FrameworkDeployment<TestPlatform> {
+    let binding = coupled_binding_with_inspection(content, credential, published, inspection);
+    coupled_framework_from_binding(binding, deployment_dir)
+}
+
+fn coupled_framework_from_binding(
+    binding: PlatformBinding<TestPlatform>,
+    deployment_dir: std::path::PathBuf,
+) -> FrameworkDeployment<TestPlatform> {
     let mut graph = DeploymentGraphBuilder::with_catalogs(
         binding.services.identities(),
         binding.providers.delivery_keys(),
@@ -565,6 +754,28 @@ fn complete_immediate<F: std::future::Future>(future: F) -> F::Output {
     match std::future::Future::poll(future.as_mut(), &mut task_context) {
         std::task::Poll::Ready(output) => output,
         std::task::Poll::Pending => panic!("test future must complete without external I/O"),
+    }
+}
+
+#[derive(Debug)]
+struct TestDeploymentDir(std::path::PathBuf);
+
+impl TestDeploymentDir {
+    fn new(label: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("tokeira-platform-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).expect("temporary deployment root");
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDeploymentDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -1543,6 +1754,274 @@ proptest! {
         prop_assert!(!rendered.contains(&credential));
         prop_assert!(!rendered.contains(&other_credential));
     }
+
+    // Feature: platform-builder-abstraction, Property 12: provider canonicalization preserves platform semantic content
+    #[test]
+    fn provider_canonicalization_preserves_platform_semantic_content(
+        image in "[a-z][a-z0-9./:-]{0,31}",
+        command in prop::collection::vec("[a-z][a-z0-9-]{0,12}", 0..6),
+        replicas in 1u16..1000,
+    ) {
+        let semantic = SemanticDocument {
+            image,
+            command,
+            replicas,
+        };
+        let document = DesiredDocument {
+            schema: "test.semantic.v1".into(),
+            value: serde_json::to_value(&semantic).expect("semantic document"),
+        };
+        let canonical = CanonicalDocument::typed::<SemanticDocument>(
+            &document,
+            "test.semantic.v1",
+        )
+        .expect("valid typed provider document");
+        let decoded: SemanticDocument =
+            serde_json::from_slice(&canonical.bytes).expect("canonical typed decode");
+        prop_assert_eq!(&decoded, &semantic);
+
+        let repeated_document = DesiredDocument {
+            schema: document.schema.clone(),
+            value: serde_json::from_slice(&canonical.bytes).expect("canonical JSON value"),
+        };
+        let repeated = CanonicalDocument::typed::<SemanticDocument>(
+            &repeated_document,
+            "test.semantic.v1",
+        )
+        .expect("idempotent canonicalization");
+        prop_assert_eq!(&canonical, &repeated);
+
+        let mut added = document.clone();
+        added.value["provider_invented"] = serde_json::json!(true);
+        prop_assert!(
+            CanonicalDocument::typed::<SemanticDocument>(&added, "test.semantic.v1").is_err()
+        );
+        let mut removed = document.clone();
+        removed.value
+            .as_object_mut()
+            .expect("typed document object")
+            .remove("image");
+        prop_assert!(
+            CanonicalDocument::typed::<SemanticDocument>(&removed, "test.semantic.v1").is_err()
+        );
+        let mut substituted = semantic.clone();
+        substituted.image.push_str("-other");
+        let substituted_document = DesiredDocument {
+            schema: document.schema,
+            value: serde_json::to_value(&substituted).expect("substituted document"),
+        };
+        let substituted_bytes = CanonicalDocument::typed::<SemanticDocument>(
+            &substituted_document,
+            "test.semantic.v1",
+        )
+        .expect("valid substituted platform choice");
+        let substituted_decoded: SemanticDocument =
+            serde_json::from_slice(&substituted_bytes.bytes).expect("substituted decode");
+        prop_assert_eq!(substituted_decoded, substituted);
+        prop_assert_ne!(substituted_bytes, canonical);
+    }
+
+    // Feature: platform-builder-abstraction, Property 15: operations declarations are catalog-bound and deterministic
+    #[test]
+    fn operations_declarations_are_catalog_bound_and_deterministic(
+        service_names in prop::collection::btree_set("[a-z][a-z0-9]{0,7}", 1..8),
+        remote_port in 1u16..u16::MAX,
+        default_local_port in 1u16..u16::MAX,
+        override_port in 1u16..u16::MAX,
+        access_mode in prop_oneof![Just("published".to_string()), Just("session".to_string())],
+        reverse_declarations in any::<bool>(),
+    ) {
+        let mut declarations = service_names
+            .iter()
+            .map(|service| ServiceOps {
+                logical_service: service.clone(),
+                logs: Some(
+                    OperationRequest::typed(
+                        &TEST_LOG_OPERATION,
+                        TestLogTarget {
+                            source: format!("logs/{service}"),
+                        },
+                    )
+                    .expect("typed log request"),
+                ),
+                ports: vec![
+                    OperationRequest::typed(
+                        &TEST_PORT_OPERATION,
+                        TestPortTarget {
+                            remote_host: format!("{service}.internal"),
+                            remote_port,
+                            protocol: "tcp".into(),
+                            access_mode: access_mode.clone(),
+                            default_local_port,
+                        },
+                    )
+                    .expect("typed port request"),
+                ],
+            })
+            .collect::<Vec<_>>();
+        if reverse_declarations {
+            declarations.reverse();
+        }
+        let operations = PlatformOps::new(declarations);
+        let providers = ProviderSet::<TestPlatform>::with_capabilities(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                Arc::new(TestProviderOperation { operation: "logs" }),
+                Arc::new(TestProviderOperation { operation: "port-forward" }),
+            ],
+        );
+        operations
+            .validate(&service_names, &providers)
+            .expect("catalog-bound operation inventory");
+        let expected = service_names.iter().map(String::as_str).collect::<Vec<_>>();
+        prop_assert_eq!(operations.supported(OperationKind::Logs), expected.clone());
+        prop_assert_eq!(
+            operations.supported(OperationKind::PortForward),
+            expected.clone()
+        );
+
+        let unknown = operations.logs("not-declared").expect_err("unknown service");
+        let OpsError::UnknownService { supported, .. } = unknown else {
+            prop_assert!(false, "unexpected error: {unknown}");
+            return Ok(());
+        };
+        prop_assert_eq!(supported, expected.iter().map(|name| (*name).to_string()).collect::<Vec<_>>());
+
+        let selected = expected[0];
+        let baseline = operations.ports(selected, None).expect("default port request");
+        let overridden = operations
+            .ports(selected, Some(override_port))
+            .expect("overridden port request");
+        prop_assert_eq!(baseline[0].request(), overridden[0].request());
+        prop_assert_eq!(baseline[0].local_port(), None);
+        prop_assert_eq!(overridden[0].local_port(), Some(override_port));
+
+        let executor = providers
+            .operation(
+                overridden[0].request().provider(),
+                overridden[0].request().operation(),
+            )
+            .expect("registered provider operation");
+        let output = complete_immediate(executor.execute(
+            &overridden[0],
+            &tokeira_iac::ProvisionContext::default(),
+        ))
+        .expect("provider operation");
+        let OperationOutput::PortForward { endpoint, .. } = output else {
+            prop_assert!(false, "expected port-forward output");
+            return Ok(());
+        };
+        prop_assert_eq!(endpoint.local_port, override_port);
+        prop_assert_eq!(endpoint.remote_host, format!("{selected}.internal"));
+        prop_assert_eq!(endpoint.remote_port, remote_port);
+        prop_assert_eq!(endpoint.access_mode, access_mode);
+
+        let mut missing_catalog_entry = service_names.clone();
+        missing_catalog_entry.remove(selected);
+        prop_assert!(operations.validate(&missing_catalog_entry, &providers).is_err());
+    }
+
+    // Feature: platform-builder-abstraction, Property 24: artifact write boundaries are disjoint
+    #[test]
+    fn artifact_write_boundaries_are_disjoint(lifecycle in 0u8..8) {
+        let root = TestDeploymentDir::new("artifact-boundary");
+        let target = root.path().join("inspection.txt");
+        std::fs::write(&target, "operator edit\n").expect("prior inspection bytes");
+        let operational = Arc::new(Mutex::new(Vec::new()));
+        let inspections = Arc::new(AtomicUsize::new(0));
+        let renderer: Arc<dyn InspectionRenderer<TestPlatform>> =
+            Arc::new(TestInspectionRenderer {
+                renders: Arc::clone(&inspections),
+                fail: false,
+            });
+        let ops = PlatformOps::new(vec![ServiceOps {
+            logical_service: "server".into(),
+            logs: Some(OperationRequest::typed(
+                &TEST_LOG_OPERATION,
+                TestLogTarget {
+                    source: "runtime/server".into(),
+                },
+            ).expect("typed log request")),
+            ports: Vec::new(),
+        }]);
+        let binding = coupled_binding_with_capabilities(
+            DesiredContent::Text("desired = true\n".into()),
+            "CREDENTIAL".into(),
+            Arc::clone(&operational),
+            ops,
+            vec![Arc::new(TestProviderOperation { operation: "logs" })],
+            vec![InspectionSpec::new(
+                RelativeArtifactPath::new("inspection.txt").expect("inspection path"),
+                renderer,
+            )],
+        );
+        let framework = coupled_framework_from_binding(binding, root.path().to_path_buf());
+        let mut context = tokeira_iac::ProvisionContext::default();
+
+        match lifecycle {
+            // definition check, plan, rollback, and destroy have no
+            // publication call available in their framework traversal.
+            0 | 1 | 3 | 4 => {
+                let _ = coupled_manifest(&framework);
+            }
+            // Provider discovery and retrieval are operational reads; they do
+            // not cross either artifact publication boundary.
+            2 => {
+                let output = complete_immediate(framework.execute_operation_with_context(
+                    OperationKind::Logs,
+                    "server",
+                    None,
+                    &context,
+                )).expect("provider operation");
+                prop_assert_eq!(
+                    output,
+                    vec![OperationOutput::Logs(vec!["runtime/server".into()])]
+                );
+            }
+            // A committed apply publishes operational content before
+            // convergence and inspection only after the commit boundary.
+            5 => {
+                complete_immediate(framework.materialize_operational_artifacts(
+                    OperationalArtifactStage::Workload,
+                    &mut context,
+                ))
+                .expect("operational apply publication");
+                framework
+                    .publish_inspection()
+                    .expect("post-commit inspection publication");
+            }
+            // A failed apply may have staged operational content, but never
+            // crosses the committed inspection boundary.
+            6 => {
+                complete_immediate(framework.materialize_operational_artifacts(
+                    OperationalArtifactStage::Workload,
+                    &mut context,
+                ))
+                .expect("pre-convergence operational publication");
+            }
+            // Creation rendering is pure and can be staged by the separate
+            // all-or-nothing deployment transaction without publishing here.
+            _ => {
+                let rendered = framework.render_inspection().expect("pure rendering");
+                prop_assert_eq!(rendered.len(), 1);
+            }
+        }
+
+        let expected_operational = usize::from(matches!(lifecycle, 5 | 6));
+        let expected_inspection = usize::from(matches!(lifecycle, 5 | 7));
+        prop_assert_eq!(
+            operational.lock().expect("operational recorder").len(),
+            expected_operational
+        );
+        prop_assert_eq!(inspections.load(Ordering::SeqCst), expected_inspection);
+        let bytes = std::fs::read(&target).expect("inspection target remains complete");
+        if lifecycle == 5 {
+            prop_assert_ne!(bytes, b"operator edit\n");
+        } else {
+            prop_assert_eq!(bytes, b"operator edit\n");
+        }
+    }
 }
 
 #[test]
@@ -1611,4 +2090,198 @@ fn deployment_file_content_is_resolved_once_per_framework_invocation() {
     );
     assert_ne!(first_manifest, coupled_manifest(&next));
     std::fs::remove_dir_all(root).expect("remove temporary deployment root");
+}
+
+#[test]
+fn framework_operations_dispatch_typed_targets_without_changing_remote_topology() {
+    let root = TestDeploymentDir::new("operations");
+    let ops = PlatformOps::new(vec![ServiceOps {
+        logical_service: "server".into(),
+        logs: Some(
+            OperationRequest::typed(
+                &TEST_LOG_OPERATION,
+                TestLogTarget {
+                    source: "runtime/server".into(),
+                },
+            )
+            .expect("typed log target"),
+        ),
+        ports: vec![
+            OperationRequest::typed(
+                &TEST_PORT_OPERATION,
+                TestPortTarget {
+                    remote_host: "server.internal".into(),
+                    remote_port: 7233,
+                    protocol: "tcp".into(),
+                    access_mode: "remote-host".into(),
+                    default_local_port: 7233,
+                },
+            )
+            .expect("typed port target"),
+        ],
+    }]);
+    let binding = coupled_binding_with_capabilities(
+        DesiredContent::Text("desired = true\n".into()),
+        "CREDENTIAL".into(),
+        Arc::new(Mutex::new(Vec::new())),
+        ops,
+        vec![
+            Arc::new(TestProviderOperation { operation: "logs" }),
+            Arc::new(TestProviderOperation {
+                operation: "port-forward",
+            }),
+        ],
+        Vec::new(),
+    );
+    let framework = coupled_framework_from_binding(binding, root.path().to_path_buf());
+    let context = tokeira_iac::ProvisionContext::default();
+
+    let unknown =
+        complete_immediate(framework.execute_operation(OperationKind::Logs, "missing", None))
+            .expect_err("unknown service is rejected before provider or state access");
+    assert!(matches!(unknown, OpsError::UnknownService { .. }));
+
+    let logs = complete_immediate(framework.execute_operation_with_context(
+        OperationKind::Logs,
+        "server",
+        None,
+        &context,
+    ))
+    .expect("provider logs");
+    assert_eq!(
+        logs,
+        vec![OperationOutput::Logs(vec!["runtime/server".into()])]
+    );
+    let ports = complete_immediate(framework.execute_operation_with_context(
+        OperationKind::PortForward,
+        "server",
+        Some(17233),
+        &context,
+    ))
+    .expect("provider port resolution");
+    let OperationOutput::PortForward { endpoint, session } = &ports[0] else {
+        panic!("port resolution must return an endpoint");
+    };
+    assert_eq!(endpoint.local_port, 17233);
+    assert_eq!(endpoint.remote_host, "server.internal");
+    assert_eq!(endpoint.remote_port, 7233);
+    assert_eq!(endpoint.access_mode, "remote-host");
+    assert_eq!(
+        session.as_ref().expect("provider session plan").program,
+        "provider-session"
+    );
+}
+
+#[test]
+fn inspection_render_failure_preserves_the_prior_complete_file() {
+    let root = TestDeploymentDir::new("inspection-render-failure");
+    let target = root.path().join("inspection.txt");
+    std::fs::write(&target, "prior complete bytes\n").expect("prior inspection");
+    let renderer: Arc<dyn InspectionRenderer<TestPlatform>> = Arc::new(TestInspectionRenderer {
+        renders: Arc::new(AtomicUsize::new(0)),
+        fail: true,
+    });
+    let framework = coupled_framework_with_inspection(
+        DesiredContent::Text("desired = true\n".into()),
+        "CREDENTIAL".into(),
+        Arc::new(Mutex::new(Vec::new())),
+        root.path().to_path_buf(),
+        vec![InspectionSpec::new(
+            RelativeArtifactPath::new("inspection.txt").expect("inspection path"),
+            renderer,
+        )],
+    );
+
+    let error = framework
+        .publish_inspection()
+        .expect_err("injected renderer failure");
+    assert!(error.to_string().contains("injected renderer failure"));
+    assert_eq!(
+        std::fs::read(&target).expect("prior inspection remains"),
+        b"prior complete bytes\n"
+    );
+}
+
+#[test]
+fn inspection_publication_replaces_operator_edits_from_same_directory_staging() {
+    let root = TestDeploymentDir::new("inspection-atomic");
+    let target = root.path().join("nested/inspection.txt");
+    std::fs::create_dir_all(target.parent().expect("target parent")).expect("target parent");
+    std::fs::write(&target, "operator edit\n").expect("operator-edited inspection");
+    let renderer: Arc<dyn InspectionRenderer<TestPlatform>> = Arc::new(TestInspectionRenderer {
+        renders: Arc::new(AtomicUsize::new(0)),
+        fail: false,
+    });
+    let framework = coupled_framework_with_inspection(
+        DesiredContent::Text("desired = true\n".into()),
+        "CREDENTIAL".into(),
+        Arc::new(Mutex::new(Vec::new())),
+        root.path().to_path_buf(),
+        vec![InspectionSpec::new(
+            RelativeArtifactPath::new("nested/inspection.txt").expect("inspection path"),
+            renderer,
+        )],
+    );
+
+    let publications = framework
+        .publish_inspection()
+        .expect("atomic inspection publication");
+    assert_eq!(publications.len(), 1);
+    let bytes = std::fs::read(&target).expect("published inspection");
+    assert!(
+        !bytes
+            .windows("operator edit".len())
+            .any(|window| window == b"operator edit")
+    );
+    let siblings = std::fs::read_dir(target.parent().expect("target parent"))
+        .expect("published directory")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(siblings, vec![std::ffi::OsString::from("inspection.txt")]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("inspection metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn inspection_publication_rejects_a_parent_symlink_that_escapes_the_deployment() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDeploymentDir::new("inspection-symlink-root");
+    let outside = TestDeploymentDir::new("inspection-symlink-outside");
+    symlink(outside.path(), root.path().join("alias")).expect("escaping parent symlink");
+    let renderer: Arc<dyn InspectionRenderer<TestPlatform>> = Arc::new(TestInspectionRenderer {
+        renders: Arc::new(AtomicUsize::new(0)),
+        fail: false,
+    });
+    let framework = coupled_framework_with_inspection(
+        DesiredContent::Text("desired = true\n".into()),
+        "CREDENTIAL".into(),
+        Arc::new(Mutex::new(Vec::new())),
+        root.path().to_path_buf(),
+        vec![InspectionSpec::new(
+            RelativeArtifactPath::new("alias/new/inspection.txt").expect("inspection path"),
+            renderer,
+        )],
+    );
+
+    let error = framework
+        .publish_inspection()
+        .expect_err("escaping parent must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("escapes the deployment directory")
+    );
+    assert!(!outside.path().join("new").exists());
 }

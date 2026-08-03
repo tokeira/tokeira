@@ -285,6 +285,143 @@ pub struct BindingError {
     pub message: String,
 }
 
+/// Failure to validate, resolve, or execute one provider-neutral operation.
+#[derive(Debug, Error)]
+pub enum OpsError {
+    /// A provider registration has an unusable identity.
+    #[error("invalid provider operation registration: {0}")]
+    InvalidRegistration(String),
+    /// A typed provider target could not be serialized, decoded, or validated.
+    #[error("invalid target for provider operation `{provider}/{operation}`: {message}")]
+    InvalidTarget {
+        /// Stable provider identity.
+        provider: String,
+        /// Stable provider-owned operation identity.
+        operation: String,
+        /// Typed serialization, decoding, or validation detail.
+        message: String,
+    },
+    /// The logical service is not present in the supported inventory for this operation class.
+    #[error("unknown {kind:?} service `{requested}`; supported services: {supported:?}")]
+    UnknownService {
+        /// Requested log or port-forward operation class.
+        kind: crate::ops::OperationKind,
+        /// Logical service supplied by the operator.
+        requested: String,
+        /// Complete deterministic supported inventory.
+        supported: Vec<String>,
+    },
+    /// A local listener override cannot be used.
+    #[error("local port override `{0}` is invalid")]
+    InvalidLocalPort(u16),
+    /// The selected binding contains no executor for an admitted request.
+    #[error("provider operation `{provider}/{operation}` is not registered")]
+    MissingExecutor {
+        /// Stable provider identity.
+        provider: String,
+        /// Stable provider-owned operation identity.
+        operation: String,
+    },
+    /// Runtime registration needed by a provider operation failed.
+    #[error(transparent)]
+    ProviderExecution(#[from] ProviderExecutionError),
+    /// Recorded infrastructure state needed by provider discovery could not be loaded.
+    #[error("cannot load infrastructure state for provider operation: {0}")]
+    State(#[from] tokeira_state::StateError),
+    /// Provider discovery, retrieval, or request construction failed.
+    #[error("provider operation `{provider}/{operation}` failed: {message}")]
+    Provider {
+        /// Stable provider identity.
+        provider: String,
+        /// Stable provider-owned operation identity.
+        operation: String,
+        /// Provider-owned actionable failure detail.
+        message: String,
+    },
+    /// A provider returned a result for a different operation class.
+    #[error("provider operation returned {actual:?} for requested {expected:?}")]
+    ResultKind {
+        /// Operation class requested through the platform inventory.
+        expected: crate::ops::OperationKind,
+        /// Operation class represented by the provider result.
+        actual: crate::ops::OperationKind,
+    },
+    /// A provider did not preserve the invocation-local listener override.
+    #[error("provider returned local port {actual} instead of requested override {expected}")]
+    LocalPortMismatch {
+        /// Invocation-local override.
+        expected: u16,
+        /// Provider-returned endpoint port.
+        actual: u16,
+    },
+}
+
+/// Platform-owned pure inspection rendering failure.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("inspection renderer error: {message}")]
+pub struct InspectionRenderError {
+    /// Actionable renderer-owned detail.
+    pub message: String,
+}
+
+impl InspectionRenderError {
+    /// Construct a pure renderer failure.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Failure to render, stage, or atomically publish an inspection artifact.
+#[derive(Debug, Error)]
+pub enum InspectionError {
+    /// A platform renderer rejected desired state before any file was staged.
+    #[error("inspection renderer `{renderer}` failed for `{path}`: {source}")]
+    Render {
+        /// Stable renderer identity.
+        renderer: String,
+        /// Validated deployment-relative target.
+        path: std::path::PathBuf,
+        /// Platform-owned pure rendering failure.
+        #[source]
+        source: InspectionRenderError,
+    },
+    /// The resolved parent directory escaped through a filesystem alias such as a symlink.
+    #[error("inspection target `{path}` escapes the deployment directory")]
+    EscapingTarget {
+        /// Rejected deployment-relative target.
+        path: std::path::PathBuf,
+    },
+    /// Deployment-root or target-parent preparation failed.
+    #[error("cannot prepare inspection target `{path}`: {source}")]
+    Prepare {
+        /// Deployment-relative target.
+        path: std::path::PathBuf,
+        /// Host filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Safe same-directory temporary-file staging failed.
+    #[error("cannot stage inspection target `{path}`: {source}")]
+    Stage {
+        /// Deployment-relative target.
+        path: std::path::PathBuf,
+        /// Host filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Atomic replacement failed; the staged file is discarded.
+    #[error("cannot atomically publish inspection target `{path}`: {source}")]
+    Publish {
+        /// Deployment-relative target.
+        path: std::path::PathBuf,
+        /// Host filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Failure before or during one format-neutral definition evaluation.
 #[derive(Debug, Error)]
 pub enum DefinitionError {

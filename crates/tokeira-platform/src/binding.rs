@@ -1,11 +1,6 @@
 //! Typed platform identity, catalogs, context/config contracts, and provider selection.
 
-use std::{
-    collections::BTreeSet,
-    marker::PhantomData,
-    path::{Component, Path},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, marker::PhantomData, path::Path, sync::Arc};
 
 use crate::{
     artifact::{ArtifactCatalog, ArtifactClass, InspectionSpec},
@@ -245,6 +240,16 @@ impl<P: Platform> PlatformBinding<P> {
         if execution_keys.len() != self.providers.executions().len() {
             return Err(BindingError::new("duplicate provider execution key"));
         }
+        let operation_keys = self.providers.operation_keys();
+        if operation_keys.len() != self.providers.operations().len() {
+            return Err(BindingError::new("duplicate provider operation key"));
+        }
+        if operation_keys
+            .iter()
+            .any(|(provider, operation)| provider.is_empty() || operation.is_empty())
+        {
+            return Err(BindingError::new("provider operation keys cannot be empty"));
+        }
         self.state.validate()?;
 
         let mut images = BTreeSet::new();
@@ -402,32 +407,20 @@ impl<P: Platform> PlatformBinding<P> {
             }
         }
 
-        self.ops.validate(&service_ids)?;
+        self.ops.validate(&service_ids, &self.providers)?;
 
         let mut inspection_paths = BTreeSet::new();
         for inspection in &self.inspection {
-            if inspection.path.as_os_str().is_empty()
-                || inspection.path.is_absolute()
-                || inspection
-                    .path
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_)))
-            {
-                return Err(BindingError::new(format!(
-                    "inspection path `{}` is not a safe canonical relative path",
-                    inspection.path.display()
-                )));
-            }
-            if !inspection_paths.insert(inspection.path.clone()) {
+            if !inspection_paths.insert(inspection.path().clone()) {
                 return Err(BindingError::new(format!(
                     "duplicate inspection path `{}`",
-                    inspection.path.display()
+                    inspection.path().as_path().display()
                 )));
             }
-            if inspection.renderer.is_empty() {
+            if inspection.renderer_key().is_empty() {
                 return Err(BindingError::new(format!(
                     "inspection path `{}` has an empty renderer identity",
-                    inspection.path.display()
+                    inspection.path().as_path().display()
                 )));
             }
         }

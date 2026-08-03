@@ -140,6 +140,10 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after deploy apply")?;
+    platform
+        .publish_inspection(deployment_dir)
+        .await
+        .context("deploy apply is committed and recorded; inspection publication failed")?;
     let mut context = crate::explain_context(platform, deployment_dir, &envelope, "deploy apply");
     context.current_revision = from_revision;
     context.proposed_revision = Some(envelope.config_revision);

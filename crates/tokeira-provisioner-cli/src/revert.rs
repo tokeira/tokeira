@@ -102,6 +102,10 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after revert")?;
+    platform
+        .publish_inspection(deployment_dir)
+        .await
+        .context("revert reconcile is committed and recorded; inspection publication failed")?;
     println!(
         "envelope: config_revision now {} (content of revision {to_revision})",
         envelope.config_revision

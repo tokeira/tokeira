@@ -6,16 +6,18 @@ use async_trait::async_trait;
 
 use crate::{
     artifact::{
-        ArtifactClass, ContentIdentity, ContentIdentitySet, DesiredContent,
-        OperationalArtifactReceipt, OperationalArtifactReceipts, OperationalArtifactRequest,
-        OperationalArtifactStage,
+        ArtifactClass, ContentIdentity, ContentIdentitySet, DesiredContent, InspectionPublication,
+        InspectionRenderRequest, OperationalArtifactReceipt, OperationalArtifactReceipts,
+        OperationalArtifactRequest, OperationalArtifactStage, RenderedInspection,
+        publish_rendered_inspection,
     },
     binding::{Platform, PlatformBinding},
     catalog::{DeliveryProjection, PlacementContext, ProviderSet},
     context::InvocationContext,
     definition::EvaluatedDefinition,
-    error::{ArtifactError, FrameworkError, ProjectionError},
+    error::{ArtifactError, FrameworkError, InspectionError, OpsError, ProjectionError},
     graph::{VerifiedGraph, WritebackValue},
+    ops::{OperationInvocation, OperationKind, OperationOutput},
     selection::{EffectiveSelection, SelectionDirection, select_modules},
 };
 
@@ -273,6 +275,122 @@ impl<P: Platform> FrameworkDeployment<P> {
     /// Whether the definition declares any provider-delivered workload.
     pub fn has_workloads(&self) -> bool {
         !self.definition.graph.workloads().is_empty()
+    }
+
+    /// Resolve and execute one catalog-bound logical operation through provider mechanics.
+    ///
+    /// This path may read provider state and perform provider discovery, but it
+    /// does not publish operational or inspection artifacts and never spawns a
+    /// provider session process.
+    pub async fn execute_operation(
+        &self,
+        kind: OperationKind,
+        logical_service: &str,
+        local_port: Option<u16>,
+    ) -> Result<Vec<OperationOutput>, OpsError> {
+        // Resolve membership before provider registration or state access so
+        // unknown names are pure inventory errors.
+        let invocations = self.operation_invocations(kind, logical_service, local_port)?;
+        let selected_providers = invocations
+            .iter()
+            .map(|invocation| invocation.request().provider().as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut context = tokeira_iac::ProvisionContext::default();
+        for execution in self
+            .binding
+            .providers
+            .executions()
+            .iter()
+            .filter(|execution| selected_providers.contains(execution.provider()))
+        {
+            execution
+                .register_infra_extensions(&self.definition.config, &self.invocation, &mut context)
+                .await?;
+        }
+        let store = self.binding.state.infra_store(
+            &self.definition.config,
+            &self.invocation,
+            &self.invocation.deployment_dir,
+        );
+        let (state, _) = store.load().await?;
+        context.state = state;
+
+        self.execute_operation_invocations(invocations, &context)
+            .await
+    }
+
+    /// Execute a catalog-bound operation with an already admitted provider context.
+    ///
+    /// Provisioner integrations use this seam when provider registration and
+    /// recorded-state loading are already part of their operation preflight.
+    pub async fn execute_operation_with_context(
+        &self,
+        kind: OperationKind,
+        logical_service: &str,
+        local_port: Option<u16>,
+        context: &tokeira_iac::ProvisionContext,
+    ) -> Result<Vec<OperationOutput>, OpsError> {
+        let invocations = self.operation_invocations(kind, logical_service, local_port)?;
+        self.execute_operation_invocations(invocations, context)
+            .await
+    }
+
+    fn operation_invocations(
+        &self,
+        kind: OperationKind,
+        logical_service: &str,
+        local_port: Option<u16>,
+    ) -> Result<Vec<OperationInvocation>, OpsError> {
+        match kind {
+            OperationKind::Logs => Ok(vec![self.binding.ops.logs(logical_service)?]),
+            OperationKind::PortForward => self.binding.ops.ports(logical_service, local_port),
+        }
+    }
+
+    async fn execute_operation_invocations(
+        &self,
+        invocations: Vec<OperationInvocation>,
+        context: &tokeira_iac::ProvisionContext,
+    ) -> Result<Vec<OperationOutput>, OpsError> {
+        let mut outputs = Vec::with_capacity(invocations.len());
+        for invocation in invocations {
+            let request = invocation.request();
+            let executor = self
+                .binding
+                .providers
+                .operation(request.provider(), request.operation())
+                .ok_or_else(|| OpsError::MissingExecutor {
+                    provider: request.provider().as_str().to_string(),
+                    operation: request.operation().as_str().to_string(),
+                })?;
+            let output = executor.execute(&invocation, context).await?;
+            validate_operation_output(&invocation, &output)?;
+            outputs.push(output);
+        }
+        Ok(outputs)
+    }
+
+    /// Render all inspection artifacts from desired inputs before any file is staged.
+    pub fn render_inspection(&self) -> Result<Vec<RenderedInspection>, InspectionError> {
+        self.binding
+            .inspection
+            .iter()
+            .map(|inspection| {
+                inspection.render(InspectionRenderRequest::new(
+                    &self.definition.config,
+                    &self.invocation,
+                    &self.definition.graph,
+                    &self.binding.services,
+                    &self.content_by_service,
+                ))
+            })
+            .collect()
+    }
+
+    /// Render and atomically replace declared non-authoritative inspection artifacts.
+    pub fn publish_inspection(&self) -> Result<Vec<InspectionPublication>, InspectionError> {
+        let rendered = self.render_inspection()?;
+        publish_rendered_inspection(&self.invocation.deployment_dir, rendered)
     }
 
     /// Build the provider context used to publish artifacts before workload convergence.
@@ -833,6 +951,50 @@ fn validate_receipt(
         return Err(ArtifactError::InvalidReceipt {
             artifact: artifact.logical_id.clone(),
             message,
+        });
+    }
+    Ok(())
+}
+
+fn validate_operation_output(
+    invocation: &OperationInvocation,
+    output: &OperationOutput,
+) -> Result<(), OpsError> {
+    let actual = match output {
+        OperationOutput::Logs(_) => OperationKind::Logs,
+        OperationOutput::PortForward { .. } => OperationKind::PortForward,
+    };
+    if actual != invocation.kind() {
+        return Err(OpsError::ResultKind {
+            expected: invocation.kind(),
+            actual,
+        });
+    }
+    let OperationOutput::PortForward { endpoint, session } = output else {
+        return Ok(());
+    };
+    if let Some(expected) = invocation.local_port()
+        && endpoint.local_port != expected
+    {
+        return Err(OpsError::LocalPortMismatch {
+            expected,
+            actual: endpoint.local_port,
+        });
+    }
+    if endpoint.local_host.is_empty()
+        || endpoint.local_port == 0
+        || endpoint.remote_host.is_empty()
+        || endpoint.remote_port == 0
+        || endpoint.protocol.is_empty()
+        || endpoint.access_mode.is_empty()
+        || session
+            .as_ref()
+            .is_some_and(|session| session.program.is_empty())
+    {
+        return Err(OpsError::Provider {
+            provider: invocation.request().provider().as_str().to_string(),
+            operation: invocation.request().operation().as_str().to_string(),
+            message: "provider returned an incomplete operational endpoint or session plan".into(),
         });
     }
     Ok(())

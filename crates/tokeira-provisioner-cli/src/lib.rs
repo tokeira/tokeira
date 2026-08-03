@@ -238,6 +238,15 @@ pub trait ProvisionerPlatform {
         self.infra_apply(deployment_dir).await
     }
 
+    /// Publish declared non-authoritative inspection artifacts after apply state commits.
+    ///
+    /// The shell calls this only after its configuration revision and engine
+    /// state are durable. Legacy adapters declare no inspection artifacts and
+    /// retain the no-op default.
+    async fn publish_inspection(&self, _deployment_dir: &Path) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Tear down the deployment's infrastructure. Returns the removed count.
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize>;
 

@@ -83,6 +83,10 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
             .save(&envelope, &version)
             .await
             .context("failed to close the operation marker")?;
+        platform
+            .publish_inspection(deployment_dir)
+            .await
+            .context("upgrade is committed and recorded; inspection publication failed")?;
         println!("upgrade complete — the deployment runs the new provisioner");
         return Ok(());
     }
@@ -183,6 +187,10 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to close the operation marker")?;
+    platform
+        .publish_inspection(deployment_dir)
+        .await
+        .context("upgrade is committed and recorded; inspection publication failed")?;
     println!("upgrade complete — the deployment runs the new provisioner");
     Ok(())
 }

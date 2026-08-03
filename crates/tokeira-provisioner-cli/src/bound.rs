@@ -344,6 +344,13 @@ where
         self.apply_infra(deployment_dir, true).await
     }
 
+    async fn publish_inspection(&self, deployment_dir: &Path) -> Result<usize> {
+        self.framework(deployment_dir)?
+            .publish_inspection()
+            .map(|publications| publications.len())
+            .context("inspection artifact publication failed")
+    }
+
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
         let (mut engine, composition) = self.infra_engine(deployment_dir).await?;
         Ok(engine
@@ -448,7 +455,7 @@ where
         if !framework.has_runtime_workloads() {
             return if framework.has_workloads() {
                 Ok(Realization::Realized(
-                    self.infra_apply(deployment_dir).await?,
+                    self.infra_apply_with_artifacts(deployment_dir).await?,
                 ))
             } else {
                 Ok(Realization::NotApplicable {
@@ -721,6 +728,7 @@ mod tests {
     struct TestDelivery {
         key: DeliveryKey,
         publications: Arc<AtomicUsize>,
+        runtime: bool,
     }
 
     #[async_trait]
@@ -745,12 +753,21 @@ mod tests {
             placement: &PlacementContext,
             _content: &ContentIdentitySet,
         ) -> Result<DeliveryProjection, DeliveryError> {
-            Ok(DeliveryProjection::Workload(Box::new(TestService {
-                name: declaration.service.clone(),
-                module: placement.module.clone(),
-                dependencies: declaration.dependencies.clone(),
-                document: declaration.document.value.clone(),
-            })))
+            if self.runtime {
+                Ok(DeliveryProjection::Workload(Box::new(TestService {
+                    name: declaration.service.clone(),
+                    module: placement.module.clone(),
+                    dependencies: declaration.dependencies.clone(),
+                    document: declaration.document.value.clone(),
+                })))
+            } else {
+                Ok(DeliveryProjection::Infrastructure(Box::new(
+                    TestInfraResource {
+                        id: tokeira_iac::ResourceId(declaration.service.clone()),
+                        module: placement.module.clone(),
+                    },
+                )))
+            }
         }
 
         async fn materialize_operational(
@@ -765,6 +782,79 @@ mod tests {
                 identity: request.identity.clone(),
                 consumers: request.artifact.consumers.clone(),
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestInfraResource {
+        id: tokeira_iac::ResourceId,
+        module: String,
+    }
+
+    #[async_trait]
+    impl tokeira_iac::Resource for TestInfraResource {
+        fn resource_type(&self) -> tokeira_iac::ResourceType {
+            tokeira_iac::ResourceType::new("test-infra-service")
+        }
+
+        fn resource_id(&self) -> tokeira_iac::ResourceId {
+            self.id.clone()
+        }
+
+        fn dependencies(&self) -> Vec<tokeira_iac::ResourceId> {
+            Vec::new()
+        }
+
+        fn module(&self) -> &str {
+            &self.module
+        }
+
+        async fn create(
+            &self,
+            _context: &tokeira_iac::ProvisionContext,
+        ) -> Result<tokeira_iac::ResourceState, tokeira_iac::IacError> {
+            Ok(tokeira_iac::ResourceState {
+                resource_type: self.resource_type(),
+                physical_id: self.id.0.clone(),
+                properties: serde_json::json!({"service": self.id.0}),
+                dependencies: Vec::new(),
+                created_at: "created".into(),
+                updated_at: "created".into(),
+                module: self.module.clone(),
+            })
+        }
+
+        async fn update(
+            &self,
+            current: &tokeira_iac::ResourceState,
+            _context: &tokeira_iac::ProvisionContext,
+        ) -> Result<tokeira_iac::ResourceState, tokeira_iac::IacError> {
+            Ok(current.clone())
+        }
+
+        async fn delete(
+            &self,
+            _current: &tokeira_iac::ResourceState,
+            _context: &tokeira_iac::ProvisionContext,
+        ) -> Result<(), tokeira_iac::IacError> {
+            Ok(())
+        }
+
+        async fn describe(
+            &self,
+            _context: &tokeira_iac::ProvisionContext,
+        ) -> Result<tokeira_iac::DescribeResult, tokeira_iac::IacError> {
+            Ok(tokeira_iac::DescribeResult::Absent)
+        }
+
+        fn diff(
+            &self,
+            _current: &tokeira_iac::ResourceState,
+            _context: &tokeira_iac::ProvisionContext,
+        ) -> tokeira_iac::InternalChange {
+            tokeira_iac::InternalChange::NoChange {
+                resource_id: self.id.clone(),
+            }
         }
     }
 
@@ -805,15 +895,17 @@ mod tests {
         }
     }
 
-    fn fake_runtime_binding(
+    fn fake_service_binding(
         applies: Arc<AtomicUsize>,
         publications: Option<Arc<AtomicUsize>>,
+        runtime: bool,
     ) -> PlatformBinding<FakePlatform> {
         let has_artifact = publications.is_some();
         let publications = publications.unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
         let delivery = Arc::new(TestDelivery {
             key: DeliveryKey::new("test").expect("delivery key"),
             publications,
+            runtime,
         });
         let service = PlatformService {
             logical_id: "server".into(),
@@ -858,6 +950,13 @@ mod tests {
                 })],
             ),
         )
+    }
+
+    fn fake_runtime_binding(
+        applies: Arc<AtomicUsize>,
+        publications: Option<Arc<AtomicUsize>>,
+    ) -> PlatformBinding<FakePlatform> {
+        fake_service_binding(applies, publications, true)
     }
 
     #[test]
@@ -987,6 +1086,38 @@ mod tests {
             .deploy_apply(root.path())
             .await
             .expect("workload apply");
+        assert_eq!(publications.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deploy_apply_publishes_infrastructure_service_artifacts() {
+        let root = tempfile::tempdir().expect("deployment");
+        write_metadata(root.path(), "compose", "tkd");
+        std::fs::write(root.path().join("definition.tkd"), "definition").expect("definition");
+        let publications = Arc::new(AtomicUsize::new(0));
+        let platform = BoundPlatform::new(
+            "compose",
+            "tkd",
+            fake_service_binding(
+                Arc::new(AtomicUsize::new(0)),
+                Some(Arc::clone(&publications)),
+                false,
+            ),
+            FakeFrontend {
+                format: DefinitionFormatId::new("tkd").expect("format"),
+                workload: true,
+            },
+        )
+        .expect("bound platform");
+
+        let Realization::Realized(applied) = platform
+            .deploy_apply(root.path())
+            .await
+            .expect("infra-only deploy apply")
+        else {
+            panic!("infrastructure service is realized");
+        };
+        assert_eq!(applied.changes.len(), 1);
         assert_eq!(publications.load(Ordering::SeqCst), 1);
     }
 

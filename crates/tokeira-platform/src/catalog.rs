@@ -15,6 +15,7 @@ use crate::{
     context::InvocationContext,
     error::{BindingError, DeliveryError, KindError, ProviderExecutionError},
     graph::WorkloadDeclaration,
+    ops::{OperationKey, ProviderKey, ProviderOperation},
 };
 
 /// Logical placement supplied to provider kinds and delivery implementations.
@@ -505,6 +506,7 @@ pub trait ProviderExecution<P: Platform>: Debug + Send + Sync {
 pub struct ProviderSet<P: Platform> {
     deliveries: Vec<Arc<dyn ProviderDelivery>>,
     executions: Vec<Arc<dyn ProviderExecution<P>>>,
+    operations: Vec<Arc<dyn ProviderOperation>>,
     marker: PhantomData<fn() -> P>,
 }
 
@@ -513,6 +515,7 @@ impl<P: Platform> std::fmt::Debug for ProviderSet<P> {
         f.debug_struct("ProviderSet")
             .field("delivery_keys", &self.delivery_keys())
             .field("execution_keys", &self.execution_keys())
+            .field("operation_keys", &self.operation_keys())
             .finish()
     }
 }
@@ -520,7 +523,7 @@ impl<P: Platform> std::fmt::Debug for ProviderSet<P> {
 impl<P: Platform> ProviderSet<P> {
     /// Construct a selected provider set.
     pub fn new(deliveries: Vec<Arc<dyn ProviderDelivery>>) -> Self {
-        Self::with_executions(deliveries, Vec::new())
+        Self::with_capabilities(deliveries, Vec::new(), Vec::new())
     }
 
     /// Construct selected delivery and runtime registrations.
@@ -528,9 +531,19 @@ impl<P: Platform> ProviderSet<P> {
         deliveries: Vec<Arc<dyn ProviderDelivery>>,
         executions: Vec<Arc<dyn ProviderExecution<P>>>,
     ) -> Self {
+        Self::with_capabilities(deliveries, executions, Vec::new())
+    }
+
+    /// Construct selected delivery, runtime, and provider-operation registrations.
+    pub fn with_capabilities(
+        deliveries: Vec<Arc<dyn ProviderDelivery>>,
+        executions: Vec<Arc<dyn ProviderExecution<P>>>,
+        operations: Vec<Arc<dyn ProviderOperation>>,
+    ) -> Self {
         Self {
             deliveries,
             executions,
+            operations,
             marker: PhantomData,
         }
     }
@@ -559,6 +572,39 @@ impl<P: Platform> ProviderSet<P> {
     /// Borrow selected provider runtime registrations.
     pub fn executions(&self) -> &[Arc<dyn ProviderExecution<P>>] {
         &self.executions
+    }
+
+    /// Return provider-operation identities for binding validation.
+    pub fn operation_keys(&self) -> BTreeSet<(String, String)> {
+        self.operations
+            .iter()
+            .map(|operation| {
+                (
+                    operation.provider().to_string(),
+                    operation.operation().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Borrow selected provider operation implementations.
+    pub fn operations(&self) -> &[Arc<dyn ProviderOperation>] {
+        &self.operations
+    }
+
+    /// Resolve provider-owned operation mechanics by the admitted envelope identity.
+    pub fn operation(
+        &self,
+        provider: &ProviderKey,
+        operation: &OperationKey,
+    ) -> Option<&dyn ProviderOperation> {
+        self.operations
+            .iter()
+            .find(|candidate| {
+                candidate.provider() == provider.as_str()
+                    && candidate.operation() == operation.as_str()
+            })
+            .map(Arc::as_ref)
     }
 
     /// Resolve the single selected deploy-engine platform, when one exists.

@@ -1,9 +1,15 @@
 //! Platform-owned artifact declarations and provider-neutral content identity.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    fs::{File, OpenOptions},
+    io::Write,
     marker::PhantomData,
     path::{Component, Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +52,33 @@ pub struct DesiredDocument {
 pub struct CanonicalDocument {
     /// Deterministic provider representation.
     pub bytes: Vec<u8>,
+}
+
+impl CanonicalDocument {
+    /// Validate one provider schema through its typed document and serialize canonical JSON bytes.
+    ///
+    /// Provider crates may wrap this baseline when their natural representation
+    /// is YAML or another format, but the typed decode remains the point where
+    /// platform-populated semantic content is admitted without additions.
+    pub fn typed<T>(
+        document: &DesiredDocument,
+        expected_schema: &str,
+    ) -> Result<Self, crate::error::DeliveryError>
+    where
+        T: serde::de::DeserializeOwned + Serialize,
+    {
+        if document.schema != expected_schema {
+            return Err(crate::error::DeliveryError::new(format!(
+                "expected provider document schema `{expected_schema}`, found `{}`",
+                document.schema
+            )));
+        }
+        let typed: T = serde_json::from_value(document.value.clone())
+            .map_err(|source| crate::error::DeliveryError::new(source.to_string()))?;
+        let bytes = serde_json::to_vec(&typed)
+            .map_err(|source| crate::error::DeliveryError::new(source.to_string()))?;
+        Ok(Self { bytes })
+    }
 }
 
 /// Platform-owned non-secret artifact content.
@@ -239,34 +272,333 @@ impl ContentIdentitySet {
     }
 }
 
-/// Platform-supplied renderer for one reproducible inspection artifact.
-#[derive(Clone)]
-pub struct InspectionSpec<P> {
-    /// Safe deployment-relative publication path.
-    pub path: PathBuf,
-    /// Stable renderer identity.
-    pub renderer: String,
-    marker: PhantomData<fn() -> P>,
+/// Desired-only input supplied to a platform-owned inspection renderer.
+#[derive(Debug, Clone, Copy)]
+pub struct InspectionRenderRequest<'a, P: crate::binding::Platform> {
+    /// Typed platform choices admitted from the definition.
+    pub config: &'a P::Config,
+    /// Immutable invocation facts admitted before definition evaluation.
+    pub invocation: &'a crate::context::InvocationContext,
+    /// Verified logical graph for the represented definition revision.
+    pub graph: &'a crate::graph::VerifiedGraph,
+    /// Complete platform-owned service catalog.
+    pub services: &'a crate::catalog::ServiceCatalog<P>,
+    content_by_service: &'a BTreeMap<String, ContentIdentitySet>,
 }
 
-impl<P> std::fmt::Debug for InspectionSpec<P> {
+impl<'a, P: crate::binding::Platform> InspectionRenderRequest<'a, P> {
+    /// Borrow content identities carried by one active service's desired representation.
+    pub fn content_for(&self, logical_service: &str) -> Option<&ContentIdentitySet> {
+        self.content_by_service.get(logical_service)
+    }
+
+    pub(crate) fn new(
+        config: &'a P::Config,
+        invocation: &'a crate::context::InvocationContext,
+        graph: &'a crate::graph::VerifiedGraph,
+        services: &'a crate::catalog::ServiceCatalog<P>,
+        content_by_service: &'a BTreeMap<String, ContentIdentitySet>,
+    ) -> Self {
+        Self {
+            config,
+            invocation,
+            graph,
+            services,
+            content_by_service,
+        }
+    }
+}
+
+/// Platform-owned pure projection of verified desired state into inspection bytes.
+pub trait InspectionRenderer<P: crate::binding::Platform>: std::fmt::Debug + Send + Sync {
+    /// Stable renderer identity used in binding validation and errors.
+    fn key(&self) -> &str;
+
+    /// Render without provider calls, state reads, filesystem writes, or prior output bytes.
+    fn render(
+        &self,
+        request: InspectionRenderRequest<'_, P>,
+    ) -> Result<Vec<u8>, crate::error::InspectionRenderError>;
+}
+
+/// Platform-selected renderer and deployment-relative publication target.
+#[derive(Clone)]
+pub struct InspectionSpec<P: crate::binding::Platform> {
+    path: RelativeArtifactPath,
+    renderer: Arc<dyn InspectionRenderer<P>>,
+}
+
+impl<P: crate::binding::Platform> std::fmt::Debug for InspectionSpec<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InspectionSpec")
             .field("path", &self.path)
-            .field("renderer", &self.renderer)
+            .field("renderer", &self.renderer.key())
             .finish()
     }
 }
 
-impl<P> InspectionSpec<P> {
-    /// Construct an inspection declaration; path safety is validated by the binding.
-    pub fn new(path: PathBuf, renderer: impl Into<String>) -> Self {
-        Self {
-            path,
-            renderer: renderer.into(),
-            marker: PhantomData,
+impl<P: crate::binding::Platform> InspectionSpec<P> {
+    /// Select one pure renderer for a validated deployment-relative path.
+    pub fn new(path: RelativeArtifactPath, renderer: Arc<dyn InspectionRenderer<P>>) -> Self {
+        Self { path, renderer }
+    }
+
+    /// Validated deployment-relative publication target.
+    pub fn path(&self) -> &RelativeArtifactPath {
+        &self.path
+    }
+
+    /// Stable selected renderer identity.
+    pub fn renderer_key(&self) -> &str {
+        self.renderer.key()
+    }
+
+    pub(crate) fn render(
+        &self,
+        request: InspectionRenderRequest<'_, P>,
+    ) -> Result<RenderedInspection, crate::error::InspectionError> {
+        let bytes = self.renderer.render(request).map_err(|source| {
+            crate::error::InspectionError::Render {
+                renderer: self.renderer.key().to_string(),
+                path: self.path.as_path().to_path_buf(),
+                source,
+            }
+        })?;
+        Ok(RenderedInspection {
+            path: self.path.clone(),
+            bytes,
+        })
+    }
+}
+
+/// Evidence for one atomically replaced non-authoritative inspection artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectionPublication {
+    /// Validated deployment-relative target.
+    pub path: RelativeArtifactPath,
+    /// Identity of the exact published bytes.
+    pub identity: ContentIdentity,
+}
+
+/// Pure platform-rendered inspection bytes awaiting lifecycle-owned publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedInspection {
+    path: RelativeArtifactPath,
+    bytes: Vec<u8>,
+}
+
+impl RenderedInspection {
+    /// Validated deployment-relative target selected by the platform binding.
+    pub fn path(&self) -> &RelativeArtifactPath {
+        &self.path
+    }
+
+    /// Borrow exact desired-only bytes without reading any prior publication.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+struct StagedInspection {
+    relative: RelativeArtifactPath,
+    target: PathBuf,
+    temporary: Option<PathBuf>,
+    identity: ContentIdentity,
+}
+
+impl StagedInspection {
+    fn commit(mut self) -> Result<InspectionPublication, crate::error::InspectionError> {
+        let temporary = self
+            .temporary
+            .take()
+            .expect("staged inspection owns one temporary path");
+        if let Err(source) = std::fs::rename(&temporary, &self.target) {
+            self.temporary = Some(temporary);
+            return Err(crate::error::InspectionError::Publish {
+                path: self.relative.as_path().to_path_buf(),
+                source,
+            });
+        }
+        Ok(InspectionPublication {
+            path: self.relative.clone(),
+            identity: self.identity.clone(),
+        })
+    }
+}
+
+impl Drop for StagedInspection {
+    fn drop(&mut self) {
+        if let Some(path) = &self.temporary {
+            let _ = std::fs::remove_file(path);
         }
     }
+}
+
+static NEXT_INSPECTION_TEMP: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically replace every rendered artifact from same-directory staged bytes.
+///
+/// All artifacts are rendered before this function is called and all temporary
+/// files are staged before the first replacement. Each replacement is atomic;
+/// callers that require a single publication transaction should declare one
+/// inspection artifact, as the current Compose platform does.
+pub fn publish_rendered_inspection(
+    deployment_dir: &Path,
+    rendered: Vec<RenderedInspection>,
+) -> Result<Vec<InspectionPublication>, crate::error::InspectionError> {
+    let root = std::fs::canonicalize(deployment_dir).map_err(|source| {
+        crate::error::InspectionError::Prepare {
+            path: PathBuf::from("."),
+            source,
+        }
+    })?;
+    let mut staged = Vec::with_capacity(rendered.len());
+    for artifact in rendered {
+        staged.push(stage_inspection(&root, artifact)?);
+    }
+    staged.into_iter().map(StagedInspection::commit).collect()
+}
+
+fn stage_inspection(
+    root: &Path,
+    artifact: RenderedInspection,
+) -> Result<StagedInspection, crate::error::InspectionError> {
+    let relative = artifact.path;
+    let canonical_parent = prepare_inspection_parent(root, &relative)?;
+    let target = canonical_parent.join(
+        relative
+            .as_path()
+            .file_name()
+            .expect("validated relative inspection target has a file name"),
+    );
+
+    let temporary = create_inspection_temp(&canonical_parent, &target, &relative)?;
+    let identity = ContentIdentity::new(
+        &format!("inspection-artifact/{}", relative.as_path().display()),
+        &artifact.bytes,
+    );
+    let mut file = temporary.1;
+    let temporary_path = temporary.0;
+    if let Err(source) = file
+        .write_all(&artifact.bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(crate::error::InspectionError::Stage {
+            path: relative.as_path().to_path_buf(),
+            source,
+        });
+    }
+    drop(file);
+    Ok(StagedInspection {
+        relative,
+        target,
+        temporary: Some(temporary_path),
+        identity,
+    })
+}
+
+fn prepare_inspection_parent(
+    root: &Path,
+    relative: &RelativeArtifactPath,
+) -> Result<PathBuf, crate::error::InspectionError> {
+    let mut current = root.to_path_buf();
+    let parent = relative
+        .as_path()
+        .parent()
+        .expect("a non-empty relative inspection target has a parent");
+    for component in parent.components() {
+        let Component::Normal(segment) = component else {
+            unreachable!("RelativeArtifactPath admits only normal components");
+        };
+        current.push(segment);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(crate::error::InspectionError::EscapingTarget {
+                    path: relative.as_path().to_path_buf(),
+                });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(crate::error::InspectionError::Prepare {
+                    path: relative.as_path().to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        format!("{} is not a directory", current.display()),
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|source| {
+                    crate::error::InspectionError::Prepare {
+                        path: relative.as_path().to_path_buf(),
+                        source,
+                    }
+                })?;
+            }
+            Err(source) => {
+                return Err(crate::error::InspectionError::Prepare {
+                    path: relative.as_path().to_path_buf(),
+                    source,
+                });
+            }
+        }
+        current = std::fs::canonicalize(&current).map_err(|source| {
+            crate::error::InspectionError::Prepare {
+                path: relative.as_path().to_path_buf(),
+                source,
+            }
+        })?;
+        if !current.starts_with(root) {
+            return Err(crate::error::InspectionError::EscapingTarget {
+                path: relative.as_path().to_path_buf(),
+            });
+        }
+    }
+    Ok(current)
+}
+
+fn create_inspection_temp(
+    parent: &Path,
+    target: &Path,
+    relative: &RelativeArtifactPath,
+) -> Result<(PathBuf, File), crate::error::InspectionError> {
+    let file_name = target
+        .file_name()
+        .expect("validated relative inspection target has a file name")
+        .to_string_lossy();
+    for _ in 0..32 {
+        let sequence = NEXT_INSPECTION_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{file_name}.tokeira-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(crate::error::InspectionError::Stage {
+                    path: relative.as_path().to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    Err(crate::error::InspectionError::Stage {
+        path: relative.as_path().to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve a unique same-directory temporary file",
+        ),
+    })
 }
 
 /// Immutable artifact inventory supplied by one platform package.

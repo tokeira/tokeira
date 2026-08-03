@@ -87,6 +87,10 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after apply")?;
+    platform
+        .publish_inspection(deployment_dir)
+        .await
+        .context("apply is committed and recorded; inspection publication failed")?;
     let mut context = crate::explain_context(platform, deployment_dir, &envelope, "infra apply");
     context.current_revision = from_revision;
     context.proposed_revision = Some(envelope.config_revision);
@@ -182,8 +186,70 @@ pub(crate) fn config_ref(deployment_dir: &Path, config_source: &crate::ConfigSou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestPlatform;
+    use crate::{ProvisionerPlatform, TestPlatform};
     use tokeira_provisioner::DeploymentStateEnvelope;
+
+    struct FailingInspectionPlatform;
+
+    impl ProvisionerPlatform for FailingInspectionPlatform {
+        fn label(&self, _deployment_dir: &Path) -> &'static str {
+            "test"
+        }
+
+        fn config_source(&self, _deployment_dir: &Path) -> Result<crate::ConfigSource> {
+            crate::ConfigSource::legacy("deployment.toml")
+        }
+
+        fn deployment_id(&self, _deployment_dir: &Path) -> Result<String> {
+            Ok("tokeira".into())
+        }
+
+        async fn infra_plan(&self, _deployment_dir: &Path) -> Result<crate::PlanOutcome> {
+            Ok(crate::PlanOutcome::default())
+        }
+
+        async fn infra_apply(&self, _deployment_dir: &Path) -> Result<crate::AppliedOutcome> {
+            Ok(crate::AppliedOutcome::default())
+        }
+
+        async fn publish_inspection(&self, _deployment_dir: &Path) -> Result<usize> {
+            anyhow::bail!("injected inspection failure")
+        }
+
+        async fn infra_destroy(&self, _deployment_dir: &Path) -> Result<usize> {
+            Ok(0)
+        }
+
+        async fn infra_destroy_selected(
+            &self,
+            _deployment_dir: &Path,
+            _ids: &[String],
+        ) -> Result<Vec<tokeira_provisioner::ChangeLogEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn deploy_plan(
+            &self,
+            _deployment_dir: &Path,
+        ) -> Result<crate::Realization<crate::PlanOutcome>> {
+            Ok(crate::Realization::NotApplicable { reason: "test" })
+        }
+
+        async fn deploy_apply(
+            &self,
+            _deployment_dir: &Path,
+        ) -> Result<crate::Realization<crate::AppliedOutcome>> {
+            Ok(crate::Realization::NotApplicable { reason: "test" })
+        }
+
+        async fn scale(
+            &self,
+            _deployment_dir: &Path,
+            _specs: &[String],
+        ) -> Result<crate::Realization<usize>> {
+            Ok(crate::Realization::NotApplicable { reason: "test" })
+        }
+    }
 
     // Task 19.4: while an upgrade/rollback marker is open, `apply` refuses —
     // recovery goes through the interrupted verb, never around it.
@@ -346,6 +412,35 @@ mod tests {
             after.config_revision, 5,
             "the artifact failure never costs the revision advance"
         );
+    }
+
+    #[tokio::test]
+    async fn inspection_failure_is_reported_after_the_apply_record_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        let env = DeploymentStateEnvelope {
+            binding: Some(ProvenanceStamp::current(Utc::now())),
+            config_revision: 4,
+            ..Default::default()
+        };
+        let (_, version) = store.load().await.unwrap();
+        store.save(&env, &version).await.unwrap();
+
+        let error = apply(
+            &FailingInspectionPlatform,
+            tmp.path(),
+            false,
+            Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect_err("inspection failure is surfaced");
+        let message = format!("{error:#}");
+        assert!(message.contains("apply is committed and recorded"));
+        assert!(message.contains("injected inspection failure"));
+
+        let (after, _) = store.load().await.unwrap();
+        assert_eq!(after.config_revision, 5);
     }
 
     #[tokio::test]

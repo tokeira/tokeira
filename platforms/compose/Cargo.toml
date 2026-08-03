@@ -7,15 +7,16 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# The platform ships its own provisioner (Req 14): the shared shell composed
-# with this crate's `provisioner` realization. The constructed binary is
-# `tkp` — deployment create marries a copy to the deployment dir.
-[[bin]]
-name = "tkp"
-path = "src/bin/tkp.rs"
+[package.metadata.tokeira.platform]
+id = "compose"
+binding-contract = 1
+launch-class = "bound-provisioner"
+default = false
 
 [dependencies]
 tokeira-provisioner-cli = { workspace = true }
+tokeira-provisioner = { workspace = true }
+tokeira-platform = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokeira-compose = { path = "../../crates/tokeira-compose" }
@@ -30,20 +31,19 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+futures-util = "0.3"
 # Observability config rendering (owned by compose-syn — alerts + dashboards +
 # the askama templates live in this crate).
 askama = "0.12"
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-# The `.tkd` interpreter now lives in the shared `tokeira-tkd` crate; compose-syn
-# supplies its `ComposeBridge` (host adapter) and delegates parsing/eval to it.
 tokeira-tkd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# The moved image-inventory tests parse the prototypical deployment.toml.
-toml = { workspace = true }
 # The semantics registry's Properties 9/10 (change-semantics Requirement 7)
 # probe realized kinds over generated contexts.
 proptest = { workspace = true }

@@ -2,19 +2,23 @@
 
 use std::{collections::BTreeMap, fmt::Debug};
 
-use crate::{author::LocatedValue, error::KindError};
+use crate::{author::LocatedValue, content::ContentIdentity, error::KindError};
 
 /// Logical placement supplied to a provider kind exactly once at execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementContext {
     /// Stable deployment identity used by provider naming policies.
     pub deployment_id: String,
+    /// Deployment root admitted by the shell for platform-local resources.
+    pub deployment_dir: std::path::PathBuf,
     /// Owning logical module.
     pub module: String,
     /// Logical id within the module.
     pub logical_id: String,
     /// Realized provider resource ids of declared dependencies.
     pub dependencies: Vec<tokeira_iac::ResourceId>,
+    /// Desired-content identities of those same dependencies.
+    pub dependency_content: BTreeMap<tokeira_iac::ResourceId, ContentIdentity>,
     /// Stable platform/provider tags.
     pub tags: BTreeMap<String, String>,
 }
@@ -30,8 +34,8 @@ pub trait ProviderKind: Debug + Send + Sync {
     /// Complete output names admitted by the structural graph.
     fn declared_outputs(&self) -> &'static [&'static str];
 
-    /// Provider-owned desired input manifest used for explanation and evidence.
-    fn desired_manifest(&self) -> serde_json::Value;
+    /// Provider-owned desired manifest at admitted invocation placement.
+    fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value;
 
     /// Realize the kind with invocation-bound identity exactly once at execution.
     fn realize(

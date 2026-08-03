@@ -467,12 +467,11 @@ fn value_to_located<K>(value: Value<HostValue<K>>) -> Result<LocatedValue, EvalE
                 .map(value_to_located)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        Value::Tuple(values) => ValueShape::Tuple(
-            values
-                .into_iter()
-                .map(value_to_located)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
+        Value::Tuple(_) => {
+            return Err(EvalError::new(
+                "tuple values are not admitted across the definition-frontend boundary",
+            ));
+        }
         Value::Opt(value) => ValueShape::Option(
             value
                 .map(|value| value_to_located(*value).map(Box::new))
@@ -494,19 +493,19 @@ fn value_to_located<K>(value: Value<HostValue<K>>) -> Result<LocatedValue, EvalE
             variant,
             body: match body {
                 VariantBody::Unit => VariantShape::Unit,
-                VariantBody::Tuple(values) => {
-                    VariantShape::Tuple(values.into_iter().map(value_to_located).collect::<Result<
-                        Vec<_>,
-                        _,
-                    >>(
-                    )?)
+                VariantBody::Tuple(mut values) if values.len() == 1 => {
+                    VariantShape::Newtype(Box::new(value_to_located(values.remove(0))?))
                 }
-                VariantBody::Struct(fields) => VariantShape::Struct(
-                    fields
-                        .into_iter()
-                        .map(|(name, value)| value_to_located(value).map(|value| (name, value)))
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
+                VariantBody::Tuple(_) => {
+                    return Err(EvalError::new(
+                        "tuple enum variants are not admitted across the definition-frontend boundary",
+                    ));
+                }
+                VariantBody::Struct(_) => {
+                    return Err(EvalError::new(
+                        "struct enum variants are not admitted across the definition-frontend boundary",
+                    ));
+                }
             },
         },
         Value::Host(handle) => {
@@ -529,11 +528,6 @@ fn located_to_value<K>(value: LocatedValue) -> Result<Value<HostValue<K>>, EvalE
             .map(located_to_value)
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Vec),
-        ValueShape::Tuple(values) => values
-            .into_iter()
-            .map(located_to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Tuple),
         ValueShape::Option(value) => value
             .map(|value| located_to_value(*value).map(Box::new))
             .transpose()
@@ -555,18 +549,7 @@ fn located_to_value<K>(value: LocatedValue) -> Result<Value<HostValue<K>>, EvalE
             variant,
             body: match body {
                 VariantShape::Unit => VariantBody::Unit,
-                VariantShape::Tuple(values) => VariantBody::Tuple(
-                    values
-                        .into_iter()
-                        .map(located_to_value)
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
-                VariantShape::Struct(fields) => VariantBody::Struct(
-                    fields
-                        .into_iter()
-                        .map(|(field, value)| located_to_value(value).map(|value| (field, value)))
-                        .collect::<Result<FieldMap<_>, _>>()?,
-                ),
+                VariantShape::Newtype(value) => VariantBody::Tuple(vec![located_to_value(*value)?]),
             },
         }),
         ValueShape::Float(value) => Err(EvalError::new(format!(
@@ -671,7 +654,7 @@ mod tests {
             &["endpoint"]
         }
 
-        fn desired_manifest(&self) -> serde_json::Value {
+        fn desired_manifest(&self, _placement: &PlacementContext) -> serde_json::Value {
             serde_json::json!({})
         }
 

@@ -236,6 +236,7 @@ impl RealizedResourceIndex {
 pub struct RealizedResources {
     index: RealizedResourceIndex,
     resources: Vec<Box<dyn tokeira_iac::Resource>>,
+    manifests: BTreeMap<tokeira_iac::ResourceId, serde_json::Value>,
 }
 
 impl fmt::Debug for RealizedResources {
@@ -243,6 +244,7 @@ impl fmt::Debug for RealizedResources {
         f.debug_struct("RealizedResources")
             .field("index", &self.index)
             .field("resource_count", &self.resources.len())
+            .field("manifest_count", &self.manifests.len())
             .finish()
     }
 }
@@ -262,6 +264,11 @@ impl RealizedResources {
     pub fn into_resources(self) -> Vec<Box<dyn tokeira_iac::Resource>> {
         self.resources
     }
+
+    /// Provider-owned desired manifests keyed by executed resource identity.
+    pub fn manifests(&self) -> &BTreeMap<tokeira_iac::ResourceId, serde_json::Value> {
+        &self.manifests
+    }
 }
 
 impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
@@ -269,10 +276,13 @@ impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
     pub fn realize(
         &self,
         deployment_id: &str,
+        deployment_dir: &std::path::Path,
         tags: &BTreeMap<String, String>,
     ) -> Result<RealizedResources, ProjectionError> {
         let nodes = self.definition.graph.resources();
         let mut index = RealizedResourceIndex::default();
+        let mut content = BTreeMap::new();
+        let mut manifests = BTreeMap::new();
         let mut pending = (0..nodes.len()).collect::<Vec<_>>();
         let mut realized = std::iter::repeat_with(|| None)
             .take(nodes.len())
@@ -293,7 +303,7 @@ impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
             };
             let node_index = pending.remove(position);
             let node = &nodes[node_index];
-            let dependencies = node
+            let dependencies: Vec<tokeira_iac::ResourceId> = node
                 .dependencies()
                 .iter()
                 .map(|dependency| {
@@ -303,13 +313,25 @@ impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
                         .expect("the selected resource has realized dependencies")
                 })
                 .collect();
+            let dependency_content = dependencies
+                .iter()
+                .filter_map(|id| {
+                    content
+                        .get(id)
+                        .cloned()
+                        .map(|identity| (id.clone(), identity))
+                })
+                .collect();
             let placement = PlacementContext {
                 deployment_id: deployment_id.to_string(),
+                deployment_dir: deployment_dir.to_path_buf(),
                 module: node.module().to_string(),
                 logical_id: node.logical_id().to_string(),
                 dependencies,
+                dependency_content,
                 tags: tags.clone(),
             };
+            let manifest = node.kind().desired_manifest(&placement);
             let resource = node
                 .kind()
                 .realize(&placement)
@@ -318,9 +340,18 @@ impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
                     provider_kind: node.kind().kind_name().to_string(),
                     message: error.message,
                 })?;
+            let resource_id = resource.resource_id();
+            content.insert(
+                resource_id.clone(),
+                crate::content::ContentIdentity::new(
+                    &format!("provider-resource/{}", node.kind().kind_name()),
+                    manifest.to_string().as_bytes(),
+                ),
+            );
+            manifests.insert(resource_id.clone(), manifest);
             index.ids.insert(
                 (node.module().to_string(), node.logical_id().to_string()),
-                resource.resource_id(),
+                resource_id,
             );
             realized[node_index] = Some(resource);
         }
@@ -329,7 +360,11 @@ impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
         for entry in realized {
             resources.push(entry.expect("every verified resource was realized"));
         }
-        Ok(RealizedResources { index, resources })
+        Ok(RealizedResources {
+            index,
+            resources,
+            manifests,
+        })
     }
 
     /// Resolve only explicitly declared writebacks from applied state.

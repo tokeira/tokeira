@@ -549,7 +549,7 @@ pub(crate) fn compose_definition_seed(
                 format!("failed to read definition seed {}", seed_path.display())
             })?
         }
-        Err(_) => tokeira_compose_deployment::DEFAULT_TKD.to_string(),
+        Err(_) => tokeira_compose_deployment::definition_seed().to_string(),
     };
     let source = crate::prototypical::compose_definition(&source, storage, region)?;
     Ok(DefinitionSeed {
@@ -630,11 +630,8 @@ pub(crate) fn load_context(
             PlatformDeploymentConfig::Local(config)
         }
         PlatformKind::Compose => {
-            let mut config: ComposeConfig =
-                tokeira_config::load_config(&deployment_config_path, None).with_context(|| {
-                    format!("failed to load {}", deployment_config_path.display())
-                })?;
-            config.deployment_dir = path.clone();
+            let config: ComposeConfig = tokeira_config::load_config(&deployment_config_path, None)
+                .with_context(|| format!("failed to load {}", deployment_config_path.display()))?;
             PlatformDeploymentConfig::Compose(Box::new(config))
         }
         PlatformKind::Ecs => {

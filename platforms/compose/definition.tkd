@@ -1,27 +1,21 @@
-// The compose deployment definition — interpreted `.tkd` (Proposal 004).
-//
-// This is data, not crate source: `tkp` parses it with `syn` and walks it at
-// runtime, so an operator edit is an ordinary `apply`, never an engine-identity
-// change. It names ONLY the author vocabulary (`Deployment`/`Service`/the kinds/
-// `cx.*`) and the config types it defines below — nothing of the engine, and
-// nothing non-hermetic (no paths, no env, no I/O).
-//
-// Two halves: `config()` is the operator surface; `deployment(cfg, cx)` is the
-// structure. Both are byte-identical in effect to the compiled `definition.rs`.
+// The Compose deployment definition. The selected frontend evaluates this source into
+// one transient structural graph and one typed Compose configuration.
 
 enum DsqlMode {
     Managed,
     Preexisting,
 }
 
+struct DsqlStorage {
+    region: String,
+    mode: DsqlMode,
+    endpoint: Option<String>,
+    arn: Option<String>,
+}
+
 enum Storage {
     InMemory,
-    Dsql {
-        region: String,
-        mode: DsqlMode,
-        endpoint: Option<String>,
-        arn: Option<String>,
-    },
+    Dsql(DsqlStorage),
 }
 
 struct Tokeirad {
@@ -57,8 +51,27 @@ struct Compose {
     observability: Observability,
 }
 
-// The default config the operator edits — overriding a default is editing a
-// value here (e.g. `storage: Storage::Dsql { .. }` for persistence).
+struct Environment {
+    name: String,
+    value: String,
+}
+
+struct StateVolume {
+    sub: String,
+    at: String,
+}
+
+struct ConfigVolume {
+    sub: String,
+    at: String,
+}
+
+enum Volume {
+    State(StateVolume),
+    Config(ConfigVolume),
+    DockerSocket,
+}
+
 fn config() -> Compose {
     Compose {
         storage: Storage::InMemory,
@@ -82,40 +95,38 @@ fn config() -> Compose {
     }
 }
 
-fn deployment(cfg: &Compose, cx: &Cx) -> Deployment {
-    let mut d = Deployment::new(&["default"]);
+fn deployment(cfg: Compose, cx: Context) -> Deployment {
+    let d = Deployment::new(&["default"]);
 
-    // bootstrap state
-    let local_state = d.module("local_state", &[]);
-    d.resource(&local_state, "dir", LocalStateDir);
+    let local_state = d.module("local_state", vec![]);
+    local_state.resource("dir", LocalStateDir {});
 
-    // persistent storage — only under DSQL
-    if let Storage::Dsql { region, mode, endpoint, arn } = &cfg.storage {
-        let dsql = d.module("dsql", &["local_state"]);
-        let cluster = d.resource(
-            &dsql,
+    if let Storage::Dsql(storage) = &cfg.storage {
+        let dsql = d.module("dsql", vec![local_state]);
+        let cluster = dsql.resource(
             "cluster",
             DsqlCluster {
-                region: region.clone(),
-                mode: mode.clone(),
-                endpoint: endpoint.clone(),
-                arn: arn.clone(),
+                identity: format!("{}-compose", cx.project_name),
+                region: storage.region.clone(),
+                mode: storage.mode.clone(),
+                endpoint: storage.endpoint.clone(),
+                arn: storage.arn.clone(),
             },
         );
-        let rate_limiter = d.resource(
-            &dsql,
+        let rate_limiter = dsql.resource(
             "rate_limiter",
             DynamoDbTable {
                 table: format!("{}-dsql-rate-limiter", cx.project_name),
+                region: storage.region.clone(),
                 hash_key: "pk".into(),
                 ttl: Some("ttl_epoch".into()),
             },
         );
-        let conn_lease = d.resource(
-            &dsql,
+        let conn_lease = dsql.resource(
             "conn_lease",
             DynamoDbTable {
                 table: format!("{}-dsql-conn-lease", cx.project_name),
+                region: storage.region.clone(),
                 hash_key: "pk".into(),
                 ttl: Some("ttl_epoch".into()),
             },
@@ -123,18 +134,32 @@ fn deployment(cfg: &Compose, cx: &Cx) -> Deployment {
 
         d.writeback("infrastructure.storage", "dsql");
         d.writeback("infrastructure.dsql.endpoint", cluster.output("cluster_endpoint"));
-        d.writeback("infrastructure.dsql.region", region.clone());
+        d.writeback("infrastructure.dsql.region", storage.region.clone());
         d.writeback("infrastructure.dsql.rate_limiter_table", rate_limiter.output("table_name"));
         d.writeback("infrastructure.dsql.conn_lease_table", conn_lease.output("table_name"));
     }
 
-    // observability — config files + the four backend services
-    let observability = d.module("observability", &["local_state"]);
+    let runtime = d.module("runtime", vec![local_state]);
+    runtime.resource(
+        "tokeirad",
+        Service {
+            image: cfg.tokeirad.image.clone(),
+            replicas: cfg.tokeirad.replicas,
+            publish: vec![cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
+            server_config: true,
+            aws_region: match &cfg.storage {
+                Storage::Dsql(storage) => Some(storage.region.clone()),
+                _ => None,
+            },
+            ..Service::EMPTY
+        },
+    );
+
+    let observability = d.module("observability", vec![local_state, runtime]);
     let o = &cfg.observability;
-    d.resource(
-        &observability,
+    let config_files = observability.resource(
         "config_files",
-        ObservabilityConfigFiles {
+        ObservabilityConfiguration {
             scrape_host: "tokeirad".into(),
             scrape_port: cfg.tokeirad.metrics_port,
             cluster: cx.project_name.clone(),
@@ -146,93 +171,73 @@ fn deployment(cfg: &Compose, cx: &Cx) -> Deployment {
             retention_hours: 168,
         },
     );
-
-    d.service(
-        &observability,
+    let mimir = observability.resource(
         "mimir",
         Service {
             image: o.mimir.image.clone(),
             replicas: o.mimir.replicas,
             publish: vec![9009],
             volumes: vec![
-                cx.state("mimir", "/data"),
-                cx.config("mimir.yaml", "/etc/mimir/mimir.yaml"),
-                cx.config("mimir/rules", "/data/mimir/rules"),
+                Volume::State(StateVolume { sub: "mimir".into(), at: "/data".into() }),
+                Volume::Config(ConfigVolume { sub: "mimir.yaml".into(), at: "/etc/mimir/mimir.yaml".into() }),
+                Volume::Config(ConfigVolume { sub: "mimir/rules".into(), at: "/data/mimir/rules".into() }),
             ],
             command: vec!["--config.file=/etc/mimir/mimir.yaml".into()],
             ..Service::EMPTY
         },
+        vec![config_files],
     );
-    d.service(
-        &observability,
+    let loki = observability.resource(
         "loki",
         Service {
             image: o.loki.image.clone(),
             replicas: o.loki.replicas,
             publish: vec![3100],
             volumes: vec![
-                cx.state("loki", "/loki"),
-                cx.config("loki.yaml", "/etc/loki/loki.yaml"),
+                Volume::State(StateVolume { sub: "loki".into(), at: "/loki".into() }),
+                Volume::Config(ConfigVolume { sub: "loki.yaml".into(), at: "/etc/loki/loki.yaml".into() }),
             ],
             command: vec!["--config.file=/etc/loki/loki.yaml".into()],
             ..Service::EMPTY
         },
+        vec![config_files],
     );
-    d.service(
-        &observability,
+    observability.resource(
         "grafana",
         Service {
             image: o.grafana.image.clone(),
             replicas: o.grafana.replicas,
             publish: vec![o.grafana.port],
             volumes: vec![
-                cx.state("grafana", "/var/lib/grafana"),
-                cx.config("grafana/provisioning", "/etc/grafana/provisioning/"),
-                cx.config("grafana/dashboards", "/var/lib/grafana/dashboards/"),
+                Volume::State(StateVolume { sub: "grafana".into(), at: "/var/lib/grafana".into() }),
+                Volume::Config(ConfigVolume { sub: "grafana/provisioning".into(), at: "/etc/grafana/provisioning/".into() }),
+                Volume::Config(ConfigVolume { sub: "grafana/dashboards".into(), at: "/var/lib/grafana/dashboards/".into() }),
             ],
-            env: vec![
-                ("GF_SECURITY_ADMIN_USER".into(), "admin".into()),
-                ("GF_SECURITY_ADMIN_PASSWORD".into(), o.grafana.admin_password.clone()),
-                ("GF_METRICS_ENABLED".into(), "true".into()),
+            environment: vec![
+                Environment { name: "GF_SECURITY_ADMIN_USER".into(), value: "admin".into() },
+                Environment { name: "GF_SECURITY_ADMIN_PASSWORD".into(), value: o.grafana.admin_password.clone() },
+                Environment { name: "GF_METRICS_ENABLED".into(), value: "true".into() },
             ],
-            needs: vec!["mimir".into(), "loki".into()],
+            depends_on: vec!["mimir".into(), "loki".into()],
             ..Service::EMPTY
         },
+        vec![config_files, mimir, loki],
     );
-    d.service(
-        &observability,
+    observability.resource(
         "alloy",
         Service {
             image: o.alloy.image.clone(),
             replicas: o.alloy.replicas,
             publish: vec![4317, 4318],
             volumes: vec![
-                cx.docker_sock(),
-                cx.config("alloy.alloy", "/etc/alloy/config.alloy"),
+                Volume::DockerSocket,
+                Volume::Config(ConfigVolume { sub: "alloy.alloy".into(), at: "/etc/alloy/config.alloy".into() }),
             ],
             command: vec!["run".into(), "/etc/alloy/config.alloy".into()],
-            needs: vec!["tokeirad".into(), "mimir".into(), "loki".into()],
+            depends_on: vec!["tokeirad".into(), "mimir".into(), "loki".into()],
             ..Service::EMPTY
         },
-    );
-
-    // runtime — tokeirad. The server-config mount and DSQL AWS edge are author
-    // mechanics; the operator only declares intent.
-    let runtime = d.module("runtime", &["local_state"]);
-    d.service(
-        &runtime,
-        "tokeirad",
-        Service {
-            image: cfg.tokeirad.image.clone(),
-            replicas: cfg.tokeirad.replicas,
-            publish: vec![cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
-            server_config: true,
-            aws: match &cfg.storage {
-                Storage::Dsql { region, .. } => Some(region.clone()),
-                _ => None,
-            },
-            ..Service::EMPTY
-        },
+        vec![config_files, mimir, loki],
     );
 
     d

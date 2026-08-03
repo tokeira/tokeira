@@ -1,192 +1,236 @@
-//! Compose platform configuration model.
-
-use std::path::PathBuf;
+//! Compose deployment configuration admitted from the selected definition frontend.
 
 use serde::{Deserialize, Serialize};
-use tokeira_orchestrator::StorageKind;
+use tokeira_platform::error::ConfigError;
 
-/// Aurora DSQL settings for compose deployments that use persistent storage.
-///
-/// Managed mode lets the compose IaC module create/delete the cluster.
-/// Preexisting mode records an externally managed endpoint without taking
-/// provider ownership.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ComposeDsqlConfig {
-    /// Lifecycle mode for the DSQL cluster resource.
-    #[serde(default)]
-    pub mode: DsqlMode,
-    /// Existing or provisioned cluster endpoint, written back after infra apply.
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    /// Optional cluster ARN recorded for adopted clusters.
-    #[serde(default)]
-    pub arn: Option<String>,
-    /// Explicit AWS region used for cluster operations and runtime IAM auth.
-    #[serde(default = "default_dsql_region")]
-    pub region: String,
-}
-
-impl Default for ComposeDsqlConfig {
-    fn default() -> Self {
-        Self {
-            mode: DsqlMode::Managed,
-            endpoint: None,
-            arn: None,
-            region: default_dsql_region(),
-        }
-    }
-}
-
-/// DSQL cluster lifecycle mode for the compose platform.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+/// DSQL lifecycle choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DsqlMode {
-    /// `tkr infra apply` creates, updates, and destroys the cluster.
-    #[default]
+    /// Create and own the cluster.
     Managed,
-    /// `tkr infra apply` adopts endpoint metadata and skips provider deletion.
+    /// Use a preexisting cluster.
     Preexisting,
 }
 
-fn default_dsql_region() -> String {
-    "us-east-1".into()
+/// Storage selected by a Compose deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Storage {
+    /// Keep workflow state in memory.
+    InMemory,
+    /// Use Aurora DSQL plus coordination tables.
+    Dsql(DsqlStorage),
 }
 
-fn default_storage_kind() -> StorageKind {
-    StorageKind::InMemory
+/// Aurora DSQL storage settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DsqlStorage {
+    /// AWS region.
+    pub region: String,
+    /// Managed or adopted lifecycle.
+    pub mode: DsqlMode,
+    /// Adopted-cluster endpoint.
+    pub endpoint: Option<String>,
+    /// Adopted-cluster ARN.
+    pub arn: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokeiradServiceConfig {
+/// Tokeirad container settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tokeirad {
+    /// Image reference.
     pub image: String,
+    /// Desired container count.
+    pub replicas: u32,
+    /// Published Temporal gRPC port.
     pub grpc_port: u16,
+    /// Published metrics port.
     pub metrics_port: u16,
+}
+
+/// One observability backend image and capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Backend {
+    /// Image reference.
+    pub image: String,
+    /// Desired container count.
     pub replicas: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObservabilityConfig {
-    #[serde(default = "default_mimir_image")]
-    pub mimir_image: String,
-    pub mimir_replicas: u32,
-    #[serde(default = "default_grafana_image")]
-    pub grafana_image: String,
-    pub grafana_replicas: u32,
-    #[serde(default = "default_loki_image")]
-    pub loki_image: String,
-    pub loki_replicas: u32,
-    #[serde(default = "default_alloy_image")]
-    pub alloy_image: String,
-    pub alloy_replicas: u32,
-    #[serde(default = "default_aws_cli_image")]
-    pub aws_cli_image: String,
-    #[serde(default = "default_busybox_image")]
-    pub busybox_image: String,
-    pub grafana_port: u16,
+/// Grafana settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Grafana {
+    /// Image reference.
+    pub image: String,
+    /// Desired container count.
+    pub replicas: u32,
+    /// Published HTTP port.
+    pub port: u16,
+    /// Initial administrator password.
+    pub admin_password: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Compose observability stack settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observability {
+    /// Mimir container.
+    pub mimir: Backend,
+    /// Loki container.
+    pub loki: Backend,
+    /// Grafana container.
+    pub grafana: Grafana,
+    /// Alloy container.
+    pub alloy: Backend,
+}
+
+/// Complete Compose configuration returned by a deployment definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComposeConfig {
-    pub project_name: String,
-    /// Storage backend selected for the compose deployment.
-    #[serde(default = "default_storage_kind")]
-    pub storage: StorageKind,
-    /// DSQL settings used when `storage = "dsql"`.
-    #[serde(default)]
-    pub dsql: Option<ComposeDsqlConfig>,
-    pub tokeirad: TokeiradServiceConfig,
-    pub observability: ObservabilityConfig,
-    /// Deployment directory path — populated by the CLI after loading.
-    /// Not serialized to TOML.
-    #[serde(skip)]
-    pub deployment_dir: PathBuf,
+    /// Workflow-state backend.
+    pub storage: Storage,
+    /// Tokeirad settings.
+    pub tokeirad: Tokeirad,
+    /// Observability stack settings.
+    pub observability: Observability,
 }
 
 impl Default for ComposeConfig {
     fn default() -> Self {
         Self {
-            project_name: "tokeira".into(),
-            storage: StorageKind::InMemory,
-            dsql: None,
-            tokeirad: TokeiradServiceConfig {
-                image: "tokeirad:latest".into(),
+            storage: Storage::InMemory,
+            tokeirad: Tokeirad {
+                image: "tokeirad:latest".to_string(),
+                replicas: 1,
                 grpc_port: 7233,
                 metrics_port: 9090,
-                replicas: 1,
             },
-            observability: ObservabilityConfig {
-                mimir_image: default_mimir_image(),
-                mimir_replicas: 1,
-                grafana_image: default_grafana_image(),
-                grafana_replicas: 1,
-                loki_image: default_loki_image(),
-                loki_replicas: 1,
-                alloy_image: default_alloy_image(),
-                alloy_replicas: 1,
-                aws_cli_image: default_aws_cli_image(),
-                busybox_image: default_busybox_image(),
-                grafana_port: 3000,
+            observability: Observability {
+                mimir: Backend {
+                    image: "grafana/mimir:3.0.6".to_string(),
+                    replicas: 1,
+                },
+                loki: Backend {
+                    image: "grafana/loki:3.7.1".to_string(),
+                    replicas: 1,
+                },
+                grafana: Grafana {
+                    image: "grafana/grafana-oss:12.4.3".to_string(),
+                    replicas: 1,
+                    port: 3000,
+                    admin_password: "admin".to_string(),
+                },
+                alloy: Backend {
+                    image: "grafana/alloy:v1.16.0".to_string(),
+                    replicas: 1,
+                },
             },
-            deployment_dir: PathBuf::new(),
         }
     }
 }
 
-fn default_mimir_image() -> String {
-    "grafana/mimir:3.0.6".into()
+/// Render the reference typed configuration for tooling that needs a value document.
+pub fn prototypical_toml(storage: tokeira_orchestrator::StorageKind) -> String {
+    let mut config = ComposeConfig::default();
+    if storage == tokeira_orchestrator::StorageKind::Dsql {
+        config.storage = Storage::Dsql(DsqlStorage {
+            region: "us-east-1".to_string(),
+            mode: DsqlMode::Managed,
+            endpoint: None,
+            arn: None,
+        });
+    }
+    toml::to_string_pretty(&config).expect("the built-in Compose configuration serializes")
 }
 
-fn default_grafana_image() -> String {
-    "grafana/grafana-oss:12.4.3".into()
-}
-
-fn default_loki_image() -> String {
-    "grafana/loki:3.7.1".into()
-}
-
-fn default_alloy_image() -> String {
-    "grafana/alloy:v1.16.0".into()
-}
-
-fn default_aws_cli_image() -> String {
-    "public.ecr.aws/aws-cli/aws-cli:latest".into()
-}
-
-fn default_busybox_image() -> String {
-    "public.ecr.aws/docker/library/busybox:latest".into()
-}
-
-/// The prototypical `deployment.toml` seeded at deployment create — the
-/// config above at its defaults for the requested storage, with the
-/// tokeirad image line annotated: it is the one image the operator must
-/// build locally before deploying (every other service image is pulled
-/// from its upstream registry as pinned in the definition).
-pub fn prototypical_config_toml(storage: StorageKind) -> String {
-    let mut config = ComposeConfig {
-        storage,
-        ..ComposeConfig::default()
+/// Enforce Compose cross-field constraints without provider or filesystem access.
+pub fn validate(config: &ComposeConfig) -> Result<(), ConfigError> {
+    let require_container = |name: &str, image: &str, replicas: u32| {
+        if image.is_empty() {
+            return Err(ConfigError::validation(format!(
+                "{name} image cannot be empty"
+            )));
+        }
+        if replicas == 0 {
+            return Err(ConfigError::validation(format!(
+                "{name} replicas must be greater than zero"
+            )));
+        }
+        Ok(())
     };
-    if storage == StorageKind::Dsql {
-        config.dsql = Some(ComposeDsqlConfig::default());
+    require_container("tokeirad", &config.tokeirad.image, config.tokeirad.replicas)?;
+    require_container(
+        "mimir",
+        &config.observability.mimir.image,
+        config.observability.mimir.replicas,
+    )?;
+    require_container(
+        "loki",
+        &config.observability.loki.image,
+        config.observability.loki.replicas,
+    )?;
+    require_container(
+        "grafana",
+        &config.observability.grafana.image,
+        config.observability.grafana.replicas,
+    )?;
+    require_container(
+        "alloy",
+        &config.observability.alloy.image,
+        config.observability.alloy.replicas,
+    )?;
+    if config.tokeirad.grpc_port == 0
+        || config.tokeirad.metrics_port == 0
+        || config.observability.grafana.port == 0
+    {
+        return Err(ConfigError::validation(
+            "published Compose ports must be greater than zero",
+        ));
     }
-    tokeira_config::write_config_toml(&config)
-        .expect("the default config serializes")
-        .replace(
-            "image = \"tokeirad:latest\"",
-            "# build the tokeirad image locally before deploying\nimage = \"tokeirad:latest\"",
-        )
+    if let Storage::Dsql(DsqlStorage {
+        region,
+        mode,
+        endpoint,
+        arn,
+    }) = &config.storage
+    {
+        if region.is_empty() {
+            return Err(ConfigError::validation("DSQL region cannot be empty"));
+        }
+        match mode {
+            DsqlMode::Managed if endpoint.is_some() || arn.is_some() => {
+                return Err(ConfigError::validation(
+                    "managed DSQL storage cannot declare an endpoint or ARN",
+                ));
+            }
+            DsqlMode::Preexisting if endpoint.is_none() || arn.is_none() => {
+                return Err(ConfigError::validation(
+                    "preexisting DSQL storage requires both endpoint and ARN",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
-/// The prototypical `tokeirad.toml` seeded beside it.
-pub fn prototypical_server_config_toml(storage: StorageKind) -> String {
-    let mut config = tokeira_config::TokeiraConfig::default();
-    if storage == StorageKind::Dsql {
-        config.infrastructure.storage = tokeira_config::ConfigStorageKind::Dsql;
-        config.infrastructure.dsql.endpoint = Some("replace-with-dsql-endpoint".to_string());
-        config.infrastructure.dsql.region = Some("us-east-1".to_string());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preexisting_dsql_requires_complete_identity() {
+        let mut config = crate::tests::reference_config();
+        config.storage = Storage::Dsql(DsqlStorage {
+            region: "eu-west-2".to_string(),
+            mode: DsqlMode::Preexisting,
+            endpoint: Some("cluster.dsql.eu-west-2.on.aws".to_string()),
+            arn: None,
+        });
+        assert!(validate(&config).is_err());
     }
-    config
-        .to_toml()
-        .expect("the default server config serializes")
 }

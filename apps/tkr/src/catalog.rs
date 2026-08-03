@@ -958,7 +958,15 @@ mod tests {
         let selected =
             TrustedCatalogs::select(Some(workspace), Some(published)).expect("one source family");
         assert_eq!(selected.source_family(), CatalogSourceFamily::Workspace);
-        assert!(selected.platforms().resolve(&id("compose")).await.is_err());
+        assert_eq!(
+            selected
+                .platforms()
+                .resolve(&id("compose"))
+                .await
+                .expect("workspace Compose descriptor")
+                .id,
+            id("compose")
+        );
         assert!(selected.frontends().resolve(&format("tkdp")).await.is_err());
     }
 

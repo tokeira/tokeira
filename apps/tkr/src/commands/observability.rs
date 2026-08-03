@@ -58,7 +58,7 @@ pub(crate) fn check_generated_observability(
     }
 
     let checks = match &ctx.platform_config {
-        PlatformDeploymentConfig::Compose(config) => compose_checks(config)?,
+        PlatformDeploymentConfig::Compose(config) => compose_checks(config, &ctx.path, &ctx.name)?,
         PlatformDeploymentConfig::Ecs(config) => ecs_checks(config)?,
         PlatformDeploymentConfig::Local(_) => vec![CheckOutcome {
             name: "local-observability",
@@ -70,14 +70,16 @@ pub(crate) fn check_generated_observability(
     Ok(CheckReport { checks })
 }
 
-fn compose_checks(config: &tokeira_compose_deployment::ComposeConfig) -> Result<Vec<CheckOutcome>> {
-    let generator = tokeira_compose_deployment::observability_config::ConfigGenerator::new(
-        config.deployment_dir.clone(),
-    );
+fn compose_checks(
+    config: &tokeira_compose_deployment::ComposeConfig,
+    deployment_dir: &std::path::Path,
+    deployment: &str,
+) -> Result<Vec<CheckOutcome>> {
+    let generator = tokeira_compose_deployment::observability::ConfigGenerator::new(deployment_dir);
     let files = generator
         .render_all(
-            &tokeira_compose_deployment::observability_config::ObservabilityParams::from_config(
-                config,
+            &tokeira_compose_deployment::observability::ObservabilityParams::from_config(
+                config, deployment,
             ),
         )
         .context("failed to render compose observability config")?;
@@ -197,7 +199,7 @@ fn ecs_checks(config: &tokeira_ecs_deployment::EcsConfig) -> Result<Vec<CheckOut
 }
 
 fn rendered_file<'a>(
-    files: &'a [tokeira_compose_deployment::observability_config::RenderedConfigFile],
+    files: &'a [tokeira_compose_deployment::observability::RenderedConfigFile],
     path: &str,
 ) -> Result<&'a str> {
     files

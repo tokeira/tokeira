@@ -42,8 +42,8 @@ pub(crate) fn compose_definition(
             }
             let region = region.unwrap_or("us-east-1");
             let dsql = format!(
-                "storage: Storage::Dsql {{ region: \"{region}\".into(), mode: DsqlMode::Managed, \
-                 endpoint: None, arn: None }},"
+                "storage: Storage::Dsql(DsqlStorage {{ region: \"{region}\".into(), mode: DsqlMode::Managed, \
+                 endpoint: None, arn: None }}),"
             );
             Ok(seed.replacen(MARKER, &dsql, 1))
         }
@@ -61,7 +61,12 @@ pub(crate) fn deployment_config(
         PlatformKind::Ecs => EcsDeployment::prototypical_config(storage),
     };
     if platform == PlatformKind::Compose && storage == StorageKind::Dsql {
-        patch_dsql_region(toml, region.unwrap_or("us-east-1"))
+        let region = region.unwrap_or("us-east-1");
+        Ok(toml.replacen(
+            "region = \"us-east-1\"",
+            &format!("region = \"{region}\""),
+            1,
+        ))
     } else {
         Ok(toml)
     }
@@ -94,12 +99,6 @@ pub(crate) fn server_config(
     } else {
         Ok(toml)
     }
-}
-
-fn patch_dsql_region(toml: String, region: &str) -> Result<String> {
-    let mut document = toml.parse::<DocumentMut>()?;
-    document["dsql"]["region"] = value(region);
-    Ok(document.to_string())
 }
 
 fn patch_server_dsql_region(toml: String, region: &str) -> Result<String> {
@@ -148,7 +147,7 @@ mod tests {
             "the in-memory default was replaced"
         );
         assert!(
-            tkd.contains("storage: Storage::Dsql { region: \"eu-west-1\".into()"),
+            tkd.contains("storage: Storage::Dsql(DsqlStorage { region: \"eu-west-1\".into()"),
             "region baked into config()"
         );
         assert!(tkd.contains("mode: DsqlMode::Managed"));
@@ -158,13 +157,8 @@ mod tests {
     fn compose_prototypical_config_contains_image_defaults_and_comments() {
         let toml = deployment_config(PlatformKind::Compose, StorageKind::InMemory, None).unwrap();
         assert!(toml.contains("image = \"tokeirad:latest\""));
-        assert!(toml.contains("aws_cli_image = \"public.ecr.aws/aws-cli/aws-cli:latest\""));
-        assert!(toml.contains("busybox_image = \"public.ecr.aws/docker/library/busybox:latest\""));
-        // One annotation, tool-neutral, on the one image the operator must
-        // build locally; the ECS-only mirror notes no longer seed compose
-        // deployments (they described another platform's workflow).
-        assert!(toml.contains("build the tokeirad image locally before deploying"));
-        assert!(!toml.contains("image mirror"));
+        assert!(toml.contains("image = \"grafana/mimir:3.0.6\""));
+        assert!(toml.contains("admin_password = \"admin\""));
 
         let _: ComposeConfig = toml::from_str(&toml).unwrap();
     }

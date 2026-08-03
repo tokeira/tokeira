@@ -55,8 +55,6 @@ pub enum ValueShape {
     String(String),
     /// Variable-length sequence.
     Sequence(Vec<LocatedValue>),
-    /// Fixed-shape tuple.
-    Tuple(Vec<LocatedValue>),
     /// Explicit option shape.
     Option(Option<Box<LocatedValue>>),
     /// Ordered map entries.
@@ -84,10 +82,8 @@ pub enum ValueShape {
 pub enum VariantShape {
     /// Unit variant.
     Unit,
-    /// Tuple or newtype variant.
-    Tuple(Vec<LocatedValue>),
-    /// Struct variant.
-    Struct(Vec<(String, LocatedValue)>),
+    /// Single-value variant.
+    Newtype(Box<LocatedValue>),
 }
 
 /// Serde admission error retaining the most specific source range encountered.
@@ -147,7 +143,6 @@ fn value_kind(value: &ValueShape) -> &'static str {
         ValueShape::Float(_) => "float",
         ValueShape::String(_) => "string",
         ValueShape::Sequence(_) => "sequence",
-        ValueShape::Tuple(_) => "tuple",
         ValueShape::Option(_) => "option",
         ValueShape::Map(_) => "map",
         ValueShape::Struct { .. } => "struct",
@@ -213,9 +208,7 @@ impl<'de> de::Deserializer<'de> for LocatedValue {
             ValueShape::Integer(value) => visitor.visit_i128(value),
             ValueShape::Float(value) => visitor.visit_f64(value),
             ValueShape::String(value) => visitor.visit_string(value),
-            ValueShape::Sequence(values) | ValueShape::Tuple(values) => {
-                visitor.visit_seq(NodeSeqAccess::new(values))
-            }
+            ValueShape::Sequence(values) => visitor.visit_seq(NodeSeqAccess::new(values)),
             ValueShape::Option(None) => visitor.visit_none(),
             ValueShape::Option(Some(value)) => visitor.visit_some(*value),
             ValueShape::Map(entries) => visitor.visit_map(NodeMapAccess::new(entries)),
@@ -384,9 +377,7 @@ impl<'de> de::Deserializer<'de> for LocatedValue {
     {
         let range = self.range;
         match self.value {
-            ValueShape::Sequence(values) | ValueShape::Tuple(values) => {
-                visitor.visit_seq(NodeSeqAccess::new(values))
-            }
+            ValueShape::Sequence(values) => visitor.visit_seq(NodeSeqAccess::new(values)),
             value => Err(mismatch("sequence", &LocatedValue { value, range })),
         }
     }
@@ -623,9 +614,7 @@ impl<'de> VariantAccess<'de> for NodeVariantAccess {
         T: DeserializeSeed<'de>,
     {
         match self.body {
-            VariantShape::Tuple(mut values) if values.len() == 1 => {
-                seed.deserialize(values.remove(0))
-            }
+            VariantShape::Newtype(value) => seed.deserialize(*value),
             _ => Err(ValueDecodeError::custom(
                 "expected a single-value enum variant",
             )),
@@ -636,10 +625,10 @@ impl<'de> VariantAccess<'de> for NodeVariantAccess {
     where
         V: Visitor<'de>,
     {
-        match self.body {
-            VariantShape::Tuple(values) => visitor.visit_seq(NodeSeqAccess::new(values)),
-            _ => Err(ValueDecodeError::custom("expected a tuple enum variant")),
-        }
+        let _ = visitor;
+        Err(ValueDecodeError::custom(
+            "tuple enum variants are not admitted",
+        ))
     }
 
     fn struct_variant<V>(
@@ -650,9 +639,9 @@ impl<'de> VariantAccess<'de> for NodeVariantAccess {
     where
         V: Visitor<'de>,
     {
-        match self.body {
-            VariantShape::Struct(fields) => visitor.visit_map(StructMapAccess::new(fields)),
-            _ => Err(ValueDecodeError::custom("expected a struct enum variant")),
-        }
+        let _ = visitor;
+        Err(ValueDecodeError::custom(
+            "struct enum variants are not admitted",
+        ))
     }
 }

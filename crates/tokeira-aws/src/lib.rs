@@ -12,6 +12,7 @@
 mod clients;
 mod context;
 mod iam_policy;
+pub mod kinds;
 pub mod resources;
 
 pub use clients::{

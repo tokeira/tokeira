@@ -28,7 +28,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    pin::Pin,
 };
+
+use futures_util::Stream;
 
 use async_trait::async_trait;
 use bollard::{
@@ -158,6 +161,9 @@ pub struct ComposeService {
     #[serde(skip)]
     pub resource_dependencies: Vec<String>,
 }
+
+/// Incremental Docker log output for one service.
+pub type LogStream = Pin<Box<dyn Stream<Item = Result<String, ComposeError>> + Send>>;
 
 impl ComposeService {
     /// Convert the service into the provider-agnostic manifest shape used by
@@ -802,13 +808,14 @@ impl ComposePlatform {
         Ok(Some(live))
     }
 
-    /// Return recent logs from the service container.
-    pub async fn logs(&self, service: &str) -> Result<Vec<String>, ComposeError> {
-        use futures_util::TryStreamExt;
+    /// Open recent logs from the service container as an incremental stream.
+    pub async fn log_stream(&self, service: &str) -> Result<LogStream, ComposeError> {
+        use futures_util::StreamExt;
 
         self.ensure_reachable().await?;
         let container_name = format!("{}_{}", self.project_name, service);
-        let bytes = self
+        let error_name = container_name.clone();
+        let stream = self
             .docker
             .logs(
                 &container_name,
@@ -820,16 +827,21 @@ impl ComposePlatform {
                     ..Default::default()
                 }),
             )
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|error| ComposeError::ContainerFailed {
-                container: container_name,
-                source: anyhow::anyhow!(error),
-            })?;
-        Ok(bytes
-            .into_iter()
-            .map(|chunk| chunk.to_string())
-            .collect::<Vec<_>>())
+            .map(move |item| {
+                item.map(|chunk| chunk.to_string())
+                    .map_err(|error| ComposeError::ContainerFailed {
+                        container: error_name.clone(),
+                        source: anyhow::anyhow!(error),
+                    })
+            });
+        Ok(Box::pin(stream))
+    }
+
+    /// Collect the recent log stream for retained callers that need a snapshot.
+    pub async fn logs(&self, service: &str) -> Result<Vec<String>, ComposeError> {
+        use futures_util::TryStreamExt;
+
+        self.log_stream(service).await?.try_collect().await
     }
 
     /// Resolve the local host/port pair for a service container port.

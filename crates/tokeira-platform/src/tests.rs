@@ -43,7 +43,7 @@ impl ProviderKind for TestKind {
         &["value"]
     }
 
-    fn desired_manifest(&self) -> serde_json::Value {
+    fn desired_manifest(&self, _placement: &PlacementContext) -> serde_json::Value {
         serde_json::Value::Null
     }
 

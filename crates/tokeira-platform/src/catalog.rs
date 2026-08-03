@@ -38,8 +38,8 @@ pub trait ProviderKind: Debug + Send + Sync {
     /// Stable selected kind name.
     fn kind_name(&self) -> &'static str;
 
-    /// Provider-owned pure input validation.
-    fn validate(&self) -> Result<(), KindError>;
+    /// Validate authored input without deployment identity, tags, clients, or state.
+    fn validate_input(&self) -> Result<(), KindError>;
 
     /// Complete names that author code may request through a resource handle.
     fn declared_outputs(&self) -> &'static [&'static str];
@@ -106,7 +106,6 @@ where
         message: error.message().to_string(),
         range: error.range().or(root_range),
     })?;
-    kind.validate().map_err(|error| error.at(root_range))?;
     Ok(Box::new(kind))
 }
 

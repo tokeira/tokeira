@@ -73,8 +73,16 @@ pub fn realize_resources(
     for resource in graph.resources() {
         let dependencies = resource
             .dependencies()
-            .filter_map(|(module, logical_id)| index.get(module, logical_id).cloned())
-            .collect();
+            .map(|(module, logical_id)| {
+                index.get(module, logical_id).cloned().ok_or_else(|| ProjectionError {
+                    resource: format!("{}/{}", resource.module(), resource.logical_id()),
+                    provider_kind: resource.kind().kind_name().to_string(),
+                    message: format!(
+                        "dependency `{module}/{logical_id}` was not realized before its consumer"
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let placement = PlacementContext {
             deployment_id: deployment_id.to_string(),
             module: resource.module().to_string(),

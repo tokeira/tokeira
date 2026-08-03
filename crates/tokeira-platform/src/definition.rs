@@ -1,7 +1,6 @@
 //! Definition frontend contract, source admission, evaluation, and configuration identity.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -15,7 +14,6 @@ use tokeira_orchestrator::DefinitionFormatId;
 use crate::{
     author::{AuthorNode, AuthorSession},
     binding::{Platform, PlatformBinding},
-    catalog::PlacementContext,
     error::{DefinitionError, FrontendDiagnostic, VerificationFinding, VerificationReport},
     graph::{DeploymentHandle, VerifiedGraph},
 };
@@ -202,10 +200,15 @@ pub struct DefinitionRequest<P: Platform> {
 /// Versioned content identity of format plus exact definition bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigurationIdentity {
-    /// Identity algorithm/version.
-    pub algorithm: String,
+    algorithm: ConfigurationIdentityAlgorithm,
     /// Lowercase SHA-256 digest.
     pub digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ConfigurationIdentityAlgorithm {
+    #[serde(rename = "sha256-v1")]
+    Sha256V1,
 }
 
 impl ConfigurationIdentity {
@@ -218,8 +221,15 @@ impl ConfigurationIdentity {
         digest.update((bytes.len() as u64).to_be_bytes());
         digest.update(bytes);
         Self {
-            algorithm: "sha256-v1".to_string(),
+            algorithm: ConfigurationIdentityAlgorithm::Sha256V1,
             digest: hex::encode(digest.finalize()),
+        }
+    }
+
+    /// Stable serialized algorithm/version label.
+    pub fn algorithm(&self) -> &'static str {
+        match self.algorithm {
+            ConfigurationIdentityAlgorithm::Sha256V1 => "sha256-v1",
         }
     }
 }
@@ -294,123 +304,41 @@ impl<P: Platform, F: DefinitionFrontend<P>> DefinitionEngine<P, F> {
         })
     }
 
-    /// Realize and verify the complete provider-resource set without clients or state access.
+    /// Validate every provider-kind input without fabricating invocation facts.
     pub fn verify<'a>(
         &self,
         definition: &'a EvaluatedDefinition<P>,
     ) -> Result<VerifiedDefinition<'a, P>, VerificationReport> {
-        let mut resources = Vec::<Box<dyn tokeira_iac::Resource>>::new();
-        let mut realized_ids = BTreeMap::<(String, String), tokeira_iac::ResourceId>::new();
-        let mut kind_by_id = BTreeMap::<tokeira_iac::ResourceId, String>::new();
         let mut findings = Vec::new();
 
         for resource in definition.graph.resources() {
-            let logical = format!("{}/{}", resource.module(), resource.logical_id());
-            let mut dependencies = Vec::new();
-            for (module, logical_id) in resource.dependencies() {
-                if let Some(id) = realized_ids.get(&(module.to_string(), logical_id.to_string())) {
-                    dependencies.push(id.clone());
-                } else {
-                    findings.push(VerificationFinding::MissingDependency {
-                        resource: logical.clone(),
-                        dependency: format!("{module}/{logical_id}"),
-                    });
-                }
-            }
-            match resource.kind().realize(&PlacementContext {
-                deployment_id: "definition-check".to_string(),
-                module: resource.module().to_string(),
-                logical_id: resource.logical_id().to_string(),
-                dependencies,
-                tags: BTreeMap::new(),
-            }) {
-                Ok(realized) => {
-                    kind_by_id.insert(
-                        realized.resource_id(),
-                        resource.kind().kind_name().to_string(),
-                    );
-                    realized_ids.insert(
-                        (
-                            resource.module().to_string(),
-                            resource.logical_id().to_string(),
-                        ),
-                        realized.resource_id(),
-                    );
-                    resources.push(realized);
-                }
-                Err(error) => findings.push(VerificationFinding::CannotRealize {
-                    resource: logical,
+            if let Err(error) = resource.kind().validate_input() {
+                findings.push(VerificationFinding::InvalidInput {
+                    resource: format!("{}/{}", resource.module(), resource.logical_id()),
                     provider_kind: resource.kind().kind_name().to_string(),
                     message: error.message,
-                }),
-            }
-        }
-
-        let ids = resources
-            .iter()
-            .map(|resource| resource.resource_id())
-            .collect::<BTreeSet<_>>();
-        let engine_findings = tokeira_iac::verify_resources(
-            &resources
-                .iter()
-                .map(Box::as_ref)
-                .collect::<Vec<&dyn tokeira_iac::Resource>>(),
-        );
-        let provider_finding_start = findings.len();
-        for resource in &resources {
-            if !resource.describes() {
-                findings.push(VerificationFinding::CannotDescribe {
-                    resource: resource.resource_id().0.clone(),
-                    provider_kind: kind_by_id
-                        .get(&resource.resource_id())
-                        .cloned()
-                        .unwrap_or_else(|| resource.resource_type().0),
                 });
             }
-            for dependency in resource.dependencies() {
-                if !ids.contains(&dependency) {
-                    findings.push(VerificationFinding::MissingDependency {
-                        resource: resource.resource_id().0,
-                        dependency: dependency.0,
-                    });
-                }
-            }
         }
-        debug_assert_eq!(
-            engine_findings.len(),
-            findings.len() - provider_finding_start,
-            "typed definition findings must cover the engine verifier exactly"
-        );
 
         if findings.is_empty() {
-            Ok(VerifiedDefinition {
-                definition,
-                resources,
-            })
+            Ok(VerifiedDefinition { definition })
         } else {
             Err(VerificationReport { findings })
         }
     }
 }
 
-/// Definition plus the complete pure-realized resource set accepted for execution.
+/// Definition whose complete logical provider-kind set passed pure input validation.
 pub struct VerifiedDefinition<'a, P: Platform> {
     /// Typed evaluated definition.
     pub definition: &'a EvaluatedDefinition<P>,
-    resources: Vec<Box<dyn tokeira_iac::Resource>>,
 }
 
 impl<P: Platform> fmt::Debug for VerifiedDefinition<'_, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VerifiedDefinition")
-            .field("resource_count", &self.resources.len())
+            .field("resource_count", &self.definition.graph.resources().len())
             .finish_non_exhaustive()
-    }
-}
-
-impl<'a, P: Platform> VerifiedDefinition<'a, P> {
-    /// Borrow realized resources in definition order.
-    pub fn resources(&self) -> impl ExactSizeIterator<Item = &dyn tokeira_iac::Resource> {
-        self.resources.iter().map(Box::as_ref)
     }
 }

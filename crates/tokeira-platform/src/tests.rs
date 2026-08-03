@@ -166,7 +166,7 @@ impl ProviderKind for TestKind {
         "test-resource"
     }
 
-    fn validate(&self) -> Result<(), crate::error::KindError> {
+    fn validate_input(&self) -> Result<(), crate::error::KindError> {
         if self.suffix.is_empty() {
             return Err(crate::error::KindError::new("suffix cannot be empty"));
         }
@@ -211,6 +211,47 @@ struct TestResource {
     module: String,
     dependencies: Vec<tokeira_iac::ResourceId>,
     describes: bool,
+}
+
+#[derive(Debug)]
+struct ValidationProbeKind {
+    valid: bool,
+    realizations: Arc<AtomicUsize>,
+}
+
+impl ProviderKind for ValidationProbeKind {
+    fn kind_name(&self) -> &'static str {
+        "validation-probe"
+    }
+
+    fn validate_input(&self) -> Result<(), crate::error::KindError> {
+        if self.valid {
+            Ok(())
+        } else {
+            Err(crate::error::KindError::new("probe input is invalid"))
+        }
+    }
+
+    fn declared_outputs(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn desired_manifest(&self) -> serde_json::Value {
+        serde_json::json!({ "valid": self.valid })
+    }
+
+    fn realize(
+        &self,
+        placement: &PlacementContext,
+    ) -> Result<Box<dyn tokeira_iac::Resource>, crate::error::KindError> {
+        self.realizations.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(TestResource {
+            id: tokeira_iac::ResourceId(format!("{}/{}", placement.module, placement.logical_id)),
+            module: placement.module.clone(),
+            dependencies: placement.dependencies.clone(),
+            describes: true,
+        }))
+    }
 }
 
 #[async_trait]
@@ -1144,29 +1185,26 @@ proptest! {
         }
     }
 
-    // Verification reports every describing and dependency fault and performs no provider operation.
+    // Verification validates only authored input; execution realizes the same logical set once.
     // Feature: platform-builder-abstraction, Property 8: definition verification is complete and pure
     #[test]
     fn property_8_verification_is_complete_and_pure(
-        describes in prop::collection::vec(any::<bool>(), 1..20),
-        dangling in prop::collection::vec(any::<bool>(), 1..20),
+        valid in prop::collection::vec(any::<bool>(), 1..20),
     ) {
-        let count = describes.len().min(dangling.len());
+        let realizations = Arc::new(AtomicUsize::new(0));
         let mut graph = DeploymentGraphBuilder::new();
         let deployment = graph.deployment_handle();
         let module = graph
             .add_module(&deployment, "module".into(), Vec::new())
             .expect("module");
-        for index in 0..count {
+        for (index, is_valid) in valid.iter().copied().enumerate() {
             graph
                 .add_resource(
                     &module,
                     format!("resource-{index}"),
-                    Box::new(TestKind {
-                        suffix: index.to_string(),
-                        describes: describes[index],
-                        extra_dependency: dangling[index]
-                            .then(|| format!("missing-{index}")),
+                    Box::new(ValidationProbeKind {
+                        valid: is_valid,
+                        realizations: Arc::clone(&realizations),
                     }),
                     Vec::new(),
                 )
@@ -1184,26 +1222,25 @@ proptest! {
             ),
         };
         let result = verification_engine().verify(&definition);
-        let expected = (0..count)
-            .map(|index| usize::from(!describes[index]) + usize::from(dangling[index]))
-            .sum::<usize>();
+        prop_assert_eq!(realizations.load(Ordering::SeqCst), 0);
+        let expected = valid.iter().filter(|value| !**value).count();
         if expected == 0 {
             prop_assert!(result.is_ok());
+            let tags = BTreeMap::from([("deployment".to_string(), "real".to_string())]);
+            let realized = realize_resources(&definition.graph, "real-deployment", &tags)
+                .expect("validated inputs realize with the admitted invocation");
+            prop_assert_eq!(realized.iter().len(), valid.len());
+            prop_assert_eq!(realizations.load(Ordering::SeqCst), valid.len());
         } else {
             let report = result.expect_err("faults must be reported");
             prop_assert_eq!(report.findings.len(), expected);
-            let cannot_describe = report
+            let invalid = report
                 .findings
                 .iter()
-                .filter(|finding| matches!(finding, VerificationFinding::CannotDescribe { .. }))
+                .filter(|finding| matches!(finding, VerificationFinding::InvalidInput { .. }))
                 .count();
-            let missing = report
-                .findings
-                .iter()
-                .filter(|finding| matches!(finding, VerificationFinding::MissingDependency { .. }))
-                .count();
-            prop_assert_eq!(cannot_describe, describes[..count].iter().filter(|value| !**value).count());
-            prop_assert_eq!(missing, dangling[..count].iter().filter(|value| **value).count());
+            prop_assert_eq!(invalid, expected);
+            prop_assert_eq!(realizations.load(Ordering::SeqCst), 0);
         }
     }
 
@@ -1546,6 +1583,26 @@ fn definition_engine_admits_config_and_bootstrap_graph_in_memory() {
     assert_eq!(
         evaluated.configuration_identity,
         ConfigurationIdentity::compute(&format, b"definition")
+    );
+}
+
+#[test]
+fn configuration_identity_serialization_remains_byte_stable() {
+    let format = tokeira_orchestrator::DefinitionFormatId::new("tkd").expect("format");
+    let identity = ConfigurationIdentity::compute(&format, b"definition");
+    let expected = format!(
+        r#"{{"algorithm":"sha256-v1","digest":"{}"}}"#,
+        identity.digest
+    );
+
+    assert_eq!(identity.algorithm(), "sha256-v1");
+    assert_eq!(
+        serde_json::to_string(&identity).expect("identity serializes"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_str::<ConfigurationIdentity>(&expected).expect("identity deserializes"),
+        identity
     );
 }
 

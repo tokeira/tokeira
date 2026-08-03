@@ -631,7 +631,7 @@ mod property_tests {
             "ProbeKind"
         }
 
-        fn validate(&self) -> Result<(), KindError> {
+        fn validate_input(&self) -> Result<(), KindError> {
             Ok(())
         }
 

@@ -710,7 +710,7 @@ mod tests {
             "TestKind"
         }
 
-        fn validate(&self) -> Result<(), KindError> {
+        fn validate_input(&self) -> Result<(), KindError> {
             if self.suffix.is_empty() {
                 return Err(KindError::new("suffix cannot be empty"));
             }

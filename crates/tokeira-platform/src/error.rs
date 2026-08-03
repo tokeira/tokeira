@@ -463,22 +463,8 @@ pub enum DefinitionError {
 /// One pure definition-verification finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationFinding {
-    /// A realized provider resource declares a dependency absent from the complete set.
-    MissingDependency {
-        /// Resource declaring the edge.
-        resource: String,
-        /// Missing physical resource identity.
-        dependency: String,
-    },
-    /// A realized resource does not truthfully perform live description.
-    CannotDescribe {
-        /// Physical resource identity.
-        resource: String,
-        /// Selected provider kind.
-        provider_kind: String,
-    },
-    /// Pure provider-kind realization rejected its typed desired input or placement.
-    CannotRealize {
+    /// Pure provider-kind input validation rejected authored desired input.
+    InvalidInput {
         /// Logical `module/resource` identity.
         resource: String,
         /// Selected provider kind.
@@ -491,24 +477,13 @@ pub enum VerificationFinding {
 impl fmt::Display for VerificationFinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingDependency {
-                resource,
-                dependency,
-            } => write!(f, "resource `{resource}` depends on missing `{dependency}`"),
-            Self::CannotDescribe {
-                resource,
-                provider_kind,
-            } => write!(
-                f,
-                "resource `{resource}` from kind `{provider_kind}` cannot describe live state"
-            ),
-            Self::CannotRealize {
+            Self::InvalidInput {
                 resource,
                 provider_kind,
                 message,
             } => write!(
                 f,
-                "resource `{resource}` from kind `{provider_kind}` cannot be realized: {message}"
+                "resource `{resource}` from kind `{provider_kind}` has invalid input: {message}"
             ),
         }
     }

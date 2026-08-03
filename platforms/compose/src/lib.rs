@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use tokeira_compose::{ComposeError, ComposePlatform};
 use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac::{self as iac, ModuleSelection, ResourceId, SelectionDirection};
@@ -40,17 +41,6 @@ pub mod ops;
 pub mod services;
 
 pub use config::ComposeConfig;
-
-/// Read-only reference source used while a workspace catalog materializes the platform seed.
-pub fn definition_seed() -> &'static str {
-    include_str!("../definition.tkd")
-}
-
-/// Compatibility type name for the in-process template caller removed by catalog routing.
-pub mod provisioner {
-    /// Compose provisioner with the built-in `.tkd` frontend selected.
-    pub type ComposeProvisioner = crate::ComposeProvisioner<tokeira_tkd::TkdFrontend>;
-}
 
 const BOOTSTRAP_MODULE: &str = "local_state";
 const METADATA_JSON: &str = "metadata.json";
@@ -404,20 +394,30 @@ impl<F: DefinitionFrontend> ComposeProvisioner<F> {
         })
     }
 
+    fn evaluate_with_context(
+        &self,
+        source: DefinitionSource,
+        context: &context::ComposeContext,
+    ) -> Result<EvaluatedDefinition<ComposeConfig, services::ComposeKind>> {
+        evaluate_definition(
+            &self.frontend,
+            source,
+            context,
+            services::kind_functions(),
+            config::validate,
+        )
+        .map_err(anyhow::Error::from)
+    }
+
     fn evaluate(
         &self,
         source: DefinitionSource,
         invocation: &InvocationContext,
     ) -> Result<EvaluatedDefinition<ComposeConfig, services::ComposeKind>> {
-        let context = context::ComposeContext::from_invocation(invocation);
-        evaluate_definition(
-            &self.frontend,
+        self.evaluate_with_context(
             source,
-            &context,
-            services::kind_functions(),
-            config::validate,
+            &context::ComposeContext::from_invocation(invocation),
         )
-        .map_err(anyhow::Error::from)
     }
 
     fn evaluate_recorded(
@@ -529,8 +529,8 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
         ConfigSource::definition(definition.format.as_str(), definition.path.as_str())
     }
 
-    fn definition_format(&self) -> Option<&'static str> {
-        Some("tkd")
+    fn definition_format(&self) -> Option<&str> {
+        Some(self.frontend.format().as_str())
     }
 
     fn deployment_id(&self, deployment_dir: &Path) -> Result<String> {
@@ -542,23 +542,55 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
         deployment_dir: &Path,
         source: Option<&Path>,
     ) -> Result<Realization<()>> {
-        let metadata = Self::metadata(deployment_dir)?;
-        let definition = Self::definition(&metadata)?;
-        let invocation = Self::invocation(deployment_dir, &metadata);
-        let (path, source_name) = match source {
-            Some(path) => (
-                path.to_path_buf(),
+        let evaluated = if let Some(path) = source {
+            let source = self.source(
+                path,
+                self.frontend.format().clone(),
                 DefinitionSourceName::AuthoringPath(path.to_path_buf()),
-            ),
-            None => (
-                deployment_dir.join(definition.path.as_path()),
+            )?;
+            let project_name = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("definition")
+                .to_string();
+            self.evaluate_with_context(source, &context::ComposeContext { project_name })?
+        } else {
+            let metadata = Self::metadata(deployment_dir)?;
+            let definition = Self::definition(&metadata)?;
+            let invocation = Self::invocation(deployment_dir, &metadata);
+            let path = deployment_dir.join(definition.path.as_path());
+            let source = self.source(
+                &path,
+                definition.format.clone(),
                 DefinitionSourceName::DeploymentRelative(definition.path.clone()),
-            ),
+            )?;
+            self.evaluate(source, &invocation)?
         };
-        let source = self.source(&path, definition.format.clone(), source_name)?;
-        let evaluated = self.evaluate(source, &invocation)?;
         verify_definition(&evaluated).map_err(anyhow::Error::from)?;
         Ok(Realization::Realized(()))
+    }
+
+    async fn log_stream(
+        &self,
+        deployment_dir: &Path,
+        service: &str,
+        follow: bool,
+        tail: Option<u32>,
+    ) -> Result<Realization<tokeira_provisioner_cli::LogStream>> {
+        let stream = ops::log_stream(service, deployment_dir, follow, tail).await?;
+        Ok(Realization::Realized(Box::pin(
+            stream.map_err(anyhow::Error::from),
+        )))
+    }
+
+    async fn port_mappings(
+        &self,
+        deployment_dir: &Path,
+        service: &str,
+    ) -> Result<Realization<Vec<orchestrator::PortMapping>>> {
+        Ok(Realization::Realized(
+            ops::port_mappings(service, deployment_dir).await?,
+        ))
     }
 
     async fn desired_snapshot(
@@ -657,24 +689,6 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
         Ok(Realization::NotApplicable {
             reason: "the Compose platform has no independent scale operation",
         })
-    }
-}
-
-impl<F: DefinitionFrontend> orchestrator::PlatformConfig for ComposeProvisioner<F> {
-    fn prototypical_config(storage: orchestrator::StorageKind) -> String {
-        config::prototypical_toml(storage)
-    }
-
-    fn prototypical_server_config(storage: orchestrator::StorageKind) -> String {
-        let mut config = tokeira_config::TokeiraConfig::default();
-        if storage == orchestrator::StorageKind::Dsql {
-            config.infrastructure.storage = tokeira_config::ConfigStorageKind::Dsql;
-            config.infrastructure.dsql.endpoint = Some("replace-with-dsql-endpoint".to_string());
-            config.infrastructure.dsql.region = Some("us-east-1".to_string());
-        }
-        config
-            .to_toml()
-            .expect("the built-in server configuration serializes")
     }
 }
 

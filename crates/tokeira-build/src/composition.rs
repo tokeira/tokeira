@@ -9,6 +9,7 @@
 use std::{
     collections::BTreeSet,
     path::{Component, Path, PathBuf},
+    process::Stdio,
 };
 
 use cargo_metadata::{Metadata, MetadataCommand, Package};
@@ -18,8 +19,8 @@ use tokeira_provisioner::{BoundProvisionerEvidence, Sha256Digest};
 
 use crate::{
     ClosureError, DEFINITION_FRONTEND_CONTRACT, DefinitionFrontendPackageDescriptor,
-    DiscoveryError, PLATFORM_BINDING_CONTRACT, PackageCoordinates, PlatformLaunchClass,
-    PlatformPackageDescriptor, ProvisionerClosure,
+    DiscoveryError, PLATFORM_BINDING_CONTRACT, PackageCoordinates, PlatformPackageDescriptor,
+    ProvisionerClosure,
     discovery::{descriptors_from_metadata, package_coordinates},
     resolve_source_closure_for_packages,
 };
@@ -42,10 +43,30 @@ pub struct BoundProvisionerSource {
     frontend_contract: u32,
     cargo_toml: String,
     main_rs: String,
+    cargo_lock: Vec<u8>,
     closure: ProvisionerClosure,
 }
 
 impl BoundProvisionerSource {
+    #[cfg(test)]
+    pub(crate) fn testing(closure: ProvisionerClosure) -> Self {
+        Self {
+            platform: PlatformId::new("alpha").expect("test platform id"),
+            format: DefinitionFormatId::new("tkd").expect("test format id"),
+            binding_contract: PLATFORM_BINDING_CONTRACT,
+            frontend_contract: DEFINITION_FRONTEND_CONTRACT,
+            cargo_toml: "[package]\nname = \"tokeira-bound-provisioner\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n".to_string(),
+            main_rs: "fn main() {}\n".to_string(),
+            cargo_lock: b"version = 4\n".to_vec(),
+            closure,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_clear_crates(&mut self) {
+        self.closure.crate_names.clear();
+    }
+
     /// Borrow the selected open platform identity.
     pub fn platform(&self) -> &PlatformId {
         &self.platform
@@ -89,7 +110,7 @@ impl BoundProvisionerSource {
     /// exports. Advancing either private contract must therefore re-key the
     /// engine instead of reusing an artifact assembled under older semantics.
     pub fn generated_root_digest(&self) -> Sha256Digest {
-        let mut bytes = b"tokeira-bound-provisioner-root/v1\n".to_vec();
+        let mut bytes = b"tokeira-bound-provisioner-root/v2\n".to_vec();
         framed_field(&mut bytes, "platform", self.platform.as_str().as_bytes());
         framed_field(&mut bytes, "format", self.format.as_str().as_bytes());
         framed_field(
@@ -104,6 +125,7 @@ impl BoundProvisionerSource {
         );
         framed_field(&mut bytes, "Cargo.toml", self.cargo_toml.as_bytes());
         framed_field(&mut bytes, "src/main.rs", self.main_rs.as_bytes());
+        framed_field(&mut bytes, "Cargo.lock", &self.cargo_lock);
         Sha256Digest::from_bytes(&bytes)
     }
 
@@ -154,7 +176,132 @@ impl BoundProvisionerSource {
         })?;
         write_generated(&root.join("Cargo.toml"), self.cargo_toml.as_bytes())?;
         write_generated(&source_dir.join("main.rs"), self.main_rs.as_bytes())?;
+        write_generated(&root.join("Cargo.lock"), &self.cargo_lock)?;
         Ok(root)
+    }
+
+    fn resolve_generated_lock(&mut self, workspace_root: &Path) -> Result<(), CompositionError> {
+        let generated_root = self.materialize_in(workspace_root)?;
+        let workspace_lock = workspace_root.join("Cargo.lock");
+        let mut lock = std::fs::read(&workspace_lock).map_err(|source| {
+            CompositionError::ReadWorkspaceLock {
+                path: workspace_lock.display().to_string(),
+                source,
+            }
+        })?;
+        if !lock.ends_with(b"\n") {
+            lock.push(b'\n');
+        }
+        lock.extend_from_slice(b"\n[[package]]\nname = \"tokeira-bound-provisioner\"\nversion = \"0.0.0\"\ndependencies = [\n");
+        for dependency in generated_dependency_packages(&self.cargo_toml)? {
+            lock.extend_from_slice(format!(" {},\n", toml_string(&dependency)).as_bytes());
+        }
+        lock.extend_from_slice(b"]\n");
+        let generated_lock = generated_root.join("Cargo.lock");
+        write_generated(&generated_lock, &lock)?;
+
+        // Cargo prunes packages unreachable under the selected roots' default
+        // features. Starting from the admitted workspace lock preserves every
+        // selected version; offline metadata can only normalize that locked
+        // graph for this root, never consult a newer registry resolution.
+        let status = std::process::Command::new("cargo")
+            .current_dir(workspace_root)
+            .args([
+                "metadata",
+                "--offline",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(generated_root.join("Cargo.toml"))
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|source| CompositionError::ResolveGeneratedLock {
+                path: generated_lock.display().to_string(),
+                source,
+            })?;
+        if !status.success() {
+            return Err(CompositionError::InvalidSelection(format!(
+                "Cargo could not normalize the generated bound-provisioner lock at {}",
+                generated_lock.display()
+            )));
+        }
+        let resolved = std::fs::read(&generated_lock).map_err(|source| {
+            CompositionError::ReadWorkspaceLock {
+                path: generated_lock.display().to_string(),
+                source,
+            }
+        })?;
+        self.validate_generated_lock(&resolved)?;
+        self.cargo_lock = resolved;
+        Ok(())
+    }
+
+    fn validate_generated_lock(&self, bytes: &[u8]) -> Result<(), CompositionError> {
+        #[derive(serde::Deserialize)]
+        struct Lockfile {
+            #[serde(default)]
+            package: Vec<LockPackage>,
+        }
+        #[derive(serde::Deserialize)]
+        struct LockPackage {
+            name: String,
+            version: String,
+            #[serde(default)]
+            source: Option<String>,
+            #[serde(default)]
+            checksum: Option<String>,
+        }
+
+        let text = std::str::from_utf8(bytes).map_err(|error| {
+            CompositionError::InvalidSelection(format!(
+                "generated bound-provisioner lock is not UTF-8: {error}"
+            ))
+        })?;
+        let lockfile: Lockfile = toml::from_str(text).map_err(|error| {
+            CompositionError::InvalidSelection(format!(
+                "generated bound-provisioner lock is invalid: {error}"
+            ))
+        })?;
+        let admitted = self.closure.locked.iter().collect::<BTreeSet<_>>();
+        let workspace = self
+            .closure
+            .crate_names
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut found_root = false;
+        for package in lockfile.package {
+            if package.name == "tokeira-bound-provisioner" && package.source.is_none() {
+                found_root = true;
+                continue;
+            }
+            if package.source.is_none() {
+                if workspace.contains(package.name.as_str()) {
+                    continue;
+                }
+            } else {
+                let dependency = crate::LockedDependency {
+                    name: package.name.clone(),
+                    version: package.version.clone(),
+                    source: package.source.clone(),
+                    checksum: package.checksum.clone(),
+                };
+                if admitted.contains(&dependency) {
+                    continue;
+                }
+            }
+            return Err(CompositionError::InvalidSelection(format!(
+                "generated lock contains package `{} {}` outside the admitted source closure",
+                package.name, package.version
+            )));
+        }
+        if !found_root {
+            return Err(CompositionError::InvalidSelection(
+                "generated lock does not contain the bound-provisioner root".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -182,6 +329,22 @@ pub enum CompositionError {
     /// Selected catalog data no longer agrees with the recognized workspace.
     #[error("invalid bound-provisioner selection: {0}")]
     InvalidSelection(String),
+    /// The admitted workspace lock could not be read for the generated root.
+    #[error("failed to read workspace lock file {path}: {source}")]
+    ReadWorkspaceLock {
+        /// Workspace lock file whose bytes were required.
+        path: String,
+        /// Filesystem failure.
+        source: std::io::Error,
+    },
+    /// Cargo could not normalize the generated lock from the admitted one.
+    #[error("failed to resolve generated lock file {path}: {source}")]
+    ResolveGeneratedLock {
+        /// Generated lock whose dependency graph was being normalized.
+        path: String,
+        /// Cargo process launch failure.
+        source: std::io::Error,
+    },
     /// Generated files could not be staged for compilation.
     #[error("failed to write generated composition-root file {path}: {source}")]
     WriteGenerated {
@@ -190,6 +353,36 @@ pub enum CompositionError {
         /// Filesystem failure.
         source: std::io::Error,
     },
+}
+
+fn generated_dependency_packages(cargo_toml: &str) -> Result<BTreeSet<String>, CompositionError> {
+    let manifest: toml::Value = toml::from_str(cargo_toml).map_err(|error| {
+        CompositionError::InvalidSelection(format!(
+            "generated bound-provisioner manifest is invalid: {error}"
+        ))
+    })?;
+    let dependencies = manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            CompositionError::InvalidSelection(
+                "generated bound-provisioner manifest has no dependency table".to_string(),
+            )
+        })?;
+    dependencies
+        .values()
+        .map(|dependency| {
+            dependency
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    CompositionError::InvalidSelection(
+                        "generated bound-provisioner dependency has no package name".to_string(),
+                    )
+                })
+        })
+        .collect()
 }
 
 /// Assemble one static provisioner from trusted workspace descriptors.
@@ -247,27 +440,24 @@ pub fn assemble_bound_provisioner(
         ],
     )?;
 
-    Ok(BoundProvisionerSource {
+    let mut source = BoundProvisionerSource {
         platform: platform.id.clone(),
         format: frontend.format.clone(),
         binding_contract: platform.binding_contract,
         frontend_contract: frontend.frontend_contract,
         cargo_toml,
         main_rs,
+        cargo_lock: Vec::new(),
         closure,
-    })
+    };
+    source.resolve_generated_lock(&workspace_root)?;
+    Ok(source)
 }
 
 fn validate_contracts(
     platform: &PlatformPackageDescriptor,
     frontend: &DefinitionFrontendPackageDescriptor,
 ) -> Result<(), CompositionError> {
-    if platform.launch_class != PlatformLaunchClass::BoundProvisioner {
-        return Err(CompositionError::InvalidSelection(format!(
-            "platform `{}` uses launch class {:?}, not bound-provisioner",
-            platform.id, platform.launch_class
-        )));
-    }
     if platform.binding_contract != PLATFORM_BINDING_CONTRACT {
         return Err(CompositionError::InvalidSelection(format!(
             "platform `{}` uses binding contract {}; supported contract is {}",
@@ -423,7 +613,7 @@ macro_rules! bound_provisioner_main {
                 &root,
                 "platforms/alpha",
                 "alpha-platform",
-                "[package.metadata.tokeira.platform]\nid = \"alpha\"\nbinding-contract = 1\nlaunch-class = \"bound-provisioner\"\ndefault = false\n",
+                "[package.metadata.tokeira.platform]\nid = \"alpha\"\nbinding-contract = 1\ndefault = false\n",
                 "pub fn provisioner<T>(_frontend: T) {}\n",
             );
             package(
@@ -571,6 +761,10 @@ macro_rules! bound_provisioner_main {
         let mut main = source;
         main.main_rs.push_str("// changed\n");
         assert_ne!(main.generated_root_digest(), digest);
+
+        let mut lock = fixture.assemble("tkd");
+        lock.cargo_lock.extend_from_slice(b"# changed\n");
+        assert_ne!(lock.generated_root_digest(), digest);
     }
 
     proptest! {
@@ -624,6 +818,7 @@ macro_rules! bound_provisioner_main {
                 frontend_contract: DEFINITION_FRONTEND_CONTRACT,
                 cargo_toml,
                 main_rs,
+                cargo_lock: b"version = 4\n".to_vec(),
                 closure: ProvisionerClosure {
                     crate_dirs: Vec::new(),
                     crate_names: vec![

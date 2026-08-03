@@ -7,7 +7,8 @@ use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
 use tokeira_provisioner::DeploymentBindingMetadata;
 
 use crate::{
-    AppliedOutcome, ChangeLogEntry, ConfigSource, DesiredSnapshot, ProvisionerPlatform, Realization,
+    AppliedOutcome, ChangeLogEntry, ConfigSource, DesiredSnapshot, LogStream, ProvisionerPlatform,
+    Realization,
 };
 
 const METADATA_JSON: &str = "metadata.json";
@@ -138,7 +139,7 @@ impl<P: ProvisionerPlatform> ProvisionerPlatform for BoundPlatform<P> {
         self.inner.config_source(deployment_dir)
     }
 
-    fn definition_format(&self) -> Option<&'static str> {
+    fn definition_format(&self) -> Option<&str> {
         self.inner.definition_format()
     }
 
@@ -180,6 +181,26 @@ impl<P: ProvisionerPlatform> ProvisionerPlatform for BoundPlatform<P> {
         source: Option<&Path>,
     ) -> Result<Realization<()>> {
         self.inner.definition_check(deployment_dir, source).await
+    }
+
+    async fn log_stream(
+        &self,
+        deployment_dir: &Path,
+        service: &str,
+        follow: bool,
+        tail: Option<u32>,
+    ) -> Result<Realization<LogStream>> {
+        self.inner
+            .log_stream(deployment_dir, service, follow, tail)
+            .await
+    }
+
+    async fn port_mappings(
+        &self,
+        deployment_dir: &Path,
+        service: &str,
+    ) -> Result<Realization<Vec<tokeira_orchestrator::PortMapping>>> {
+        self.inner.port_mappings(deployment_dir, service).await
     }
 
     async fn desired_snapshot(

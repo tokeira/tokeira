@@ -12,7 +12,7 @@
 // CLI shell: stdout/stderr are the operator interface.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::path::Path;
+use std::{path::Path, pin::Pin};
 
 use anyhow::Result;
 use tokeira_iac::{Change, ChangeKind, PlanOutcome};
@@ -116,6 +116,10 @@ pub enum Realization<T> {
 /// plan's changes without translation.
 pub type DesiredSnapshot = std::collections::BTreeMap<tokeira_iac::ResourceId, serde_json::Value>;
 
+/// Incremental operator log output. Providers retain their native streaming
+/// behavior; the shell never collects logs into an in-memory snapshot.
+pub type LogStream = Pin<Box<dyn futures_util::Stream<Item = Result<String>> + Send>>;
+
 /// The typed refusal a verb returns after emitting a platform-issue
 /// document: the document already said everything (output-templates §The
 /// platform cannot be reached — "The verb exits non-zero"), so [`cli::run`]
@@ -204,7 +208,7 @@ pub trait ProvisionerPlatform {
     fn config_source(&self, deployment_dir: &Path) -> Result<ConfigSource>;
 
     /// Definition format compiled into this provisioner, when interpreted.
-    fn definition_format(&self) -> Option<&'static str> {
+    fn definition_format(&self) -> Option<&str> {
         None
     }
 
@@ -272,6 +276,30 @@ pub trait ProvisionerPlatform {
         let _ = (deployment_dir, source);
         Ok(Realization::NotApplicable {
             reason: "this platform has no interpreted definition",
+        })
+    }
+
+    /// Open a platform-native stream for one logical service.
+    async fn log_stream(
+        &self,
+        _deployment_dir: &Path,
+        _service: &str,
+        _follow: bool,
+        _tail: Option<u32>,
+    ) -> Result<Realization<LogStream>> {
+        Ok(Realization::NotApplicable {
+            reason: "this platform exposes no service logs",
+        })
+    }
+
+    /// Resolve live host/container mappings for one logical service.
+    async fn port_mappings(
+        &self,
+        _deployment_dir: &Path,
+        _service: &str,
+    ) -> Result<Realization<Vec<tokeira_orchestrator::PortMapping>>> {
+        Ok(Realization::NotApplicable {
+            reason: "this platform exposes no published port mappings",
         })
     }
 

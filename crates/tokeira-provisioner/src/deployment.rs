@@ -5,9 +5,7 @@
 //! verify before reading its definition or touching state/provider seams.
 
 use serde::{Deserialize, Serialize};
-use tokeira_orchestrator::{
-    DefinitionFormatId, PlatformId, PlatformLaunchClass, RelativeDefinitionPath,
-};
+use tokeira_orchestrator::{DefinitionFormatId, PlatformId, RelativeDefinitionPath};
 
 /// Definition identity recorded for a deployment-root source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,9 +29,6 @@ pub struct DeploymentBindingMetadata {
     pub id: uuid::Uuid,
     /// Open platform identity selected at deployment creation.
     pub platform: PlatformId,
-    /// Generic launch mechanism selected by the trusted platform descriptor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_class: Option<PlatformLaunchClass>,
     /// Recorded definition identity for bound-provisioner deployments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<RecordedDefinition>,
@@ -49,7 +44,6 @@ mod tests {
             "name": "demo",
             "id": "7698ae09-197e-4325-9f77-256dac98f23a",
             "platform": "compose",
-            "launch_class": "bound-provisioner",
             "definition": {
                 "format": "tkd",
                 "path": "definition.tkd"
@@ -74,7 +68,6 @@ mod tests {
             "name": "demo",
             "id": "7698ae09-197e-4325-9f77-256dac98f23a",
             "platform": "compose",
-            "launch_class": "bound-provisioner",
             "definition": { "format": "tkd", "path": "../definition.tkd" }
         }))
         .expect_err("escaping path must not reach filesystem access");

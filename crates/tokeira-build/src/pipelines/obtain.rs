@@ -105,9 +105,7 @@ pub async fn obtain_provisioner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ProvisionerClosure, SnapshotRequest, snapshot_source_closure, testing::MockDaggerClient,
-    };
+    use crate::{SnapshotRequest, snapshot_source_closure, testing::MockDaggerClient};
     use std::{
         path::{Path, PathBuf},
         process::Command,
@@ -138,6 +136,7 @@ mod tests {
             "[toolchain]\nchannel = \"1.95\"\n",
         )
         .expect("write");
+        std::fs::write(repo.join("Cargo.lock"), "version = 4\n").expect("write");
         std::fs::write(repo.join("platforms/alpha/src/lib.rs"), "pub fn a() {}\n").expect("write");
         git(repo, &["add", "."]);
         git(repo, &["commit", "-q", "-m", "seed"]);
@@ -146,26 +145,27 @@ mod tests {
             closure_paths: vec![
                 PathBuf::from("platforms/alpha"),
                 PathBuf::from("rust-toolchain.toml"),
+                PathBuf::from("Cargo.lock"),
             ],
             include_untracked: false,
         })
         .expect("snapshot");
         ProvisionerBuildRequest {
             workspace_root: repo.to_path_buf(),
-            seed_package: "tokeira-alpha".into(),
-            bin_name: "tkp-alpha".into(),
-            features: vec!["provisioner".into()],
+            bound_source: crate::BoundProvisionerSource::testing(crate::ProvisionerClosure {
+                crate_dirs: vec![PathBuf::from("platforms/alpha")],
+                crate_names: vec!["tokeira-alpha".into()],
+                workspace_files: vec![
+                    PathBuf::from("rust-toolchain.toml"),
+                    PathBuf::from("Cargo.lock"),
+                ],
+                locked: vec![],
+            }),
             targets: vec![Target("aarch64-unknown-linux-gnu".into())],
             profile: BuildProfile::Dist,
             authority: BuildAuthority::LocalDeveloper,
             build_image: format!("rust:1.95-slim-bookworm@sha256:{}", "ab".repeat(32)),
             snapshot,
-            closure: ProvisionerClosure {
-                crate_dirs: vec![PathBuf::from("platforms/alpha")],
-                crate_names: vec!["tokeira-alpha".into()],
-                workspace_files: vec![PathBuf::from("rust-toolchain.toml")],
-                locked: vec![],
-            },
             version: "0.1.0".into(),
             request_id: "req-1".into(),
             output_dir: out.to_path_buf(),

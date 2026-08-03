@@ -808,8 +808,13 @@ impl ComposePlatform {
         Ok(Some(live))
     }
 
-    /// Open recent logs from the service container as an incremental stream.
-    pub async fn log_stream(&self, service: &str) -> Result<LogStream, ComposeError> {
+    /// Open service logs as an incremental stream.
+    pub async fn log_stream(
+        &self,
+        service: &str,
+        follow: bool,
+        tail: Option<u32>,
+    ) -> Result<LogStream, ComposeError> {
         use futures_util::StreamExt;
 
         self.ensure_reachable().await?;
@@ -820,10 +825,10 @@ impl ComposePlatform {
             .logs(
                 &container_name,
                 Some(LogsOptions::<String> {
-                    follow: false,
+                    follow,
                     stdout: true,
                     stderr: true,
-                    tail: "100".into(),
+                    tail: tail.unwrap_or(100).to_string(),
                     ..Default::default()
                 }),
             )
@@ -835,13 +840,6 @@ impl ComposePlatform {
                     })
             });
         Ok(Box::pin(stream))
-    }
-
-    /// Collect the recent log stream for retained callers that need a snapshot.
-    pub async fn logs(&self, service: &str) -> Result<Vec<String>, ComposeError> {
-        use futures_util::TryStreamExt;
-
-        self.log_stream(service).await?.try_collect().await
     }
 
     /// Resolve the local host/port pair for a service container port.

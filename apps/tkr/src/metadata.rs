@@ -10,7 +10,7 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokeira_orchestrator::{PlatformKind, PlatformLaunchClass, StorageKind};
+use tokeira_orchestrator::{PlatformId, StorageKind};
 use tokeira_provisioner::RecordedDefinition;
 use uuid::Uuid;
 
@@ -38,11 +38,7 @@ pub(crate) enum DeploymentStatus {
 pub(crate) struct DeploymentMetadata {
     pub name: String,
     pub id: Uuid,
-    pub platform: PlatformKind,
-    /// Descriptor-selected launch mechanism. Absent only on deployments
-    /// created before launch-class metadata was introduced.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_class: Option<PlatformLaunchClass>,
+    pub platform: PlatformId,
     /// Format and safe live source path for a bound-provisioner deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<RecordedDefinition>,

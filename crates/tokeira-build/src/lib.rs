@@ -45,5 +45,5 @@ pub use pipelines::{
 pub use snapshot::{
     SnapshotError, SnapshotRequest, SourceSnapshot, materialize_snapshot, snapshot_source_closure,
 };
-pub use tokeira_orchestrator::{DefinitionSourceExtension, PlatformLaunchClass};
+pub use tokeira_orchestrator::DefinitionSourceExtension;
 pub use toolchain::rust_toolchain_version;

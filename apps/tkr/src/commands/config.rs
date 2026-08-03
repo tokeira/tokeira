@@ -18,14 +18,7 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 
-use crate::deployment_dir::{
-    DEFINITION_TKD, DEPLOYMENT_TOML, DeploymentResolver, METADATA_JSON, TOKEIRAD_TOML,
-};
-
-/// Every known config source, in the order an operator reads them: what
-/// defines the deployment, then what configures the server it runs. A given
-/// deployment carries the subset its platform uses.
-const SOURCES: [&str; 3] = [DEFINITION_TKD, DEPLOYMENT_TOML, TOKEIRAD_TOML];
+use crate::deployment_dir::{DEPLOYMENT_TOML, DeploymentResolver, METADATA_JSON, TOKEIRAD_TOML};
 
 pub(crate) fn run_show(deployments: &DeploymentResolver, requested: Option<&str>) -> Result<()> {
     let name = deployments.resolve_name(requested)?;
@@ -34,10 +27,22 @@ pub(crate) fn run_show(deployments: &DeploymentResolver, requested: Option<&str>
         bail!("{}", deployments.not_found_message(&name)?);
     }
 
-    let present: Vec<&str> = SOURCES
-        .into_iter()
-        .filter(|source| path.join(source).exists())
-        .collect();
+    let mut present = fs::read_dir(&path)?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            name == DEPLOYMENT_TOML || name == TOKEIRAD_TOML || name.starts_with("definition.")
+        })
+        .collect::<Vec<_>>();
+    present.sort_by_key(|name| {
+        if name.starts_with("definition.") {
+            (0, name.clone())
+        } else if name == DEPLOYMENT_TOML {
+            (1, name.clone())
+        } else {
+            (2, name.clone())
+        }
+    });
     if present.is_empty() {
         println!(
             "deployment '{name}' has no configuration sources under {}",
@@ -78,7 +83,7 @@ mod tests {
         let path = deployments.path("fwd");
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join(METADATA_JSON), "{}").unwrap();
-        std::fs::write(path.join(DEFINITION_TKD), "fn config() {}").unwrap();
+        std::fs::write(path.join("definition.tkd"), "fn config() {}").unwrap();
         std::fs::write(path.join(TOKEIRAD_TOML), "[server]").unwrap();
 
         run_show(&deployments, Some("fwd")).expect("a `.tkd` deployment shows its sources");

@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use futures_util::StreamExt;
 use tokeira_orchestrator::DefinitionFormatId;
 
 use crate::{
@@ -63,6 +64,10 @@ enum Command {
     /// Change workload capacity (`<dim>=<n>` specs); a config revision + a
     /// workload apply. `NotApplicable` where the platform has no scale dimension.
     Scale(ScaleArgs),
+    /// Stream logs for one logical service.
+    Logs(LogsArgs),
+    /// Print live published port mappings for one logical service.
+    PortMappings(ServiceArgs),
     /// Revert to a prior config revision — a same-engine apply, gated on the binding.
     Revert(RevertArgs),
     /// Upgrade to a new engine identity.
@@ -90,10 +95,36 @@ impl Command {
             }
             Self::Infra(InfraCommand::Destroy(args)) => Some(&args.deployment_dir),
             Self::Scale(args) => Some(&args.deployment_dir),
+            Self::Logs(args) => Some(&args.deployment_dir),
+            Self::PortMappings(args) => Some(&args.deployment_dir),
             Self::Revert(args) => Some(&args.deployment_dir),
             Self::Rollback(args) => Some(&args.deployment_dir),
         }
     }
+}
+
+#[derive(Args)]
+struct LogsArgs {
+    /// Logical service name owned by the platform.
+    service: String,
+    /// Continue streaming new output when supported.
+    #[arg(long)]
+    follow: bool,
+    /// Number of recent lines requested from the provider.
+    #[arg(long)]
+    tail: Option<u32>,
+    /// Deployment directory holding platform state.
+    #[arg(long)]
+    deployment_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct ServiceArgs {
+    /// Logical service name owned by the platform.
+    service: String,
+    /// Deployment directory holding platform state.
+    #[arg(long)]
+    deployment_dir: PathBuf,
 }
 
 #[derive(Args)]
@@ -251,6 +282,41 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
             )
             .await
         }
+        Command::Logs(args) => match platform
+            .log_stream(&args.deployment_dir, &args.service, args.follow, args.tail)
+            .await?
+        {
+            crate::Realization::Realized(mut stream) => {
+                while let Some(line) = stream.next().await {
+                    println!("{}", line?);
+                }
+                Ok(())
+            }
+            crate::Realization::NotApplicable { reason } => anyhow::bail!(reason),
+        },
+        Command::PortMappings(args) => match platform
+            .port_mappings(&args.deployment_dir, &args.service)
+            .await?
+        {
+            crate::Realization::Realized(mappings) => {
+                if mappings.is_empty() {
+                    println!("no port mappings for service {}", args.service);
+                } else {
+                    for mapping in mappings {
+                        println!(
+                            "{}:{} -> {}:{}/{}",
+                            mapping.host_addr,
+                            mapping.host_port,
+                            args.service,
+                            mapping.container_port,
+                            mapping.protocol
+                        );
+                    }
+                }
+                Ok(())
+            }
+            crate::Realization::NotApplicable { reason } => anyhow::bail!(reason),
+        },
         Command::Infra(InfraCommand::Plan(args)) => {
             plan::plan(
                 &platform,

@@ -58,7 +58,6 @@ pub(crate) fn check_generated_observability(
     }
 
     let checks = match &ctx.platform_config {
-        PlatformDeploymentConfig::Compose(config) => compose_checks(config, &ctx.path, &ctx.name)?,
         PlatformDeploymentConfig::Ecs(config) => ecs_checks(config)?,
         PlatformDeploymentConfig::Local(_) => vec![CheckOutcome {
             name: "local-observability",
@@ -68,66 +67,6 @@ pub(crate) fn check_generated_observability(
     };
 
     Ok(CheckReport { checks })
-}
-
-fn compose_checks(
-    config: &tokeira_compose_deployment::ComposeConfig,
-    deployment_dir: &std::path::Path,
-    deployment: &str,
-) -> Result<Vec<CheckOutcome>> {
-    let generator = tokeira_compose_deployment::observability::ConfigGenerator::new(deployment_dir);
-    let files = generator
-        .render_all(
-            &tokeira_compose_deployment::observability::ObservabilityParams::from_config(
-                config, deployment,
-            ),
-        )
-        .context("failed to render compose observability config")?;
-    let alloy = rendered_file(&files, "config/alloy.alloy")?;
-    let alerts = rendered_file(&files, "config/mimir/rules/observability-alerts.yaml")?;
-    let dashboard_count = files
-        .iter()
-        .filter(|file| {
-            file.relative_path
-                .to_string_lossy()
-                .starts_with("config/grafana/dashboards/")
-        })
-        .count();
-
-    require_contains(
-        alloy,
-        "prometheus.scrape \"tokeirad\"",
-        "compose Alloy tokeirad scrape",
-    )?;
-    require_contains(
-        alloy,
-        "prometheus.scrape \"mimir\"",
-        "compose Alloy Mimir scrape",
-    )?;
-    require_contains(
-        alerts,
-        "DsqlReservoirExhaustion",
-        "compose Mimir alert rules",
-    )?;
-    if dashboard_count == 0 {
-        bail!("compose Grafana dashboard provisioning rendered no dashboards");
-    }
-
-    Ok(vec![
-        pass(
-            "compose-scrapes",
-            "Alloy config contains process and infrastructure scrape jobs",
-        ),
-        pass(
-            "compose-dashboards",
-            format!("{dashboard_count} Grafana dashboards rendered"),
-        ),
-        pass("compose-alerts", "Mimir alert rules rendered"),
-        warn(
-            "live-backend-query",
-            "live Mimir/Loki/Grafana queries require a reachable deployment endpoint",
-        ),
-    ])
 }
 
 fn ecs_checks(config: &tokeira_ecs_deployment::EcsConfig) -> Result<Vec<CheckOutcome>> {
@@ -198,17 +137,6 @@ fn ecs_checks(config: &tokeira_ecs_deployment::EcsConfig) -> Result<Vec<CheckOut
     ])
 }
 
-fn rendered_file<'a>(
-    files: &'a [tokeira_compose_deployment::observability::RenderedConfigFile],
-    path: &str,
-) -> Result<&'a str> {
-    files
-        .iter()
-        .find(|file| file.relative_path == *path)
-        .map(|file| file.contents.as_str())
-        .with_context(|| format!("rendered observability file missing: {path}"))
-}
-
 fn require_contains(contents: &str, needle: &str, context: &str) -> Result<()> {
     if contents.contains(needle) {
         Ok(())
@@ -242,7 +170,7 @@ mod tests {
         deployment_dir::{DeploymentContext, PlatformDeploymentConfig},
         metadata::{DeploymentMetadata, DeploymentStatus},
     };
-    use tokeira_orchestrator::{PlatformKind, StorageKind};
+    use tokeira_orchestrator::StorageKind;
     use uuid::Uuid;
 
     fn context(platform_config: PlatformDeploymentConfig) -> DeploymentContext {
@@ -252,8 +180,7 @@ mod tests {
             metadata: DeploymentMetadata {
                 name: "test".into(),
                 id: Uuid::nil(),
-                platform: PlatformKind::Local,
-                launch_class: Some(tokeira_orchestrator::PlatformLaunchClass::LegacyInProcess),
+                platform: tokeira_orchestrator::PlatformId::new("local").expect("platform"),
                 definition: None,
                 storage: StorageKind::InMemory,
                 status: DeploymentStatus::Created,
@@ -262,28 +189,6 @@ mod tests {
             },
             platform_config,
         }
-    }
-
-    #[test]
-    fn compose_check_validates_generated_artifacts() {
-        let report = check_generated_observability(
-            &context(PlatformDeploymentConfig::Compose(Box::default())),
-            30,
-        )
-        .unwrap();
-
-        assert!(
-            report
-                .checks
-                .iter()
-                .any(|check| check.name == "compose-scrapes")
-        );
-        assert!(
-            report
-                .checks
-                .iter()
-                .any(|check| check.name == "compose-dashboards")
-        );
     }
 
     #[test]

@@ -133,20 +133,6 @@ impl Default for ComposeConfig {
     }
 }
 
-/// Render the reference typed configuration for tooling that needs a value document.
-pub fn prototypical_toml(storage: tokeira_orchestrator::StorageKind) -> String {
-    let mut config = ComposeConfig::default();
-    if storage == tokeira_orchestrator::StorageKind::Dsql {
-        config.storage = Storage::Dsql(DsqlStorage {
-            region: "us-east-1".to_string(),
-            mode: DsqlMode::Managed,
-            endpoint: None,
-            arn: None,
-        });
-    }
-    toml::to_string_pretty(&config).expect("the built-in Compose configuration serializes")
-}
-
 /// Enforce Compose cross-field constraints without provider or filesystem access.
 pub fn validate(config: &ComposeConfig) -> Result<(), ConfigError> {
     let require_container = |name: &str, image: &str, replicas: u32| {

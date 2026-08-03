@@ -7697,7 +7697,6 @@ dependencies = [
  "tokeira-build",
  "tokeira-build-info",
  "tokeira-compatibility",
- "tokeira-compose-deployment",
  "tokeira-config",
  "tokeira-deploy-engine",
  "tokeira-ecs-deployment",
@@ -8020,7 +8019,6 @@ dependencies = [
  "tokeira-state",
  "tokeira-tkd",
  "tokio",
- "toml 0.8.23",
  "tracing",
 ]
 
@@ -8464,6 +8462,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "futures-util",
  "proptest",
  "serde",
  "serde_json",

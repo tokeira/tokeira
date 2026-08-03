@@ -10,7 +10,6 @@ authors.workspace = true
 [package.metadata.tokeira.platform]
 id = "compose"
 binding-contract = 1
-launch-class = "bound-provisioner"
 default = false
 
 [dependencies]
@@ -32,7 +31,6 @@ serde = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-toml = { workspace = true }
 futures-util = "0.3"
 # Observability config rendering (owned by compose-syn — alerts + dashboards +
 # the askama templates live in this crate).
@@ -40,9 +38,9 @@ askama = "0.12"
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-tokeira-tkd = { workspace = true }
 
 [dev-dependencies]
+tokeira-tkd = { workspace = true }
 tempfile = { workspace = true }
 # The semantics registry's Properties 9/10 (change-semantics Requirement 7)
 # probe realized kinds over generated contexts.

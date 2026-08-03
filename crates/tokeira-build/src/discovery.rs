@@ -13,8 +13,7 @@ use cargo_metadata::{Metadata, MetadataCommand, Package};
 use serde::Deserialize;
 use thiserror::Error;
 use tokeira_orchestrator::{
-    DefinitionFormatId, DefinitionSourceExtension, PlatformId, PlatformLaunchClass,
-    RelativeDefinitionPath,
+    DefinitionFormatId, DefinitionSourceExtension, PlatformId, RelativeDefinitionPath,
 };
 
 /// Private platform binding contract understood by this workspace.
@@ -43,8 +42,6 @@ pub struct PlatformPackageDescriptor {
     pub id: PlatformId,
     /// Whether this source entry requests catalog-default status.
     pub is_default: bool,
-    /// Generic launch mechanism, independent of platform identity.
-    pub launch_class: PlatformLaunchClass,
     /// Private binding contract version.
     pub binding_contract: u32,
     /// Conventional source-library coordinates.
@@ -104,7 +101,6 @@ pub enum DiscoveryError {
 struct RawPlatformDescriptor {
     id: String,
     binding_contract: u32,
-    launch_class: PlatformLaunchClass,
     default: bool,
 }
 
@@ -195,7 +191,6 @@ fn decode_platform(
     Ok(PlatformPackageDescriptor {
         id,
         is_default: raw.default,
-        launch_class: raw.launch_class,
         binding_contract: raw.binding_contract,
         package: coordinates,
     })
@@ -373,7 +368,6 @@ edition = "2024"
 [package.metadata.tokeira.platform]
 id = "synthetic"
 binding-contract = 1
-launch-class = "bound-provisioner"
 default = true
 "#,
         )
@@ -390,7 +384,6 @@ default = true
 [package.metadata.tokeira.platform]
 id = "compose"
 binding-contract = 1
-launch-class = "bound-provisioner"
 default = false
 "#,
             false,
@@ -449,7 +442,6 @@ default-relative-path = "definition.tkd"
 [package.metadata.tokeira.platform]
 id = "compose"
 binding-contract = 1
-launch-class = "bound-provisioner"
 default = false
 "#,
                 false,

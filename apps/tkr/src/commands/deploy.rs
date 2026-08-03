@@ -7,11 +7,11 @@
 //!   [`crate::process::spawn_tokeirad`]. Status toggles to `Running` at
 //!   spawn and back to `Stopped` when the process exits (normally or via
 //!   ctrl-c).
-//! - **Compose**: run a Compose-specific pre-flight validation, then have
-//!   the [`DeployEngine`] reconcile the compose stack on disk. Status
-//!   flips to `Running` once the stack is up.
 //! - **ECS**: currently a `todo` surface — the runtime engine for ECS
 //!   exists but this CLI path hasn't been wired yet (tracked separately).
+//!
+//! Definition-bound platforms, including Compose, never enter this module;
+//! `tkr` forwards their deploy verbs to the married provisioner.
 //!
 //! `deploy status` prefers the live [`crate::process::local_process_status`]
 //! for local deployments over the metadata file so a crashed server is
@@ -20,7 +20,7 @@
 use anyhow::Result;
 use tokeira_ecs_deployment::EcsDeployment;
 use tokeira_local_deployment::LocalDeployment;
-use tokeira_orchestrator::{DeployEngine, PlatformKind};
+use tokeira_orchestrator::DeployEngine;
 
 use crate::{
     cli::DeployAction,
@@ -41,9 +41,6 @@ pub(crate) async fn run(
                 PlatformDeploymentConfig::Local(config) => {
                     let mut engine = DeployEngine::new(LocalDeployment, config, &ctx.path).await?;
                     print_plan(&engine.plan().await?);
-                }
-                PlatformDeploymentConfig::Compose(_) => {
-                    return Err(super::compose_requires_definition().into());
                 }
                 PlatformDeploymentConfig::Ecs(config) => {
                     let mut engine =
@@ -69,16 +66,13 @@ pub(crate) async fn run(
                     deployments.update_status(&ctx.name, DeploymentStatus::Stopped)?;
                     result?;
                 }
-                PlatformDeploymentConfig::Compose(_) => {
-                    return Err(super::compose_requires_definition().into());
-                }
                 PlatformDeploymentConfig::Ecs(_) => {
                     anyhow::bail!("ECS deploy apply is not implemented yet");
                 }
             }
         }
         DeployAction::Status => {
-            let status = if ctx.metadata.platform == PlatformKind::Local {
+            let status = if ctx.metadata.platform.as_str() == "local" {
                 process::local_process_status(&ctx.path)
             } else {
                 ctx.metadata.status.clone()

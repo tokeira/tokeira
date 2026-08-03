@@ -1,11 +1,8 @@
 //! Command handlers, one module per top-level `tkr` subcommand.
 //!
 //! Each submodule owns its own `run(...)` entry point, called from the
-//! dispatcher in `main.rs`. Handlers receive a `DeploymentContext` (when
-//! applicable) and use [`PlatformOps::from_context`] to get a
-//! platform-agnostic interface to day-2 operations (scale, logs,
-//! port-forward). Subcommand-specific flows (`infra`, `deploy`, `image`,
-//! `schema`) are more bespoke because their engine boundaries differ.
+//! dispatcher in `main.rs`. Definition-bound deployments are forwarded to their
+//! married provisioner. These handlers retain the Local/ECS in-process path.
 //!
 //! # Adding a new subcommand
 //!
@@ -33,34 +30,27 @@ pub(crate) mod schema;
 pub(crate) mod version;
 pub(crate) mod workstation;
 
-use std::path::PathBuf;
-
 use anyhow::{Result, bail};
-use tokeira_compose_deployment::ComposeConfig;
 use tokeira_ecs_deployment::{EcsConfig, EcsDeployment};
 use tokeira_local_deployment::{LocalConfig, LocalDeployment};
 use tokeira_orchestrator::Ops;
 
 use crate::deployment_dir::{DeploymentContext, PlatformDeploymentConfig};
 
-/// Platform-agnostic facade over the three concrete deployment types.
+/// Legacy facade over the Local and ECS deployment types.
 ///
 /// Each variant carries the platform's `Deployment` implementor together
 /// with the config it needs. The `Deployment` trait is object-unsafe
 /// (it's generic over `Config`), so a plain `Box<dyn Deployment>` won't
-/// work — this enum threads the three platforms explicitly instead.
+/// work — this enum threads the two remaining in-process platforms explicitly.
 ///
 /// Day-2 handlers (`scale`, `logs`, `port_forward`) go through this facade
 /// so they stay platform-neutral. Handlers that need to reach into
 /// platform-specific APIs (the engine-based `infra` and `deploy`
 /// handlers, or the ECS-only `image push/mirror`) match on
 /// [`PlatformDeploymentConfig`] directly.
-///
-/// The Compose variant also carries the deployment directory because the
-/// Compose ops need it to locate the generated `docker-compose.yml`.
 pub(crate) enum PlatformOps {
     Local(LocalDeployment, LocalConfig),
-    Compose(Box<ComposeConfig>, PathBuf),
     Ecs(EcsDeployment, Box<EcsConfig>),
 }
 
@@ -69,9 +59,6 @@ impl PlatformOps {
         match &ctx.platform_config {
             PlatformDeploymentConfig::Local(config) => {
                 Ok(Self::Local(LocalDeployment, config.clone()))
-            }
-            PlatformDeploymentConfig::Compose(config) => {
-                Ok(Self::Compose(config.clone(), ctx.path.clone()))
             }
             PlatformDeploymentConfig::Ecs(config) => {
                 Ok(Self::Ecs(EcsDeployment::new(), config.clone()))
@@ -82,7 +69,6 @@ impl PlatformOps {
     pub(crate) fn desired_replicas(&self) -> Vec<tokeira_orchestrator::ServiceReplicas> {
         match self {
             Self::Local(d, c) => d.desired_replicas(c),
-            Self::Compose(c, _) => tokeira_compose_deployment::ops::desired_replicas(c),
             Self::Ecs(d, c) => d.desired_replicas(c),
         }
     }
@@ -94,7 +80,6 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_up(service, replicas, c).await,
-            Self::Compose(..) => Err(compose_requires_definition()),
             Self::Ecs(d, c) => d.scale_up(service, replicas, c).await,
         }
     }
@@ -106,7 +91,6 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<()> {
         match self {
             Self::Local(d, c) => d.scale_down(service, replicas, c).await,
-            Self::Compose(..) => Err(compose_requires_definition()),
             Self::Ecs(d, c) => d.scale_down(service, replicas, c).await,
         }
     }
@@ -114,7 +98,6 @@ impl PlatformOps {
     pub(crate) async fn logs(&self, service: &str) -> tokeira_orchestrator::Result<Vec<String>> {
         match self {
             Self::Local(d, c) => d.logs(service, c).await,
-            Self::Compose(c, dir) => tokeira_compose_deployment::ops::logs(service, c, dir).await,
             Self::Ecs(d, c) => d.logs(service, c).await,
         }
     }
@@ -125,24 +108,9 @@ impl PlatformOps {
     ) -> tokeira_orchestrator::Result<Vec<tokeira_orchestrator::PortMapping>> {
         match self {
             Self::Local(d, c) => d.port_mappings(service, c).await,
-            Self::Compose(c, dir) => {
-                tokeira_compose_deployment::ops::port_mappings(service, c, dir).await
-            }
             Self::Ecs(d, c) => d.port_mappings(service, c).await,
         }
     }
-}
-
-/// Every compose deployment is `.tkd`-defined and driven by its married
-/// provisioner; these in-process arms exist only to keep the platform match
-/// total. Reaching one means the deployment directory has no
-/// `definition.tkd` — the error names that gap.
-pub(crate) fn compose_requires_definition() -> tokeira_orchestrator::OrchestratorError {
-    anyhow::anyhow!(
-        "this compose deployment has no `definition.tkd`; compose verbs are realized by \
-         the deployment's provisioner over its definition"
-    )
-    .into()
 }
 
 /// Gate a destructive action behind an explicit `--yes` flag.

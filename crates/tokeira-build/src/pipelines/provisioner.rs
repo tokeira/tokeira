@@ -18,7 +18,7 @@
 //! Tests run inside the same container, on the same frozen source; reaching
 //! the packaging step at all means they passed ([`TestEvidence`]).
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use tokeira_provisioner::{
     BinaryArtifactDescriptor, BuildAuthority, BuildProfile, EngineIdentity, ProvisionerBundle,
@@ -28,7 +28,7 @@ use tokeira_provisioner::{
 };
 
 use crate::{
-    BuildError, DaggerClient, ProvisionerClosure, SourceSnapshot, materialize_snapshot,
+    BoundProvisionerSource, BuildError, DaggerClient, SourceSnapshot, materialize_snapshot,
     rust_toolchain_version,
 };
 
@@ -45,12 +45,8 @@ pub struct ProvisionerBuildRequest {
     /// The repository the snapshot's objects live in (also supplies
     /// `rust-toolchain.toml` for the toolchain identity input).
     pub workspace_root: PathBuf,
-    /// The platform seed package (e.g. `tokeira-compose-deployment`).
-    pub seed_package: String,
-    /// The provisioner bin target the platform ships (`tkp`).
-    pub bin_name: String,
-    /// Cargo features enabling the bin target (e.g. `provisioner`).
-    pub features: Vec<String>,
+    /// Exact generated composition root and its three-root source closure.
+    pub bound_source: BoundProvisionerSource,
     /// Target triples to build. Every successfully built target joins the
     /// bundle's manifest.
     pub targets: Vec<Target>,
@@ -66,7 +62,6 @@ pub struct ProvisionerBuildRequest {
     pub snapshot: SourceSnapshot,
     /// The resolved closure (crate names for the test set; canonical lock
     /// bytes for the identity's lock digest).
-    pub closure: ProvisionerClosure,
     /// Human-facing version label for the bundle (the workspace semver).
     pub version: String,
     /// Correlation id, recorded in the bundle's build manifest.
@@ -98,6 +93,12 @@ pub fn build_provisioner(
     .map_err(|e| BuildError::Validation {
         reason: format!("failed to materialize the source snapshot: {e}"),
     })?;
+    request
+        .bound_source
+        .materialize_in(&source_dir)
+        .map_err(|error| BuildError::Validation {
+            reason: format!("failed to materialize the generated composition root: {error}"),
+        })?;
     let source = dagger.host_directory(&source_dir)?;
 
     // The base build environment: pinned image + system deps + the frozen
@@ -109,11 +110,10 @@ pub fn build_provisioner(
     base = base.with_env("RUSTUP_TOOLCHAIN", &toolchain)?;
     base = base.with_workdir("/src")?;
     base = base.with_directory("/src", &*source)?;
-
     // Tests: the closure's workspace crates, once (target-independent), on
     // the frozen source. A failure aborts the pipeline — no bundle exists.
     let mut test_args: Vec<String> = vec!["cargo".into(), "test".into(), "--locked".into()];
-    for name in &request.closure.crate_names {
+    for name in &request.bound_source.closure().crate_names {
         test_args.push("-p".into());
         test_args.push(name.clone());
     }
@@ -130,8 +130,7 @@ pub fn build_provisioner(
     for target in &request.targets {
         let mut builder = base.clone_ref()?;
         builder = builder.with_exec(&["rustup", "target", "add", &target.0])?;
-        let feature_list = request.features.join(",");
-        let mut build_args: Vec<String> = vec![
+        let build_args: Vec<String> = vec![
             "cargo".into(),
             "build".into(),
             "--locked".into(),
@@ -139,22 +138,17 @@ pub fn build_provisioner(
             profile_flag.to_string(),
             "--target".into(),
             target.0.clone(),
-            "-p".into(),
-            request.seed_package.clone(),
-            "--bin".into(),
-            request.bin_name.clone(),
+            "--manifest-path".into(),
+            format!("/src/{}/Cargo.toml", crate::GENERATED_ROOT_RELATIVE_PATH),
         ];
-        if !feature_list.is_empty() {
-            build_args.push("--features".into());
-            build_args.push(feature_list);
-        }
         builder = builder.with_exec(&as_strs(&build_args))?;
 
         let built = format!(
-            "/src/target/{}/{}/{}",
+            "/src/{}/target/{}/{}/{}",
+            crate::GENERATED_ROOT_RELATIVE_PATH,
             target.0,
             profile_dir(request.profile),
-            request.bin_name
+            crate::GENERATED_PROVISIONER_BIN
         );
         builder = builder.with_exec(&["strip", &built])?;
 
@@ -178,7 +172,7 @@ pub fn build_provisioner(
 
     Ok(ProvisionerBundle {
         identity,
-        bound: None,
+        bound: Some(request.bound_source.evidence(&request.snapshot.tree_oid)),
         authority: request.authority.clone(),
         provisioner_version: request.version.clone(),
         artifacts,
@@ -202,11 +196,15 @@ pub fn engine_identity_for(
     let build_container = validate(request)?;
     let toolchain = rust_toolchain_version(&request.workspace_root)?;
     Ok(EngineIdentity {
-        source_closure: EngineIdentity::source_closure_digest_for_tree(&request.snapshot.tree_oid),
-        lock_closure: Sha256Digest::from_bytes(&request.closure.canonical_lock_bytes()),
+        source_closure: request
+            .bound_source
+            .source_closure_digest(&request.snapshot.tree_oid),
+        lock_closure: Sha256Digest::from_bytes(
+            &request.bound_source.closure().canonical_lock_bytes(),
+        ),
         toolchain,
         build_container: Some(build_container),
-        features: request.features.iter().cloned().collect(),
+        features: BTreeSet::new(),
         profile: request.profile,
     })
 }
@@ -217,7 +215,7 @@ fn validate(request: &ProvisionerBuildRequest) -> Result<Sha256Digest, BuildErro
     if request.targets.is_empty() {
         return refuse("no build targets requested".into());
     }
-    if request.closure.crate_names.is_empty() {
+    if request.bound_source.closure().crate_names.is_empty() {
         return refuse("the resolved closure contains no workspace crates".into());
     }
     if request.snapshot.tree_oid.is_empty() {
@@ -275,7 +273,10 @@ fn as_strs(args: &[String]) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MockCall, MockDaggerClient, mock_artifact_bytes};
+    use crate::{
+        ProvisionerClosure,
+        testing::{MockCall, MockDaggerClient, mock_artifact_bytes},
+    };
     use std::{path::Path, process::Command};
 
     fn git(dir: &Path, args: &[&str]) {
@@ -306,6 +307,7 @@ mod tests {
             "[toolchain]\nchannel = \"1.95\"\n",
         )
         .expect("write");
+        std::fs::write(dir.join("Cargo.lock"), "version = 4\n").expect("write");
         std::fs::write(dir.join("platforms/alpha/src/lib.rs"), "pub fn a() {}\n").expect("write");
         git(dir, &["add", "."]);
         git(dir, &["commit", "-q", "-m", "seed"]);
@@ -314,6 +316,7 @@ mod tests {
             closure_paths: vec![
                 PathBuf::from("platforms/alpha"),
                 PathBuf::from("rust-toolchain.toml"),
+                PathBuf::from("Cargo.lock"),
             ],
             include_untracked: false,
         })
@@ -324,7 +327,10 @@ mod tests {
         ProvisionerClosure {
             crate_dirs: vec![PathBuf::from("platforms/alpha")],
             crate_names: vec!["tokeira-alpha".into()],
-            workspace_files: vec![PathBuf::from("rust-toolchain.toml")],
+            workspace_files: vec![
+                PathBuf::from("rust-toolchain.toml"),
+                PathBuf::from("Cargo.lock"),
+            ],
             locked: vec![],
         }
     }
@@ -332,15 +338,12 @@ mod tests {
     fn request(repo: &Path, out: &Path) -> ProvisionerBuildRequest {
         ProvisionerBuildRequest {
             workspace_root: repo.to_path_buf(),
-            seed_package: "tokeira-alpha".into(),
-            bin_name: "tkp-alpha".into(),
-            features: vec!["provisioner".into()],
+            bound_source: BoundProvisionerSource::testing(closure()),
             targets: vec![Target("aarch64-unknown-linux-gnu".into())],
             profile: BuildProfile::Dist,
             authority: BuildAuthority::LocalDeveloper,
             build_image: format!("rust:1.95-slim-bookworm@sha256:{}", "ab".repeat(32)),
             snapshot: snapshot_fixture(repo),
-            closure: closure(),
             version: "0.1.0".into(),
             request_id: "req-1".into(),
             output_dir: out.to_path_buf(),
@@ -359,7 +362,9 @@ mod tests {
         // Identity: closure-scoped inputs, pinned container, dist profile.
         assert_eq!(
             bundle.identity.source_closure,
-            EngineIdentity::source_closure_digest_for_tree(&request.snapshot.tree_oid)
+            request
+                .bound_source
+                .source_closure_digest(&request.snapshot.tree_oid)
         );
         assert_eq!(bundle.identity.toolchain, "1.95");
         assert_eq!(
@@ -369,7 +374,8 @@ mod tests {
 
         // The artifact attests the EXPORTED bytes (the mock writes
         // deterministic bytes derived from the container path).
-        let built = "/src/target/aarch64-unknown-linux-gnu/dist/tkp-alpha";
+        let built =
+            "/src/.tokeira-build/bound-provisioner/target/aarch64-unknown-linux-gnu/dist/tkp";
         assert_eq!(bundle.artifacts.len(), 1);
         assert_eq!(
             bundle.artifacts[0].sha256,
@@ -393,7 +399,7 @@ mod tests {
             "-p".into(),
             "tokeira-alpha".into(),
         ])));
-        // The cross-build carries --locked, the dist profile, and features.
+        // The cross-build targets the generated composition root.
         assert!(calls.contains(&MockCall::WithExec(vec![
             "cargo".into(),
             "build".into(),
@@ -402,12 +408,8 @@ mod tests {
             "dist".into(),
             "--target".into(),
             "aarch64-unknown-linux-gnu".into(),
-            "-p".into(),
-            "tokeira-alpha".into(),
-            "--bin".into(),
-            "tkp-alpha".into(),
-            "--features".into(),
-            "provisioner".into(),
+            "--manifest-path".into(),
+            "/src/.tokeira-build/bound-provisioner/Cargo.toml".into(),
         ])));
         assert!(bundle.tests.passed);
         assert_eq!(bundle.build.source_tree_oid, request.snapshot.tree_oid);
@@ -447,7 +449,7 @@ mod tests {
         assert!(build_provisioner(&no_targets, &mock).is_err());
 
         let mut no_crates = base;
-        no_crates.closure.crate_names.clear();
+        no_crates.bound_source.testing_clear_crates();
         assert!(build_provisioner(&no_crates, &mock).is_err());
     }
 

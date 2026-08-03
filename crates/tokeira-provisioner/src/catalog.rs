@@ -9,8 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use tokeira_orchestrator::{
-    DefinitionFormatId, DefinitionSourceExtension, PlatformId, PlatformLaunchClass,
-    RelativeDefinitionPath,
+    DefinitionFormatId, DefinitionSourceExtension, PlatformId, RelativeDefinitionPath,
 };
 
 use crate::EngineIdentity;
@@ -23,8 +22,6 @@ pub struct PublishedPlatformDescriptor {
     pub id: PlatformId,
     /// Whether this entry is the distribution's unique default.
     pub is_default: bool,
-    /// Generic launch mechanism, independent of platform identity.
-    pub launch_class: PlatformLaunchClass,
     /// Private Platform Binding contract used to assemble its provisioners.
     pub binding_contract: u32,
 }
@@ -89,7 +86,6 @@ mod tests {
             platforms: vec![PublishedPlatformDescriptor {
                 id: platform.clone(),
                 is_default: true,
-                launch_class: PlatformLaunchClass::BoundProvisioner,
                 binding_contract: 1,
             }],
             frontends: vec![PublishedDefinitionFrontendDescriptor {

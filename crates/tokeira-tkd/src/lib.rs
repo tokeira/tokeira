@@ -18,7 +18,7 @@ pub mod subset;
 pub mod value;
 
 pub use bridge::HostBridge;
-pub use framework::{TkdContext, TkdFrontend, frontend};
+pub use framework::{TkdFrontend, frontend};
 pub use subset::{Diagnostic, Diagnostics};
 pub use value::{EnumPath, EvalError, FieldMap, FieldMapExt, Value, VariantBody};
 

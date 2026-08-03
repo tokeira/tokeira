@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokeira_orchestrator::DefinitionFormatId;
-use tokeira_platform::definition::RelativeDefinitionPath;
+use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 
 use crate::ConfigSource;
 

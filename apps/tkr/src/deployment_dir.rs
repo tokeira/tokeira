@@ -39,8 +39,9 @@ use directories::ProjectDirs;
 use tokeira_compose_deployment::ComposeConfig;
 use tokeira_ecs_deployment::EcsConfig;
 use tokeira_local_deployment::LocalConfig;
-use tokeira_orchestrator::{DefinitionFormatId, PlatformKind, PlatformLaunchClass, StorageKind};
-use tokeira_platform::definition::RelativeDefinitionPath;
+use tokeira_orchestrator::{
+    DefinitionFormatId, PlatformKind, PlatformLaunchClass, RelativeDefinitionPath, StorageKind,
+};
 use tokeira_provisioner::RecordedDefinition;
 use uuid::Uuid;
 

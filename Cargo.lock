@@ -8371,17 +8371,15 @@ dependencies = [
 name = "tokeira-platform"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "hex",
  "proptest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
- "tokeira-deploy-engine",
  "tokeira-iac",
  "tokeira-orchestrator",
- "tokeira-state",
  "uuid",
 ]
 
@@ -8448,7 +8446,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokeira-build-info",
  "tokeira-orchestrator",
- "tokeira-platform",
  "tokeira-state",
  "tokio",
  "uuid",
@@ -8471,7 +8468,6 @@ dependencies = [
  "tokeira-explain",
  "tokeira-iac",
  "tokeira-orchestrator",
- "tokeira-platform",
  "tokeira-provisioner",
  "tokeira-report",
  "tokeira-state",

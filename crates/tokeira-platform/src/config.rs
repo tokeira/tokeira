@@ -1,44 +1,25 @@
-//! Typed platform configuration admission and pure validation contracts.
+//! Serde-backed admission of platform-owned configuration structs.
 
-use std::{fmt::Debug, marker::PhantomData};
-
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 
 use crate::{
     author::{LocatedValue, from_located_value},
     error::ConfigError,
 };
 
-/// Configuration supplied by one platform and admitted from any definition frontend.
-pub trait PlatformConfig:
-    Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
+/// Decode a frontend value and run the platform's pure validation function.
+pub fn admit_config<C>(
+    value: LocatedValue,
+    validate: fn(&C) -> Result<(), ConfigError>,
+) -> Result<C, ConfigError>
+where
+    C: DeserializeOwned,
 {
-    /// Enforce cross-field invariants without provider access or ambient discovery.
-    fn validate(&self) -> Result<(), ConfigError>;
-}
-
-/// Compile-time admission contract for one platform configuration type.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ConfigContract<C: PlatformConfig> {
-    marker: PhantomData<fn() -> C>,
-}
-
-impl<C: PlatformConfig> ConfigContract<C> {
-    /// Construct the standard Serde-backed contract.
-    pub const fn new() -> Self {
-        Self {
-            marker: PhantomData,
-        }
-    }
-
-    /// Decode host-free data and run platform-owned pure validation.
-    pub fn admit(&self, node: LocatedValue) -> Result<C, ConfigError> {
-        let root_range = node.range;
-        let config: C = from_located_value(node).map_err(|error| ConfigError {
-            message: error.message().to_string(),
-            range: error.range().or(root_range),
-        })?;
-        config.validate().map_err(|error| error.at(root_range))?;
-        Ok(config)
-    }
+    let root_range = value.range;
+    let config = from_located_value(value).map_err(|error| ConfigError {
+        message: error.message().to_string(),
+        range: error.range().or(root_range),
+    })?;
+    validate(&config).map_err(|error| error.at(root_range))?;
+    Ok(config)
 }

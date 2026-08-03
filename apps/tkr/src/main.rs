@@ -1194,8 +1194,7 @@ mod tests {
             launch_class: Some(tokeira_orchestrator::PlatformLaunchClass::BoundProvisioner),
             definition: Some(tokeira_provisioner::RecordedDefinition {
                 format: tokeira_orchestrator::DefinitionFormatId::new("tkd").unwrap(),
-                path: tokeira_platform::definition::RelativeDefinitionPath::new("definition.tkd")
-                    .unwrap(),
+                path: tokeira_orchestrator::RelativeDefinitionPath::new("definition.tkd").unwrap(),
             }),
             storage: StorageKind::Dsql,
             status: metadata::DeploymentStatus::Running,

@@ -16,8 +16,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use tokeira_iac::{Change, ChangeKind, PlanOutcome};
-use tokeira_orchestrator::DefinitionFormatId;
-use tokeira_platform::definition::RelativeDefinitionPath;
+use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 use tokeira_provisioner::DeploymentStateEnvelope;
 use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 
@@ -48,33 +47,31 @@ pub use cli::run;
 pub use tokeira_provisioner::{ChangeLogEntry, ChangeOp};
 
 /// Generate the disposable `tkp` entrypoint for one statically selected
-/// platform binding and one Definition Frontend.
+/// concrete platform provisioner and one definition frontend.
 #[macro_export]
 macro_rules! bound_provisioner_main {
     (
         expected_platform: $platform:literal,
-        binding: $binding:path,
+        platform: $platform_factory:path,
         expected_format: $format:literal,
         frontend: $frontend:path $(,)?
     ) => {
         fn main() -> std::process::ExitCode {
-            $crate::run_bound_provisioner($platform, $format, $binding(), $frontend())
+            $crate::run_bound_provisioner($platform, $format, $platform_factory($frontend()))
         }
     };
 }
 
 /// Synchronous process boundary used only by generated composition roots.
-pub fn run_bound_provisioner<P, F>(
+pub fn run_bound_provisioner<P>(
     expected_platform: &'static str,
     expected_format: &'static str,
-    binding: tokeira_platform::binding::PlatformBinding<P>,
-    frontend: F,
+    platform: P,
 ) -> std::process::ExitCode
 where
-    P: tokeira_platform::binding::Platform,
-    F: tokeira_platform::definition::DefinitionFrontend<P>,
+    P: ProvisionerPlatform,
 {
-    let platform = match BoundPlatform::new(expected_platform, expected_format, binding, frontend) {
+    let platform = match BoundPlatform::new(expected_platform, expected_format, platform) {
         Ok(platform) => platform,
         Err(error) => {
             eprintln!("{error:#}");

@@ -20,7 +20,6 @@ tokeira-build-info = { workspace = true }
 tokeira-iac = { workspace = true }
 tokeira-report = { workspace = true }
 tokeira-explain = { workspace = true }
-tokeira-platform = { workspace = true }
 tokeira-orchestrator = { path = "../tokeira-orchestrator" }
 termimad = { workspace = true }
 

@@ -361,7 +361,7 @@ fn render_main(platform: &PlatformId, format: &DefinitionFormatId) -> String {
     let platform = serde_json::to_string(platform.as_str()).expect("platform ids serialize");
     let format = serde_json::to_string(format.as_str()).expect("format ids serialize");
     format!(
-        "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: {platform},\n    binding: selected_platform::binding,\n    expected_format: {format},\n    frontend: selected_frontend::frontend,\n);\n"
+        "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: {platform},\n    platform: selected_platform::provisioner,\n    expected_format: {format},\n    frontend: selected_frontend::frontend,\n);\n"
     )
 }
 
@@ -408,12 +408,12 @@ mod tests {
 macro_rules! bound_provisioner_main {
     (
         expected_platform: $platform:literal,
-        binding: $binding:path,
+        platform: $platform_factory:path,
         expected_format: $format:literal,
         frontend: $frontend:path $(,)?
     ) => {
         fn main() {
-            let _ = ($platform, $format, $binding(), $frontend());
+            let _ = ($platform, $format, $platform_factory($frontend()));
         }
     };
 }
@@ -424,7 +424,7 @@ macro_rules! bound_provisioner_main {
                 "platforms/alpha",
                 "alpha-platform",
                 "[package.metadata.tokeira.platform]\nid = \"alpha\"\nbinding-contract = 1\nlaunch-class = \"bound-provisioner\"\ndefault = false\n",
-                "pub fn binding() {}\n",
+                "pub fn provisioner<T>(_frontend: T) {}\n",
             );
             package(
                 &root,
@@ -476,7 +476,7 @@ macro_rules! bound_provisioner_main {
         assert_eq!(first, second);
         assert_eq!(
             first.main_rs,
-            "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: \"alpha\",\n    binding: selected_platform::binding,\n    expected_format: \"tkd\",\n    frontend: selected_frontend::frontend,\n);\n"
+            "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: \"alpha\",\n    platform: selected_platform::provisioner,\n    expected_format: \"tkd\",\n    frontend: selected_frontend::frontend,\n);\n"
         );
         let manifest: toml::Value = toml::from_str(&first.cargo_toml).expect("generated manifest");
         let dependencies = manifest
@@ -713,7 +713,7 @@ macro_rules! bound_provisioner_main {
         let output = cargo_check(&generated);
         assert!(!output.status.success());
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("binding"),
+            String::from_utf8_lossy(&output.stderr).contains("provisioner"),
             "unexpected compiler error: {}",
             String::from_utf8_lossy(&output.stderr)
         );

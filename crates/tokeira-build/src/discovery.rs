@@ -12,8 +12,10 @@ use std::{
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use serde::Deserialize;
 use thiserror::Error;
-use tokeira_orchestrator::{DefinitionFormatId, PlatformId, PlatformLaunchClass};
-use tokeira_platform::definition::{DefinitionSourceExtension, RelativeDefinitionPath};
+use tokeira_orchestrator::{
+    DefinitionFormatId, DefinitionSourceExtension, PlatformId, PlatformLaunchClass,
+    RelativeDefinitionPath,
+};
 
 /// Private platform binding contract understood by this workspace.
 pub const PLATFORM_BINDING_CONTRACT: u32 = 1;

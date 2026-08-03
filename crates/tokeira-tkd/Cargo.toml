@@ -25,10 +25,10 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 # `span-locations` gives parse errors a line/column on stable — an operator
 # fixing a 200-line definition needs "line 112", not just "expected `,`".
 proc-macro2 = { version = "1", features = ["span-locations"] }
-
-[dev-dependencies]
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
 tokeira-iac.workspace = true
 
 [lints]

@@ -8,8 +8,10 @@
 //! authority and integrity admission policy.
 
 use serde::{Deserialize, Serialize};
-use tokeira_orchestrator::{DefinitionFormatId, PlatformId, PlatformLaunchClass};
-use tokeira_platform::definition::{DefinitionSourceExtension, RelativeDefinitionPath};
+use tokeira_orchestrator::{
+    DefinitionFormatId, DefinitionSourceExtension, PlatformId, PlatformLaunchClass,
+    RelativeDefinitionPath,
+};
 
 use crate::EngineIdentity;
 

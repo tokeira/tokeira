@@ -5,8 +5,9 @@
 //! verify before reading its definition or touching state/provider seams.
 
 use serde::{Deserialize, Serialize};
-use tokeira_orchestrator::{DefinitionFormatId, PlatformId, PlatformLaunchClass};
-use tokeira_platform::definition::RelativeDefinitionPath;
+use tokeira_orchestrator::{
+    DefinitionFormatId, PlatformId, PlatformLaunchClass, RelativeDefinitionPath,
+};
 
 /// Definition identity recorded for a deployment-root source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

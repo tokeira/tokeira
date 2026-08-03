@@ -17,8 +17,10 @@ use tokeira_build::{
     PLATFORM_BINDING_CONTRACT, PackageCoordinates, PlatformPackageDescriptor,
     discover_workspace_descriptors,
 };
-use tokeira_orchestrator::{DefinitionFormatId, PlatformId, PlatformLaunchClass};
-use tokeira_platform::definition::{DefinitionSourceExtension, RelativeDefinitionPath};
+use tokeira_orchestrator::{
+    DefinitionFormatId, DefinitionSourceExtension, PlatformId, PlatformLaunchClass,
+    RelativeDefinitionPath,
+};
 use tokeira_provisioner::{PublishedProvisionerCatalog, PublishedProvisionerLocator};
 
 /// Coordinates owned by the active trusted catalog source.

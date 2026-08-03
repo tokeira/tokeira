@@ -1,132 +1,21 @@
-//! Definition frontend contract, source admission, evaluation, and configuration identity.
+//! Definition source admission, frontend evaluation, and invocation-bound realization.
 
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use thiserror::Error;
-use tokeira_orchestrator::DefinitionFormatId;
+use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 
 use crate::{
     author::LocatedValue,
-    binding::{Platform, PlatformBinding},
-    error::{DefinitionError, FrontendDiagnostic, VerificationFinding, VerificationReport},
-    graph::VerifiedGraph,
+    config::admit_config,
+    error::{
+        ConfigError, DefinitionError, FrontendDiagnostic, ProjectionError, VerificationFinding,
+        VerificationReport,
+    },
+    graph::{VerifiedGraph, WritebackValue},
+    kind::{KindFunctions, PlacementContext, ProviderKind},
 };
-
-/// Safe canonical path relative to one deployment root.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct RelativeDefinitionPath(String);
-
-/// Canonical source-file extension without a leading dot.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct DefinitionSourceExtension(String);
-
-impl DefinitionSourceExtension {
-    /// Validate a portable lower-kebab source extension.
-    pub fn new(value: impl Into<String>) -> Result<Self, DefinitionSourceExtensionError> {
-        let value = value.into();
-        DefinitionFormatId::new(value.clone()).map_err(|source| {
-            DefinitionSourceExtensionError {
-                value: value.clone(),
-                source,
-            }
-        })?;
-        Ok(Self(value))
-    }
-
-    /// Borrow the extension without a leading dot.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for DefinitionSourceExtension {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Rejection of a non-portable definition source extension.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("invalid source extension `{value}`: {source}")]
-pub struct DefinitionSourceExtensionError {
-    value: String,
-    source: tokeira_orchestrator::IdentifierError,
-}
-
-impl RelativeDefinitionPath {
-    /// Validate a portable deployment-relative definition path.
-    pub fn new(path: impl AsRef<Path>) -> Result<Self, DefinitionPathError> {
-        let path = path.as_ref();
-        let Some(value) = path.to_str() else {
-            return Err(DefinitionPathError::NonUtf8);
-        };
-        if value.is_empty() {
-            return Err(DefinitionPathError::Empty);
-        }
-        if path.is_absolute() || value.starts_with('/') {
-            return Err(DefinitionPathError::Absolute(value.to_string()));
-        }
-        if value.contains('\\') || value.contains(':') {
-            return Err(DefinitionPathError::NonCanonical(value.to_string()));
-        }
-        if value
-            .split('/')
-            .any(|component| component.is_empty() || component == "." || component == "..")
-        {
-            return Err(DefinitionPathError::NonCanonical(value.to_string()));
-        }
-        Ok(Self(value.to_string()))
-    }
-
-    /// Borrow the portable slash-separated path.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Borrow as a host path only after deployment-root validation.
-    pub fn as_path(&self) -> &Path {
-        Path::new(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for RelativeDefinitionPath {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Rejection reason for recorded deployment-definition paths.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum DefinitionPathError {
-    /// Path has no components.
-    #[error("definition path cannot be empty")]
-    Empty,
-    /// Absolute paths could escape the deployment root.
-    #[error("definition path `{0}` must be deployment-relative")]
-    Absolute(String),
-    /// Path contains aliases, escaping components, separators, or empty components.
-    #[error("definition path `{0}` is not canonical and deployment-relative")]
-    NonCanonical(String),
-    /// Deployment metadata paths must be portable UTF-8.
-    #[error("definition path is not valid UTF-8")]
-    NonUtf8,
-}
 
 /// Source identity safe to render in frontend diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +35,7 @@ impl fmt::Display for DefinitionSourceName {
     }
 }
 
-/// Exact admitted source and independently selected format.
+/// Exact owned source and independently selected format.
 #[derive(Debug, Clone)]
 pub struct DefinitionSource {
     /// Recorded or explicitly selected frontend format.
@@ -157,7 +46,7 @@ pub struct DefinitionSource {
     pub bytes: Arc<[u8]>,
 }
 
-/// Borrowed source supplied to one statically selected definition frontend.
+/// One borrow of an admitted definition source.
 #[derive(Debug, Clone, Copy)]
 pub struct FrontendSource<'a> {
     /// Display-safe source identity.
@@ -166,36 +55,30 @@ pub struct FrontendSource<'a> {
     pub bytes: &'a [u8],
 }
 
-/// Completed transient definition returned by one frontend evaluation.
+/// Completed transient structure returned by a definition frontend.
 #[derive(Debug)]
-pub struct FrontendOutput {
-    /// Host-free configuration value.
+pub struct FrontendOutput<K> {
+    /// Host-free platform configuration value.
     pub config: LocatedValue,
     /// Completed structural graph built inside the frontend evaluator.
-    pub graph: VerifiedGraph,
+    pub graph: VerifiedGraph<K>,
 }
 
-/// Statically assembled parser/checker/evaluator for one definition format.
-pub trait DefinitionFrontend<P: Platform>: Clone + Send + Sync + 'static {
+/// Statically assembled evaluator for one definition format.
+pub trait DefinitionFrontend: Clone + Send + Sync + 'static {
     /// Open validated format identity embedded in the assembled provisioner.
     fn format(&self) -> &DefinitionFormatId;
 
-    /// Parse, check, and evaluate into one transient in-memory definition.
-    fn evaluate(
+    /// Evaluate typed context into one completed transient structure.
+    fn evaluate<C, K>(
         &self,
         source: FrontendSource<'_>,
-        context: &P::Context,
-        binding: &PlatformBinding<P>,
-    ) -> Result<FrontendOutput, FrontendDiagnostic>;
-}
-
-/// Input to one pure platform definition evaluation.
-#[derive(Debug)]
-pub struct DefinitionRequest<P: Platform> {
-    /// Admitted format, source name, and exact bytes.
-    pub source: DefinitionSource,
-    /// Immutable platform context for this invocation.
-    pub context: P::Context,
+        context: &C,
+        kinds: KindFunctions<K>,
+    ) -> Result<FrontendOutput<K>, FrontendDiagnostic>
+    where
+        C: Serialize,
+        K: ProviderKind + 'static;
 }
 
 /// Versioned content identity of format plus exact definition bytes.
@@ -235,104 +118,249 @@ impl ConfigurationIdentity {
     }
 }
 
-/// Typed config, immutable graph, and source-derived identity admitted in memory.
+/// Typed config, immutable graph, and source identity admitted in memory.
 #[derive(Debug)]
-pub struct EvaluatedDefinition<P: Platform> {
-    /// Typed platform config; the source remains its sole persisted desired representation.
-    pub config: P::Config,
-    /// Completed language-neutral graph.
-    pub graph: VerifiedGraph,
+pub struct EvaluatedDefinition<C, K> {
+    /// Typed platform config.
+    pub config: C,
+    /// Completed structural graph.
+    pub graph: VerifiedGraph<K>,
     /// Format-plus-source configuration identity.
     pub configuration_identity: ConfigurationIdentity,
 }
 
-/// One selected platform binding and one statically selected definition frontend.
-#[derive(Debug, Clone)]
-pub struct DefinitionEngine<P: Platform, F: DefinitionFrontend<P>> {
-    binding: PlatformBinding<P>,
-    frontend: F,
+/// Evaluate a source, admit its typed config, and retain no frontend runtime state.
+pub fn evaluate_definition<Cx, C, K, F>(
+    frontend: &F,
+    source: DefinitionSource,
+    context: &Cx,
+    kinds: KindFunctions<K>,
+    validate_config: fn(&C) -> Result<(), ConfigError>,
+) -> Result<EvaluatedDefinition<C, K>, DefinitionError>
+where
+    Cx: Serialize,
+    C: DeserializeOwned,
+    K: ProviderKind + 'static,
+    F: DefinitionFrontend,
+{
+    if &source.format != frontend.format() {
+        return Err(DefinitionError::FormatMismatch {
+            source_format: source.format,
+            frontend_format: frontend.format().clone(),
+        });
+    }
+    let identity = ConfigurationIdentity::compute(&source.format, source.bytes.as_ref());
+    let format = source.format.clone();
+    let source_name = source.source_name.clone();
+    let output = frontend.evaluate(
+        FrontendSource {
+            source_name: &source.source_name,
+            bytes: source.bytes.as_ref(),
+        },
+        context,
+        kinds,
+    )?;
+    let config =
+        admit_config(output.config, validate_config).map_err(|error| DefinitionError::Config {
+            format,
+            source_name,
+            error,
+        })?;
+    Ok(EvaluatedDefinition {
+        config,
+        graph: output.graph,
+        configuration_identity: identity,
+    })
 }
 
-impl<P: Platform, F: DefinitionFrontend<P>> DefinitionEngine<P, F> {
-    /// Assemble from a validated platform binding and one frontend.
-    pub fn new(binding: PlatformBinding<P>, frontend: F) -> Self {
-        Self { binding, frontend }
-    }
-
-    /// Parse, evaluate, admit typed config, and complete the graph without I/O.
-    pub fn evaluate(
-        &self,
-        request: DefinitionRequest<P>,
-    ) -> Result<EvaluatedDefinition<P>, DefinitionError> {
-        if &request.source.format != self.frontend.format() {
-            return Err(DefinitionError::FormatMismatch {
-                source_format: request.source.format,
-                frontend_format: self.frontend.format().clone(),
-            });
-        }
-        let identity =
-            ConfigurationIdentity::compute(&request.source.format, request.source.bytes.as_ref());
-        let format = request.source.format.clone();
-        let source_name = request.source.source_name.clone();
-        let output = self.frontend.evaluate(
-            FrontendSource {
-                source_name: &request.source.source_name,
-                bytes: request.source.bytes.as_ref(),
-            },
-            &request.context,
-            &self.binding,
-        )?;
-        let config =
-            self.binding
-                .config
-                .admit(output.config)
-                .map_err(|error| DefinitionError::Config {
-                    format: format.clone(),
-                    source_name: source_name.clone(),
-                    error,
-                })?;
-        Ok(EvaluatedDefinition {
-            config,
-            graph: output.graph,
-            configuration_identity: identity,
-        })
-    }
-
-    /// Validate every provider-kind input without fabricating invocation facts.
-    pub fn verify<'a>(
-        &self,
-        definition: &'a EvaluatedDefinition<P>,
-    ) -> Result<VerifiedDefinition<'a, P>, VerificationReport> {
-        let mut findings = Vec::new();
-
-        for resource in definition.graph.resources() {
-            if let Err(error) = resource.kind().validate_input() {
-                findings.push(VerificationFinding::InvalidInput {
-                    resource: format!("{}/{}", resource.module(), resource.logical_id()),
-                    provider_kind: resource.kind().kind_name().to_string(),
-                    message: error.message,
-                });
-            }
-        }
-
-        if findings.is_empty() {
-            Ok(VerifiedDefinition { definition })
-        } else {
-            Err(VerificationReport { findings })
-        }
-    }
+/// Definition whose complete concrete kind set passed pure input validation.
+pub struct VerifiedDefinition<'a, C, K> {
+    definition: &'a EvaluatedDefinition<C, K>,
 }
 
-/// Definition whose complete logical provider-kind set passed pure input validation.
-pub struct VerifiedDefinition<'a, P: Platform> {
-    /// Typed evaluated definition.
-    pub definition: &'a EvaluatedDefinition<P>,
-}
-
-impl<P: Platform> fmt::Debug for VerifiedDefinition<'_, P> {
+impl<C, K> fmt::Debug for VerifiedDefinition<'_, C, K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VerifiedDefinition")
             .field("resource_count", &self.definition.graph.resources().len())
-            .finish_non_exhaustive()
+            .finish()
+    }
+}
+
+impl<'a, C, K> VerifiedDefinition<'a, C, K> {
+    /// Borrow the exact evaluated definition that was validated.
+    pub fn definition(&self) -> &'a EvaluatedDefinition<C, K> {
+        self.definition
+    }
+}
+
+/// Validate every concrete kind input without fabricating invocation facts.
+pub fn verify_definition<C, K: ProviderKind>(
+    definition: &EvaluatedDefinition<C, K>,
+) -> Result<VerifiedDefinition<'_, C, K>, VerificationReport> {
+    let findings =
+        definition
+            .graph
+            .resources()
+            .iter()
+            .filter_map(|resource| {
+                resource.kind().validate_input().err().map(|error| {
+                    VerificationFinding::InvalidInput {
+                        resource: format!("{}/{}", resource.module(), resource.logical_id()),
+                        provider_kind: resource.kind().kind_name().to_string(),
+                        message: error.message,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+    if findings.is_empty() {
+        Ok(VerifiedDefinition { definition })
+    } else {
+        Err(VerificationReport { findings })
+    }
+}
+
+/// Logical-to-engine identity produced by the one execution realization.
+#[derive(Debug, Clone, Default)]
+pub struct RealizedResourceIndex {
+    ids: BTreeMap<(String, String), tokeira_iac::ResourceId>,
+}
+
+impl RealizedResourceIndex {
+    /// Resolve one logical resource to its engine identity.
+    pub fn get(&self, module: &str, resource: &str) -> Option<&tokeira_iac::ResourceId> {
+        self.ids.get(&(module.to_string(), resource.to_string()))
+    }
+}
+
+/// Complete invocation-bound realization in declaration order.
+pub struct RealizedResources {
+    index: RealizedResourceIndex,
+    resources: Vec<Box<dyn tokeira_iac::Resource>>,
+}
+
+impl fmt::Debug for RealizedResources {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RealizedResources")
+            .field("index", &self.index)
+            .field("resource_count", &self.resources.len())
+            .finish()
+    }
+}
+
+impl RealizedResources {
+    /// Borrow the logical-to-engine identity index.
+    pub fn index(&self) -> &RealizedResourceIndex {
+        &self.index
+    }
+
+    /// Borrow resources in source declaration order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &dyn tokeira_iac::Resource> {
+        self.resources.iter().map(Box::as_ref)
+    }
+
+    /// Transfer resources to the infrastructure engine.
+    pub fn into_resources(self) -> Vec<Box<dyn tokeira_iac::Resource>> {
+        self.resources
+    }
+}
+
+impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
+    /// Realize the verified set once with real invocation identity and placement.
+    pub fn realize(
+        &self,
+        deployment_id: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<RealizedResources, ProjectionError> {
+        let nodes = self.definition.graph.resources();
+        let mut index = RealizedResourceIndex::default();
+        let mut pending = (0..nodes.len()).collect::<Vec<_>>();
+        let mut realized = std::iter::repeat_with(|| None)
+            .take(nodes.len())
+            .collect::<Vec<Option<Box<dyn tokeira_iac::Resource>>>>();
+        while !pending.is_empty() {
+            let Some(position) = pending.iter().position(|node_index| {
+                nodes[*node_index].dependencies().iter().all(|dependency| {
+                    index
+                        .get(dependency.module(), dependency.logical_id())
+                        .is_some()
+                })
+            }) else {
+                return Err(ProjectionError {
+                    resource: "structural-graph".to_string(),
+                    provider_kind: "dependency-order".to_string(),
+                    message: "verified resource dependencies could not be ordered".to_string(),
+                });
+            };
+            let node_index = pending.remove(position);
+            let node = &nodes[node_index];
+            let dependencies = node
+                .dependencies()
+                .iter()
+                .map(|dependency| {
+                    index
+                        .get(dependency.module(), dependency.logical_id())
+                        .cloned()
+                        .expect("the selected resource has realized dependencies")
+                })
+                .collect();
+            let placement = PlacementContext {
+                deployment_id: deployment_id.to_string(),
+                module: node.module().to_string(),
+                logical_id: node.logical_id().to_string(),
+                dependencies,
+                tags: tags.clone(),
+            };
+            let resource = node
+                .kind()
+                .realize(&placement)
+                .map_err(|error| ProjectionError {
+                    resource: format!("{}/{}", node.module(), node.logical_id()),
+                    provider_kind: node.kind().kind_name().to_string(),
+                    message: error.message,
+                })?;
+            index.ids.insert(
+                (node.module().to_string(), node.logical_id().to_string()),
+                resource.resource_id(),
+            );
+            realized[node_index] = Some(resource);
+        }
+
+        let mut resources = Vec::with_capacity(realized.len());
+        for entry in realized {
+            resources.push(entry.expect("every verified resource was realized"));
+        }
+        Ok(RealizedResources { index, resources })
+    }
+
+    /// Resolve only explicitly declared writebacks from applied state.
+    pub fn resolve_writeback(
+        &self,
+        realized: &RealizedResources,
+        state: &tokeira_iac::InfraState,
+    ) -> Vec<(String, String)> {
+        self.definition
+            .graph
+            .writeback()
+            .iter()
+            .filter_map(|entry| {
+                let value = match entry.value() {
+                    WritebackValue::Literal(value) => Some(value.clone()),
+                    WritebackValue::Output(output) => {
+                        let reference = output.resource();
+                        let resource_id = realized
+                            .index()
+                            .get(reference.module(), reference.logical_id())?;
+                        state
+                            .resources
+                            .get(resource_id)?
+                            .properties
+                            .get(output.output())?
+                            .as_str()
+                            .map(str::to_string)
+                    }
+                }?;
+                Some((entry.key().to_string(), value))
+            })
+            .collect()
     }
 }

@@ -181,6 +181,124 @@ open_identifier!(
     "Validated, inventory-free identity of a deployment-definition format."
 );
 
+/// Canonical source-file extension without a leading dot.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DefinitionSourceExtension(String);
+
+impl DefinitionSourceExtension {
+    /// Validate a portable lower-kebab source extension.
+    pub fn new(
+        value: impl Into<String>,
+    ) -> std::result::Result<Self, DefinitionSourceExtensionError> {
+        let value = value.into();
+        DefinitionFormatId::new(value.clone()).map_err(|source| {
+            DefinitionSourceExtensionError {
+                value: value.clone(),
+                source,
+            }
+        })?;
+        Ok(Self(value))
+    }
+
+    /// Borrow the extension without a leading dot.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DefinitionSourceExtension {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Rejection of a non-portable definition source extension.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid source extension `{value}`: {source}")]
+pub struct DefinitionSourceExtensionError {
+    value: String,
+    source: IdentifierError,
+}
+
+/// Safe canonical path relative to one deployment root.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RelativeDefinitionPath(String);
+
+impl RelativeDefinitionPath {
+    /// Validate a portable deployment-relative definition path.
+    pub fn new(path: impl AsRef<Path>) -> std::result::Result<Self, DefinitionPathError> {
+        let path = path.as_ref();
+        let Some(value) = path.to_str() else {
+            return Err(DefinitionPathError::NonUtf8);
+        };
+        if value.is_empty() {
+            return Err(DefinitionPathError::Empty);
+        }
+        if path.is_absolute() || value.starts_with('/') {
+            return Err(DefinitionPathError::Absolute(value.to_string()));
+        }
+        if value.contains('\\') || value.contains(':') {
+            return Err(DefinitionPathError::NonCanonical(value.to_string()));
+        }
+        if value
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+        {
+            return Err(DefinitionPathError::NonCanonical(value.to_string()));
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    /// Borrow the portable slash-separated path.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Borrow as a host path after deployment-root admission.
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl std::fmt::Display for RelativeDefinitionPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RelativeDefinitionPath {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Rejection reason for recorded deployment-definition paths.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DefinitionPathError {
+    /// Path has no components.
+    #[error("definition path cannot be empty")]
+    Empty,
+    /// Absolute paths could escape the deployment root.
+    #[error("definition path `{0}` must be deployment-relative")]
+    Absolute(String),
+    /// Path contains aliases, escaping components, separators, or empty components.
+    #[error("definition path `{0}` is not canonical and deployment-relative")]
+    NonCanonical(String),
+    /// Deployment metadata paths must be portable UTF-8.
+    #[error("definition path is not valid UTF-8")]
+    NonUtf8,
+}
+
 /// Generic launch mechanism selected by trusted platform catalog metadata.
 ///
 /// This vocabulary describes how `tkr` launches a platform without naming

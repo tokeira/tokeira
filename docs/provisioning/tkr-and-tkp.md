@@ -6,63 +6,74 @@ and places target-specific bytes, establishes the Day-0 verification material, a
 verifies the married executable before later versioned mutations. The spawned `tkp` then
 owns the lifecycle transition and provider convergence.
 
-This boundary is what makes a custom `definition.tkd` safe to retain as data. Its kinds,
-methods, defaults, adapter behavior, and provider realization are defined by the exact
-platform-specific engine bound to the deployment, not by a generic executable selected
-by name or semantic version.
+This boundary is what makes a deployment definition safe to retain as data. Its format,
+closed kind set, context, and provider realization are defined by the exact platform and
+frontend bound to the deployment, not by a generic executable selected by name or
+semantic version.
 
-## A platform engine, not a generic wrapper
+## A statically assembled platform engine
 
-The platform package owns the `tkp` binary target. Its dependency closure brings together:
+A platform package does not own a committed `tkp` binary target. It exports its concrete
+provisioner constructor, while a definition-frontend package exports its evaluator.
+Cargo-metadata descriptors let `tkr` select both without a platform enum or match arm.
 
-- the platform's custom TKD host values, kinds, methods, and `HostBridge`;
-- the builder and orchestrator `Deployment` adapter;
-- the `ProvisionerPlatform` implementation;
-- provider clients, stores, resource types, and convergence engines;
-- the checked `tokeira-tkd` interpreter;
-- the shared `tokeira-provisioner-cli` lifecycle shell; and
-- the `tokeira-provisioner` identity, integrity, admission, and transition domain.
+`tokeira-build` generates a disposable composition root with exactly three direct
+dependencies:
 
-The binary entry point may be tiny, but the compiled closure is the language engine. A
-change anywhere in the identity-bearing closure produces a different engine identity.
-The definition itself is deliberately not an identity input: it is versioned data whose
-meaning is fixed by the married engine.
+- the selected platform implementation;
+- the selected definition frontend; and
+- the shared `tokeira-provisioner-cli` lifecycle shell.
+
+The generated `main.rs` binds the platform and frontend's conventional exports and
+records their open identifiers. It contains no runtime platform dispatch. The resolved
+source closure then brings in provider clients, state and convergence types, the
+frontend evaluator, and the provisioner identity and transition domain required by that
+one selection.
+
+The generated entry point is tiny, but its compiled closure is the language engine. A
+change anywhere in the identity-bearing closure, or a change to the selected platform,
+format, or private contract version, produces different evidence. The definition bytes
+remain versioned configuration data rather than engine-identity input.
 
 ## Constructing and obtaining a versioned TKP
 
-The bundled creation path begins from a platform seed package rather than from an
-already-installed executable:
+The bundled creation path begins from catalog selection rather than an already-installed
+executable or a hard-coded seed package:
 
-1. `tkr` asks Cargo metadata for every workspace package reachable from the seed with all
-   features enabled. The safe over-approximation means an optional workspace dependency
-   can re-key the engine but cannot be omitted from its provenance. Workspace
-   `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, and `.cargo/config.toml` also join
-   the source closure when present.
-2. The same dependency walk records the reachable third-party lock closure as canonical
-   name, version, source, and lockfile checksum tuples.
+1. `tkr` loads the normalized platform/frontend catalog from Cargo metadata, validates
+   descriptor contracts and package coordinates, and selects one platform plus one
+   compatible definition format.
+2. `tokeira-build` renders the three-dependency composition root and resolves the union
+   source and lock closure of the generic shell, selected platform, and selected
+   frontend. Workspace `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, and
+   `.cargo/config.toml` join the closure when present.
 3. `tkr` freezes tracked worktree bytes under the closure paths into a content-addressed
    Git tree and deterministic audit commit without changing the real index, worktree, or
    refs. Staged and unstaged tracked content is captured. Untracked Rust sources refuse
    the current request rather than disappear from provenance.
-4. Before any compilation, the snapshot tree, lock closure, exact toolchain,
-   digest-pinned build container, features, and profile determine `EngineIdentity`.
+4. Before compilation, the selected identifiers and contract versions, generated-root
+   bytes, snapshot tree, lock closure, exact toolchain, digest-pinned build container,
+   features, and profile determine the build and binding evidence.
 5. The bundle store is queried by authority tier, identity, and target. A hit is admitted
    and byte-verified again; it is not trusted because it was cached.
 6. On a miss, the canonical Dagger pipeline materializes only the frozen snapshot. It
-   runs `cargo test --locked` for the reachable workspace crates, then builds the
-   platform-owned `tkp` target with `--locked`, strips it, exports it, and calculates size
-   and SHA-256 from the exported host bytes.
+   runs the closure test command, then builds the generated root's `tkp` target with
+   `--locked`, strips it, exports it, and calculates size and SHA-256 from the exported
+   host bytes.
 7. The resulting `ProvisionerBundle` binds identity, build authority, human version,
-   `TestEvidence` showing the closure test command passed, the build manifest, and all
-   target artifact descriptors. Publication validates the evidence and bytes and writes
-   the manifest last.
+   `TestEvidence`, the selected platform/frontend and generated-root evidence, the build
+   manifest, and all target artifact descriptors. Publication validates the evidence and
+   bytes and writes the manifest last.
 
 ```mermaid
 flowchart TB
-    Seed["Platform seed package"] --> Resolve["Resolve source and lock closure"]
+    Metadata["Cargo metadata descriptors"] --> Catalog["Validate and select platform + frontend"]
+    Catalog --> Root["Generate static three-dependency root"]
+    Root --> Resolve["Resolve union source and lock closure"]
     Resolve --> Snapshot["Freeze immutable source tree"]
     Resolve --> Lock["Digest reachable locked dependencies"]
-    Snapshot --> Identity["EngineIdentity"]
+    Root --> Identity["EngineIdentity and binding evidence"]
+    Snapshot --> Identity
     Lock --> Identity
     Toolchain["Exact toolchain"] --> Identity
     Container["Digest-pinned build container"] --> Identity
@@ -95,16 +106,16 @@ therefore not be described as the same current path.
 The current `tkr deployment create --bundle --build-image
 IMAGE@sha256:DIGEST` implementation is intentionally narrower than the platform contract:
 
-- its seed package is currently fixed to `tokeira-compose-deployment`;
-- it builds the `tkp` target with the `provisioner` feature and `dist` profile;
+- it resolves Compose and TKD through the workspace catalog;
+- it builds the generated bound-provisioner target with the `dist` profile;
 - it records `BuildAuthority::LocalDeveloper`;
 - it builds the host target selected through `TKR_TARGET`;
 - it uses a deployment-creation-local bundle CAS; and
 - it excludes untracked Rust sources from the snapshot request, which makes their
   presence a refusal.
 
-This is the complete versioned construction path implemented today for Compose. It does
-not yet make Local, ECS, or EKS definition-backed platform engines.
+This is the complete versioned construction path implemented today for Compose. Local
+remains on its isolated legacy route; ECS and EKS are not migrated by this work.
 
 ## Retention and placement
 
@@ -130,17 +141,12 @@ engine source used by verified two-binary rollback.
     └── binaries/
 ```
 
-Creating Compose without `--bundle` follows the development placement path instead. Its
-source resolution order is:
-
-1. `tkp` installed on `PATH`;
-2. `tkp` beside the running `tkr`; or
-3. a workspace build of the Compose package's `tkp` target.
-
-`tkr` copies those bytes into the deployment and makes them executable, but there is no
-bundle sidecar. The first initialization records a pre-identity development self-stamp.
-This path is useful for native iteration; it is not interchangeable with the versioned
-bundle guarantee.
+Creating Compose without `--bundle` follows the native development path. `tkr` uses the
+same catalog selection and composition-root generation, builds that generated root with
+the workspace toolchain and lockfile, and places its `tkp` bytes in the deployment. There
+is no bundle sidecar, so first initialization records a development self-stamp rather
+than versioned bundle evidence. This path is useful for native iteration; it is not
+interchangeable with the versioned bundle guarantee.
 
 Local and ECS currently use the in-process deployment shape, receive `deployment.toml`,
 and have no deployment-local provisioner. See
@@ -159,7 +165,7 @@ For a bundled engine, initialization:
 4. verifies descriptor uniqueness, canonical SHA-256, size, and digest;
 5. records the bundle's integrity manifest and engine provenance in the deployment
    envelope; and
-6. retains `definition.tkd` as configuration revision `0`.
+6. retains the definition recorded in `metadata.json` as configuration revision `0`.
 
 A missing target, malformed sidecar, or byte mismatch aborts initialization. The sidecar
 is not permission to trust arbitrary bytes; it supplies the bundle material from which
@@ -179,7 +185,7 @@ sequenceDiagram
     TKP->>TKP: read its running executable
     TKP->>TKP: verify target size and SHA-256
     TKP->>Envelope: record identity, authority, provenance, integrity
-    TKP->>History: retain definition.tkd as revision 0
+    TKP->>History: retain recorded definition as revision 0
     TKP-->>TKR: binding established
 ```
 
@@ -223,9 +229,10 @@ The launcher inherits stdin, stdout, and stderr and propagates the TKP status un
 
 ## Forwarding decision and command mapping
 
-`tkr` identifies the definition-backed shape by the presence of `definition.tkd`. A
-command without a TKP implementation is refused rather than sent to a nonexistent
-`deployment.toml` handler.
+`tkr` identifies a bound deployment from the admitted definition record in
+`metadata.json`, not from filename or extension heuristics. The record names the open
+platform ID, definition format, and safe deployment-relative definition path. A command
+without a TKP implementation is refused rather than sent to a legacy in-process handler.
 
 | Operator command | Launched command |
 |---|---|
@@ -397,11 +404,15 @@ commands are primarily useful for implementation tests and precise lifecycle dia
   source-backed custom vocabulary and assembly idioms.
 - [Deployment configuration](deployment-configuration.md) — registry and current command
   surfaces.
-- [`tkr` bundle construction](../../apps/tkr/src/bundle_create.rs) — current Compose seed,
-  snapshot, obtain, retention, and placement flow.
+- [`tkr` catalog](../../apps/tkr/src/catalog.rs) — normalized workspace and published
+  platform/frontend discovery.
+- [`tkr` deployment construction](../../apps/tkr/src/deployment_dir.rs) — definition
+  recording, generated native build, and placement.
+- [`tkr` bundle construction](../../apps/tkr/src/bundle_create.rs) — snapshot, obtain,
+  retention, and versioned placement flow.
 - [Provisioner build pipeline](../../crates/tokeira-build/src/pipelines/provisioner.rs) —
   hermetic test, build, export, and packaging implementation.
 - [`apps/tkr` launcher](../../apps/tkr/src/launcher.rs) — launch classification and byte
   verification.
-- [Compose TKP target](../../platforms/compose/src/bin/tkp.rs) — the small entry point at
-  the root of the complete platform engine closure.
+- [Generated provisioner composition](../../crates/tokeira-build/src/composition.rs) —
+  the deterministic root binding one platform, one frontend, and the generic shell.

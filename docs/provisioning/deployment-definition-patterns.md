@@ -1,43 +1,33 @@
 # Definition patterns and current practice
 
 This guide shows how the abstract
-[deployment-definition programming model](deployment-definitions.md) appears in current
-source. It is example-led: snippets come from platform definitions, bridges, builders,
-adapters, and provisioners already in the repository.
+[deployment-definition programming model](deployment-definitions.md) appears in the
+current Compose implementation. Compose is the complete definition-backed proof: it
+supplies a canonical definition, typed configuration and context, a closed first-party
+kind set, a concrete provisioner, and the catalog-selected `tkr` route.
 
-The examples have different support status:
-
-- **Compose** supplies the complete definition-backed chain: a canonical
-  `definition.tkd`, closed vocabulary, adapter, `ProvisionerPlatform`, platform-owned
-  `tkp`, and `tkr` route.
-- **EKS** supplies a bridge, builder, and kind vocabulary but not the complete
-  adapter/provisioner/binary/operator chain. Its snippets demonstrate platform-extension
-  practice, not an available EKS deployment workflow.
-
-Treat these as current idioms, not a promise that every bound engine exposes the same
-kinds or methods. The engine's closed `HostBridge` remains the authority for its
-vocabulary.
+The selected definition frontend evaluates source into one completed structural graph.
+Frontend handles are private implementation details; platform code receives only the
+completed graph and the host-free configuration value.
 
 ## Pattern map
 
 | Concern | Current example | Source |
 |---|---|---|
-| Separate editable values from deployment structure | Compose config types, `config()`, and `deployment()` | [`platforms/compose/definition.tkd`](../../platforms/compose/definition.tkd) |
+| Separate editable values from deployment structure | `config()` and `deployment()` | [Compose definition](../../platforms/compose/definition.tkd) |
+| Admit configuration through a platform serde type | `ComposeConfig` and pure validation | [Compose config](../../platforms/compose/src/config.rs) |
+| Supply platform-specific runtime facts | `ComposeContext` | [Compose context](../../platforms/compose/src/context.rs) |
 | Select modules from config variants | Conditional DSQL module | [Compose definition](../../platforms/compose/definition.tkd) |
-| Distinguish module and workload dependencies | Module `needs` and service `needs` | [Compose definition](../../platforms/compose/definition.tkd) |
-| Keep host paths out of source | Context-provided volume anchors | [Compose definition](../../platforms/compose/definition.tkd) |
-| Bind derived values through handles | Resource outputs and writeback | [Compose definition](../../platforms/compose/definition.tkd) |
-| Supply optional kind fields through defaults | `Service::EMPTY` | [Compose bridge](../../platforms/compose/src/bridge.rs) |
-| Keep kind values linear | Take-once host handles | [Compose bridge](../../platforms/compose/src/bridge.rs), [EKS bridge](../../platforms/eks/src/bridge.rs) |
-| Distinguish config structs from host kinds | `ServiceManifest` and `IngressRule` classification | [EKS bridge](../../platforms/eks/src/bridge.rs) |
-| Reject unknown kind fields | Typed extraction followed by `expect_empty()` | [Compose bridge](../../platforms/compose/src/bridge.rs), [EKS bridge](../../platforms/eks/src/bridge.rs) |
-| Keep checking, snapshots, plan, and apply on one interpretation path | `interpret_definition` | [Compose provisioner](../../platforms/compose/src/provisioner.rs) |
+| Keep host paths out of source | Logical `Volume` values | [Compose services](../../platforms/compose/src/services/mod.rs) |
+| Preserve configuration coupling | Resource dependencies plus content digests | [Compose services](../../platforms/compose/src/services/mod.rs) |
+| Decode a closed kind set without a registry | `ComposeKind` and `kind_functions()` | [Compose services](../../platforms/compose/src/services/mod.rs) |
+| Keep checking and execution on one evaluation path | `evaluate_with_context()` | [Compose provisioner](../../platforms/compose/src/lib.rs) |
+| Bind one platform and frontend into `tkp` | Generated composition root | [Provisioner composition](../../crates/tokeira-build/src/composition.rs) |
 
 ## Keep configuration and topology separate
 
 The Compose definition puts operator-editable values in ordinary config structs and
-keeps builder calls in `deployment()`. The root config marks storage identity as a
-create-time concern:
+keeps structural graph construction in `deployment()`:
 
 ```rust
 struct Compose {
@@ -47,30 +37,12 @@ struct Compose {
     observability: Observability,
 }
 
-fn config() -> Compose {
-    Compose {
-        storage: Storage::InMemory,
-        tokeirad: Tokeirad {
-            image: "tokeirad:latest".into(),
-            replicas: 1,
-            grpc_port: 7233,
-            metrics_port: 9090,
-        },
-        // ...
-    }
-}
-```
+fn deployment(cfg: Compose, cx: Context) -> Deployment {
+    let d = Deployment::new(&["default"]);
+    let local_state = d.module("local_state", vec![]);
+    local_state.resource("dir", LocalStateDir {});
 
-The second entry point turns those values into platform handles and desired structure:
-
-```rust
-fn deployment(cfg: &Compose, cx: &Cx) -> Deployment {
-    let mut d = Deployment::new(&["default"]);
-
-    let local_state = d.module("local_state", &[]);
-    d.resource(&local_state, "dir", LocalStateDir);
-
-    // ...
+    // Conditional resources and services follow.
     d
 }
 ```
@@ -78,10 +50,12 @@ fn deployment(cfg: &Compose, cx: &Cx) -> Deployment {
 This split gives each half one job:
 
 - `config()` remains host-free, comparable operator data;
-- `deployment()` owns modules, resources, services, output references, and context use.
+- `deployment()` owns modules, resources, dependencies, output references, writeback,
+  and context use.
 
-Do not move a constructed kind or builder handle into `config()` for convenience. The
-interpreter deliberately rejects host values in the config result.
+The frontend returns the config as `LocatedValue`; Compose immediately admits it into
+`ComposeConfig` through serde with unknown fields denied and then applies pure platform
+validation.
 
 ## Use enum variants to select structure
 
@@ -89,66 +63,69 @@ The canonical Compose source models storage as an enum. Only the DSQL variant ad
 DSQL module and resources:
 
 ```rust
-if let Storage::Dsql { region, mode, endpoint, arn } = &cfg.storage {
-    let dsql = d.module("dsql", &["local_state"]);
-    let cluster = d.resource(
-        &dsql,
+if let Storage::Dsql(storage) = &cfg.storage {
+    let dsql = d.module("dsql", vec![local_state]);
+    let cluster = dsql.resource(
         "cluster",
         DsqlCluster {
-            region: region.clone(),
-            mode: mode.clone(),
-            endpoint: endpoint.clone(),
-            arn: arn.clone(),
+            identity: format!("{}-compose", cx.project_name),
+            region: storage.region.clone(),
+            mode: storage.mode.clone(),
+            endpoint: storage.endpoint.clone(),
+            arn: storage.arn.clone(),
         },
     );
 
-    // coordination resources and writeback use `cluster` below
+    d.writeback(
+        "infrastructure.dsql.endpoint",
+        cluster.output("cluster_endpoint"),
+    );
 }
 ```
 
 This is preferable to constructing an always-present resource with sentinel strings.
-The variant states both the data shape and whether the desired module exists. Plan and
-apply therefore see the same structural decision.
+The variant states both the data shape and whether the desired module exists, so checking
+and execution make the same structural decision.
 
-The `#[create]` marker on `storage` records that changing this choice is intended to be a
-retarget decision. Current Compose `ProvisionerPlatform` interpretation does not call
-`tokeira_tkd::retarget_check` against the prior config, so the annotation is not yet an
-automatic apply refusal. Code and documentation should preserve that distinction.
+The `#[create]` marker records that changing storage is intended to be a retarget
+decision. It should not be described as an automatic apply refusal until the command
+host enforces that policy against the prior admitted configuration.
 
-## Use stable modules as the large-grained graph
+## Use stable modules and explicit dependency layers
 
-Compose groups resources and services under named modules and declares dependencies by
-module name:
+Compose groups resources under named modules and declares prerequisites by module name:
 
 ```rust
-let local_state = d.module("local_state", &[]);
-let observability = d.module("observability", &["local_state"]);
-let runtime = d.module("runtime", &["local_state"]);
+let local_state = d.module("local_state", vec![]);
+let runtime = d.module("runtime", vec![local_state]);
+let observability = d.module("observability", vec![local_state, runtime]);
 ```
 
-The names become part of operation selection, state ownership, and explanation. Keep them
-stable. Add a module edge for ordering between groups; do not rely on source order.
+The names become part of operation selection, state ownership, and explanation. Keep
+them stable. Add module edges for ordering between groups; do not rely on source order.
 
-Workload startup dependencies are separate. Grafana, for example, names the services it
-needs inside the `Service` kind:
+Resource dependencies are separate. Services consuming rendered observability files
+depend on the configuration resource explicitly:
 
 ```rust
-Service {
-    image: o.grafana.image.clone(),
-    replicas: o.grafana.replicas,
-    publish: vec![o.grafana.port],
-    needs: vec!["mimir".into(), "loki".into()],
-    ..Service::EMPTY
-}
+let config_files = observability.resource(
+    "config_files",
+    ObservabilityConfiguration { /* ... */ },
+);
+
+observability.resource(
+    "mimir",
+    Service { /* ... */ },
+    vec![config_files],
+);
 ```
 
-A module dependency orders infrastructure composition. `Service.needs` records workload
-ordering. Resource-level dependencies can be added by realization code as a third graph.
-The Compose builder does this for services that mount generated config: typed config
-volume anchors cause the realized service resource to depend on the config-files
-resource. That edge is host logic rather than an extra magic string in the definition.
+During placement, the service retains that resource dependency and carries the
+configuration's `ContentIdentity` digest in its desired environment. This makes a
+content change visible to planning without reviving a separate artifact catalog.
+`Service.depends_on` is different again: it records Docker Compose service start order.
 
-## Use engine defaults for sparse kinds
+## Use platform defaults for sparse kinds
 
 The Compose service vocabulary has many optional fields. Definitions overlay the fields
 that matter onto `Service::EMPTY`:
@@ -159,316 +136,135 @@ Service {
     replicas: cfg.tokeirad.replicas,
     publish: vec![cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
     server_config: true,
-    aws: match &cfg.storage {
-        Storage::Dsql { region, .. } => Some(region.clone()),
+    aws_region: match &cfg.storage {
+        Storage::Dsql(storage) => Some(storage.region.clone()),
         _ => None,
     },
     ..Service::EMPTY
 }
 ```
 
-The bridge implements that syntax by returning a complete default field map:
+The frontend asks the platform's compile-time `KindFunctions` for the default
+`LocatedValue`. The same closed function set then decodes the completed value into the
+serde `Service` type. Unknown fields are rejected by `#[serde(deny_unknown_fields)]`;
+there is no string-keyed plugin registry or public object protocol.
 
-```rust
-pub(crate) fn service_defaults() -> FieldMap {
-    FieldMap::from([
-        ("image".to_string(), Value::Str(String::new())),
-        ("replicas".to_string(), Value::Int(0)),
-        ("publish".to_string(), Value::Vec(Vec::new())),
-        // ...
-        ("server_config".to_string(), Value::Bool(false)),
-        ("aws".to_string(), Value::Opt(None)),
-    ])
-}
-```
+When changing a defaulted kind, keep its default field set and serde type in lockstep.
+Prefer no default to a misleading default that changes resource identity or security
+posture.
 
-The source-level `EMPTY` is therefore a host contract, not ordinary Rust constant
-evaluation. When adding or changing a defaulted kind, keep the bridge field map and the
-real kind defaults in lockstep. Prefer no default to a misleading default that changes
-resource identity or security posture.
+## Use logical volumes instead of host paths
 
-## Use context anchors instead of host paths
-
-The Compose vocabulary exposes logical volume constructors through `cx`. The definition
-names state or config intent and a container destination, not a machine-specific source
-path:
+Definitions describe volume intent and container targets, not machine-specific source
+paths:
 
 ```rust
 volumes: vec![
-    cx.state("grafana", "/var/lib/grafana"),
-    cx.config("grafana/provisioning", "/etc/grafana/provisioning/"),
-    cx.config("grafana/dashboards", "/var/lib/grafana/dashboards/"),
+    Volume::State(StateVolume {
+        sub: "grafana".into(),
+        at: "/var/lib/grafana".into(),
+    }),
+    Volume::Config(ConfigVolume {
+        sub: "grafana/dashboards".into(),
+        at: "/var/lib/grafana/dashboards/".into(),
+    }),
 ],
 ```
 
-The builder carries these as typed `Vol` values. Realization resolves them relative to the
-deployment directory. This keeps the definition hermetic and lets the engine control
-which host paths are reachable.
+Compose resolves these typed values beneath the deployment's state and configuration
+directories during invocation-bound placement. `Volume::DockerSocket` is an explicit
+platform-owned capability, not a general path escape. The author-visible Compose context
+therefore needs only `project_name`; the deployment directory remains an execution fact.
 
-The Docker socket is a deliberately whitelisted context method:
+## Bind outputs through structural references
 
-```rust
-volumes: vec![
-    cx.docker_sock(),
-    cx.config("alloy.alloy", "/etc/alloy/config.alloy"),
-],
-```
-
-That does not establish a general path escape. Compose recognizes one vetted method; the
-EKS bridge exposes no volume host type and no `state`, `config`, or `docker_sock` methods.
-Vocabulary should be as small as the target platform requires.
-
-## Bind outputs through resource handles
-
-Compose retains handles returned by `resource()` and uses them to declare deferred
-writeback:
+`resource()` returns a frontend-private handle that can create checked structural output
+references:
 
 ```rust
-let cluster = d.resource(
-    &dsql,
-    "cluster",
-    DsqlCluster {
-        region: region.clone(),
-        mode: mode.clone(),
-        endpoint: endpoint.clone(),
-        arn: arn.clone(),
-    },
-);
-
-d.writeback("infrastructure.storage", "dsql");
+let cluster = dsql.resource("cluster", DsqlCluster { /* ... */ });
 d.writeback(
     "infrastructure.dsql.endpoint",
     cluster.output("cluster_endpoint"),
 );
 ```
 
-The `Output` handle records the logical module, resource, and output name. The adapter can
-later realize the physical resource ID and resolve the named property from `InfraState`.
-This is safer than assembling a string such as `"dsql.cluster.cluster_endpoint"`.
+The completed graph contains the logical module, resource, and declared output name.
+Graph verification rejects unknown resources or outputs. Compose later maps the verified
+reference to the realized resource ID and collects writeback from committed
+infrastructure state. The transient graph is never serialized and never becomes a
+second desired-state authority.
 
-Writeback remains desired projection data. The current Compose adapter can calculate
-values, but `ProvisionerPlatform::infra_apply` returns IDs-only change entries and does
-not carry that writeback payload into `tokeirad.toml`. Do not document a declared
-writeback as persisted runtime configuration until the command host actually performs
-that persistence.
+## Keep checking pure and realization invocation-bound
 
-## How a platform supplies a custom TKD
-
-A platform implementation is a complete chain, not only a list of kind names:
-
-```mermaid
-flowchart LR
-    Definition["definition.tkd"] --> Core["tokeira-tkd"]
-    Core --> Host["closed host-value enum"]
-    Host --> Bridge["HostBridge"]
-    Bridge --> Builder["platform builder"]
-    Builder --> Adapter["orchestrator Deployment adapter"]
-    Adapter --> Realization["resources, workloads, stores, providers"]
-    Realization --> Seam["ProvisionerPlatform"]
-    Seam --> Binary["platform-owned tkp"]
-    Binary --> TKR["tkr construction and launch path"]
-```
-
-Compose implements the whole line. EKS currently implements the host, bridge, builder,
-and resource-realization portion but stops before a complete adapter,
-`ProvisionerPlatform`, `tkp`, and `tkr` route.
-
-### Define a closed host-value set
-
-Both current bridges use an enum for every opaque value the interpreter may carry.
-Compose includes deployment, module, resource, output, kind, volume, and context handles:
+Compose uses one evaluation path for standalone checks and deployment execution:
 
 ```rust
-pub enum HostObj {
-    Deployment(Rc<RefCell<builder::Deployment>>),
-    Module(ModuleRef),
-    Resource(ResourceRef),
-    Output(Output),
-    Kind(Rc<RefCell<Option<HostKindVal>>>),
-    Vol(Vol),
-    Cx(Rc<Cx>),
-}
+evaluate_definition(
+    &self.frontend,
+    source,
+    context,
+    services::kind_functions(),
+    config::validate,
+)
 ```
 
-EKS deliberately omits `Vol` because its vocabulary has no bind-mount operations. A
-closed enum makes unsupported receiver/method combinations structural and avoids runtime
-reflection.
+`definition check` evaluates and verifies the completed graph, including pure
+`ProviderKind::validate_input` calls, but does not fabricate a deployment identity or
+realize resources. Execution verifies the same evaluated set and then realizes it once
+with the real deployment ID, directory, and dependency content identities.
 
-### Make constructed kinds take-once
+This boundary keeps source evaluation deterministic while leaving environment, provider
+clients, state stores, and filesystem effects in the concrete platform execution path.
 
-A kind literal is an unplaced desired object. Current bridges wrap it in
-`Rc<RefCell<Option<...>>>` and consume the option when `resource()` or `service()` places
-it. A second placement returns `kind handle already consumed`.
+## Assemble and provenance-bind the provisioner
 
-This linear-use convention prevents one mutable host object from being aliased into two
-logical resources. Keep the take-once boundary in the bridge even when the concrete kind
-is cloneable.
+No platform owns a committed `src/bin/tkp.rs`. Cargo-metadata descriptors select one
+platform package and one definition frontend. `tokeira-build` generates a disposable
+composition root with exactly three dependencies: the selected platform, the selected
+frontend, and the generic provisioner shell.
 
-### Distinguish config structs from host kinds
-
-EKS demonstrates an important classification boundary. `ServiceDeployment` is a host
-kind that realizes provider resources. `ServiceManifest` and `IngressRule` are config
-structs declared in source and nested inside kind fields. Its `is_kind` table includes
-only the realizing types:
+Its generated `main.rs` binds conventional exports:
 
 ```rust
-fn is_kind(&self, name: &str) -> bool {
-    matches!(
-        name,
-        "Vpc"
-            | "VpcEndpoint"
-            | "SecurityGroup"
-            // ...
-            | "ServiceDeployment"
-    )
-}
+tokeira_provisioner_cli::bound_provisioner_main!(
+    expected_platform: "compose",
+    platform: selected_platform::provisioner,
+    expected_format: "tkd",
+    frontend: selected_frontend::frontend,
+);
 ```
 
-`ServiceManifest` and `IngressRule` are intentionally absent. The bridge receives them as
-ordinary `Value::Struct` values and explicitly decomposes their fields. Misclassifying a
-config struct as a kind would route it through host construction and change the language
-meaning.
-
-### Consume every kind field
-
-Current constructors extract each typed field and end with `expect_empty()`:
-
-```rust
-pub(crate) fn build_vpc(f: &mut FieldMap) -> Result<Vpc, EvalError> {
-    let r = Vpc {
-        cidr: f.take_str("cidr")?,
-        availability_zones: f.take_vec_str("availability_zones")?,
-    };
-    f.expect_empty()?;
-    Ok(r)
-}
-```
-
-This pattern performs range and shape checks at the bridge edge and rejects misspelled or
-unknown fields. Do not ignore leftovers for forward compatibility: silently dropped
-desired data is more dangerous than a clear incompatibility error.
-
-### Expose only deliberate context fields
-
-Compose exposes `project_name` and optional `region`; EKS additionally exposes optional
-`account_id`. Both omit `deployment_dir` from readable fields even though realization
-context carries it internally.
-
-```rust
-match field {
-    "project_name" => Ok(Value::Str(cx.project_name.clone())),
-    "region" => Ok(Value::Opt(
-        cx.region.clone().map(|s| Box::new(Value::Str(s))),
-    )),
-    other => Err(EvalError::new(format!(
-        "`Cx` has no readable field `{other}`"
-    ))),
-}
-```
-
-Keep provider clients, credentials, live state, and filesystem locations out of this
-surface. They belong in typed engine contexts used after interpretation.
-
-### Let vocabulary differ by realization model
-
-The current bridges intentionally do not expose identical APIs:
-
-- Compose has `service`, volume anchors, and `Service::EMPTY` because containers and
-  bind-mounted config are part of its author model.
-- EKS has no `service` builder verb and no volume host type. Kubernetes workloads are
-  represented as resource kinds and flow through one infrastructure engine path.
-- Compose's DSQL kind has an explicit `DsqlMode`; EKS infers managed versus preexisting
-  behavior from endpoint or ARN presence.
-
-These differences are evidence that TKD is a per-platform language. Do not force a
-least-common-denominator bridge merely to make source look portable.
-
-### Adapt the builder without changing meaning
-
-The adapter should map the interpreted builder to orchestrator modules, resources,
-workloads, stores, namespaces, and deferred outputs. Keep provider handles outside the
-definition and register them through typed engine contexts.
-
-Compose's `TkdDeployment` reinterprets the retained source to supply modules and desired
-snapshots. Its builder shares realization paths so planning and apply cannot derive
-resource identities or dependencies differently. For example, the same
-`realized_service` helper feeds module realization and desired snapshots.
-
-### Use one full-interpretation entry point
-
-Compose's provisioner funnels definition checking, config loading, desired snapshots,
-plan, and apply through one `interpret_definition` helper:
-
-```rust
-fn interpret_definition(
-    deployment_dir: &Path,
-    path: &Path,
-) -> Result<(String, Cx, crate::builder::Deployment)> {
-    let source = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let cx = Cx {
-        project_name: project_name(deployment_dir),
-        region: None,
-        deployment_dir: deployment_dir.to_path_buf(),
-    };
-    let (deployment, _config) = crate::interp::interpret(&source, &cx)
-        .map_err(|e| anyhow::anyhow!("the definition does not verify: {e}"))?;
-    Ok((source, cx, deployment))
-}
-```
-
-The context contains host plumbing, but only bridge-whitelisted fields reach source. The
-shared helper ensures authoring checks and lifecycle operations cannot assign different
-meaning to the same bytes.
-
-### Assemble and provenance-bind the engine
-
-The complete platform binary should contain almost no policy at its entry point:
-
-```rust
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tokeira_provisioner_cli::run(ComposeProvisioner).await
-}
-```
-
-The small main does not make the engine generic. Its reachable closure contains the
-interpreter, bridge, builder, adapter, realization, provider wiring, lifecycle seam, and
-domain contracts. TKR's versioned construction and verification path binds that complete
-closure to the deployment. See [`tkr` and `tkp`](tkr-and-tkp.md) for the provenance chain.
+The generated root contains no platform dispatch. `tkr` builds and records this
+point-in-time selection, including platform, format, definition path, source closure,
+lock closure, and generated-root evidence. See [`tkr` and `tkp`](tkr-and-tkp.md) for the
+provenance chain.
 
 ## Review checklist
 
 When borrowing a pattern from current source, check the contract rather than copying its
 shape mechanically:
 
-- Is the value host-free config, a host kind, or an opaque handle?
+- Is config admitted through one serde type with pure validation?
 - Is a structural branch better modeled as an enum variant?
 - Is the logical module or resource name stable across ordinary edits?
-- Is the dependency a module edge, resource edge, or workload edge?
-- Does a context helper preserve hermetic source?
-- Does every kind constructor consume and reject leftover fields?
-- Is a constructed kind consumed exactly once?
-- Are config structs kept out of `is_kind`?
-- Do checks, snapshots, plan, and apply share one interpretation path?
-- Does writeback have an actual persistence owner?
-- Does the platform implement the complete adapter/provisioner/binary/launcher chain, or
-  only an authoring component?
-- Will changing this behavior re-key the platform engine rather than masquerade as a
-  config-only edit?
+- Is the dependency a module edge, resource edge, or service start-order edge?
+- Does a content-consuming resource retain both dependency and digest coupling?
+- Are platform-specific runtime facts carried by a typed context?
+- Does checking validate without realization?
+- Do checking and execution evaluate the same structural definition?
+- Does writeback name an actual declared output and persistence owner?
+- Is the kind part of a small compile-time first-party set?
+- Does the generated provisioner bind exactly one platform and one frontend?
 
 ## Further reading
 
-- [Deployment definition programming guide](deployment-definitions.md) — abstract
-  language and authoring rules.
-- [Provisioning overview](README.md) — matched language/engine architecture.
+- [Deployment definition programming guide](deployment-definitions.md) — language and
+  authoring rules.
+- [Provisioning overview](README.md) — matched language and engine architecture.
 - [The platform provisioner](provisioner.md) — lifecycle seam, state, and transitions.
 - [`tkr` and `tkp`](tkr-and-tkp.md) — construction, identity, placement, and verification.
-- [Extending the IaC framework](../iac/extending.md) — resource, module, adapter, and
-  provider seams beneath a platform vocabulary.
-- [Compose definition](../../platforms/compose/definition.tkd) and
-  [Compose bridge](../../platforms/compose/src/bridge.rs) — complete current authoring
-  path.
-- [EKS bridge](../../platforms/eks/src/bridge.rs) and
-  [EKS kinds](../../platforms/eks/src/kinds.rs) — current vocabulary components without a
-  complete operator path.
+- [Extending the IaC framework](../iac/extending.md) — resource and provider seams.
+- [Compose definition](../../platforms/compose/definition.tkd),
+  [kind set](../../platforms/compose/src/services/mod.rs), and
+  [provisioner](../../platforms/compose/src/lib.rs) — the complete current Compose path.

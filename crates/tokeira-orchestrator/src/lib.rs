@@ -610,6 +610,14 @@ impl<D: Deployment> InfraEngine<D> {
         &mut self.ctx
     }
 
+    /// Borrow the deployment together with the provider context for an apply preflight.
+    ///
+    /// The paired borrow preserves the exact desired deployment and registered
+    /// provider handles that the subsequent [`Self::apply`] consumes.
+    pub fn deployment_and_context_mut(&mut self) -> (&D, &mut iac::ProvisionContext) {
+        (&self.deployment, &mut self.ctx)
+    }
+
     fn make_saver(&self, initial_version: String) -> iac::StateSaver {
         let store = Arc::clone(&self.state_store);
         let version = Arc::new(Mutex::new(initial_version));

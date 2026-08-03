@@ -7,6 +7,7 @@ use tokeira_orchestrator::{
     DefinitionFormatId, DeployEngine, Deployment as _, InfraEngine, PlatformId, PlatformLaunchClass,
 };
 use tokeira_platform::{
+    artifact::OperationalArtifactStage,
     binding::{Platform, PlatformBinding},
     context::InvocationContext,
     definition::{
@@ -250,6 +251,32 @@ where
         let composition = engine.compose(tokeira_iac::ModuleSelection::All)?;
         Ok((engine, composition))
     }
+
+    async fn apply_infra(
+        &self,
+        deployment_dir: &Path,
+        materialize_artifacts: bool,
+    ) -> Result<AppliedOutcome> {
+        let (mut engine, composition) = self.infra_engine(deployment_dir).await?;
+        if materialize_artifacts {
+            let (framework, context) = engine.deployment_and_context_mut();
+            framework
+                .materialize_operational_artifacts(
+                    OperationalArtifactStage::Infrastructure,
+                    context,
+                )
+                .await
+                .context("operational artifact publication failed before infrastructure apply")?;
+        }
+        let changes = engine
+            .apply(&composition, tokeira_iac::ModuleSelection::All)
+            .await
+            .context("infrastructure apply failed")?;
+        Ok(AppliedOutcome {
+            display_by_id: engine.display_map(&composition)?,
+            changes,
+        })
+    }
 }
 
 fn service_changes(changes: Vec<tokeira_orchestrator::ServiceChange>) -> Vec<tokeira_iac::Change> {
@@ -310,15 +337,11 @@ where
     }
 
     async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
-        let (mut engine, composition) = self.infra_engine(deployment_dir).await?;
-        let changes = engine
-            .apply(&composition, tokeira_iac::ModuleSelection::All)
-            .await
-            .context("infrastructure apply failed")?;
-        Ok(AppliedOutcome {
-            display_by_id: engine.display_map(&composition)?,
-            changes,
-        })
+        self.apply_infra(deployment_dir, false).await
+    }
+
+    async fn infra_apply_with_artifacts(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
+        self.apply_infra(deployment_dir, true).await
     }
 
     async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
@@ -438,6 +461,14 @@ where
                 "runtime workloads are declared but no selected provider supplies a deploy executor"
             )
         })?;
+        let mut operational_context = framework.prepare_operational_context().await?;
+        framework
+            .materialize_operational_artifacts(
+                OperationalArtifactStage::Workload,
+                &mut operational_context,
+            )
+            .await
+            .context("operational artifact publication failed before workload apply")?;
         let config = framework.engine_config();
         let mut engine = DeployEngine::new(framework, &config, deployment_dir)
             .await
@@ -480,8 +511,9 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use tokeira_platform::{
         artifact::{
-            ArtifactCatalog, CanonicalDocument, ContentIdentitySet, DeliveryKey, DesiredDocument,
-            OperationalArtifactReceipt, OperationalArtifactRequest,
+            ArtifactCatalog, ArtifactClass, ArtifactUse, CanonicalDocument, ContentIdentitySet,
+            DeliveryKey, DesiredContent, DesiredDocument, OperationalArtifactReceipt,
+            OperationalArtifactRequest, PlatformArtifact,
         },
         author::{
             AuthorArgument, AuthorHandle, AuthorNode, AuthorResult, AuthorSession, AuthorValue,
@@ -565,6 +597,15 @@ mod tests {
         services: ServiceCatalog<FakePlatform>,
         providers: ProviderSet<FakePlatform>,
     ) -> PlatformBinding<FakePlatform> {
+        fake_binding_with_artifacts(id, services, ArtifactCatalog::default(), providers)
+    }
+
+    fn fake_binding_with_artifacts(
+        id: &str,
+        services: ServiceCatalog<FakePlatform>,
+        artifacts: ArtifactCatalog<FakePlatform>,
+        providers: ProviderSet<FakePlatform>,
+    ) -> PlatformBinding<FakePlatform> {
         let images = ImageCatalog::new(
             services
                 .entries()
@@ -579,7 +620,7 @@ mod tests {
             ContextContract::new(fake_context, authoring_context),
             KindSet::default(),
             services,
-            ArtifactCatalog::default(),
+            artifacts,
             images,
             providers,
             StateBinding::new(StatePolicy::LocalCas),
@@ -679,6 +720,7 @@ mod tests {
     #[derive(Debug)]
     struct TestDelivery {
         key: DeliveryKey,
+        publications: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -713,12 +755,16 @@ mod tests {
 
         async fn materialize_operational(
             &self,
-            _request: OperationalArtifactRequest<'_>,
+            request: OperationalArtifactRequest<'_>,
             _context: &tokeira_iac::ProvisionContext,
         ) -> Result<OperationalArtifactReceipt, DeliveryError> {
-            Err(DeliveryError::new(
-                "the test provider has no operational artifacts",
-            ))
+            self.publications.fetch_add(1, Ordering::SeqCst);
+            Ok(OperationalArtifactReceipt {
+                artifact: request.artifact.logical_id.clone(),
+                provider_reference: format!("test/{}", request.artifact.logical_id),
+                identity: request.identity.clone(),
+                consumers: request.artifact.consumers.clone(),
+            })
         }
     }
 
@@ -759,9 +805,15 @@ mod tests {
         }
     }
 
-    fn fake_runtime_binding(applies: Arc<AtomicUsize>) -> PlatformBinding<FakePlatform> {
+    fn fake_runtime_binding(
+        applies: Arc<AtomicUsize>,
+        publications: Option<Arc<AtomicUsize>>,
+    ) -> PlatformBinding<FakePlatform> {
+        let has_artifact = publications.is_some();
+        let publications = publications.unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
         let delivery = Arc::new(TestDelivery {
             key: DeliveryKey::new("test").expect("delivery key"),
+            publications,
         });
         let service = PlatformService {
             logical_id: "server".into(),
@@ -772,16 +824,33 @@ mod tests {
             ports: Vec::new(),
             health: HealthDeclaration::default(),
             placement: PlacementDeclaration::default(),
-            configuration: Vec::new(),
+            configuration: has_artifact
+                .then(|| ArtifactUse {
+                    artifact: "runtime-config".into(),
+                    role: "server-config".into(),
+                })
+                .into_iter()
+                .collect(),
             delivery: delivery.key().clone(),
             document: DesiredDocument {
                 schema: "test-service-v1".into(),
                 value: serde_json::json!({"service": "server"}),
             },
         };
-        fake_binding_with(
+        let artifacts = has_artifact
+            .then(|| PlatformArtifact {
+                logical_id: "runtime-config".into(),
+                class: ArtifactClass::Operational,
+                content: DesiredContent::Text("runtime = true\n".into()),
+                consumers: vec!["server".into()],
+                delivery: delivery.key().clone(),
+            })
+            .into_iter()
+            .collect();
+        fake_binding_with_artifacts(
             "compose",
             ServiceCatalog::new(vec![service]),
+            ArtifactCatalog::new(artifacts),
             ProviderSet::with_executions(
                 vec![delivery],
                 vec![Arc::new(TestExecution {
@@ -883,15 +952,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_publishes_only_artifacts_consumed_in_its_engine_universe() {
+        let root = tempfile::tempdir().expect("deployment");
+        write_metadata(root.path(), "compose", "tkd");
+        std::fs::write(root.path().join("definition.tkd"), "definition").expect("definition");
+        let publications = Arc::new(AtomicUsize::new(0));
+        let platform = BoundPlatform::new(
+            "compose",
+            "tkd",
+            fake_runtime_binding(
+                Arc::new(AtomicUsize::new(0)),
+                Some(Arc::clone(&publications)),
+            ),
+            FakeFrontend {
+                format: DefinitionFormatId::new("tkd").expect("format"),
+                workload: true,
+            },
+        )
+        .expect("bound platform");
+
+        let _ = platform.infra_plan(root.path()).await.expect("plan");
+        assert_eq!(publications.load(Ordering::SeqCst), 0);
+        let _ = platform
+            .infra_apply(root.path())
+            .await
+            .expect("rollback-safe core reconcile");
+        assert_eq!(publications.load(Ordering::SeqCst), 0);
+        let _ = platform
+            .infra_apply_with_artifacts(root.path())
+            .await
+            .expect("ordinary apply");
+        assert_eq!(publications.load(Ordering::SeqCst), 0);
+        let _ = platform
+            .deploy_apply(root.path())
+            .await
+            .expect("workload apply");
+        assert_eq!(publications.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn bound_platform_delegates_runtime_workloads_to_the_selected_provider() {
         let root = tempfile::tempdir().expect("deployment");
         write_metadata(root.path(), "compose", "tkd");
         std::fs::write(root.path().join("definition.tkd"), "definition").expect("definition");
         let applies = Arc::new(AtomicUsize::new(0));
+        let publications = Arc::new(AtomicUsize::new(0));
         let platform = BoundPlatform::new(
             "compose",
             "tkd",
-            fake_runtime_binding(Arc::clone(&applies)),
+            fake_runtime_binding(Arc::clone(&applies), Some(Arc::clone(&publications))),
             FakeFrontend {
                 format: DefinitionFormatId::new("tkd").expect("format"),
                 workload: true,
@@ -908,6 +1017,7 @@ mod tests {
         };
         assert_eq!(plan.changes.len(), 1);
         assert_eq!(plan.changes[0].kind, tokeira_iac::ChangeKind::Create);
+        assert_eq!(publications.load(Ordering::SeqCst), 0);
 
         let Realization::Realized(applied) = platform
             .deploy_apply(root.path())
@@ -918,6 +1028,7 @@ mod tests {
         };
         assert_eq!(applied.changes.len(), 1);
         assert_eq!(applies.load(Ordering::SeqCst), 1);
+        assert_eq!(publications.load(Ordering::SeqCst), 1);
 
         let Realization::Realized(after) = platform
             .deploy_plan(root.path())

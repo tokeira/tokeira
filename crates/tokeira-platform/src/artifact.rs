@@ -1,6 +1,10 @@
 //! Platform-owned artifact declarations and provider-neutral content identity.
 
-use std::{collections::BTreeSet, marker::PhantomData, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    marker::PhantomData,
+    path::{Component, Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,15 +55,46 @@ pub enum DesiredContent {
     Text(String),
     /// Opaque non-secret bytes.
     Bytes(Vec<u8>),
+    /// Authoritative non-secret input already present in the deployment directory.
+    DeploymentFile(RelativeArtifactPath),
 }
 
-impl DesiredContent {
-    /// Borrow the exact content bytes used for deterministic coupling.
-    pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            Self::Text(value) => value.as_bytes(),
-            Self::Bytes(value) => value,
+/// Validated deployment-relative path for authoritative artifact input.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RelativeArtifactPath(PathBuf);
+
+impl RelativeArtifactPath {
+    /// Construct a canonical relative path that cannot escape a deployment root lexically.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, crate::error::BindingError> {
+        let path = path.into();
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(crate::error::BindingError::new(format!(
+                "artifact source path `{}` is not a safe canonical relative path",
+                path.display()
+            )));
         }
+        Ok(Self(path))
+    }
+
+    /// Borrow the validated relative path.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RelativeArtifactPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = PathBuf::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -71,6 +106,15 @@ pub enum ArtifactClass {
     Operational,
     /// Reproducible output that no lifecycle command reads as desired state.
     Inspection,
+}
+
+/// Engine universe in which an operational artifact's declared consumers converge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationalArtifactStage {
+    /// Consumers realized as ordinary infrastructure resources.
+    Infrastructure,
+    /// Consumers realized through the separate deploy-engine workload universe.
+    Workload,
 }
 
 /// Reference from a platform service to one platform-owned artifact.
@@ -102,6 +146,8 @@ pub struct PlatformArtifact {
 pub struct OperationalArtifactRequest<'a> {
     /// Platform-owned declaration.
     pub artifact: &'a PlatformArtifact,
+    /// Exact resolved bytes selected for this apply invocation.
+    pub content: &'a [u8],
     /// Deterministic non-secret content identity carried by consumers.
     pub identity: &'a ContentIdentity,
 }
@@ -117,6 +163,24 @@ pub struct OperationalArtifactReceipt {
     pub identity: ContentIdentity,
     /// Consumers authorized by the platform declaration.
     pub consumers: Vec<String>,
+}
+
+/// Ordered provider receipts produced before declared consumers converge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperationalArtifactReceipts {
+    receipts: Vec<OperationalArtifactReceipt>,
+}
+
+impl OperationalArtifactReceipts {
+    /// Construct receipts after provider responses have passed framework validation.
+    pub(crate) fn new(receipts: Vec<OperationalArtifactReceipt>) -> Self {
+        Self { receipts }
+    }
+
+    /// Borrow receipts in platform artifact declaration order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &OperationalArtifactReceipt> {
+        self.receipts.iter()
+    }
 }
 
 /// Versioned SHA-256 identity of one domain-separated non-secret content value.
@@ -147,30 +211,31 @@ impl ContentIdentity {
 /// Deterministically ordered identities consumed by one workload.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContentIdentitySet {
-    identities: Vec<(String, ContentIdentity)>,
+    identities: Vec<(ArtifactUse, ContentIdentity)>,
 }
 
 impl ContentIdentitySet {
     /// Construct a set after rejecting duplicate logical artifact identities.
     pub fn new(
-        identities: Vec<(String, ContentIdentity)>,
+        identities: Vec<(ArtifactUse, ContentIdentity)>,
     ) -> Result<Self, crate::error::BindingError> {
         let mut seen = BTreeSet::new();
-        for (logical_id, _) in &identities {
-            if !seen.insert(logical_id.clone()) {
+        for (use_, _) in &identities {
+            if !seen.insert((use_.artifact.clone(), use_.role.clone())) {
                 return Err(crate::error::BindingError::new(format!(
-                    "duplicate content identity `{logical_id}`"
+                    "duplicate content identity `{}` for role `{}`",
+                    use_.artifact, use_.role
                 )));
             }
         }
         Ok(Self { identities })
     }
 
-    /// Iterate in declaration order.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &ContentIdentity)> {
+    /// Iterate over artifact uses and identities in service declaration order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&ArtifactUse, &ContentIdentity)> {
         self.identities
             .iter()
-            .map(|(logical_id, identity)| (logical_id.as_str(), identity))
+            .map(|(use_, identity)| (use_, identity))
     }
 }
 
@@ -223,6 +288,13 @@ impl<P> ArtifactCatalog<P> {
     /// Borrow declarations in platform order.
     pub fn entries(&self) -> &[PlatformArtifact] {
         &self.entries
+    }
+
+    /// Resolve one logical artifact without constructing a second inventory.
+    pub fn get(&self, logical_id: &str) -> Option<&PlatformArtifact> {
+        self.entries
+            .iter()
+            .find(|artifact| artifact.logical_id == logical_id)
     }
 }
 

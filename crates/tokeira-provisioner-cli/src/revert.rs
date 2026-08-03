@@ -76,7 +76,12 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
         config_history::config_file(deployment_dir, &config_source).display()
     );
 
-    let applied = crate::change_log_entries(&platform.infra_apply(deployment_dir).await?.changes);
+    let applied = crate::change_log_entries(
+        &platform
+            .infra_apply_with_artifacts(deployment_dir)
+            .await?
+            .changes,
+    );
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
     // — the set the rollback B-delete pass consumes (task 19.3).
     envelope.record_post_checkpoint_changes(&applied);

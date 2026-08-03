@@ -159,6 +159,13 @@ pub enum GraphFinding {
     DuplicateWriteback(String),
     /// A module dependency refers to no declared module.
     UnknownModuleDependency { module: String, dependency: String },
+    /// A resource dependency refers to no declared logical resource.
+    UnknownResourceDependency {
+        module: String,
+        resource: String,
+        dependency_module: String,
+        dependency_resource: String,
+    },
     /// The binding's state-bootstrap module is absent from the completed graph.
     MissingBootstrap(String),
     /// Module dependencies contain a cycle.
@@ -183,6 +190,16 @@ impl fmt::Display for GraphFinding {
                     "module `{module}` depends on unknown module `{dependency}`"
                 )
             }
+            Self::UnknownResourceDependency {
+                module,
+                resource,
+                dependency_module,
+                dependency_resource,
+            } => write!(
+                f,
+                "resource `{module}/{resource}` depends on unknown resource \
+                 `{dependency_module}/{dependency_resource}`"
+            ),
             Self::MissingBootstrap(module) => {
                 write!(f, "required bootstrap module `{module}` is not declared")
             }

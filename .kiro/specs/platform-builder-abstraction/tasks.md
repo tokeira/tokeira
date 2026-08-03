@@ -4,14 +4,14 @@ This plan implements the approved requirements and design in dependency order. E
 the workspace-standard `proptest` infrastructure, runs at least 100 cases, and carries the exact feature
 and property tag shown below. Checkpoints are mandatory completion gates for the preceding slice.
 
-- [ ] 1. Establish the shared vocabulary and `tokeira-platform` crate boundary
+- [x] 1. Establish the shared vocabulary and `tokeira-platform` crate boundary
   - [x] 1.1 Add `crates/tokeira-platform` to the workspace with the documented module surface
     - Add module documentation and public-item contracts for `artifact`, `author`, `binding`, `catalog`,
       `config`, `context`, `definition`, `error`, `graph`, `ops`, `projection`, and `selection`.
     - Add only the approved provider- and frontend-neutral dependencies; do not add Monty or depend on
       `tokeira-tkd`, a provider crate, a platform crate, `tkr`, or the provisioner CLI.
     - _Requirements: 1.9–1.14, 5.1–5.5, 14.21, 14.44, 14.48_
-  - [ ] 1.2 Replace closed shared selection vocabulary with validated identifiers
+  - [x] 1.2 Replace closed shared selection vocabulary with validated identifiers
     - Add serde-transparent `PlatformId` and `DefinitionFormatId` values in the shared orchestrator
       vocabulary, including canonical lower-kebab validation and actionable invalid-id errors.
     - Preserve any legacy `PlatformKind` use only behind the out-of-scope Local launch path until its
@@ -62,7 +62,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       graphs on rejection for at least 100 cases.
     - Tag: `// Feature: platform-builder-abstraction, Property 1: graph declarations preserve order and reject foreign handles`
     - _Requirements: 7.1–7.8, 7.10, 14.5, 14.7_
-  - [ ] 3.2 Property test: Property 2 — finished graphs are exactly the well-formed graphs
+  - [x] 3.2 Property test: Property 2 — finished graphs are exactly the well-formed graphs
     - Compare `finish` against a small reference validator over generated valid graphs and one-fault
       mutations for uniqueness, known targets, and module acyclicity.
     - Tag: `// Feature: platform-builder-abstraction, Property 2: finished graphs are exactly the well-formed graphs`
@@ -78,7 +78,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - Tag: `// Feature: platform-builder-abstraction, Property 6: platform context exposure is immutable and allow-listed`
     - _Requirements: 2.5–2.8, 8.5, 8.9, 14.10_
 
-- [ ] 4. Implement canonical provider kinds, verification, projection, selection, and writeback
+- [x] 4. Implement canonical provider kinds, verification, projection, selection, and writeback
   - [x] 4.1 Add the provider-owned kind and delivery registration seams
     - Implement `ProviderKind`, `KindRegistration::typed`, `ProviderKindCatalog`, placement, declared
       outputs, desired manifests, realization, and closed first-party selection without dynamic loading.
@@ -105,7 +105,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
     - Resolve literals and outputs through the realized physical-resource index, preserve declaration
       order, emit only declared keys, and apply the accepted omission behavior for absent values.
     - _Requirements: 7.5–7.6, 9.10–9.15, 14.6_
-  - [ ] 4.6 Transport provider reachability and mutation failures without reinterpretation
+  - [x] 4.6 Transport provider reachability and mutation failures without reinterpretation
     - Preserve `PlatformIssue` component/fact/evidence/direction, no-change plan outcomes, complete report
       rendering, and bare non-zero exit semantics; retain hard actionable apply/destroy errors.
     - Treat a downstream endpoint scheduled for first creation differently from an unexpectedly
@@ -138,7 +138,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
       order, and the exact declared key set against a reference model.
     - Tag: `// Feature: platform-builder-abstraction, Property 10: writeback is explicit, ordered, and resolved through physical state`
     - _Requirements: 7.5–7.6, 9.10–9.15, 14.6_
-  - [ ] 5.6 Property test: Property 13 — reachability issues are lossless no-change outcomes
+  - [x] 5.6 Property test: Property 13 — reachability issues are lossless no-change outcomes
     - Generate provider failures/evidence and assert no changes, verbatim evidence, grounded direction,
       one complete report, and a bare non-zero process result.
     - Tag: `// Feature: platform-builder-abstraction, Property 13: reachability issues are lossless no-change outcomes`
@@ -156,7 +156,7 @@ and property tag shown below. Checkpoints are mandatory completion gates for the
   - _Requirements: 14.23–14.24_
 
 - [ ] 7. Extract the current `.tkd` frontend onto the Authoring Contract
-  - [ ] 7.1 Invert the dependency and implement `TkdFrontend`
+  - [x] 7.1 Invert the dependency and implement `TkdFrontend`
     - Make `tokeira-tkd` depend on `tokeira-platform`; keep parsing, subset checking, evaluation,
       runtime values, spans, `#[create]`, and `#[require]` in `tokeira-tkd`.
     - Implement one adapter from `tokeira_tkd::Value`/`HostObj` to `AuthorNode`, `AuthorHandle`,

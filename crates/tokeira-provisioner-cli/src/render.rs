@@ -899,7 +899,7 @@ fn truncate(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokeira_explain::{DeploymentContext, explain_plan};
+    use tokeira_explain::{DeploymentContext, EvidenceId, explain_plan};
     use tokeira_iac::{Change, PlanOutcome, RefreshCoverage, ResourceId};
     use tokeira_report::{Mode, render};
 
@@ -1848,6 +1848,55 @@ mod tests {
             prop_assert_eq!(&a, &b, "JSON must be depth-blind");
             let back: DeploymentExplanation = serde_json::from_str(&a).unwrap();
             prop_assert_eq!(&back, &report.explanation, "JSON must round-trip to an equal model");
+        }
+
+        // Provider issues survive engine, explanation, rendering, and process-status boundaries.
+        // Feature: platform-builder-abstraction, Property 13: reachability issues are lossless no-change outcomes
+        #[test]
+        fn property_13_reachability_issue_report_and_exit_are_lossless(
+            component in "[A-Za-z][A-Za-z0-9-]{0,15}",
+            fact in "[A-Za-z][A-Za-z0-9 /:._-]{0,39}",
+            evidence in "[A-Za-z0-9][A-Za-z0-9 /:._-]{0,47}",
+            direction in proptest::option::of("[A-Za-z][A-Za-z0-9 /:._-]{0,47}"),
+        ) {
+            let issue = tokeira_iac::PlatformIssue {
+                component: component.clone(),
+                fact: fact.clone(),
+                evidence: evidence.clone(),
+                direction: direction.clone(),
+            };
+            let outcome = PlanOutcome {
+                platform_issues: vec![issue],
+                ..Default::default()
+            };
+            let report = report_for(&outcome, BindingVerdict::DevIterate, true);
+
+            prop_assert!(report.explanation.changes.is_empty());
+            prop_assert_eq!(report.explanation.platform_issues.len(), 1);
+            let transported = &report.explanation.platform_issues[0];
+            prop_assert_eq!(&transported.evidence_id, &EvidenceId::issue(&component));
+            prop_assert_eq!(&transported.fact, &fact);
+            prop_assert_eq!(&transported.evidence, &evidence);
+            prop_assert_eq!(&transported.direction, &direction);
+
+            let summary = render(&report, Mode::resolve(false, false)).unwrap();
+            prop_assert!(summary.contains(&fact));
+            prop_assert!(summary.contains(&evidence));
+            if let Some(direction) = &direction {
+                prop_assert!(summary.contains(direction));
+            }
+            for absent in ["## Created", "## Updated", "## Replaced", "## Deleted"] {
+                prop_assert!(!summary.contains(absent));
+            }
+
+            let json = render(&report, Mode::resolve(true, true)).unwrap();
+            let decoded: DeploymentExplanation = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(decoded.platform_issues, report.explanation.platform_issues);
+            prop_assert!(decoded.changes.is_empty());
+
+            let status = crate::cli::exit_status(Err(crate::PlatformBlocked.into()))
+                .expect("the already-rendered issue becomes a process status");
+            prop_assert_eq!(status, std::process::ExitCode::FAILURE);
         }
 
         // Property 8 — not-determined slots make no claims. Evolved twice:

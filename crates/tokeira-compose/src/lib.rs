@@ -105,7 +105,13 @@ pub fn docker_unreachable_issue(socket_path: &str, evidence: &str) -> iac::Platf
 
 impl From<ComposeError> for iac::IacError {
     fn from(value: ComposeError) -> Self {
-        iac::IacError::Other(anyhow::anyhow!(value))
+        match value {
+            ComposeError::DockerNotAvailable {
+                socket_path,
+                evidence,
+            } => iac::IacError::PlatformIssue(docker_unreachable_issue(&socket_path, &evidence)),
+            error => iac::IacError::Other(anyhow::anyhow!(error)),
+        }
     }
 }
 
@@ -1585,6 +1591,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ComposeError::DockerNotAvailable { .. }));
+    }
+
+    #[test]
+    fn docker_reachability_maps_to_the_typed_iac_issue() {
+        let error = ComposeError::DockerNotAvailable {
+            socket_path: "/var/run/docker.sock".to_string(),
+            evidence: "connect ECONNREFUSED /var/run/docker.sock".to_string(),
+        };
+        let iac::IacError::PlatformIssue(issue) = iac::IacError::from(error) else {
+            panic!("Docker reachability must retain the typed plan refusal");
+        };
+        assert_eq!(issue.component, "Docker");
+        assert_eq!(issue.fact, "Unable to connect to Docker");
+        assert_eq!(issue.evidence, "connect ECONNREFUSED /var/run/docker.sock");
+        assert_eq!(
+            issue.direction.as_deref(),
+            Some(
+                "nothing accepted connections at `/var/run/docker.sock` - verify Docker is listening there"
+            )
+        );
     }
 
     #[test]

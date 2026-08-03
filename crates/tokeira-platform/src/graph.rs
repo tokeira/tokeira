@@ -469,6 +469,19 @@ impl DeploymentGraphBuilder {
                 });
             }
         }
+        for resource in &self.resources {
+            for dependency in &resource.dependencies {
+                if !resources.contains(&(dependency.module.clone(), dependency.logical_id.clone()))
+                {
+                    findings.push(GraphFinding::UnknownResourceDependency {
+                        module: resource.module.clone(),
+                        resource: resource.logical_id.clone(),
+                        dependency_module: dependency.module.clone(),
+                        dependency_resource: dependency.logical_id.clone(),
+                    });
+                }
+            }
+        }
 
         let mut writeback = BTreeSet::new();
         for entry in &self.writeback {
@@ -598,5 +611,186 @@ impl VerifiedGraph {
     /// Explicit writeback declarations in declaration order.
     pub fn writeback(&self) -> &[WritebackEntry] {
         &self.writeback
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::{catalog::PlacementContext, error::KindError};
+
+    #[derive(Debug)]
+    struct ProbeKind;
+
+    impl ProviderKind for ProbeKind {
+        fn kind_name(&self) -> &'static str {
+            "ProbeKind"
+        }
+
+        fn validate(&self) -> Result<(), KindError> {
+            Ok(())
+        }
+
+        fn declared_outputs(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn desired_manifest(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+
+        fn realize(
+            &self,
+            _placement: &PlacementContext,
+        ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
+            Err(KindError::new("property probe is never realized"))
+        }
+    }
+
+    fn reference_valid(graph: &DeploymentGraphBuilder) -> bool {
+        let module_names = graph
+            .modules
+            .iter()
+            .map(|module| module.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if module_names.len() != graph.modules.len()
+            || graph.modules.iter().any(|module| {
+                module
+                    .dependencies
+                    .iter()
+                    .any(|dependency| !module_names.contains(dependency.as_str()))
+            })
+        {
+            return false;
+        }
+
+        let dependencies = graph
+            .modules
+            .iter()
+            .map(|module| {
+                (
+                    module.name.as_str(),
+                    module
+                        .dependencies
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut admitted = BTreeSet::new();
+        loop {
+            let before = admitted.len();
+            for (module, required) in &dependencies {
+                if required.is_subset(&admitted) {
+                    admitted.insert(*module);
+                }
+            }
+            if admitted.len() == dependencies.len() {
+                break;
+            }
+            if admitted.len() == before {
+                return false;
+            }
+        }
+
+        let resources = graph
+            .resources
+            .iter()
+            .map(|resource| (resource.module.as_str(), resource.logical_id.as_str()))
+            .collect::<BTreeSet<_>>();
+        if resources.len() != graph.resources.len()
+            || graph.resources.iter().any(|resource| {
+                resource.dependencies.iter().any(|dependency| {
+                    !resources
+                        .contains(&(dependency.module.as_str(), dependency.logical_id.as_str()))
+                })
+            })
+        {
+            return false;
+        }
+
+        graph
+            .writeback
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            == graph.writeback.len()
+    }
+
+    proptest! {
+        // Completion matches an independent validator across valid graphs and one-fault mutations.
+        // Feature: platform-builder-abstraction, Property 2: finished graphs are exactly the well-formed graphs
+        #[test]
+        fn property_2_finish_matches_reference_validator(
+            module_count in 2_usize..12,
+            resource_count in 2_usize..12,
+            fault in 0_u8..7,
+        ) {
+            let mut graph = DeploymentGraphBuilder::new();
+            let deployment = graph.deployment_handle();
+            let mut modules = Vec::new();
+            for index in 0..module_count {
+                modules.push(
+                    graph
+                        .add_module(&deployment, format!("module-{index}"), Vec::new())
+                        .expect("owned module"),
+                );
+            }
+            for index in 0..resource_count {
+                graph
+                    .add_resource(
+                        &modules[index % module_count],
+                        format!("resource-{index}"),
+                        Box::new(ProbeKind),
+                        Vec::new(),
+                    )
+                    .expect("owned resource");
+            }
+            graph
+                .add_writeback(
+                    &deployment,
+                    "runtime.first".to_string(),
+                    WritebackValue::Literal("one".to_string()),
+                )
+                .expect("owned writeback");
+            graph
+                .add_writeback(
+                    &deployment,
+                    "runtime.second".to_string(),
+                    WritebackValue::Literal("two".to_string()),
+                )
+                .expect("owned writeback");
+
+            match fault {
+                0 => {}
+                1 => graph.modules[module_count - 1].name = "module-0".to_string(),
+                2 => graph.modules[0].dependencies.push("missing".to_string()),
+                3 => {
+                    graph.modules[0].dependencies.push("module-1".to_string());
+                    graph.modules[1].dependencies.push("module-0".to_string());
+                }
+                4 => {
+                    let module = graph.resources[0].module.clone();
+                    let logical_id = graph.resources[0].logical_id.clone();
+                    graph.resources[resource_count - 1].module = module;
+                    graph.resources[resource_count - 1].logical_id = logical_id;
+                }
+                5 => graph.resources[0].dependencies.push(ResourceKey {
+                    module: "module-0".to_string(),
+                    logical_id: "missing".to_string(),
+                }),
+                6 => graph.writeback[1].key = graph.writeback[0].key.clone(),
+                _ => unreachable!("the generated fault is bounded"),
+            }
+
+            let expected = reference_valid(&graph);
+            prop_assert_eq!(graph.finish().is_ok(), expected);
+        }
     }
 }

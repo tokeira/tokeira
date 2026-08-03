@@ -318,11 +318,7 @@ impl ProviderExecution<TestPlatform> for TestProviderExecution {
         Some(Arc::clone(&self.deploy_platform))
     }
 
-    fn hydrate_config(
-        &self,
-        config: &TestConfig,
-        _state: &tokeira_iac::InfraState,
-    ) -> TestConfig {
+    fn hydrate_config(&self, config: &TestConfig, _state: &tokeira_iac::InfraState) -> TestConfig {
         let mut hydrated = config.clone();
         hydrated.replicas += 1;
         hydrated

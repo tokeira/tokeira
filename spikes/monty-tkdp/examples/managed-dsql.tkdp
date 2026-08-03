@@ -1,0 +1,30 @@
+from dataclasses import dataclass
+
+
+@dataclass
+class Minimal:
+    storage: Storage
+
+
+def config() -> Minimal:
+    return Minimal(storage=ManagedDsql(region="eu-west-2"))
+
+
+def deployment(cfg: Minimal, cx: Context) -> Deployment:
+    d = Deployment(["default"])
+
+    match cfg.storage:
+        case ManagedDsql(region=region) if region != "":
+            dsql = d.module("dsql")
+            dsql.resource(
+                "cluster",
+                DsqlCluster(region=region, mode=Managed),
+            )
+        case ManagedDsql(region=_):
+            fallback = d.module("dsql")
+            fallback.resource("cluster", DsqlCluster(region="eu-west-1", mode=Managed))
+        case InMemory():
+            state = d.module("local_state")
+            state.resource("dir", LocalStateDir())
+
+    return d

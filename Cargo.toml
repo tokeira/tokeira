@@ -55,6 +55,7 @@ members = [
 exclude = [
     "scenarios/worker-versioning",
     "scenarios/standalone-activities",
+    "spikes/monty-tkdp",
     "tools/simulation/engine",
     "tools/simulation/broker",
     "tools/simulation/placement",

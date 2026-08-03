@@ -1,0 +1,34 @@
+[package]
+name = "spike-monty-tkdp"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone spike (root AGENTS.md task): excluded from the tokeira workspace,
+# no tokeira crate dependencies, own lockfile.
+[workspace]
+
+[dependencies]
+# Monty gained in-sandbox `@dataclass` support in pydantic/monty#626, which is
+# NOT in the 0.0.19 crates.io release — pin the exact main-branch revision the
+# spike was validated against (2026-07-31).
+monty = { git = "https://github.com/pydantic/monty", rev = "69f8a613e4f42d2f4dc0e659c792569923531e4f" }
+monty-types = { git = "https://github.com/pydantic/monty", rev = "69f8a613e4f42d2f4dc0e659c792569923531e4f" }
+# The exact ruff line monty pins (its workspace deps), so cargo unifies our
+# parser/AST types with monty's own — no duplicate ruff in the tree. These
+# crates carry no API stability guarantees; move them only together with the
+# monty rev above.
+ruff_python_ast = "0.0.3"
+ruff_python_parser = "0.0.3"
+ruff_source_file = "0.0.3"
+ruff_text_size = "0.0.3"
+thiserror = "2"
+anyhow = "1"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+print_stdout = "deny"
+print_stderr = "deny"

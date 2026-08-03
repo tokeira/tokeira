@@ -39,6 +39,8 @@ pub(crate) async fn describe<P: ProvisionerPlatform>(
         platform.label(deployment_dir),
         retained,
         load_bundle_view(deployment_dir),
+        read_storage(deployment_dir),
+        deployment_dir,
     );
 
     if json {
@@ -48,9 +50,36 @@ pub(crate) async fn describe<P: ProvisionerPlatform>(
     } else if detail {
         report.print_verification(deployment_dir);
     } else {
-        report.print_operator();
+        // The operator summary is Markdown narrative under the output
+        // contract: termimad-skinned on a terminal, deterministic raw
+        // Markdown everywhere else (D8).
+        crate::emit_report(
+            &report.summary_markdown(),
+            tokeira_report::Mode::resolve(false, false),
+        );
     }
     Ok(())
+}
+
+/// The deployment's storage kind as `tokeirad.toml` records it
+/// (`infrastructure.storage`) — the definitive statement of what the
+/// deployment runs on. Parsed tolerantly: `describe` must keep working
+/// against a config written by a newer engine, so every other field is
+/// ignored, and an absent or unreadable file simply omits the fact.
+fn read_storage(deployment_dir: &Path) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ServerConfig {
+        infrastructure: Option<Infrastructure>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Infrastructure {
+        storage: Option<String>,
+    }
+    let raw = std::fs::read_to_string(deployment_dir.join(config_history::SERVER_CONFIG)).ok()?;
+    toml::from_str::<ServerConfig>(&raw)
+        .ok()?
+        .infrastructure?
+        .storage
 }
 
 /// Read the deployment's bundle sidecar for the verification view. `describe`
@@ -173,6 +202,12 @@ struct BundleView {
 struct DescribeReport {
     platform: &'static str,
     running: StampView,
+    /// Storage kind from `tokeirad.toml` (`infrastructure.storage`) — the
+    /// definitive record; `None` when the config is absent or unreadable.
+    storage: Option<String>,
+    /// The deployment directory — where the envelope, definition, and
+    /// married provisioner live.
+    state_dir: std::path::PathBuf,
     deployment_id: String,
     schema_version: u32,
     config_revision: u64,
@@ -188,6 +223,11 @@ struct DescribeReport {
     runtime_head_present: bool,
     operation: Option<String>,
     lock_holder: Option<String>,
+    /// Attention-only binding prose (shared with the plan reports). A
+    /// rendering concern, not model content — excluded from `--json`, which
+    /// already carries the verdict itself.
+    #[serde(skip)]
+    binding_attention: Option<&'static str>,
 }
 
 impl DescribeReport {
@@ -197,11 +237,15 @@ impl DescribeReport {
         platform: &'static str,
         retained_revisions: Vec<u64>,
         bundle: Option<BundleView>,
+        storage: Option<String>,
+        deployment_dir: &Path,
     ) -> Self {
         let verdict = check_binding(envelope.binding.as_ref(), running);
         Self {
             platform,
             running: StampView::of(running),
+            storage,
+            state_dir: deployment_dir.to_path_buf(),
             deployment_id: envelope.deployment_id.clone(),
             schema_version: envelope.schema_version,
             config_revision: envelope.config_revision,
@@ -235,65 +279,75 @@ impl DescribeReport {
                     // The in-flight audit log (task 19.2): what B committed,
                     // visible exactly when recovery needs it.
                     Some(recorded) => format!(
-                        "{:?} (phase: {}, {recorded} change(s) recorded)",
-                        op.kind, op.phase
+                        "{:?} (phase: {}, {} recorded)",
+                        op.kind,
+                        op.phase,
+                        tokeira_report::counted(recorded, "change")
                     ),
                     None => format!("{:?} (phase: {})", op.kind, op.phase),
                 }
             }),
             lock_holder: envelope.lock.as_ref().map(|l| l.holder.clone()),
+            binding_attention: crate::render::binding_attention(
+                envelope.binding.is_some(),
+                verdict,
+            ),
         }
     }
 
-    /// The default human view: "is this deployment healthy and safe to act on"
-    /// at a glance — short identity, binding status, revision, operation, lock.
-    /// No checksums, no digests.
-    fn print_operator(&self) {
+    /// The default human view: "is this deployment healthy and safe to act
+    /// on" at a glance — the facts an operator acts on, as Markdown
+    /// narrative. No checksums, no digests, no revision bookkeeping (those
+    /// live in `--detail`/`--json`); an operation in flight and a binding
+    /// that would refuse are the only lines that join uninvited.
+    fn summary_markdown(&self) -> String {
+        let mut out = String::new();
         let id = if self.deployment_id.is_empty() {
             "(uninitialized)"
         } else {
             &self.deployment_id
         };
-        println!("deployment  {id}  [{}]", self.platform);
-        println!(
-            "engine      {} ({:?})  {}",
-            self.running.version,
-            self.running.build_mode,
-            short_hash(&self.running.source_tree_hash)
-        );
-
-        let mark = if self.binding.proceeds {
-            "proceeds"
-        } else {
-            "REFUSES"
+        out.push_str(&format!("# {id}\n"));
+        push_fact(&mut out, "platform", &format!("`{}`", self.platform));
+        let engine = match self.running.build_mode {
+            // The qualifier is exceptional-only: a released build is the
+            // norm and renders bare; a dev build says so, because it is why
+            // the binding gate treats the deployment as a dev iterate.
+            BuildMode::Dev => format!("{} (dev build)", self.running.version),
+            BuildMode::Versioned => self.running.version.clone(),
         };
-        let auth = if self.binding.authoritative {
-            " (authoritative)"
+        push_fact(&mut out, "engine", &engine);
+        if let Some(storage) = &self.storage {
+            push_fact(&mut out, "storage", &storage_prose(storage));
+        }
+        push_fact(&mut out, "state", &home_abbreviated(&self.state_dir));
+        push_fact(
+            &mut out,
+            "infra",
+            if self.infra_head_present {
+                "Provisioned"
+            } else {
+                "Not provisioned"
+            },
+        );
+        let services = if self.runtime_head_present {
+            format!("Applied at revision {}", self.config_revision)
         } else {
-            ""
+            "None — nothing applied yet".to_string()
         };
-        println!("binding     {} — {mark}{auth}", self.binding.verdict);
-
-        println!(
-            "config      revision {} ({})",
-            self.config_revision,
-            self.effective_config_ref
-                .as_deref()
-                .map(short_ref)
-                .unwrap_or_else(|| "none applied".to_string())
-        );
-        println!(
-            "operation   {}",
-            self.operation.as_deref().unwrap_or("none")
-        );
-        println!(
-            "lock        {}",
-            match &self.lock_holder {
-                Some(h) => format!("held by {h}"),
-                None => "free".to_string(),
-            }
-        );
-        println!("\n(`--detail` for the verification view: full manifest, revisions, heads)");
+        push_fact(&mut out, "services", &services);
+        let lock = match &self.lock_holder {
+            Some(holder) => format!("Held by {holder}"),
+            None => "Not locked".to_string(),
+        };
+        push_fact(&mut out, "lock", &lock);
+        if let Some(operation) = &self.operation {
+            push_fact(&mut out, "operation", operation);
+        }
+        if let Some(attention) = self.binding_attention {
+            push_fact(&mut out, "binding", attention);
+        }
+        out
     }
 
     /// The verification / debug view: the full auditable record, for verifying
@@ -454,21 +508,36 @@ impl DescribeReport {
     }
 }
 
-/// A short, glanceable prefix of a digest for the operator view.
-fn short_hash(hash: &str) -> String {
-    if hash.len() > 12 {
-        format!("{}…", &hash[..12])
-    } else {
-        hash.to_string()
+/// Value column for the summary's fact lines: the longest label
+/// (`services`) plus two spaces, so values align down the page.
+const FACT_LABEL_WIDTH: usize = 10;
+
+/// One `- **label**  value` fact line, value-aligned across the summary.
+fn push_fact(out: &mut String, label: &str, value: &str) {
+    let pad = " ".repeat(FACT_LABEL_WIDTH.saturating_sub(label.len()));
+    out.push_str(&format!("- **{label}**{pad}{value}\n"));
+}
+
+/// Human prose for the recorded storage kind (`--json` keeps the raw value).
+fn storage_prose(raw: &str) -> String {
+    match raw {
+        "in-memory" => "In-memory".to_string(),
+        "dsql" => "DSQL".to_string(),
+        other => other.to_string(),
     }
 }
 
-/// A short form of an effective-config ref (`sha256:abcd…`).
-fn short_ref(config_ref: &str) -> String {
-    match config_ref.split_once(':') {
-        Some((scheme, digest)) => format!("{scheme}:{}", short_hash(digest)),
-        None => config_ref.to_string(),
+/// Abbreviate `$HOME` to `~` in the summary's state line.
+fn home_abbreviated(path: &Path) -> String {
+    let rendered = path.display().to_string();
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+        && let Some(rest) = rendered.strip_prefix(&home)
+        && rest.starts_with('/')
+    {
+        return format!("~{rest}");
     }
+    rendered
 }
 
 fn verdict_label(verdict: BindingVerdict) -> &'static str {
@@ -494,7 +563,15 @@ mod tests {
         assert!(envelope.binding.is_none());
 
         let running = ProvenanceStamp::current(Utc::now());
-        let report = DescribeReport::build(&running, &envelope, "test", Vec::new(), None);
+        let report = DescribeReport::build(
+            &running,
+            &envelope,
+            "test",
+            Vec::new(),
+            None,
+            None,
+            tmp.path(),
+        );
         assert_eq!(report.binding.verdict, "Unknown");
         assert!(!report.binding.proceeds, "an unstamped deployment refuses");
         assert!(report.integrity.is_none());
@@ -530,7 +607,15 @@ mod tests {
 
         // Re-load and describe — round-trips through the envelope store.
         let (loaded, _) = store.load().await.unwrap();
-        let report = DescribeReport::build(&running, &loaded, "test", vec![1, 3], None);
+        let report = DescribeReport::build(
+            &running,
+            &loaded,
+            "test",
+            vec![1, 3],
+            None,
+            None,
+            tmp.path(),
+        );
         assert_eq!(report.deployment_id, "dep-1");
         assert_eq!(report.config_revision, 3);
         assert_eq!(report.binding.verdict, "Match");
@@ -550,7 +635,15 @@ mod tests {
             build_mode: BuildMode::Dev,
             ..versioned_stamp("hashA")
         };
-        let report = DescribeReport::build(&dev_running, &envelope, "test", Vec::new(), None);
+        let report = DescribeReport::build(
+            &dev_running,
+            &envelope,
+            "test",
+            Vec::new(),
+            None,
+            None,
+            Path::new("dep"),
+        );
         assert_eq!(report.binding.verdict, "ModeRegression");
         assert!(!report.binding.proceeds);
     }
@@ -581,6 +674,8 @@ mod tests {
             "test",
             Vec::new(),
             None,
+            None,
+            Path::new("dep"),
         );
         let integrity = report.integrity.expect("manifest present");
         assert_eq!(integrity.artifacts.len(), 1);
@@ -649,6 +744,8 @@ mod tests {
             "test",
             Vec::new(),
             load_bundle_view(tmp.path()),
+            None,
+            tmp.path(),
         );
 
         let id_view = report
@@ -677,11 +774,83 @@ mod tests {
         assert!(load_bundle_view(tmp.path()).is_none());
     }
 
+    // The operator summary: the agreed fact lines, value-aligned, in prose —
+    // and silent on binding/operation when neither carries attention.
     #[test]
-    fn short_forms_truncate_for_the_operator_view() {
-        assert_eq!(short_hash("abcdef0123456789"), "abcdef012345…");
-        assert_eq!(short_hash("short"), "short");
-        assert_eq!(short_ref("sha256:abcdef0123456789"), "sha256:abcdef012345…");
-        assert_eq!(short_ref("default"), "default");
+    fn operator_summary_states_the_facts() {
+        let envelope = DeploymentStateEnvelope {
+            deployment_id: "dev-compose-tkd".to_string(),
+            binding: Some(ProvenanceStamp {
+                build_mode: BuildMode::Dev,
+                ..versioned_stamp("hashA")
+            }),
+            ..Default::default()
+        };
+        let dev_running = ProvenanceStamp {
+            version: "0.1.0".to_string(),
+            build_mode: BuildMode::Dev,
+            ..versioned_stamp("hashA")
+        };
+        let report = DescribeReport::build(
+            &dev_running,
+            &envelope,
+            "compose",
+            Vec::new(),
+            None,
+            Some("in-memory".to_string()),
+            Path::new("/deployments/dev-compose-tkd"),
+        );
+        let summary = report.summary_markdown();
+        assert!(summary.starts_with("# dev-compose-tkd\n"), "{summary}");
+        assert!(summary.contains("- **platform**  `compose`\n"), "{summary}");
+        assert!(
+            summary.contains("- **engine**    0.1.0 (dev build)\n"),
+            "{summary}"
+        );
+        assert!(summary.contains("- **storage**   In-memory\n"), "{summary}");
+        assert!(
+            summary.contains("- **state**     /deployments/dev-compose-tkd\n"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("- **infra**     Not provisioned\n"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("- **services**  None — nothing applied yet\n"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("- **lock**      Not locked\n"),
+            "{summary}"
+        );
+        // A dev binding on a dev deployment proceeds — no uninvited lines.
+        assert!(!summary.contains("**binding**"), "{summary}");
+        assert!(!summary.contains("**operation**"), "{summary}");
+    }
+
+    // Attention lines join uninvited exactly when they should: a fresh
+    // (unstamped) deployment speaks; a versioned engine renders bare; an
+    // unrecorded storage line is absent, never guessed.
+    #[test]
+    fn operator_summary_attention_lines_speak_when_needed() {
+        let report = DescribeReport::build(
+            &versioned_stamp("hashA"),
+            &DeploymentStateEnvelope::default(),
+            "compose",
+            Vec::new(),
+            None,
+            None,
+            Path::new("/d"),
+        );
+        let summary = report.summary_markdown();
+        assert!(summary.starts_with("# (uninitialized)\n"), "{summary}");
+        assert!(summary.contains("- **engine**    1.0.0\n"), "{summary}");
+        assert!(!summary.contains("(dev build)"), "{summary}");
+        assert!(
+            summary.contains("- **binding**   not initialized"),
+            "{summary}"
+        );
+        assert!(!summary.contains("**storage**"), "{summary}");
     }
 }

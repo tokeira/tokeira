@@ -89,7 +89,7 @@ whose reference transcripts are asserted against the renderer.
 
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4, with *live state* confirmed
+**Plan for compose-explore** at revision 4
 
 ## Update
 - the *tokeirad* service would be updated - `image`: `tokeirad:v3` → `tokeirad:v4` - `tokeirad::compose/tokeirad`

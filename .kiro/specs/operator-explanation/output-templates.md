@@ -50,7 +50,7 @@ dependency — a definition keeping a dependant of a resource it removes.
 
 ```text
 # {Verb}                       — the operation, title-cased ("Infra Plan")
-**Plan for {platform}** {revision anchor}
+**Plan for {deployment}** {revision anchor}
 [**binding:** {attention line}]  — only when something blocks or qualifies the apply
 ## Platform Issue[s]           — first when present; suppresses every section below
 ## {Action} sections           — Create / Update / Replace / Delete, definition-driven
@@ -59,8 +59,11 @@ dependency — a definition keeping a dependant of a resource it removes.
 ## Impact[s]                   — severity-first, always last
 ```
 
-The revision anchor is `at revision {N}`, or `before its first apply` for a
-never-applied deployment — the one place the document states a revision number.
+The revision anchor is `at revision {N}`; only a deployment whose envelope
+records no revision yet (revision `0`) anchors as `before its first apply` —
+a revision count of 1 or more means the deployment has history, even when
+nothing is currently applied. The anchor is the one place the document states
+a revision number.
 
 ### Platform Issue lines
 
@@ -174,7 +177,7 @@ dependant of mimir. These transcripts are the byte-for-byte assertion targets fo
 <!-- reference: infra-plan-summary -->
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4
+**Plan for compose-explore** at revision 4
 
 ## Update
 - the *grafana* service would be updated - `image`: `grafana/grafana-oss:12.4.3` → `grafana/grafana-oss:12.5.0` - `grafana::compose/grafana`
@@ -209,7 +212,7 @@ dependant of mimir. These transcripts are the byte-for-byte assertion targets fo
 <!-- reference: infra-plan-detail -->
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4
+**Plan for compose-explore** at revision 4
 
 ## Update
 - the *grafana* service would be updated - `image`: `grafana/grafana-oss:12.4.3` → `grafana/grafana-oss:12.5.0` - `grafana::compose/grafana`
@@ -262,7 +265,7 @@ Every example is a **complete output**, never a snippet.
 <!-- reference: infra-plan-platform-issue -->
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4
+**Plan for compose-explore** at revision 4
 
 ## Platform Issue
 - Unable to connect to Docker:
@@ -288,7 +291,7 @@ resource, one line, every diff at detail.
 
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4
+**Plan for compose-explore** at revision 4
 
 ## Update
 - the *grafana* service would be updated - `image`: `grafana/grafana-oss:12.4.3` → `grafana/grafana-oss:12.5.0` and 2 more fields - `grafana::compose/grafana`
@@ -320,7 +323,7 @@ the drifted field is annotated where it appears.
 
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4
+**Plan for compose-explore** at revision 4
 
 ## Update
 - the *grafana* service would be updated - `image`: `grafana/grafana-oss:12.4.3` → `grafana/grafana-oss:12.5.0` and 1 more field - `grafana::compose/grafana`
@@ -347,7 +350,7 @@ the drifted field is annotated where it appears.
 
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4
+**Plan for compose-explore** at revision 4
 
 ## Create
 - the *pyroscope* service would be created - `pyroscope::compose/pyroscope`
@@ -369,7 +372,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4
+**Plan for compose-explore** at revision 4
 
 ## Update
 - the *tokeirad* service would be updated - `environment`: `AWS_REGION=us-east-1` → `(removed)` and 1 more field - `tokeirad::compose/tokeirad`
@@ -418,7 +421,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4
+**Plan for compose-explore** at revision 4
 
 ## Update
 - the *tokeirad* service would be updated - an output of the *Aurora DSQL cluster* changed - `tokeirad::compose/tokeirad`
@@ -437,7 +440,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 5
+**Plan for compose-explore** at revision 5
 
 ## Update
 - the *alloy* service would be updated - this provisioner realizes the definition differently - `alloy::compose/alloy`
@@ -458,7 +461,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 
 ```markdown
 # Infra Plan
-**Plan for compose** at revision 4
+**Plan for compose-explore** at revision 4
 
 ## Update
 - the *mimir* service would be updated - `mimir::compose/mimir`
@@ -479,7 +482,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 
 ```text
 # {Verb}                        — "Infra Apply"
-**Applied to {platform}** — revision {N} → {N+1}[, without a gating plan's evidence]
+**Applied to {deployment}** — revision {N} → {N+1}
 ## {Action} sections            — past tense: Created / Updated / Replaced / Deleted
 ```
 
@@ -488,7 +491,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 <!-- reference: infra-apply-after-plan -->
 ```markdown
 # Infra Apply
-**Applied to compose** — revision 4 → 5
+**Applied to compose-explore** — revision 4 → 5
 
 ## Updated
 - the *grafana* service - `image`: `grafana/grafana-oss:12.4.3` → `grafana/grafana-oss:12.5.0` - `grafana::compose/grafana`
@@ -508,7 +511,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 <!-- reference: infra-apply-no-plan -->
 ```markdown
 # Infra Apply
-**Applied to compose** — revision 4 → 5, without a gating plan's evidence
+**Applied to compose-explore** — revision 4 → 5
 
 ## Updated
 - the *grafana* service - `grafana::compose/grafana`
@@ -516,7 +519,7 @@ plannable world. That guarantee is what lets impacts speak entirely through chan
 
 *What's speaking:*
 
-- identities alone, the absence stated in the header — F1:
+- identities alone, the absence machine-side only — F1:
   `tokeira_explain::build` (`explain_applied`) records one
-  field-evidence-unavailable uncertainty per committed change;
-  `tokeira_provisioner_cli::{apply, render}` state it once
+  field-evidence-unavailable uncertainty per committed change; the
+  narrative never describes its own missing decoration

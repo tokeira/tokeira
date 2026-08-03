@@ -9086,6 +9086,7 @@ dependencies = [
  "tokeira-report",
  "tokeira-state",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]

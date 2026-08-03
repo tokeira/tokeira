@@ -768,7 +768,7 @@ macro_rules! bound_provisioner_main {
     }
 
     proptest! {
-        // Property 22 assembly half: one selected platform and frontend determine the complete root.
+        // Feature: platform-builder-abstraction, Property 22: catalog selection determines one static root.
         #[test]
         fn generated_assembly_matches_the_three_root_reference_model(
             platform_segment in "[a-z][a-z0-9]{0,10}",

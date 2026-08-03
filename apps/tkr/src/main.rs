@@ -969,6 +969,7 @@ mod tests {
     }
 
     proptest! {
+        // Feature: platform-builder-abstraction, Property 23: deployment publication is all-or-nothing.
         #[test]
         fn creation_transaction_hides_staging_and_rolls_back_latest_failure(
             suffix in "[a-z0-9]{1,12}",
@@ -1276,6 +1277,7 @@ mod tests {
     }
 
     #[tokio::test]
+    // Feature: platform-builder-abstraction, Property 23: deployment publication is all-or-nothing.
     async fn catalog_selection_creates_and_checks_with_the_generated_compose_provisioner() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = catalog::PlatformCatalog::from_workspace(&workspace).expect("catalog");

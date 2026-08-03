@@ -109,6 +109,109 @@ pub fn expand_module_selection(
     ))
 }
 
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestModule {
+        name: &'static str,
+        dependencies: Vec<&'static str>,
+    }
+
+    impl Module for TestModule {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn dependencies(&self) -> Vec<&str> {
+            self.dependencies.clone()
+        }
+
+        fn resources(
+            &self,
+            _context: &crate::ModuleContext<'_>,
+        ) -> Result<Vec<Box<dyn crate::Resource>>, crate::IacError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn modules() -> Vec<Box<dyn Module>> {
+        vec![
+            Box::new(TestModule {
+                name: "state",
+                dependencies: Vec::new(),
+            }),
+            Box::new(TestModule {
+                name: "database",
+                dependencies: vec!["state"],
+            }),
+            Box::new(TestModule {
+                name: "service",
+                dependencies: vec!["database"],
+            }),
+            Box::new(TestModule {
+                name: "metrics",
+                dependencies: vec!["state"],
+            }),
+        ]
+    }
+
+    fn selected(selection: ModuleSelection) -> Vec<String> {
+        let ModuleSelection::Only(selected) = selection else {
+            panic!("explicit selection remains explicit");
+        };
+        selected
+    }
+
+    #[test]
+    // Feature: platform-builder-abstraction, Property 9: module selection is the required closure.
+    fn module_selection_expands_the_directional_transitive_closure() {
+        assert_eq!(
+            selected(
+                expand_module_selection(
+                    &modules(),
+                    &ModuleSelection::Only(vec!["service".to_string()]),
+                    SelectionDirection::Prerequisites,
+                )
+                .expect("prerequisite closure"),
+            ),
+            ["state", "database", "service"]
+        );
+        assert_eq!(
+            selected(
+                expand_module_selection(
+                    &modules(),
+                    &ModuleSelection::Only(vec!["state".to_string()]),
+                    SelectionDirection::Dependants,
+                )
+                .expect("dependant closure"),
+            ),
+            ["state", "database", "service", "metrics"]
+        );
+    }
+
+    #[test]
+    fn module_selection_rejects_empty_and_unknown_requests() {
+        assert!(
+            expand_module_selection(
+                &modules(),
+                &ModuleSelection::Only(Vec::new()),
+                SelectionDirection::Prerequisites,
+            )
+            .is_err()
+        );
+        assert!(
+            expand_module_selection(
+                &modules(),
+                &ModuleSelection::Only(vec!["unknown".to_string()]),
+                SelectionDirection::Prerequisites,
+            )
+            .is_err()
+        );
+    }
+}
+
 /// A composed set of modules ready for plan/apply/destroy.
 ///
 /// Carries three module lists following the deploy-eks pattern:

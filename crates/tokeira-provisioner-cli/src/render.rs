@@ -1851,9 +1851,8 @@ mod tests {
         }
 
         // Provider issues survive engine, explanation, rendering, and process-status boundaries.
-        // Feature: platform-builder-abstraction, Property 13: reachability issues are lossless no-change outcomes
         #[test]
-        fn property_13_reachability_issue_report_and_exit_are_lossless(
+        fn provider_issue_report_and_exit_are_lossless(
             component in "[A-Za-z][A-Za-z0-9-]{0,15}",
             fact in "[A-Za-z][A-Za-z0-9 /:._-]{0,39}",
             evidence in "[A-Za-z0-9][A-Za-z0-9 /:._-]{0,47}",

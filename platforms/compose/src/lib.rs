@@ -795,6 +795,7 @@ mod tests {
     }
 
     #[test]
+    // Feature: platform-builder-abstraction, Property 16: Compose storage modes preserve graph parity.
     fn storage_modes_preserve_the_reference_graph_shape() {
         for (source, has_dsql) in [
             (reference_source().to_string(), false),
@@ -826,6 +827,7 @@ mod tests {
     }
 
     #[tokio::test]
+    // Feature: platform-builder-abstraction, Property 8: verification is pure and execution uses the verified set.
     async fn definition_check_is_provider_and_state_free() {
         let directory = deployment(reference_source());
         assert!(matches!(
@@ -840,37 +842,47 @@ mod tests {
     }
 
     #[test]
+    // Feature: platform-builder-abstraction, Property 11: content coupling is deterministic and sensitive.
     fn configuration_content_is_coupled_to_every_consumer() {
         let directory = deployment(reference_source());
         let first = provisioner()
             .execution(directory.path(), None)
             .expect("realize reference definition");
         let config_id = observability::configuration_resource_id();
-        let mimir = first
-            .resources
-            .values()
-            .flatten()
-            .find(|resource| resource.resource_id().0 == "compose/mimir")
-            .expect("mimir resource");
-        assert!(mimir.dependencies().contains(&config_id));
-        let digest = first.manifests[&ResourceId("compose/mimir".to_string())]["environment"]
-            ["TOKEIRA_CONFIG_DIGEST"]
-            .as_str()
-            .expect("configuration digest")
-            .to_string();
+        let consumers = ["mimir", "loki", "grafana", "alloy"];
+        let first_digests = consumers
+            .iter()
+            .map(|name| {
+                let id = ResourceId(format!("compose/{name}"));
+                let resource = first
+                    .resources
+                    .values()
+                    .flatten()
+                    .find(|resource| resource.resource_id() == id)
+                    .expect("configuration consumer");
+                assert!(resource.dependencies().contains(&config_id));
+                first.manifests[&id]["environment"]["TOKEIRA_CONFIG_DIGEST"]
+                    .as_str()
+                    .expect("configuration digest")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
 
         let edited = reference_source().replace("retention_hours: 168", "retention_hours: 24");
         std::fs::write(directory.path().join("definition.tkd"), edited).expect("edit definition");
         let second = provisioner()
             .execution(directory.path(), None)
             .expect("realize edited definition");
-        assert_ne!(
-            digest,
-            second.manifests[&ResourceId("compose/mimir".to_string())]["environment"]["TOKEIRA_CONFIG_DIGEST"]
-        );
+        for (name, first_digest) in consumers.iter().zip(first_digests) {
+            assert_ne!(
+                first_digest,
+                second.manifests[&ResourceId(format!("compose/{name}"))]["environment"]["TOKEIRA_CONFIG_DIGEST"]
+            );
+        }
     }
 
     #[tokio::test]
+    // Feature: platform-builder-abstraction, Property 17: inspection is deterministic and non-authoritative.
     async fn inspection_projection_is_deterministic_and_non_authoritative() {
         let directory = deployment(reference_source());
         let provisioner = provisioner();

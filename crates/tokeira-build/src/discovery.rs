@@ -485,7 +485,7 @@ default-relative-path = "definition.py"
     }
 
     proptest! {
-        // Property 22 package-shape half: descriptor packages are conventional libraries only.
+        // Feature: platform-builder-abstraction, Property 22: catalog selection determines one static root.
         #[test]
         fn descriptor_target_admission_matches_the_reference_shape(
             has_library in any::<bool>(),

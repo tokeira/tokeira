@@ -99,7 +99,15 @@ impl Engine {
         known: &[&dyn Resource],
         ctx: &mut ProvisionContext,
     ) -> Result<PlanOutcome, IacError> {
-        let refreshed = refresh_state(known, desired, ctx, None).await?;
+        let recorded = ctx.state.clone();
+        let refreshed = match refresh_state(known, desired, ctx, None).await {
+            Ok(refreshed) => refreshed,
+            Err(IacError::PlatformIssue(issue)) => {
+                ctx.state = recorded;
+                return Ok(PlanOutcome::blocked_by(issue));
+            }
+            Err(error) => return Err(error),
+        };
         ctx.state = refreshed.state;
         let delta = compute_changes(desired, &ctx.state, ctx);
         Ok(PlanOutcome {
@@ -127,7 +135,15 @@ impl Engine {
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let desired_refs: Vec<&dyn Resource> = desired.iter().map(|r| r.as_ref()).collect();
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
-        let refreshed = refresh_state(&known_refs, &desired_refs, ctx, None).await?;
+        let recorded = ctx.state.clone();
+        let refreshed = match refresh_state(&known_refs, &desired_refs, ctx, None).await {
+            Ok(refreshed) => refreshed,
+            Err(IacError::PlatformIssue(issue)) => {
+                ctx.state = recorded;
+                return Ok(PlanOutcome::blocked_by(issue));
+            }
+            Err(error) => return Err(error),
+        };
         ctx.state = refreshed.state;
         let delta = compute_changes(&desired_refs, &ctx.state, ctx);
         let active: Vec<&str> = composition
@@ -255,7 +271,15 @@ impl Engine {
         let known = collect_resources_from(&composition.known_modules, ctx)?;
         let known_refs: Vec<&dyn Resource> = known.iter().map(|r| r.as_ref()).collect();
         let desired: [&dyn Resource; 0] = [];
-        let refreshed = refresh_state(&known_refs, &desired, ctx, None).await?;
+        let recorded = ctx.state.clone();
+        let refreshed = match refresh_state(&known_refs, &desired, ctx, None).await {
+            Ok(refreshed) => refreshed,
+            Err(IacError::PlatformIssue(issue)) => {
+                ctx.state = recorded;
+                return Ok(PlanOutcome::blocked_by(issue));
+            }
+            Err(error) => return Err(error),
+        };
         ctx.state = refreshed.state;
         let delta = compute_changes(&desired, &ctx.state, ctx);
         Ok(PlanOutcome {
@@ -290,7 +314,7 @@ impl Engine {
             semantics_by_id: outcome.semantics_by_id,
             display_by_id: outcome.display_by_id,
             edges_by_id: outcome.edges_by_id,
-            platform_issues: Vec::new(),
+            platform_issues: outcome.platform_issues,
         })
     }
 
@@ -587,6 +611,27 @@ pub struct PlatformIssue {
     pub direction: Option<String>,
 }
 
+impl std::fmt::Display for PlatformIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.fact, self.evidence)?;
+        if let Some(direction) = &self.direction {
+            write!(f, "; {direction}")?;
+        }
+        Ok(())
+    }
+}
+
+impl PlanOutcome {
+    /// Refuse a plan without manufacturing record-based changes when a
+    /// provider cannot describe the live substrate it owns.
+    fn blocked_by(issue: PlatformIssue) -> Self {
+        Self {
+            platform_issues: vec![issue],
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RefreshReport {
     state: crate::document::InfraState,
@@ -698,12 +743,22 @@ async fn refresh_state(
         })?;
         let is_desired = desired_ids.contains(&resource_id);
 
-        match resource.describe(ctx).await.map_err(|err| {
-            IacError::Other(anyhow::anyhow!(
-                "failed to describe resource '{}' during refresh: {err}",
-                resource_id.0
-            ))
-        })? {
+        let description = match resource.describe(ctx).await {
+            Ok(description) => description,
+            // The provider owns every word of this typed issue. Keeping the
+            // variant intact lets plan return it verbatim, while apply and
+            // destroy still propagate the same failure as a hard error.
+            Err(IacError::PlatformIssue(issue)) => {
+                return Err(IacError::PlatformIssue(issue));
+            }
+            Err(error) => {
+                return Err(IacError::Other(anyhow::anyhow!(
+                    "failed to describe resource '{}' during refresh: {error}",
+                    resource_id.0
+                )));
+            }
+        };
+        match description {
             DescribeResult::Present(live_state) => {
                 if let Some(prior) = recorded.resources.get(&resource_id)
                     && prior.properties != live_state.properties
@@ -1506,7 +1561,9 @@ mod tests {
         /// When true, `diff` returns [`InternalChange::Replace`] — models an
         /// immutable-field change requiring delete-then-recreate.
         diff_replace: bool,
+        describe_issue: Option<PlatformIssue>,
         create_fails: bool,
+        create_counter: Option<Arc<AtomicUsize>>,
         delete_counter: Option<Arc<AtomicUsize>>,
         delete_capture: Option<Arc<Mutex<Vec<String>>>>,
     }
@@ -1519,7 +1576,9 @@ mod tests {
                 describe_state: None,
                 describe_unsupported: false,
                 diff_replace: false,
+                describe_issue: None,
                 create_fails: false,
+                create_counter: None,
                 delete_counter: None,
                 delete_capture: None,
             }
@@ -1532,7 +1591,9 @@ mod tests {
                 describe_state: Some(stub_state(id, module)),
                 describe_unsupported: false,
                 diff_replace: false,
+                describe_issue: None,
                 create_fails: false,
+                create_counter: None,
                 delete_counter: None,
                 delete_capture: None,
             }
@@ -1545,7 +1606,9 @@ mod tests {
                 describe_state: None,
                 describe_unsupported: false,
                 diff_replace: false,
+                describe_issue: None,
                 create_fails: true,
+                create_counter: None,
                 delete_counter: None,
                 delete_capture: None,
             }
@@ -1560,6 +1623,16 @@ mod tests {
         /// `diff` reports an immutable-field change ([`InternalChange::Replace`]).
         fn with_replace(mut self) -> Self {
             self.diff_replace = true;
+            self
+        }
+
+        fn with_describe_issue(mut self, issue: PlatformIssue) -> Self {
+            self.describe_issue = Some(issue);
+            self
+        }
+
+        fn with_create_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
+            self.create_counter = Some(counter);
             self
         }
 
@@ -1593,6 +1666,9 @@ mod tests {
         }
 
         async fn create(&self, _ctx: &ProvisionContext) -> Result<crate::ResourceState, IacError> {
+            if let Some(counter) = &self.create_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
             if self.create_fails {
                 return Err(IacError::Other(anyhow::anyhow!("create failed")));
             }
@@ -1625,6 +1701,9 @@ mod tests {
         }
 
         async fn describe(&self, _ctx: &ProvisionContext) -> Result<DescribeResult, IacError> {
+            if let Some(issue) = &self.describe_issue {
+                return Err(IacError::PlatformIssue(issue.clone()));
+            }
             if self.describe_unsupported {
                 return Ok(DescribeResult::Unsupported);
             }
@@ -1956,6 +2035,84 @@ mod tests {
 
     fn refs(resources: &[Box<dyn Resource>]) -> Vec<&dyn Resource> {
         resources.iter().map(|resource| resource.as_ref()).collect()
+    }
+
+    #[tokio::test]
+    async fn reachability_issue_blocks_plans_without_softening_mutations() {
+        let issue = PlatformIssue {
+            component: "Docker".to_string(),
+            fact: "Unable to connect to Docker".to_string(),
+            evidence: "connection refused by /var/run/docker.sock".to_string(),
+            direction: Some("verify Docker is listening".to_string()),
+        };
+        let creates = Arc::new(AtomicUsize::new(0));
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let resource = StubResource::missing("z-service", "runtime")
+            .with_describe_issue(issue.clone())
+            .with_create_counter(Arc::clone(&creates))
+            .with_delete_counter(Arc::clone(&deletes));
+        let resources = boxed_resources(vec![StubResource::live("a-live", "runtime"), resource]);
+        let references = refs(&resources);
+        let engine = Engine::new();
+
+        let mut plan_context = ProvisionContext::default();
+        let outcome = engine
+            .plan_with_known(&references, &references, &mut plan_context)
+            .await
+            .expect("provider reachability is a typed plan outcome");
+        assert!(outcome.changes.is_empty());
+        assert_eq!(outcome.platform_issues, vec![issue.clone()]);
+        assert!(
+            plan_context.state.resources.is_empty(),
+            "a refused plan restores its complete pre-refresh in-memory state"
+        );
+
+        let mut apply_context = ProvisionContext::default();
+        let apply_error = engine
+            .apply_with_known(&references, &references, &mut apply_context, None)
+            .await
+            .expect_err("apply must keep provider reachability as a hard error");
+        assert!(matches!(apply_error, IacError::PlatformIssue(ref actual) if actual == &issue));
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+
+        let mut destroy_context = ProvisionContext::default();
+        destroy_context.state.resources.insert(
+            ResourceId("z-service".to_string()),
+            stub_state("z-service", "runtime"),
+        );
+        let destroy_error = engine
+            .destroy_known(&references, &mut destroy_context, None)
+            .await
+            .expect_err("destroy must keep provider reachability as a hard error");
+        let rendered = destroy_error.to_string();
+        assert!(rendered.contains(&issue.fact));
+        assert!(rendered.contains(&issue.evidence));
+        assert!(rendered.contains(issue.direction.as_deref().expect("direction")));
+        assert_eq!(deletes.load(Ordering::SeqCst), 0);
+        assert!(
+            destroy_context
+                .state
+                .resources
+                .contains_key(&ResourceId("z-service".to_string())),
+            "a refused destroy retains recorded state"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_desired_endpoint_remains_plannable_during_first_creation() {
+        let resources = boxed_resources(vec![StubResource::missing("cluster/service", "runtime")]);
+        let references = refs(&resources);
+        let mut context = ProvisionContext::default();
+
+        let outcome = Engine::new()
+            .plan_with_known(&references, &references, &mut context)
+            .await
+            .expect("a not-yet-created desired endpoint is ordinary absence");
+
+        assert!(outcome.platform_issues.is_empty());
+        assert_eq!(outcome.changes.len(), 1);
+        assert_eq!(outcome.changes[0].kind, ChangeKind::Create);
+        assert_eq!(outcome.changes[0].resource, "cluster/service");
     }
 
     #[test]
@@ -2508,7 +2665,9 @@ mod tests {
             describe_state: Some(live_state),
             describe_unsupported: false,
             diff_replace: false,
+            describe_issue: None,
             create_fails: false,
+            create_counter: None,
             delete_counter: None,
             delete_capture: None,
         }

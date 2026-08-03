@@ -322,6 +322,12 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
             .await
         }
     };
+    exit_status(outcome)
+}
+
+/// Collapse the typed post-report platform refusal to a bare process status.
+/// Every other failure remains an error so the entrypoint can render it once.
+pub(crate) fn exit_status(outcome: Result<()>) -> Result<std::process::ExitCode> {
     match outcome {
         Ok(()) => Ok(std::process::ExitCode::SUCCESS),
         Err(err) => match err.downcast::<crate::PlatformBlocked>() {

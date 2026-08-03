@@ -3,8 +3,15 @@
 use thiserror::Error;
 use tokeira_state::StateError;
 
+use crate::PlatformIssue;
+
 #[derive(Debug, Error)]
 pub enum IacError {
+    /// A provider SDK seam classified a reachability failure while describing
+    /// live state. Plan paths transport this as a no-change outcome; mutation
+    /// paths keep it as a hard, actionable error.
+    #[error("Platform issue: {0}")]
+    PlatformIssue(PlatformIssue),
     /// Provider-owned runtime preparation failed before resource execution.
     #[error("Provider error: {0}")]
     Provider(String),

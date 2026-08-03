@@ -11,7 +11,9 @@ use crate::{
         OperationalArtifactReceipt, OperationalArtifactRequest,
     },
     author::{AuthorNode, KindSchema, from_author_node},
-    error::{BindingError, DeliveryError, KindError},
+    binding::Platform,
+    context::InvocationContext,
+    error::{BindingError, DeliveryError, KindError, ProviderExecutionError},
     graph::WorkloadDeclaration,
 };
 
@@ -437,26 +439,98 @@ pub trait ProviderDelivery: Debug + Send + Sync {
     ) -> Result<OperationalArtifactReceipt, DeliveryError>;
 }
 
+/// Provider-owned runtime capabilities selected by one platform binding.
+///
+/// Author evaluation never receives this registration. The generic framework
+/// invokes it only after definition verification and deployment identity
+/// admission, preserving the provider/context extension boundary used by the
+/// existing infrastructure and deploy engines.
+#[async_trait]
+pub trait ProviderExecution<P: Platform>: Debug + Send + Sync {
+    /// Stable provider identity used for validation and actionable errors.
+    fn provider(&self) -> &str;
+
+    /// Register provider clients, recovery hooks, and validated runtime handles.
+    async fn register_infra_extensions(
+        &self,
+        _config: &P::Config,
+        _invocation: &InvocationContext,
+        _context: &mut tokeira_iac::ProvisionContext,
+    ) -> Result<(), ProviderExecutionError> {
+        Ok(())
+    }
+
+    /// Register handles consumed while projecting or applying runtime services.
+    async fn register_deploy_extensions(
+        &self,
+        _config: &P::Config,
+        _invocation: &InvocationContext,
+        _context: &mut tokeira_deploy_engine::ServiceContext,
+    ) -> Result<(), ProviderExecutionError> {
+        Ok(())
+    }
+
+    /// Register handles consumed while resolving selected platform images.
+    async fn register_image_extensions(
+        &self,
+        _config: &P::Config,
+        _invocation: &InvocationContext,
+        _context: &mut tokeira_deploy_engine::ImageContext,
+    ) -> Result<(), ProviderExecutionError> {
+        Ok(())
+    }
+
+    /// Resolve the subset of the platform image catalog owned by this provider.
+    fn images(
+        &self,
+        _config: &P::Config,
+        _catalog: &ImageCatalog<P>,
+    ) -> Vec<Box<dyn tokeira_deploy_engine::Image>> {
+        Vec::new()
+    }
+
+    /// Hydrate provider-derived infrastructure outputs into runtime-only config.
+    fn hydrate_config(&self, config: &P::Config, _state: &tokeira_iac::InfraState) -> P::Config {
+        config.clone()
+    }
+
+    /// Supply the provider executor for a separate deploy-engine workload universe.
+    fn deploy_platform(&self) -> Option<Arc<dyn tokeira_deploy_engine::Platform>> {
+        None
+    }
+}
+
 /// Selected provider capabilities for one platform binding.
 #[derive(Clone)]
-pub struct ProviderSet<P> {
+pub struct ProviderSet<P: Platform> {
     deliveries: Vec<Arc<dyn ProviderDelivery>>,
+    executions: Vec<Arc<dyn ProviderExecution<P>>>,
     marker: PhantomData<fn() -> P>,
 }
 
-impl<P> std::fmt::Debug for ProviderSet<P> {
+impl<P: Platform> std::fmt::Debug for ProviderSet<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderSet")
             .field("delivery_keys", &self.delivery_keys())
+            .field("execution_keys", &self.execution_keys())
             .finish()
     }
 }
 
-impl<P> ProviderSet<P> {
+impl<P: Platform> ProviderSet<P> {
     /// Construct a selected provider set.
     pub fn new(deliveries: Vec<Arc<dyn ProviderDelivery>>) -> Self {
+        Self::with_executions(deliveries, Vec::new())
+    }
+
+    /// Construct selected delivery and runtime registrations.
+    pub fn with_executions(
+        deliveries: Vec<Arc<dyn ProviderDelivery>>,
+        executions: Vec<Arc<dyn ProviderExecution<P>>>,
+    ) -> Self {
         Self {
             deliveries,
+            executions,
             marker: PhantomData,
         }
     }
@@ -474,6 +548,46 @@ impl<P> ProviderSet<P> {
         &self.deliveries
     }
 
+    /// Return provider execution identities for binding validation.
+    pub fn execution_keys(&self) -> BTreeSet<String> {
+        self.executions
+            .iter()
+            .map(|execution| execution.provider().to_string())
+            .collect()
+    }
+
+    /// Borrow selected provider runtime registrations.
+    pub fn executions(&self) -> &[Arc<dyn ProviderExecution<P>>] {
+        &self.executions
+    }
+
+    /// Resolve the single selected deploy-engine platform, when one exists.
+    pub fn deploy_platform(
+        &self,
+    ) -> Result<Option<Arc<dyn tokeira_deploy_engine::Platform>>, crate::error::FrameworkError>
+    {
+        let platforms = self
+            .executions
+            .iter()
+            .filter_map(|execution| {
+                execution
+                    .deploy_platform()
+                    .map(|platform| (execution.provider(), platform))
+            })
+            .collect::<Vec<_>>();
+        match platforms.as_slice() {
+            [] => Ok(None),
+            [(_, platform)] => Ok(Some(Arc::clone(platform))),
+            _ => Err(crate::error::FrameworkError::AmbiguousDeployPlatform(
+                platforms
+                    .iter()
+                    .map(|(provider, _)| *provider)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )),
+        }
+    }
+
     /// Resolve selected provider delivery mechanics by stable key.
     pub fn delivery(&self, key: &DeliveryKey) -> Option<&dyn ProviderDelivery> {
         self.deliveries
@@ -483,7 +597,7 @@ impl<P> ProviderSet<P> {
     }
 }
 
-impl<P> Default for ProviderSet<P> {
+impl<P: Platform> Default for ProviderSet<P> {
     fn default() -> Self {
         Self::new(Vec::new())
     }

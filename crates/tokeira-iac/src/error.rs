@@ -5,6 +5,9 @@ use tokeira_state::StateError;
 
 #[derive(Debug, Error)]
 pub enum IacError {
+    /// Provider-owned runtime preparation failed before resource execution.
+    #[error("Provider error: {0}")]
+    Provider(String),
     #[error("Provider SDK error: {0}")]
     AwsSdk(String),
     #[error("State not found: {0}")]

@@ -4,7 +4,7 @@
 //! frontends and selected by first-party platform bindings. It deliberately
 //! contains no parser, provider implementation, platform inventory, CLI, or
 //! provisioner entrypoint. Frontends translate their runtime values into
-//! [`author::AuthorNode`]; provider crates supply typed registrations through
+//! [`author::LocatedValue`]; provider crates supply typed registrations through
 //! [`catalog`]; platform crates assemble immutable values through [`binding`].
 
 pub mod artifact;

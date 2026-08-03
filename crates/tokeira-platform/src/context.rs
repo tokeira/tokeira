@@ -4,7 +4,7 @@ use std::{fmt::Debug, marker::PhantomData, path::PathBuf};
 
 use serde::Serialize;
 
-use crate::{author::AuthorNode, error::ContextError};
+use crate::{author::LocatedValue, error::ContextError};
 
 /// Shell-owned facts from which a platform constructs one immutable evaluation context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +27,7 @@ pub struct InvocationContext {
 #[derive(Debug, Clone)]
 pub enum ContextArgument<T> {
     /// Ordinary host-free author value.
-    Value(AuthorNode),
+    Value(LocatedValue),
     /// Typed value previously produced by this context.
     Token(T),
 }
@@ -36,7 +36,7 @@ pub enum ContextArgument<T> {
 #[derive(Debug, Clone)]
 pub enum ContextProjection<T> {
     /// Ordinary host-free author value.
-    Value(AuthorNode),
+    Value(LocatedValue),
     /// Typed value that must remain opaque to the definition frontend.
     Token(T),
 }

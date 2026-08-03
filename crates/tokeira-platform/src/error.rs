@@ -243,40 +243,6 @@ pub enum GraphError {
     Invalid(Vec<GraphFinding>),
 }
 
-/// Failure in generic authoring dispatch.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("authoring contract error: {message}")]
-pub struct AuthorError {
-    /// Actionable dispatch, receiver, or graph detail.
-    pub message: String,
-    /// Most specific frontend range supplied by the failed argument.
-    pub range: Option<SourceRange>,
-}
-
-impl AuthorError {
-    /// Construct an unlocated authoring error.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            range: None,
-        }
-    }
-
-    /// Attach a range unless a lower layer supplied one.
-    pub fn at(mut self, range: Option<SourceRange>) -> Self {
-        if self.range.is_none() {
-            self.range = range;
-        }
-        self
-    }
-}
-
-impl From<GraphError> for AuthorError {
-    fn from(value: GraphError) -> Self {
-        Self::new(value.to_string())
-    }
-}
-
 /// Failure to assemble one immutable platform binding.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("invalid platform binding: {message}")]

@@ -522,9 +522,7 @@ mod tests {
             DeliveryKey, DesiredContent, DesiredDocument, OperationalArtifactReceipt,
             OperationalArtifactRequest, PlatformArtifact,
         },
-        author::{
-            AuthorArgument, AuthorHandle, AuthorNode, AuthorResult, AuthorSession, AuthorValue,
-        },
+        author::{LocatedValue, ValueShape},
         binding::{StateBinding, StatePolicy},
         catalog::{
             DeliveryProjection, HealthDeclaration, ImageCatalog, ImageSelection, KindSet,
@@ -534,7 +532,7 @@ mod tests {
         config::{ConfigContract, PlatformConfig},
         context::{ContextArgument, ContextContract, ContextProjection, PlatformContext},
         error::{ConfigError, ContextError, DeliveryError, FrontendDiagnostic},
-        graph::WorkloadDeclaration,
+        graph::{DeploymentGraphBuilder, WorkloadDeclaration},
         ops::PlatformOps,
     };
 
@@ -651,39 +649,36 @@ mod tests {
         fn evaluate(
             &self,
             _source: tokeira_platform::definition::FrontendSource<'_>,
-            author: &mut AuthorSession<FakePlatform>,
+            _context: &FakeContext,
+            binding: &PlatformBinding<FakePlatform>,
         ) -> Result<tokeira_platform::definition::FrontendOutput, FrontendDiagnostic> {
-            let AuthorResult::Handle(AuthorHandle::Deployment(deployment)) = author
-                .associated("Deployment.new", Vec::new())
-                .expect("deployment constructor")
-            else {
-                panic!("Deployment.new returns a deployment handle");
-            };
-            let AuthorResult::Handle(AuthorHandle::Module(bootstrap)) = author
-                .call(
-                    AuthorHandle::Deployment(deployment.clone()),
-                    "module",
-                    vec![AuthorArgument::Value(AuthorNode::string("bootstrap"))],
-                )
-                .expect("bootstrap module")
-            else {
-                panic!("Deployment.module returns a module handle");
-            };
+            let mut graph = DeploymentGraphBuilder::with_catalogs(
+                binding.services.identities(),
+                binding.providers.delivery_keys(),
+            )
+            .require_bootstrap(binding.bootstrap_module.clone());
+            let deployment = graph.deployment_handle();
+            let bootstrap = graph
+                .add_module(&deployment, "bootstrap".into(), Vec::new())
+                .expect("bootstrap module");
             if self.workload {
-                author
-                    .call(
-                        AuthorHandle::Module(bootstrap),
-                        "workload",
-                        vec![
-                            AuthorArgument::Value(AuthorNode::string("server")),
-                            AuthorArgument::Value(AuthorNode::new(AuthorValue::Integer(1))),
-                        ],
+                let service = binding.services.get("server").expect("test service");
+                graph
+                    .add_workload(
+                        &bootstrap,
+                        WorkloadDeclaration {
+                            service: service.logical_id.clone(),
+                            dependencies: service.placement.needs.clone(),
+                            desired_capacity: 1,
+                            delivery: service.delivery.clone(),
+                            document: service.document.clone(),
+                        },
                     )
                     .expect("runtime workload");
             }
             Ok(tokeira_platform::definition::FrontendOutput {
-                config: AuthorNode::new(AuthorValue::Unit),
-                deployment,
+                config: LocatedValue::new(ValueShape::Unit),
+                graph: graph.finish_for(deployment).expect("completed graph"),
             })
         }
     }

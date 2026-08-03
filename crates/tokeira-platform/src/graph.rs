@@ -38,27 +38,6 @@ pub struct ResourceHandle {
     declared_outputs: Arc<[String]>,
 }
 
-/// Opaque take-once provider-kind identity owned by an author session.
-#[derive(Debug, Clone)]
-pub struct KindHandle {
-    owner: Weak<()>,
-    index: usize,
-}
-
-impl KindHandle {
-    pub(crate) fn new(owner: Weak<()>, index: usize) -> Self {
-        Self { owner, index }
-    }
-
-    pub(crate) fn owner(&self) -> &Weak<()> {
-        &self.owner
-    }
-
-    pub(crate) fn index(&self) -> usize {
-        self.index
-    }
-}
-
 /// Checked logical reference to one declared provider-resource output.
 #[derive(Debug, Clone)]
 pub struct OutputReference {

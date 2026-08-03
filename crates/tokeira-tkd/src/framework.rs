@@ -1,17 +1,22 @@
-//! Adapter from the `.tkd` interpreter runtime to the language-neutral Authoring Contract.
+//! `.tkd` frontend adapter over the transient structural-definition boundary.
+//!
+//! Evaluator handles and the name-to-operation table live here. The platform
+//! framework receives only a completed graph and a located host-free config
+//! value; no interpreter handle or dispatch protocol crosses the crate seam.
 
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::{
-    author::{
-        AuthorArgument, AuthorHandle, AuthorNode, AuthorResult, AuthorSession, AuthorValue,
-        AuthorVariantBody,
-    },
-    binding::Platform,
+    author::{LocatedValue, ValueShape, VariantShape},
+    binding::{Platform, PlatformBinding},
+    catalog::ProviderKind,
     definition::{DefinitionFrontend, FrontendOutput, FrontendSource},
-    error::{DiagnosticCategory, FrontendDiagnostic, SourceRange},
-    graph::DeploymentHandle,
+    error::{ContextError, DiagnosticCategory, FrontendDiagnostic, SourceRange},
+    graph::{
+        DeploymentGraphBuilder, DeploymentHandle, ModuleHandle, OutputReference, ResourceHandle,
+        VerifiedGraph, WritebackValue,
+    },
 };
 
 use crate::{
@@ -19,7 +24,26 @@ use crate::{
     value::{EvalError, FieldMap, Value, VariantBody},
 };
 
-/// The trusted `.tkd` frontend selected independently of any platform.
+/// `.tkd`-specific access to one platform's typed evaluation context.
+///
+/// Implementations return host-free values. Platform paths and other ambient
+/// objects never become opaque shared tokens; a platform may instead return a
+/// normal struct or enum value that its provider kinds decode through Serde.
+pub trait TkdContext: Clone + std::fmt::Debug + Send + Sync + 'static {
+    /// Complete field names accepted by the `.tkd` subset checker.
+    fn fields() -> &'static [&'static str];
+
+    /// Complete method names accepted by the `.tkd` subset checker.
+    fn methods() -> &'static [&'static str];
+
+    /// Read one field as a host-free located value.
+    fn field(&self, name: &str) -> Result<LocatedValue, ContextError>;
+
+    /// Invoke one pure context method with host-free arguments.
+    fn call(&self, method: &str, args: &[LocatedValue]) -> Result<LocatedValue, ContextError>;
+}
+
+/// The trusted `.tkd` frontend selected independently of platform identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TkdFrontend {
     format: DefinitionFormatId,
@@ -46,7 +70,11 @@ pub fn frontend() -> TkdFrontend {
     TkdFrontend::new()
 }
 
-impl<P: Platform> DefinitionFrontend<P> for TkdFrontend {
+impl<P> DefinitionFrontend<P> for TkdFrontend
+where
+    P: Platform,
+    P::Context: TkdContext,
+{
     fn format(&self) -> &DefinitionFormatId {
         &self.format
     }
@@ -54,7 +82,8 @@ impl<P: Platform> DefinitionFrontend<P> for TkdFrontend {
     fn evaluate(
         &self,
         source: FrontendSource<'_>,
-        author: &mut AuthorSession<P>,
+        context: &P::Context,
+        binding: &PlatformBinding<P>,
     ) -> Result<FrontendOutput, FrontendDiagnostic> {
         let source_text =
             std::str::from_utf8(source.bytes).map_err(|error| FrontendDiagnostic {
@@ -65,100 +94,100 @@ impl<P: Platform> DefinitionFrontend<P> for TkdFrontend {
                 message: format!("definition source is not UTF-8: {error}"),
             })?;
         let source_map = SourceMap::new(source.bytes);
-        let bridge = FrameworkBridge::new(author);
-        let (deployment, config) =
-            crate::interpret(source_text, &bridge, &()).map_err(|error| FrontendDiagnostic {
-                format: self.format.clone(),
-                source_name: source.source_name.clone(),
-                range: error
-                    .span
-                    .and_then(|span| source_map.range(span.start(), span.end())),
-                category: DiagnosticCategory::Frontend,
-                message: error.msg,
-            })?;
-        let config = value_to_author_node(config).map_err(|error| FrontendDiagnostic {
-            format: self.format.clone(),
-            source_name: source.source_name.clone(),
-            range: error
-                .span
-                .and_then(|span| source_map.range(span.start(), span.end())),
-            category: DiagnosticCategory::Config,
-            message: error.msg,
-        })?;
-        Ok(FrontendOutput { config, deployment })
+        let bridge = FrameworkBridge::new(binding, context);
+        let (deployment, config) = crate::interpret(source_text, &bridge, context)
+            .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
+        let config = value_to_located(config)
+            .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
+        let graph = bridge
+            .finish_graph(deployment)
+            .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
+        Ok(FrontendOutput { config, graph })
+    }
+}
+
+enum HostValue {
+    Deployment(DeploymentHandle),
+    Module(ModuleHandle),
+    Resource(ResourceHandle),
+    Output(OutputReference),
+    Kind(Rc<RefCell<Option<Box<dyn ProviderKind>>>>),
+    Context,
+}
+
+impl Clone for HostValue {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Deployment(value) => Self::Deployment(value.clone()),
+            Self::Module(value) => Self::Module(value.clone()),
+            Self::Resource(value) => Self::Resource(value.clone()),
+            Self::Output(value) => Self::Output(value.clone()),
+            Self::Kind(value) => Self::Kind(Rc::clone(value)),
+            Self::Context => Self::Context,
+        }
+    }
+}
+
+impl std::fmt::Debug for HostValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deployment(_) => f.write_str("Deployment"),
+            Self::Module(_) => f.write_str("Module"),
+            Self::Resource(_) => f.write_str("Resource"),
+            Self::Output(_) => f.write_str("Output"),
+            Self::Kind(_) => f.write_str("ProviderKind"),
+            Self::Context => f.write_str("Context"),
+        }
     }
 }
 
 struct FrameworkBridge<'a, P: Platform> {
-    author: RefCell<&'a mut AuthorSession<P>>,
-    schema: tokeira_platform::author::AuthorSchema,
-    modules: RefCell<BTreeMap<String, AuthorHandle>>,
+    binding: &'a PlatformBinding<P>,
+    context: &'a P::Context,
+    graph: RefCell<Option<DeploymentGraphBuilder>>,
+    modules: RefCell<BTreeMap<String, ModuleHandle>>,
 }
 
 impl<'a, P: Platform> FrameworkBridge<'a, P> {
-    fn new(author: &'a mut AuthorSession<P>) -> Self {
-        let schema = author.schema();
+    fn new(binding: &'a PlatformBinding<P>, context: &'a P::Context) -> Self {
+        let graph = DeploymentGraphBuilder::with_catalogs(
+            binding.services.identities(),
+            binding.providers.delivery_keys(),
+        )
+        .require_bootstrap(binding.bootstrap_module.clone());
         Self {
-            author: RefCell::new(author),
-            schema,
+            binding,
+            context,
+            graph: RefCell::new(Some(graph)),
             modules: RefCell::new(BTreeMap::new()),
         }
     }
 
-    fn invoke(
+    fn with_graph<T>(
         &self,
-        receiver: AuthorHandle,
-        method: &str,
-        args: Vec<Value<AuthorHandle>>,
-    ) -> Result<Value<AuthorHandle>, EvalError> {
-        let arguments = args
-            .into_iter()
-            .map(value_to_author_argument)
-            .collect::<Result<Vec<_>, _>>()?;
-        self.author
-            .borrow_mut()
-            .call(receiver, method, arguments)
-            .map_err(author_error)
-            .and_then(author_result_to_value)
+        action: impl FnOnce(
+            &mut DeploymentGraphBuilder,
+        ) -> Result<T, tokeira_platform::error::GraphError>,
+    ) -> Result<T, EvalError> {
+        let mut graph = self.graph.borrow_mut();
+        let graph = graph
+            .as_mut()
+            .ok_or_else(|| EvalError::new("the structural graph is already complete"))?;
+        action(graph).map_err(|error| EvalError::new(error.to_string()))
     }
 
-    fn invoke_module(
-        &self,
-        receiver: AuthorHandle,
-        args: Vec<Value<AuthorHandle>>,
-    ) -> Result<Value<AuthorHandle>, EvalError> {
-        let mut args = args.into_iter();
-        let name = args
-            .next()
-            .ok_or_else(|| EvalError::new("Deployment.module expects a module name"))?;
-        let name_text = name.as_str()?.to_string();
-        let mut arguments = vec![AuthorArgument::Value(value_to_author_node(name)?)];
-        if let Some(dependencies) = args.next() {
-            arguments.extend(self.module_dependencies(dependencies)?);
-        }
-        if args.next().is_some() {
-            return Err(EvalError::new(
-                "Deployment.module expects a name and one dependency collection",
-            ));
-        }
-        let result = self
-            .author
+    fn finish_graph(&self, deployment: DeploymentHandle) -> Result<VerifiedGraph, EvalError> {
+        let graph = self
+            .graph
             .borrow_mut()
-            .call(receiver, "module", arguments)
-            .map_err(author_error)?;
-        let AuthorResult::Handle(handle @ AuthorHandle::Module(_)) = result else {
-            return Err(EvalError::new(
-                "Deployment.module returned a non-module author value",
-            ));
-        };
-        self.modules.borrow_mut().insert(name_text, handle.clone());
-        Ok(Value::Host(handle))
+            .take()
+            .ok_or_else(|| EvalError::new("the structural graph is already complete"))?;
+        graph
+            .finish_for(deployment)
+            .map_err(|error| EvalError::new(error.to_string()))
     }
 
-    fn module_dependencies(
-        &self,
-        value: Value<AuthorHandle>,
-    ) -> Result<Vec<AuthorArgument>, EvalError> {
+    fn module_dependencies(&self, value: Value<HostValue>) -> Result<Vec<ModuleHandle>, EvalError> {
         let Value::Vec(values) = value else {
             return Err(EvalError::new(
                 "module dependencies must be an array of module names or handles",
@@ -167,18 +196,12 @@ impl<'a, P: Platform> FrameworkBridge<'a, P> {
         values
             .into_iter()
             .map(|value| match value {
-                Value::Host(handle @ AuthorHandle::Module(_)) => Ok(AuthorArgument::Handle(handle)),
-                Value::Str(name) => self
-                    .modules
-                    .borrow()
-                    .get(&name)
-                    .cloned()
-                    .map(AuthorArgument::Handle)
-                    .ok_or_else(|| {
-                        EvalError::new(format!(
-                            "module dependency `{name}` has not been declared yet"
-                        ))
-                    }),
+                Value::Host(HostValue::Module(module)) => Ok(module),
+                Value::Str(name) => self.modules.borrow().get(&name).cloned().ok_or_else(|| {
+                    EvalError::new(format!(
+                        "module dependency `{name}` has not been declared yet"
+                    ))
+                }),
                 other => Err(EvalError::new(format!(
                     "module dependencies must be module names or handles, got {other:?}"
                 ))),
@@ -186,121 +209,116 @@ impl<'a, P: Platform> FrameworkBridge<'a, P> {
             .collect()
     }
 
-    fn invoke_resource(
-        &self,
-        args: Vec<Value<AuthorHandle>>,
-    ) -> Result<Value<AuthorHandle>, EvalError> {
-        let mut args = args.into_iter();
-        let module = match args.next() {
-            Some(Value::Host(handle @ AuthorHandle::Module(_))) => handle,
-            Some(other) => {
-                return Err(EvalError::new(format!(
-                    "Deployment.resource expects a module handle, got {other:?}"
-                )));
-            }
-            None => {
-                return Err(EvalError::new(
-                    "Deployment.resource expects a module handle, logical id, and kind",
-                ));
-            }
-        };
-        let logical_id = args
-            .next()
-            .ok_or_else(|| EvalError::new("Deployment.resource is missing its logical id"))?;
-        let kind = args
-            .next()
-            .ok_or_else(|| EvalError::new("Deployment.resource is missing its provider kind"))?;
-        let mut arguments = vec![
-            value_to_author_argument(logical_id)?,
-            value_to_author_argument(kind)?,
-        ];
-        if let Some(dependencies) = args.next() {
-            arguments.extend(resource_dependencies(dependencies)?);
-        }
-        if args.next().is_some() {
+    fn resource_dependencies(value: Value<HostValue>) -> Result<Vec<ResourceHandle>, EvalError> {
+        let Value::Vec(values) = value else {
             return Err(EvalError::new(
-                "Deployment.resource accepts at most one dependency collection",
+                "resource dependencies must be an array of resource handles",
             ));
-        }
-        self.author
-            .borrow_mut()
-            .call(module, "resource", arguments)
-            .map_err(author_error)
-            .and_then(author_result_to_value)
+        };
+        values
+            .into_iter()
+            .map(|value| match value {
+                Value::Host(HostValue::Resource(resource)) => Ok(resource),
+                other => Err(EvalError::new(format!(
+                    "resource dependencies must be resource handles, got {other:?}"
+                ))),
+            })
+            .collect()
     }
 
-    fn invoke_module_resource(
+    fn add_module(
         &self,
-        receiver: AuthorHandle,
-        args: Vec<Value<AuthorHandle>>,
-    ) -> Result<Value<AuthorHandle>, EvalError> {
+        deployment: &DeploymentHandle,
+        args: Vec<Value<HostValue>>,
+    ) -> Result<Value<HostValue>, EvalError> {
+        let mut args = args.into_iter();
+        let name = args
+            .next()
+            .ok_or_else(|| EvalError::new("Deployment.module expects a module name"))?
+            .as_str()?
+            .to_string();
+        let dependencies = args
+            .next()
+            .map(|value| self.module_dependencies(value))
+            .transpose()?
+            .unwrap_or_default();
+        if args.next().is_some() {
+            return Err(EvalError::new(
+                "Deployment.module expects a name and one dependency collection",
+            ));
+        }
+        let module =
+            self.with_graph(|graph| graph.add_module(deployment, name.clone(), dependencies))?;
+        self.modules.borrow_mut().insert(name, module.clone());
+        Ok(Value::Host(HostValue::Module(module)))
+    }
+
+    fn add_resource(
+        &self,
+        module: ModuleHandle,
+        args: Vec<Value<HostValue>>,
+    ) -> Result<Value<HostValue>, EvalError> {
         let mut args = args.into_iter();
         let logical_id = args
             .next()
-            .ok_or_else(|| EvalError::new("Module.resource is missing its logical id"))?;
-        let kind = args
+            .ok_or_else(|| EvalError::new("resource is missing its logical id"))?
+            .as_str()?
+            .to_string();
+        let kind = match args
             .next()
-            .ok_or_else(|| EvalError::new("Module.resource is missing its provider kind"))?;
-        let mut arguments = vec![
-            value_to_author_argument(logical_id)?,
-            value_to_author_argument(kind)?,
-        ];
-        if let Some(dependencies) = args.next() {
-            arguments.extend(resource_dependencies(dependencies)?);
-        }
+            .ok_or_else(|| EvalError::new("resource is missing its provider kind"))?
+        {
+            Value::Host(HostValue::Kind(kind)) => kind,
+            other => {
+                return Err(EvalError::new(format!(
+                    "resource expects a provider kind, got {other:?}"
+                )));
+            }
+        };
+        let dependencies = args
+            .next()
+            .map(Self::resource_dependencies)
+            .transpose()?
+            .unwrap_or_default();
         if args.next().is_some() {
             return Err(EvalError::new(
-                "Module.resource accepts at most one dependency collection",
+                "resource accepts at most one dependency collection",
             ));
         }
-        self.author
+        let kind = kind
             .borrow_mut()
-            .call(receiver, "resource", arguments)
-            .map_err(author_error)
-            .and_then(author_result_to_value)
+            .take()
+            .ok_or_else(|| EvalError::new("provider-kind handle was already consumed"))?;
+        let resource =
+            self.with_graph(|graph| graph.add_resource(&module, logical_id, kind, dependencies))?;
+        Ok(Value::Host(HostValue::Resource(resource)))
     }
 }
 
-impl<P: Platform> HostBridge for FrameworkBridge<'_, P> {
-    type Host = AuthorHandle;
-    type Cx = ();
+impl<P> HostBridge for FrameworkBridge<'_, P>
+where
+    P: Platform,
+    P::Context: TkdContext,
+{
+    type Host = HostValue;
+    type Cx = P::Context;
     type Output = DeploymentHandle;
 
     fn is_kind(&self, name: &str) -> bool {
-        self.schema.kinds.iter().any(|kind| kind.name == name)
+        self.binding.kinds.contains(name)
     }
 
     fn knows_method(&self, name: &str) -> bool {
-        name == "resource"
-            || self
-                .schema
-                .receivers
-                .iter()
-                .any(|receiver| receiver.methods.iter().any(|method| method == name))
-            || self
-                .schema
-                .context_methods
-                .iter()
-                .any(|method| method == name)
+        matches!(name, "module" | "resource" | "writeback" | "output")
+            || <P::Context as TkdContext>::methods().contains(&name)
     }
 
     fn knows_assoc(&self, path: &str) -> bool {
-        let name = path.replace("::", ".");
-        self.schema
-            .associated_functions
-            .iter()
-            .any(|function| function.name == name)
+        path == "Deployment::new"
     }
 
     fn kind_defaults(&self, name: &str) -> Option<FieldMap<Self::Host>> {
-        let defaults = self
-            .schema
-            .kinds
-            .iter()
-            .find(|kind| kind.name == name)?
-            .defaults
-            .clone()?;
-        match author_node_to_value(defaults).ok()? {
+        match located_to_value(self.binding.kinds.defaults(name)?).ok()? {
             Value::Struct { fields, .. } => Some(fields),
             _ => None,
         }
@@ -310,28 +328,34 @@ impl<P: Platform> HostBridge for FrameworkBridge<'_, P> {
         &self,
         name: &str,
         fields: FieldMap<Self::Host>,
-        _cx: &Self::Cx,
+        _context: &Self::Cx,
     ) -> Result<Self::Host, EvalError> {
-        let input = AuthorNode::new(AuthorValue::Struct {
+        let input = LocatedValue::new(ValueShape::Struct {
             name: name.to_string(),
             fields: fields
                 .into_iter()
-                .map(|(name, value)| value_to_author_node(value).map(|value| (name, value)))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(|(name, value)| value_to_located(value).map(|value| (name, value)))
+                .collect::<Result<_, _>>()?,
         });
-        self.author
-            .borrow_mut()
-            .construct_kind(name, input)
-            .map(AuthorHandle::Kind)
-            .map_err(author_error)
+        let kind = self
+            .binding
+            .kinds
+            .decode(name, input)
+            .map_err(|error| EvalError::new(error.message))?;
+        Ok(HostValue::Kind(Rc::new(RefCell::new(Some(kind)))))
     }
 
     fn assoc(
         &self,
         path: &str,
         args: Vec<Value<Self::Host>>,
-        _cx: &Self::Cx,
+        _context: &Self::Cx,
     ) -> Result<Self::Host, EvalError> {
+        if path != "Deployment::new" {
+            return Err(EvalError::new(format!(
+                "unknown associated function `{path}`"
+            )));
+        }
         let namespaces = match args.as_slice() {
             [] => Vec::new(),
             [Value::Vec(values)] => values
@@ -344,62 +368,100 @@ impl<P: Platform> HostBridge for FrameworkBridge<'_, P> {
                 ));
             }
         };
-        let name = path.replace("::", ".");
-        let result = self
-            .author
-            .borrow_mut()
-            .associated(&name, Vec::new())
-            .map_err(author_error)?;
-        let AuthorResult::Handle(handle @ AuthorHandle::Deployment(_)) = result else {
-            return Err(EvalError::new(
-                "Deployment::new returned a non-deployment author value",
-            ));
-        };
+        let deployment = self.with_graph(|graph| Ok(graph.deployment_handle()))?;
         for namespace in namespaces {
-            self.author
-                .borrow_mut()
-                .call(
-                    handle.clone(),
-                    "namespace",
-                    vec![AuthorArgument::Value(AuthorNode::string(namespace))],
-                )
-                .map_err(author_error)?;
+            self.with_graph(|graph| graph.add_namespace(&deployment, namespace))?;
         }
-        Ok(handle)
+        Ok(HostValue::Deployment(deployment))
     }
 
     fn call_method(
         &self,
-        recv: &Self::Host,
+        receiver: &Self::Host,
         method: &str,
-        args: Vec<Value<Self::Host>>,
-        _cx: &Self::Cx,
+        mut args: Vec<Value<Self::Host>>,
+        _context: &Self::Cx,
     ) -> Result<Value<Self::Host>, EvalError> {
-        match (recv, method) {
-            (AuthorHandle::Deployment(_), "module") => self.invoke_module(recv.clone(), args),
-            (AuthorHandle::Deployment(_), "resource") => self.invoke_resource(args),
-            (AuthorHandle::Module(_), "resource") => {
-                self.invoke_module_resource(recv.clone(), args)
+        match (receiver, method) {
+            (HostValue::Deployment(deployment), "module") => self.add_module(deployment, args),
+            (HostValue::Deployment(_), "resource") => {
+                let Some(Value::Host(HostValue::Module(module))) = args.first().cloned() else {
+                    return Err(EvalError::new(
+                        "Deployment.resource expects a module handle first",
+                    ));
+                };
+                let _ = args.remove(0);
+                self.add_resource(module, args)
             }
-            _ => self.invoke(recv.clone(), method, args),
+            (HostValue::Module(module), "resource") => self.add_resource(module.clone(), args),
+            (HostValue::Deployment(deployment), "writeback") => {
+                if args.len() != 2 {
+                    return Err(EvalError::new(
+                        "Deployment.writeback expects a dotted key and literal or output",
+                    ));
+                }
+                let key = args.remove(0).as_str()?.to_string();
+                let value = match args.remove(0) {
+                    Value::Str(value) => WritebackValue::Literal(value),
+                    Value::Host(HostValue::Output(output)) => WritebackValue::Output(output),
+                    other => {
+                        return Err(EvalError::new(format!(
+                            "writeback value must be a string or output reference, got {other:?}"
+                        )));
+                    }
+                };
+                self.with_graph(|graph| graph.add_writeback(deployment, key, value))?;
+                Ok(Value::Unit)
+            }
+            (HostValue::Resource(resource), "output") => {
+                let [value] = args.as_slice() else {
+                    return Err(EvalError::new("Resource.output expects one string"));
+                };
+                let output = resource
+                    .output(value.as_str()?)
+                    .map_err(|error| EvalError::new(error.to_string()))?;
+                Ok(Value::Host(HostValue::Output(output)))
+            }
+            (HostValue::Context, method) => {
+                let args = args
+                    .into_iter()
+                    .map(value_to_located)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let value = self
+                    .context
+                    .call(method, &args)
+                    .map_err(|error| EvalError::new(error.to_string()))?;
+                located_to_value(value)
+            }
+            (receiver, method) => Err(EvalError::new(format!(
+                "receiver {receiver:?} has no method `{method}`"
+            ))),
         }
     }
 
     fn host_field(&self, host: &Self::Host, field: &str) -> Result<Value<Self::Host>, EvalError> {
-        self.author
-            .borrow_mut()
-            .field(host.clone(), field)
-            .map_err(author_error)
-            .and_then(author_result_to_value)
+        let HostValue::Context = host else {
+            return Err(EvalError::new(format!(
+                "receiver {host:?} has no field `{field}`"
+            )));
+        };
+        if !<P::Context as TkdContext>::fields().contains(&field) {
+            return Err(EvalError::new(format!("unknown context field `{field}`")));
+        }
+        let value = self
+            .context
+            .field(field)
+            .map_err(|error| EvalError::new(error.to_string()))?;
+        located_to_value(value)
     }
 
-    fn cx_host(&self, _cx: &Self::Cx) -> Self::Host {
-        AuthorHandle::Context(self.author.borrow().context_handle())
+    fn cx_host(&self, _context: &Self::Cx) -> Self::Host {
+        HostValue::Context
     }
 
-    fn finish(&self, ret: Self::Host) -> Result<Self::Output, EvalError> {
-        match ret {
-            AuthorHandle::Deployment(deployment) => Ok(deployment),
+    fn finish(&self, value: Self::Host) -> Result<Self::Output, EvalError> {
+        match value {
+            HostValue::Deployment(deployment) => Ok(deployment),
             other => Err(EvalError::new(format!(
                 "deployment() must return a Deployment, got {other:?}"
             ))),
@@ -407,119 +469,84 @@ impl<P: Platform> HostBridge for FrameworkBridge<'_, P> {
     }
 }
 
-fn resource_dependencies(value: Value<AuthorHandle>) -> Result<Vec<AuthorArgument>, EvalError> {
-    let Value::Vec(values) = value else {
-        return Err(EvalError::new(
-            "resource dependencies must be an array of resource handles",
-        ));
-    };
-    values
-        .into_iter()
-        .map(|value| match value {
-            Value::Host(handle @ AuthorHandle::Resource(_)) => Ok(AuthorArgument::Handle(handle)),
-            other => Err(EvalError::new(format!(
-                "resource dependencies must be resource handles, got {other:?}"
-            ))),
-        })
-        .collect()
-}
-
-fn value_to_author_argument(value: Value<AuthorHandle>) -> Result<AuthorArgument, EvalError> {
-    match value {
-        Value::Host(handle) => Ok(AuthorArgument::Handle(handle)),
-        value => value_to_author_node(value).map(AuthorArgument::Value),
-    }
-}
-
-fn value_to_author_node(value: Value<AuthorHandle>) -> Result<AuthorNode, EvalError> {
+fn value_to_located(value: Value<HostValue>) -> Result<LocatedValue, EvalError> {
     let value = match value {
-        Value::Unit => AuthorValue::Unit,
-        Value::Bool(value) => AuthorValue::Bool(value),
-        Value::Int(value) => AuthorValue::Integer(value),
-        Value::Str(value) => AuthorValue::String(value),
-        Value::Vec(values) => AuthorValue::Sequence(
+        Value::Unit => ValueShape::Unit,
+        Value::Bool(value) => ValueShape::Bool(value),
+        Value::Int(value) => ValueShape::Integer(value),
+        Value::Str(value) => ValueShape::String(value),
+        Value::Vec(values) | Value::Tuple(values) => ValueShape::Sequence(
             values
                 .into_iter()
-                .map(value_to_author_node)
+                .map(value_to_located)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        Value::Tuple(values) => AuthorValue::Tuple(
-            values
-                .into_iter()
-                .map(value_to_author_node)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        Value::Opt(value) => AuthorValue::Option(
+        Value::Opt(value) => ValueShape::Option(
             value
-                .map(|value| value_to_author_node(*value).map(Box::new))
+                .map(|value| value_to_located(*value).map(Box::new))
                 .transpose()?,
         ),
-        Value::Struct { ty, fields } => AuthorValue::Struct {
+        Value::Struct { ty, fields } => ValueShape::Struct {
             name: ty,
             fields: fields
                 .into_iter()
-                .map(|(name, value)| value_to_author_node(value).map(|value| (name, value)))
+                .map(|(name, value)| value_to_located(value).map(|value| (name, value)))
                 .collect::<Result<Vec<_>, _>>()?,
         },
         Value::Enum {
             path,
             variant,
             body,
-        } => AuthorValue::Enum {
+        } => ValueShape::Enum {
             name: path.ty,
             variant,
             body: match body {
-                VariantBody::Unit => AuthorVariantBody::Unit,
-                VariantBody::Tuple(values) => AuthorVariantBody::Tuple(
-                    values
-                        .into_iter()
-                        .map(value_to_author_node)
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
-                VariantBody::Struct(fields) => AuthorVariantBody::Struct(
+                VariantBody::Unit => VariantShape::Unit,
+                VariantBody::Tuple(values) => {
+                    VariantShape::Tuple(values.into_iter().map(value_to_located).collect::<Result<
+                        Vec<_>,
+                        _,
+                    >>(
+                    )?)
+                }
+                VariantBody::Struct(fields) => VariantShape::Struct(
                     fields
                         .into_iter()
-                        .map(|(name, value)| value_to_author_node(value).map(|value| (name, value)))
+                        .map(|(name, value)| value_to_located(value).map(|value| (name, value)))
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
             },
         },
-        Value::Host(AuthorHandle::ContextValue(token)) => AuthorValue::ContextToken(token),
         Value::Host(handle) => {
             return Err(EvalError::new(format!(
-                "author handle {handle:?} cannot appear in host-free data"
+                "frontend handle {handle:?} cannot appear in host-free data"
             )));
         }
     };
-    Ok(AuthorNode::new(value))
+    Ok(LocatedValue::new(value))
 }
 
-fn author_node_to_value(node: AuthorNode) -> Result<Value<AuthorHandle>, EvalError> {
-    match node.value {
-        AuthorValue::Unit => Ok(Value::Unit),
-        AuthorValue::Bool(value) => Ok(Value::Bool(value)),
-        AuthorValue::Integer(value) => Ok(Value::Int(value)),
-        AuthorValue::String(value) => Ok(Value::Str(value)),
-        AuthorValue::Sequence(values) => values
+fn located_to_value(value: LocatedValue) -> Result<Value<HostValue>, EvalError> {
+    match value.value {
+        ValueShape::Unit => Ok(Value::Unit),
+        ValueShape::Bool(value) => Ok(Value::Bool(value)),
+        ValueShape::Integer(value) => Ok(Value::Int(value)),
+        ValueShape::String(value) => Ok(Value::Str(value)),
+        ValueShape::Sequence(values) | ValueShape::Tuple(values) => values
             .into_iter()
-            .map(author_node_to_value)
+            .map(located_to_value)
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Vec),
-        AuthorValue::Tuple(values) => values
-            .into_iter()
-            .map(author_node_to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Tuple),
-        AuthorValue::Option(value) => value
-            .map(|value| author_node_to_value(*value).map(Box::new))
+        ValueShape::Option(value) => value
+            .map(|value| located_to_value(*value).map(Box::new))
             .transpose()
             .map(Value::Opt),
-        AuthorValue::Struct { name, fields } => fields
+        ValueShape::Struct { name, fields } => fields
             .into_iter()
-            .map(|(field, value)| author_node_to_value(value).map(|value| (field, value)))
+            .map(|(field, value)| located_to_value(value).map(|value| (field, value)))
             .collect::<Result<FieldMap<_>, _>>()
             .map(|fields| Value::Struct { ty: name, fields }),
-        AuthorValue::Enum {
+        ValueShape::Enum {
             name,
             variant,
             body,
@@ -530,42 +557,45 @@ fn author_node_to_value(node: AuthorNode) -> Result<Value<AuthorHandle>, EvalErr
             },
             variant,
             body: match body {
-                AuthorVariantBody::Unit => VariantBody::Unit,
-                AuthorVariantBody::Tuple(values) => VariantBody::Tuple(
+                VariantShape::Unit => VariantBody::Unit,
+                VariantShape::Tuple(values) => VariantBody::Tuple(
                     values
                         .into_iter()
-                        .map(author_node_to_value)
+                        .map(located_to_value)
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
-                AuthorVariantBody::Struct(fields) => VariantBody::Struct(
+                VariantShape::Struct(fields) => VariantBody::Struct(
                     fields
                         .into_iter()
-                        .map(|(field, value)| {
-                            author_node_to_value(value).map(|value| (field, value))
-                        })
+                        .map(|(field, value)| located_to_value(value).map(|value| (field, value)))
                         .collect::<Result<FieldMap<_>, _>>()?,
                 ),
             },
         }),
-        AuthorValue::ContextToken(token) => Ok(Value::Host(AuthorHandle::ContextValue(token))),
-        AuthorValue::Float(value) => Err(EvalError::new(format!(
+        ValueShape::Float(value) => Err(EvalError::new(format!(
             "the tkd runtime cannot represent floating-point value {value}"
         ))),
-        AuthorValue::Map(_) => Err(EvalError::new(
+        ValueShape::Map(_) => Err(EvalError::new(
             "the tkd runtime cannot represent an untyped map",
         )),
     }
 }
 
-fn author_result_to_value(result: AuthorResult) -> Result<Value<AuthorHandle>, EvalError> {
-    match result {
-        AuthorResult::Handle(handle) => Ok(Value::Host(handle)),
-        AuthorResult::Value(value) => author_node_to_value(value),
+fn diagnostic(
+    format: &DefinitionFormatId,
+    source: FrontendSource<'_>,
+    source_map: &SourceMap,
+    error: EvalError,
+) -> FrontendDiagnostic {
+    FrontendDiagnostic {
+        format: format.clone(),
+        source_name: source.source_name.clone(),
+        range: error
+            .span
+            .and_then(|span| source_map.range(span.start(), span.end())),
+        category: DiagnosticCategory::Frontend,
+        message: error.msg,
     }
-}
-
-fn author_error(error: tokeira_platform::error::AuthorError) -> EvalError {
-    EvalError::new(error.message)
 }
 
 struct SourceMap {
@@ -611,10 +641,8 @@ mod tests {
     use std::sync::Arc;
 
     use serde::{Deserialize, Serialize};
-    use tokeira_orchestrator::DefinitionFormatId;
     use tokeira_platform::{
         artifact::ArtifactCatalog,
-        author::AuthorNode,
         binding::{Platform, PlatformBinding, StateBinding, StatePolicy},
         catalog::{
             ImageCatalog, KindRegistration, KindSet, PlacementContext, ProviderKind,
@@ -630,7 +658,8 @@ mod tests {
         ops::PlatformOps,
     };
 
-    use super::TkdFrontend;
+    use super::{TkdContext, TkdFrontend};
+    use tokeira_platform::author::LocatedValue;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -670,7 +699,9 @@ mod tests {
 
         fn field(&self, name: &str) -> Result<ContextProjection<Self::Value>, ContextError> {
             match name {
-                "project_name" => Ok(ContextProjection::Value(AuthorNode::string(&self.project))),
+                "project_name" => Ok(ContextProjection::Value(LocatedValue::string(
+                    &self.project,
+                ))),
                 _ => Err(ContextError::new(format!("unknown context field `{name}`"))),
             }
         }
@@ -680,6 +711,29 @@ mod tests {
             method: &str,
             _args: &[ContextArgument<Self::Value>],
         ) -> Result<ContextProjection<Self::Value>, ContextError> {
+            Err(ContextError::new(format!(
+                "unknown context method `{method}`"
+            )))
+        }
+    }
+
+    impl TkdContext for TestContext {
+        fn fields() -> &'static [&'static str] {
+            &["project_name"]
+        }
+
+        fn methods() -> &'static [&'static str] {
+            &[]
+        }
+
+        fn field(&self, name: &str) -> Result<LocatedValue, ContextError> {
+            match name {
+                "project_name" => Ok(LocatedValue::string(&self.project)),
+                _ => Err(ContextError::new(format!("unknown context field `{name}`"))),
+            }
+        }
+
+        fn call(&self, method: &str, _args: &[LocatedValue]) -> Result<LocatedValue, ContextError> {
             Err(ContextError::new(format!(
                 "unknown context method `{method}`"
             )))
@@ -787,7 +841,8 @@ mod tests {
 
     fn source(bytes: &str) -> DefinitionSource {
         DefinitionSource {
-            format: DefinitionFormatId::new("tkd").expect("canonical tkd format id"),
+            format: tokeira_orchestrator::DefinitionFormatId::new("tkd")
+                .expect("canonical tkd format id"),
             source_name: DefinitionSourceName::DeploymentRelative(
                 RelativeDefinitionPath::new("definition.tkd").expect("canonical definition path"),
             ),
@@ -796,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn tkd_frontend_drives_only_the_language_neutral_author_session() {
+    fn tkd_frontend_returns_one_completed_structural_definition() {
         let engine = DefinitionEngine::new(binding(), TkdFrontend::new());
         let definition = engine
             .evaluate(DefinitionRequest {
@@ -842,7 +897,7 @@ fn deployment(cfg: &TestConfig, cx: &Cx) -> Deployment {
     }
 
     #[test]
-    fn tkd_frontend_returns_a_source_range_for_authoring_failures() {
+    fn tkd_frontend_returns_a_source_range_for_evaluator_failures() {
         let engine = DefinitionEngine::new(binding(), TkdFrontend::new());
         let error = engine
             .evaluate(DefinitionRequest {
@@ -859,7 +914,7 @@ fn deployment(cfg: &TestConfig, cx: &Cx) -> Deployment {
                     project: "sample".to_string(),
                 },
             })
-            .expect_err("an unknown author method must be rejected");
+            .expect_err("an unknown evaluator method must be rejected");
 
         let tokeira_platform::error::DefinitionError::Frontend(diagnostic) = error else {
             panic!("expected a frontend diagnostic");

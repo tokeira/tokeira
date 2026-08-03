@@ -10,7 +10,7 @@ use crate::{
         ArtifactUse, CanonicalDocument, ContentIdentitySet, DeliveryKey, DesiredDocument,
         OperationalArtifactReceipt, OperationalArtifactRequest,
     },
-    author::{AuthorNode, KindSchema, from_author_node},
+    author::{LocatedValue, from_located_value},
     binding::Platform,
     context::InvocationContext,
     error::{BindingError, DeliveryError, KindError, ProviderExecutionError},
@@ -59,7 +59,7 @@ pub trait ProviderKind: Debug + Send + Sync {
 pub struct KindRegistration {
     /// Stable author-visible name.
     pub name: &'static str,
-    decode: fn(AuthorNode) -> Result<Box<dyn ProviderKind>, KindError>,
+    decode: fn(LocatedValue) -> Result<Box<dyn ProviderKind>, KindError>,
     /// Optional provider-owned defaults for frontend schema presentation.
     pub defaults: Option<fn() -> serde_json::Map<String, serde_json::Value>>,
     /// Complete output inventory, checked against every decoded instance.
@@ -92,17 +92,17 @@ impl KindRegistration {
         }
     }
 
-    fn decode(&self, input: AuthorNode) -> Result<Box<dyn ProviderKind>, KindError> {
+    fn decode(&self, input: LocatedValue) -> Result<Box<dyn ProviderKind>, KindError> {
         (self.decode)(input)
     }
 }
 
-fn decode_kind<T>(input: AuthorNode) -> Result<Box<dyn ProviderKind>, KindError>
+fn decode_kind<T>(input: LocatedValue) -> Result<Box<dyn ProviderKind>, KindError>
 where
     T: ProviderKind + DeserializeOwned + 'static,
 {
     let root_range = input.range;
-    let kind: T = from_author_node(input).map_err(|error| KindError {
+    let kind: T = from_located_value(input).map_err(|error| KindError {
         message: error.message().to_string(),
         range: error.range().or(root_range),
     })?;
@@ -136,7 +136,7 @@ impl KindSet {
     pub fn decode(
         &self,
         name: &str,
-        input: AuthorNode,
+        input: LocatedValue,
     ) -> Result<Box<dyn ProviderKind>, KindError> {
         let Some(registration) = self
             .catalogs
@@ -175,29 +175,30 @@ impl KindSet {
             .collect()
     }
 
-    /// Build frontend schema entries without retaining provider runtime values.
-    pub fn schemas(&self) -> Vec<KindSchema> {
+    /// Whether the selected first-party set contains one author-visible kind.
+    pub fn contains(&self, name: &str) -> bool {
         self.catalogs
             .iter()
             .flat_map(|catalog| catalog.entries)
-            .map(|registration| KindSchema {
+            .any(|registration| registration.name == name)
+    }
+
+    /// Provider-owned default fields for one selected kind.
+    pub fn defaults(&self, name: &str) -> Option<LocatedValue> {
+        let registration = self
+            .catalogs
+            .iter()
+            .flat_map(|catalog| catalog.entries)
+            .find(|registration| registration.name == name)?;
+        registration.defaults.map(|defaults| {
+            LocatedValue::new(crate::author::ValueShape::Struct {
                 name: registration.name.to_string(),
-                defaults: registration.defaults.map(|defaults| {
-                    AuthorNode::new(crate::author::AuthorValue::Struct {
-                        name: registration.name.to_string(),
-                        fields: defaults()
-                            .into_iter()
-                            .map(|(name, value)| (name, json_to_author_node(value)))
-                            .collect(),
-                    })
-                }),
-                outputs: registration
-                    .declared_outputs
-                    .iter()
-                    .map(|output| (*output).to_string())
+                fields: defaults()
+                    .into_iter()
+                    .map(|(name, value)| (name, json_to_located_value(value)))
                     .collect(),
             })
-            .collect()
+        })
     }
 
     pub(crate) fn validate(&self) -> Result<(), BindingError> {
@@ -232,37 +233,37 @@ impl KindSet {
     }
 }
 
-fn json_to_author_node(value: serde_json::Value) -> AuthorNode {
-    use crate::author::AuthorValue;
+fn json_to_located_value(value: serde_json::Value) -> LocatedValue {
+    use crate::author::ValueShape;
 
     let value = match value {
-        serde_json::Value::Null => AuthorValue::Option(None),
-        serde_json::Value::Bool(value) => AuthorValue::Bool(value),
+        serde_json::Value::Null => ValueShape::Option(None),
+        serde_json::Value::Bool(value) => ValueShape::Bool(value),
         serde_json::Value::Number(value) => {
             if let Some(value) = value.as_i64() {
-                AuthorValue::Integer(i128::from(value))
+                ValueShape::Integer(i128::from(value))
             } else if let Some(value) = value.as_u64() {
-                AuthorValue::Integer(i128::from(value))
+                ValueShape::Integer(i128::from(value))
             } else {
-                AuthorValue::Float(
+                ValueShape::Float(
                     value
                         .as_f64()
-                        .expect("a serde_json number is representable as i64, u64, or f64"),
+                        .expect("a JSON number is representable as i64, u64, or f64"),
                 )
             }
         }
-        serde_json::Value::String(value) => AuthorValue::String(value),
+        serde_json::Value::String(value) => ValueShape::String(value),
         serde_json::Value::Array(values) => {
-            AuthorValue::Sequence(values.into_iter().map(json_to_author_node).collect())
+            ValueShape::Sequence(values.into_iter().map(json_to_located_value).collect())
         }
-        serde_json::Value::Object(fields) => AuthorValue::Map(
+        serde_json::Value::Object(fields) => ValueShape::Map(
             fields
                 .into_iter()
-                .map(|(name, value)| (AuthorNode::string(name), json_to_author_node(value)))
+                .map(|(name, value)| (LocatedValue::string(name), json_to_located_value(value)))
                 .collect(),
         ),
     };
-    AuthorNode::new(value)
+    LocatedValue::new(value)
 }
 
 /// Desired image selected by a platform service.

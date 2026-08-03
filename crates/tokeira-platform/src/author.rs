@@ -1,38 +1,30 @@
-//! Host-free definition values and generic authoring dispatch.
+//! Located, host-free values returned by definition frontends.
 //!
-//! Frontends convert their own syntax/runtime values into [`AuthorNode`] and
-//! keep opaque [`AuthorHandle`] wrappers in the frontend runtime. Provider and
-//! platform crates therefore never receive parser values or host objects.
+//! Frontends keep evaluator handles private and return only this Serde-shaped
+//! tree plus a completed structural graph. The tree is transient and decoded
+//! immediately into typed platform configuration or provider-kind input.
 
-use std::{fmt, sync::Weak};
+use std::fmt;
 
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, EnumAccess, IntoDeserializer, MapAccess, SeqAccess,
     VariantAccess, Visitor,
 };
 
-use crate::{
-    binding::{Platform, PlatformBinding},
-    context::{ContextArgument, ContextProjection, PlatformContext},
-    error::{AuthorError, SourceRange},
-    graph::{
-        DeploymentGraphBuilder, DeploymentHandle, KindHandle, ModuleHandle, OutputReference,
-        ResourceHandle, VerifiedGraph,
-    },
-};
+use crate::error::SourceRange;
 
 /// A frontend-neutral value with an optional source byte range.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AuthorNode {
+pub struct LocatedValue {
     /// Host-free value shape.
-    pub value: AuthorValue,
+    pub value: ValueShape,
     /// Most specific frontend-supplied byte range for this value.
     pub range: Option<SourceRange>,
 }
 
-impl AuthorNode {
+impl LocatedValue {
     /// Construct an unlocated host-free value.
-    pub fn new(value: AuthorValue) -> Self {
+    pub fn new(value: ValueShape) -> Self {
         Self { value, range: None }
     }
 
@@ -44,13 +36,13 @@ impl AuthorNode {
 
     /// Construct a string value.
     pub fn string(value: impl Into<String>) -> Self {
-        Self::new(AuthorValue::String(value.into()))
+        Self::new(ValueShape::String(value.into()))
     }
 }
 
 /// Host-free Serde-shaped value admitted from every definition frontend.
 #[derive(Debug, Clone, PartialEq)]
-pub enum AuthorValue {
+pub enum ValueShape {
     /// Serde unit.
     Unit,
     /// Boolean scalar.
@@ -62,19 +54,19 @@ pub enum AuthorValue {
     /// UTF-8 string scalar.
     String(String),
     /// Variable-length sequence.
-    Sequence(Vec<AuthorNode>),
+    Sequence(Vec<LocatedValue>),
     /// Fixed-shape tuple.
-    Tuple(Vec<AuthorNode>),
+    Tuple(Vec<LocatedValue>),
     /// Explicit option shape.
-    Option(Option<Box<AuthorNode>>),
+    Option(Option<Box<LocatedValue>>),
     /// Ordered map entries.
-    Map(Vec<(AuthorNode, AuthorNode)>),
+    Map(Vec<(LocatedValue, LocatedValue)>),
     /// Named struct shape; the type name is diagnostic metadata.
     Struct {
         /// Frontend-provided type name.
         name: String,
         /// Fields in source declaration order.
-        fields: Vec<(String, AuthorNode)>,
+        fields: Vec<(String, LocatedValue)>,
     },
     /// Named externally tagged enum shape.
     Enum {
@@ -83,46 +75,29 @@ pub enum AuthorValue {
         /// Selected variant.
         variant: String,
         /// Variant payload.
-        body: AuthorVariantBody,
+        body: VariantShape,
     },
-    /// Opaque typed platform-context value interned by one author session.
-    ContextToken(ContextToken),
 }
 
 /// Payload shape of an externally tagged author enum.
 #[derive(Debug, Clone, PartialEq)]
-pub enum AuthorVariantBody {
+pub enum VariantShape {
     /// Unit variant.
     Unit,
     /// Tuple or newtype variant.
-    Tuple(Vec<AuthorNode>),
+    Tuple(Vec<LocatedValue>),
     /// Struct variant.
-    Struct(Vec<(String, AuthorNode)>),
+    Struct(Vec<(String, LocatedValue)>),
 }
-
-/// Opaque identity of one typed value stored by an [`AuthorSession`].
-#[derive(Debug, Clone)]
-pub struct ContextToken {
-    owner: Weak<()>,
-    index: usize,
-}
-
-impl PartialEq for ContextToken {
-    fn eq(&self, other: &Self) -> bool {
-        self.index == other.index && self.owner.ptr_eq(&other.owner)
-    }
-}
-
-impl Eq for ContextToken {}
 
 /// Serde admission error retaining the most specific source range encountered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorDecodeError {
+pub struct ValueDecodeError {
     message: String,
     range: Option<SourceRange>,
 }
 
-impl AuthorDecodeError {
+impl ValueDecodeError {
     fn at(message: impl Into<String>, range: Option<SourceRange>) -> Self {
         Self {
             message: message.into(),
@@ -145,44 +120,43 @@ impl AuthorDecodeError {
     }
 }
 
-impl fmt::Display for AuthorDecodeError {
+impl fmt::Display for ValueDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for AuthorDecodeError {}
+impl std::error::Error for ValueDecodeError {}
 
-impl de::Error for AuthorDecodeError {
+impl de::Error for ValueDecodeError {
     fn custom<T: fmt::Display>(message: T) -> Self {
         Self::at(message.to_string(), None)
     }
 }
 
 /// Decode a host-free author value through ordinary Serde data-model semantics.
-pub fn from_author_node<T: DeserializeOwned>(node: AuthorNode) -> Result<T, AuthorDecodeError> {
+pub fn from_located_value<T: DeserializeOwned>(node: LocatedValue) -> Result<T, ValueDecodeError> {
     T::deserialize(node)
 }
 
-fn value_kind(value: &AuthorValue) -> &'static str {
+fn value_kind(value: &ValueShape) -> &'static str {
     match value {
-        AuthorValue::Unit => "unit",
-        AuthorValue::Bool(_) => "boolean",
-        AuthorValue::Integer(_) => "integer",
-        AuthorValue::Float(_) => "float",
-        AuthorValue::String(_) => "string",
-        AuthorValue::Sequence(_) => "sequence",
-        AuthorValue::Tuple(_) => "tuple",
-        AuthorValue::Option(_) => "option",
-        AuthorValue::Map(_) => "map",
-        AuthorValue::Struct { .. } => "struct",
-        AuthorValue::Enum { .. } => "enum",
-        AuthorValue::ContextToken(_) => "platform context token",
+        ValueShape::Unit => "unit",
+        ValueShape::Bool(_) => "boolean",
+        ValueShape::Integer(_) => "integer",
+        ValueShape::Float(_) => "float",
+        ValueShape::String(_) => "string",
+        ValueShape::Sequence(_) => "sequence",
+        ValueShape::Tuple(_) => "tuple",
+        ValueShape::Option(_) => "option",
+        ValueShape::Map(_) => "map",
+        ValueShape::Struct { .. } => "struct",
+        ValueShape::Enum { .. } => "enum",
     }
 }
 
-fn mismatch(expected: &str, node: &AuthorNode) -> AuthorDecodeError {
-    AuthorDecodeError::at(
+fn mismatch(expected: &str, node: &LocatedValue) -> ValueDecodeError {
+    ValueDecodeError::at(
         format!("expected {expected}, found {}", value_kind(&node.value)),
         node.range,
     )
@@ -196,12 +170,12 @@ macro_rules! deserialize_signed {
         {
             let range = self.range;
             match self.value {
-                AuthorValue::Integer(value) => <$ty>::try_from(value)
+                ValueShape::Integer(value) => <$ty>::try_from(value)
                     .map_err(|_| {
-                        AuthorDecodeError::at(format!("integer {value} is out of range"), range)
+                        ValueDecodeError::at(format!("integer {value} is out of range"), range)
                     })
                     .and_then(|value| visitor.$visit(value)),
-                value => Err(mismatch(stringify!($ty), &AuthorNode { value, range })),
+                value => Err(mismatch(stringify!($ty), &LocatedValue { value, range })),
             }
         }
     };
@@ -215,45 +189,40 @@ macro_rules! deserialize_unsigned {
         {
             let range = self.range;
             match self.value {
-                AuthorValue::Integer(value) => <$ty>::try_from(value)
+                ValueShape::Integer(value) => <$ty>::try_from(value)
                     .map_err(|_| {
-                        AuthorDecodeError::at(format!("integer {value} is out of range"), range)
+                        ValueDecodeError::at(format!("integer {value} is out of range"), range)
                     })
                     .and_then(|value| visitor.$visit(value)),
-                value => Err(mismatch(stringify!($ty), &AuthorNode { value, range })),
+                value => Err(mismatch(stringify!($ty), &LocatedValue { value, range })),
             }
         }
     };
 }
 
-impl<'de> de::Deserializer<'de> for AuthorNode {
-    type Error = AuthorDecodeError;
+impl<'de> de::Deserializer<'de> for LocatedValue {
+    type Error = ValueDecodeError;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        let range = self.range;
         match self.value {
-            AuthorValue::Unit => visitor.visit_unit(),
-            AuthorValue::Bool(value) => visitor.visit_bool(value),
-            AuthorValue::Integer(value) => visitor.visit_i128(value),
-            AuthorValue::Float(value) => visitor.visit_f64(value),
-            AuthorValue::String(value) => visitor.visit_string(value),
-            AuthorValue::Sequence(values) | AuthorValue::Tuple(values) => {
+            ValueShape::Unit => visitor.visit_unit(),
+            ValueShape::Bool(value) => visitor.visit_bool(value),
+            ValueShape::Integer(value) => visitor.visit_i128(value),
+            ValueShape::Float(value) => visitor.visit_f64(value),
+            ValueShape::String(value) => visitor.visit_string(value),
+            ValueShape::Sequence(values) | ValueShape::Tuple(values) => {
                 visitor.visit_seq(NodeSeqAccess::new(values))
             }
-            AuthorValue::Option(None) => visitor.visit_none(),
-            AuthorValue::Option(Some(value)) => visitor.visit_some(*value),
-            AuthorValue::Map(entries) => visitor.visit_map(NodeMapAccess::new(entries)),
-            AuthorValue::Struct { fields, .. } => visitor.visit_map(StructMapAccess::new(fields)),
-            AuthorValue::Enum { variant, body, .. } => {
+            ValueShape::Option(None) => visitor.visit_none(),
+            ValueShape::Option(Some(value)) => visitor.visit_some(*value),
+            ValueShape::Map(entries) => visitor.visit_map(NodeMapAccess::new(entries)),
+            ValueShape::Struct { fields, .. } => visitor.visit_map(StructMapAccess::new(fields)),
+            ValueShape::Enum { variant, body, .. } => {
                 visitor.visit_enum(NodeEnumAccess { variant, body })
             }
-            AuthorValue::ContextToken(_) => Err(AuthorDecodeError::at(
-                "platform context tokens cannot be decoded as configuration or provider input",
-                range,
-            )),
         }
     }
 
@@ -263,8 +232,8 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::Bool(value) => visitor.visit_bool(value),
-            value => Err(mismatch("boolean", &AuthorNode { value, range })),
+            ValueShape::Bool(value) => visitor.visit_bool(value),
+            value => Err(mismatch("boolean", &LocatedValue { value, range })),
         }
     }
 
@@ -285,9 +254,9 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::Float(value) => visitor.visit_f32(value as f32),
-            AuthorValue::Integer(value) => visitor.visit_f32(value as f32),
-            value => Err(mismatch("number", &AuthorNode { value, range })),
+            ValueShape::Float(value) => visitor.visit_f32(value as f32),
+            ValueShape::Integer(value) => visitor.visit_f32(value as f32),
+            value => Err(mismatch("number", &LocatedValue { value, range })),
         }
     }
 
@@ -297,9 +266,9 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::Float(value) => visitor.visit_f64(value),
-            AuthorValue::Integer(value) => visitor.visit_f64(value as f64),
-            value => Err(mismatch("number", &AuthorNode { value, range })),
+            ValueShape::Float(value) => visitor.visit_f64(value),
+            ValueShape::Integer(value) => visitor.visit_f64(value as f64),
+            value => Err(mismatch("number", &LocatedValue { value, range })),
         }
     }
 
@@ -309,23 +278,23 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::String(value) => {
+            ValueShape::String(value) => {
                 let mut chars = value.chars();
                 let Some(character) = chars.next() else {
-                    return Err(AuthorDecodeError::at(
+                    return Err(ValueDecodeError::at(
                         "expected one character, found an empty string",
                         range,
                     ));
                 };
                 if chars.next().is_some() {
-                    return Err(AuthorDecodeError::at(
+                    return Err(ValueDecodeError::at(
                         "expected one character, found a longer string",
                         range,
                     ));
                 }
                 visitor.visit_char(character)
             }
-            value => Err(mismatch("character", &AuthorNode { value, range })),
+            value => Err(mismatch("character", &LocatedValue { value, range })),
         }
     }
 
@@ -342,8 +311,8 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::String(value) => visitor.visit_string(value),
-            value => Err(mismatch("string", &AuthorNode { value, range })),
+            ValueShape::String(value) => visitor.visit_string(value),
+            value => Err(mismatch("string", &LocatedValue { value, range })),
         }
     }
 
@@ -353,8 +322,8 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::String(value) => visitor.visit_byte_buf(value.into_bytes()),
-            value => Err(mismatch("byte string", &AuthorNode { value, range })),
+            ValueShape::String(value) => visitor.visit_byte_buf(value.into_bytes()),
+            value => Err(mismatch("byte string", &LocatedValue { value, range })),
         }
     }
 
@@ -370,8 +339,8 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
         V: Visitor<'de>,
     {
         match self.value {
-            AuthorValue::Option(None) => visitor.visit_none(),
-            AuthorValue::Option(Some(value)) => visitor.visit_some(*value),
+            ValueShape::Option(None) => visitor.visit_none(),
+            ValueShape::Option(Some(value)) => visitor.visit_some(*value),
             _ => visitor.visit_some(self),
         }
     }
@@ -382,8 +351,8 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::Unit => visitor.visit_unit(),
-            value => Err(mismatch("unit", &AuthorNode { value, range })),
+            ValueShape::Unit => visitor.visit_unit(),
+            value => Err(mismatch("unit", &LocatedValue { value, range })),
         }
     }
 
@@ -415,10 +384,10 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::Sequence(values) | AuthorValue::Tuple(values) => {
+            ValueShape::Sequence(values) | ValueShape::Tuple(values) => {
                 visitor.visit_seq(NodeSeqAccess::new(values))
             }
-            value => Err(mismatch("sequence", &AuthorNode { value, range })),
+            value => Err(mismatch("sequence", &LocatedValue { value, range })),
         }
     }
 
@@ -447,9 +416,9 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::Map(entries) => visitor.visit_map(NodeMapAccess::new(entries)),
-            AuthorValue::Struct { fields, .. } => visitor.visit_map(StructMapAccess::new(fields)),
-            value => Err(mismatch("map", &AuthorNode { value, range })),
+            ValueShape::Map(entries) => visitor.visit_map(NodeMapAccess::new(entries)),
+            ValueShape::Struct { fields, .. } => visitor.visit_map(StructMapAccess::new(fields)),
+            value => Err(mismatch("map", &LocatedValue { value, range })),
         }
     }
 
@@ -476,11 +445,11 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
     {
         let range = self.range;
         match self.value {
-            AuthorValue::Enum { variant, body, .. } => {
+            ValueShape::Enum { variant, body, .. } => {
                 visitor.visit_enum(NodeEnumAccess { variant, body })
             }
-            AuthorValue::String(variant) => visitor.visit_enum(variant.into_deserializer()),
-            value => Err(mismatch("enum", &AuthorNode { value, range })),
+            ValueShape::String(variant) => visitor.visit_enum(variant.into_deserializer()),
+            value => Err(mismatch("enum", &LocatedValue { value, range })),
         }
     }
 
@@ -500,11 +469,11 @@ impl<'de> de::Deserializer<'de> for AuthorNode {
 }
 
 struct NodeSeqAccess {
-    values: std::vec::IntoIter<AuthorNode>,
+    values: std::vec::IntoIter<LocatedValue>,
 }
 
 impl NodeSeqAccess {
-    fn new(values: Vec<AuthorNode>) -> Self {
+    fn new(values: Vec<LocatedValue>) -> Self {
         Self {
             values: values.into_iter(),
         }
@@ -512,7 +481,7 @@ impl NodeSeqAccess {
 }
 
 impl<'de> SeqAccess<'de> for NodeSeqAccess {
-    type Error = AuthorDecodeError;
+    type Error = ValueDecodeError;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
     where
@@ -530,12 +499,12 @@ impl<'de> SeqAccess<'de> for NodeSeqAccess {
 }
 
 struct NodeMapAccess {
-    entries: std::vec::IntoIter<(AuthorNode, AuthorNode)>,
-    value: Option<AuthorNode>,
+    entries: std::vec::IntoIter<(LocatedValue, LocatedValue)>,
+    value: Option<LocatedValue>,
 }
 
 impl NodeMapAccess {
-    fn new(entries: Vec<(AuthorNode, AuthorNode)>) -> Self {
+    fn new(entries: Vec<(LocatedValue, LocatedValue)>) -> Self {
         Self {
             entries: entries.into_iter(),
             value: None,
@@ -544,7 +513,7 @@ impl NodeMapAccess {
 }
 
 impl<'de> MapAccess<'de> for NodeMapAccess {
-    type Error = AuthorDecodeError;
+    type Error = ValueDecodeError;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
     where
@@ -564,7 +533,7 @@ impl<'de> MapAccess<'de> for NodeMapAccess {
         let value = self
             .value
             .take()
-            .ok_or_else(|| AuthorDecodeError::custom("map value requested before map key"))?;
+            .ok_or_else(|| ValueDecodeError::custom("map value requested before map key"))?;
         seed.deserialize(value)
     }
 
@@ -574,12 +543,12 @@ impl<'de> MapAccess<'de> for NodeMapAccess {
 }
 
 struct StructMapAccess {
-    fields: std::vec::IntoIter<(String, AuthorNode)>,
-    value: Option<AuthorNode>,
+    fields: std::vec::IntoIter<(String, LocatedValue)>,
+    value: Option<LocatedValue>,
 }
 
 impl StructMapAccess {
-    fn new(fields: Vec<(String, AuthorNode)>) -> Self {
+    fn new(fields: Vec<(String, LocatedValue)>) -> Self {
         Self {
             fields: fields.into_iter(),
             value: None,
@@ -588,7 +557,7 @@ impl StructMapAccess {
 }
 
 impl<'de> MapAccess<'de> for StructMapAccess {
-    type Error = AuthorDecodeError;
+    type Error = ValueDecodeError;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
     where
@@ -608,7 +577,7 @@ impl<'de> MapAccess<'de> for StructMapAccess {
         let value = self
             .value
             .take()
-            .ok_or_else(|| AuthorDecodeError::custom("struct value requested before field name"))?;
+            .ok_or_else(|| ValueDecodeError::custom("struct value requested before field name"))?;
         seed.deserialize(value)
     }
 
@@ -619,11 +588,11 @@ impl<'de> MapAccess<'de> for StructMapAccess {
 
 struct NodeEnumAccess {
     variant: String,
-    body: AuthorVariantBody,
+    body: VariantShape,
 }
 
 impl<'de> EnumAccess<'de> for NodeEnumAccess {
-    type Error = AuthorDecodeError;
+    type Error = ValueDecodeError;
     type Variant = NodeVariantAccess;
 
     fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
@@ -636,16 +605,16 @@ impl<'de> EnumAccess<'de> for NodeEnumAccess {
 }
 
 struct NodeVariantAccess {
-    body: AuthorVariantBody,
+    body: VariantShape,
 }
 
 impl<'de> VariantAccess<'de> for NodeVariantAccess {
-    type Error = AuthorDecodeError;
+    type Error = ValueDecodeError;
 
     fn unit_variant(self) -> Result<(), Self::Error> {
         match self.body {
-            AuthorVariantBody::Unit => Ok(()),
-            _ => Err(AuthorDecodeError::custom("expected a unit enum variant")),
+            VariantShape::Unit => Ok(()),
+            _ => Err(ValueDecodeError::custom("expected a unit enum variant")),
         }
     }
 
@@ -654,10 +623,10 @@ impl<'de> VariantAccess<'de> for NodeVariantAccess {
         T: DeserializeSeed<'de>,
     {
         match self.body {
-            AuthorVariantBody::Tuple(mut values) if values.len() == 1 => {
+            VariantShape::Tuple(mut values) if values.len() == 1 => {
                 seed.deserialize(values.remove(0))
             }
-            _ => Err(AuthorDecodeError::custom(
+            _ => Err(ValueDecodeError::custom(
                 "expected a single-value enum variant",
             )),
         }
@@ -668,8 +637,8 @@ impl<'de> VariantAccess<'de> for NodeVariantAccess {
         V: Visitor<'de>,
     {
         match self.body {
-            AuthorVariantBody::Tuple(values) => visitor.visit_seq(NodeSeqAccess::new(values)),
-            _ => Err(AuthorDecodeError::custom("expected a tuple enum variant")),
+            VariantShape::Tuple(values) => visitor.visit_seq(NodeSeqAccess::new(values)),
+            _ => Err(ValueDecodeError::custom("expected a tuple enum variant")),
         }
     }
 
@@ -682,528 +651,8 @@ impl<'de> VariantAccess<'de> for NodeVariantAccess {
         V: Visitor<'de>,
     {
         match self.body {
-            AuthorVariantBody::Struct(fields) => visitor.visit_map(StructMapAccess::new(fields)),
-            _ => Err(AuthorDecodeError::custom("expected a struct enum variant")),
+            VariantShape::Struct(fields) => visitor.visit_map(StructMapAccess::new(fields)),
+            _ => Err(ValueDecodeError::custom("expected a struct enum variant")),
         }
-    }
-}
-
-/// Opaque frontend-side identity for a framework authoring value.
-#[derive(Debug, Clone)]
-pub enum AuthorHandle {
-    /// The sole deployment graph under construction.
-    Deployment(DeploymentHandle),
-    /// A declared module.
-    Module(ModuleHandle),
-    /// A declared provider resource.
-    Resource(ResourceHandle),
-    /// A checked provider-resource output reference.
-    Output(OutputReference),
-    /// A constructed but not yet installed provider kind.
-    Kind(KindHandle),
-    /// The immutable platform context receiver.
-    Context(ContextHandle),
-    /// One typed context value interned by this session.
-    ContextValue(ContextToken),
-}
-
-/// Opaque identity of the immutable platform context receiver.
-#[derive(Debug, Clone)]
-pub struct ContextHandle {
-    owner: Weak<()>,
-}
-
-impl PartialEq for ContextHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.owner.ptr_eq(&other.owner)
-    }
-}
-
-impl Eq for ContextHandle {}
-
-/// Argument admitted by generic authoring dispatch.
-#[derive(Debug, Clone)]
-pub enum AuthorArgument {
-    /// Host-free data.
-    Value(AuthorNode),
-    /// Opaque framework identity.
-    Handle(AuthorHandle),
-}
-
-/// Result returned to a definition frontend.
-#[derive(Debug, Clone)]
-pub enum AuthorResult {
-    /// Host-free data.
-    Value(AuthorNode),
-    /// Opaque framework identity.
-    Handle(AuthorHandle),
-}
-
-/// Schema for one associated authoring function.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssociatedFunctionSchema {
-    /// Stable dispatch name.
-    pub name: String,
-}
-
-/// Schema for methods and fields on one receiver kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiverSchema {
-    /// Stable receiver name.
-    pub receiver: String,
-    /// Complete method inventory.
-    pub methods: Vec<String>,
-    /// Complete field inventory.
-    pub fields: Vec<String>,
-}
-
-/// Schema for one selected provider kind.
-#[derive(Debug, Clone, PartialEq)]
-pub struct KindSchema {
-    /// Stable kind name.
-    pub name: String,
-    /// Provider-owned default field values used by frontends for `..EMPTY` syntax.
-    pub defaults: Option<AuthorNode>,
-    /// Declared output names.
-    pub outputs: Vec<String>,
-}
-
-/// Discoverable, frontend-neutral authoring vocabulary.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AuthorSchema {
-    /// Standard associated functions.
-    pub associated_functions: Vec<AssociatedFunctionSchema>,
-    /// Standard receiver methods and fields.
-    pub receivers: Vec<ReceiverSchema>,
-    /// Selected first-party kinds.
-    pub kinds: Vec<KindSchema>,
-    /// Platform context fields.
-    pub context_fields: Vec<String>,
-    /// Platform context methods.
-    pub context_methods: Vec<String>,
-}
-
-/// One pure definition evaluation over a selected platform binding.
-#[derive(Debug)]
-pub struct AuthorSession<P: Platform> {
-    binding: PlatformBinding<P>,
-    context: P::Context,
-    graph: DeploymentGraphBuilder,
-    owner: std::sync::Arc<()>,
-    context_values: Vec<<P::Context as PlatformContext>::Value>,
-    kinds: Vec<Option<Box<dyn crate::catalog::ProviderKind>>>,
-}
-
-impl<P: Platform> AuthorSession<P> {
-    /// Begin an in-memory authoring evaluation.
-    pub fn new(binding: PlatformBinding<P>, context: P::Context) -> Self {
-        let graph = DeploymentGraphBuilder::with_catalogs(
-            binding.services.identities(),
-            binding.providers.delivery_keys(),
-        )
-        .require_bootstrap(binding.bootstrap_module.clone());
-        Self {
-            binding,
-            context,
-            graph,
-            owner: std::sync::Arc::new(()),
-            context_values: Vec::new(),
-            kinds: Vec::new(),
-        }
-    }
-
-    /// Return the complete callable schema for the selected binding.
-    pub fn schema(&self) -> AuthorSchema {
-        AuthorSchema {
-            associated_functions: vec![AssociatedFunctionSchema {
-                name: "Deployment.new".into(),
-            }],
-            receivers: vec![
-                ReceiverSchema {
-                    receiver: "Deployment".into(),
-                    methods: vec!["namespace".into(), "module".into(), "writeback".into()],
-                    fields: Vec::new(),
-                },
-                ReceiverSchema {
-                    receiver: "Module".into(),
-                    methods: vec!["resource".into(), "workload".into()],
-                    fields: Vec::new(),
-                },
-                ReceiverSchema {
-                    receiver: "Resource".into(),
-                    methods: vec!["output".into()],
-                    fields: Vec::new(),
-                },
-            ],
-            kinds: self.binding.kinds.schemas(),
-            context_fields: P::Context::fields()
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
-            context_methods: P::Context::methods()
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
-        }
-    }
-
-    /// Return the immutable platform context receiver for this session.
-    pub fn context_handle(&self) -> ContextHandle {
-        ContextHandle {
-            owner: std::sync::Arc::downgrade(&self.owner),
-        }
-    }
-
-    /// Construct one selected first-party provider kind as a take-once value.
-    pub fn construct_kind(
-        &mut self,
-        name: &str,
-        input: AuthorNode,
-    ) -> Result<KindHandle, AuthorError> {
-        let range = input.range;
-        let kind = self
-            .binding
-            .kinds
-            .decode(name, input)
-            .map_err(|error| AuthorError::new(error.message).at(error.range.or(range)))?;
-        let index = self.kinds.len();
-        self.kinds.push(Some(kind));
-        Ok(KindHandle::new(
-            std::sync::Arc::downgrade(&self.owner),
-            index,
-        ))
-    }
-
-    /// Invoke a standard receiver method.
-    pub fn call(
-        &mut self,
-        receiver: AuthorHandle,
-        method: &str,
-        args: Vec<AuthorArgument>,
-    ) -> Result<AuthorResult, AuthorError> {
-        match receiver {
-            AuthorHandle::Deployment(handle) => self.call_deployment(handle, method, args),
-            AuthorHandle::Module(handle) => self.call_module(handle, method, args),
-            AuthorHandle::Resource(handle) => self.call_resource(handle, method, args),
-            AuthorHandle::Context(handle) => self.call_context(handle, method, args),
-            other => Err(AuthorError::new(format!(
-                "receiver {} has no method `{method}`",
-                handle_name(&other)
-            ))),
-        }
-    }
-
-    /// Invoke a standard associated function.
-    pub fn associated(
-        &mut self,
-        name: &str,
-        args: Vec<AuthorArgument>,
-    ) -> Result<AuthorResult, AuthorError> {
-        if name != "Deployment.new" {
-            return Err(AuthorError::new(format!(
-                "unknown associated function `{name}`; supported: Deployment.new"
-            )));
-        }
-        if !args.is_empty() {
-            return Err(AuthorError::new("Deployment.new accepts no arguments"));
-        }
-        Ok(AuthorResult::Handle(AuthorHandle::Deployment(
-            self.graph.deployment_handle(),
-        )))
-    }
-
-    /// Read a standard or platform-context field.
-    pub fn field(
-        &mut self,
-        receiver: AuthorHandle,
-        name: &str,
-    ) -> Result<AuthorResult, AuthorError> {
-        let AuthorHandle::Context(handle) = receiver else {
-            return Err(AuthorError::new(format!(
-                "receiver {} has no field `{name}`",
-                handle_name(&receiver)
-            )));
-        };
-        self.check_session_owner(&handle.owner, "context")?;
-        let projection = self.context.field(name).map_err(|error| {
-            AuthorError::new(format!(
-                "{}; supported fields: {}",
-                error,
-                P::Context::fields().join(", ")
-            ))
-        })?;
-        Ok(self.intern_projection(projection))
-    }
-
-    /// Complete the graph after validating the frontend's returned deployment handle.
-    pub fn finish(
-        self,
-        deployment: DeploymentHandle,
-    ) -> Result<VerifiedGraph, crate::error::GraphError> {
-        self.graph.finish_for(deployment)
-    }
-
-    fn check_session_owner(&self, owner: &Weak<()>, kind: &'static str) -> Result<(), AuthorError> {
-        let Some(owner) = owner.upgrade() else {
-            return Err(AuthorError::new(format!("the {kind} handle has expired")));
-        };
-        if !std::sync::Arc::ptr_eq(&owner, &self.owner) {
-            return Err(AuthorError::new(format!(
-                "the {kind} handle belongs to another author session"
-            )));
-        }
-        Ok(())
-    }
-
-    fn intern_projection(
-        &mut self,
-        projection: ContextProjection<<P::Context as PlatformContext>::Value>,
-    ) -> AuthorResult {
-        match projection {
-            ContextProjection::Value(value) => AuthorResult::Value(value),
-            ContextProjection::Token(value) => {
-                let index = self.context_values.len();
-                self.context_values.push(value);
-                AuthorResult::Handle(AuthorHandle::ContextValue(ContextToken {
-                    owner: std::sync::Arc::downgrade(&self.owner),
-                    index,
-                }))
-            }
-        }
-    }
-
-    fn call_deployment(
-        &mut self,
-        handle: DeploymentHandle,
-        method: &str,
-        args: Vec<AuthorArgument>,
-    ) -> Result<AuthorResult, AuthorError> {
-        match method {
-            "namespace" => {
-                let [AuthorArgument::Value(value)] = args.as_slice() else {
-                    return Err(AuthorError::new("Deployment.namespace expects one string"));
-                };
-                let namespace = node_string(value)?;
-                self.graph.add_namespace(&handle, namespace)?;
-                Ok(AuthorResult::Value(AuthorNode::new(AuthorValue::Unit)))
-            }
-            "module" => {
-                let Some(AuthorArgument::Value(name)) = args.first() else {
-                    return Err(AuthorError::new(
-                        "Deployment.module expects a name followed by module dependencies",
-                    ));
-                };
-                let name = node_string(name)?;
-                let dependencies = args[1..]
-                    .iter()
-                    .map(|arg| match arg {
-                        AuthorArgument::Handle(AuthorHandle::Module(handle)) => Ok(handle.clone()),
-                        _ => Err(AuthorError::new(
-                            "Deployment.module dependencies must be module handles",
-                        )),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let module = self.graph.add_module(&handle, name, dependencies)?;
-                Ok(AuthorResult::Handle(AuthorHandle::Module(module)))
-            }
-            "writeback" => {
-                let [AuthorArgument::Value(key), value] = args.as_slice() else {
-                    return Err(AuthorError::new(
-                        "Deployment.writeback expects a dotted key and literal or output",
-                    ));
-                };
-                let key = node_string(key)?;
-                let value = match value {
-                    AuthorArgument::Value(value) => {
-                        crate::graph::WritebackValue::Literal(node_string(value)?)
-                    }
-                    AuthorArgument::Handle(AuthorHandle::Output(output)) => {
-                        crate::graph::WritebackValue::Output(output.clone())
-                    }
-                    _ => {
-                        return Err(AuthorError::new(
-                            "writeback value must be a string or output reference",
-                        ));
-                    }
-                };
-                self.graph.add_writeback(&handle, key, value)?;
-                Ok(AuthorResult::Value(AuthorNode::new(AuthorValue::Unit)))
-            }
-            _ => Err(AuthorError::new(format!(
-                "unknown Deployment method `{method}`; supported: namespace, module, writeback"
-            ))),
-        }
-    }
-
-    fn call_module(
-        &mut self,
-        handle: ModuleHandle,
-        method: &str,
-        args: Vec<AuthorArgument>,
-    ) -> Result<AuthorResult, AuthorError> {
-        match method {
-            "resource" => {
-                let [
-                    AuthorArgument::Value(logical_id),
-                    AuthorArgument::Handle(AuthorHandle::Kind(kind)),
-                    dependencies @ ..,
-                ] = args.as_slice()
-                else {
-                    return Err(AuthorError::new(
-                        "Module.resource expects a logical id, kind, and optional resource dependencies",
-                    ));
-                };
-                self.check_session_owner(kind.owner(), "provider-kind")?;
-                let Some(cell) = self.kinds.get_mut(kind.index()) else {
-                    return Err(AuthorError::new("provider-kind handle index is invalid"));
-                };
-                let provider_kind = cell
-                    .take()
-                    .ok_or_else(|| AuthorError::from(crate::error::GraphError::ConsumedKind))?;
-                let dependencies = dependencies
-                    .iter()
-                    .map(|arg| match arg {
-                        AuthorArgument::Handle(AuthorHandle::Resource(resource)) => {
-                            Ok(resource.clone())
-                        }
-                        _ => Err(AuthorError::new(
-                            "Module.resource dependencies must be resource handles",
-                        )),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.graph
-                    .validate_resource_insertion(&handle, &dependencies)?;
-                let resource = self.graph.add_resource(
-                    &handle,
-                    node_string(logical_id)?,
-                    provider_kind,
-                    dependencies,
-                )?;
-                Ok(AuthorResult::Handle(AuthorHandle::Resource(resource)))
-            }
-            "workload" => {
-                let [
-                    AuthorArgument::Value(service),
-                    AuthorArgument::Value(capacity),
-                ] = args.as_slice()
-                else {
-                    return Err(AuthorError::new(
-                        "Module.workload expects a logical service and desired capacity",
-                    ));
-                };
-                let service_id = node_string(service)?;
-                let capacity = node_u32(capacity)?;
-                let service = self.binding.services.get(&service_id).ok_or_else(|| {
-                    AuthorError::new(format!(
-                        "unknown platform service `{service_id}`; supported: {}",
-                        self.binding
-                            .services
-                            .identities()
-                            .into_iter()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
-                })?;
-                let declaration = crate::graph::WorkloadDeclaration {
-                    service: service.logical_id.clone(),
-                    dependencies: service.placement.needs.clone(),
-                    desired_capacity: capacity,
-                    delivery: service.delivery.clone(),
-                    document: service.document.clone(),
-                };
-                self.graph.add_workload(&handle, declaration)?;
-                Ok(AuthorResult::Value(AuthorNode::new(AuthorValue::Unit)))
-            }
-            _ => Err(AuthorError::new(format!(
-                "unknown Module method `{method}`; supported: resource, workload"
-            ))),
-        }
-    }
-
-    fn call_resource(
-        &mut self,
-        handle: ResourceHandle,
-        method: &str,
-        args: Vec<AuthorArgument>,
-    ) -> Result<AuthorResult, AuthorError> {
-        if method != "output" {
-            return Err(AuthorError::new(format!(
-                "unknown Resource method `{method}`; supported: output"
-            )));
-        }
-        let [AuthorArgument::Value(name)] = args.as_slice() else {
-            return Err(AuthorError::new("Resource.output expects one string"));
-        };
-        let output = handle.output(&node_string(name)?)?;
-        Ok(AuthorResult::Handle(AuthorHandle::Output(output)))
-    }
-
-    fn call_context(
-        &mut self,
-        handle: ContextHandle,
-        method: &str,
-        args: Vec<AuthorArgument>,
-    ) -> Result<AuthorResult, AuthorError> {
-        self.check_session_owner(&handle.owner, "context")?;
-        let args =
-            args.into_iter()
-                .map(|argument| match argument {
-                    AuthorArgument::Value(value) => Ok(ContextArgument::Value(value)),
-                    AuthorArgument::Handle(AuthorHandle::ContextValue(token)) => {
-                        self.check_session_owner(&token.owner, "context-value")?;
-                        let value = self.context_values.get(token.index).ok_or_else(|| {
-                            AuthorError::new("context-value handle index is invalid")
-                        })?;
-                        Ok(ContextArgument::Token(value.clone()))
-                    }
-                    _ => Err(AuthorError::new(
-                        "context methods accept host-free values or context-value handles",
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        let projection = self.context.call(method, &args).map_err(|error| {
-            AuthorError::new(format!(
-                "{}; supported methods: {}",
-                error,
-                P::Context::methods().join(", ")
-            ))
-        })?;
-        Ok(self.intern_projection(projection))
-    }
-}
-
-fn node_string(node: &AuthorNode) -> Result<String, AuthorError> {
-    match &node.value {
-        AuthorValue::String(value) => Ok(value.clone()),
-        _ => Err(AuthorError::new(format!(
-            "expected string, found {}",
-            value_kind(&node.value)
-        ))
-        .at(node.range)),
-    }
-}
-
-fn node_u32(node: &AuthorNode) -> Result<u32, AuthorError> {
-    match &node.value {
-        AuthorValue::Integer(value) => u32::try_from(*value).map_err(|_| {
-            AuthorError::new(format!("integer {value} is outside the u32 range")).at(node.range)
-        }),
-        _ => Err(AuthorError::new(format!(
-            "expected integer, found {}",
-            value_kind(&node.value)
-        ))
-        .at(node.range)),
-    }
-}
-
-fn handle_name(handle: &AuthorHandle) -> &'static str {
-    match handle {
-        AuthorHandle::Deployment(_) => "Deployment",
-        AuthorHandle::Module(_) => "Module",
-        AuthorHandle::Resource(_) => "Resource",
-        AuthorHandle::Output(_) => "Output",
-        AuthorHandle::Kind(_) => "ProviderKind",
-        AuthorHandle::Context(_) => "Context",
-        AuthorHandle::ContextValue(_) => "ContextValue",
     }
 }

@@ -5,7 +5,7 @@ use std::{fmt::Debug, marker::PhantomData};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    author::{AuthorNode, from_author_node},
+    author::{LocatedValue, from_located_value},
     error::ConfigError,
 };
 
@@ -32,9 +32,9 @@ impl<C: PlatformConfig> ConfigContract<C> {
     }
 
     /// Decode host-free data and run platform-owned pure validation.
-    pub fn admit(&self, node: AuthorNode) -> Result<C, ConfigError> {
+    pub fn admit(&self, node: LocatedValue) -> Result<C, ConfigError> {
         let root_range = node.range;
-        let config: C = from_author_node(node).map_err(|error| ConfigError {
+        let config: C = from_located_value(node).map_err(|error| ConfigError {
             message: error.message().to_string(),
             range: error.range().or(root_range),
         })?;

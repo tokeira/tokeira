@@ -12,10 +12,10 @@ use thiserror::Error;
 use tokeira_orchestrator::DefinitionFormatId;
 
 use crate::{
-    author::{AuthorNode, AuthorSession},
+    author::LocatedValue,
     binding::{Platform, PlatformBinding},
     error::{DefinitionError, FrontendDiagnostic, VerificationFinding, VerificationReport},
-    graph::{DeploymentHandle, VerifiedGraph},
+    graph::VerifiedGraph,
 };
 
 /// Safe canonical path relative to one deployment root.
@@ -166,13 +166,13 @@ pub struct FrontendSource<'a> {
     pub bytes: &'a [u8],
 }
 
-/// Frontend result before typed config and graph completion admission.
+/// Completed transient definition returned by one frontend evaluation.
 #[derive(Debug)]
 pub struct FrontendOutput {
     /// Host-free configuration value.
-    pub config: AuthorNode,
-    /// Opaque final deployment handle from the supplied author session.
-    pub deployment: DeploymentHandle,
+    pub config: LocatedValue,
+    /// Completed structural graph built inside the frontend evaluator.
+    pub graph: VerifiedGraph,
 }
 
 /// Statically assembled parser/checker/evaluator for one definition format.
@@ -180,11 +180,12 @@ pub trait DefinitionFrontend<P: Platform>: Clone + Send + Sync + 'static {
     /// Open validated format identity embedded in the assembled provisioner.
     fn format(&self) -> &DefinitionFormatId;
 
-    /// Parse, check, and evaluate while driving only the language-neutral author session.
+    /// Parse, check, and evaluate into one transient in-memory definition.
     fn evaluate(
         &self,
         source: FrontendSource<'_>,
-        author: &mut AuthorSession<P>,
+        context: &P::Context,
+        binding: &PlatformBinding<P>,
     ) -> Result<FrontendOutput, FrontendDiagnostic>;
 }
 
@@ -273,13 +274,13 @@ impl<P: Platform, F: DefinitionFrontend<P>> DefinitionEngine<P, F> {
             ConfigurationIdentity::compute(&request.source.format, request.source.bytes.as_ref());
         let format = request.source.format.clone();
         let source_name = request.source.source_name.clone();
-        let mut author = AuthorSession::new(self.binding.clone(), request.context);
         let output = self.frontend.evaluate(
             FrontendSource {
                 source_name: &request.source.source_name,
                 bytes: request.source.bytes.as_ref(),
             },
-            &mut author,
+            &request.context,
+            &self.binding,
         )?;
         let config =
             self.binding
@@ -290,16 +291,9 @@ impl<P: Platform, F: DefinitionFrontend<P>> DefinitionEngine<P, F> {
                     source_name: source_name.clone(),
                     error,
                 })?;
-        let graph = author
-            .finish(output.deployment)
-            .map_err(|error| DefinitionError::Graph {
-                format,
-                source_name,
-                error: Box::new(error),
-            })?;
         Ok(EvaluatedDefinition {
             config,
-            graph,
+            graph: output.graph,
             configuration_identity: identity,
         })
     }

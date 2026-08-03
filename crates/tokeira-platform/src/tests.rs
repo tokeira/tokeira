@@ -18,7 +18,7 @@ use crate::{
         OperationalArtifactReceipts, OperationalArtifactRequest, OperationalArtifactStage,
         PlatformArtifact, RelativeArtifactPath,
     },
-    author::{AuthorArgument, AuthorHandle, AuthorNode, AuthorResult, AuthorValue},
+    author::{LocatedValue, ValueShape},
     binding::{Platform, PlatformBinding, StateBinding, StatePolicy},
     catalog::{
         DeliveryProjection, HealthDeclaration, ImageCatalog, ImageSelection, KindRegistration,
@@ -98,7 +98,9 @@ impl PlatformContext for TestContext {
 
     fn field(&self, name: &str) -> Result<ContextProjection<Self::Value>, ContextError> {
         match name {
-            "project_name" => Ok(ContextProjection::Value(AuthorNode::string(&self.project))),
+            "project_name" => Ok(ContextProjection::Value(LocatedValue::string(
+                &self.project,
+            ))),
             _ => Err(ContextError::new(format!("unknown context field `{name}`"))),
         }
     }
@@ -112,8 +114,8 @@ impl PlatformContext for TestContext {
             (
                 "anchor",
                 [
-                    ContextArgument::Value(AuthorNode {
-                        value: AuthorValue::String(suffix),
+                    ContextArgument::Value(LocatedValue {
+                        value: ValueShape::String(suffix),
                         ..
                     }),
                 ],
@@ -832,48 +834,48 @@ fn kind_node(
     suffix: impl Into<String>,
     describes: bool,
     extra_dependency: Option<String>,
-) -> AuthorNode {
-    AuthorNode::new(AuthorValue::Struct {
+) -> LocatedValue {
+    LocatedValue::new(ValueShape::Struct {
         name: "TestKind".into(),
         fields: vec![
-            ("suffix".into(), AuthorNode::string(suffix)),
+            ("suffix".into(), LocatedValue::string(suffix)),
             (
                 "describes".into(),
-                AuthorNode::new(AuthorValue::Bool(describes)),
+                LocatedValue::new(ValueShape::Bool(describes)),
             ),
             (
                 "extra_dependency".into(),
-                AuthorNode::new(AuthorValue::Option(
-                    extra_dependency.map(|value| Box::new(AuthorNode::string(value))),
+                LocatedValue::new(ValueShape::Option(
+                    extra_dependency.map(|value| Box::new(LocatedValue::string(value))),
                 )),
             ),
         ],
     })
 }
 
-fn config_node(storage: &TestStorage, replicas: u16) -> AuthorNode {
+fn config_node(storage: &TestStorage, replicas: u16) -> LocatedValue {
     let storage = match storage {
-        TestStorage::Memory => AuthorNode::new(AuthorValue::Enum {
+        TestStorage::Memory => LocatedValue::new(ValueShape::Enum {
             name: "TestStorage".into(),
             variant: "Memory".into(),
-            body: crate::author::AuthorVariantBody::Unit,
+            body: crate::author::VariantShape::Unit,
         }),
-        TestStorage::Dsql { region } => AuthorNode::new(AuthorValue::Enum {
+        TestStorage::Dsql { region } => LocatedValue::new(ValueShape::Enum {
             name: "TestStorage".into(),
             variant: "Dsql".into(),
-            body: crate::author::AuthorVariantBody::Struct(vec![(
+            body: crate::author::VariantShape::Struct(vec![(
                 "region".into(),
-                AuthorNode::string(region),
+                LocatedValue::string(region),
             )]),
         }),
     };
-    AuthorNode::new(AuthorValue::Struct {
+    LocatedValue::new(ValueShape::Struct {
         name: "TestConfig".into(),
         fields: vec![
             ("storage".into(), storage),
             (
                 "replicas".into(),
-                AuthorNode::new(AuthorValue::Integer(i128::from(replicas))),
+                LocatedValue::new(ValueShape::Integer(i128::from(replicas))),
             ),
         ],
     })
@@ -909,24 +911,18 @@ impl DefinitionFrontend<TestPlatform> for EchoFrontend {
     fn evaluate(
         &self,
         _source: FrontendSource<'_>,
-        author: &mut crate::author::AuthorSession<TestPlatform>,
+        _context: &TestContext,
+        binding: &PlatformBinding<TestPlatform>,
     ) -> Result<FrontendOutput, FrontendDiagnostic> {
-        let AuthorResult::Handle(AuthorHandle::Deployment(deployment)) = author
-            .associated("Deployment.new", Vec::new())
-            .expect("standard associated function")
-        else {
-            panic!("Deployment.new must return a deployment handle");
-        };
-        author
-            .call(
-                AuthorHandle::Deployment(deployment.clone()),
-                "module",
-                vec![AuthorArgument::Value(AuthorNode::string("state"))],
-            )
+        let mut graph =
+            DeploymentGraphBuilder::new().require_bootstrap(binding.bootstrap_module.clone());
+        let deployment = graph.deployment_handle();
+        graph
+            .add_module(&deployment, "state".into(), Vec::new())
             .expect("bootstrap module");
         Ok(FrontendOutput {
             config: config_node(&TestStorage::Memory, 1),
-            deployment,
+            graph: graph.finish_for(deployment).expect("completed graph"),
         })
     }
 }
@@ -939,7 +935,8 @@ impl DefinitionFrontend<TestPlatform> for UnusedFrontend {
     fn evaluate(
         &self,
         _source: FrontendSource<'_>,
-        _author: &mut crate::author::AuthorSession<TestPlatform>,
+        _context: &TestContext,
+        _binding: &PlatformBinding<TestPlatform>,
     ) -> Result<FrontendOutput, FrontendDiagnostic> {
         unreachable!("verification tests do not invoke the frontend")
     }
@@ -1051,10 +1048,10 @@ proptest! {
     ) {
         let mut node = kind_node(&suffix, describes, None);
         if surplus {
-            let AuthorValue::Struct { fields, .. } = &mut node.value else {
+            let ValueShape::Struct { fields, .. } = &mut node.value else {
                 unreachable!("helper always constructs a struct");
             };
-            fields.push(("surplus".into(), AuthorNode::new(AuthorValue::Bool(true))));
+            fields.push(("surplus".into(), LocatedValue::new(ValueShape::Bool(true))));
         }
         let decoded = test_kinds().decode("test-resource", node);
         prop_assert_eq!(decoded.is_ok(), !surplus);
@@ -1137,10 +1134,10 @@ proptest! {
         let expected = TestConfig { storage: storage.clone(), replicas };
         let mut node = config_node(&storage, replicas);
         if surplus {
-            let AuthorValue::Struct { fields, .. } = &mut node.value else {
+            let ValueShape::Struct { fields, .. } = &mut node.value else {
                 unreachable!("helper always constructs a struct");
             };
-            fields.push(("surplus".into(), AuthorNode::string("rejected")));
+            fields.push(("surplus".into(), LocatedValue::string("rejected")));
         }
         let admitted = ConfigContract::<TestConfig>::new().admit(node);
         prop_assert_eq!(admitted.is_ok(), !surplus);
@@ -1149,39 +1146,6 @@ proptest! {
             let bytes = serde_json::to_vec(&admitted).expect("serialize admitted config");
             let round_trip: TestConfig = serde_json::from_slice(&bytes).expect("deserialize config");
             prop_assert_eq!(round_trip, expected);
-        }
-    }
-
-    // Context dispatch is repeatable, immutable, and limited to the declared schema.
-    // Feature: platform-builder-abstraction, Property 6: platform context exposure is immutable and allow-listed
-    #[test]
-    fn property_6_context_is_immutable_and_allow_listed(
-        project in "[a-z]{1,16}",
-        requests in prop::collection::vec(any::<bool>(), 1..24),
-    ) {
-        let mut session = crate::author::AuthorSession::new(
-            test_binding(),
-            TestContext { project: project.clone() },
-        );
-        let context = AuthorHandle::Context(session.context_handle());
-        for valid in requests {
-            let result = session.field(
-                context.clone(),
-                if valid { "project_name" } else { "deployment_dir" },
-            );
-            if valid {
-                let AuthorResult::Value(AuthorNode {
-                    value: AuthorValue::String(actual),
-                    ..
-                }) = result.expect("declared field is available")
-                else {
-                    prop_assert!(false, "declared field returned the wrong value shape");
-                    continue;
-                };
-                prop_assert_eq!(actual, project.as_str());
-            } else {
-                prop_assert!(result.is_err());
-            }
         }
     }
 
@@ -1467,45 +1431,6 @@ proptest! {
             );
         }
     }
-}
-
-#[test]
-fn context_tokens_are_rejected_by_typed_kind_admission() {
-    let mut session = crate::author::AuthorSession::new(
-        test_binding(),
-        TestContext {
-            project: "project".into(),
-        },
-    );
-    let context = AuthorHandle::Context(session.context_handle());
-    let token = session
-        .call(
-            context,
-            "anchor",
-            vec![AuthorArgument::Value(AuthorNode::string("state"))],
-        )
-        .expect("context projection succeeds");
-    let AuthorResult::Handle(AuthorHandle::ContextValue(token)) = token else {
-        panic!("anchor must return a typed token");
-    };
-    let node = AuthorNode::new(AuthorValue::Struct {
-        name: "TestKind".into(),
-        fields: vec![
-            (
-                "suffix".into(),
-                AuthorNode::new(AuthorValue::ContextToken(token)),
-            ),
-            ("describes".into(), AuthorNode::new(AuthorValue::Bool(true))),
-            (
-                "extra_dependency".into(),
-                AuthorNode::new(AuthorValue::Option(None)),
-            ),
-        ],
-    });
-    let error = test_kinds()
-        .decode("test-resource", node)
-        .expect_err("provider input cannot contain a context token");
-    assert!(error.message.contains("context token"));
 }
 
 #[test]

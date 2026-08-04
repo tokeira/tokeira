@@ -50,6 +50,10 @@ exceptions = [
     # webpki-roots bundles Mozilla's CA certificate set under the data-only
     # CDLA-Permissive-2.0 license; the crate's own code is permissive.
     { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+    # monty's unicode_names2 embeds the Unicode character-name tables under
+    # the data-files license predecessor of the already-allowed Unicode-3.0
+    # (OSI approved); the crate's own code is MIT OR Apache-2.0.
+    { crate = "unicode_names2", allow = ["Unicode-DFS-2016"] },
 ]
 
 [bans]

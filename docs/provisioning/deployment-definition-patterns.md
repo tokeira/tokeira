@@ -18,9 +18,9 @@ completed graph and the host-free configuration value.
 | Admit configuration through a platform serde type | `ComposeConfig` and pure validation | [Compose config](../../platforms/compose/src/config.rs) |
 | Supply platform-specific runtime facts | `ComposeContext` | [Compose context](../../platforms/compose/src/context.rs) |
 | Select modules from config variants | Conditional DSQL module | [Compose definition](../../platforms/compose/definition.tkd) |
-| Keep host paths out of source | Logical `Volume` values | [Compose services](../../platforms/compose/src/services/mod.rs) |
-| Preserve configuration coupling | Resource dependencies plus content digests | [Compose services](../../platforms/compose/src/services/mod.rs) |
-| Decode a closed kind set without a registry | `ComposeKind` and `kind_functions()` | [Compose services](../../platforms/compose/src/services/mod.rs) |
+| Keep host paths out of source | Logical `Volume` values | [Compose kinds](../../crates/tokeira-compose/src/kinds/mod.rs) |
+| Preserve configuration coupling | Resource dependencies plus content digests | [Compose kinds](../../crates/tokeira-compose/src/kinds/mod.rs) |
+| Decode a closed kind set without a registry | `EngineKind` and `kind_functions()` | [Engine kind library](../../crates/tokeira-kinds/src/lib.rs) |
 | Keep checking and execution on one evaluation path | `evaluate_with_context()` | [Compose provisioner](../../platforms/compose/src/lib.rs) |
 | Bind one platform and frontend into `tkp` | Generated composition root | [Provisioner composition](../../crates/tokeira-build/src/composition.rs) |
 
@@ -265,5 +265,5 @@ shape mechanically:
 - [`tkr` and `tkp`](tkr-and-tkp.md) — construction, identity, placement, and verification.
 - [Extending the IaC framework](../iac/extending.md) — resource and provider seams.
 - [Compose definition](../../platforms/compose/definition.tkd),
-  [kind set](../../platforms/compose/src/services/mod.rs), and
+  [kind set](../../crates/tokeira-compose/src/kinds/mod.rs), and
   [provisioner](../../platforms/compose/src/lib.rs) — the complete current Compose path.

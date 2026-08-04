@@ -14,7 +14,7 @@
 
 use std::{path::Path, pin::Pin};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokeira_iac::{Change, ChangeKind, PlanOutcome};
 use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 use tokeira_provisioner::DeploymentStateEnvelope;
@@ -307,6 +307,24 @@ pub trait ProvisionerPlatform {
         })
     }
 
+    /// The retarget gate: compare the retained prior configuration against
+    /// the live source and refuse a create-time-immutable change before any
+    /// mutation. The shell supplies both sources; the platform evaluates
+    /// them through its own frontend. An `Err` is the refusal, naming the
+    /// changed fields; `NotApplicable` serves platforms with no interpreted
+    /// definition, which gate nothing.
+    async fn retarget_check(
+        &self,
+        deployment_dir: &Path,
+        prior_source: &str,
+        current_source: &str,
+    ) -> Result<Realization<()>> {
+        let _ = (deployment_dir, prior_source, current_source);
+        Ok(Realization::NotApplicable {
+            reason: "this platform has no interpreted definition",
+        })
+    }
+
     /// Open a platform-native stream for one logical service.
     async fn log_stream(
         &self,
@@ -475,6 +493,39 @@ pub(crate) fn committed_changes(applied: &AppliedOutcome) -> Vec<tokeira_explain
 /// For now a local CAS store under `{deployment_dir}/state/envelope`; cloud
 /// deployments will select an `S3StateStore` through the platform store seam
 /// (task 13.2), just like the infra/runtime state.
+/// The retarget gate, run by every config-applying verb after the binding
+/// gate and before any mutation: a `#[create]` change is a new deployment,
+/// not an apply. No retained prior revision means nothing has ever applied,
+/// so there is nothing to gate — Day-0 `init` retains revision 0 from the
+/// operator's already-edited definition, which is exactly why choosing a
+/// `#[create]` value *before* the first apply is legitimate and changing it
+/// *after* is refused.
+pub(crate) async fn retarget_gate<P: ProvisionerPlatform>(
+    platform: &P,
+    deployment_dir: &Path,
+    envelope: &DeploymentStateEnvelope,
+) -> Result<()> {
+    let config_source = platform.config_source(deployment_dir)?;
+    let Some(prior) =
+        config_history::retained_source(deployment_dir, &config_source, envelope.config_revision)?
+    else {
+        return Ok(());
+    };
+    let live_path = config_history::config_file(deployment_dir, &config_source);
+    let current = std::fs::read_to_string(&live_path).with_context(|| {
+        format!(
+            "failed to read the live definition at {}",
+            live_path.display()
+        )
+    })?;
+    match platform
+        .retarget_check(deployment_dir, &prior, &current)
+        .await?
+    {
+        Realization::Realized(()) | Realization::NotApplicable { .. } => Ok(()),
+    }
+}
+
 pub(crate) fn envelope_store(
     deployment_dir: &Path,
 ) -> Box<dyn DeploymentStore<DeploymentStateEnvelope>> {

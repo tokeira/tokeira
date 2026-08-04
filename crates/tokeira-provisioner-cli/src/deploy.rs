@@ -104,6 +104,9 @@ pub(crate) async fn deploy_apply<P: ProvisionerPlatform>(
         GateOutcome::Proceed { verdict, .. } => verdict,
     };
 
+    // ── Retarget gate: identical contract to `infra apply`. ──
+    crate::retarget_gate(platform, deployment_dir, &envelope).await?;
+
     // ── Destructive gate (§4): identical contract to `infra apply`. The
     // gate's plan doubles as the applied explanation's field evidence
     // (Property 9: never invented, only reused). ──

@@ -48,6 +48,9 @@ pub(crate) async fn scale<P: ProvisionerPlatform>(
         GateOutcome::Proceed { .. } => {}
     }
 
+    // ── Retarget gate: a capacity change is a config apply, gated the same. ──
+    crate::retarget_gate(platform, deployment_dir, &envelope).await?;
+
     // ── Capacity change (realized by the injected platform) ──
     let change_count = match platform.scale(deployment_dir, specs).await? {
         Realization::NotApplicable { reason } => {

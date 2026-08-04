@@ -22,7 +22,7 @@ use tokeira_platform::{
     context::InvocationContext,
     definition::{
         DefinitionFrontend, DefinitionSource, DefinitionSourceName, EvaluatedDefinition,
-        RealizedResourceIndex, evaluate_definition, verify_definition,
+        FrontendSource, RealizedResourceIndex, evaluate_definition, verify_definition,
     },
     graph::{ModuleNode, WritebackEntry, WritebackValue},
 };
@@ -638,6 +638,41 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
         };
         Self::verify_admitted(&evaluated).map_err(anyhow::Error::from)?;
         Ok(Realization::Realized(()))
+    }
+
+    async fn retarget_check(
+        &self,
+        deployment_dir: &Path,
+        prior_source: &str,
+        current_source: &str,
+    ) -> Result<Realization<()>> {
+        let metadata = Self::metadata(deployment_dir)?;
+        let definition = Self::definition(&metadata)?;
+        let invocation = Self::invocation(deployment_dir, &metadata);
+        let context = context::ComposeContext::from_invocation(&invocation);
+        // Both revisions carry the recorded definition identity: the compare
+        // is between two states of the same document, not two documents.
+        let source_name = DefinitionSourceName::DeploymentRelative(definition.path.clone());
+        let prior = FrontendSource {
+            source_name: &source_name,
+            bytes: prior_source.as_bytes(),
+        };
+        let current = FrontendSource {
+            source_name: &source_name,
+            bytes: current_source.as_bytes(),
+        };
+        match self.frontend.retarget_check(
+            prior,
+            current,
+            &context,
+            tokeira_kinds::kind_functions(),
+        ) {
+            Ok(()) => Ok(Realization::Realized(())),
+            Err(messages) => anyhow::bail!(
+                "retarget refused — a create-time value changed; create a new deployment instead:\n  - {}",
+                messages.join("\n  - ")
+            ),
+        }
     }
 
     async fn log_stream(

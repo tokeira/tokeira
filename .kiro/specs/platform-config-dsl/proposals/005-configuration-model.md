@@ -177,6 +177,10 @@ material, and third-party credentials to come.
 3. **Resolution happens at process start; rotation is a restart.** Nothing re-reads secrets live.
    Rotating a secret means a rolling restart — boring on purpose.
 
+Which delivery each platform prefers — files, runtime retrieval, or environment injection as the
+explicit escape hatch — is the platform policy recorded in
+[platforms/SECRETS.md](../../../../platforms/SECRETS.md).
+
 ### `SecretRef` — a locator for one value
 
 The same locator idea as §5, at field granularity. A secret-typed schema field (`SecretRef` in
@@ -222,7 +226,7 @@ Rendering and loading are identical everywhere; only the middle differs.
 | Channel | rendered file in the deployment dir, bind-mounted read-only | rendered bytes in a `SecretsManagerSecret`, injected by the ECS agent | rendered bytes in a ConfigMap, mounted by the kubelet |
 | Load | `TOKEIRA_CONFIG=/etc/tokeira/tokeirad.toml` | `TOKEIRA_CONFIG=env:TOKEIRA_CONFIG_CONTENT`; `secrets.valueFrom` pinned to the version | `TOKEIRA_CONFIG=/etc/tokeira/tokeirad.toml` |
 | Change shows up as | digest env on the service | digest + pinned version in the task definition | checksum annotation on the pod template |
-| `SecretRef` values | provider with operator credentials | provider via task role; native `valueFrom` for plain env secrets | provider via pod identity — no copies into K8s `Secret` objects |
+| `SecretRef` values | provider with operator credentials | provider via task role; native `valueFrom` only as the env escape hatch | ASCP/CSI file mounts under Pod Identity — no copies into K8s `Secret` objects |
 
 The exemplars use **target vocabulary**: compose names are current source; the ECS and EKS kinds are
 what those migrations bind. Illustrative, per the
@@ -309,10 +313,11 @@ is transport, and none of it is authored:
 ### 7.3 EKS
 
 Same definition shape. The rendered document becomes a ConfigMap; pod templates mount it, set the
-file locator, and carry a checksum annotation so a content change rolls the Deployment. `SecretRef`
-values resolve in-process through the AWS provider under **pod identity** — deliberately no
-ExternalSecrets or CSI sync layer: the secret store *is* Secrets Manager, and copies of secret
-material into cluster objects are avoided rather than managed.
+file locator, and carry a checksum annotation so a content change rolls the Deployment. Secret
+values arrive as **files**: the Secrets Store CSI Driver with the AWS provider mounts them under
+**Pod Identity**, never synced into Kubernetes `Secret` objects — no cluster API object ever holds
+the value. In-process retrieval through the AWS provider remains the path on Fargate, where CSI
+mounting is unsupported.
 
 ## 8. Deltas to the standing contract
 
@@ -346,7 +351,6 @@ Judgments deliberately left open:
 | Question | Recommendation |
 |---|---|
 | Full definition authority vs a layered operator-editable base file | **Full authority** — one document to edit; layering means two owners and merge rules |
-| EKS secrets: in-process provider vs ExternalSecrets/CSI | In-process provider under pod identity (no synced copies) |
 | Break-glass ergonomics | Through the definition (revisioned); revisit only if incident latency proves it too slow |
 
 ## Further reading

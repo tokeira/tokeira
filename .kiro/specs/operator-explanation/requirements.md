@@ -296,17 +296,25 @@ quietly updates a resource, so that I can judge the operational cost before appl
    its applicable change kinds, asserting the semantic classification, not the rendered
    prose.
 
-#### Kind inventory and declaration policy
+#### Declaration ownership
 
-Every `Resource` implementation is accounted for; the executable half is the platform's
-semantics registry (`platforms/compose/src/semantics_registry.rs`), whose accounting
-test fails the moment an unclassified kind realizes.
+Capturing the properties the deployment engine acts on is the resource + kind
+author's responsibility, discharged at authoring time: `change_semantics` has no
+default, so a kind cannot compile without stating its semantics alongside the
+lifecycle it implements. There is no inventory, no registry, and no tier
+classification — the enforcement is structural:
 
-| Tier | Kinds | Policy |
-|---|---|---|
-| **Tier 1 — operating set** | `compose_service` (`tokeira_compose`), `observability_config_files`, `local_state_dir`, `server_config` | SHALL declare every applicable field with a citation. These run on the platform operators use today. |
-| **Tier 2 — storage path** | `DsqlCluster`, `DynamoDbTable` | SHALL declare. Storage transitions are the highest-stakes explanation Tokeira produces; an unexplained DSQL change is the worst possible silence. |
-| **Tier 3 — unexercised providers** | the remaining `tokeira-aws` kinds (EC2, ECS, EKS, ALB, IAM, S3, VPC, SSM, Secrets Manager, ECR, ASG, and their neighbours), the k8s namespace kind, and the `tokeira-remote-workstation` kinds | SHALL default to unknown. Declaring provider semantics for a platform no operator currently exercises would be asserting facts nobody has verified. |
+- **Presence** — the trait requires the declaration; the compiler asks every
+  author, for every kind, on every platform.
+- **Evidence** — fact-bearing confidence values (`EngineFact`, `Inference`,
+  `ProviderGuarantee`) carry citations structurally; a claim cannot be stated
+  without naming its source.
+- **Honesty** — verification travels in the confidence tier, not in a policy
+  table: what the kind's own lifecycle code does is `EngineFact`; what is
+  derived from that code is `Inference`, owned as derived; a documented
+  provider behaviour is `ProviderGuarantee` with the document cited; and a
+  claim nobody has established is declared `Unknown` per-field, with intent —
+  never defaulted.
 
 ### Requirement 5: Causality
 

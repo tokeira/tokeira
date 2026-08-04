@@ -495,15 +495,14 @@ pub trait Resource: Send + Sync {
     ///
     /// MUST be pure and total: no I/O, no provider call, no panic, a value
     /// for every input — the engine calls this during change computation,
-    /// inside the plan path's tight loop. The default declares nothing
-    /// (every field `Unknown`), which is the honest posture for a kind whose
-    /// provider behaviour nobody has established — not a placeholder. A kind
-    /// that overrides this cites its sources (`EngineFact` /
-    /// `ProviderGuarantee` carry citations structurally).
-    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
-        let _ = ctx;
-        ChangeSemantics::default()
-    }
+    /// inside the plan path's tight loop. Deliberately no default: capturing
+    /// the properties the deployment engine acts on is the resource + kind
+    /// author's responsibility, discharged at authoring time — the compiler
+    /// asks alongside the lifecycle itself. Claims cite their sources
+    /// (`EngineFact` / `ProviderGuarantee` carry citations structurally);
+    /// a single claim nobody can establish is declared `Unknown` per-field,
+    /// with intent.
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics;
 
     /// A short operator-facing noun for what this resource is — "service",
     /// "DNS zone", "state directory". Consumers compose it into prose

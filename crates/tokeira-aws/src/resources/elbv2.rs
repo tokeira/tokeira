@@ -5,8 +5,9 @@ use aws_sdk_elasticloadbalancingv2::types::{
     Matcher, ProtocolEnum, RuleCondition, TargetTypeEnum,
 };
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DescribeResult, Disruption, InternalChange,
+    ProvisionContext, Resource, ResourceId, ResourceState, ResourceType, SemanticsContext,
+    error::IacError,
 };
 
 /// Listener mode for the internal edge ALB.
@@ -148,6 +149,40 @@ impl AlbResource {
 
 #[async_trait::async_trait]
 impl Resource for AlbResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — elasticloadbalancing:CreateLoadBalancer (internal \
+             scheme) across the state-read subnets and security groups"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: the balancer's shape is fixed at \
+             create and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — elasticloadbalancing:DeleteLoadBalancer by recorded \
+             ARN; anything still routing through it loses its path"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        match ctx.kind {
+            ChangeKind::Create => {
+                semantics.provider_assigned = vec!["load_balancer_arn".into(), "dns_name".into()];
+            }
+            // A live balancer is a serving component: deleting it is the
+            // one arm whose disruption is not None.
+            ChangeKind::Delete => {
+                semantics.disruption = Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: DELETE,
+                };
+            }
+            _ => {}
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("Alb")
     }
@@ -353,6 +388,30 @@ impl AlbTargetGroupResource {
 
 #[async_trait::async_trait]
 impl Resource for AlbTargetGroupResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — elasticloadbalancing:CreateTargetGroup (GRPC protocol \
+             version, health check per config)"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: target-group settings are fixed at \
+             create and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — elasticloadbalancing:DeleteTargetGroup by recorded \
+             ARN (listeners referencing it are deleted first by dependency \
+             order)"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Create) {
+            semantics.provider_assigned = vec!["target_group_arn".into()];
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("AlbTargetGroup")
     }
@@ -600,6 +659,44 @@ impl AlbListenerResource {
 
 #[async_trait::async_trait]
 impl Resource for AlbListenerResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — elasticloadbalancing:CreateListener on the balancer's \
+             port, then per-host forwarding rules"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: listener and rules are fixed at \
+             create and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — elasticloadbalancing:DeleteListener by recorded ARN; \
+             the balancer stops accepting traffic on the listener's port"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        match ctx.kind {
+            ChangeKind::Create => {
+                semantics.provider_assigned = vec![
+                    "listener_arn".into(),
+                    "edge_api_rule_arn".into(),
+                    "edge_poll_rule_arn".into(),
+                ];
+            }
+            // Removing the listener closes the serving port — the one arm
+            // whose disruption is not None.
+            ChangeKind::Delete => {
+                semantics.disruption = Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: DELETE,
+                };
+            }
+            _ => {}
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("AlbListener")
     }

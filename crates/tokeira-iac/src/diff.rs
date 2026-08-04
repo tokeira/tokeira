@@ -57,6 +57,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::Resource for FakeResource {
+        fn change_semantics(&self, _ctx: &crate::SemanticsContext<'_>) -> crate::ChangeSemantics {
+            crate::ChangeSemantics::default()
+        }
         fn resource_type(&self) -> ResourceType {
             self.rtype.clone()
         }

@@ -88,6 +88,77 @@ impl K8sManifestResource {
 
 #[async_trait]
 impl iac::Resource for K8sManifestResource {
+    fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
+        const CREATE: iac::Citation = iac::Citation::code(concat!(
+            module_path!(),
+            "::create — server-side apply of the bundle's manifests through \
+             the registered KubePlatform"
+        ));
+        const UPDATE: iac::Citation = iac::Citation::code(concat!(
+            module_path!(),
+            "::update — a re-apply of the desired manifest set: server-side \
+             apply reconciles field-by-field; Kubernetes rolls workloads whose \
+             pod template changed under their own update strategy"
+        ));
+        const DELETE: iac::Citation = iac::Citation::code(concat!(
+            module_path!(),
+            "::delete — deletes the bundle's objects in reverse order \
+             (not-found tolerated); whatever they were running stops"
+        ));
+        let claims = |operation,
+                      disruption: iac::Confidence<iac::Disruption>,
+                      citation: iac::Citation| iac::ChangeSemantics {
+            operation: iac::Confidence::EngineFact {
+                value: operation,
+                citation: citation.clone(),
+            },
+            replacement: iac::Confidence::EngineFact {
+                value: iac::ReplacementPolicy::NotRequired,
+                citation: citation.clone(),
+            },
+            disruption,
+            data_effect: iac::Confidence::EngineFact {
+                value: iac::DataEffect::NoDataHeld,
+                citation: citation.clone(),
+            },
+            reversibility: iac::Confidence::EngineFact {
+                value: iac::Reversibility::Reversible,
+                citation,
+            },
+            statement: None,
+            provider_assigned: Vec::new(),
+        };
+        match ctx.kind {
+            iac::ChangeKind::Create => claims(
+                iac::LifecycleOperation::Created,
+                iac::Confidence::EngineFact {
+                    value: iac::Disruption::None,
+                    citation: CREATE,
+                },
+                CREATE,
+            ),
+            // The roll is Kubernetes executing each workload's own update
+            // strategy after our re-apply — derived, not issued.
+            iac::ChangeKind::Update | iac::ChangeKind::Replace => claims(
+                iac::LifecycleOperation::UpdatedInPlace,
+                iac::Confidence::Inference {
+                    value: iac::Disruption::Rolling,
+                    citation: UPDATE,
+                },
+                UPDATE,
+            ),
+            iac::ChangeKind::Delete => claims(
+                iac::LifecycleOperation::Deleted,
+                iac::Confidence::EngineFact {
+                    value: iac::Disruption::UnavailableDuringChange,
+                    citation: DELETE,
+                },
+                DELETE,
+            ),
+            iac::ChangeKind::NoChange => iac::ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new(RESOURCE_TYPE)
     }

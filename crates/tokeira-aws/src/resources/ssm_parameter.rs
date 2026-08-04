@@ -1,6 +1,6 @@
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext, Resource,
+    ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
 };
 
 /// Secure SSM parameter used for generated task configuration payloads.
@@ -28,6 +28,23 @@ impl Resource for SsmParameterResource {
 
     fn module(&self) -> &str {
         &self.module
+    }
+
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        // Generated task configuration: the value regenerates from the
+        // definition on the next apply, so the parameter holds no data of
+        // record.
+        super::generated_content_semantics(
+            ctx.kind,
+            Citation::code(concat!(
+                module_path!(),
+                "::{create,update} — ssm:PutParameter with overwrite(true)"
+            )),
+            Citation::code(concat!(
+                module_path!(),
+                "::delete — ssm:DeleteParameter, ParameterNotFound tolerated (idempotent)"
+            )),
+        )
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {

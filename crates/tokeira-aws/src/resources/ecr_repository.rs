@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
+    InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource, ResourceId,
+    ResourceState, ResourceType, Reversibility, SemanticsContext, error::IacError,
 };
 
 use crate::{EcrError, ImageTagMutability, RepositoryDescription, clients::ecr::ecr_client};
@@ -37,6 +38,88 @@ impl EcrRepository {
 
 #[async_trait::async_trait]
 impl Resource for EcrRepository {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ecr:CreateRepository (mutable tags), then \
+             ecr:PutLifecyclePolicy"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — in-place reconcile: ecr:PutLifecyclePolicy and \
+             ecr:TagResource; images are never touched"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ecr:DeleteRepository with force(true): the repository \
+             AND every image stored in it are deleted by our own parameter \
+             choice"
+        ));
+        let claims = |operation,
+                      data_effect: Confidence<DataEffect>,
+                      reversibility: Confidence<Reversibility>,
+                      citation: Citation| ChangeSemantics {
+            operation: Confidence::EngineFact {
+                value: operation,
+                citation: citation.clone(),
+            },
+            replacement: Confidence::EngineFact {
+                value: ReplacementPolicy::NotRequired,
+                citation: citation.clone(),
+            },
+            disruption: Confidence::EngineFact {
+                value: Disruption::None,
+                citation,
+            },
+            data_effect,
+            reversibility,
+            statement: None,
+            provider_assigned: Vec::new(),
+        };
+        match ctx.kind {
+            ChangeKind::Create => claims(
+                LifecycleOperation::Created,
+                Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: CREATE,
+                },
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: CREATE,
+                },
+                CREATE,
+            ),
+            ChangeKind::Update | ChangeKind::Replace => claims(
+                LifecycleOperation::UpdatedInPlace,
+                Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: UPDATE,
+                },
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: UPDATE,
+                },
+                UPDATE,
+            ),
+            // force(true) destroying the stored images is our parameter — an
+            // engine fact. That the loss is recoverable only by re-pushing
+            // (images are build artifacts, not unique data) is derived.
+            ChangeKind::Delete => claims(
+                LifecycleOperation::Deleted,
+                Confidence::EngineFact {
+                    value: DataEffect::Destroyed,
+                    citation: DELETE,
+                },
+                Confidence::Inference {
+                    value: Reversibility::ReversibleWithDataLoss,
+                    citation: DELETE,
+                },
+                DELETE,
+            ),
+            ChangeKind::NoChange => ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("EcrRepository")
     }

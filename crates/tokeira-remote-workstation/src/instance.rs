@@ -52,6 +52,49 @@ pub struct WorkstationInstance {
 
 #[async_trait::async_trait]
 impl Resource for WorkstationInstance {
+    fn change_semantics(
+        &self,
+        ctx: &tokeira_iac::SemanticsContext<'_>,
+    ) -> tokeira_iac::ChangeSemantics {
+        const CREATE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::create — renders user-data from state-read volume ids, then \
+             drives the generic Ec2Instance create (ec2:RunInstances, running \
+             waiter, volume attachments)"
+        ));
+        const UPDATE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: instance properties are immutable \
+             and `diff` answers NoChange"
+        ));
+        const DELETE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::delete — ec2:TerminateInstances plus the terminated waiter; \
+             the cache/repo EBS volumes are separate resources and survive, \
+             the instance's own root disk does not"
+        ));
+        let mut semantics =
+            tokeira_aws::resources::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, tokeira_iac::ChangeKind::Delete) {
+            // Same story as the generic Ec2Instance: termination interrupts
+            // the workstation, and the root disk's loss is derived from this
+            // module never disabling delete-on-termination.
+            semantics.disruption = tokeira_iac::Confidence::EngineFact {
+                value: tokeira_iac::Disruption::UnavailableDuringChange,
+                citation: DELETE,
+            };
+            semantics.data_effect = tokeira_iac::Confidence::Inference {
+                value: tokeira_iac::DataEffect::Destroyed,
+                citation: DELETE,
+            };
+            semantics.reversibility = tokeira_iac::Confidence::Inference {
+                value: tokeira_iac::Reversibility::ReversibleWithDataLoss,
+                citation: DELETE,
+            };
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("Ec2Instance")
     }

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DescribeResult, Disruption, InternalChange,
+    ProvisionContext, Resource, ResourceId, ResourceState, ResourceType, SemanticsContext,
+    error::IacError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +102,41 @@ pub struct TaskDefinitionResource {
 
 #[async_trait::async_trait]
 impl Resource for TaskDefinitionResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ecs:RegisterTaskDefinition registers one new revision \
+             of the family"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — delegates to create: an update registers a new \
+             revision; no running task is touched"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ecs:DeregisterTaskDefinition marks the recorded \
+             revision INACTIVE"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        match ctx.kind {
+            ChangeKind::Create => {
+                semantics.provider_assigned = vec!["task_definition_arn".into()];
+            }
+            // The provider accretes revisions rather than mutating one — the
+            // reason this is UpdatedInPlace, not Replaced: nothing is
+            // destroyed, nothing running is disturbed.
+            ChangeKind::Update | ChangeKind::Replace => {
+                semantics.statement = Some(std::borrow::Cow::Borrowed(
+                    "a new task-definition revision would be registered; running \
+                     tasks keep the revision they started with",
+                ));
+            }
+            _ => {}
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("EcsTaskDefinition")
     }
@@ -269,6 +305,53 @@ pub struct EcsServiceResource {
 
 #[async_trait::async_trait]
 impl Resource for EcsServiceResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ecs:CreateService on the state-read cluster and task \
+             definition, with service-registry wiring when declared"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — ecs:UpdateService to the state-read task definition \
+             with force_new_deployment(true): ECS starts a new deployment and \
+             replaces tasks under the service's deployment configuration"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ecs:DeleteService with force(true): running tasks are \
+             stopped with the service, by our own parameter choice \
+             (ServiceNotFound/ClusterNotFound tolerated)"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        match ctx.kind {
+            ChangeKind::Create => {
+                semantics.provider_assigned = vec!["service_arn".into()];
+            }
+            // Our fact is requesting the new deployment; that ECS rolls tasks
+            // rather than stopping them together is the provider executing
+            // the service's deployment configuration — derived, not issued.
+            ChangeKind::Update | ChangeKind::Replace => {
+                semantics.disruption = Confidence::Inference {
+                    value: Disruption::Rolling,
+                    citation: UPDATE,
+                };
+                semantics.statement = Some(std::borrow::Cow::Borrowed(
+                    "a new rolling deployment would start; tasks are replaced \
+                     under the service's deployment configuration",
+                ));
+            }
+            ChangeKind::Delete => {
+                semantics.disruption = Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: DELETE,
+                };
+            }
+            _ => {}
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("EcsService")
     }
@@ -487,6 +570,29 @@ pub struct CloudMapNamespaceResource {
 
 #[async_trait::async_trait]
 impl Resource for CloudMapNamespaceResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — servicediscovery:CreatePrivateDnsNamespace in the \
+             state-read VPC, polled to completion"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: the namespace is fixed at create \
+             and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — servicediscovery:DeleteNamespace by recorded \
+             namespace id"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Create) {
+            semantics.provider_assigned = vec!["namespace_id".into()];
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("CloudMapNamespace")
     }

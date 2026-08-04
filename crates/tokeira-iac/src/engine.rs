@@ -1649,6 +1649,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Resource for StubResource {
+        fn change_semantics(&self, _ctx: &crate::SemanticsContext<'_>) -> crate::ChangeSemantics {
+            crate::ChangeSemantics::default()
+        }
         fn resource_type(&self) -> crate::ResourceType {
             crate::ResourceType::new("Stub")
         }
@@ -1813,6 +1816,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Resource for VerifyProbe {
+        fn change_semantics(&self, _ctx: &crate::SemanticsContext<'_>) -> crate::ChangeSemantics {
+            crate::ChangeSemantics::default()
+        }
         fn resource_id(&self) -> ResourceId {
             ResourceId(self.id.to_string())
         }

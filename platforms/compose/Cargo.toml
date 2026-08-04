@@ -47,9 +47,6 @@ thiserror = { workspace = true }
 tokeira-tkd = { workspace = true }
 tokeira-tkdp = { workspace = true }
 tempfile = { workspace = true }
-# The semantics registry's Properties 9/10 (change-semantics Requirement 7)
-# probe realized kinds over generated contexts.
-proptest = { workspace = true }
 # The exercise test asserts the explanation model over the real engine outcome
 # (evidence-model task 7.2).
 tokeira-explain = { workspace = true }

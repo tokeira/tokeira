@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
+    InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource, ResourceId,
+    ResourceState, ResourceType, Reversibility, SemanticsContext, error::IacError,
 };
 
 /// Configuration for a single S3 bucket provider resource.
@@ -109,6 +110,78 @@ fn extract_snapshot_policy_prefix(
 
 #[async_trait::async_trait]
 impl Resource for S3Bucket {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — s3:CreateBucket (region-constrained), then \
+             s3:PutBucketTagging / PutBucketVersioning / PutBucketPolicy per \
+             config"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — in-place reconcile of the same bucket-level Puts \
+             (tagging, versioning, policy); objects are never touched"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — s3:DeleteBucket only (NoSuchBucket tolerated); this \
+             module never deletes objects, and S3 refuses to remove a \
+             non-empty bucket, so stored data cannot be destroyed here"
+        ));
+        let claims =
+            |operation, data_effect: Confidence<DataEffect>, citation: Citation| ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: operation,
+                    citation: citation.clone(),
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: citation.clone(),
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: citation.clone(),
+                },
+                data_effect,
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation,
+                },
+                statement: None,
+                provider_assigned: Vec::new(),
+            };
+        match ctx.kind {
+            ChangeKind::Create => claims(
+                LifecycleOperation::Created,
+                Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: CREATE,
+                },
+                CREATE,
+            ),
+            ChangeKind::Update | ChangeKind::Replace => claims(
+                LifecycleOperation::UpdatedInPlace,
+                Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: UPDATE,
+                },
+                UPDATE,
+            ),
+            // Preserved is an inference: our fact is that only DeleteBucket
+            // is issued; that a non-empty bucket refuses (so objects survive
+            // any outcome) is S3's behaviour, not a call we make.
+            ChangeKind::Delete => claims(
+                LifecycleOperation::Deleted,
+                Confidence::Inference {
+                    value: DataEffect::Preserved,
+                    citation: DELETE,
+                },
+                DELETE,
+            ),
+            ChangeKind::NoChange => ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("S3Bucket")
     }

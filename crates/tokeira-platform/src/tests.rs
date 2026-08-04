@@ -123,6 +123,12 @@ struct ProbeResource {
 }
 
 impl tokeira_iac::Resource for ProbeResource {
+    fn change_semantics(
+        &self,
+        _ctx: &tokeira_iac::SemanticsContext<'_>,
+    ) -> tokeira_iac::ChangeSemantics {
+        tokeira_iac::ChangeSemantics::default()
+    }
     fn resource_type(&self) -> tokeira_iac::ResourceType {
         tokeira_iac::ResourceType::new("ValidationProbe")
     }

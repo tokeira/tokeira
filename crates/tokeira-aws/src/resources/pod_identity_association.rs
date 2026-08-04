@@ -1,8 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext,
+    Resource, ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
 };
 
 /// Configuration for a single EKS Pod Identity Association provider resource.
@@ -147,6 +147,29 @@ impl PodIdentityAssociation {
 
 #[async_trait::async_trait]
 impl Resource for PodIdentityAssociation {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — eks:CreatePodIdentityAssociation binding the state-read \
+             role ARN to the service account"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: associations are immutable and `diff` \
+             answers NoChange (recreate to change)"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — eks:DeletePodIdentityAssociation by recorded association \
+             id (absent id is already done)"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Create) {
+            semantics.provider_assigned = vec!["association_id".into()];
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("PodIdentityAssociation")
     }

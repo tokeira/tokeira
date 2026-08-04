@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext,
+    Resource, ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
 };
 
 /// Security group rule descriptor for testing and diffing.
@@ -195,6 +195,30 @@ impl SecurityGroup {
 
 #[async_trait::async_trait]
 impl Resource for SecurityGroup {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ec2:CreateSecurityGroup in the state-read VPC, then \
+             ec2:AuthorizeSecurityGroupIngress per declared rule"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — in-place rule reconcile: \
+             ec2:RevokeSecurityGroupIngress for rules leaving the set, \
+             ec2:AuthorizeSecurityGroupIngress for rules joining it, \
+             ec2:CreateTags; the group itself is never recreated"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ec2:DeleteSecurityGroup by recorded group id"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Create) {
+            semantics.provider_assigned = vec!["security_group_id".into()];
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("SecurityGroup")
     }

@@ -7,8 +7,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext, Resource,
+    ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
 };
 use tokio::time::sleep;
 
@@ -52,6 +52,27 @@ impl IamInstanceProfile {
 
 #[async_trait::async_trait]
 impl Resource for IamInstanceProfile {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — iam:CreateInstanceProfile (EntityAlreadyExists \
+             adopted), iam:AddRoleToInstanceProfile, then a GetInstanceProfile \
+             poll for IAM propagation (EC2 cannot reference a fresh profile \
+             for ~10-15s)"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: the profile's only mutable relation \
+             (its role) is fixed at create, and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — iam:RemoveRoleFromInstanceProfile (errors ignored), \
+             then iam:DeleteInstanceProfile"
+        ));
+        super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE)
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("IamInstanceProfile")
     }

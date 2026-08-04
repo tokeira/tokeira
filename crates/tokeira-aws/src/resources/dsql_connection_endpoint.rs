@@ -1,8 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext,
+    Resource, ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
 };
 
 /// Configuration for a single DSQL connection endpoint resource.
@@ -166,6 +166,29 @@ impl DsqlConnectionEndpoint {
 
 #[async_trait::async_trait]
 impl Resource for DsqlConnectionEndpoint {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ec2:CreateVpcEndpoint (Interface) against the \
+             cluster's state-read service name, then a describe poll until \
+             the endpoint is usable"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — tags only (ec2:CreateTags on the endpoint); the \
+             endpoint's service binding is fixed at create"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ec2:DeleteVpcEndpoints by recorded endpoint id"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Create) {
+            semantics.provider_assigned = vec!["endpoint_id".into(), "private_hostname".into()];
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("DsqlConnectionEndpoint")
     }

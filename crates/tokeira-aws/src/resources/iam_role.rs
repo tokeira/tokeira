@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext,
+    Resource, ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
 };
 
 // ── Config and resource structs ──────────────────────────────────────────────
@@ -51,6 +51,32 @@ fn normalize_sorted_strings(mut values: Vec<String>) -> Vec<String> {
 
 #[async_trait::async_trait]
 impl Resource for IamRole {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — iam:CreateRole (EntityAlreadyExists adopted), then \
+             iam:TagRole, iam:PutRolePolicy per inline policy, \
+             iam:AttachRolePolicy per managed ARN"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — in-place reconcile: iam:UntagRole/TagRole, stale inline \
+             policies deleted, iam:PutRolePolicy upserts, managed attachments \
+             detached/attached to the desired set; principals using the role \
+             are never interrupted"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — detach managed policies, delete inline policies, then \
+             iam:DeleteRole (NoSuchEntity tolerated at each step)"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Create) {
+            semantics.provider_assigned = vec!["role_arn".into()];
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("IamRole")
     }

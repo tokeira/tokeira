@@ -14,8 +14,9 @@ use aws_sdk_ec2::{
     },
 };
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
+    InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource, ResourceId,
+    ResourceState, ResourceType, Reversibility, SemanticsContext, error::IacError,
 };
 
 use crate::ResourceContext;
@@ -70,6 +71,97 @@ impl Ec2Instance {
 
 #[async_trait::async_trait]
 impl Resource for Ec2Instance {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ec2:RunInstances with user-data and the state-read \
+             security group, the SDK wait_until_instance_running waiter, then \
+             ec2:AttachVolume per declared EBS attachment"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: instance properties are immutable \
+             (destroy + recreate to change) and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ec2:TerminateInstances, then the SDK \
+             wait_until_instance_terminated waiter; attached EBS volumes are \
+             separate resources and survive, the instance's own root disk \
+             does not"
+        ));
+        let claims = |operation,
+                      disruption,
+                      data_effect: Confidence<DataEffect>,
+                      reversibility: Confidence<Reversibility>,
+                      citation: Citation| ChangeSemantics {
+            operation: Confidence::EngineFact {
+                value: operation,
+                citation: citation.clone(),
+            },
+            replacement: Confidence::EngineFact {
+                value: ReplacementPolicy::NotRequired,
+                citation: citation.clone(),
+            },
+            disruption: Confidence::EngineFact {
+                value: disruption,
+                citation,
+            },
+            data_effect,
+            reversibility,
+            statement: None,
+            provider_assigned: Vec::new(),
+        };
+        match ctx.kind {
+            ChangeKind::Create => claims(
+                LifecycleOperation::Created,
+                Disruption::None,
+                Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: CREATE,
+                },
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: CREATE,
+                },
+                CREATE,
+            ),
+            ChangeKind::Update | ChangeKind::Replace => claims(
+                LifecycleOperation::UpdatedInPlace,
+                Disruption::None,
+                Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: UPDATE,
+                },
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: UPDATE,
+                },
+                UPDATE,
+            ),
+            // Termination interrupts whatever runs on the instance, and the
+            // root disk goes with it — data claims are inferences (our code
+            // issues TerminateInstances; the root-volume loss is derived
+            // from this module never disabling delete-on-termination, not
+            // from a call we make). Recreate yields a fresh instance and a
+            // fresh root: reversible, with that loss.
+            ChangeKind::Delete => claims(
+                LifecycleOperation::Deleted,
+                Disruption::UnavailableDuringChange,
+                Confidence::Inference {
+                    value: DataEffect::Destroyed,
+                    citation: DELETE,
+                },
+                Confidence::Inference {
+                    value: Reversibility::ReversibleWithDataLoss,
+                    citation: DELETE,
+                },
+                DELETE,
+            ),
+            ChangeKind::NoChange => ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("Ec2Instance")
     }

@@ -22,8 +22,8 @@ pub struct PublishedPlatformDescriptor {
     pub id: PlatformId,
     /// Whether this entry is the distribution's unique default.
     pub is_default: bool,
-    /// Private Platform Binding contract used to assemble its provisioners.
-    pub binding_contract: u32,
+    /// Exact Engine_Version its provisioners were assembled against.
+    pub engine: String,
 }
 
 /// Language-neutral definition-frontend descriptor emitted by a trusted release pipeline.
@@ -32,8 +32,6 @@ pub struct PublishedPlatformDescriptor {
 pub struct PublishedDefinitionFrontendDescriptor {
     /// Open Definition Format identity.
     pub format: DefinitionFormatId,
-    /// Private Definition Frontend contract used to assemble provisioners.
-    pub frontend_contract: u32,
     /// Canonical source extension without a leading dot.
     pub source_extension: DefinitionSourceExtension,
     /// Safe default definition path relative to a deployment directory.
@@ -86,11 +84,10 @@ mod tests {
             platforms: vec![PublishedPlatformDescriptor {
                 id: platform.clone(),
                 is_default: true,
-                binding_contract: 1,
+                engine: "0.1.0".to_string(),
             }],
             frontends: vec![PublishedDefinitionFrontendDescriptor {
                 format: format.clone(),
-                frontend_contract: 1,
                 source_extension: DefinitionSourceExtension::new("tkd").expect("extension"),
                 default_relative_path: RelativeDefinitionPath::new("definition.tkd").expect("path"),
             }],

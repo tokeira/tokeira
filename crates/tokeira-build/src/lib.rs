@@ -30,9 +30,8 @@ pub use composition::{
 pub use dagger::{ContainerRef, DaggerClient, DirectoryRef, FileRef, SecretRef};
 pub use dagger_default::DefaultDaggerClient;
 pub use discovery::{
-    DEFINITION_FRONTEND_CONTRACT, DefinitionFrontendPackageDescriptor, DiscoveryError,
-    PLATFORM_BINDING_CONTRACT, PackageCoordinates, PlatformPackageDescriptor, WorkspaceDescriptors,
-    discover_workspace_descriptors,
+    DefinitionFrontendPackageDescriptor, DiscoveryError, PackageCoordinates,
+    PlatformPackageDescriptor, WorkspaceDescriptors, discover_workspace_descriptors,
 };
 pub use error::BuildError;
 pub use pipelines::{

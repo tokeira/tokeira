@@ -9,7 +9,7 @@ authors.workspace = true
 
 [package.metadata.tokeira.platform]
 id = "compose"
-binding-contract = 1
+engine = "0.1.0"
 default = false
 
 [dependencies]

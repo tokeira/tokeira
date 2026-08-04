@@ -42,8 +42,8 @@ impl Provider {
 }
 
 /// Complete author-visible kind names for the whole engine, in provider
-/// order. Maintained manually because slice concatenation is not const;
-/// [`tests::names_concatenate_provider_inventories`] holds it equal to the
+/// order. Maintained manually because slice concatenation is not const; the
+/// `names_concatenate_provider_inventories` test holds it equal to the
 /// provider exports so it cannot drift.
 pub const KIND_NAMES: &[&str] = &[
     // aws

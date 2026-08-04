@@ -12,8 +12,8 @@ use std::{
 
 use thiserror::Error;
 use tokeira_build::{
-    DEFINITION_FRONTEND_CONTRACT, DefinitionFrontendPackageDescriptor, DiscoveryError,
-    PLATFORM_BINDING_CONTRACT, PlatformPackageDescriptor, discover_workspace_descriptors,
+    DefinitionFrontendPackageDescriptor, DiscoveryError, PlatformPackageDescriptor,
+    discover_workspace_descriptors,
 };
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
 use tokeira_provisioner::{PublishedProvisionerCatalog, PublishedProvisionerLocator};
@@ -43,8 +43,8 @@ pub struct PlatformDescriptor {
     pub id: PlatformId,
     /// Whether the descriptor requests catalog-default status.
     pub is_default: bool,
-    /// Private platform binding contract.
-    pub binding_contract: u32,
+    /// Exact Engine_Version the platform definition indicates.
+    pub engine: String,
     /// Source-specific coordinates retained after admission.
     pub source: PlatformSource,
 }
@@ -63,8 +63,6 @@ pub enum FrontendSource {
 pub struct FrontendDescriptor {
     /// Open definition-format identity.
     pub format: DefinitionFormatId,
-    /// Private frontend contract.
-    pub frontend_contract: u32,
     /// Canonical source extension without a leading dot.
     pub source_extension: tokeira_orchestrator::DefinitionSourceExtension,
     /// Safe default source path inside a deployment and a platform package.
@@ -121,7 +119,7 @@ impl PlatformCatalog {
             .map(|descriptor| PlatformDescriptor {
                 id: descriptor.id.clone(),
                 is_default: descriptor.is_default,
-                binding_contract: descriptor.binding_contract,
+                engine: descriptor.engine.clone(),
                 source: PlatformSource::Workspace(descriptor),
             })
             .collect();
@@ -130,7 +128,6 @@ impl PlatformCatalog {
             .into_iter()
             .map(|descriptor| FrontendDescriptor {
                 format: descriptor.format.clone(),
-                frontend_contract: descriptor.frontend_contract,
                 source_extension: descriptor.source_extension.clone(),
                 default_relative_path: descriptor.default_relative_path.clone(),
                 source: FrontendSource::Workspace(descriptor),
@@ -148,7 +145,7 @@ impl PlatformCatalog {
             .map(|descriptor| PlatformDescriptor {
                 id: descriptor.id.clone(),
                 is_default: descriptor.is_default,
-                binding_contract: descriptor.binding_contract,
+                engine: descriptor.engine.clone(),
                 source: PlatformSource::Published(
                     by_platform.get(&descriptor.id).cloned().unwrap_or_default(),
                 ),
@@ -159,7 +156,6 @@ impl PlatformCatalog {
             .iter()
             .map(|descriptor| FrontendDescriptor {
                 format: descriptor.format.clone(),
-                frontend_contract: descriptor.frontend_contract,
                 source_extension: descriptor.source_extension.clone(),
                 default_relative_path: descriptor.default_relative_path.clone(),
                 source: FrontendSource::Published(
@@ -204,14 +200,6 @@ impl PlatformCatalog {
                 "expected at least one definition frontend".to_string(),
             ));
         }
-        for platform in &platforms {
-            if platform.binding_contract != PLATFORM_BINDING_CONTRACT {
-                return Err(CatalogError::Invalid(format!(
-                    "platform `{}` uses binding contract {}; supported contract is {}",
-                    platform.id, platform.binding_contract, PLATFORM_BINDING_CONTRACT
-                )));
-            }
-        }
         for pair in platforms.windows(2) {
             if pair[0].id == pair[1].id {
                 return Err(CatalogError::Invalid(format!(
@@ -230,12 +218,6 @@ impl PlatformCatalog {
             )));
         }
         for frontend in &frontends {
-            if frontend.frontend_contract != DEFINITION_FRONTEND_CONTRACT {
-                return Err(CatalogError::Invalid(format!(
-                    "format `{}` uses frontend contract {}; supported contract is {}",
-                    frontend.format, frontend.frontend_contract, DEFINITION_FRONTEND_CONTRACT
-                )));
-            }
             let extension = frontend
                 .default_relative_path
                 .as_path()
@@ -473,11 +455,10 @@ mod tests {
             platforms: vec![PublishedPlatformDescriptor {
                 id: platform.clone(),
                 is_default: false,
-                binding_contract: PLATFORM_BINDING_CONTRACT,
+                engine: "0.1.0".to_string(),
             }],
             frontends: vec![PublishedDefinitionFrontendDescriptor {
                 format: format.clone(),
-                frontend_contract: DEFINITION_FRONTEND_CONTRACT,
                 source_extension: DefinitionSourceExtension::new("tkd").expect("extension"),
                 default_relative_path: RelativeDefinitionPath::new("definition.tkd").expect("path"),
             }],

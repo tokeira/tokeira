@@ -16,12 +16,6 @@ use tokeira_orchestrator::{
     DefinitionFormatId, DefinitionSourceExtension, PlatformId, RelativeDefinitionPath,
 };
 
-/// Private platform binding contract understood by this workspace.
-pub const PLATFORM_BINDING_CONTRACT: u32 = 1;
-
-/// Private definition-frontend contract understood by this workspace.
-pub const DEFINITION_FRONTEND_CONTRACT: u32 = 1;
-
 /// Cargo coordinates for one trusted conventional library export.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PackageCoordinates {
@@ -42,8 +36,8 @@ pub struct PlatformPackageDescriptor {
     pub id: PlatformId,
     /// Whether this source entry requests catalog-default status.
     pub is_default: bool,
-    /// Private binding contract version.
-    pub binding_contract: u32,
+    /// Exact Engine_Version this platform definition composes with.
+    pub engine: String,
     /// Conventional source-library coordinates.
     pub package: PackageCoordinates,
 }
@@ -52,9 +46,10 @@ pub struct PlatformPackageDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefinitionFrontendPackageDescriptor {
     /// Open definition-format identity advertised by the package.
+    ///
+    /// Frontends carry no engine or contract field: they are engine
+    /// components and version with the engine itself.
     pub format: DefinitionFormatId,
-    /// Private frontend contract version.
-    pub frontend_contract: u32,
     /// Seed-materialization source extension.
     pub source_extension: DefinitionSourceExtension,
     /// Safe default path relative to a deployment directory.
@@ -100,7 +95,7 @@ pub enum DiscoveryError {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct RawPlatformDescriptor {
     id: String,
-    binding_contract: u32,
+    engine: String,
     default: bool,
 }
 
@@ -108,7 +103,6 @@ struct RawPlatformDescriptor {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct RawFrontendDescriptor {
     format: String,
-    frontend_contract: u32,
     source_extension: String,
     default_relative_path: String,
 }
@@ -175,13 +169,31 @@ fn decode_platform(
 ) -> Result<PlatformPackageDescriptor, DiscoveryError> {
     let raw: RawPlatformDescriptor = serde_json::from_value(value)
         .map_err(|error| invalid(package, "platform", error.to_string()))?;
-    if raw.binding_contract != PLATFORM_BINDING_CONTRACT {
+    // The indication is an exact version, never a requirement expression: the
+    // in-tree assertion below is the whole compatibility handshake, and a
+    // range would turn a reviewable adoption act into a silent float.
+    if raw.engine.chars().any(|c| "^~><=*, ".contains(c)) {
         return Err(invalid(
             package,
             "platform",
             format!(
-                "unsupported binding contract {}; supported contract is {}",
-                raw.binding_contract, PLATFORM_BINDING_CONTRACT
+                "engine indication `{}` must be an exact version, not a range or constraint",
+                raw.engine
+            ),
+        ));
+    }
+    // The package inherits the workspace version, so its own version IS the
+    // Engine_Version of the tree being built. A stale indication is the
+    // platform not yet adopting the engine's surface — refused here, before
+    // any composition root exists.
+    let workspace_engine = package.version.to_string();
+    if raw.engine != workspace_engine {
+        return Err(invalid(
+            package,
+            "platform",
+            format!(
+                "platform `{}` indicates engine {}; this workspace is engine {}. Adopt the {}                  surface (see its engine surface delta), then update `engine`",
+                raw.id, raw.engine, workspace_engine, workspace_engine
             ),
         ));
     }
@@ -191,7 +203,7 @@ fn decode_platform(
     Ok(PlatformPackageDescriptor {
         id,
         is_default: raw.default,
-        binding_contract: raw.binding_contract,
+        engine: raw.engine,
         package: coordinates,
     })
 }
@@ -202,16 +214,6 @@ fn decode_frontend(
 ) -> Result<DefinitionFrontendPackageDescriptor, DiscoveryError> {
     let raw: RawFrontendDescriptor = serde_json::from_value(value)
         .map_err(|error| invalid(package, "definition-frontend", error.to_string()))?;
-    if raw.frontend_contract != DEFINITION_FRONTEND_CONTRACT {
-        return Err(invalid(
-            package,
-            "definition-frontend",
-            format!(
-                "unsupported frontend contract {}; supported contract is {}",
-                raw.frontend_contract, DEFINITION_FRONTEND_CONTRACT
-            ),
-        ));
-    }
     let format = DefinitionFormatId::new(raw.format)
         .map_err(|error| invalid(package, "definition-frontend", error.to_string()))?;
     let source_extension = DefinitionSourceExtension::new(raw.source_extension)
@@ -236,7 +238,6 @@ fn decode_frontend(
     let coordinates = package_coordinates(package, "definition-frontend")?;
     Ok(DefinitionFrontendPackageDescriptor {
         format,
-        frontend_contract: raw.frontend_contract,
         source_extension,
         default_relative_path,
         package: coordinates,
@@ -367,7 +368,7 @@ edition = "2024"
 
 [package.metadata.tokeira.platform]
 id = "synthetic"
-binding-contract = 1
+engine = "0.1.0"
 default = true
 "#,
         )
@@ -383,7 +384,7 @@ default = true
             r#"
 [package.metadata.tokeira.platform]
 id = "compose"
-binding-contract = 1
+engine = "0.1.0"
 default = false
 "#,
             false,
@@ -394,7 +395,6 @@ default = false
             r#"
 [package.metadata.tokeira.definition-frontend]
 format = "tkd"
-frontend-contract = 1
 source-extension = "tkd"
 default-relative-path = "definition.tkd"
 "#,
@@ -419,7 +419,6 @@ default-relative-path = "definition.tkd"
             r#"
 [package.metadata.tokeira.definition-frontend]
 format = "tkd"
-frontend-contract = 1
 source-extension = "tkd"
 default-relative-path = "definition.tkd"
 "#,
@@ -441,7 +440,7 @@ default-relative-path = "definition.tkd"
                 r#"
 [package.metadata.tokeira.platform]
 id = "compose"
-binding-contract = 1
+engine = "0.1.0"
 default = false
 "#,
                 false,
@@ -459,7 +458,6 @@ default = false
             r#"
 [package.metadata.tokeira.definition-frontend]
 format = "tkd"
-frontend-contract = 1
 source-extension = "tkd"
 default-relative-path = "definition.py"
 "#,

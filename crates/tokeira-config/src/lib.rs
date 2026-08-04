@@ -1,8 +1,10 @@
 pub mod documentation;
 pub mod loader;
+pub mod overlay;
 pub mod source;
 pub use documentation::{CONFIG_FIELD_CATALOG, ConfigFieldClass, ConfigFieldDocumentation};
 pub use loader::{ConfigLoaderError, load_config, load_config_from_source, write_config_toml};
+pub use overlay::{overlay_document, overlay_document_str, render_document};
 pub use source::{CONFIG_ENV, ConfigSource};
 
 use std::{collections::HashSet, path::Path};
@@ -1015,6 +1017,17 @@ impl TokeiraConfig {
         config.apply_storage_defaults();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Produce the complete rendered document for a partial overlay: overlay
+    /// onto defaults, apply storage defaults, validate, serialize. This is
+    /// the ServerConfig node's render — failures surface at definition check
+    /// or plan, never at tokeirad boot.
+    pub fn render_overlaid(overlay: toml::Value) -> Result<String, ConfigError> {
+        let mut config: TokeiraConfig = overlay::overlay_document(overlay)?;
+        config.apply_storage_defaults();
+        config.validate()?;
+        config.to_toml()
     }
 
     /// Resolve the effective configuration: the `--config` locator, then the

@@ -52,6 +52,10 @@ enum Command {
     /// The deployment definition — the interpreted `.tkd`.
     #[command(subcommand)]
     Definition(DefinitionCommand),
+    /// Server configuration — the rendered document the platform seeds for
+    /// the deployment.
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Substrate — the infrastructure the deployment stands on. Namespaced to
     /// mirror `tkr` so forwarding is a transparent pass-through (Req 7.3).
     #[command(subcommand)]
@@ -82,6 +86,7 @@ impl Command {
     fn admission_dir(&self) -> Option<&std::path::Path> {
         match self {
             Self::Init(args) | Self::Upgrade(args) => Some(&args.deployment_dir),
+            Self::Config(ConfigCommand::Seed(args)) => Some(&args.deployment_dir),
             Self::Describe(args) => Some(&args.deployment_dir),
             Self::Definition(DefinitionCommand::Check(args)) => args
                 .definition
@@ -101,6 +106,16 @@ impl Command {
             Self::Rollback(args) => Some(&args.deployment_dir),
         }
     }
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Seed the deployment's server configuration: the config-document render
+    /// with provider-derived fields left blank. Internal — invoked by `tkr
+    /// deployment create` against the staging directory before the deployment
+    /// is published, so it is hidden from help.
+    #[command(hide = true)]
+    Seed(LifecycleArgs),
 }
 
 #[derive(Args)]
@@ -281,6 +296,9 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
                 mode,
             )
             .await
+        }
+        Command::Config(ConfigCommand::Seed(args)) => {
+            crate::config_seed::seed(&platform, &args.deployment_dir).await
         }
         Command::Logs(args) => match platform
             .log_stream(&args.deployment_dir, &args.service, args.follow, args.tail)

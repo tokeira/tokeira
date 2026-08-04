@@ -25,6 +25,7 @@ mod bound;
 mod causality;
 mod cli;
 mod config_history;
+mod config_seed;
 mod definition;
 mod deploy;
 mod describe;
@@ -276,6 +277,20 @@ pub trait ProvisionerPlatform {
         let _ = (deployment_dir, source);
         Ok(Realization::NotApplicable {
             reason: "this platform has no interpreted definition",
+        })
+    }
+
+    /// Seed the deployment's server configuration at create time: realize the
+    /// definition's config-document render with provider-derived fields left
+    /// blank and write the result into the deployment directory. Evaluation
+    /// only — no provider access, no engine state. `tkr deployment create`
+    /// invokes this against the staging directory after the staged definition
+    /// check; `NotApplicable` keeps the generic seeded document, so create
+    /// never fails for a platform that has not adopted the render.
+    async fn config_seed(&self, deployment_dir: &Path) -> Result<Realization<()>> {
+        let _ = deployment_dir;
+        Ok(Realization::NotApplicable {
+            reason: "this platform does not seed server configuration",
         })
     }
 

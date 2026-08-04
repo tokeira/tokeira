@@ -493,6 +493,32 @@ pub(crate) async fn validate_staged_definition(deployment_dir: &Path) -> Result<
     Ok(())
 }
 
+/// Seed the staged deployment's server configuration through the exact
+/// provisioner bytes that will be published with it. A platform that has not
+/// adopted the render answers not-applicable inside the verb and exits
+/// success, keeping the generic seeded document; a failure here is a
+/// defective definition and keeps staging invisible.
+pub(crate) async fn seed_staged_config(deployment_dir: &Path) -> Result<()> {
+    let provisioner = deployment_dir.join(crate::deployment_dir::PROVISIONER_BIN);
+    let status = tokio::process::Command::new(&provisioner)
+        .args([
+            "config",
+            "seed",
+            "--deployment-dir",
+            &deployment_dir.display().to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| format!("failed to launch staged `{}`", provisioner.display()))?;
+    if !status.success() {
+        bail!("staged provisioner could not seed the server configuration");
+    }
+    Ok(())
+}
+
 /// Forward `infra apply`, first forwarding the internal `init` when the
 /// deployment has never been stamped — so `tkr deployment apply` is a coherent
 /// one-command flow.

@@ -74,7 +74,7 @@ without evaluating them.
 ```python
 from dataclasses import dataclass
 
-from tokeira import Context, Deployment, DsqlCluster, LocalStateDir, Service
+from tokeira import Context, Deployment, DsqlCluster, LocalStateDir, ServerConfig, Service
 
 
 @dataclass
@@ -140,14 +140,15 @@ def deployment(cfg: Compose, cx: Context) -> Deployment:
             pass
 
     runtime = d.module("runtime", [local_state])
+    server_config = runtime.resource("server_config", ServerConfig())
     runtime.resource(
         "tokeirad",
         Service(
             image=cfg.tokeirad.image,
             replicas=cfg.tokeirad.replicas,
             publish=[cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
-            server_config=True,
         ),
+        [server_config],
     )
 
     return d
@@ -210,9 +211,9 @@ Sanctioned deviations from CPython, stated rather than accidental:
   `frontend()` export consumed by generated composition roots.
 - `platforms/compose/definition.tkd` — the live authored surface this feature mirrors: user config
   types, `config()`, `deployment(cfg, cx)`, modules with dependencies, kind construction
-  (`LocalStateDir`, `DsqlCluster`, `DynamoDbTable`, `Service` with `EMPTY` defaults,
-  `ObservabilityConfiguration`), resource dependencies, `output()` references, writebacks, and
-  `cx.project_name`.
+  (`LocalStateDir`, `DsqlCluster`, `DynamoDbTable`, `ServerConfig`, `Service` with `EMPTY`
+  defaults, `ObservabilityConfiguration`), resource dependencies, `output()` references,
+  writebacks, and `cx.project_name`.
 - `spikes/monty-tkdp` (merged `a99e0274`) — validated ground truth for: the restricted subset and its
   preflight codes; splice lowering with CPython-faithful dispatch, guard, and binding semantics;
   exact source mapping including internal-region labelling; Monty capabilities at rev `69f8a613`

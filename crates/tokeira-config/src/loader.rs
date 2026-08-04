@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+use crate::source::ConfigSource;
+
 /// Errors from the generic config loader.
 #[derive(Debug, Error)]
 pub enum ConfigLoaderError {
@@ -12,6 +14,8 @@ pub enum ConfigLoaderError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to read config source '{locator}': {reason}")]
+    ReadSource { locator: String, reason: String },
     #[error("TOML parse error in '{path}': {source}")]
     Parse {
         path: PathBuf,
@@ -33,13 +37,44 @@ pub fn load_config<T: DeserializeOwned>(
     base_path: &Path,
     profile_path: Option<&Path>,
 ) -> Result<T, ConfigLoaderError> {
-    let raw = std::fs::read_to_string(base_path).map_err(|source| ConfigLoaderError::ReadFile {
-        path: base_path.to_path_buf(),
-        source,
-    })?;
+    load_config_from_source(&ConfigSource::File(base_path.to_path_buf()), profile_path)
+}
+
+/// Load a TOML config document from any [`ConfigSource`], optionally
+/// deep-merging a profile overlay, and deserialize into `T`.
+///
+/// The same pipeline as [`load_config`] with the read step generalized to a
+/// locator: a document arriving through `env:` merges, substitutes, and
+/// parses exactly like the same bytes in a file. The profile overlay stays a
+/// file path — overlays are operator-local by nature.
+pub fn load_config_from_source<T: DeserializeOwned>(
+    source: &ConfigSource,
+    profile_path: Option<&Path>,
+) -> Result<T, ConfigLoaderError> {
+    // The locator names the source in every error; parse errors reuse it as
+    // the path label so file-based messages keep their current shape.
+    let locator = source.to_string();
+    let raw = match source {
+        // File sources keep the exact historical read-error shape.
+        ConfigSource::File(path) => {
+            std::fs::read_to_string(path).map_err(|source| ConfigLoaderError::ReadFile {
+                path: path.clone(),
+                source,
+            })?
+        }
+        _ => source.read().map_err(|err| ConfigLoaderError::ReadSource {
+            locator: locator.clone(),
+            // The read error already names the locator; keep only its reason
+            // so the message carries it once.
+            reason: match err {
+                crate::ConfigError::Source { reason, .. } => reason,
+                other => other.to_string(),
+            },
+        })?,
+    };
     let mut base: toml::Value =
         toml::from_str(&raw).map_err(|source| ConfigLoaderError::Parse {
-            path: base_path.to_path_buf(),
+            path: PathBuf::from(&locator),
             source,
         })?;
 
@@ -67,7 +102,7 @@ pub fn load_config<T: DeserializeOwned>(
     substitute_project_vars(&mut base, &project_name);
 
     base.try_into().map_err(|source| ConfigLoaderError::Parse {
-        path: base_path.to_path_buf(),
+        path: PathBuf::from(&locator),
         source,
     })
 }

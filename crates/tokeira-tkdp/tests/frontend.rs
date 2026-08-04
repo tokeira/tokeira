@@ -2,6 +2,7 @@
 //! structural output, over a synthetic two-kind platform, with the spike's
 //! semantics corpus carried across as writeback-observable fixtures.
 
+use ruff_text_size::TextSize;
 use serde::{Deserialize, Serialize};
 use tokeira_orchestrator::RelativeDefinitionPath;
 use tokeira_platform::{
@@ -426,6 +427,24 @@ fn nested_match_and_loop_break_behave() {
     assert_eq!(out, "E");
 }
 
+#[test]
+fn bare_capture_case_binds_the_subject() {
+    let out =
+        run_snippet("match 5:\n    case n:\n        out = \"got:\" + str(n)").expect("snippet");
+    assert_eq!(out, "got:5");
+}
+
+#[test]
+fn guards_run_only_for_cases_whose_pattern_matched() {
+    // `.append` returns None, so `or True` keeps the guard truthy while the
+    // call records that the guard was evaluated at all.
+    let out = run_snippet(
+        "calls = []\nmatch 3:\n    case 1 if calls.append(\"one\") or True:\n        out = \"one\"\n    case 3 if calls.append(\"three\") or True:\n        out = \"three\"\n    case _:\n        out = \"other\"\nout = out + \":\" + calls[0] + \":\" + str(len(calls))",
+    )
+    .expect("snippet");
+    assert_eq!(out, "three:three:1");
+}
+
 // ---------------------------------------------------------------------------
 // Failure paths.
 // ---------------------------------------------------------------------------
@@ -491,6 +510,16 @@ fn runtime_error_maps_to_original_line() {
 }
 
 #[test]
+// Print output is trace-logged on success and attached to failures, so a
+// definition author's debug prints are never silently lost.
+fn captured_print_output_is_attached_to_failures() {
+    let error = run_snippet("print(\"hello from tkdp\")\nboom = 1 / 0")
+        .expect_err("division fails after print");
+    assert!(error.contains("captured output:"), "{error}");
+    assert!(error.contains("hello from tkdp"), "{error}");
+}
+
+#[test]
 // Feature: tkdp-frontend, Property 7: evaluation is stateless — repeated
 // evaluation of identical inputs yields identical structures.
 fn repeated_evaluation_is_identical() {
@@ -514,6 +543,41 @@ fn repeated_evaluation_is_identical() {
         )
     };
     assert_eq!(render(&first), render(&second));
+}
+
+#[test]
+// The inspection seam (`transient_program`, carried from the spike CLI's
+// `lower --show-generated`) assembles exactly the program `evaluate`
+// executes, deterministically, with the source map covering every byte.
+fn transient_program_is_assembled_without_executing() {
+    let path = RelativeDefinitionPath::new("definition.tkdp").expect("path");
+    let source_name = DefinitionSourceName::DeploymentRelative(path);
+    let program = |bytes: &str| {
+        frontend()
+            .transient_program(
+                FrontendSource {
+                    source_name: &source_name,
+                    bytes: bytes.as_bytes(),
+                },
+                &ctx(),
+                kinds(),
+            )
+            .expect("assembles")
+    };
+    let first = program(EXEMPLAR);
+    let second = program(EXEMPLAR);
+    assert_eq!(first.text, second.text);
+    // Facade, lowered match, and driver are all present in the one text.
+    for needle in [
+        "__tokeira_internal_match",
+        "__tokeira_internal_subject_0",
+        "__tokeira_internal_export",
+    ] {
+        assert!(first.text.contains(needle), "missing {needle}");
+    }
+    // The map covers the assembled text to its last byte.
+    let last = TextSize::new(first.text.len() as u32 - 1);
+    assert!(first.map.resolve(last).is_some());
 }
 
 #[test]

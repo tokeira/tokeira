@@ -477,3 +477,49 @@ could accept source the actual engine rejects or assign it a different meaning.
 - [`tkr` and `tkp`](tkr-and-tkp.md) — engine construction, placement, and verification.
 - [`tokeira-tkd`](../../crates/tokeira-tkd/src/lib.rs) and
   [`HostBridge`](../../crates/tokeira-tkd/src/bridge.rs) — exact interpreter contracts.
+
+## The Python form: `.tkdp`
+
+A deployment definition can equally be authored in Python as `definition.tkdp`,
+evaluated by the embedded Monty interpreter through the same structural
+contract. `.tkd` and `.tkdp` are peer definition formats: one logical
+definition produces the same typed configuration, the same structural graph,
+and the same realized desired manifests in either form (the Compose seeds are
+held to exactly that parity by test), and a deployment differs only in its
+recorded definition format.
+
+The authored shape mirrors the Rust form:
+
+- **Facade imports.** Builders and kinds arrive via
+  `from tokeira import Context, Deployment, Service, …`. The importable set is
+  the complete engine kind inventory plus `Context` and `Deployment` — no
+  platform curates below what the engine ships. `import tokeira` and
+  `from tokeira import *` are rejected; the frontend satisfies the import
+  itself (Monty resolves no such module).
+- **Config types are dataclasses.** `@dataclass` classes with typed fields and
+  defaults; union fields (`storage: InMemory | Dsql`) are admitted as
+  annotations. Enum variants are spelled one dataclass per variant — a
+  zero-field dataclass is a unit variant (`Managed()`), a field-carrying one a
+  payload variant (`Dsql(region=…)`), decoding exactly as the `.tkd` enum
+  spelling does.
+- **The entrypoints are `config()` and `deployment(cfg, cx)`**, both required
+  exactly once, with exact arities.
+- **Kinds construct with keyword fields.** Omitted fields fill from the
+  provider's declared defaults (the `..Service::EMPTY` equivalent); unknown
+  kinds and fields fail at the declaring call with its position.
+- **`match` is supported in a restricted subset**: wildcard, bare capture,
+  literal and singleton patterns, keyword-only class patterns whose fields
+  capture into bare names (or `_`), and guards. Sequence, mapping, OR, `as`,
+  star, positional-argument, and dotted-value patterns are rejected before
+  evaluation with spanned diagnostics. Two deliberate deviations from CPython,
+  chosen for configuration semantics: a `match` whose cases all fail **raises**
+  with the definition position (silent fall-through would let a definition
+  that matches nothing produce an incomplete graph), and class patterns match
+  on **exact variant identity** (`type(x) is C`), not `isinstance` subclassing.
+- **Diagnostics land on your file.** The transient program Monty executes is
+  internal; every parse error, runtime traceback, decode failure, and
+  structural finding is translated to `definition.tkdp` positions, with
+  facade/driver frames labelled internal.
+
+Reserved namespace: identifiers beginning `__tokeira_internal_` are rejected
+in definitions (they belong to the lowering), as is tab indentation.

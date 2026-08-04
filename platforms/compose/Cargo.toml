@@ -11,6 +11,9 @@ authors.workspace = true
 id = "compose"
 engine = "0.1.0"
 default = false
+# Seeded when `deployment create` names no --format; the package supplies
+# peer seeds for both `tkd` and `tkdp`.
+default-format = "tkd"
 
 [dependencies]
 tokeira-provisioner-cli = { workspace = true }
@@ -42,6 +45,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokeira-tkd = { workspace = true }
+tokeira-tkdp = { workspace = true }
 tempfile = { workspace = true }
 # The semantics registry's Properties 9/10 (change-semantics Requirement 7)
 # probe realized kinds over generated contexts.

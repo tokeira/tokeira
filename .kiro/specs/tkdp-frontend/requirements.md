@@ -167,10 +167,11 @@ workspace dependency graph under the recorded pin; and the operator documentatio
 about the first.
 
 Out of scope: any change to `crates/tokeira-platform`, `tokeira-tkd`, provisioner lifecycle, catalogs,
-or `tkr` beyond publishing the new descriptor and seed — with exactly two sanctioned
-platform-contract accommodations this feature owns: the enum-position admission of struct-shaped
+or `tkr` beyond publishing the new descriptor and seed — with exactly three sanctioned
+accommodations this feature owns: the enum-position admission of struct-shaped
 values in the `LocatedValue` deserializer (variant tagged by class name; zero fields as a unit
-variant), and the kind-name inventory exposed alongside membership, defaults, and decode. Also out
+variant), the kind-name inventory exposed alongside membership, defaults, and decode, and the
+platform-declared `default-format` seed selection (Requirement 9) that peer seeds make necessary. Also out
 of scope: general Python support beyond the pinned Monty subset; PEP 634 forms outside the
 Restricted_Match_Subset; ECS and EKS seeds (those platforms are not yet migrated onto the platform
 contract); type-checking integration; and lowering `match` inside Monty itself (upstream
@@ -354,7 +355,7 @@ exactly what the `.tkd` definition expresses, in Python.
    per-kind frontend code, so that a kind added to or evolved in a provider crate becomes
    authorable in `.tkdp` with no `tokeira-tkdp` change.
 9. THE facade SHALL publish the complete kind set assembled into the bound provisioner: every kind
-   the platform's kind functions admit SHALL be importable, with no curated subset — a definition
+   the engine kind library admits SHALL be importable, with no curated subset — a definition
    edited within one engine version SHALL be able to adopt any kind that engine ships.
    (Prerequisite: the platform contract exposes the kind-name inventory alongside membership,
    defaults, and decode.)
@@ -537,6 +538,9 @@ carries no operational cost.
    and its format identity for explicit same-format revert.
 6. WHEN `definition check --definition <path> --format tkdp` is invoked in authoring mode, THE check
    SHALL evaluate the standalone file without deployment state.
+7. WHEN creation names no format, THE platform's declared `default-format` (platform package
+   metadata) SHALL select the seed; a platform supplying seeds for more than one format with no
+   declaration SHALL be refused with the peer formats and the `--format` remedy named.
 
 ### Requirement 10: Completeness, tests, and documentation
 

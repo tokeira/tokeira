@@ -319,6 +319,22 @@ impl PlatformCatalog {
             }
             return Ok((frontend, seed));
         }
+        // No requested format: the platform's declared `default-format`
+        // decides. Peer formats are equals, so with several seeds and no
+        // declaration there is no principled winner — the operator selects.
+        if let Some(format) = &platform_package.default_format {
+            let frontend = self.frontend(format)?;
+            let seed = package_dir.join(frontend.default_relative_path.as_path());
+            if !seed.is_file() {
+                return Err(CatalogError::Invalid(format!(
+                    "platform `{}` declares default definition format `{format}` but supplies no \
+                     seed at {}",
+                    platform.id,
+                    seed.display()
+                )));
+            }
+            return Ok((frontend, seed));
+        }
         let candidates = self
             .frontends
             .iter()
@@ -327,14 +343,22 @@ impl PlatformCatalog {
                 seed.is_file().then_some((frontend, seed))
             })
             .collect::<Vec<_>>();
-        let [(frontend, seed)] = candidates.as_slice() else {
-            return Err(CatalogError::Invalid(format!(
-                "platform `{}` must supply exactly one recognized definition seed; found {}",
+        match candidates.as_slice() {
+            [(frontend, seed)] => Ok((*frontend, seed.clone())),
+            [] => Err(CatalogError::Invalid(format!(
+                "platform `{}` supplies no recognized definition seed",
+                platform.id
+            ))),
+            many => Err(CatalogError::Invalid(format!(
+                "platform `{}` supplies definition seeds for formats {} and declares no \
+                 `default-format`; select one with `--format`",
                 platform.id,
-                candidates.len()
-            )));
-        };
-        Ok((*frontend, seed.clone()))
+                many.iter()
+                    .map(|(frontend, _)| format!("`{}`", frontend.format))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
     }
 
     /// Borrow the deterministic admitted platform inventory.
@@ -498,11 +522,48 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = PlatformCatalog::from_workspace(&root).expect("workspace catalog");
         let platform = catalog.platform(&id("compose")).expect("compose");
+
+        // Compose ships peer seeds; no requested format resolves through the
+        // platform's declared `default-format`.
         let (frontend, seed) = catalog
             .workspace_frontend(platform, None)
-            .expect("unique frontend seed");
+            .expect("declared default seed");
         assert_eq!(frontend.format, format("tkd"));
         assert!(seed.ends_with("platforms/compose/definition.tkd"));
+
+        // An explicit format selects its peer seed.
+        let (frontend, seed) = catalog
+            .workspace_frontend(platform, Some(&format("tkdp")))
+            .expect("requested tkdp seed");
+        assert_eq!(frontend.format, format("tkdp"));
+        assert!(seed.ends_with("platforms/compose/definition.tkdp"));
+    }
+
+    #[test]
+    fn multiple_seeds_without_a_declared_default_demand_a_format() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = PlatformCatalog::from_workspace(&root).expect("workspace catalog");
+        let compose = catalog.platform(&id("compose")).expect("compose");
+        let PlatformSource::Workspace(package) = &compose.source else {
+            panic!("compose is a workspace platform");
+        };
+
+        // Same package directory (both seed files present), declaration
+        // withheld: selection must name the peer formats and the remedy.
+        let undeclared = PlatformDescriptor {
+            source: PlatformSource::Workspace(PlatformPackageDescriptor {
+                default_format: None,
+                ..package.clone()
+            }),
+            ..compose.clone()
+        };
+        let error = catalog
+            .workspace_frontend(&undeclared, None)
+            .expect_err("ambiguous seeds must not self-select");
+        let rendered = error.to_string();
+        for needle in ["`tkd`", "`tkdp`", "`--format`"] {
+            assert!(rendered.contains(needle), "missing {needle} in: {rendered}");
+        }
     }
 
     #[test]

@@ -18,12 +18,11 @@ use tokeira_platform::{
 
 use crate::{
     convert::convert,
-    facade,
+    diagnostics, facade,
     lower::lower,
-    preflight::{Finding, preflight},
-    program::assemble,
+    preflight::{Preflight, preflight},
+    program::{Program, assemble},
     runner::execute,
-    source_map::LineTable,
 };
 
 /// The trusted `.tkdp` frontend, selected independently of any platform.
@@ -54,6 +53,107 @@ pub fn frontend() -> TkdpFrontend {
     TkdpFrontend::new()
 }
 
+/// The front half of one evaluation: the validated source with the transient
+/// program assembled for it, not yet executed.
+struct Prepared<'a> {
+    text: &'a str,
+    preflight: Preflight,
+    program: Program,
+}
+
+fn to_range(range: ruff_text_size::TextRange) -> Option<SourceRange> {
+    SourceRange::new(range.start().to_usize(), range.end().to_usize()).ok()
+}
+
+impl TkdpFrontend {
+    fn diagnostic(
+        &self,
+        source: &FrontendSource<'_>,
+        range: Option<SourceRange>,
+        message: String,
+    ) -> FrontendDiagnostic {
+        FrontendDiagnostic {
+            format: self.format.clone(),
+            source_name: source.source_name.clone(),
+            range,
+            category: DiagnosticCategory::Frontend,
+            message,
+        }
+    }
+
+    /// Runs admission, preflight, lowering, facade synthesis, and assembly —
+    /// everything `evaluate` does before Monty runs. Shared by `evaluate` and
+    /// [`Self::transient_program`] so an inspected program is byte-for-byte
+    /// the program that executes.
+    fn prepare<'a, C, K>(
+        &self,
+        source: &FrontendSource<'a>,
+        context: &C,
+        kinds: &KindFunctions<K>,
+    ) -> Result<Prepared<'a>, FrontendDiagnostic>
+    where
+        C: Serialize,
+        K: ProviderKind + 'static,
+    {
+        let text = std::str::from_utf8(source.bytes).map_err(|error| {
+            self.diagnostic(
+                source,
+                None,
+                format!("definition source is not UTF-8: {error}"),
+            )
+        })?;
+
+        let label = source.source_name.to_string();
+        let names = facade::facade_names(kinds.names);
+        let pf = preflight(text, &names).map_err(|findings| {
+            self.diagnostic(
+                source,
+                findings.first().and_then(|f| to_range(f.range)),
+                diagnostics::render(&label, text, &findings),
+            )
+        })?;
+
+        let context_value = serde_json::to_value(context).map_err(|error| {
+            self.diagnostic(
+                source,
+                None,
+                format!("platform context did not serialize: {error}"),
+            )
+        })?;
+        let synthesized = facade::render(kinds.names, &pf.imports, &context_value);
+
+        let lowered = lower(text, &pf.module, &label, &pf.import_ranges);
+        let program = assemble(&synthesized, lowered);
+        Ok(Prepared {
+            text,
+            preflight: pf,
+            program,
+        })
+    }
+
+    /// Assembles the transient program `evaluate` would execute for this
+    /// source, without executing it.
+    ///
+    /// This is the inspection seam for an operator-level `lower` /
+    /// `--show-generated` verb beside `definition check` (carried from the
+    /// spike CLI): the returned [`Program`] holds the assembled text and its
+    /// source map. No operator command surfaces it today, and the text is
+    /// never persisted — evaluation always reassembles.
+    pub fn transient_program<C, K>(
+        &self,
+        source: FrontendSource<'_>,
+        context: &C,
+        kinds: KindFunctions<K>,
+    ) -> Result<Program, FrontendDiagnostic>
+    where
+        C: Serialize,
+        K: ProviderKind + 'static,
+    {
+        self.prepare(&source, context, &kinds)
+            .map(|prepared| prepared.program)
+    }
+}
+
 impl DefinitionFrontend for TkdpFrontend {
     fn format(&self) -> &DefinitionFormatId {
         &self.format
@@ -69,61 +169,14 @@ impl DefinitionFrontend for TkdpFrontend {
         C: Serialize,
         K: ProviderKind + 'static,
     {
-        let diagnostic = |range: Option<SourceRange>, message: String| FrontendDiagnostic {
-            format: self.format.clone(),
-            source_name: source.source_name.clone(),
-            range,
-            category: DiagnosticCategory::Frontend,
-            message,
-        };
-        let to_range = |range: ruff_text_size::TextRange| {
-            SourceRange::new(range.start().to_usize(), range.end().to_usize()).ok()
-        };
+        let prepared = self.prepare(&source, context, &kinds)?;
 
-        let text = std::str::from_utf8(source.bytes).map_err(|error| {
-            diagnostic(None, format!("definition source is not UTF-8: {error}"))
+        let result = execute(&prepared.program, prepared.text).map_err(|failure| {
+            self.diagnostic(&source, failure.range.and_then(to_range), failure.message)
         })?;
 
-        let names = facade::facade_names(kinds.names);
-        let pf = preflight(text, &names).map_err(|findings| {
-            diagnostic(
-                findings.first().and_then(|f| to_range(f.range)),
-                render_findings(text, &findings),
-            )
-        })?;
-
-        let context_value = serde_json::to_value(context).map_err(|error| {
-            diagnostic(None, format!("platform context did not serialize: {error}"))
-        })?;
-        let synthesized = facade::render(kinds.names, &pf.imports, &context_value);
-
-        let label = source.source_name.to_string();
-        let lowered = lower(text, &pf.module, &label, &pf.import_ranges);
-        let program = assemble(&synthesized, lowered);
-
-        let result = execute(&program, text)
-            .map_err(|failure| diagnostic(failure.range.and_then(to_range), failure.message))?;
-
+        let pf = prepared.preflight;
         convert(result, &kinds, &pf.call_sites, pf.deployment_range)
-            .map_err(|error| diagnostic(to_range(error.range), error.message))
+            .map_err(|error| self.diagnostic(&source, to_range(error.range), error.message))
     }
-}
-
-/// All findings of one preflight pass as a single operator-facing message,
-/// each with its code and position.
-fn render_findings(source: &str, findings: &[Finding]) -> String {
-    let table = LineTable::new(source);
-    let mut message = format!(
-        "definition rejected with {} finding{}:",
-        findings.len(),
-        if findings.len() == 1 { "" } else { "s" }
-    );
-    for finding in findings {
-        let (line, column) = table.line_column(finding.range.start());
-        message.push_str(&format!(
-            "\n  [{}] {line}:{column}: {}",
-            finding.code, finding.message
-        ));
-    }
-    message
 }

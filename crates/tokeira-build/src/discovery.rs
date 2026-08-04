@@ -38,6 +38,10 @@ pub struct PlatformPackageDescriptor {
     pub is_default: bool,
     /// Exact Engine_Version this platform definition composes with.
     pub engine: String,
+    /// Definition format seeded when creation names none. Optional for
+    /// single-seed platforms; a platform supplying seeds for more than one
+    /// format must declare it or force an explicit format selection.
+    pub default_format: Option<DefinitionFormatId>,
     /// Conventional source-library coordinates.
     pub package: PackageCoordinates,
 }
@@ -97,6 +101,8 @@ struct RawPlatformDescriptor {
     id: String,
     engine: String,
     default: bool,
+    #[serde(default)]
+    default_format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,18 +198,31 @@ fn decode_platform(
             package,
             "platform",
             format!(
-                "platform `{}` indicates engine {}; this workspace is engine {}. Adopt the {}                  surface (see its engine surface delta), then update `engine`",
+                "platform `{}` indicates engine {}; this workspace is engine {}. Adopt the {} \
+                 surface (see its engine surface delta), then update `engine`",
                 raw.id, raw.engine, workspace_engine, workspace_engine
             ),
         ));
     }
     let id =
         PlatformId::new(raw.id).map_err(|error| invalid(package, "platform", error.to_string()))?;
+    let default_format = raw
+        .default_format
+        .map(DefinitionFormatId::new)
+        .transpose()
+        .map_err(|error| {
+            invalid(
+                package,
+                "platform",
+                format!("default-format is not a valid definition format: {error}"),
+            )
+        })?;
     let coordinates = package_coordinates(package, "platform")?;
     Ok(PlatformPackageDescriptor {
         id,
         is_default: raw.default,
         engine: raw.engine,
+        default_format,
         package: coordinates,
     })
 }
@@ -377,13 +396,25 @@ default = true
 
     #[test]
     fn discovers_independent_platform_and_frontend_descriptors() {
-        let root = workspace(&["platform", "frontend"]);
+        let root = workspace(&["platform", "bare", "frontend"]);
         write_package(
             root.path(),
             "platform",
             r#"
 [package.metadata.tokeira.platform]
 id = "compose"
+engine = "0.1.0"
+default = false
+default-format = "tkd"
+"#,
+            false,
+        );
+        write_package(
+            root.path(),
+            "bare",
+            r#"
+[package.metadata.tokeira.platform]
+id = "bare"
 engine = "0.1.0"
 default = false
 "#,
@@ -402,11 +433,45 @@ default-relative-path = "definition.tkd"
         );
 
         let discovered = discover_workspace_descriptors(root.path()).expect("discover descriptors");
-        assert_eq!(discovered.platforms[0].id.as_str(), "compose");
+        assert_eq!(discovered.platforms[0].id.as_str(), "bare");
+        assert_eq!(discovered.platforms[0].default_format, None);
+        assert_eq!(discovered.platforms[1].id.as_str(), "compose");
+        assert_eq!(
+            discovered.platforms[1]
+                .default_format
+                .as_ref()
+                .map(|format| format.as_str()),
+            Some("tkd")
+        );
         assert_eq!(discovered.frontends[0].format.as_str(), "tkd");
         assert_eq!(
             discovered.frontends[0].default_relative_path.as_str(),
             "definition.tkd"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_default_format() {
+        let root = workspace(&["platform"]);
+        write_package(
+            root.path(),
+            "platform",
+            r#"
+[package.metadata.tokeira.platform]
+id = "compose"
+engine = "0.1.0"
+default = false
+default-format = "Not A Format!"
+"#,
+            false,
+        );
+        let error =
+            discover_workspace_descriptors(root.path()).expect_err("format id must be admitted");
+        assert!(
+            error
+                .to_string()
+                .contains("default-format is not a valid definition format"),
+            "{error}"
         );
     }
 

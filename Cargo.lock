@@ -8615,6 +8615,7 @@ dependencies = [
  "tokeira-provisioner-cli",
  "tokeira-state",
  "tokeira-tkd",
+ "tokeira-tkdp",
  "tokio",
  "tracing",
 ]

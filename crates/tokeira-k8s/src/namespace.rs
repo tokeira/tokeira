@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Namespace as K8sNamespace;
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 use tokeira_iac::{
-    DescribeResult, IacError, InternalChange, ProvisionContext, Resource, ResourceId,
-    ResourceState, ResourceType,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
+    IacError, InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource,
+    ResourceId, ResourceState, ResourceType, Reversibility, SemanticsContext,
 };
 
 use crate::KubePlatform;
@@ -86,6 +87,94 @@ impl NamespaceResource {
 
 #[async_trait]
 impl Resource for NamespaceResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — Namespace create through the registered KubePlatform \
+             client, with standard labels"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — bookkeeping only: a namespace is name-only from the \
+             engine's view and `diff` never reports a change"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — Namespace delete through the registered KubePlatform \
+             client; Kubernetes garbage-collects every object scoped to the \
+             namespace with it"
+        ));
+        let claims = |operation,
+                      disruption,
+                      data_effect: Confidence<DataEffect>,
+                      reversibility: Confidence<Reversibility>,
+                      citation: Citation| ChangeSemantics {
+            operation: Confidence::EngineFact {
+                value: operation,
+                citation: citation.clone(),
+            },
+            replacement: Confidence::EngineFact {
+                value: ReplacementPolicy::NotRequired,
+                citation: citation.clone(),
+            },
+            disruption: Confidence::EngineFact {
+                value: disruption,
+                citation,
+            },
+            data_effect,
+            reversibility,
+            statement: None,
+            provider_assigned: Vec::new(),
+        };
+        match ctx.kind {
+            ChangeKind::Create => claims(
+                LifecycleOperation::Created,
+                Disruption::None,
+                Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: CREATE,
+                },
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: CREATE,
+                },
+                CREATE,
+            ),
+            ChangeKind::Update | ChangeKind::Replace => claims(
+                LifecycleOperation::UpdatedInPlace,
+                Disruption::None,
+                Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: UPDATE,
+                },
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: UPDATE,
+                },
+                UPDATE,
+            ),
+            // The cascade is Kubernetes's behaviour, not a call we issue —
+            // the data claims are derived: our delete removes one object;
+            // everything scoped to it (workloads, config, claims) goes by
+            // the platform's garbage collection, and only what a definition
+            // re-applies comes back.
+            ChangeKind::Delete => claims(
+                LifecycleOperation::Deleted,
+                Disruption::UnavailableDuringChange,
+                Confidence::Inference {
+                    value: DataEffect::Destroyed,
+                    citation: DELETE,
+                },
+                Confidence::Inference {
+                    value: Reversibility::ReversibleWithDataLoss,
+                    citation: DELETE,
+                },
+                DELETE,
+            ),
+            ChangeKind::NoChange => ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new(RESOURCE_TYPE)
     }

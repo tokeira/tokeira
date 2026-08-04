@@ -38,8 +38,6 @@ pub mod context;
 pub mod images;
 
 pub mod ops;
-#[cfg(test)]
-mod semantics_registry;
 
 pub use config::ComposeConfig;
 

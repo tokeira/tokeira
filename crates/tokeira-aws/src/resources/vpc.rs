@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext,
+    Resource, ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
 };
 
 /// VPC resource: creates VPC, private subnets, and route tables.
@@ -66,6 +66,35 @@ fn subnet_cidr(vpc_cidr: &str, index: usize) -> String {
 
 #[async_trait::async_trait]
 impl Resource for VpcResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ec2:CreateVpc, private subnets per AZ, route tables and \
+             associations (private-only: no IGW, no NAT, no public subnets)"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — tags only (ec2:CreateTags on the VPC and each subnet); \
+             the CIDR is immutable and the subnet/route-table topology is fixed \
+             at create"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — tear down associations, route tables, subnets, then \
+             ec2:DeleteVpc"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Create) {
+            semantics.provider_assigned = vec![
+                "vpc_id".into(),
+                "subnet_ids".into(),
+                "route_table_id".into(),
+                "route_table_association_ids".into(),
+            ];
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("Vpc")
     }

@@ -19,7 +19,7 @@ const SOURCE_METADATA: &str = "source.json";
 /// resolves companions against it (rather than the live deployment dir) can
 /// then attribute a `tokeirad.toml` edit to the operator instead of
 /// misreading it as a provisioner advance.
-const SERVER_CONFIG: &str = "tokeirad.toml";
+pub(crate) const SERVER_CONFIG: &str = "tokeirad.toml";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

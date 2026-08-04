@@ -259,6 +259,27 @@ struct WorkstationSecurityGroup {
 
 #[async_trait::async_trait]
 impl Resource for WorkstationSecurityGroup {
+    fn change_semantics(
+        &self,
+        ctx: &tokeira_iac::SemanticsContext<'_>,
+    ) -> tokeira_iac::ChangeSemantics {
+        const CREATE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::create — ec2:CreateSecurityGroup in the configured VPC \
+             (egress-only; no ingress rules)"
+        ));
+        const UPDATE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: the group is fixed at create and \
+             `diff` answers NoChange"
+        ));
+        const DELETE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::delete — ec2:DeleteSecurityGroup by recorded group id"
+        ));
+        tokeira_aws::resources::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE)
+    }
+
     fn resource_type(&self) -> tokeira_iac::ResourceType {
         tokeira_iac::ResourceType::new("SecurityGroup")
     }

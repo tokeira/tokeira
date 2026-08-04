@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use aws_sdk_eks::client::Waiters as EksWaiters;
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
+    InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource, ResourceId,
+    ResourceState, ResourceType, Reversibility, SemanticsContext, error::IacError,
 };
 
 /// EKS cluster with Auto Mode.
@@ -163,6 +164,105 @@ impl EksClusterResource {
 
 #[async_trait::async_trait]
 impl Resource for EksClusterResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — eks:CreateCluster (existing cluster adopted) over the \
+             state-read VPC/SG/roles, wait_until_cluster_active (up to 20m), \
+             then admin access entries"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — eks:UpdateClusterVersion in place when the declared \
+             version moved (wait_until_cluster_active, up to 20m), then \
+             eks:TagResource; nothing in this module touches workloads or \
+             cluster state"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — delete recorded access entries, disable deletion \
+             protection, eks:DeleteCluster, wait_until_cluster_deleted; \
+             everything running on the cluster goes with it"
+        ));
+        match ctx.kind {
+            ChangeKind::Create => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Created,
+                    citation: CREATE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: CREATE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::None,
+                    citation: CREATE,
+                },
+                data_effect: Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: CREATE,
+                },
+                reversibility: Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: CREATE,
+                },
+                statement: None,
+                provider_assigned: vec!["cluster_arn".into(), "cluster_endpoint".into()],
+            },
+            // The version upgrade's runtime disruption is EKS's managed
+            // behaviour, not something this module's calls establish —
+            // deliberately Unknown rather than guessed. Reversibility is
+            // derived: neither EKS nor this module offers a version
+            // downgrade, so returning means recreating the cluster.
+            ChangeKind::Update | ChangeKind::Replace => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::UpdatedInPlace,
+                    citation: UPDATE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: UPDATE,
+                },
+                disruption: Confidence::Unknown,
+                data_effect: Confidence::Inference {
+                    value: DataEffect::Preserved,
+                    citation: UPDATE,
+                },
+                reversibility: Confidence::Inference {
+                    value: Reversibility::ReversibleWithDataLoss,
+                    citation: UPDATE,
+                },
+                statement: None,
+                provider_assigned: Vec::new(),
+            },
+            ChangeKind::Delete => ChangeSemantics {
+                operation: Confidence::EngineFact {
+                    value: LifecycleOperation::Deleted,
+                    citation: DELETE,
+                },
+                replacement: Confidence::EngineFact {
+                    value: ReplacementPolicy::NotRequired,
+                    citation: DELETE,
+                },
+                disruption: Confidence::EngineFact {
+                    value: Disruption::UnavailableDuringChange,
+                    citation: DELETE,
+                },
+                data_effect: Confidence::Inference {
+                    value: DataEffect::Destroyed,
+                    citation: DELETE,
+                },
+                reversibility: Confidence::Inference {
+                    value: Reversibility::ReversibleWithDataLoss,
+                    citation: DELETE,
+                },
+                statement: None,
+                provider_assigned: Vec::new(),
+            },
+            ChangeKind::NoChange => ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("EksCluster")
     }

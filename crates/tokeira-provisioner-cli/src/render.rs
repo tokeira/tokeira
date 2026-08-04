@@ -13,10 +13,10 @@
 use tokeira_explain::{DeploymentExplanation, ExplainedChange};
 use tokeira_iac::{ChangeKind, RefreshStatus};
 use tokeira_provisioner::BindingVerdict;
-use tokeira_report::{Depth, Report, symbol};
+use tokeira_report::{Depth, Report};
 
 /// The read-only plan report: the deployment explanation, framed by the
-/// verb-level annotations (platform line, attention-only binding).
+/// verb-level annotations (deployment header, attention-only binding).
 ///
 /// `--json` emits the **explanation model alone** (operator-explanation Req 9.3):
 /// the manual `Serialize` delegates to it, so the artifact and the `--json`
@@ -61,7 +61,7 @@ impl Report for ExplanationReport {
         // plan only renders what could execute (output-templates §header).
         out.push_str(&format!(
             "**Plan for {}** {}\n",
-            explanation.platform,
+            explanation.deployment,
             revision_anchor(explanation),
         ));
         // Verdict narration is attention-only: a verdict that lets the apply
@@ -83,34 +83,57 @@ impl Report for ExplanationReport {
     }
 }
 
+/// The upgrade document (accepted shape, 2026-08-03): the deployment being
+/// upgraded, the provisioner replacement as its own section, then the
+/// reconcile as the apply document itself — an upgrade's reconcile IS an
+/// apply, and it reads as one, `**Applied to {deployment}**` header
+/// included.
+///
+/// The `## tkp` section gains the platform/engine version facts when the
+/// versioning model lands (tkdp frontend spec) — until then it states the
+/// replacement alone; the spec section for this document lands with that
+/// work too. `--json` emits the applied explanation model (one schema
+/// between artifact and flag, Req 9.3 discipline).
+#[derive(Debug)]
+pub(crate) struct UpgradeReport {
+    pub explanation: DeploymentExplanation,
+}
+
+impl serde::Serialize for UpgradeReport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.explanation.serialize(serializer)
+    }
+}
+
+impl Report for UpgradeReport {
+    fn narrative(&self, _depth: Depth, out: &mut String) {
+        out.push_str(&format!(
+            "# Upgrading `{}` deployment\n\n",
+            self.explanation.deployment
+        ));
+        out.push_str("## `tkp`\nUpgraded `tkp` provisioner\n\n");
+        applied_narrative(&self.explanation, out);
+    }
+}
+
 /// The apply document (`output-templates.md` §The apply document): the
 /// revision-advance header — the document's one revision statement — then
 /// past-tense action sections recording what committed, each line the
-/// identity with the gating plan's field evidence where ids matched. An
-/// apply that ran without a gating plan states the absence once, in the
-/// header; the per-change gaps stay machine-side as field-evidence
-/// uncertainties. The unchanged census renders no line. Both depths render
-/// the same document — an apply's evidence is what it reused, already on
-/// the lines.
+/// identity with field evidence where a plan in the same invocation
+/// supplied it. Lines without that evidence carry the identity alone — the
+/// absence stays machine-side as field-evidence uncertainties, never
+/// narrated: the operator reviewed a plan either way, and a report must not
+/// describe its own rendering. The unchanged census renders no line. Both
+/// depths render the same document — an apply's evidence is what it
+/// reused, already on the lines.
 fn applied_narrative(explanation: &DeploymentExplanation, out: &mut String) {
     let advance = match explanation.proposed_revision {
         Some(to) => format!("revision {} → {to}", explanation.current_revision),
         None => format!("revision {}", explanation.current_revision),
     };
-    let unevidenced = explanation.uncertainties.iter().any(|u| {
-        matches!(
-            u.reason,
-            tokeira_explain::UncertaintyReason::FieldEvidenceUnavailable
-        )
-    });
-    let qualifier = if unevidenced {
-        ", without a gating plan's evidence"
-    } else {
-        ""
-    };
     out.push_str(&format!(
-        "**Applied to {}** — {advance}{qualifier}\n",
-        explanation.platform,
+        "**Applied to {}** — {advance}\n",
+        explanation.deployment,
     ));
     for (kind, section) in [
         (ChangeKind::Create, "## Created"),
@@ -843,7 +866,10 @@ fn join_would_phrases(phrases: &[(bool, String)]) -> String {
 /// when the verdict would block the apply, or the deployment is fresh (the
 /// first apply does more than the plan shows — the Day-0 stamp). Proceeding
 /// verdicts return `None`.
-fn binding_attention(initialized: bool, verdict: BindingVerdict) -> Option<&'static str> {
+pub(crate) fn binding_attention(
+    initialized: bool,
+    verdict: BindingVerdict,
+) -> Option<&'static str> {
     if !initialized {
         return Some("not initialized — `apply` stamps this deployment on first run");
     }
@@ -864,22 +890,6 @@ fn binding_attention(initialized: bool, verdict: BindingVerdict) -> Option<&'sta
         // Unreachable today (Unknown ⇔ no recorded binding) — kept exhaustive
         // so a future verdict cannot fall through silently.
         BindingVerdict::Unknown => Some("unknown — apply refuses"),
-    }
-}
-
-/// Print what an apply actually committed — one line per resource, the
-/// audit entries as the operator report (`+` created, `~` updated, `-`
-/// deleted). An apply that hides its work behind a count blinds the
-/// operator during the highest-stakes verb.
-pub(crate) fn print_applied(entries: &[tokeira_provisioner::ChangeLogEntry]) {
-    use tokeira_provisioner::ChangeOp;
-    for entry in entries {
-        let glyph = match entry.op {
-            ChangeOp::Created => symbol::CREATE,
-            ChangeOp::Updated => symbol::UPDATE,
-            ChangeOp::Deleted => symbol::DELETE,
-        };
-        println!("  {glyph} {}", entry.id);
     }
 }
 
@@ -1060,13 +1070,47 @@ mod tests {
     // Requirement 4.5: no changes is a statement, not a silence — and the
     // header is the plan's anchor alone (the templates agreement: coverage
     // never rides the header).
+    // The upgrade document (accepted shape, 2026-08-03): deployment heading,
+    // the `## tkp` section, then the reconcile as the apply document itself —
+    // header included, and no narrated evidence-absence anywhere.
+    #[test]
+    fn the_upgrade_document_wraps_the_apply_document() {
+        let explanation = tokeira_explain::explain_applied(
+            DeploymentContext {
+                deployment: "compose-explore".to_string(),
+                platform: "compose".to_string(),
+                operation: "upgrade".to_string(),
+                current_revision: 4,
+                proposed_revision: None,
+                definition_ref: None,
+            },
+            &[],
+            None,
+        );
+        let r = UpgradeReport { explanation };
+        let text = render(&r, Mode::resolve(false, false)).unwrap();
+        assert!(
+            text.starts_with(
+                "# Upgrading `compose-explore` deployment\n\n\
+                 ## `tkp`\nUpgraded `tkp` provisioner\n\n\
+                 **Applied to compose-explore** — revision 4\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("without a gating plan"), "{text}");
+
+        let json = render(&r, Mode::resolve(true, false)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["operation"], "upgrade");
+    }
+
     #[test]
     fn a_quiet_plan_states_full_confirmation() {
         let outcome = examined(Vec::new());
         let r = report_for(&outcome, BindingVerdict::DevIterate, true);
         let text = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(text.contains("No changes - everything matches the definition."));
-        assert!(text.contains("**Plan for test** at revision 1\n"));
+        assert!(text.contains("**Plan for test-deployment** at revision 1\n"));
     }
 
     // The templates agreement on an unread resource: the summary line still
@@ -1176,7 +1220,7 @@ mod tests {
         let summary = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(summary.contains("# Infra Plan\n"), "title: {summary}");
         assert!(
-            summary.contains("**Plan for test** at revision 1\n"),
+            summary.contains("**Plan for test-deployment** at revision 1\n"),
             "header anchor: {summary}"
         );
         assert!(
@@ -1421,6 +1465,7 @@ mod tests {
         };
         let mut r = report_for(&outcome, BindingVerdict::DevIterate, true);
         r.explanation.current_revision = 4;
+        r.explanation.deployment = "compose-explore".to_string();
         r.explanation.platform = "compose".to_string();
 
         let manifest = |v: &str| serde_json::json!({ "field": v });
@@ -1485,7 +1530,7 @@ mod tests {
         let r = causality_reference_report();
         let summary = render(&r, Mode::resolve(false, false)).unwrap();
         assert!(
-            summary.contains("**Plan for compose** at revision 4\n"),
+            summary.contains("**Plan for compose-explore** at revision 4\n"),
             "header anchor: {summary}"
         );
         assert!(
@@ -1593,6 +1638,7 @@ mod tests {
         };
         let mut r = report_for(&outcome, BindingVerdict::DevIterate, true);
         r.explanation.current_revision = 4;
+        r.explanation.deployment = "compose-explore".to_string();
         r.explanation.platform = "compose".to_string();
         r
     }
@@ -1677,7 +1723,7 @@ mod tests {
 
         let explanation = tokeira_explain::explain_applied(
             tokeira_explain::DeploymentContext {
-                deployment: "test-deployment".to_string(),
+                deployment: "compose-explore".to_string(),
                 platform: "compose".to_string(),
                 operation: "infra apply".to_string(),
                 current_revision: 4,

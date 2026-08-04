@@ -390,7 +390,9 @@ pub(crate) async fn launch_upgrade(deployment_dir: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bound_path, std::fs::Permissions::from_mode(0o755))?;
     }
-    println!("provisioner: `tkp` updated (sha256 {}…)", &sha256[..12]);
+    // No narration: the placement is evidence, not answer — the upgrade
+    // document tkp just rendered is the report, and `describe --detail`
+    // carries the recorded sha for verification.
     Ok(())
 }
 

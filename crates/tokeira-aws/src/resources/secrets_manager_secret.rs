@@ -1,8 +1,9 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
+    InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource, ResourceId,
+    ResourceState, ResourceType, Reversibility, SemanticsContext, error::IacError,
 };
 
 /// Configuration for a single Secrets Manager secret provider resource.
@@ -125,6 +126,123 @@ impl SecretsManagerSecret {
 
 #[async_trait::async_trait]
 impl Resource for SecretsManagerSecret {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — secretsmanager:CreateSecret with the generated initial \
+             value (ResourceExists adopted via DescribeSecret)"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: the live secret value is never \
+             overwritten after creation, and `diff` answers NoChange"
+        ));
+        const DELETE_WINDOWED: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — secretsmanager:DeleteSecret with the configured \
+             recovery_window_in_days; secretsmanager:RestoreSecret can cancel \
+             the deletion within that window"
+        ));
+        const DELETE_FORCED: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — secretsmanager:DeleteSecret with \
+             force_delete_without_recovery(true): no recovery window, by our \
+             own parameter choice"
+        ));
+        let claims = |operation,
+                      data_effect: Confidence<DataEffect>,
+                      reversibility: Confidence<Reversibility>,
+                      citation: Citation| ChangeSemantics {
+            operation: Confidence::EngineFact {
+                value: operation,
+                citation: citation.clone(),
+            },
+            replacement: Confidence::EngineFact {
+                value: ReplacementPolicy::NotRequired,
+                citation: citation.clone(),
+            },
+            disruption: Confidence::EngineFact {
+                value: Disruption::None,
+                citation,
+            },
+            data_effect,
+            reversibility,
+            statement: None,
+            provider_assigned: Vec::new(),
+        };
+        match ctx.kind {
+            ChangeKind::Create => {
+                let mut semantics = claims(
+                    LifecycleOperation::Created,
+                    Confidence::EngineFact {
+                        value: DataEffect::NoDataHeld,
+                        citation: CREATE,
+                    },
+                    Confidence::EngineFact {
+                        value: Reversibility::Reversible,
+                        citation: CREATE,
+                    },
+                    CREATE,
+                );
+                // The committed secret version — the identity consumers pin.
+                semantics.provider_assigned = vec!["version_id".into()];
+                semantics
+            }
+            ChangeKind::Update | ChangeKind::Replace => claims(
+                LifecycleOperation::UpdatedInPlace,
+                Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: UPDATE,
+                },
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: UPDATE,
+                },
+                UPDATE,
+            ),
+            // Both delete modes destroy the stored value by our call; how
+            // recoverable that is depends on the configured mode. A
+            // recreated secret gets a fresh generated value — any value
+            // rotated after creation is not reproducible from the
+            // definition, hence data loss on the forced path.
+            ChangeKind::Delete => {
+                if self.config.recovery_window_days.is_some() {
+                    let mut semantics = claims(
+                        LifecycleOperation::Deleted,
+                        Confidence::EngineFact {
+                            value: DataEffect::Destroyed,
+                            citation: DELETE_WINDOWED,
+                        },
+                        Confidence::Inference {
+                            value: Reversibility::Reversible,
+                            citation: DELETE_WINDOWED,
+                        },
+                        DELETE_WINDOWED,
+                    );
+                    semantics.statement = Some(std::borrow::Cow::Borrowed(
+                        "it would be scheduled for deletion with a recovery window; \
+                         restoring within the window cancels the deletion",
+                    ));
+                    semantics
+                } else {
+                    claims(
+                        LifecycleOperation::Deleted,
+                        Confidence::EngineFact {
+                            value: DataEffect::Destroyed,
+                            citation: DELETE_FORCED,
+                        },
+                        Confidence::Inference {
+                            value: Reversibility::ReversibleWithDataLoss,
+                            citation: DELETE_FORCED,
+                        },
+                        DELETE_FORCED,
+                    )
+                }
+            }
+            ChangeKind::NoChange => ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("SecretsManagerSecret")
     }

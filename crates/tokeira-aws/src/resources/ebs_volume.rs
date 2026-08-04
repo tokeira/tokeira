@@ -7,8 +7,9 @@ use std::{collections::HashMap, time::Duration};
 
 use aws_sdk_ec2::client::Waiters as Ec2Waiters;
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DataEffect, DescribeResult, Disruption,
+    InternalChange, LifecycleOperation, ProvisionContext, ReplacementPolicy, Resource, ResourceId,
+    ResourceState, ResourceType, Reversibility, SemanticsContext, error::IacError,
 };
 
 use crate::ResourceContext;
@@ -48,6 +49,89 @@ impl EbsVolume {
 
 #[async_trait::async_trait]
 impl Resource for EbsVolume {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ec2:CreateVolume (encrypted, typed per config), then \
+             the SDK wait_until_volume_available waiter"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: volume size/type are immutable \
+             (destroy + recreate to change) and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ec2:DeleteVolume by recorded volume id; nothing in \
+             this module snapshots the volume first, so deletion retires the \
+             only copy of its contents"
+        ));
+        let claims = |operation,
+                      data_effect: Confidence<DataEffect>,
+                      reversibility: Confidence<Reversibility>,
+                      citation: Citation| ChangeSemantics {
+            operation: Confidence::EngineFact {
+                value: operation,
+                citation: citation.clone(),
+            },
+            replacement: Confidence::EngineFact {
+                value: ReplacementPolicy::NotRequired,
+                citation: citation.clone(),
+            },
+            disruption: Confidence::EngineFact {
+                value: Disruption::None,
+                citation,
+            },
+            data_effect,
+            reversibility,
+            statement: None,
+            provider_assigned: Vec::new(),
+        };
+        match ctx.kind {
+            ChangeKind::Create => claims(
+                LifecycleOperation::Created,
+                Confidence::EngineFact {
+                    value: DataEffect::NoDataHeld,
+                    citation: CREATE,
+                },
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: CREATE,
+                },
+                CREATE,
+            ),
+            ChangeKind::Update | ChangeKind::Replace => claims(
+                LifecycleOperation::UpdatedInPlace,
+                Confidence::EngineFact {
+                    value: DataEffect::Preserved,
+                    citation: UPDATE,
+                },
+                Confidence::EngineFact {
+                    value: Reversibility::Reversible,
+                    citation: UPDATE,
+                },
+                UPDATE,
+            ),
+            // The data claims are inferences: our code only issues
+            // DeleteVolume — that the contents are gone with it is derived
+            // from this module never snapshotting, not from a provider call
+            // we make.
+            ChangeKind::Delete => claims(
+                LifecycleOperation::Deleted,
+                Confidence::Inference {
+                    value: DataEffect::Destroyed,
+                    citation: DELETE,
+                },
+                Confidence::Inference {
+                    value: Reversibility::Irreversible,
+                    citation: DELETE,
+                },
+                DELETE,
+            ),
+            ChangeKind::NoChange => ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("EbsVolume")
     }

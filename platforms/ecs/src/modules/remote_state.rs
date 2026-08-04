@@ -53,6 +53,47 @@ struct RemoteStateBucket {
 
 #[async_trait]
 impl Resource for RemoteStateBucket {
+    fn change_semantics(
+        &self,
+        ctx: &tokeira_iac::SemanticsContext<'_>,
+    ) -> tokeira_iac::ChangeSemantics {
+        const DELETE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::delete — deliberately a no-op: the shared remote-state bucket \
+             is never deleted; only the engine's record is retired"
+        ));
+        match ctx.kind {
+            // The wrapper's one behavioural difference from the inner
+            // S3Bucket is the preserving delete — every other arm is the
+            // inner kind's own story.
+            tokeira_iac::ChangeKind::Delete => tokeira_iac::ChangeSemantics {
+                operation: tokeira_iac::Confidence::EngineFact {
+                    value: tokeira_iac::LifecycleOperation::Deleted,
+                    citation: DELETE,
+                },
+                replacement: tokeira_iac::Confidence::EngineFact {
+                    value: tokeira_iac::ReplacementPolicy::NotRequired,
+                    citation: DELETE,
+                },
+                disruption: tokeira_iac::Confidence::EngineFact {
+                    value: tokeira_iac::Disruption::None,
+                    citation: DELETE,
+                },
+                data_effect: tokeira_iac::Confidence::EngineFact {
+                    value: tokeira_iac::DataEffect::Preserved,
+                    citation: DELETE,
+                },
+                reversibility: tokeira_iac::Confidence::EngineFact {
+                    value: tokeira_iac::Reversibility::Reversible,
+                    citation: DELETE,
+                },
+                statement: None,
+                provider_assigned: Vec::new(),
+            },
+            _ => self.inner.change_semantics(ctx),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         self.inner.resource_type()
     }

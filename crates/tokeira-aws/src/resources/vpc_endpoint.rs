@@ -1,8 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext,
+    Resource, ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
 };
 
 /// Whether a VPC endpoint uses the Gateway or Interface type.
@@ -139,6 +139,29 @@ impl VpcEndpoint {
 
 #[async_trait::async_trait]
 impl Resource for VpcEndpoint {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — adopt an existing endpoint for the service when \
+             `describe` finds one, else ec2:CreateVpcEndpoint (Gateway or \
+             Interface per config)"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — tags only (ec2:CreateTags on the endpoint); `diff` \
+             answers NoChange (endpoints are static once created)"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ec2:DeleteVpcEndpoints by recorded endpoint id"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Create) {
+            semantics.provider_assigned = vec!["endpoint_id".into()];
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("VpcEndpoint")
     }

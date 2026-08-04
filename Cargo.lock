@@ -8595,7 +8595,6 @@ dependencies = [
  "aws-config",
  "futures-util",
  "hex",
- "proptest",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -9086,6 +9085,7 @@ dependencies = [
  "tokeira-report",
  "tokeira-state",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]

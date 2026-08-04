@@ -184,6 +184,50 @@ impl AdoptedDsqlResource {
 
 #[async_trait::async_trait]
 impl Resource for AdoptedDsqlResource {
+    fn change_semantics(
+        &self,
+        ctx: &tokeira_iac::SemanticsContext<'_>,
+    ) -> tokeira_iac::ChangeSemantics {
+        const RECORD_ONLY: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::{create,update,delete} — record-only: no provider call is ever \
+             made; the preexisting DSQL cluster is referenced, never managed, \
+             and the delete retires the record leaving the cluster running"
+        ));
+        let claims = |operation| tokeira_iac::ChangeSemantics {
+            operation: tokeira_iac::Confidence::EngineFact {
+                value: operation,
+                citation: RECORD_ONLY,
+            },
+            replacement: tokeira_iac::Confidence::EngineFact {
+                value: tokeira_iac::ReplacementPolicy::NotRequired,
+                citation: RECORD_ONLY,
+            },
+            disruption: tokeira_iac::Confidence::EngineFact {
+                value: tokeira_iac::Disruption::None,
+                citation: RECORD_ONLY,
+            },
+            data_effect: tokeira_iac::Confidence::EngineFact {
+                value: tokeira_iac::DataEffect::Preserved,
+                citation: RECORD_ONLY,
+            },
+            reversibility: tokeira_iac::Confidence::EngineFact {
+                value: tokeira_iac::Reversibility::Reversible,
+                citation: RECORD_ONLY,
+            },
+            statement: None,
+            provider_assigned: Vec::new(),
+        };
+        match ctx.kind {
+            tokeira_iac::ChangeKind::Create => claims(tokeira_iac::LifecycleOperation::Created),
+            tokeira_iac::ChangeKind::Update | tokeira_iac::ChangeKind::Replace => {
+                claims(tokeira_iac::LifecycleOperation::UpdatedInPlace)
+            }
+            tokeira_iac::ChangeKind::Delete => claims(tokeira_iac::LifecycleOperation::Deleted),
+            tokeira_iac::ChangeKind::NoChange => tokeira_iac::ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("DsqlEndpoint")
     }
@@ -336,6 +380,50 @@ impl DsqlIamRoleResource {
 
 #[async_trait::async_trait]
 impl Resource for DsqlIamRoleResource {
+    fn change_semantics(
+        &self,
+        ctx: &tokeira_iac::SemanticsContext<'_>,
+    ) -> tokeira_iac::ChangeSemantics {
+        const PREEXISTING: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::{create,update,delete} (preexisting role) — record-only: the \
+             configured role ARN is referenced, never managed"
+        ));
+        const CREATE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::create (managed) — delegates to the generic IamRole create: \
+             iam:CreateRole with the DSQL trust policy, then the cluster-ARN \
+             inline policy"
+        ));
+        const UPDATE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op; the role's policy is fixed at create"
+        ));
+        const DELETE: tokeira_iac::Citation = tokeira_iac::Citation::code(concat!(
+            module_path!(),
+            "::delete (managed) — delegates to the generic IamRole delete: \
+             detach and delete policies, then iam:DeleteRole"
+        ));
+        if self.preexisting_role_arn.is_some() {
+            let mut semantics = tokeira_aws::resources::control_plane_semantics(
+                ctx.kind,
+                PREEXISTING,
+                PREEXISTING,
+                PREEXISTING,
+            );
+            // Record-only: nothing the provider holds is touched either way.
+            if matches!(ctx.kind, tokeira_iac::ChangeKind::Delete) {
+                semantics.data_effect = tokeira_iac::Confidence::EngineFact {
+                    value: tokeira_iac::DataEffect::Preserved,
+                    citation: PREEXISTING,
+                };
+            }
+            semantics
+        } else {
+            tokeira_aws::resources::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE)
+        }
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("IamRole")
     }

@@ -23,7 +23,8 @@ pub struct DeploymentExplanation {
     pub platform: String,
     /// The verb this explains: `"infra plan"`, `"infra apply"`, ….
     pub operation: String,
-    /// The last applied revision (`0` for a never-applied deployment).
+    /// The deployment's current config revision (`0` for an uninitialized
+    /// envelope — the anchor renders `before its first apply` only there).
     pub current_revision: u64,
     /// The revision a mutating verb would produce; absent for read-only verbs.
     #[serde(skip_serializing_if = "Option::is_none")]

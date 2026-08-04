@@ -26,6 +26,7 @@ use crate::{ProvisionerPlatform, envelope_store, init::running_integrity_manifes
 pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
+    mode: tokeira_report::Mode,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now()); // B
     let store = envelope_store(deployment_dir);
@@ -62,17 +63,10 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         // Idempotent remainder: drift gate, apply B's plan, record the audit
         // log, close the marker — the same tail the fresh path runs.
         check_baseline_drift(&envelope)?;
-        let applied = crate::change_log_entries(
-            &platform
-                .infra_apply_with_artifacts(deployment_dir, None)
-                .await?
-                .changes,
-        );
-        println!(
-            "infra apply: {}",
-            tokeira_report::counted(applied.len(), "change")
-        );
-        crate::render::print_applied(&applied);
+        let outcome = platform
+            .infra_apply_with_artifacts(deployment_dir, None)
+            .await?;
+        let applied = crate::change_log_entries(&outcome.changes);
         // B's creations join keys(S_B) − keys(S_A) — the rollback delete-set
         // (task 19.3) — in the same save as the audit log.
         envelope.record_post_checkpoint_changes(&applied);
@@ -87,7 +81,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
             .publish_inspection(deployment_dir)
             .await
             .context("upgrade is committed and recorded; inspection publication failed")?;
-        println!("upgrade complete — the deployment runs the new provisioner");
+        emit_upgrade_document(platform, deployment_dir, &envelope, &outcome, mode)?;
         return Ok(());
     }
 
@@ -101,23 +95,14 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
 
     match evaluate_upgrade(&recorded, &running) {
         UpgradeDecision::Refuse(reason) => anyhow::bail!("`upgrade` refused: {reason}"),
-        UpgradeDecision::VersionedAdvance => println!(
-            "upgrade: advancing the deployment's provisioner {} → {}",
-            recorded.version, running.version
-        ),
-        UpgradeDecision::Promotion => println!(
-            "upgrade: promoting the deployment's provisioner from dev to version {}",
-            running.version
-        ),
-        // The dev-loop refresh: same ceremony (transfer, migrations, apply,
-        // audit), advisory stamp; the re-recorded integrity manifest is what
-        // actually changes — the envelope describes the new binary. The
-        // caller (`tkr`) has already established the bytes differ. The gate
-        // regime (advisory vs authoritative) is describe's story, not this
-        // line's.
-        UpgradeDecision::DevRefresh => {
-            println!("upgrade: replacing the deployment's provisioner with the current dev build")
-        }
+        // Proceeding decisions run one ceremony (transfer, migrations, apply,
+        // audit) and speak once, through the upgrade document at the end —
+        // no mid-ceremony narration. The decision's nuance (advance /
+        // promotion / dev refresh) joins the document's `## tkp` section
+        // with the versioning model (tkdp frontend spec).
+        UpgradeDecision::VersionedAdvance
+        | UpgradeDecision::Promotion
+        | UpgradeDecision::DevRefresh => {}
     }
 
     // ── State-schema migration boundary (before any mutation) ──
@@ -162,17 +147,10 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     check_baseline_drift(&envelope)?;
 
     // ── Apply B's plan (realized by the injected platform) ──
-    let applied = crate::change_log_entries(
-        &platform
-            .infra_apply_with_artifacts(deployment_dir, None)
-            .await?
-            .changes,
-    );
-    println!(
-        "infra apply: {}",
-        tokeira_report::counted(applied.len(), "change")
-    );
-    crate::render::print_applied(&applied);
+    let outcome = platform
+        .infra_apply_with_artifacts(deployment_dir, None)
+        .await?;
+    let applied = crate::change_log_entries(&outcome.changes);
 
     // ── Record the ids-only audit change log in the open marker (19.2) and
     // fold B's creations into the rollback delete-set (19.3), persisted
@@ -191,7 +169,28 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         .publish_inspection(deployment_dir)
         .await
         .context("upgrade is committed and recorded; inspection publication failed")?;
-    println!("upgrade complete — the deployment runs the new provisioner");
+    emit_upgrade_document(platform, deployment_dir, &envelope, &outcome, mode)?;
+    Ok(())
+}
+
+/// Render the upgrade document (the verb's one report): the `## tkp`
+/// replacement section, then the reconcile as the apply document. The
+/// model's operation is `"upgrade"` — truthful in `--json` — while the
+/// narrative header is the applied narrative's own. No explanation artifact
+/// is retained here: upgrade re-applies the recorded revision, whose own
+/// apply's explanation stays authoritative for that revision.
+fn emit_upgrade_document<P: ProvisionerPlatform>(
+    platform: &P,
+    deployment_dir: &Path,
+    envelope: &DeploymentStateEnvelope,
+    outcome: &crate::AppliedOutcome,
+    mode: tokeira_report::Mode,
+) -> Result<()> {
+    let context = crate::explain_context(platform, deployment_dir, envelope, "upgrade");
+    let explanation =
+        tokeira_explain::explain_applied(context, &crate::committed_changes(outcome), None);
+    let report = crate::render::UpgradeReport { explanation };
+    crate::emit_report(&tokeira_report::render(&report, mode)?, mode);
     Ok(())
 }
 
@@ -277,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn upgrade_refuses_an_unstamped_deployment() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = upgrade(&TestPlatform, tmp.path())
+        let err = upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(err.to_string().contains("unstamped"), "unexpected: {err}");
@@ -303,7 +302,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = upgrade(&TestPlatform, tmp.path())
+        let err = upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
             .await
             .expect_err("versioned → dev refuses");
         assert!(err.to_string().contains("refused"), "unexpected: {err}");
@@ -366,7 +365,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        upgrade(&TestPlatform, tmp.path())
+        upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
             .await
             .expect("the re-run resumes and completes");
 
@@ -386,7 +385,7 @@ mod tests {
         // tkp-side ceremony is unconditional; byte-level idempotency is the
         // launcher's gate (`tkr` compares candidate vs bound bytes and skips
         // the ceremony entirely when they match).
-        upgrade(&TestPlatform, tmp.path())
+        upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
             .await
             .expect("dev → dev proceeds as a refresh");
         let (after_refresh, _) = store.load().await.unwrap();
@@ -473,7 +472,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = upgrade(&TestPlatform, tmp.path())
+        let err = upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
             .await
             .expect_err("drift refuses the resume/apply");
         assert!(
@@ -504,7 +503,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = upgrade(&TestPlatform, tmp.path())
+        let err = upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
             .await
             .expect_err("a foreign marker refuses");
         assert!(

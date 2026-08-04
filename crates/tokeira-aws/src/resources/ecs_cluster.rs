@@ -1,7 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeKind, ChangeSemantics, Citation, Confidence, DescribeResult, Disruption, InternalChange,
+    ProvisionContext, Resource, ResourceId, ResourceState, ResourceType, SemanticsContext,
+    error::IacError,
 };
 
 /// ECS cluster with ECS Exec configured for private Session Manager access.
@@ -46,6 +47,24 @@ impl EcsClusterResource {
 
 #[async_trait::async_trait]
 impl Resource for EcsClusterResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ecs:CreateCluster with container-insights and tags"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: cluster settings are fixed at create \
+             and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ecs:DeleteCluster (services and capacity are separate \
+             resources, deleted first by dependency order)"
+        ));
+        super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE)
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("EcsCluster")
     }
@@ -224,6 +243,28 @@ impl LaunchTemplateResource {
 
 #[async_trait::async_trait]
 impl Resource for LaunchTemplateResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ec2:CreateLaunchTemplate with the state-read AMI, \
+             instance profile, and security group"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: template content is fixed at create \
+             and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ec2:DeleteLaunchTemplate by recorded template id"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Create) {
+            semantics.provider_assigned = vec!["launch_template_id".into()];
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("LaunchTemplate")
     }
@@ -386,6 +427,33 @@ impl AsgResource {
 
 #[async_trait::async_trait]
 impl Resource for AsgResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — autoscaling:CreateAutoScalingGroup from the state-read \
+             launch template; the group launches its instances"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: group shape is fixed at create and \
+             `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — autoscaling:DeleteAutoScalingGroup with \
+             force_delete(true): the group's instances are terminated with it, \
+             by our own parameter choice"
+        ));
+        let mut semantics = super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE);
+        if matches!(ctx.kind, ChangeKind::Delete) {
+            semantics.disruption = Confidence::EngineFact {
+                value: Disruption::UnavailableDuringChange,
+                citation: DELETE,
+            };
+        }
+        semantics
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("AutoScalingGroup")
     }
@@ -540,6 +608,25 @@ impl CapacityProviderResource {
 
 #[async_trait::async_trait]
 impl Resource for CapacityProviderResource {
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        const CREATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::create — ecs:CreateCapacityProvider over the state-read ASG, \
+             then ecs:PutClusterCapacityProviders to attach it"
+        ));
+        const UPDATE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: provider settings are fixed at \
+             create and `diff` answers NoChange"
+        ));
+        const DELETE: Citation = Citation::code(concat!(
+            module_path!(),
+            "::delete — ecs:DeleteCapacityProvider after detaching it from \
+             the cluster"
+        ));
+        super::control_plane_semantics(ctx.kind, CREATE, UPDATE, DELETE)
+    }
+
     fn resource_type(&self) -> ResourceType {
         ResourceType::new("EcsCapacityProvider")
     }

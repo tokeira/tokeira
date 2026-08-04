@@ -429,7 +429,8 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
         }
         Command::Upgrade(args) => {
             let dir = args.deployment_dir;
-            lock::with_operation_lock(&dir, "upgrade", || upgrade::upgrade(&platform, &dir)).await
+            lock::with_operation_lock(&dir, "upgrade", || upgrade::upgrade(&platform, &dir, mode))
+                .await
         }
         Command::Rollback(args) => {
             let dir = args.deployment_dir;

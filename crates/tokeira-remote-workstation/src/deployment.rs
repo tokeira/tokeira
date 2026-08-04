@@ -222,6 +222,66 @@ struct LocalStateResource {
 
 #[async_trait]
 impl Resource for LocalStateResource {
+    fn change_semantics(&self, ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
+        const CREATE: iac::Citation = iac::Citation::code(concat!(
+            module_path!(),
+            "::create — std::fs::create_dir_all on the workstation state dir \
+             (idempotent; an existing dir is success)"
+        ));
+        const UPDATE: iac::Citation = iac::Citation::code(concat!(
+            module_path!(),
+            "::update — a recorded no-op: the directory has no engine-tracked \
+             mutable fields"
+        ));
+        const DELETE: iac::Citation = iac::Citation::code(concat!(
+            module_path!(),
+            "::delete — deliberately a no-op: the directory and everything in \
+             it are left in place, and only the engine's record is retired"
+        ));
+        let claims = |operation, data_effect, citation: iac::Citation| iac::ChangeSemantics {
+            operation: iac::Confidence::EngineFact {
+                value: operation,
+                citation: citation.clone(),
+            },
+            replacement: iac::Confidence::EngineFact {
+                value: iac::ReplacementPolicy::NotRequired,
+                citation: citation.clone(),
+            },
+            disruption: iac::Confidence::EngineFact {
+                value: iac::Disruption::None,
+                citation: citation.clone(),
+            },
+            data_effect: iac::Confidence::EngineFact {
+                value: data_effect,
+                citation: citation.clone(),
+            },
+            reversibility: iac::Confidence::EngineFact {
+                value: iac::Reversibility::Reversible,
+                citation,
+            },
+            statement: None,
+            provider_assigned: Vec::new(),
+        };
+        match ctx.kind {
+            iac::ChangeKind::Create => claims(
+                iac::LifecycleOperation::Created,
+                iac::DataEffect::NoDataHeld,
+                CREATE,
+            ),
+            iac::ChangeKind::Update | iac::ChangeKind::Replace => claims(
+                iac::LifecycleOperation::UpdatedInPlace,
+                iac::DataEffect::Preserved,
+                UPDATE,
+            ),
+            iac::ChangeKind::Delete => claims(
+                iac::LifecycleOperation::Deleted,
+                iac::DataEffect::Preserved,
+                DELETE,
+            ),
+            iac::ChangeKind::NoChange => iac::ChangeSemantics::default(),
+        }
+    }
+
     fn resource_type(&self) -> iac::ResourceType {
         iac::ResourceType::new("local_state_dir")
     }

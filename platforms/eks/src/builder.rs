@@ -302,6 +302,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl iac::Resource for StubResource {
+        fn change_semantics(&self, _ctx: &iac::SemanticsContext<'_>) -> iac::ChangeSemantics {
+            iac::ChangeSemantics::default()
+        }
         fn resource_type(&self) -> iac::ResourceType {
             iac::ResourceType::new("stub")
         }

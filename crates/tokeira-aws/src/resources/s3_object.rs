@@ -1,8 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
 use sha2::{Digest, Sha256};
 use tokeira_iac::{
-    DescribeResult, InternalChange, ProvisionContext, Resource, ResourceId, ResourceState,
-    ResourceType, error::IacError,
+    ChangeSemantics, Citation, DescribeResult, InternalChange, ProvisionContext, Resource,
+    ResourceId, ResourceState, ResourceType, SemanticsContext, error::IacError,
 };
 
 /// Provider resource for generated observability artifacts stored in S3.
@@ -34,6 +34,19 @@ impl Resource for S3Object {
 
     fn module(&self) -> &str {
         &self.module
+    }
+
+    fn change_semantics(&self, ctx: &SemanticsContext<'_>) -> ChangeSemantics {
+        // Generated observability artifacts, content-addressed by checksum:
+        // the object regenerates from the definition on the next apply.
+        super::generated_content_semantics(
+            ctx.kind,
+            Citation::code(concat!(
+                module_path!(),
+                "::{create,update} — s3:PutObject, whole-object overwrite"
+            )),
+            Citation::code(concat!(module_path!(), "::delete — s3:DeleteObject")),
+        )
     }
 
     async fn create(&self, ctx: &ProvisionContext) -> Result<ResourceState, IacError> {

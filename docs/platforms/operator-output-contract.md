@@ -49,7 +49,7 @@ Depth is a human affordance only, so the 2×2 matrix has three real cells.
 
 1. Fact lines are `subject: state` — lowercase key, no trailing period. Markdown
    reports carry structure instead: a `#` title (title-case), the `**Plan for
-   {platform}**` assurance line, and `##` sections whose headings state the action
+   {deployment}**` assurance line, and `##` sections whose headings state the action
    once — lines beneath carry no glyphs, counts, or type annotations, and code
    identifiers appear only inside code spans and citation links (values embedding a
    backtick widen to double-backtick spans).

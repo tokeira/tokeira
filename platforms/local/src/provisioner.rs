@@ -152,7 +152,10 @@ mod tests {
         // shell's Day-0/dev-loop substrate.
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(LocalPlatform.deployment_id(tmp.path()).unwrap(), "tokeira");
-        let outcome = LocalPlatform.infra_plan(tmp.path(), None).await.expect("plan");
+        let outcome = LocalPlatform
+            .infra_plan(tmp.path(), None)
+            .await
+            .expect("plan");
         assert_eq!(
             outcome.changes.len(),
             1,

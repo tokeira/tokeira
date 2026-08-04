@@ -111,6 +111,7 @@ pub(crate) async fn run(
                     )?;
                 }
                 launcher::validate_staged_definition(pending.path()).await?;
+                launcher::seed_staged_config(pending.path()).await?;
             }
             let metadata = pending.publish()?;
             print_metadata(&metadata, json)?;
@@ -187,7 +188,7 @@ pub(crate) async fn run(
         }
         DeploymentAction::Apply { yes } => {
             let dir = deployments.resolve_dir(selected)?;
-            launcher::launch_apply(&dir, yes, None).await?;
+            launcher::launch_apply(&dir, yes, None, None).await?;
         }
         DeploymentAction::Upgrade => {
             let dir = deployments.resolve_dir(selected)?;

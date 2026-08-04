@@ -156,10 +156,14 @@ async fn main() -> Result<()> {
                 // initialized first, then applied — the operator's first
                 // apply works whichever spelling they reach for.
                 if let InfraAction::Apply {
-                    yes, explanation, ..
+                    yes,
+                    explanation,
+                    module,
+                    ..
                 } = &action
                 {
-                    launcher::launch_apply(&dir, *yes, explanation.as_deref()).await
+                    launcher::launch_apply(&dir, *yes, module.as_deref(), explanation.as_deref())
+                        .await
                 } else {
                     let (verb, mut extra) = forwarded_infra_verb(&action);
                     // The output contract's global flags travel with the
@@ -333,19 +337,35 @@ fn mutation_target(command: &Command, selected: Option<&str>) -> Option<Option<S
 /// so forwarding is a transparent pass-through (Req 7.3).
 fn forwarded_infra_verb(action: &InfraAction) -> (&'static [&'static str], Vec<String>) {
     match action {
-        InfraAction::Plan { explanation, .. } => {
-            (&["infra", "plan"], explanation_flag(explanation.as_deref()))
+        InfraAction::Plan {
+            explanation,
+            module,
+            ..
+        } => {
+            let mut extra = explanation_flag(explanation.as_deref());
+            extra.extend(module_flag(module.as_deref()));
+            (&["infra", "plan"], extra)
         }
         InfraAction::Apply { .. } => (&["infra", "apply"], Vec::new()),
-        InfraAction::Destroy { yes, .. } => (
-            &["infra", "destroy"],
-            if *yes {
+        InfraAction::Destroy { yes, module, .. } => {
+            let mut extra = if *yes {
                 vec!["--yes".to_string()]
             } else {
                 Vec::new()
-            },
-        ),
+            };
+            extra.extend(module_flag(module.as_deref()));
+            (&["infra", "destroy"], extra)
+        }
         InfraAction::Status => (&["describe"], Vec::new()),
+    }
+}
+
+/// `--module` crosses to the bound `tkp` verbatim — the platform owns its
+/// meaning; `tkr` no longer drops it silently on the forwarded path.
+fn module_flag(module: Option<&str>) -> Vec<String> {
+    match module {
+        Some(name) => vec!["--module".to_string(), name.to_string()],
+        None => Vec::new(),
     }
 }
 

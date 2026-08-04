@@ -22,6 +22,17 @@ use crate::{LocalConfig, LocalDeployment};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LocalPlatform;
 
+/// Local declares no infrastructure modules, so a `--module` filter can only
+/// be a mistake — refused by name rather than silently running everything.
+fn refuse_module_filter(module: Option<&str>) -> Result<()> {
+    if let Some(name) = module {
+        anyhow::bail!(
+            "the local platform has no infrastructure modules; `--module {name}` names nothing"
+        );
+    }
+    Ok(())
+}
+
 impl ProvisionerPlatform for LocalPlatform {
     fn label(&self, _deployment_dir: &Path) -> &'static str {
         "local"
@@ -35,7 +46,8 @@ impl ProvisionerPlatform for LocalPlatform {
         Ok(load_local_config(deployment_dir)?.project_name)
     }
 
-    async fn infra_plan(&self, deployment_dir: &Path) -> Result<PlanOutcome> {
+    async fn infra_plan(&self, deployment_dir: &Path, module: Option<&str>) -> Result<PlanOutcome> {
+        refuse_module_filter(module)?;
         let mut engine = open_engine(deployment_dir).await?;
         let composition = engine.compose(ModuleSelection::All)?;
         engine
@@ -44,7 +56,12 @@ impl ProvisionerPlatform for LocalPlatform {
             .context("infrastructure plan failed")
     }
 
-    async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
+    async fn infra_apply(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<AppliedOutcome> {
+        refuse_module_filter(module)?;
         let mut engine = open_engine(deployment_dir).await?;
         let composition = engine.compose(ModuleSelection::All)?;
         let changes = engine
@@ -58,7 +75,8 @@ impl ProvisionerPlatform for LocalPlatform {
         })
     }
 
-    async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
+    async fn infra_destroy(&self, deployment_dir: &Path, module: Option<&str>) -> Result<usize> {
+        refuse_module_filter(module)?;
         let mut engine = open_engine(deployment_dir).await?;
         let composition = engine.compose(ModuleSelection::All)?;
         let removed = engine
@@ -87,13 +105,13 @@ impl ProvisionerPlatform for LocalPlatform {
         // Local has no separate workload notion; the workload rides the
         // infra universe.
         Ok(Realization::Realized(
-            self.infra_plan(deployment_dir).await?,
+            self.infra_plan(deployment_dir, None).await?,
         ))
     }
 
     async fn deploy_apply(&self, deployment_dir: &Path) -> Result<Realization<AppliedOutcome>> {
         Ok(Realization::Realized(
-            self.infra_apply(deployment_dir).await?,
+            self.infra_apply(deployment_dir, None).await?,
         ))
     }
 
@@ -134,7 +152,10 @@ mod tests {
         // shell's Day-0/dev-loop substrate.
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(LocalPlatform.deployment_id(tmp.path()).unwrap(), "tokeira");
-        let outcome = LocalPlatform.infra_plan(tmp.path()).await.expect("plan");
+        let outcome = LocalPlatform
+            .infra_plan(tmp.path(), None)
+            .await
+            .expect("plan");
         assert_eq!(
             outcome.changes.len(),
             1,

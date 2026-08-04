@@ -1,12 +1,15 @@
 pub mod documentation;
 pub mod loader;
+pub mod overlay;
+pub mod secret;
+pub mod source;
 pub use documentation::{CONFIG_FIELD_CATALOG, ConfigFieldClass, ConfigFieldDocumentation};
-pub use loader::{ConfigLoaderError, load_config, write_config_toml};
+pub use loader::{ConfigLoaderError, load_config, load_config_from_source, write_config_toml};
+pub use overlay::{overlay_document, overlay_document_str, render_document};
+pub use secret::{NoSecretsProvider, Secret, SecretError, SecretRef, SecretsProvider};
+pub use source::{CONFIG_ENV, ConfigSource};
 
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, path::Path};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,9 +17,9 @@ use thiserror::Error;
 #[derive(clap::Parser, Debug)]
 #[command(name = "tokeirad", disable_version_flag = true)]
 pub struct Cli {
-    /// Path to the TOML configuration file.
+    /// Configuration locator: a file path, `file:<path>`, or `env:<VAR>`.
     #[arg(long)]
-    pub config: Option<PathBuf>,
+    pub config: Option<String>,
 
     /// Print resolved configuration as TOML and exit.
     #[arg(long)]
@@ -855,6 +858,12 @@ pub struct EmergencyConfig {
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
     Io(#[from] std::io::Error),
+    #[error("config source `{locator}` cannot be read: {reason}")]
+    Source { locator: String, reason: String },
+    #[error(
+        "unknown config source scheme `{scheme}:` in `{locator}` — supported: a file path, `file:<path>`, `env:<VAR>`"
+    )]
+    UnknownScheme { scheme: String, locator: String },
     #[error("failed to parse TOML: {0}")]
     Parse(#[from] toml::de::Error),
     #[error("failed to serialize config as TOML: {0}")]
@@ -998,23 +1007,43 @@ impl Default for DsqlCapacityConfig {
 
 impl TokeiraConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)?;
+        Self::from_source(&ConfigSource::File(path.to_path_buf()))
+    }
+
+    /// Load and validate a document from any source. One pipeline for every
+    /// locator — read, parse, storage defaults, validate — so a document
+    /// arriving through `env:` behaves exactly like the same bytes in a file.
+    pub fn from_source(source: &ConfigSource) -> Result<Self, ConfigError> {
+        let content = source.read()?;
         let mut config: TokeiraConfig = toml::from_str(&content)?;
         config.apply_storage_defaults();
         config.validate()?;
         Ok(config)
     }
 
-    pub fn resolve(config_path: Option<&Path>) -> Result<(Self, &'static str), ConfigError> {
-        let (mut config, source) = if let Some(path) = config_path {
-            (Self::load(path)?, "cli --config")
-        } else if let Ok(env_path) = std::env::var("TOKEIRA_CONFIG") {
-            (Self::load(Path::new(&env_path))?, "TOKEIRA_CONFIG env")
-        } else {
-            let mut config = Self::default();
-            config.apply_storage_defaults();
-            config.validate()?;
-            (config, "defaults")
+    /// Produce the complete rendered document for a partial overlay: overlay
+    /// onto defaults, apply storage defaults, validate, serialize. This is
+    /// the ServerConfig node's render — failures surface at definition check
+    /// or plan, never at tokeirad boot.
+    pub fn render_overlaid(overlay: toml::Value) -> Result<String, ConfigError> {
+        let mut config: TokeiraConfig = overlay::overlay_document(overlay)?;
+        config.apply_storage_defaults();
+        config.validate()?;
+        config.to_toml()
+    }
+
+    /// Resolve the effective configuration: the `--config` locator, then the
+    /// `TOKEIRA_CONFIG` locator, then built-in defaults. The returned label
+    /// names the winning locator for startup logs and `--dump-config`.
+    pub fn resolve(config: Option<&str>) -> Result<(Self, String), ConfigError> {
+        let (mut config, source) = match ConfigSource::from_cli_env(config)? {
+            Some((source, label)) => (Self::from_source(&source)?, label),
+            None => {
+                let mut config = Self::default();
+                config.apply_storage_defaults();
+                config.validate()?;
+                (config, "defaults".to_string())
+            }
         };
         // Per-pod placement overrides from the environment. Under Kubernetes/ECS the
         // config document is a shared ConfigMap, so a node's own reachable membership
@@ -1527,7 +1556,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use proptest::prelude::*;
-    use std::sync::Mutex;
+    use std::{path::PathBuf, sync::Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1956,8 +1985,8 @@ mod tests {
             std::env::set_var("TOKEIRA_CONFIG", &env_path);
         }
 
-        let (config, source) = TokeiraConfig::resolve(Some(cli_path.as_path())).unwrap();
-        assert_eq!(source, "cli --config");
+        let (config, source) = TokeiraConfig::resolve(Some(cli_path.to_str().unwrap())).unwrap();
+        assert_eq!(source, format!("--config {}", cli_path.display()));
         assert_eq!(config.infrastructure.cluster_name, "cli");
 
         // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
@@ -1978,7 +2007,7 @@ mod tests {
         }
 
         let (config, source) = TokeiraConfig::resolve(None).unwrap();
-        assert_eq!(source, "TOKEIRA_CONFIG env");
+        assert_eq!(source, format!("TOKEIRA_CONFIG {}", env_path.display()));
         assert_eq!(config.infrastructure.cluster_name, "env");
 
         // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
@@ -1986,6 +2015,51 @@ mod tests {
             std::env::remove_var("TOKEIRA_CONFIG");
         }
         let _ = std::fs::remove_file(env_path);
+    }
+
+    #[test]
+    fn resolve_reads_an_env_inline_document() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
+        unsafe {
+            std::env::set_var("TOKEIRA_CONFIG", "env:TOKEIRA_TEST_INLINE_DOC");
+            std::env::set_var(
+                "TOKEIRA_TEST_INLINE_DOC",
+                "[infrastructure]\ncluster_name = \"inline\"",
+            );
+        }
+
+        let (config, source) = TokeiraConfig::resolve(None).unwrap();
+        assert_eq!(source, "TOKEIRA_CONFIG env:TOKEIRA_TEST_INLINE_DOC");
+        assert_eq!(config.infrastructure.cluster_name, "inline");
+
+        // A named-but-unset variable is fatal and repeats the locator — never
+        // a silent fall-through to defaults.
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
+        unsafe {
+            std::env::remove_var("TOKEIRA_TEST_INLINE_DOC");
+        }
+        let err = TokeiraConfig::resolve(None).unwrap_err();
+        assert!(
+            err.to_string().contains("env:TOKEIRA_TEST_INLINE_DOC"),
+            "{err}"
+        );
+
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
+        unsafe {
+            std::env::remove_var("TOKEIRA_CONFIG");
+        }
+    }
+
+    #[test]
+    fn resolve_refuses_an_unknown_scheme() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: edition-2024 env mutation, serialized by ENV_LOCK held for the whole test.
+        unsafe {
+            std::env::remove_var("TOKEIRA_CONFIG");
+        }
+        let err = TokeiraConfig::resolve(Some("s3:bucket/tokeirad.toml")).unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownScheme { .. }), "{err:?}");
     }
 
     #[test]

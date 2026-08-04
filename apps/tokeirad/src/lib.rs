@@ -587,6 +587,8 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
 
     let (effective_config, config_source) = TokeiraConfig::resolve(cli.config.as_deref())?;
     if cli.dump_config {
+        // A TOML comment so the dump stays parseable while naming the winner.
+        println!("# config source: {config_source}");
         println!("{}", effective_config.to_toml()?);
         return Ok(());
     }
@@ -615,7 +617,7 @@ pub async fn run_from_cli(cli: Cli) -> Result<()> {
                 effective_config.infrastructure.network.grpc_addr
             )
         })?;
-    info!(config_source, "loaded tokeirad configuration");
+    info!(config_source = %config_source, "loaded tokeirad configuration");
 
     let (server_task, bound_addr, _shutdown_tx, _background_cancel, _log_broadcast, wire_recorder) =
         build_and_serve(addr, effective_config).await?;

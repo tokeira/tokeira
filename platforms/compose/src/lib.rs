@@ -22,7 +22,7 @@ use tokeira_platform::{
     context::InvocationContext,
     definition::{
         DefinitionFrontend, DefinitionSource, DefinitionSourceName, EvaluatedDefinition,
-        RealizedResourceIndex, evaluate_definition, verify_definition,
+        FrontendSource, RealizedResourceIndex, evaluate_definition, verify_definition,
     },
     graph::{ModuleNode, WritebackEntry, WritebackValue},
 };
@@ -266,6 +266,10 @@ impl orchestrator::Deployment for ConcreteDeployment {
         selection: &ModuleSelection,
     ) -> Vec<Box<dyn iac::Module>> {
         let all = Self::all_infra(config);
+        // Verb entries validate and expand the operator's filter through
+        // `operation_selection` before any selection reaches here, so this
+        // re-expansion is idempotent for valid input; the fallback exists
+        // only because this trait method cannot return an error.
         let expanded =
             iac::expand_module_selection(&all, selection, SelectionDirection::Prerequisites)
                 .unwrap_or_else(|_| selection.clone());
@@ -564,6 +568,26 @@ impl<F: DefinitionFrontend> ComposeProvisioner<F> {
     }
 }
 
+/// The operation's module selection from the operator's `--module`: `None`
+/// is the whole graph; a name is validated against the definition's modules
+/// and expanded along `direction` by the engine, so an unknown module is
+/// refused with the known modules listed — never silently widened. The same
+/// expanded selection drives both `compose` and the operation, so the two
+/// cannot disagree.
+fn operation_selection<D: orchestrator::Deployment>(
+    engine: &orchestrator::InfraEngine<D>,
+    module: Option<&str>,
+    direction: SelectionDirection,
+) -> Result<ModuleSelection> {
+    match module {
+        None => Ok(ModuleSelection::All),
+        Some(name) => {
+            Ok(engine
+                .expand_selection(&ModuleSelection::Only(vec![name.to_string()]), direction)?)
+        }
+    }
+}
+
 impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
     fn label(&self, _deployment_dir: &Path) -> &'static str {
         "compose"
@@ -616,6 +640,41 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
         Ok(Realization::Realized(()))
     }
 
+    async fn retarget_check(
+        &self,
+        deployment_dir: &Path,
+        prior_source: &str,
+        current_source: &str,
+    ) -> Result<Realization<()>> {
+        let metadata = Self::metadata(deployment_dir)?;
+        let definition = Self::definition(&metadata)?;
+        let invocation = Self::invocation(deployment_dir, &metadata);
+        let context = context::ComposeContext::from_invocation(&invocation);
+        // Both revisions carry the recorded definition identity: the compare
+        // is between two states of the same document, not two documents.
+        let source_name = DefinitionSourceName::DeploymentRelative(definition.path.clone());
+        let prior = FrontendSource {
+            source_name: &source_name,
+            bytes: prior_source.as_bytes(),
+        };
+        let current = FrontendSource {
+            source_name: &source_name,
+            bytes: current_source.as_bytes(),
+        };
+        match self.frontend.retarget_check(
+            prior,
+            current,
+            &context,
+            tokeira_kinds::kind_functions(),
+        ) {
+            Ok(()) => Ok(Realization::Realized(())),
+            Err(messages) => anyhow::bail!(
+                "retarget refused — a create-time value changed; create a new deployment instead:\n  - {}",
+                messages.join("\n  - ")
+            ),
+        }
+    }
+
     async fn log_stream(
         &self,
         deployment_dir: &Path,
@@ -657,7 +716,11 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
         Ok(state)
     }
 
-    async fn infra_plan(&self, deployment_dir: &Path) -> Result<iac::PlanOutcome> {
+    async fn infra_plan(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<iac::PlanOutcome> {
         let (mut engine, issue) = self.engine(deployment_dir, false).await?;
         if let Some(issue) = issue {
             return Ok(iac::PlanOutcome {
@@ -665,18 +728,24 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
                 ..Default::default()
             });
         }
-        let composition = engine.compose(ModuleSelection::All)?;
+        let selection = operation_selection(&engine, module, SelectionDirection::Prerequisites)?;
+        let composition = engine.compose(selection.clone())?;
         engine
-            .plan(&composition, ModuleSelection::All)
+            .plan(&composition, selection)
             .await
             .context("Compose infrastructure plan failed")
     }
 
-    async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
+    async fn infra_apply(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<AppliedOutcome> {
         let (mut engine, _) = self.engine(deployment_dir, true).await?;
-        let composition = engine.compose(ModuleSelection::All)?;
+        let selection = operation_selection(&engine, module, SelectionDirection::Prerequisites)?;
+        let composition = engine.compose(selection.clone())?;
         let changes = engine
-            .apply(&composition, ModuleSelection::All)
+            .apply(&composition, selection)
             .await
             .context("Compose infrastructure apply failed")?;
         let display_by_id = engine.display_map(&composition)?;
@@ -694,11 +763,14 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
         Ok(1)
     }
 
-    async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
+    async fn infra_destroy(&self, deployment_dir: &Path, module: Option<&str>) -> Result<usize> {
         let (mut engine, _) = self.engine(deployment_dir, true).await?;
-        let composition = engine.compose(ModuleSelection::All)?;
+        // Destroy expands dependants: taking a module down takes down what
+        // stands on it, never what it stands on.
+        let selection = operation_selection(&engine, module, SelectionDirection::Dependants)?;
+        let composition = engine.compose(selection.clone())?;
         Ok(engine
-            .destroy(&composition, ModuleSelection::All)
+            .destroy(&composition, selection)
             .await
             .context("Compose infrastructure destroy failed")?
             .len())
@@ -721,13 +793,13 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
 
     async fn deploy_plan(&self, deployment_dir: &Path) -> Result<Realization<iac::PlanOutcome>> {
         Ok(Realization::Realized(
-            self.infra_plan(deployment_dir).await?,
+            self.infra_plan(deployment_dir, None).await?,
         ))
     }
 
     async fn deploy_apply(&self, deployment_dir: &Path) -> Result<Realization<AppliedOutcome>> {
         Ok(Realization::Realized(
-            self.infra_apply(deployment_dir).await?,
+            self.infra_apply(deployment_dir, None).await?,
         ))
     }
 

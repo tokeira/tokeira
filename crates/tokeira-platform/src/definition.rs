@@ -79,6 +79,26 @@ pub trait DefinitionFrontend: Clone + Send + Sync + 'static {
     where
         C: Serialize,
         K: ProviderKind + 'static;
+
+    /// Refuse a create-time-immutable change between two sources: the prior
+    /// admitted configuration and the one about to apply. Each refusal
+    /// message names a changed field. The default gates nothing — a format
+    /// with no create-time admission surface admits every edit; the `.tkd`
+    /// frontend overrides this, and `.tkdp` adopts when its admission
+    /// surface lands.
+    fn retarget_check<C, K>(
+        &self,
+        _prior: FrontendSource<'_>,
+        _current: FrontendSource<'_>,
+        _context: &C,
+        _kinds: KindFunctions<K>,
+    ) -> Result<(), Vec<String>>
+    where
+        C: Serialize,
+        K: ProviderKind + 'static,
+    {
+        Ok(())
+    }
 }
 
 /// Versioned content identity of format plus exact definition bytes.

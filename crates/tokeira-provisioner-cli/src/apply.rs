@@ -21,6 +21,7 @@ use crate::{
 pub(crate) async fn apply<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
+    module: Option<&str>,
     yes: bool,
     mode: Mode,
     explanation_path: Option<&Path>,
@@ -47,6 +48,10 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
         GateOutcome::Proceed { verdict, .. } => verdict,
     };
 
+    // ── Retarget gate: a `#[create]` change is a new deployment, not an
+    // apply — refused absolutely, before even the destructive-plan review. ──
+    crate::retarget_gate(platform, deployment_dir, &envelope).await?;
+
     // ── Destructive gate (§4, Proposal 002): the engine classifies, the
     // shell confirms. Skipped under `--yes` — the operator has already
     // reviewed — so the confirmed path pays no extra plan pass. The gate's
@@ -56,7 +61,7 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     let preceding = if yes {
         None
     } else {
-        let planned = platform.infra_plan(deployment_dir).await?;
+        let planned = platform.infra_plan(deployment_dir, module).await?;
         refuse_destructive_without_yes("infra apply", &planned.changes)?;
         Some(planned)
     };
@@ -64,7 +69,9 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     // ── Engine apply (realized by the injected platform) ──
     // The deployment identity seeds the platform context; it was set at `init`.
     let project_name = deployment_identity(&envelope.deployment_id);
-    let applied = platform.infra_apply_with_artifacts(deployment_dir).await?;
+    let applied = platform
+        .infra_apply_with_artifacts(deployment_dir, module)
+        .await?;
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
     // — the set the rollback B-delete pass consumes (task 19.3). The
     // checkpoint consumes the audit vocabulary, not the report identity.
@@ -191,6 +198,123 @@ mod tests {
     use crate::{ProvisionerPlatform, TestPlatform};
     use tokeira_provisioner::DeploymentStateEnvelope;
 
+    struct RetargetRefusingPlatform;
+
+    impl ProvisionerPlatform for RetargetRefusingPlatform {
+        fn label(&self, _deployment_dir: &Path) -> &'static str {
+            "test"
+        }
+
+        fn config_source(&self, _deployment_dir: &Path) -> Result<crate::ConfigSource> {
+            crate::ConfigSource::legacy("deployment.toml")
+        }
+
+        fn deployment_id(&self, _deployment_dir: &Path) -> Result<String> {
+            Ok("tokeira".into())
+        }
+
+        async fn retarget_check(
+            &self,
+            _deployment_dir: &Path,
+            _prior_source: &str,
+            _current_source: &str,
+        ) -> Result<crate::Realization<()>> {
+            anyhow::bail!("retarget refused — `Config.storage` is create-time-immutable")
+        }
+
+        async fn infra_plan(
+            &self,
+            _deployment_dir: &Path,
+            _module: Option<&str>,
+        ) -> Result<crate::PlanOutcome> {
+            unreachable!("the retarget gate refuses before any plan")
+        }
+
+        async fn infra_apply(
+            &self,
+            _deployment_dir: &Path,
+            _module: Option<&str>,
+        ) -> Result<crate::AppliedOutcome> {
+            unreachable!("the retarget gate refuses before any mutation")
+        }
+
+        async fn infra_destroy(
+            &self,
+            _deployment_dir: &Path,
+            _module: Option<&str>,
+        ) -> Result<usize> {
+            unreachable!()
+        }
+
+        async fn infra_destroy_selected(
+            &self,
+            _deployment_dir: &Path,
+            _ids: &[String],
+        ) -> Result<Vec<tokeira_provisioner::ChangeLogEntry>> {
+            unreachable!()
+        }
+
+        async fn deploy_plan(
+            &self,
+            _deployment_dir: &Path,
+        ) -> Result<crate::Realization<crate::PlanOutcome>> {
+            unreachable!()
+        }
+
+        async fn deploy_apply(
+            &self,
+            _deployment_dir: &Path,
+        ) -> Result<crate::Realization<crate::AppliedOutcome>> {
+            unreachable!()
+        }
+
+        async fn scale(
+            &self,
+            _deployment_dir: &Path,
+            _specs: &[String],
+        ) -> Result<crate::Realization<usize>> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retained_revision_and_a_refusing_platform_stop_apply_before_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = envelope_store(tmp.path());
+        let env = DeploymentStateEnvelope {
+            binding: Some(ProvenanceStamp::current(Utc::now())),
+            config_revision: 1,
+            ..Default::default()
+        };
+        let (_, v) = store.load().await.unwrap();
+        store.save(&env, &v).await.unwrap();
+
+        // Retain revision 1 so the gate has a prior to compare against.
+        let source = crate::ConfigSource::legacy("deployment.toml").unwrap();
+        std::fs::write(
+            tmp.path().join("deployment.toml"),
+            "project_name = \"one\"\n",
+        )
+        .unwrap();
+        config_history::snapshot(tmp.path(), &source, 1).unwrap();
+
+        let err = apply(
+            &RetargetRefusingPlatform,
+            tmp.path(),
+            None,
+            false,
+            Mode::resolve(false, false),
+            None,
+        )
+        .await
+        .expect_err("the retarget gate refuses");
+        assert!(err.to_string().contains("retarget"), "unexpected: {err}");
+
+        // Refused before any mutation: the revision did not advance.
+        let (after, _) = store.load().await.unwrap();
+        assert_eq!(after.config_revision, 1, "no revision advance on refusal");
+    }
+
     struct FailingInspectionPlatform;
 
     impl ProvisionerPlatform for FailingInspectionPlatform {
@@ -206,11 +330,19 @@ mod tests {
             Ok("tokeira".into())
         }
 
-        async fn infra_plan(&self, _deployment_dir: &Path) -> Result<crate::PlanOutcome> {
+        async fn infra_plan(
+            &self,
+            _deployment_dir: &Path,
+            _module: Option<&str>,
+        ) -> Result<crate::PlanOutcome> {
             Ok(crate::PlanOutcome::default())
         }
 
-        async fn infra_apply(&self, _deployment_dir: &Path) -> Result<crate::AppliedOutcome> {
+        async fn infra_apply(
+            &self,
+            _deployment_dir: &Path,
+            _module: Option<&str>,
+        ) -> Result<crate::AppliedOutcome> {
             Ok(crate::AppliedOutcome::default())
         }
 
@@ -218,7 +350,11 @@ mod tests {
             anyhow::bail!("injected inspection failure")
         }
 
-        async fn infra_destroy(&self, _deployment_dir: &Path) -> Result<usize> {
+        async fn infra_destroy(
+            &self,
+            _deployment_dir: &Path,
+            _module: Option<&str>,
+        ) -> Result<usize> {
             Ok(0)
         }
 
@@ -275,6 +411,7 @@ mod tests {
         let err = apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             None,
@@ -325,6 +462,7 @@ mod tests {
         let err = apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             None,
@@ -358,6 +496,7 @@ mod tests {
         apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             Some(&path),
@@ -405,6 +544,7 @@ mod tests {
         let err = apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             Some(&path),
@@ -439,6 +579,7 @@ mod tests {
         let error = apply(
             &FailingInspectionPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             None,
@@ -472,6 +613,7 @@ mod tests {
         apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             None,

@@ -64,7 +64,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         check_baseline_drift(&envelope)?;
         let applied = crate::change_log_entries(
             &platform
-                .infra_apply_with_artifacts(deployment_dir)
+                .infra_apply_with_artifacts(deployment_dir, None)
                 .await?
                 .changes,
         );
@@ -164,7 +164,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     // ── Apply B's plan (realized by the injected platform) ──
     let applied = crate::change_log_entries(
         &platform
-            .infra_apply_with_artifacts(deployment_dir)
+            .infra_apply_with_artifacts(deployment_dir, None)
             .await?
             .changes,
     );

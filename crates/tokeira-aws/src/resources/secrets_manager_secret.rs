@@ -155,6 +155,7 @@ impl Resource for SecretsManagerSecret {
         let secret_string = self.initial_secret_string(ctx).await?;
 
         let secret_arn;
+        let version_id;
 
         // secretsmanager:CreateSecret with secret string and tags
         match ctx
@@ -170,6 +171,7 @@ impl Resource for SecretsManagerSecret {
         {
             Ok(output) => {
                 secret_arn = output.arn().unwrap_or_default().to_string();
+                version_id = output.version_id().unwrap_or_default().to_string();
             }
             Err(e) => {
                 let svc_err = e.into_service_error();
@@ -191,6 +193,19 @@ impl Resource for SecretsManagerSecret {
                             ))
                         })?;
                     secret_arn = desc.arn().unwrap_or_default().to_string();
+                    // The adopted secret's current version: the id staged
+                    // AWSCURRENT, which is what a pinned consumer must name.
+                    version_id = desc
+                        .version_ids_to_stages()
+                        .and_then(|stages| {
+                            stages.iter().find_map(|(id, labels)| {
+                                labels
+                                    .iter()
+                                    .any(|label| label == "AWSCURRENT")
+                                    .then(|| id.clone())
+                            })
+                        })
+                        .unwrap_or_default();
                 } else {
                     return Err(IacError::AwsSdk(format!(
                         "secretsmanager:CreateSecret: {svc_err}"
@@ -203,9 +218,14 @@ impl Resource for SecretsManagerSecret {
         Ok(ResourceState {
             resource_type: ResourceType::new("SecretsManagerSecret"),
             physical_id: secret_arn,
+            // `version_id` is the committed secret version — the identity a
+            // pinned consumer (an ECS task definition's `valueFrom`) names so
+            // a content change is a visible, planned redeploy rather than a
+            // silent drift between replicas.
             properties: serde_json::json!({
                 "secret_name": self.secret_name,
                 "tags": tags,
+                "version_id": version_id,
             }),
             dependencies: vec![],
             created_at: now.clone(),

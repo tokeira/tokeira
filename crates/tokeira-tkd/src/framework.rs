@@ -83,6 +83,40 @@ impl DefinitionFrontend for TkdFrontend {
             .map_err(|error| diagnostic(&self.format, source, &source_map, error))?;
         Ok(FrontendOutput { config, graph })
     }
+
+    fn retarget_check<C, K>(
+        &self,
+        prior: FrontendSource<'_>,
+        current: FrontendSource<'_>,
+        context: &C,
+        kinds: KindFunctions<K>,
+    ) -> Result<(), Vec<String>>
+    where
+        C: Serialize,
+        K: ProviderKind + 'static,
+    {
+        // Both revisions run the same full interpretation as evaluate() —
+        // one evaluation path for checking and execution — and the diff runs
+        // over the host-free config values. The *current* source supplies the
+        // `#[create]` admission metadata: the annotation set an operator is
+        // editing under is the one that gates them.
+        let evaluate_config = |source: FrontendSource<'_>,
+                               label: &str|
+         -> Result<crate::Value<HostValue<K>>, Vec<String>> {
+            let text = std::str::from_utf8(source.bytes)
+                .map_err(|error| vec![format!("{label} definition is not UTF-8: {error}")])?;
+            let fields = context_fields(context).map_err(|error| vec![error.msg.clone()])?;
+            let bridge = FrameworkBridge::new(kinds, fields);
+            let (_, config) = crate::interpret(text, &bridge, &())
+                .map_err(|error| vec![format!("{label} definition: {}", error.msg)])?;
+            Ok(config)
+        };
+        let prior_config = evaluate_config(prior, "prior")?;
+        let current_config = evaluate_config(current, "current")?;
+        let current_text = std::str::from_utf8(current.bytes)
+            .map_err(|error| vec![format!("current definition is not UTF-8: {error}")])?;
+        crate::retarget_check(current_text, &prior_config, &current_config)
+    }
 }
 
 enum HostValue<K> {
@@ -712,5 +746,72 @@ mod tests {
         assert_eq!(config, TestConfig { replicas: 2 });
         assert_eq!(output.graph.resources().len(), 1);
         assert_eq!(output.graph.writeback().len(), 1);
+    }
+
+    fn retarget_source(mode: &str, replicas: u16) -> Vec<u8> {
+        format!(
+            r#"
+            struct Config {{ #[create] mode: String, replicas: u16 }}
+            fn config() -> Config {{
+                Config {{ mode: "{mode}".into(), replicas: {replicas} }}
+            }}
+            fn deployment(cfg: Config, cx: Context) -> Deployment {{
+                let d = Deployment::new(&["default"]);
+                let core = d.module("core", vec![]);
+                core.resource("resource", TestResource {{}});
+                let _ = cx.project_name;
+                d
+            }}
+            "#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn retarget_check_refuses_a_create_change_and_admits_the_rest() {
+        let source_name = DefinitionSourceName::AuthoringPath("definition.tkd".into());
+        let frontend = TkdFrontend::new();
+        let context = TestContext {
+            project_name: "example".to_string(),
+        };
+        let prior = retarget_source("dsql", 1);
+
+        // A `#[create]` field changed → refused, naming the field.
+        let retargeted = retarget_source("in-memory", 1);
+        let messages = frontend
+            .retarget_check(
+                FrontendSource {
+                    source_name: &source_name,
+                    bytes: &prior,
+                },
+                FrontendSource {
+                    source_name: &source_name,
+                    bytes: &retargeted,
+                },
+                &context,
+                kinds(),
+            )
+            .expect_err("a create-time change is a retarget");
+        assert!(
+            messages.iter().any(|m| m.contains("mode")),
+            "refusal names the field: {messages:?}"
+        );
+
+        // Only an ordinary field changed → admitted.
+        let reconciled = retarget_source("dsql", 3);
+        frontend
+            .retarget_check(
+                FrontendSource {
+                    source_name: &source_name,
+                    bytes: &prior,
+                },
+                FrontendSource {
+                    source_name: &source_name,
+                    bytes: &reconciled,
+                },
+                &context,
+                kinds(),
+            )
+            .expect("a non-create edit reconciles");
     }
 }

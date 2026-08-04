@@ -51,7 +51,7 @@ pub trait ProviderKind: Debug + Send + Sync {
 }
 
 /// Compile-time constructor functions supplied by one concrete platform.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct KindFunctions<K> {
     /// Complete author-visible kind names — the single inventory a frontend
     /// may enumerate (a definition edited within one engine version can adopt
@@ -66,3 +66,14 @@ pub struct KindFunctions<K> {
     /// Decode one named kind into the platform's concrete kind enum.
     pub decode: fn(&str, LocatedValue) -> Result<K, KindError>,
 }
+
+// Manual impls: the struct is function pointers and a static slice, so it is
+// unconditionally copyable — the derive would demand `K: Copy`, which no
+// concrete kind enum satisfies or should.
+impl<K> Clone for KindFunctions<K> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<K> Copy for KindFunctions<K> {}

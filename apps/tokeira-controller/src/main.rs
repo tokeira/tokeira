@@ -71,14 +71,10 @@ fn readiness_handle(name: &'static str) -> ReadinessHandle {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path = config_path_from_args()?;
-    let config: ControllerProcessConfig = tokeira_config::load_config(&config_path, None)
-        .with_context(|| {
-            format!(
-                "failed to load controller config at {}",
-                config_path.display()
-            )
-        })?;
+    let (config_source, config_label) = config_source_from_args()?;
+    let config: ControllerProcessConfig =
+        tokeira_config::load_config_from_source(&config_source, None)
+            .with_context(|| format!("failed to load controller config from {config_label}"))?;
     config.validate()?;
 
     let readiness = ControllerReadiness::new();
@@ -384,17 +380,24 @@ fn process_observability_config(
     })
 }
 
-fn config_path_from_args() -> Result<PathBuf> {
+fn config_source_from_args() -> Result<(tokeira_config::ConfigSource, String)> {
     let mut args = std::env::args().skip(1);
-    let Some(first) = args.next() else {
-        return Ok(PathBuf::from("controller.toml"));
+    let flag = match args.next() {
+        None => None,
+        Some(first) if first == "--config" => {
+            Some(args.next().context("--config requires a locator")?)
+        }
+        Some(first) => Some(first),
     };
-    if first == "--config" {
-        args.next()
-            .map(PathBuf::from)
-            .context("--config requires a path")
-    } else {
-        Ok(PathBuf::from(first))
+    // Flag, then TOKEIRA_CONFIG, then the conventional file name — the same
+    // precedence every Tokeira binary uses; the locator forms (a path,
+    // `file:<path>`, `env:<VAR>`) are shared too.
+    match tokeira_config::ConfigSource::from_cli_env(flag.as_deref())? {
+        Some(resolved) => Ok(resolved),
+        None => Ok((
+            tokeira_config::ConfigSource::File(PathBuf::from("controller.toml")),
+            "default controller.toml".to_string(),
+        )),
     }
 }
 

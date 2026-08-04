@@ -14,7 +14,7 @@
 
 use std::{path::Path, pin::Pin};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokeira_iac::{Change, ChangeKind, PlanOutcome};
 use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 use tokeira_provisioner::DeploymentStateEnvelope;
@@ -25,6 +25,7 @@ mod bound;
 mod causality;
 mod cli;
 mod config_history;
+mod config_seed;
 mod definition;
 mod deploy;
 mod describe;
@@ -219,14 +220,22 @@ pub trait ProvisionerPlatform {
     /// plus the refresh coverage behind them. The infra verbs are universal —
     /// every provisioner provisions infrastructure — so they are
     /// unconditional, unlike the workload verbs below.
-    async fn infra_plan(&self, deployment_dir: &Path) -> Result<PlanOutcome>;
+    /// `module` is the operator's `--module` filter; the platform owns its
+    /// meaning — validating the name and expanding along the module DAG
+    /// (prerequisites here, dependants for destroy) — and `None` is the whole
+    /// graph.
+    async fn infra_plan(&self, deployment_dir: &Path, module: Option<&str>) -> Result<PlanOutcome>;
 
     /// Reconcile infrastructure to desired. Returns the committed changes
     /// with their engine identity and operator nouns — never before-images
     /// (Proposal 002): the applied report renders identity, and `upgrade`
     /// records the [`change_log_entries`] distillation as the audit change
     /// log (task 19.2).
-    async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome>;
+    async fn infra_apply(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<AppliedOutcome>;
 
     /// Reconcile infrastructure after publishing declared operational artifacts.
     ///
@@ -235,8 +244,12 @@ pub trait ProvisionerPlatform {
     /// [`infra_apply`](Self::infra_apply) so it cannot publish artifacts while
     /// restoring the retained engine. Legacy adapters have no artifact catalog
     /// and retain their existing apply behavior through this default.
-    async fn infra_apply_with_artifacts(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
-        self.infra_apply(deployment_dir).await
+    async fn infra_apply_with_artifacts(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<AppliedOutcome> {
+        self.infra_apply(deployment_dir, module).await
     }
 
     /// Publish declared non-authoritative inspection artifacts after apply state commits.
@@ -249,7 +262,8 @@ pub trait ProvisionerPlatform {
     }
 
     /// Tear down the deployment's infrastructure. Returns the removed count.
-    async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize>;
+    /// A `module` filter expands along dependants, never prerequisites.
+    async fn infra_destroy(&self, deployment_dir: &Path, module: Option<&str>) -> Result<usize>;
 
     /// Delete **exactly** the named resource ids — the rollback B-delete pass
     /// (task 19.3, Proposal 002): fail-closed (an id the platform does not
@@ -274,6 +288,38 @@ pub trait ProvisionerPlatform {
         source: Option<&Path>,
     ) -> Result<Realization<()>> {
         let _ = (deployment_dir, source);
+        Ok(Realization::NotApplicable {
+            reason: "this platform has no interpreted definition",
+        })
+    }
+
+    /// Seed the deployment's server configuration at create time: realize the
+    /// definition's config-document render with provider-derived fields left
+    /// blank and write the result into the deployment directory. Evaluation
+    /// only — no provider access, no engine state. `tkr deployment create`
+    /// invokes this against the staging directory after the staged definition
+    /// check; `NotApplicable` keeps the generic seeded document, so create
+    /// never fails for a platform that has not adopted the render.
+    async fn config_seed(&self, deployment_dir: &Path) -> Result<Realization<()>> {
+        let _ = deployment_dir;
+        Ok(Realization::NotApplicable {
+            reason: "this platform does not seed server configuration",
+        })
+    }
+
+    /// The retarget gate: compare the retained prior configuration against
+    /// the live source and refuse a create-time-immutable change before any
+    /// mutation. The shell supplies both sources; the platform evaluates
+    /// them through its own frontend. An `Err` is the refusal, naming the
+    /// changed fields; `NotApplicable` serves platforms with no interpreted
+    /// definition, which gate nothing.
+    async fn retarget_check(
+        &self,
+        deployment_dir: &Path,
+        prior_source: &str,
+        current_source: &str,
+    ) -> Result<Realization<()>> {
+        let _ = (deployment_dir, prior_source, current_source);
         Ok(Realization::NotApplicable {
             reason: "this platform has no interpreted definition",
         })
@@ -447,6 +493,39 @@ pub(crate) fn committed_changes(applied: &AppliedOutcome) -> Vec<tokeira_explain
 /// For now a local CAS store under `{deployment_dir}/state/envelope`; cloud
 /// deployments will select an `S3StateStore` through the platform store seam
 /// (task 13.2), just like the infra/runtime state.
+/// The retarget gate, run by every config-applying verb after the binding
+/// gate and before any mutation: a `#[create]` change is a new deployment,
+/// not an apply. No retained prior revision means nothing has ever applied,
+/// so there is nothing to gate — Day-0 `init` retains revision 0 from the
+/// operator's already-edited definition, which is exactly why choosing a
+/// `#[create]` value *before* the first apply is legitimate and changing it
+/// *after* is refused.
+pub(crate) async fn retarget_gate<P: ProvisionerPlatform>(
+    platform: &P,
+    deployment_dir: &Path,
+    envelope: &DeploymentStateEnvelope,
+) -> Result<()> {
+    let config_source = platform.config_source(deployment_dir)?;
+    let Some(prior) =
+        config_history::retained_source(deployment_dir, &config_source, envelope.config_revision)?
+    else {
+        return Ok(());
+    };
+    let live_path = config_history::config_file(deployment_dir, &config_source);
+    let current = std::fs::read_to_string(&live_path).with_context(|| {
+        format!(
+            "failed to read the live definition at {}",
+            live_path.display()
+        )
+    })?;
+    match platform
+        .retarget_check(deployment_dir, &prior, &current)
+        .await?
+    {
+        Realization::Realized(()) | Realization::NotApplicable { .. } => Ok(()),
+    }
+}
+
 pub(crate) fn envelope_store(
     deployment_dir: &Path,
 ) -> Box<dyn DeploymentStore<DeploymentStateEnvelope>> {
@@ -477,15 +556,23 @@ impl ProvisionerPlatform for TestPlatform {
         Ok("tokeira".to_string())
     }
 
-    async fn infra_plan(&self, _deployment_dir: &Path) -> Result<PlanOutcome> {
+    async fn infra_plan(
+        &self,
+        _deployment_dir: &Path,
+        _module: Option<&str>,
+    ) -> Result<PlanOutcome> {
         Ok(PlanOutcome::default())
     }
 
-    async fn infra_apply(&self, _deployment_dir: &Path) -> Result<AppliedOutcome> {
+    async fn infra_apply(
+        &self,
+        _deployment_dir: &Path,
+        _module: Option<&str>,
+    ) -> Result<AppliedOutcome> {
         Ok(AppliedOutcome::default())
     }
 
-    async fn infra_destroy(&self, _deployment_dir: &Path) -> Result<usize> {
+    async fn infra_destroy(&self, _deployment_dir: &Path, _module: Option<&str>) -> Result<usize> {
         Ok(0)
     }
 

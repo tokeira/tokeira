@@ -144,6 +144,23 @@ fn identity_matches(retained: &RetainedSourceIdentity, source: &ConfigSource) ->
 }
 
 /// Whether a revision carries bytes under the exact current format/path.
+/// The retained source text for `revision`, when that revision was retained.
+/// Absence is a fact, not an error: a deployment that has never applied has
+/// nothing to compare against.
+pub(crate) fn retained_source(
+    deployment_dir: &Path,
+    source: &ConfigSource,
+    revision: u64,
+) -> anyhow::Result<Option<String>> {
+    let path = snapshot_path(deployment_dir, source, revision);
+    if !path.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read the retained revision at {}", path.display()))
+        .map(Some)
+}
+
 pub(crate) fn is_retained(deployment_dir: &Path, source: &ConfigSource, revision: u64) -> bool {
     let bytes_exist = snapshot_path(deployment_dir, source, revision).is_file();
     if !bytes_exist {

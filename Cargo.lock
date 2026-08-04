@@ -7976,17 +7976,22 @@ name = "tokeira-compose"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "askama",
  "async-trait",
  "bollard",
  "futures-util",
+ "hex",
  "proptest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokeira-deploy-engine",
  "tokeira-iac",
+ "tokeira-platform",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8012,6 +8017,7 @@ dependencies = [
  "tokeira-deploy-engine",
  "tokeira-explain",
  "tokeira-iac",
+ "tokeira-kinds",
  "tokeira-orchestrator",
  "tokeira-platform",
  "tokeira-provisioner",
@@ -8305,6 +8311,17 @@ dependencies = [
  "tokeira-proto",
  "tokeira-types",
  "tracing",
+]
+
+[[package]]
+name = "tokeira-kinds"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tokeira-aws",
+ "tokeira-compose",
+ "tokeira-iac",
+ "tokeira-platform",
 ]
 
 [[package]]

@@ -15,3 +15,4 @@ cc 91eff89c0544009aac32b7bdbe9520c9203ae5899661f67f1ce9ef25f1026283 # shrinks to
 cc db53ed17b7be5353967ee1a2f7ea2a307002fadd4899b09edcb02daade26a49b # shrinks to logical_seq = 7, attempt = 2
 cc 45347be30838bc954d8c64c662e36e02dfa96ad9a094094b1271088b39b614a1 # shrinks to logical_seqs = [18, 22, 26]
 cc 75058d8cd6cc62918f47a1dc5995e60057c9c10649ad36fc33f452f5d01220fe # shrinks to logical_seqs = [21, 2, 3, 24]
+cc 492c40e72ece3e70149be7bfbc28106a7539add93a4bda129ef6516a303ad0d9 # shrinks to logical_seq = 1, attempt = 2

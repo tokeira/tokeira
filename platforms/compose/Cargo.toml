@@ -19,6 +19,7 @@ tokeira-platform = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokeira-compose = { path = "../../crates/tokeira-compose" }
+tokeira-kinds = { path = "../../crates/tokeira-kinds" }
 tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
 tokeira-iac = { workspace = true }
 tokeira-deploy-engine = { workspace = true }

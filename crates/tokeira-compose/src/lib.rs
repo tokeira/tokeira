@@ -25,6 +25,9 @@
 //! return compose resources. The same platform can be passed to the deploy
 //! facade for runtime service apply.
 
+pub mod kinds;
+pub mod observability;
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

@@ -15,6 +15,7 @@ members = [
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
+    "crates/tokeira-kinds",
     "crates/tokeira-chasm-derive",
     "crates/tokeira-chasm",
     "crates/tokeira-chasm-activity",

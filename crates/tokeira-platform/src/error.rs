@@ -233,6 +233,20 @@ pub enum VerificationFinding {
         /// Provider-owned failure detail.
         message: String,
     },
+    /// The kind's provider is not wired by the executing platform. Produced
+    /// by the engine kind library's wiring check; carried here so every
+    /// verification finding renders through one report path. Strings only —
+    /// this crate stays ignorant of concrete providers.
+    UnwiredProvider {
+        /// Logical module/resource identity.
+        resource: String,
+        /// Provider kind identity.
+        provider_kind: String,
+        /// Provider the kind requires.
+        provider: String,
+        /// Platform that does not wire it.
+        platform: String,
+    },
 }
 
 /// Complete pure verification report.

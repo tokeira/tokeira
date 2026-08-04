@@ -8624,6 +8624,7 @@ dependencies = [
 name = "tokeira-config"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "proptest",
  "serde",
@@ -9171,6 +9172,18 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "tokeira-secrets"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-secretsmanager",
+ "aws-sdk-ssm",
+ "tokeira-config",
+ "tokio",
 ]
 
 [[package]]

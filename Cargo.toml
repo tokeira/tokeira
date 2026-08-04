@@ -27,6 +27,7 @@ members = [
     "crates/tokeira-iac",
     "crates/tokeira-deploy-engine",
     "crates/tokeira-config",
+    "crates/tokeira-secrets",
     "crates/tokeira-aws",
     "crates/tokeira-autoscaler",
     "crates/tokeira-remote-workstation",
@@ -163,6 +164,7 @@ tokeira-platform = { path = "crates/tokeira-platform" }
 tokeira-tkd = { path = "crates/tokeira-tkd" }
 tokeira-tkdp = { path = "crates/tokeira-tkdp" }
 tokeira-kinds = { path = "crates/tokeira-kinds" }
+tokeira-secrets = { path = "crates/tokeira-secrets" }
 tokeira-k8s = { path = "crates/tokeira-k8s" }
 tokeira-observability = { path = "crates/tokeira-observability" }
 tokeira-build-info = { path = "crates/tokeira-build-info" }

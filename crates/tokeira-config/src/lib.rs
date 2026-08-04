@@ -1,10 +1,12 @@
 pub mod documentation;
 pub mod loader;
 pub mod overlay;
+pub mod secret;
 pub mod source;
 pub use documentation::{CONFIG_FIELD_CATALOG, ConfigFieldClass, ConfigFieldDocumentation};
 pub use loader::{ConfigLoaderError, load_config, load_config_from_source, write_config_toml};
 pub use overlay::{overlay_document, overlay_document_str, render_document};
+pub use secret::{NoSecretsProvider, Secret, SecretError, SecretRef, SecretsProvider};
 pub use source::{CONFIG_ENV, ConfigSource};
 
 use std::{collections::HashSet, path::Path};

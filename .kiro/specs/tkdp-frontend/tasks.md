@@ -1,20 +1,25 @@
 # Tkdp Frontend Implementation Plan
 
-- [ ] 1. Platform accommodations (the two sanctioned `tokeira-platform` changes)
-  - [ ] 1.1 Add the kind-name inventory to `KindFunctions<K>`: a `names: &'static [&'static str]`
+- [x] 1. Platform accommodations — DONE 2026-08-04 (658e9821), delivered as the
+  operator-directed engine kind library: provider crates export complete kind sets,
+  `crates/tokeira-kinds` unions them (`EngineKind`, engine-owned `kind_functions`),
+  platforms declare wired providers, and `verify_wiring` refuses unwired kinds at
+  `definition check`.
+  - [x] 1.1 Add the kind-name inventory to `KindFunctions<K>`: a `names: &'static [&'static str]`
     field backing `contains`; Compose supplies one `const` slice for both; `tokeira-tkd` ignores
     the field; add the platform test asserting `contains(n)` for every listed name and that the
     decode arms cover exactly the listed set. _Requirements: 2.9_
-  - [ ] 1.2 Add the enum-position struct admission arm to the `LocatedValue` deserializer: a
+  - [x] 1.2 — DONE 2026-08-04 (658e9821). Add the enum-position struct admission arm to the `LocatedValue` deserializer: a
     `ValueShape::Struct { name, fields }` where an enum is expected decodes as the variant tagged
     by `name` — unit when `fields` is empty, newtype-struct otherwise; unknown variant names fail
     with the struct's range; `Enum` and `String` admissions unchanged. _Requirements: 2.10, 2.11_
-  - [ ] 1.3 Required PBT — Property 11 (variant-spelling equivalence, deserializer half): for any
+  - [x] 1.3 — DONE 2026-08-04 (658e9821). Required PBT — Property 11 (variant-spelling equivalence, deserializer half): for any
     enum target and variant instance spelled as a struct-shaped value, the decoded result equals
     the `Enum`-shape spelling's result; unit/newtype boundary covered. Lives beside the arm in
     `tokeira-platform`. _Property 11. Requirements: 2.10, 2.11_
 
-- [ ] 2. Checkpoint: workspace bar green with accommodations in place, `.tkd` behaviour unchanged
+- [x] 2. Checkpoint — DONE 2026-08-04: full §10.4 bar green (457-test workspace
+  suite). Checkpoint: workspace bar green with accommodations in place, `.tkd` behaviour unchanged
   (full §10.4 bar; Compose parity-untouched: existing platform tests pass unmodified).
 
 - [ ] 3. Monty admission and crate scaffold

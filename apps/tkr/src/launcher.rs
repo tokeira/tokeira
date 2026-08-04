@@ -525,6 +525,7 @@ pub(crate) async fn seed_staged_config(deployment_dir: &Path) -> Result<()> {
 pub(crate) async fn launch_apply(
     deployment_dir: &Path,
     yes: bool,
+    module: Option<&str>,
     explanation: Option<&Path>,
 ) -> Result<()> {
     if load_envelope(deployment_dir).await?.binding.is_none() {
@@ -533,6 +534,10 @@ pub(crate) async fn launch_apply(
     let mut extra = Vec::new();
     if yes {
         extra.push("--yes".to_string());
+    }
+    if let Some(name) = module {
+        extra.push("--module".to_string());
+        extra.push(name.to_string());
     }
     if let Some(path) = explanation {
         extra.push("--explanation".to_string());

@@ -25,6 +25,7 @@ use crate::{
 pub(crate) async fn destroy<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
+    module: Option<&str>,
     yes: bool,
 ) -> Result<()> {
     let running = ProvenanceStamp::current(Utc::now());
@@ -58,7 +59,7 @@ pub(crate) async fn destroy<P: ProvisionerPlatform>(
     }
 
     // ── Engine destroy (realized by the injected platform) ──
-    let removed = platform.infra_destroy(deployment_dir).await?;
+    let removed = platform.infra_destroy(deployment_dir, module).await?;
     println!(
         "[{}] infra destroy: {removed} resource(s) removed",
         platform.label(deployment_dir)
@@ -101,7 +102,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = destroy(&TestPlatform, tmp.path(), false)
+        let err = destroy(&TestPlatform, tmp.path(), None, false)
             .await
             .expect_err("destroy without --yes refuses");
         assert!(
@@ -114,7 +115,7 @@ mod tests {
     async fn destroy_refuses_an_unstamped_deployment() {
         // No binding → Unknown → gate refuses before the confirmation guard.
         let tmp = tempfile::tempdir().unwrap();
-        let err = destroy(&TestPlatform, tmp.path(), true)
+        let err = destroy(&TestPlatform, tmp.path(), None, true)
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(
@@ -136,7 +137,7 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        destroy(&TestPlatform, tmp.path(), true)
+        destroy(&TestPlatform, tmp.path(), None, true)
             .await
             .expect("local destroy succeeds");
 

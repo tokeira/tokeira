@@ -78,7 +78,7 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
 
     let applied = crate::change_log_entries(
         &platform
-            .infra_apply_with_artifacts(deployment_dir)
+            .infra_apply_with_artifacts(deployment_dir, None)
             .await?
             .changes,
     );
@@ -178,6 +178,7 @@ mod tests {
         crate::apply::apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             tokeira_report::Mode::resolve(false, false),
             None,
@@ -194,6 +195,7 @@ mod tests {
         crate::apply::apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             tokeira_report::Mode::resolve(false, false),
             None,

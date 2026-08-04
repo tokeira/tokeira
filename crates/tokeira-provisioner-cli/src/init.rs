@@ -296,6 +296,7 @@ mod tests {
         crate::apply::apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             tokeira_report::Mode::resolve(false, false),
             None,
@@ -305,6 +306,7 @@ mod tests {
         crate::apply::apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             tokeira_report::Mode::resolve(false, false),
             None,

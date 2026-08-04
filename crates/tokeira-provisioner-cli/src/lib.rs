@@ -220,14 +220,22 @@ pub trait ProvisionerPlatform {
     /// plus the refresh coverage behind them. The infra verbs are universal —
     /// every provisioner provisions infrastructure — so they are
     /// unconditional, unlike the workload verbs below.
-    async fn infra_plan(&self, deployment_dir: &Path) -> Result<PlanOutcome>;
+    /// `module` is the operator's `--module` filter; the platform owns its
+    /// meaning — validating the name and expanding along the module DAG
+    /// (prerequisites here, dependants for destroy) — and `None` is the whole
+    /// graph.
+    async fn infra_plan(&self, deployment_dir: &Path, module: Option<&str>) -> Result<PlanOutcome>;
 
     /// Reconcile infrastructure to desired. Returns the committed changes
     /// with their engine identity and operator nouns — never before-images
     /// (Proposal 002): the applied report renders identity, and `upgrade`
     /// records the [`change_log_entries`] distillation as the audit change
     /// log (task 19.2).
-    async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome>;
+    async fn infra_apply(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<AppliedOutcome>;
 
     /// Reconcile infrastructure after publishing declared operational artifacts.
     ///
@@ -236,8 +244,12 @@ pub trait ProvisionerPlatform {
     /// [`infra_apply`](Self::infra_apply) so it cannot publish artifacts while
     /// restoring the retained engine. Legacy adapters have no artifact catalog
     /// and retain their existing apply behavior through this default.
-    async fn infra_apply_with_artifacts(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
-        self.infra_apply(deployment_dir).await
+    async fn infra_apply_with_artifacts(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<AppliedOutcome> {
+        self.infra_apply(deployment_dir, module).await
     }
 
     /// Publish declared non-authoritative inspection artifacts after apply state commits.
@@ -250,7 +262,8 @@ pub trait ProvisionerPlatform {
     }
 
     /// Tear down the deployment's infrastructure. Returns the removed count.
-    async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize>;
+    /// A `module` filter expands along dependants, never prerequisites.
+    async fn infra_destroy(&self, deployment_dir: &Path, module: Option<&str>) -> Result<usize>;
 
     /// Delete **exactly** the named resource ids — the rollback B-delete pass
     /// (task 19.3, Proposal 002): fail-closed (an id the platform does not
@@ -492,15 +505,23 @@ impl ProvisionerPlatform for TestPlatform {
         Ok("tokeira".to_string())
     }
 
-    async fn infra_plan(&self, _deployment_dir: &Path) -> Result<PlanOutcome> {
+    async fn infra_plan(
+        &self,
+        _deployment_dir: &Path,
+        _module: Option<&str>,
+    ) -> Result<PlanOutcome> {
         Ok(PlanOutcome::default())
     }
 
-    async fn infra_apply(&self, _deployment_dir: &Path) -> Result<AppliedOutcome> {
+    async fn infra_apply(
+        &self,
+        _deployment_dir: &Path,
+        _module: Option<&str>,
+    ) -> Result<AppliedOutcome> {
         Ok(AppliedOutcome::default())
     }
 
-    async fn infra_destroy(&self, _deployment_dir: &Path) -> Result<usize> {
+    async fn infra_destroy(&self, _deployment_dir: &Path, _module: Option<&str>) -> Result<usize> {
         Ok(0)
     }
 

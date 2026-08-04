@@ -13,6 +13,7 @@ use crate::{ProvisionerPlatform, envelope_store, render::ExplanationReport};
 pub(crate) async fn plan<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
+    module: Option<&str>,
     mode: Mode,
     explanation_path: Option<&Path>,
 ) -> Result<()> {
@@ -26,7 +27,7 @@ pub(crate) async fn plan<P: ProvisionerPlatform>(
     // Causality's S is gathered before the plan runs its refresh
     // (Requirement 2.3) — see the causality module's isolation rule.
     let gathered = crate::causality::gather_causality(platform, deployment_dir, &envelope).await?;
-    let outcome = platform.infra_plan(deployment_dir).await?;
+    let outcome = platform.infra_plan(deployment_dir, module).await?;
     let mut explanation = tokeira_explain::explain_plan(
         crate::explain_context(platform, deployment_dir, &envelope, "infra plan"),
         &outcome,
@@ -70,6 +71,7 @@ mod tests {
         plan(
             &TestPlatform,
             tmp.path(),
+            None,
             Mode::resolve(false, false),
             Some(&path),
         )
@@ -110,6 +112,7 @@ mod tests {
         async fn infra_plan(
             &self,
             _deployment_dir: &std::path::Path,
+            _module: Option<&str>,
         ) -> anyhow::Result<tokeira_iac::PlanOutcome> {
             Ok(tokeira_iac::PlanOutcome {
                 platform_issues: vec![tokeira_iac::PlatformIssue {
@@ -122,11 +125,19 @@ mod tests {
             })
         }
 
-        async fn infra_apply(&self, _d: &std::path::Path) -> anyhow::Result<crate::AppliedOutcome> {
+        async fn infra_apply(
+            &self,
+            _d: &std::path::Path,
+            _module: Option<&str>,
+        ) -> anyhow::Result<crate::AppliedOutcome> {
             unreachable!("the blocked platform never applies")
         }
 
-        async fn infra_destroy(&self, _d: &std::path::Path) -> anyhow::Result<usize> {
+        async fn infra_destroy(
+            &self,
+            _d: &std::path::Path,
+            _module: Option<&str>,
+        ) -> anyhow::Result<usize> {
             unreachable!()
         }
 
@@ -172,6 +183,7 @@ mod tests {
         let err = plan(
             &BlockedPlatform,
             tmp.path(),
+            None,
             Mode::resolve(false, false),
             Some(&path),
         )
@@ -197,6 +209,7 @@ mod tests {
         let err = plan(
             &TestPlatform,
             tmp.path(),
+            None,
             Mode::resolve(false, false),
             Some(&path),
         )

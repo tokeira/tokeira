@@ -147,24 +147,38 @@ impl<P: ProvisionerPlatform> ProvisionerPlatform for BoundPlatform<P> {
         self.inner.deployment_id(deployment_dir)
     }
 
-    async fn infra_plan(&self, deployment_dir: &Path) -> Result<tokeira_iac::PlanOutcome> {
-        self.inner.infra_plan(deployment_dir).await
+    async fn infra_plan(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<tokeira_iac::PlanOutcome> {
+        self.inner.infra_plan(deployment_dir, module).await
     }
 
-    async fn infra_apply(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
-        self.inner.infra_apply(deployment_dir).await
+    async fn infra_apply(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<AppliedOutcome> {
+        self.inner.infra_apply(deployment_dir, module).await
     }
 
-    async fn infra_apply_with_artifacts(&self, deployment_dir: &Path) -> Result<AppliedOutcome> {
-        self.inner.infra_apply_with_artifacts(deployment_dir).await
+    async fn infra_apply_with_artifacts(
+        &self,
+        deployment_dir: &Path,
+        module: Option<&str>,
+    ) -> Result<AppliedOutcome> {
+        self.inner
+            .infra_apply_with_artifacts(deployment_dir, module)
+            .await
     }
 
     async fn publish_inspection(&self, deployment_dir: &Path) -> Result<usize> {
         self.inner.publish_inspection(deployment_dir).await
     }
 
-    async fn infra_destroy(&self, deployment_dir: &Path) -> Result<usize> {
-        self.inner.infra_destroy(deployment_dir).await
+    async fn infra_destroy(&self, deployment_dir: &Path, module: Option<&str>) -> Result<usize> {
+        self.inner.infra_destroy(deployment_dir, module).await
     }
 
     async fn infra_destroy_selected(

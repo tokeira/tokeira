@@ -201,6 +201,11 @@ struct PlanArgs {
     /// Deployment directory holding the state envelope.
     #[arg(long)]
     deployment_dir: PathBuf,
+    /// Restrict the operation to one module and what it stands on (infra
+    /// verbs only; the platform expands prerequisites, and destroy expands
+    /// dependants instead).
+    #[arg(long)]
+    module: Option<String>,
     /// Also write the complete explanation model as JSON to this path.
     /// Orthogonal to `--json`: the report still renders to stdout.
     #[arg(long, value_name = "PATH")]
@@ -216,6 +221,10 @@ struct ApplyArgs {
     /// plan is destructive refuses without it (review before action, §4).
     #[arg(long)]
     yes: bool,
+    /// Restrict the operation to one module and what it stands on (infra
+    /// verbs only; the platform expands prerequisites).
+    #[arg(long)]
+    module: Option<String>,
     /// Also write the complete explanation model as JSON to this path.
     /// Orthogonal to `--json`: the report still renders to stdout.
     #[arg(long, value_name = "PATH")]
@@ -251,6 +260,10 @@ struct DestroyArgs {
     /// Deployment directory holding the state envelope.
     #[arg(long)]
     deployment_dir: PathBuf,
+    /// Restrict the teardown to one module and everything standing on it
+    /// (the platform expands dependants, never prerequisites).
+    #[arg(long)]
+    module: Option<String>,
     /// Confirm the irreversible teardown (required).
     #[arg(long)]
     yes: bool,
@@ -339,12 +352,18 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
             plan::plan(
                 &platform,
                 &args.deployment_dir,
+                args.module.as_deref(),
                 mode,
                 args.explanation.as_deref(),
             )
             .await
         }
         Command::Deploy(DeployCommand::Plan(args)) => {
+            // Refused, never silently dropped: the workload verbs take no
+            // module filter — that is the infra verbs' vocabulary.
+            if args.module.is_some() {
+                anyhow::bail!("`deploy plan` takes no `--module`; module filters are infra verbs");
+            }
             deploy::deploy_plan(
                 &platform,
                 &args.deployment_dir,
@@ -362,19 +381,34 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
         Command::Infra(InfraCommand::Apply(args)) => {
             let dir = args.deployment_dir;
             let yes = args.yes;
+            let module = args.module;
             let explanation = args.explanation;
             lock::with_operation_lock(&dir, "apply", || {
-                apply::apply(&platform, &dir, yes, mode, explanation.as_deref())
+                apply::apply(
+                    &platform,
+                    &dir,
+                    module.as_deref(),
+                    yes,
+                    mode,
+                    explanation.as_deref(),
+                )
             })
             .await
         }
         Command::Infra(InfraCommand::Destroy(args)) => {
             let dir = args.deployment_dir;
             let yes = args.yes;
-            lock::with_operation_lock(&dir, "destroy", || destroy::destroy(&platform, &dir, yes))
-                .await
+            let module = args.module;
+            lock::with_operation_lock(&dir, "destroy", || {
+                destroy::destroy(&platform, &dir, module.as_deref(), yes)
+            })
+            .await
         }
         Command::Deploy(DeployCommand::Apply(args)) => {
+            // Refused, never silently dropped — as with `deploy plan`.
+            if args.module.is_some() {
+                anyhow::bail!("`deploy apply` takes no `--module`; module filters are infra verbs");
+            }
             let dir = args.deployment_dir;
             let yes = args.yes;
             let explanation = args.explanation;

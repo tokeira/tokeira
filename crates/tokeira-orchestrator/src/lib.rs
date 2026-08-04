@@ -531,6 +531,24 @@ impl<D: Deployment> InfraEngine<D> {
         })
     }
 
+    /// Expand an operator's module filter along `direction` against the
+    /// deployment's declared modules: prerequisites for plan/apply so a
+    /// filtered operation never runs a module without what it stands on,
+    /// dependants for destroy so nothing is left standing on a removed
+    /// module. An unknown name is refused with the known modules listed —
+    /// never silently widened. Verbs pass the expanded result to both
+    /// `compose` and the operation so the two cannot disagree.
+    pub fn expand_selection(
+        &self,
+        selection: &iac::ModuleSelection,
+        direction: iac::SelectionDirection,
+    ) -> Result<iac::ModuleSelection> {
+        let all = self
+            .deployment
+            .infra_modules(&self.config, &iac::ModuleSelection::All);
+        Ok(iac::expand_module_selection(&all, selection, direction)?)
+    }
+
     pub fn compose(&self, selection: iac::ModuleSelection) -> Result<iac::InfraComposition> {
         let remote_state = self
             .deployment

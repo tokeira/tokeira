@@ -21,6 +21,7 @@ use crate::{
 pub(crate) async fn apply<P: ProvisionerPlatform>(
     platform: &P,
     deployment_dir: &Path,
+    module: Option<&str>,
     yes: bool,
     mode: Mode,
     explanation_path: Option<&Path>,
@@ -56,7 +57,7 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     let preceding = if yes {
         None
     } else {
-        let planned = platform.infra_plan(deployment_dir).await?;
+        let planned = platform.infra_plan(deployment_dir, module).await?;
         refuse_destructive_without_yes("infra apply", &planned.changes)?;
         Some(planned)
     };
@@ -64,7 +65,9 @@ pub(crate) async fn apply<P: ProvisionerPlatform>(
     // ── Engine apply (realized by the injected platform) ──
     // The deployment identity seeds the platform context; it was set at `init`.
     let project_name = deployment_identity(&envelope.deployment_id);
-    let applied = platform.infra_apply_with_artifacts(deployment_dir).await?;
+    let applied = platform
+        .infra_apply_with_artifacts(deployment_dir, module)
+        .await?;
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
     // — the set the rollback B-delete pass consumes (task 19.3). The
     // checkpoint consumes the audit vocabulary, not the report identity.
@@ -206,11 +209,19 @@ mod tests {
             Ok("tokeira".into())
         }
 
-        async fn infra_plan(&self, _deployment_dir: &Path) -> Result<crate::PlanOutcome> {
+        async fn infra_plan(
+            &self,
+            _deployment_dir: &Path,
+            _module: Option<&str>,
+        ) -> Result<crate::PlanOutcome> {
             Ok(crate::PlanOutcome::default())
         }
 
-        async fn infra_apply(&self, _deployment_dir: &Path) -> Result<crate::AppliedOutcome> {
+        async fn infra_apply(
+            &self,
+            _deployment_dir: &Path,
+            _module: Option<&str>,
+        ) -> Result<crate::AppliedOutcome> {
             Ok(crate::AppliedOutcome::default())
         }
 
@@ -218,7 +229,11 @@ mod tests {
             anyhow::bail!("injected inspection failure")
         }
 
-        async fn infra_destroy(&self, _deployment_dir: &Path) -> Result<usize> {
+        async fn infra_destroy(
+            &self,
+            _deployment_dir: &Path,
+            _module: Option<&str>,
+        ) -> Result<usize> {
             Ok(0)
         }
 
@@ -275,6 +290,7 @@ mod tests {
         let err = apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             None,
@@ -325,6 +341,7 @@ mod tests {
         let err = apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             None,
@@ -358,6 +375,7 @@ mod tests {
         apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             Some(&path),
@@ -405,6 +423,7 @@ mod tests {
         let err = apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             Some(&path),
@@ -439,6 +458,7 @@ mod tests {
         let error = apply(
             &FailingInspectionPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             None,
@@ -472,6 +492,7 @@ mod tests {
         apply(
             &TestPlatform,
             tmp.path(),
+            None,
             false,
             Mode::resolve(false, false),
             None,

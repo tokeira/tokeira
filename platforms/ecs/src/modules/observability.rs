@@ -184,57 +184,77 @@ fn observability_artifacts() -> &'static [ObservabilityArtifact] {
         ObservabilityArtifact {
             key: "dashboards/grpc-edge-health.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/grpc-edge-health.json"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/dashboards/grpc-edge-health.json"
+            ),
         },
         ObservabilityArtifact {
             key: "dashboards/broker-runtime-health.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/broker-runtime-health.json"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/dashboards/broker-runtime-health.json"
+            ),
         },
         ObservabilityArtifact {
             key: "dashboards/storage-projection-health.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/storage-projection-health.json"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/dashboards/storage-projection-health.json"
+            ),
         },
         ObservabilityArtifact {
             key: "dashboards/log-exploration.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/log-exploration.json"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/dashboards/log-exploration.json"
+            ),
         },
         ObservabilityArtifact {
             key: "dashboards/dsql-connection-health.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/dsql-connection-health.json"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/dashboards/dsql-connection-health.json"
+            ),
         },
         ObservabilityArtifact {
             key: "dashboards/occ-contention.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/occ-contention.json"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/dashboards/occ-contention.json"
+            ),
         },
         ObservabilityArtifact {
             key: "dashboards/placement-controller.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/placement-controller.json"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/dashboards/placement-controller.json"
+            ),
         },
         ObservabilityArtifact {
             key: "dashboards/autoscaler.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/autoscaler.json"),
+            content: include_str!("../../../../crates/tokeira-compose/dashboards/autoscaler.json"),
         },
         ObservabilityArtifact {
             key: "dashboards/projection-workers.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/projection-workers.json"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/dashboards/projection-workers.json"
+            ),
         },
         ObservabilityArtifact {
             key: "dashboards/infrastructure-health.json",
             content_type: "application/json",
-            content: include_str!("../../../compose/dashboards/infrastructure-health.json"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/dashboards/infrastructure-health.json"
+            ),
         },
         ObservabilityArtifact {
             key: "alerts/observability-alerts.yaml",
             content_type: "application/yaml",
-            content: include_str!("../../../compose/alerts/observability-alerts.yaml"),
+            content: include_str!(
+                "../../../../crates/tokeira-compose/alerts/observability-alerts.yaml"
+            ),
         },
     ]
 }

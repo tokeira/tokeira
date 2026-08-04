@@ -1,15 +1,20 @@
-//! Compose service kinds and platform-local resources.
+//! The Compose provider's complete kind export.
+//!
+//! Every authorable Docker/local capability of this provider appears in
+//! [`KIND_NAMES`] and decodes through [`decode`]. The engine kind library
+//! aggregates provider exports verbatim — no platform curates below this
+//! set, so a definition edited within one engine version can adopt any kind
+//! the provider ships.
 
 use std::{collections::HashMap, path::PathBuf};
 
+use crate::ComposeService;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokeira_aws::kinds::{dsql_cluster::DsqlCluster, dynamodb_table::DynamoDbTable};
-use tokeira_compose::ComposeService;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape, from_located_value},
     error::KindError,
-    kind::{KindFunctions, PlacementContext, ProviderKind},
+    kind::{PlacementContext, ProviderKind},
 };
 
 use crate::observability::ObservabilityConfiguration;
@@ -202,7 +207,7 @@ impl ProviderKind for Service {
     }
 
     fn desired_manifest(&self, placement: &PlacementContext) -> serde_json::Value {
-        tokeira_compose::canonicalize_manifest(self.compose_service(placement).to_manifest())
+        crate::canonicalize_manifest(self.compose_service(placement).to_manifest())
     }
 
     fn realize(
@@ -685,13 +690,9 @@ fn local_marker_semantics(
     }
 }
 
-/// Closed first-party Compose kind set selected at compile time.
+/// The Compose provider's closed kind set.
 #[derive(Debug)]
 pub enum ComposeKind {
-    /// Aurora DSQL cluster.
-    DsqlCluster(DsqlCluster),
-    /// DynamoDB coordination table.
-    DynamoDbTable(DynamoDbTable),
     /// Deployment-local state root.
     LocalStateDir(LocalStateDir),
     /// Generated observability configuration.
@@ -705,8 +706,6 @@ pub enum ComposeKind {
 macro_rules! delegate_kind {
     ($self:ident, $method:ident $(, $argument:expr)?) => {
         match $self {
-            Self::DsqlCluster(kind) => kind.$method($($argument)?),
-            Self::DynamoDbTable(kind) => kind.$method($($argument)?),
             Self::LocalStateDir(kind) => kind.$method($($argument)?),
             Self::ObservabilityConfiguration(kind) => kind.$method($($argument)?),
             Self::ServerConfig(kind) => kind.$method($($argument)?),
@@ -740,26 +739,21 @@ impl ProviderKind for ComposeKind {
     }
 }
 
-/// Compile-time constructor functions for the Compose first-party set.
-pub fn kind_functions() -> KindFunctions<ComposeKind> {
-    KindFunctions {
-        contains: |name| {
-            matches!(
-                name,
-                "DsqlCluster"
-                    | "DynamoDbTable"
-                    | "LocalStateDir"
-                    | "ObservabilityConfiguration"
-                    | "ServerConfig"
-                    | "Service"
-            )
-        },
-        defaults: |name| (name == "Service").then(service_defaults),
-        decode,
-    }
+/// Complete author-visible Compose-provider kind names, in stable order.
+pub const KIND_NAMES: &[&str] = &[
+    "LocalStateDir",
+    "ObservabilityConfiguration",
+    "ServerConfig",
+    "Service",
+];
+
+/// Provider-owned `<Kind>::EMPTY` defaults.
+pub fn defaults(name: &str) -> Option<LocatedValue> {
+    (name == "Service").then(service_defaults)
 }
 
-fn decode(name: &str, value: LocatedValue) -> Result<ComposeKind, KindError> {
+/// Decode one named Compose-provider kind from a host-free author value.
+pub fn decode(name: &str, value: LocatedValue) -> Result<ComposeKind, KindError> {
     let range = value.range;
     macro_rules! decode_as {
         ($variant:ident, $type:ty) => {
@@ -769,15 +763,15 @@ fn decode(name: &str, value: LocatedValue) -> Result<ComposeKind, KindError> {
         };
     }
     match name {
-        "DsqlCluster" => decode_as!(DsqlCluster, DsqlCluster),
-        "DynamoDbTable" => decode_as!(DynamoDbTable, DynamoDbTable),
         "LocalStateDir" => decode_as!(LocalStateDir, LocalStateDir),
         "ObservabilityConfiguration" => {
             decode_as!(ObservabilityConfiguration, ObservabilityConfiguration)
         }
         "ServerConfig" => decode_as!(ServerConfig, ServerConfig),
         "Service" => decode_as!(Service, Service),
-        _ => Err(KindError::new(format!("unknown Compose kind `{name}`"))),
+        _ => Err(KindError::new(format!(
+            "unknown Compose-provider kind `{name}`"
+        ))),
     }
 }
 
@@ -839,7 +833,9 @@ struct InspectionService {
 }
 
 /// Render the deterministic operator-facing Compose inspection projection.
-pub(crate) fn inspection_bytes(
+/// Deterministic operator-facing docker-compose projection of realized
+/// service manifests. Tokeira never reads it back.
+pub fn inspection_bytes(
     manifests: &std::collections::BTreeMap<tokeira_iac::ResourceId, serde_json::Value>,
 ) -> Result<Vec<u8>, serde_yaml::Error> {
     let services = manifests
@@ -858,4 +854,41 @@ pub(crate) fn inspection_bytes(
         .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
         .map_err(|error| <serde_yaml::Error as serde::de::Error>::custom(error.to_string()))?;
     serde_yaml::to_string(&InspectionDocument { services }).map(String::into_bytes)
+}
+
+#[cfg(test)]
+mod kind_inventory_tests {
+    use super::*;
+
+    // The inventory is the provider's single kind authority: every listed
+    // name reaches a decode arm (a listed name may fail decode on missing
+    // fields, never as unknown), and unlisted names never decode.
+    #[test]
+    fn inventory_matches_decode_arms_exactly() {
+        for name in KIND_NAMES {
+            let probe = decode(
+                name,
+                LocatedValue::new(ValueShape::Struct {
+                    name: (*name).to_string(),
+                    fields: Vec::new(),
+                }),
+            );
+            if let Err(error) = probe {
+                assert!(
+                    !error.message.contains("unknown"),
+                    "inventory name `{name}` hit the unknown-kind arm: {}",
+                    error.message
+                );
+            }
+        }
+        let unknown = decode(
+            "NotAComposeKind",
+            LocatedValue::new(ValueShape::Struct {
+                name: "NotAComposeKind".to_string(),
+                fields: Vec::new(),
+            }),
+        )
+        .expect_err("unknown kind must not decode");
+        assert!(unknown.message.contains("unknown"));
+    }
 }

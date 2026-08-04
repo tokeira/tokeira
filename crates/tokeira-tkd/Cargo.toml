@@ -9,7 +9,6 @@ authors.workspace = true
 
 [package.metadata.tokeira.definition-frontend]
 format = "tkd"
-frontend-contract = 1
 source-extension = "tkd"
 default-relative-path = "definition.tkd"
 

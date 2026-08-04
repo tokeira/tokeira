@@ -190,21 +190,6 @@ pub fn configuration_resource_id() -> iac::ResourceId {
 }
 
 impl ObservabilityParams {
-    /// Parameters derived from typed Compose config and runtime deployment identity.
-    pub fn from_config(config: &crate::config::ComposeConfig, deployment: &str) -> Self {
-        Self {
-            metrics_target_host: "tokeirad".into(),
-            metrics_target_port: config.tokeirad.metrics_port,
-            cluster: deployment.to_string(),
-            deployment: deployment.to_string(),
-            mimir_remote_write_url: "http://mimir:9009/api/v1/push".into(),
-            loki_push_url: "http://loki:3100/loki/api/v1/push".into(),
-            mimir_http_port: 9009,
-            loki_http_port: 3100,
-            loki_retention_hours: 168,
-        }
-    }
-
     #[cfg(test)]
     fn reference() -> Self {
         Self {

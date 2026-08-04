@@ -668,6 +668,7 @@ mod tests {
 
     fn kinds() -> KindFunctions<TestKind> {
         KindFunctions {
+            names: &["TestResource"],
             contains: |name| name == "TestResource",
             defaults: |_| None,
             decode: |name, _| {

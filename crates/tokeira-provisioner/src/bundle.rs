@@ -67,10 +67,8 @@ pub struct BoundProvisionerEvidence {
     pub platform: PlatformId,
     /// Definition format selected independently from the trusted frontend catalog.
     pub format: DefinitionFormatId,
-    /// Private Platform Binding contract admitted at assembly time.
-    pub binding_contract: u32,
-    /// Private Definition Frontend contract admitted at assembly time.
-    pub frontend_contract: u32,
+    /// Exact Engine_Version the platform definition indicated at assembly.
+    pub engine: String,
     /// Digest of the deterministic generated `Cargo.toml` and `main.rs` root.
     pub generated_root: Sha256Digest,
     /// Source closure including the frozen workspace tree and generated root.
@@ -113,8 +111,7 @@ impl BoundProvisionerEvidence {
 
         require_equal!(platform);
         require_equal!(format);
-        require_equal!(binding_contract);
-        require_equal!(frontend_contract);
+        require_equal!(engine);
         for (field, actual, expected) in [
             (
                 "generated_root",
@@ -296,8 +293,7 @@ mod tests {
         BoundProvisionerEvidence {
             platform: PlatformId::new("compose").expect("canonical platform"),
             format: DefinitionFormatId::new("tkd").expect("canonical format"),
-            binding_contract: 1,
-            frontend_contract: 1,
+            engine: "0.1.0".to_string(),
             generated_root: Sha256Digest::from_bytes(b"generated-root"),
             source_closure: bundle.identity.source_closure,
             lock_closure: bundle.identity.lock_closure,
@@ -360,11 +356,8 @@ mod tests {
         wrong.format = DefinitionFormatId::new("tkdp").expect("canonical format");
         variants.push(("format", wrong));
         let mut wrong = expected.clone();
-        wrong.binding_contract += 1;
-        variants.push(("binding_contract", wrong));
-        let mut wrong = expected.clone();
-        wrong.frontend_contract += 1;
-        variants.push(("frontend_contract", wrong));
+        wrong.engine = "9.9.9".to_string();
+        variants.push(("engine", wrong));
         let mut wrong = expected.clone();
         wrong.generated_root = Sha256Digest::from_bytes(b"other root");
         variants.push(("generated_root", wrong));

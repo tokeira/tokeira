@@ -9,15 +9,20 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+askama = "0.12"
 async-trait.workspace = true
 bollard.workspace = true
 futures-util = "0.3"
+hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2.workspace = true
+tracing.workspace = true
 thiserror.workspace = true
 tokeira-deploy-engine = { path = "../tokeira-deploy-engine" }
 tokeira-iac = { path = "../tokeira-iac" }
+tokeira-platform = { path = "../tokeira-platform" }
 
 [dev-dependencies]
 proptest = "1"

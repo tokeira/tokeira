@@ -53,6 +53,12 @@ pub trait ProviderKind: Debug + Send + Sync {
 /// Compile-time constructor functions supplied by one concrete platform.
 #[derive(Debug, Clone, Copy)]
 pub struct KindFunctions<K> {
+    /// Complete author-visible kind names — the single inventory a frontend
+    /// may enumerate (a definition edited within one engine version can adopt
+    /// any kind the engine ships, so no frontend curates below this set).
+    /// The platform backs `contains` with the same slice; a platform test
+    /// asserts the two agree.
+    pub names: &'static [&'static str],
     /// Test whether an author-visible name belongs to the platform's closed first-party set.
     pub contains: fn(&str) -> bool,
     /// Return provider-owned defaults for `<Kind>::EMPTY`.

@@ -440,6 +440,26 @@ impl<'de> de::Deserializer<'de> for LocatedValue {
                 visitor.visit_enum(NodeEnumAccess { variant, body })
             }
             ValueShape::String(variant) => visitor.visit_enum(variant.into_deserializer()),
+            // A struct-shaped value in enum position is the variant tagged by
+            // its type name: unit when it has no fields, newtype-struct
+            // otherwise. This is what lets a frontend whose syntax cannot mark
+            // variant-ness (a Python dataclass per variant) admit into enum
+            // targets exactly as the explicit `Enum` spelling does; a name
+            // matching no variant fails with serde's unknown-variant error at
+            // this value's range.
+            ValueShape::Struct { name, fields } => {
+                if fields.is_empty() {
+                    visitor.visit_enum(name.into_deserializer())
+                } else {
+                    visitor.visit_enum(NodeEnumAccess {
+                        variant: name.clone(),
+                        body: VariantShape::Newtype(Box::new(LocatedValue {
+                            value: ValueShape::Struct { name, fields },
+                            range,
+                        })),
+                    })
+                }
+            }
             value => Err(mismatch("enum", &LocatedValue { value, range })),
         }
     }

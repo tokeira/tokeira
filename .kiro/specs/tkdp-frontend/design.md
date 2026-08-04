@@ -73,10 +73,19 @@ src/
   program.rs    transient-program assembly (facade + lowered source + driver)
   runner.rs     Monty execution, limits, output capture, traceback translation
   convert.rs    Structural_Result → LocatedValue + StructuralGraphBuilder
+  diagnostics.rs caret-underlined rendering of preflight findings
 ```
 
+`TkdpFrontend::transient_program` (inherent, not on the trait) runs the pipeline's front half —
+admission through assembly — and returns the transient program unexecuted: the inspection seam for
+a future `lower`/`--show-generated` operator verb beside `definition check`. It shares `prepare`
+with `evaluate`, so an inspected program is byte-for-byte the program that runs.
+
 `Cargo.toml` publishes the descriptor (`format = "tkdp"`, `source-extension = "tkdp"`,
-`default-relative-path = "definition.tkdp"`) and the conventional export:
+`default-relative-path = "definition.tkdp"`) and the conventional export. A platform shipping peer
+seeds names its no-format creation default in platform metadata (`default-format = "tkd"` for
+Compose); the catalog resolves it, and with several seeds and no declaration it refuses, naming the
+peer formats and the `--format` remedy (Requirement 9.7):
 
 ```rust
 pub fn frontend() -> TkdpFrontend {
@@ -111,9 +120,11 @@ pub struct KindFunctions<K> {
 }
 ```
 
-Each platform backs `names` and `contains` with one `const` slice; a platform test asserts
-`contains(n)` for every listed name and the decode arm count matches. `tokeira-tkd` ignores
-`names` (its resolution stays pull-based), so the addition is behaviour-neutral for `.tkd`.
+The engine kind library (`crates/tokeira-kinds`) owns the inventory: provider crates export
+complete kind sets, the library unions them into `EngineKind` with engine-owned
+`kind_functions()`, and per-provider tests hold each inventory to its decode arms.
+`tokeira-tkd` ignores `names` (its resolution stays pull-based), so the addition is
+behaviour-neutral for `.tkd`.
 
 ### Platform accommodation 2: enum-position struct admission
 
@@ -182,8 +193,10 @@ maps linearly (char-column correct), facade/driver frames render as named intern
 The returned `MontyObject` envelope converts mechanically:
 
 - scalars, strings, sequences, dicts → the corresponding `ValueShape`s;
-- `MontyObject::Dataclass { name, field_names, values }` → `ValueShape::Struct` (always — the
-  deserializer's enum-position arm supplies variant semantics when the decode target is an enum);
+- dataclass instances export **in-sandbox** to tagged plain data (native dataclasses cross the
+  boundary as opaque `Repr` values — probed at the pin; `MontyObject::Dataclass` is for
+  host-supplied values), and the tagged form converts to `ValueShape::Struct` — the deserializer's
+  enum-position arm supplies variant semantics when the decode target is an enum;
 - kind kwargs → `Struct` merged over `kinds.defaults(kind_name)` (authored fields win), then
   `kinds.decode(kind_name, value)`; decode errors carry the resource declaration's range from the
   envelope's recorded call sites;

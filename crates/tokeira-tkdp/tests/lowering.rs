@@ -1,15 +1,26 @@
-//! Lowering shape tests: canonical output, determinism, and the source map.
+//! Lowering shape battery (spike-carried): canonical output, determinism,
+//! re-indentation edges, import blanking, and source-map coverage.
+//
+// Feature: tkdp-frontend, Property 3: the lowered form is deterministic and
+// exactly mapped.
 
-use ruff_text_size::TextSize;
-use spike_monty_tkdp::{
-    lower::{LowerOptions, lower},
-    preflight::preflight,
+use ruff_python_ast::ModModule;
+use ruff_text_size::{TextRange, TextSize};
+use tokeira_tkdp::{
+    lower::lower,
     source_map::{Mapped, OriginKind, SourceMapBuilder},
 };
 
-fn lowered_text(source: &str, options: &LowerOptions) -> String {
-    let pf = preflight(source).expect("preflight");
-    lower(source, &pf.module, "test.tkdp", options).text
+/// Parses without preflight: these tests exercise the lowering in isolation,
+/// so entrypoint and import rules don't apply.
+fn parse(source: &str) -> ModModule {
+    ruff_python_parser::parse_module(source)
+        .expect("test source parses")
+        .into_syntax()
+}
+
+fn lowered_text(source: &str) -> String {
+    lower(source, &parse(source), "test.tkdp", &[]).text
 }
 
 const REPRESENTATIVE: &str = r#"def pick(s):
@@ -25,8 +36,8 @@ const REPRESENTATIVE: &str = r#"def pick(s):
 "#;
 
 /// The exact canonical lowering of [`REPRESENTATIVE`]. Deliberately a full
-/// golden string: the lowered form is a contract (deterministic digests
-/// depend on it), so shape drift must be a conscious edit here.
+/// golden string: the lowered form feeds deterministic behaviour, so shape
+/// drift must be a conscious edit here.
 const REPRESENTATIVE_LOWERED: &str = r#"def pick(s):
     __tokeira_internal_subject_0 = (s)
     __tokeira_internal_done_0 = False
@@ -52,38 +63,25 @@ const REPRESENTATIVE_LOWERED: &str = r#"def pick(s):
 
 #[test]
 fn representative_lowering_is_canonical() {
-    let text = lowered_text(REPRESENTATIVE, &LowerOptions::default());
-    assert_eq!(text, REPRESENTATIVE_LOWERED);
+    assert_eq!(lowered_text(REPRESENTATIVE), REPRESENTATIVE_LOWERED);
 }
 
 #[test]
 fn lowering_is_deterministic() {
-    let opts = LowerOptions::default();
-    assert_eq!(
-        lowered_text(REPRESENTATIVE, &opts),
-        lowered_text(REPRESENTATIVE, &opts)
-    );
+    assert_eq!(lowered_text(REPRESENTATIVE), lowered_text(REPRESENTATIVE));
 }
 
 #[test]
-fn strict_exhaustion_appends_raise_only_without_irrefutable_case() {
+fn strict_exhaustion_raise_is_emitted_only_without_irrefutable_case() {
     let refutable_only = "match s:\n    case 1:\n        pass\n";
-    let strict = lowered_text(refutable_only, &LowerOptions::default());
+    let strict = lowered_text(refutable_only);
     assert!(
         strict.contains("raise RuntimeError(\"test.tkdp:1: match fell through"),
         "{strict}"
     );
 
-    let faithful = lowered_text(
-        refutable_only,
-        &LowerOptions {
-            strict_exhaustion: false,
-        },
-    );
-    assert!(!faithful.contains("raise RuntimeError"), "{faithful}");
-
     // A trailing wildcard makes the raise dead code, so it is not emitted.
-    let with_wildcard = lowered_text(REPRESENTATIVE, &LowerOptions::default());
+    let with_wildcard = lowered_text(REPRESENTATIVE);
     assert!(
         !with_wildcard.contains("raise RuntimeError"),
         "{with_wildcard}"
@@ -96,7 +94,7 @@ fn guard_wraps_verbatim_and_shifts_body() {
     case ManagedDsql(region=r) if r != "":
         use(r)
 "#;
-    let text = lowered_text(source, &LowerOptions::default());
+    let text = lowered_text(source);
     // Top-level match: probe at +4, guard at +8, body shifted to +12.
     assert!(text.contains("        if (r != \"\"):\n"), "{text}");
     assert!(text.contains("            use(r)\n"), "{text}");
@@ -119,7 +117,7 @@ match c:
     case 3:
         pass
 "#;
-    let text = lowered_text(source, &LowerOptions::default());
+    let text = lowered_text(source);
     for needle in [
         "__tokeira_internal_subject_0 = (a)",
         "__tokeira_internal_subject_1 = (b)",
@@ -132,7 +130,7 @@ match c:
 #[test]
 fn two_space_indentation_is_reindented() {
     let source = "def f(s):\n  match s:\n    case _:\n      out = 1\n  return out\n";
-    let text = lowered_text(source, &LowerOptions::default());
+    let text = lowered_text(source);
     // Body normalizes to the match column plus two generated steps.
     assert!(text.contains("\n          out = 1\n"), "{text}");
     // Code after the match keeps its original indentation.
@@ -142,7 +140,7 @@ fn two_space_indentation_is_reindented() {
 #[test]
 fn inline_case_body_splices_onto_its_own_line() {
     let source = "match s:\n    case _: out = 1\n";
-    let text = lowered_text(source, &LowerOptions::default());
+    let text = lowered_text(source);
     assert!(text.contains("\n        out = 1\n"), "{text}");
 }
 
@@ -150,21 +148,31 @@ fn inline_case_body_splices_onto_its_own_line() {
 fn comments_between_statements_survive() {
     let source =
         "# leading comment\nx = 1\n# between\nmatch x:\n    case _:\n        pass\n# trailing\n";
-    let text = lowered_text(source, &LowerOptions::default());
+    let text = lowered_text(source);
     for needle in ["# leading comment", "# between", "# trailing"] {
         assert!(text.contains(needle), "missing {needle} in:\n{text}");
     }
 }
 
 #[test]
+fn blanked_imports_pad_to_equal_width_and_preserve_offsets() {
+    let import_stmt = "from tokeira import Context, Deployment";
+    let source = format!("{import_stmt}\n\nx = 1\nmatch x:\n    case _:\n        pass\n");
+    let module = parse(&source);
+    let import_range = TextRange::new(TextSize::new(0), TextSize::of(import_stmt));
+    let text = lower(&source, &module, "test.tkdp", &[import_range]).text;
+
+    // The statement becomes equal-width comment padding on its own line.
+    let hashes = "#".repeat(import_stmt.len());
+    assert!(text.starts_with(&format!("{hashes}\n")), "{text}");
+    // Every byte offset after the import is unchanged.
+    assert_eq!(text.find("x = 1"), source.find("x = 1"));
+}
+
+#[test]
 fn map_covers_verbatim_body_and_generated_scaffolding() {
-    let pf = preflight(REPRESENTATIVE).expect("preflight");
-    let lowered = lower(
-        REPRESENTATIVE,
-        &pf.module,
-        "test.tkdp",
-        &LowerOptions::default(),
-    );
+    let module = parse(REPRESENTATIVE);
+    let lowered = lower(REPRESENTATIVE, &module, "test.tkdp", &[]);
     let mut builder = SourceMapBuilder::new();
     for seg in &lowered.segments {
         builder.push(seg.generated.len(), seg.origin.clone());

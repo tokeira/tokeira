@@ -1,0 +1,277 @@
+# The Compose deployment definition, Python form. The selected frontend
+# evaluates this source into one transient structural graph and one typed
+# Compose configuration — the logical equal of definition.tkd.
+
+from dataclasses import dataclass
+
+from tokeira import (
+    Context,
+    Deployment,
+    DsqlCluster,
+    DynamoDbTable,
+    LocalStateDir,
+    ObservabilityConfiguration,
+    ServerConfig,
+    Service,
+)
+
+
+@dataclass
+class Managed:
+    pass
+
+
+@dataclass
+class Preexisting:
+    pass
+
+
+@dataclass
+class InMemory:
+    pass
+
+
+@dataclass
+class Dsql:
+    region: str
+    mode: Managed | Preexisting
+    endpoint: str | None = None
+    arn: str | None = None
+
+
+@dataclass
+class Tokeirad:
+    image: str
+    replicas: int
+    grpc_port: int
+    metrics_port: int
+
+
+@dataclass
+class Backend:
+    image: str
+    replicas: int
+
+
+@dataclass
+class Grafana:
+    image: str
+    replicas: int
+    port: int
+    admin_password: str
+
+
+@dataclass
+class Observability:
+    mimir: Backend
+    loki: Backend
+    grafana: Grafana
+    alloy: Backend
+
+
+@dataclass
+class Compose:
+    storage: InMemory | Dsql
+    tokeirad: Tokeirad
+    observability: Observability
+
+
+@dataclass
+class State:
+    sub: str
+    at: str
+
+
+@dataclass
+class Config:
+    sub: str
+    at: str
+
+
+@dataclass
+class DockerSocket:
+    pass
+
+
+@dataclass
+class Environment:
+    name: str
+    value: str
+
+
+def config() -> Compose:
+    return Compose(
+        storage=InMemory(),
+        tokeirad=Tokeirad(
+            image="tokeirad:latest",
+            replicas=1,
+            grpc_port=7233,
+            metrics_port=9090,
+        ),
+        observability=Observability(
+            mimir=Backend(image="grafana/mimir:3.0.6", replicas=1),
+            loki=Backend(image="grafana/loki:3.7.1", replicas=1),
+            grafana=Grafana(
+                image="grafana/grafana-oss:12.4.3",
+                replicas=1,
+                port=3000,
+                admin_password="admin",
+            ),
+            alloy=Backend(image="grafana/alloy:v1.16.0", replicas=1),
+        ),
+    )
+
+
+def deployment(cfg: Compose, cx: Context) -> Deployment:
+    d = Deployment(["default"])
+
+    local_state = d.module("local_state")
+    local_state.resource("dir", LocalStateDir())
+
+    aws_region = None
+    match cfg.storage:
+        case Dsql(region=region, mode=mode, endpoint=endpoint, arn=arn):
+            aws_region = region
+            dsql = d.module("dsql", [local_state])
+            cluster = dsql.resource(
+                "cluster",
+                DsqlCluster(
+                    identity=cx.project_name + "-compose",
+                    region=region,
+                    mode=mode,
+                    endpoint=endpoint,
+                    arn=arn,
+                ),
+            )
+            rate_limiter = dsql.resource(
+                "rate_limiter",
+                DynamoDbTable(
+                    table=cx.project_name + "-dsql-rate-limiter",
+                    region=region,
+                    hash_key="pk",
+                    ttl="ttl_epoch",
+                ),
+            )
+            conn_lease = dsql.resource(
+                "conn_lease",
+                DynamoDbTable(
+                    table=cx.project_name + "-dsql-conn-lease",
+                    region=region,
+                    hash_key="pk",
+                    ttl="ttl_epoch",
+                ),
+            )
+
+            d.writeback("infrastructure.storage", "dsql")
+            d.writeback(
+                "infrastructure.dsql.endpoint", cluster.output("cluster_endpoint")
+            )
+            d.writeback("infrastructure.dsql.region", region)
+            d.writeback(
+                "infrastructure.dsql.rate_limiter_table",
+                rate_limiter.output("table_name"),
+            )
+            d.writeback(
+                "infrastructure.dsql.conn_lease_table",
+                conn_lease.output("table_name"),
+            )
+        case InMemory():
+            pass
+
+    runtime = d.module("runtime", [local_state])
+    server_config = runtime.resource("server_config", ServerConfig())
+    runtime.resource(
+        "tokeirad",
+        Service(
+            image=cfg.tokeirad.image,
+            replicas=cfg.tokeirad.replicas,
+            publish=[cfg.tokeirad.grpc_port, cfg.tokeirad.metrics_port],
+            aws_region=aws_region,
+        ),
+        [server_config],
+    )
+
+    observability = d.module("observability", [local_state, runtime])
+    o = cfg.observability
+    config_files = observability.resource(
+        "config_files",
+        ObservabilityConfiguration(
+            scrape_host="tokeirad",
+            scrape_port=cfg.tokeirad.metrics_port,
+            cluster=cx.project_name,
+            deployment=cx.project_name,
+            mimir_remote_write="http://mimir:9009/api/v1/push",
+            loki_push="http://loki:3100/loki/api/v1/push",
+            mimir_http_port=9009,
+            loki_http_port=3100,
+            retention_hours=168,
+        ),
+    )
+    mimir = observability.resource(
+        "mimir",
+        Service(
+            image=o.mimir.image,
+            replicas=o.mimir.replicas,
+            publish=[9009],
+            volumes=[
+                State(sub="mimir", at="/data"),
+                Config(sub="mimir.yaml", at="/etc/mimir/mimir.yaml"),
+                Config(sub="mimir/rules", at="/data/mimir/rules"),
+            ],
+            command=["--config.file=/etc/mimir/mimir.yaml"],
+        ),
+        [config_files],
+    )
+    loki = observability.resource(
+        "loki",
+        Service(
+            image=o.loki.image,
+            replicas=o.loki.replicas,
+            publish=[3100],
+            volumes=[
+                State(sub="loki", at="/loki"),
+                Config(sub="loki.yaml", at="/etc/loki/loki.yaml"),
+            ],
+            command=["--config.file=/etc/loki/loki.yaml"],
+        ),
+        [config_files],
+    )
+    observability.resource(
+        "grafana",
+        Service(
+            image=o.grafana.image,
+            replicas=o.grafana.replicas,
+            publish=[o.grafana.port],
+            volumes=[
+                State(sub="grafana", at="/var/lib/grafana"),
+                Config(sub="grafana/provisioning", at="/etc/grafana/provisioning/"),
+                Config(sub="grafana/dashboards", at="/var/lib/grafana/dashboards/"),
+            ],
+            environment=[
+                Environment(name="GF_SECURITY_ADMIN_USER", value="admin"),
+                Environment(
+                    name="GF_SECURITY_ADMIN_PASSWORD", value=o.grafana.admin_password
+                ),
+                Environment(name="GF_METRICS_ENABLED", value="true"),
+            ],
+            depends_on=["mimir", "loki"],
+        ),
+        [config_files, mimir, loki],
+    )
+    observability.resource(
+        "alloy",
+        Service(
+            image=o.alloy.image,
+            replicas=o.alloy.replicas,
+            publish=[4317, 4318],
+            volumes=[
+                DockerSocket(),
+                Config(sub="alloy.alloy", at="/etc/alloy/config.alloy"),
+            ],
+            command=["run", "/etc/alloy/config.alloy"],
+            depends_on=["tokeirad", "mimir", "loki"],
+        ),
+        [config_files, mimir, loki],
+    )
+
+    return d

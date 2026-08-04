@@ -12,8 +12,8 @@ use std::{
 
 use thiserror::Error;
 use tokeira_build::{
-    DEFINITION_FRONTEND_CONTRACT, DefinitionFrontendPackageDescriptor, DiscoveryError,
-    PLATFORM_BINDING_CONTRACT, PlatformPackageDescriptor, discover_workspace_descriptors,
+    DefinitionFrontendPackageDescriptor, DiscoveryError, PlatformPackageDescriptor,
+    discover_workspace_descriptors,
 };
 use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
 use tokeira_provisioner::{PublishedProvisionerCatalog, PublishedProvisionerLocator};
@@ -43,8 +43,8 @@ pub struct PlatformDescriptor {
     pub id: PlatformId,
     /// Whether the descriptor requests catalog-default status.
     pub is_default: bool,
-    /// Private platform binding contract.
-    pub binding_contract: u32,
+    /// Exact Engine_Version the platform definition indicates.
+    pub engine: String,
     /// Source-specific coordinates retained after admission.
     pub source: PlatformSource,
 }
@@ -63,8 +63,6 @@ pub enum FrontendSource {
 pub struct FrontendDescriptor {
     /// Open definition-format identity.
     pub format: DefinitionFormatId,
-    /// Private frontend contract.
-    pub frontend_contract: u32,
     /// Canonical source extension without a leading dot.
     pub source_extension: tokeira_orchestrator::DefinitionSourceExtension,
     /// Safe default source path inside a deployment and a platform package.
@@ -121,7 +119,7 @@ impl PlatformCatalog {
             .map(|descriptor| PlatformDescriptor {
                 id: descriptor.id.clone(),
                 is_default: descriptor.is_default,
-                binding_contract: descriptor.binding_contract,
+                engine: descriptor.engine.clone(),
                 source: PlatformSource::Workspace(descriptor),
             })
             .collect();
@@ -130,7 +128,6 @@ impl PlatformCatalog {
             .into_iter()
             .map(|descriptor| FrontendDescriptor {
                 format: descriptor.format.clone(),
-                frontend_contract: descriptor.frontend_contract,
                 source_extension: descriptor.source_extension.clone(),
                 default_relative_path: descriptor.default_relative_path.clone(),
                 source: FrontendSource::Workspace(descriptor),
@@ -148,7 +145,7 @@ impl PlatformCatalog {
             .map(|descriptor| PlatformDescriptor {
                 id: descriptor.id.clone(),
                 is_default: descriptor.is_default,
-                binding_contract: descriptor.binding_contract,
+                engine: descriptor.engine.clone(),
                 source: PlatformSource::Published(
                     by_platform.get(&descriptor.id).cloned().unwrap_or_default(),
                 ),
@@ -159,7 +156,6 @@ impl PlatformCatalog {
             .iter()
             .map(|descriptor| FrontendDescriptor {
                 format: descriptor.format.clone(),
-                frontend_contract: descriptor.frontend_contract,
                 source_extension: descriptor.source_extension.clone(),
                 default_relative_path: descriptor.default_relative_path.clone(),
                 source: FrontendSource::Published(
@@ -204,14 +200,6 @@ impl PlatformCatalog {
                 "expected at least one definition frontend".to_string(),
             ));
         }
-        for platform in &platforms {
-            if platform.binding_contract != PLATFORM_BINDING_CONTRACT {
-                return Err(CatalogError::Invalid(format!(
-                    "platform `{}` uses binding contract {}; supported contract is {}",
-                    platform.id, platform.binding_contract, PLATFORM_BINDING_CONTRACT
-                )));
-            }
-        }
         for pair in platforms.windows(2) {
             if pair[0].id == pair[1].id {
                 return Err(CatalogError::Invalid(format!(
@@ -230,12 +218,6 @@ impl PlatformCatalog {
             )));
         }
         for frontend in &frontends {
-            if frontend.frontend_contract != DEFINITION_FRONTEND_CONTRACT {
-                return Err(CatalogError::Invalid(format!(
-                    "format `{}` uses frontend contract {}; supported contract is {}",
-                    frontend.format, frontend.frontend_contract, DEFINITION_FRONTEND_CONTRACT
-                )));
-            }
             let extension = frontend
                 .default_relative_path
                 .as_path()
@@ -337,6 +319,22 @@ impl PlatformCatalog {
             }
             return Ok((frontend, seed));
         }
+        // No requested format: the platform's declared `default-format`
+        // decides. Peer formats are equals, so with several seeds and no
+        // declaration there is no principled winner — the operator selects.
+        if let Some(format) = &platform_package.default_format {
+            let frontend = self.frontend(format)?;
+            let seed = package_dir.join(frontend.default_relative_path.as_path());
+            if !seed.is_file() {
+                return Err(CatalogError::Invalid(format!(
+                    "platform `{}` declares default definition format `{format}` but supplies no \
+                     seed at {}",
+                    platform.id,
+                    seed.display()
+                )));
+            }
+            return Ok((frontend, seed));
+        }
         let candidates = self
             .frontends
             .iter()
@@ -345,14 +343,22 @@ impl PlatformCatalog {
                 seed.is_file().then_some((frontend, seed))
             })
             .collect::<Vec<_>>();
-        let [(frontend, seed)] = candidates.as_slice() else {
-            return Err(CatalogError::Invalid(format!(
-                "platform `{}` must supply exactly one recognized definition seed; found {}",
+        match candidates.as_slice() {
+            [(frontend, seed)] => Ok((*frontend, seed.clone())),
+            [] => Err(CatalogError::Invalid(format!(
+                "platform `{}` supplies no recognized definition seed",
+                platform.id
+            ))),
+            many => Err(CatalogError::Invalid(format!(
+                "platform `{}` supplies definition seeds for formats {} and declares no \
+                 `default-format`; select one with `--format`",
                 platform.id,
-                candidates.len()
-            )));
-        };
-        Ok((*frontend, seed.clone()))
+                many.iter()
+                    .map(|(frontend, _)| format!("`{}`", frontend.format))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
     }
 
     /// Borrow the deterministic admitted platform inventory.
@@ -473,11 +479,10 @@ mod tests {
             platforms: vec![PublishedPlatformDescriptor {
                 id: platform.clone(),
                 is_default: false,
-                binding_contract: PLATFORM_BINDING_CONTRACT,
+                engine: "0.1.0".to_string(),
             }],
             frontends: vec![PublishedDefinitionFrontendDescriptor {
                 format: format.clone(),
-                frontend_contract: DEFINITION_FRONTEND_CONTRACT,
                 source_extension: DefinitionSourceExtension::new("tkd").expect("extension"),
                 default_relative_path: RelativeDefinitionPath::new("definition.tkd").expect("path"),
             }],
@@ -517,11 +522,48 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = PlatformCatalog::from_workspace(&root).expect("workspace catalog");
         let platform = catalog.platform(&id("compose")).expect("compose");
+
+        // Compose ships peer seeds; no requested format resolves through the
+        // platform's declared `default-format`.
         let (frontend, seed) = catalog
             .workspace_frontend(platform, None)
-            .expect("unique frontend seed");
+            .expect("declared default seed");
         assert_eq!(frontend.format, format("tkd"));
         assert!(seed.ends_with("platforms/compose/definition.tkd"));
+
+        // An explicit format selects its peer seed.
+        let (frontend, seed) = catalog
+            .workspace_frontend(platform, Some(&format("tkdp")))
+            .expect("requested tkdp seed");
+        assert_eq!(frontend.format, format("tkdp"));
+        assert!(seed.ends_with("platforms/compose/definition.tkdp"));
+    }
+
+    #[test]
+    fn multiple_seeds_without_a_declared_default_demand_a_format() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = PlatformCatalog::from_workspace(&root).expect("workspace catalog");
+        let compose = catalog.platform(&id("compose")).expect("compose");
+        let PlatformSource::Workspace(package) = &compose.source else {
+            panic!("compose is a workspace platform");
+        };
+
+        // Same package directory (both seed files present), declaration
+        // withheld: selection must name the peer formats and the remedy.
+        let undeclared = PlatformDescriptor {
+            source: PlatformSource::Workspace(PlatformPackageDescriptor {
+                default_format: None,
+                ..package.clone()
+            }),
+            ..compose.clone()
+        };
+        let error = catalog
+            .workspace_frontend(&undeclared, None)
+            .expect_err("ambiguous seeds must not self-select");
+        let rendered = error.to_string();
+        for needle in ["`tkd`", "`tkdp`", "`--format`"] {
+            assert!(rendered.contains(needle), "missing {needle} in: {rendered}");
+        }
     }
 
     #[test]

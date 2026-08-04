@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 
 use crate::{
-    author::{LocatedValue, ValueShape},
+    author::{LocatedValue, ValueShape, VariantShape, from_located_value},
     config::admit_config,
     content::ContentIdentity,
     definition::{ConfigurationIdentity, EvaluatedDefinition, verify_definition},
@@ -443,4 +443,88 @@ proptest! {
             prop_assert_ne!(first, ContentIdentity::new(&other_domain, &bytes));
         }
     }
+}
+
+/// Test enum mirroring the shapes real config/kind enums use: a unit variant
+/// and a newtype-struct variant.
+#[derive(Debug, PartialEq, serde::Deserialize)]
+enum VariantTarget {
+    InMemory,
+    Dsql(DsqlPayload),
+}
+
+#[derive(Debug, PartialEq, serde::Deserialize)]
+struct DsqlPayload {
+    region: String,
+    replicas: u32,
+}
+
+fn struct_spelling(name: &str, fields: Vec<(String, LocatedValue)>) -> LocatedValue {
+    LocatedValue::new(ValueShape::Struct {
+        name: name.to_string(),
+        fields,
+    })
+}
+
+proptest! {
+    // Feature: tkdp-frontend, Property 11: variant-spelling equivalence — a
+    // struct-shaped value in enum position decodes identically to the
+    // explicit externally tagged Enum spelling.
+    #[test]
+    fn struct_spelling_decodes_like_enum_spelling(
+        region in "[a-z0-9-]{1,24}",
+        replicas in 0u32..64,
+    ) {
+        let fields = vec![
+            ("region".to_string(), LocatedValue::string(region.clone())),
+            (
+                "replicas".to_string(),
+                LocatedValue::new(ValueShape::Integer(i128::from(replicas))),
+            ),
+        ];
+        let via_struct: VariantTarget =
+            from_located_value(struct_spelling("Dsql", fields.clone())).expect("struct spelling");
+        let via_enum: VariantTarget = from_located_value(LocatedValue::new(ValueShape::Enum {
+            name: "VariantTarget".to_string(),
+            variant: "Dsql".to_string(),
+            body: VariantShape::Newtype(Box::new(struct_spelling("Dsql", fields))),
+        }))
+        .expect("enum spelling");
+        prop_assert_eq!(&via_struct, &via_enum);
+        prop_assert_eq!(
+            via_struct,
+            VariantTarget::Dsql(DsqlPayload { region, replicas })
+        );
+    }
+}
+
+#[test]
+// Feature: tkdp-frontend, Property 11: zero-field structs are the unit-variant
+// spelling; unknown variant names fail; non-enum positions are unaffected.
+fn struct_spelling_unit_and_unknown_variant_boundaries() {
+    let unit: VariantTarget =
+        from_located_value(struct_spelling("InMemory", Vec::new())).expect("unit spelling");
+    assert_eq!(unit, VariantTarget::InMemory);
+
+    let unknown = from_located_value::<VariantTarget>(struct_spelling(
+        "Postgres",
+        vec![("region".to_string(), LocatedValue::string("eu"))],
+    ))
+    .expect_err("unknown variant name");
+    assert!(unknown.message().contains("Postgres"), "{unknown:?}");
+
+    // A struct where a struct is expected still decodes as a struct: the
+    // admission arm applies only in enum position.
+    let plain: DsqlPayload = from_located_value(struct_spelling(
+        "DsqlPayload",
+        vec![
+            ("region".to_string(), LocatedValue::string("eu")),
+            (
+                "replicas".to_string(),
+                LocatedValue::new(ValueShape::Integer(1)),
+            ),
+        ],
+    ))
+    .expect("plain struct");
+    assert_eq!(plain.region, "eu");
 }

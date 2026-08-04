@@ -36,13 +36,20 @@ use tokeira_state::{CasStore, DeploymentStore, LocalBackend};
 pub mod config;
 pub mod context;
 pub mod images;
-pub mod observability;
+
 pub mod ops;
 #[cfg(test)]
 mod semantics_registry;
-pub mod services;
 
 pub use config::ComposeConfig;
+
+/// Provider stacks this platform wires at execution: Docker/local Compose
+/// mechanics and the AWS SDK. The engine kind library admits every engine
+/// kind at authoring; these are the ones Compose can actually execute.
+pub const WIRED_PROVIDERS: &[tokeira_kinds::Provider] = &[
+    tokeira_kinds::Provider::Compose,
+    tokeira_kinds::Provider::Aws,
+];
 
 const BOOTSTRAP_MODULE: &str = "local_state";
 const METADATA_JSON: &str = "metadata.json";
@@ -396,16 +403,44 @@ impl<F: DefinitionFrontend> ComposeProvisioner<F> {
         })
     }
 
+    /// Verify authored inputs and provider wiring as one report.
+    ///
+    /// The engine kind library is the whole authoring vocabulary, so a
+    /// definition can name kinds this platform cannot execute; the wiring
+    /// check turns that into a located `definition check` refusal instead of
+    /// a provider failure at apply.
+    fn verify_admitted<'a>(
+        evaluated: &'a EvaluatedDefinition<ComposeConfig, tokeira_kinds::EngineKind>,
+    ) -> Result<
+        tokeira_platform::definition::VerifiedDefinition<
+            'a,
+            ComposeConfig,
+            tokeira_kinds::EngineKind,
+        >,
+        tokeira_platform::error::VerificationReport,
+    > {
+        let mut findings =
+            tokeira_kinds::verify_wiring(&evaluated.graph, "compose", WIRED_PROVIDERS);
+        match verify_definition(evaluated) {
+            Ok(verified) if findings.is_empty() => Ok(verified),
+            Ok(_) => Err(tokeira_platform::error::VerificationReport { findings }),
+            Err(mut report) => {
+                findings.append(&mut report.findings);
+                Err(tokeira_platform::error::VerificationReport { findings })
+            }
+        }
+    }
+
     fn evaluate_with_context(
         &self,
         source: DefinitionSource,
         context: &context::ComposeContext,
-    ) -> Result<EvaluatedDefinition<ComposeConfig, services::ComposeKind>> {
+    ) -> Result<EvaluatedDefinition<ComposeConfig, tokeira_kinds::EngineKind>> {
         evaluate_definition(
             &self.frontend,
             source,
             context,
-            services::kind_functions(),
+            tokeira_kinds::kind_functions(),
             config::validate,
         )
         .map_err(anyhow::Error::from)
@@ -415,7 +450,7 @@ impl<F: DefinitionFrontend> ComposeProvisioner<F> {
         &self,
         source: DefinitionSource,
         invocation: &InvocationContext,
-    ) -> Result<EvaluatedDefinition<ComposeConfig, services::ComposeKind>> {
+    ) -> Result<EvaluatedDefinition<ComposeConfig, tokeira_kinds::EngineKind>> {
         self.evaluate_with_context(
             source,
             &context::ComposeContext::from_invocation(invocation),
@@ -428,7 +463,7 @@ impl<F: DefinitionFrontend> ComposeProvisioner<F> {
         definition_path: Option<&Path>,
     ) -> Result<(
         InvocationContext,
-        EvaluatedDefinition<ComposeConfig, services::ComposeKind>,
+        EvaluatedDefinition<ComposeConfig, tokeira_kinds::EngineKind>,
     )> {
         let metadata = Self::metadata(deployment_dir)?;
         let definition = Self::definition(&metadata)?;
@@ -459,7 +494,7 @@ impl<F: DefinitionFrontend> ComposeProvisioner<F> {
             .unwrap_or(deployment_dir)
             .to_path_buf();
         let (invocation, evaluated) = self.evaluate_recorded(deployment_dir, definition_path)?;
-        let verified = verify_definition(&evaluated).map_err(anyhow::Error::from)?;
+        let verified = Self::verify_admitted(&evaluated).map_err(anyhow::Error::from)?;
         let realized = verified.realize(
             &invocation.deployment_id,
             &invocation.deployment_dir,
@@ -577,7 +612,7 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
             )?;
             self.evaluate(source, &invocation)?
         };
-        verify_definition(&evaluated).map_err(anyhow::Error::from)?;
+        Self::verify_admitted(&evaluated).map_err(anyhow::Error::from)?;
         Ok(Realization::Realized(()))
     }
 
@@ -653,7 +688,7 @@ impl<F: DefinitionFrontend> ProvisionerPlatform for ComposeProvisioner<F> {
 
     async fn publish_inspection(&self, deployment_dir: &Path) -> Result<usize> {
         let execution = self.execution(deployment_dir, None)?;
-        let bytes = services::inspection_bytes(&execution.manifests)?;
+        let bytes = tokeira_compose::kinds::inspection_bytes(&execution.manifests)?;
         let path = orchestrator::RelativeDefinitionPath::new("docker-compose.yml")?;
         tokeira_platform::inspection::publish_inspection(deployment_dir, path, &bytes)?;
         Ok(1)
@@ -859,7 +894,7 @@ mod tests {
         let first = provisioner()
             .execution(directory.path(), None)
             .expect("realize reference definition");
-        let config_id = observability::configuration_resource_id();
+        let config_id = tokeira_compose::observability::configuration_resource_id();
         let consumers = ["mimir", "loki", "grafana", "alloy"];
         let first_digests = consumers
             .iter()
@@ -904,7 +939,7 @@ mod tests {
         let directory = deployment(reference_source());
         std::fs::write(directory.path().join("tokeirad.toml"), "port = 1\n")
             .expect("write server config");
-        let node_id = services::server_config_resource_id();
+        let node_id = tokeira_compose::kinds::server_config_resource_id();
         let tokeirad = ResourceId("compose/tokeirad".to_string());
 
         let first = provisioner()
@@ -982,7 +1017,7 @@ mod tests {
         let execution = provisioner()
             .execution(directory.path(), None)
             .expect("realize without a server config");
-        let node_id = services::server_config_resource_id();
+        let node_id = tokeira_compose::kinds::server_config_resource_id();
         assert!(execution.manifests[&node_id]["content_digest"].is_null());
 
         let node = execution
@@ -1009,8 +1044,10 @@ mod tests {
         let execution = provisioner
             .execution(directory.path(), None)
             .expect("realize definition");
-        let first = services::inspection_bytes(&execution.manifests).expect("render projection");
-        let second = services::inspection_bytes(&execution.manifests).expect("render projection");
+        let first = tokeira_compose::kinds::inspection_bytes(&execution.manifests)
+            .expect("render projection");
+        let second = tokeira_compose::kinds::inspection_bytes(&execution.manifests)
+            .expect("render projection");
         assert_eq!(first, second);
         assert!(
             !directory

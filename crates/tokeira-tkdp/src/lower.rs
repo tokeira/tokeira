@@ -8,6 +8,11 @@
 //! original text. That choice is what makes the source map exact where it
 //! matters: any position inside operator-authored code maps back linearly.
 //!
+//! The validated `from tokeira import …` statements are blanked to
+//! equal-width comment padding — every non-newline byte becomes `#` — so the
+//! facade can satisfy the import while every subsequent byte offset stays
+//! identical and the map stays linear.
+//!
 //! Lowered shape for `match <subj>:` (match index `n`, case index `k`):
 //!
 //! ```text
@@ -19,23 +24,22 @@
 //!         if (<guard verbatim>):                     # only when guarded
 //!             __tokeira_internal_done_n = True
 //!             <case body, verbatim lines>
-//! if not __tokeira_internal_done_n:                  # strict mode only
-//!     raise RuntimeError("<file>:<line>: match fell through ...")
+//! if not __tokeira_internal_done_n:                  # unless an irrefutable
+//!     raise RuntimeError("<file>:<line>: …")         # case exists
 //! ```
 //!
-//! Probes: class patterns call the prelude helper
-//! `__tokeira_internal_match(subject, Cls, ["field", ...])` (exact
-//! `type(subject) is Cls` identity — algebraic-variant semantics, not
-//! `isinstance` subclassing); literals compare `== (<lit>)`; singletons
-//! compare `is`; capture/wildcard probe `if True:`.
+//! Probes: class patterns call the facade helper
+//! `__tokeira_internal_match(subject, Cls, ["field", …])` (exact
+//! `type(subject) is Cls` identity — algebraic-variant semantics); literals
+//! compare `== (<lit>)`; singletons compare `is`; capture/wildcard probe
+//! `if True:`.
 //!
 //! Semantics are CPython-faithful by construction: one subject evaluation,
 //! first match wins, captures bind before the guard runs and stay bound if
-//! the guard fails (CPython leaves them bound too), later guards never run
-//! once a case has taken. The one deliberate deviation is exhaustion:
-//! `LowerOptions::strict_exhaustion` (default on) raises on fall-through
-//! where CPython would continue silently — a config definition that matches
-//! nothing is a bug, not a no-op. `faithful` mode restores CPython behaviour.
+//! the guard fails, later guards never run once a case has taken. The one
+//! sanctioned deviation is strict exhaustion: a match whose cases all fail
+//! raises with the definition position — a configuration that matches
+//! nothing is a defect, not a no-op.
 //!
 //! Depth is bounded: every case restarts from the match's own indentation, so
 //! a 30-case match nests no deeper than a 2-case one.
@@ -52,41 +56,22 @@ use crate::{
 /// width; scaffolding is always four-space.
 const STEP: &str = "    ";
 
-#[derive(Debug, Clone)]
-pub struct LowerOptions {
-    /// Raise `RuntimeError` when no case matches (Tokeira semantics). When
-    /// false, fall through silently exactly as CPython does.
-    pub strict_exhaustion: bool,
-}
-
-impl Default for LowerOptions {
-    fn default() -> Self {
-        Self {
-            strict_exhaustion: true,
-        }
-    }
-}
-
-/// The lowered user region: transformed text plus segments relative to it.
+/// The lowered operator region: transformed text plus segments relative to it.
 #[derive(Debug)]
 pub struct Lowered {
+    /// Transformed source text.
     pub text: String,
+    /// Byte-covering segments relative to `text`.
     pub segments: Vec<Segment>,
-    /// Number of match statements expanded (drives generated-name suffixes).
-    pub match_count: usize,
 }
 
-/// Lowers all match statements in a preflight-validated module.
-pub fn lower(
-    source: &str,
-    module: &ModModule,
-    file_label: &str,
-    options: &LowerOptions,
-) -> Lowered {
+/// Lowers all match statements in a preflight-validated module and blanks the
+/// facade import statements.
+pub fn lower(source: &str, module: &ModModule, file_label: &str, blank: &[TextRange]) -> Lowered {
     let mut emitter = Emitter {
         source,
         file_label,
-        options,
+        blank,
         line_table: LineTable::new(source),
         out: String::new(),
         map: SourceMapBuilder::new(),
@@ -102,14 +87,13 @@ pub fn lower(
     Lowered {
         text: emitter.out,
         segments: emitter.map.finish().segments().to_vec(),
-        match_count: emitter.match_counter,
     }
 }
 
 struct Emitter<'a> {
     source: &'a str,
     file_label: &'a str,
-    options: &'a LowerOptions,
+    blank: &'a [TextRange],
     line_table: LineTable,
     out: String,
     map: SourceMapBuilder,
@@ -136,6 +120,19 @@ impl Emitter<'_> {
                 original_start: range.start(),
             },
         );
+    }
+
+    /// Equal-width comment padding for a satisfied import: newlines survive,
+    /// every other byte becomes `#`, so all later offsets are unchanged.
+    fn push_blanked(&mut self, range: TextRange) {
+        let padded: String = self.source[range]
+            .chars()
+            .map(|c| if c == '\n' { '\n' } else { '#' })
+            .collect();
+        // `#` is one byte, so only multi-byte characters change the length —
+        // and the import statement grammar admits none.
+        debug_assert_eq!(padded.len(), range.len().to_usize());
+        self.push_generated(&padded, range, OriginKind::Scaffold);
     }
 
     // ------------------------------------------------------------------
@@ -178,12 +175,12 @@ impl Emitter<'_> {
 
     /// Copies a line-aligned range, shifting each line's indentation by
     /// `delta` bytes of spaces. `delta == 0` degenerates to one verbatim
-    /// segment; blank lines are never padded (no trailing whitespace).
+    /// segment; blank lines are never padded.
     ///
-    /// Caveat (documented spike boundary): a shift also displaces the
-    /// continuation lines of triple-quoted strings, since the copy is
-    /// line-based, not token-aware. `delta != 0` only occurs under guarded
-    /// case bodies and non-four-space indentation.
+    /// Documented boundary: a shift also displaces the continuation lines of
+    /// triple-quoted strings, since the copy is line-based, not token-aware.
+    /// `delta != 0` only occurs under guarded case bodies and
+    /// non-four-space indentation.
     fn copy_shifted(&mut self, range: TextRange, delta: i32) {
         if range.is_empty() {
             return;
@@ -196,8 +193,8 @@ impl Emitter<'_> {
         while cursor < range.end() {
             let end = self.line_end_incl(cursor).min(range.end());
             let line = &self.source[TextRange::new(cursor, end)];
-            let blank = line.trim().is_empty();
-            if blank {
+            let blank_line = line.trim().is_empty();
+            if blank_line {
                 self.push_verbatim(TextRange::new(cursor, end));
             } else if delta > 0 {
                 let pad = " ".repeat(delta as usize);
@@ -214,12 +211,19 @@ impl Emitter<'_> {
 
     /// Emits a statement region: statements free of `match` copy through in
     /// bulk (preserving interleaved comments and blank lines); `match`
-    /// statements expand; other compounds that *contain* a match recurse
-    /// suite-by-suite with their headers copied verbatim.
+    /// statements expand; blanked imports pad; other compounds that *contain*
+    /// a match recurse suite-by-suite with their headers copied verbatim.
     fn emit_region(&mut self, stmts: &[Stmt], bounds: TextRange, delta: i32) {
         let mut cursor = bounds.start();
         for stmt in stmts {
-            if !contains_match(stmt) {
+            let blanked = self.blank.contains(&stmt.range());
+            if !blanked && !contains_match(stmt) {
+                continue;
+            }
+            if blanked {
+                self.copy_shifted(TextRange::new(cursor, stmt.range().start()), delta);
+                self.push_blanked(stmt.range());
+                cursor = stmt.range().end();
                 continue;
             }
             let stmt_line_begin = self.line_begin(stmt.range().start());
@@ -286,8 +290,9 @@ impl Emitter<'_> {
             self.emit_case(n, k, case, &prefix);
         }
 
+        // Dead code after an unguarded irrefutable case, so not emitted then.
         let has_irrefutable = m.cases.iter().any(is_irrefutable);
-        if self.options.strict_exhaustion && !has_irrefutable {
+        if !has_irrefutable {
             let (line, _) = self.line_table.line_column(m.range().start());
             let file = self.file_label.replace('\\', "\\\\").replace('"', "\\\"");
             self.push_generated(
@@ -488,12 +493,12 @@ fn match_bearing_suites(stmt: &Stmt) -> Vec<&[Stmt]> {
 }
 
 /// Every directly nested suite of a compound statement, in source order.
-fn all_suites<'a>(stmt: &'a Stmt) -> Vec<&'a [Stmt]> {
+fn all_suites(stmt: &Stmt) -> Vec<&[Stmt]> {
     match stmt {
         Stmt::FunctionDef(s) => vec![&s.body],
         Stmt::ClassDef(s) => vec![&s.body],
         Stmt::If(s) => {
-            let mut suites: Vec<&'a [Stmt]> = vec![&s.body];
+            let mut suites: Vec<&[Stmt]> = vec![&s.body];
             suites.extend(s.elif_else_clauses.iter().map(|c| c.body.as_slice()));
             suites
         }
@@ -501,7 +506,7 @@ fn all_suites<'a>(stmt: &'a Stmt) -> Vec<&'a [Stmt]> {
         Stmt::For(s) => vec![&s.body, &s.orelse],
         Stmt::With(s) => vec![&s.body],
         Stmt::Try(s) => {
-            let mut suites: Vec<&'a [Stmt]> = vec![&s.body];
+            let mut suites: Vec<&[Stmt]> = vec![&s.body];
             suites.extend(s.handlers.iter().map(|h| {
                 let ast::ExceptHandler::ExceptHandler(h) = h;
                 h.body.as_slice()

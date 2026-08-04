@@ -18,9 +18,8 @@ use tokeira_orchestrator::{DefinitionFormatId, PlatformId};
 use tokeira_provisioner::{BoundProvisionerEvidence, Sha256Digest};
 
 use crate::{
-    ClosureError, DEFINITION_FRONTEND_CONTRACT, DefinitionFrontendPackageDescriptor,
-    DiscoveryError, PLATFORM_BINDING_CONTRACT, PackageCoordinates, PlatformPackageDescriptor,
-    ProvisionerClosure,
+    ClosureError, DefinitionFrontendPackageDescriptor, DiscoveryError, PackageCoordinates,
+    PlatformPackageDescriptor, ProvisionerClosure,
     discovery::{descriptors_from_metadata, package_coordinates},
     resolve_source_closure_for_packages,
 };
@@ -39,8 +38,7 @@ pub const GENERATED_PROVISIONER_BIN: &str = "tkp";
 pub struct BoundProvisionerSource {
     platform: PlatformId,
     format: DefinitionFormatId,
-    binding_contract: u32,
-    frontend_contract: u32,
+    engine: String,
     cargo_toml: String,
     main_rs: String,
     cargo_lock: Vec<u8>,
@@ -53,8 +51,7 @@ impl BoundProvisionerSource {
         Self {
             platform: PlatformId::new("alpha").expect("test platform id"),
             format: DefinitionFormatId::new("tkd").expect("test format id"),
-            binding_contract: PLATFORM_BINDING_CONTRACT,
-            frontend_contract: DEFINITION_FRONTEND_CONTRACT,
+            engine: "0.0.0".to_string(),
             cargo_toml: "[package]\nname = \"tokeira-bound-provisioner\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n".to_string(),
             main_rs: "fn main() {}\n".to_string(),
             cargo_lock: b"version = 4\n".to_vec(),
@@ -77,14 +74,9 @@ impl BoundProvisionerSource {
         &self.format
     }
 
-    /// Return the admitted private Platform Binding contract version.
-    pub fn binding_contract(&self) -> u32 {
-        self.binding_contract
-    }
-
-    /// Return the admitted private Definition Frontend contract version.
-    pub fn frontend_contract(&self) -> u32 {
-        self.frontend_contract
+    /// Return the Engine_Version the platform definition indicated.
+    pub fn engine(&self) -> &str {
+        &self.engine
     }
 
     /// Borrow the deterministic generated `Cargo.toml` bytes.
@@ -110,19 +102,10 @@ impl BoundProvisionerSource {
     /// exports. Advancing either private contract must therefore re-key the
     /// engine instead of reusing an artifact assembled under older semantics.
     pub fn generated_root_digest(&self) -> Sha256Digest {
-        let mut bytes = b"tokeira-bound-provisioner-root/v2\n".to_vec();
+        let mut bytes = b"tokeira-bound-provisioner-root/v3\n".to_vec();
         framed_field(&mut bytes, "platform", self.platform.as_str().as_bytes());
         framed_field(&mut bytes, "format", self.format.as_str().as_bytes());
-        framed_field(
-            &mut bytes,
-            "binding-contract",
-            self.binding_contract.to_string().as_bytes(),
-        );
-        framed_field(
-            &mut bytes,
-            "frontend-contract",
-            self.frontend_contract.to_string().as_bytes(),
-        );
+        framed_field(&mut bytes, "engine", self.engine.as_bytes());
         framed_field(&mut bytes, "Cargo.toml", self.cargo_toml.as_bytes());
         framed_field(&mut bytes, "src/main.rs", self.main_rs.as_bytes());
         framed_field(&mut bytes, "Cargo.lock", &self.cargo_lock);
@@ -156,8 +139,7 @@ impl BoundProvisionerSource {
         BoundProvisionerEvidence {
             platform: self.platform.clone(),
             format: self.format.clone(),
-            binding_contract: self.binding_contract,
-            frontend_contract: self.frontend_contract,
+            engine: self.engine.clone(),
             generated_root: self.generated_root_digest(),
             source_closure: self.source_closure_digest(snapshot_tree_oid),
             lock_closure: Sha256Digest::from_bytes(&self.closure.canonical_lock_bytes()),
@@ -391,8 +373,6 @@ pub fn assemble_bound_provisioner(
     platform: &PlatformPackageDescriptor,
     frontend: &DefinitionFrontendPackageDescriptor,
 ) -> Result<BoundProvisionerSource, CompositionError> {
-    validate_contracts(platform, frontend)?;
-
     let metadata = MetadataCommand::new()
         .manifest_path(workspace_root.join("Cargo.toml"))
         .no_deps()
@@ -443,8 +423,7 @@ pub fn assemble_bound_provisioner(
     let mut source = BoundProvisionerSource {
         platform: platform.id.clone(),
         format: frontend.format.clone(),
-        binding_contract: platform.binding_contract,
-        frontend_contract: frontend.frontend_contract,
+        engine: platform.engine.clone(),
         cargo_toml,
         main_rs,
         cargo_lock: Vec::new(),
@@ -452,25 +431,6 @@ pub fn assemble_bound_provisioner(
     };
     source.resolve_generated_lock(&workspace_root)?;
     Ok(source)
-}
-
-fn validate_contracts(
-    platform: &PlatformPackageDescriptor,
-    frontend: &DefinitionFrontendPackageDescriptor,
-) -> Result<(), CompositionError> {
-    if platform.binding_contract != PLATFORM_BINDING_CONTRACT {
-        return Err(CompositionError::InvalidSelection(format!(
-            "platform `{}` uses binding contract {}; supported contract is {}",
-            platform.id, platform.binding_contract, PLATFORM_BINDING_CONTRACT
-        )));
-    }
-    if frontend.frontend_contract != DEFINITION_FRONTEND_CONTRACT {
-        return Err(CompositionError::InvalidSelection(format!(
-            "format `{}` uses frontend contract {}; supported contract is {}",
-            frontend.format, frontend.frontend_contract, DEFINITION_FRONTEND_CONTRACT
-        )));
-    }
-    Ok(())
 }
 
 fn find_workspace_package<'a>(
@@ -613,21 +573,21 @@ macro_rules! bound_provisioner_main {
                 &root,
                 "platforms/alpha",
                 "alpha-platform",
-                "[package.metadata.tokeira.platform]\nid = \"alpha\"\nbinding-contract = 1\ndefault = false\n",
+                "[package.metadata.tokeira.platform]\nid = \"alpha\"\nengine = \"0.1.0\"\ndefault = false\n",
                 "pub fn provisioner<T>(_frontend: T) {}\n",
             );
             package(
                 &root,
                 "frontends/tkd",
                 "tkd-frontend",
-                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkd\"\nfrontend-contract = 1\nsource-extension = \"tkd\"\ndefault-relative-path = \"definition.tkd\"\n",
+                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkd\"\nsource-extension = \"tkd\"\ndefault-relative-path = \"definition.tkd\"\n",
                 "pub fn frontend() {}\n",
             );
             package(
                 &root,
                 "frontends/tkdp",
                 "tkdp-frontend",
-                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkdp\"\nfrontend-contract = 1\nsource-extension = \"tkdp\"\ndefault-relative-path = \"definition.tkdp\"\n",
+                "[package.metadata.tokeira.definition-frontend]\nformat = \"tkdp\"\nsource-extension = \"tkdp\"\ndefault-relative-path = \"definition.tkdp\"\n",
                 "pub fn frontend() {}\n",
             );
             package(
@@ -730,8 +690,7 @@ macro_rules! bound_provisioner_main {
         let evidence = tkd.evidence("tree-a");
         assert_eq!(evidence.platform, *tkd.platform());
         assert_eq!(evidence.format, *tkd.format());
-        assert_eq!(evidence.binding_contract, tkd.binding_contract());
-        assert_eq!(evidence.frontend_contract, tkd.frontend_contract());
+        assert_eq!(evidence.engine, tkd.engine());
         assert_eq!(evidence.generated_root, tkd.generated_root_digest());
         assert_eq!(evidence.source_closure, tkd.source_closure_digest("tree-a"));
         assert_eq!(
@@ -741,18 +700,14 @@ macro_rules! bound_provisioner_main {
     }
 
     #[test]
-    fn generated_root_digest_covers_contracts_and_exact_generated_bytes() {
+    fn generated_root_digest_covers_engine_and_exact_generated_bytes() {
         let fixture = Fixture::new();
         let source = fixture.assemble("tkd");
         let digest = source.generated_root_digest();
 
-        let mut binding_contract = source.clone();
-        binding_contract.binding_contract += 1;
-        assert_ne!(binding_contract.generated_root_digest(), digest);
-
-        let mut frontend_contract = source.clone();
-        frontend_contract.frontend_contract += 1;
-        assert_ne!(frontend_contract.generated_root_digest(), digest);
+        let mut engine = source.clone();
+        engine.engine = "9.9.9".to_string();
+        assert_ne!(engine.generated_root_digest(), digest);
 
         let mut manifest = source.clone();
         manifest.cargo_toml.push_str("# changed\n");
@@ -814,8 +769,7 @@ macro_rules! bound_provisioner_main {
             let source = BoundProvisionerSource {
                 platform: platform_id,
                 format: format_id,
-                binding_contract: PLATFORM_BINDING_CONTRACT,
-                frontend_contract: DEFINITION_FRONTEND_CONTRACT,
+                engine: "0.1.0".to_string(),
                 cargo_toml,
                 main_rs,
                 cargo_lock: b"version = 4\n".to_vec(),
@@ -847,7 +801,7 @@ macro_rules! bound_provisioner_main {
             prop_assert_eq!(source.evidence(&snapshot), source.clone().evidence(&snapshot));
 
             let mut changed_contract = source.clone();
-            changed_contract.frontend_contract += 1;
+            changed_contract.engine = "9.9.9".to_string();
             prop_assert_ne!(
                 source.generated_root_digest(),
                 changed_contract.generated_root_digest()

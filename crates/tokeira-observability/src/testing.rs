@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn compose_dashboards_follow_style_contract() {
-        let dashboards = repo_root().join("platforms/compose/dashboards");
+        let dashboards = repo_root().join("crates/tokeira-compose/dashboards");
 
         DashboardValidator::validate_directory(&dashboards).unwrap();
     }

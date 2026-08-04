@@ -314,8 +314,7 @@ mod tests {
         BoundProvisionerEvidence {
             platform: PlatformId::new("compose").expect("canonical platform"),
             format: DefinitionFormatId::new("tkd").expect("canonical format"),
-            binding_contract: 1,
-            frontend_contract: 1,
+            engine: "0.1.0".to_string(),
             generated_root: Sha256Digest::from_bytes(b"generated-root"),
             source_closure: bundle.identity.source_closure,
             lock_closure: bundle.identity.lock_closure,

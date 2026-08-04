@@ -1,8 +1,9 @@
-//! Segmented mapping from the generated (lowered) program back to the
-//! operator-authored `.tkdp` source.
+//! Segmented mapping from the transient program back to the operator's
+//! `.tkdp` source.
 //!
-//! The lowered program is assembled from three regions — prelude, transformed
-//! user source, driver — and the transformed region interleaves verbatim
+//! The transient program is assembled from three regions — synthesized
+//! facade, transformed operator source, driver — and the transformed region
+//! interleaves verbatim
 //! copies of original text with generated scaffolding. Every byte of the
 //! generated program is covered by exactly one [`Segment`], so any position a
 //! Monty traceback reports can be resolved to either an original source
@@ -10,7 +11,7 @@
 //! that motivated it) or to a named internal region.
 //!
 //! Offsets are byte offsets. Only the original `.tkdp` file is ever shown to
-//! the operator; the generated program is transient and inspectable on demand.
+//! the operator; the transient program is never persisted or surfaced.
 
 use ruff_text_size::{TextRange, TextSize};
 
@@ -59,8 +60,8 @@ pub enum Origin {
         original: TextRange,
         kind: OriginKind,
     },
-    /// The fixed Tokeira model prelude prepended to every program.
-    Prelude,
+    /// The synthesized authoring facade prepended to every program.
+    Facade,
     /// The entrypoint driver appended after the user source.
     Driver,
 }
@@ -82,7 +83,7 @@ pub enum Mapped {
         offset: TextSize,
         context: Option<OriginKind>,
     },
-    Prelude,
+    Facade,
     Driver,
 }
 
@@ -120,7 +121,7 @@ impl SourceMap {
                 offset: original.start(),
                 context: Some(*kind),
             },
-            Origin::Prelude => Mapped::Prelude,
+            Origin::Facade => Mapped::Facade,
             Origin::Driver => Mapped::Driver,
         })
     }

@@ -15,6 +15,7 @@ members = [
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
+    "crates/tokeira-kinds",
     "crates/tokeira-chasm-derive",
     "crates/tokeira-chasm",
     "crates/tokeira-chasm-activity",
@@ -32,6 +33,7 @@ members = [
     "crates/tokeira-orchestrator",
     "crates/tokeira-platform",
     "crates/tokeira-tkd",
+    "crates/tokeira-tkdp",
     "crates/tokeira-k8s",
     "crates/tokeira-compose",
     "crates/tokeira-storage",
@@ -55,7 +57,6 @@ members = [
 exclude = [
     "scenarios/worker-versioning",
     "scenarios/standalone-activities",
-    "spikes/monty-tkdp",
     "tools/simulation/engine",
     "tools/simulation/broker",
     "tools/simulation/placement",
@@ -137,6 +138,18 @@ tower-http = { version = "0.4", features = ["cors"] }
 url = "2"
 uuid = { version = "1.10", features = ["serde", "v4"] }
 serde_yaml = "0.9"
+# Monty pinned to an exact main revision: crates.io 0.0.19 predates in-sandbox
+# dataclasses (pydantic/monty#626). The ruff crates are pinned to the exact line
+# monty pins so one parser family exists in the tree; move them only together
+# with the monty revision (tkdp-frontend Requirement 8). The lockfile holds
+# get-size2 at 0.10.1: 0.10.3 implements GetSize for compact_str 0.10 while the
+# ruff 0.0.3 line still uses 0.9, which fails the build — restore after an
+# accidental bump with `cargo update -p get-size2 --precise 0.10.1`.
+monty = { git = "https://github.com/pydantic/monty", rev = "69f8a613e4f42d2f4dc0e659c792569923531e4f" }
+monty-types = { git = "https://github.com/pydantic/monty", rev = "69f8a613e4f42d2f4dc0e659c792569923531e4f" }
+ruff_python_ast = "0.0.3"
+ruff_python_parser = "0.0.3"
+ruff_text_size = "0.0.3"
 tokeira-state = { path = "crates/tokeira-state" }
 tokeira-provisioner = { path = "crates/tokeira-provisioner" }
 tokeira-provisioner-cli = { path = "crates/tokeira-provisioner-cli" }
@@ -148,6 +161,8 @@ tokeira-config = { path = "crates/tokeira-config" }
 tokeira-aws = { path = "crates/tokeira-aws" }
 tokeira-platform = { path = "crates/tokeira-platform" }
 tokeira-tkd = { path = "crates/tokeira-tkd" }
+tokeira-tkdp = { path = "crates/tokeira-tkdp" }
+tokeira-kinds = { path = "crates/tokeira-kinds" }
 tokeira-k8s = { path = "crates/tokeira-k8s" }
 tokeira-observability = { path = "crates/tokeira-observability" }
 tokeira-build-info = { path = "crates/tokeira-build-info" }

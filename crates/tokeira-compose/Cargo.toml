@@ -9,7 +9,6 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-askama = "0.12"
 async-trait.workspace = true
 bollard.workspace = true
 futures-util = "0.3"

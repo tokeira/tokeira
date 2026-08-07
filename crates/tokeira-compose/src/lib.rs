@@ -25,8 +25,19 @@
 //! return compose resources. The same platform can be passed to the deploy
 //! facade for runtime service apply.
 
+pub mod execution;
 pub mod kinds;
-pub mod observability;
+pub mod ops;
+
+/// The well-known identity of the deployment's rendered-config-content
+/// resource — the fencing contract between the [`kinds::Service`] consumer
+/// (which injects `TOKEIRA_CONFIG_DIGEST` from this dependency's content
+/// identity) and whatever platform-owned resource renders the content and
+/// declares itself under this id. The provider owns the contract; a platform
+/// owns the implementation.
+pub fn config_content_resource_id() -> iac::ResourceId {
+    iac::ResourceId("compose/observability-config-files".into())
+}
 
 use std::{
     collections::HashMap,
@@ -51,6 +62,19 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokeira_deploy_engine as deploy_engine;
 use tokeira_iac as iac;
+
+/// The Compose provider's complete export, for a platform entry point:
+/// the kind library, the ops surface, the reachability probe, and the
+/// infra constructor arrive together — using Compose IS this export; no
+/// separate wiring act exists.
+pub fn provider() -> tokeira_platform::declaration::ProviderExport {
+    tokeira_platform::declaration::ProviderExport {
+        kinds: kinds::set(),
+        ops: Some(Box::new(ops::DockerOps)),
+        execution: Box::new(execution::ComposeExecution),
+        infra: Some(std::sync::Arc::new(execution::ComposeInfraConstructor)),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ComposeError {
@@ -511,6 +535,14 @@ impl ComposePlatform {
             project_name: project_name.into(),
             socket_path: "local-default".into(),
         })
+    }
+
+    /// Ledger-free ops handle: Docker plus the project scope, for live
+    /// questions (logs, port mappings, running containers). The compose-file
+    /// path is empty by construction — the ops paths never touch it, and
+    /// reconcile/scale/remove must never be called on this handle.
+    pub fn ops(project_name: impl Into<String>) -> Result<Self, ComposeError> {
+        Self::connect(std::path::PathBuf::new(), project_name)
     }
 
     /// Connect to Docker through an explicit Unix socket path.

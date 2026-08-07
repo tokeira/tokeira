@@ -1,11 +1,28 @@
-// The Compose deployment definition. The selected frontend evaluates this source into
-// one transient structural graph and one typed Compose configuration.
+// The Compose deployment definition: the single authored description of what a
+// Compose deployment is. The frontend evaluates this source into one typed
+// configuration (the `Compose` value returned by `config()`) and one structural
+// graph (the modules, resources, and writeback declared by `deployment()`).
+// Everything the deployment consists of is stated here, once — the platform
+// crate defines no mirror of these types, and no other document describes the
+// deployment.
+//
+// Operators change a deployment by editing this file (and its companions) and
+// applying; each accepted edit is a configuration revision. Fields marked
+// `#[create]` are fixed at deployment creation — an edit that changes one is
+// refused at retarget check, because it names a different deployment rather
+// than a change to this one.
 
+// How the deployment stores workflow state. `Managed` creates and owns an
+// Aurora DSQL cluster; `Preexisting` adopts one the operator already runs.
 enum DsqlMode {
     Managed,
     Preexisting,
 }
 
+// DSQL storage settings. `endpoint` and `arn` identify an adopted cluster and
+// accompany `Preexisting` only; a managed cluster derives its identity at
+// creation. The `DsqlCluster` kind refuses inconsistent combinations at the
+// authoring site.
 struct DsqlStorage {
     region: String,
     mode: DsqlMode,
@@ -13,11 +30,15 @@ struct DsqlStorage {
     arn: Option<String>,
 }
 
+// The storage choice: keep workflow state in memory (development), or on
+// Aurora DSQL plus its coordination tables (durable).
 enum Storage {
     InMemory,
     Dsql(DsqlStorage),
 }
 
+// The tokeirad server container: image, capacity, and the two published ports
+// (Temporal-compatible gRPC, Prometheus metrics).
 struct Tokeirad {
     image: String,
     replicas: u32,
@@ -25,11 +46,14 @@ struct Tokeirad {
     metrics_port: u16,
 }
 
+// One observability backend container: image and capacity.
 struct Backend {
     image: String,
     replicas: u32,
 }
 
+// Grafana: image, capacity, published HTTP port, and the initial administrator
+// password seeded at first start.
 struct Grafana {
     image: String,
     replicas: u32,
@@ -37,6 +61,8 @@ struct Grafana {
     admin_password: String,
 }
 
+// The observability stack: Mimir (metrics), Loki (logs), Grafana (dashboards),
+// Alloy (collection).
 struct Observability {
     mimir: Backend,
     loki: Backend,
@@ -44,37 +70,66 @@ struct Observability {
     alloy: Backend,
 }
 
+// The aws provider's deployment-level attributes: the deployed context,
+// materialized under the provider's namespace. Resource-attached attributes
+// take precedence by the provider's own rule.
+struct Aws {
+    region: String,
+}
+
+// The complete Compose configuration — the shape `config()` returns and the
+// value every later revision edits. `storage` and `aws` are create-time:
+// switching a deployment's storage or relocating its region is a different
+// deployment.
 struct Compose {
     #[create]
     storage: Storage,
+    #[create]
+    aws: Aws,
     tokeirad: Tokeirad,
     observability: Observability,
 }
 
+// One container environment variable.
 struct Environment {
     name: String,
     value: String,
 }
 
+// A durable-data mount: `sub` names a subdirectory of the deployment's state
+// root, mounted into the container at `at`. State volumes survive container
+// replacement.
 struct StateVolume {
     sub: String,
     at: String,
 }
 
+// A rendered-configuration mount: `sub` names a file or directory under the
+// deployment's rendered-config root, mounted at `at`. The content is produced
+// by the configuration resources below; its digest fences every consumer, so
+// a content change is a visible container change.
 struct ConfigVolume {
     sub: String,
     at: String,
 }
 
+// The mount families a service may declare. `DockerSocket` grants the
+// container the host's Docker socket — used only by the collector, which
+// discovers the other containers through it.
 enum Volume {
     State(StateVolume),
     Config(ConfigVolume),
     DockerSocket,
 }
 
+// The deployment's configuration values. This function is the operator
+// surface: its literals are the defaults a new deployment starts from, and
+// revisions edit them in place. The observability images are pinned upstream
+// references; Docker pulls them directly.
 fn config() -> Compose {
     Compose {
         storage: Storage::InMemory,
+        aws: Aws { region: "eu-west-2".into() },
         tokeirad: Tokeirad {
             image: "tokeirad:latest".into(),
             replicas: 1,
@@ -95,12 +150,29 @@ fn config() -> Compose {
     }
 }
 
+// The deployment graph. Modules group resources and order coarsely: a module's
+// dependency list names the modules applied before it, and destroy reverses
+// the order. Within a module, a resource's trailing dependency list orders
+// creation exactly — a service is never created before the configuration
+// content it mounts exists, because a missing bind source would poison the
+// mount.
+//
+// `cx.project_name` is the deployment's name, supplied by the framework; it
+// scopes container names and provider resource identities.
 fn deployment(cfg: Compose, cx: Context) -> Deployment {
     let d = Deployment::new(&["default"]);
 
+    // Bootstrap: the deployment's local state root. Everything else stands on
+    // it, so every other module depends on this one.
     let local_state = d.module("local_state", vec![]);
     local_state.resource("dir", LocalStateDir {});
 
+    // Durable storage, present only when the configuration selects DSQL: the
+    // cluster plus the two DynamoDB coordination tables. The writeback
+    // entries feed the applied infrastructure's identities into the server
+    // configuration document under `infrastructure.*` — literals pass through
+    // as written; `output(...)` references resolve from the applied
+    // resources' recorded outputs.
     if let Storage::Dsql(storage) = &cfg.storage {
         let dsql = d.module("dsql", vec![local_state]);
         let cluster = dsql.resource(
@@ -139,6 +211,12 @@ fn deployment(cfg: Compose, cx: Context) -> Deployment {
         d.writeback("infrastructure.dsql.conn_lease_table", conn_lease.output("table_name"));
     }
 
+    // The engine itself. `ServerConfig` records the deployment's server
+    // configuration document (`tokeirad.toml`, a companion of this file) and
+    // digests its content; the service's dependency on it means the container
+    // mounts the recorded document and follows its digest. The published
+    // ports and the AWS region (DSQL mode only) come straight from the
+    // configuration.
     let runtime = d.module("runtime", vec![local_state]);
     let server_config = runtime.resource("server_config", ServerConfig {});
     runtime.resource(
@@ -156,6 +234,13 @@ fn deployment(cfg: Compose, cx: Context) -> Deployment {
         vec![server_config],
     );
 
+    // The observability stack. `ObservabilityConfiguration` renders the
+    // backend configuration from the content shipped beside this definition
+    // (`observability/`: templates, dashboards, alert rules) with the
+    // parameters below; every consumer depends on it and carries its content
+    // digest, so a content or parameter edit is a plannable change to each
+    // consumer. `depends_on` orders container start; the trailing dependency
+    // lists order creation.
     let observability = d.module("observability", vec![local_state, runtime]);
     let o = &cfg.observability;
     let config_files = observability.resource(

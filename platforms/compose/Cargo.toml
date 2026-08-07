@@ -7,6 +7,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# The catalog descriptor: how the build discovers this platform, and the
+# definition format selected when none is requested. The definitions sit
+# beside this file at each frontend's conventional relative path
+# (definition.tkd, definition.tkdp) — catalog convention plus co-location is
+# the whole platform-to-definition association.
 [package.metadata.tokeira.platform]
 id = "compose"
 engine = "0.1.0"
@@ -15,41 +20,32 @@ default = false
 # peer seeds for both `tkd` and `tkdp`.
 default-format = "tkd"
 
+# The platform is description plus its own kinds: the definitions, their
+# companion content (observability/), the descriptor above, one exported
+# entry point, and the platform-owned observability kind that renders the
+# companion content (src/observability.rs). The dependencies mirror that —
+# the providers the entry point wires, the framework it speaks to, and the
+# machinery the platform's own kind needs. The platform still defines no
+# configuration types (the definition authors the shape) and hosts no
+# pipeline (the framework owns it).
 [dependencies]
-tokeira-provisioner-cli = { workspace = true }
-tokeira-provisioner = { workspace = true }
-tokeira-platform = { workspace = true }
-tracing = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokeira-compose = { path = "../../crates/tokeira-compose" }
-tokeira-kinds = { path = "../../crates/tokeira-kinds" }
-tokeira-orchestrator = { path = "../../crates/tokeira-orchestrator" }
-tokeira-iac = { workspace = true }
-tokeira-deploy-engine = { workspace = true }
-tokeira-state = { path = "../../crates/tokeira-state" }
-tokeira-config = { path = "../../crates/tokeira-config" }
 tokeira-aws = { workspace = true }
-aws-config = { version = "1", features = ["behavior-version-latest"] }
+tokeira-provisioner-cli = { workspace = true }
+# The platform-owned observability kind's machinery.
+tokeira-platform = { workspace = true }
+tokeira-iac = { workspace = true }
 anyhow = { workspace = true }
-serde = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-futures-util = "0.3"
-# Observability config rendering (owned by compose-syn — alerts + dashboards +
-# the askama templates live in this crate).
-askama = "0.12"
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokeira-tkd = { workspace = true }
-tokeira-tkdp = { workspace = true }
 tempfile = { workspace = true }
-# The exercise test asserts the explanation model over the real engine outcome
-# (evidence-model task 7.2).
-tokeira-explain = { workspace = true }
 
 [lints]
 workspace = true

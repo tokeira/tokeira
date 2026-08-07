@@ -1,0 +1,56 @@
+# The refined Compose platform — the reference exhibit for the
+# compose-platform-refinement spec. Deliberately non-compiling: the framework
+# seams it names are specified in ../../design.md and do not all exist yet.
+# The empty [workspace] table below detaches it from the repository workspace,
+# so no cargo invocation ever builds it.
+#
+# The dependency list mirrors what Compose is — the definition and its
+# companion content (no dependency), the substrate, the auxiliary kind
+# selection, and the framework the entry point speaks to:
+#
+#   tokeira-compose          — the substrate. Its export carries the kind
+#                              library (Service, LocalStateDir, ServerConfig,
+#                              ObservabilityConfiguration), the Docker
+#                              mechanics behind those kinds, the runtime reads
+#                              (logs, port mappings), and the
+#                              execution-extension constructor the framework
+#                              invokes at operation start.
+#   tokeira-aws              — the auxiliary kinds, under `kinds`: the entry
+#                              point selects all() or a named subset.
+#   tokeira-provisioner-cli  — the framework: defines PlatformDeclaration and
+#                              everything it carries, assembles the bound tkp,
+#                              and owns the provisioning pipeline. There is no
+#                              binary and no main() here; the framework's
+#                              generated entry names this platform.
+#
+# Nothing else. The platform defines no configuration types (the definition
+# authors the shape; hence no serde), inlines no mechanics (the substrate owns
+# them; hence no Docker or AWS SDK dependencies), and hosts no pipeline (the
+# framework owns it; hence no engine crates). The dependency list and the
+# authoring vocabulary are one declaration — src/lib.rs `platform()` — and
+# cannot drift apart.
+
+[package]
+name = "tokeira-compose-idealized"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The catalog descriptor: how the build discovers this platform, and the
+# definition format selected when none is requested. The definition itself
+# sits beside this file at the frontend's conventional relative path
+# (definition.tkd) — catalog convention plus co-location is the whole
+# platform-to-definition association.
+[package.metadata.tokeira.platform]
+id = "compose"
+engine = "0.1.0"
+default = false
+default-format = "tkd"
+
+[workspace]
+# Detached on purpose. See the header comment.
+
+[dependencies]
+tokeira-compose = { path = "../../../../crates/tokeira-compose" }
+tokeira-aws = { path = "../../../../crates/tokeira-aws" }
+tokeira-provisioner-cli = { path = "../../../../crates/tokeira-provisioner-cli" }

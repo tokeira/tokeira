@@ -9,41 +9,10 @@
 use serde::Serialize;
 use tokeira_orchestrator::RelativeDefinitionPath;
 use tokeira_platform::{
-    author::LocatedValue,
+    declaration::Vocabulary,
     definition::{DefinitionFrontend, DefinitionSourceName, FrontendSource},
-    error::KindError,
-    kind::{KindFunctions, PlacementContext, ProviderKind},
 };
 use tokeira_tkdp::frontend;
-
-/// These sources fail before any kind decodes, so the platform is kind-less.
-#[derive(Debug, Clone, PartialEq)]
-enum NoKind {}
-
-impl ProviderKind for NoKind {
-    fn kind_name(&self) -> &'static str {
-        match *self {}
-    }
-
-    fn validate_input(&self) -> Result<(), KindError> {
-        match *self {}
-    }
-
-    fn declared_outputs(&self) -> &'static [&'static str] {
-        match *self {}
-    }
-
-    fn desired_manifest(&self, _placement: &PlacementContext) -> serde_json::Value {
-        match *self {}
-    }
-
-    fn realize(
-        &self,
-        _placement: &PlacementContext,
-    ) -> Result<Box<dyn tokeira_iac::Resource>, KindError> {
-        match *self {}
-    }
-}
 
 #[derive(Debug, Serialize)]
 struct Ctx {
@@ -51,12 +20,9 @@ struct Ctx {
 }
 
 fn failure(source: &str) -> String {
-    let kinds: KindFunctions<NoKind> = KindFunctions {
-        names: &[],
-        contains: |_| false,
-        defaults: |_| None::<LocatedValue>,
-        decode: |name, _| Err(KindError::new(format!("unknown kind `{name}`"))),
-    };
+    // These sources fail before any kind decodes, so the platform is
+    // kind-less: the empty vocabulary.
+    let vocabulary = Vocabulary::of(Vec::new()).expect("the empty vocabulary composes");
     let path = RelativeDefinitionPath::new("definition.tkdp").expect("path");
     let source_name = DefinitionSourceName::DeploymentRelative(path);
     let ctx = Ctx {
@@ -69,7 +35,7 @@ fn failure(source: &str) -> String {
                 bytes: source.as_bytes(),
             },
             &ctx,
-            kinds,
+            &vocabulary,
         )
         .expect_err("source must fail")
         .message

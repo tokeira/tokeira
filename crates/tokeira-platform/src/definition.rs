@@ -2,19 +2,19 @@
 
 use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 
 use crate::{
     author::LocatedValue,
-    config::admit_config,
+    declaration::Vocabulary,
     error::{
-        ConfigError, DefinitionError, FrontendDiagnostic, ProjectionError, VerificationFinding,
+        DefinitionError, FrontendDiagnostic, ProjectionError, VerificationFinding,
         VerificationReport,
     },
     graph::{VerifiedGraph, WritebackValue},
-    kind::{KindFunctions, PlacementContext, ProviderKind},
+    kind::{DecodedKind, PlacementContext, ProviderKind},
 };
 
 /// Source identity safe to render in frontend diagnostics.
@@ -57,28 +57,33 @@ pub struct FrontendSource<'a> {
 
 /// Completed transient structure returned by a definition frontend.
 #[derive(Debug)]
-pub struct FrontendOutput<K> {
+pub struct FrontendOutput {
     /// Host-free platform configuration value.
     pub config: LocatedValue,
     /// Completed structural graph built inside the frontend evaluator.
-    pub graph: VerifiedGraph<K>,
+    pub graph: VerifiedGraph<DecodedKind>,
 }
 
 /// Statically assembled evaluator for one definition format.
+///
+/// The frontend receives the composed authoring [`Vocabulary`] by reference:
+/// the kinds a definition may name are exactly the declaration's, and the
+/// frontend needs nothing else — names for enumeration, membership for
+/// unknown-kind refusals, defaults for `<Kind>::EMPTY`, and decoding into
+/// realizable kinds.
 pub trait DefinitionFrontend: Clone + Send + Sync + 'static {
     /// Open validated format identity embedded in the assembled provisioner.
     fn format(&self) -> &DefinitionFormatId;
 
     /// Evaluate typed context into one completed transient structure.
-    fn evaluate<C, K>(
+    fn evaluate<C>(
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        kinds: KindFunctions<K>,
-    ) -> Result<FrontendOutput<K>, FrontendDiagnostic>
+        vocabulary: &Vocabulary,
+    ) -> Result<FrontendOutput, FrontendDiagnostic>
     where
-        C: Serialize,
-        K: ProviderKind + 'static;
+        C: Serialize;
 
     /// Refuse a create-time-immutable change between two sources: the prior
     /// admitted configuration and the one about to apply. Each refusal
@@ -86,16 +91,15 @@ pub trait DefinitionFrontend: Clone + Send + Sync + 'static {
     /// with no create-time admission surface admits every edit; the `.tkd`
     /// frontend overrides this, and `.tkdp` adopts when its admission
     /// surface lands.
-    fn retarget_check<C, K>(
+    fn retarget_check<C>(
         &self,
         _prior: FrontendSource<'_>,
         _current: FrontendSource<'_>,
         _context: &C,
-        _kinds: KindFunctions<K>,
+        _vocabulary: &Vocabulary,
     ) -> Result<(), Vec<String>>
     where
         C: Serialize,
-        K: ProviderKind + 'static,
     {
         Ok(())
     }
@@ -138,29 +142,32 @@ impl ConfigurationIdentity {
     }
 }
 
-/// Typed config, immutable graph, and source identity admitted in memory.
+/// Evaluated configuration value, immutable graph, and source identity
+/// admitted in memory.
+///
+/// The configuration is the frontend's evaluated value, held as data: the
+/// definition authors the shape, the kinds validate their own inputs, and no
+/// platform-side configuration type exists to decode into.
 #[derive(Debug)]
-pub struct EvaluatedDefinition<C, K> {
-    /// Typed platform config.
-    pub config: C,
+pub struct EvaluatedDefinition<K> {
+    /// The evaluated configuration value.
+    pub config: LocatedValue,
     /// Completed structural graph.
     pub graph: VerifiedGraph<K>,
     /// Format-plus-source configuration identity.
     pub configuration_identity: ConfigurationIdentity,
 }
 
-/// Evaluate a source, admit its typed config, and retain no frontend runtime state.
-pub fn evaluate_definition<Cx, C, K, F>(
+/// Evaluate a source against the composed vocabulary; retain no frontend
+/// runtime state.
+pub fn evaluate_definition<Cx, F>(
     frontend: &F,
     source: DefinitionSource,
     context: &Cx,
-    kinds: KindFunctions<K>,
-    validate_config: fn(&C) -> Result<(), ConfigError>,
-) -> Result<EvaluatedDefinition<C, K>, DefinitionError>
+    vocabulary: &Vocabulary,
+) -> Result<EvaluatedDefinition<DecodedKind>, DefinitionError>
 where
     Cx: Serialize,
-    C: DeserializeOwned,
-    K: ProviderKind + 'static,
     F: DefinitionFrontend,
 {
     if &source.format != frontend.format() {
@@ -170,35 +177,27 @@ where
         });
     }
     let identity = ConfigurationIdentity::compute(&source.format, source.bytes.as_ref());
-    let format = source.format.clone();
-    let source_name = source.source_name.clone();
     let output = frontend.evaluate(
         FrontendSource {
             source_name: &source.source_name,
             bytes: source.bytes.as_ref(),
         },
         context,
-        kinds,
+        vocabulary,
     )?;
-    let config =
-        admit_config(output.config, validate_config).map_err(|error| DefinitionError::Config {
-            format,
-            source_name,
-            error,
-        })?;
     Ok(EvaluatedDefinition {
-        config,
+        config: output.config,
         graph: output.graph,
         configuration_identity: identity,
     })
 }
 
 /// Definition whose complete concrete kind set passed pure input validation.
-pub struct VerifiedDefinition<'a, C, K> {
-    definition: &'a EvaluatedDefinition<C, K>,
+pub struct VerifiedDefinition<'a, K> {
+    definition: &'a EvaluatedDefinition<K>,
 }
 
-impl<C, K> fmt::Debug for VerifiedDefinition<'_, C, K> {
+impl<K> fmt::Debug for VerifiedDefinition<'_, K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VerifiedDefinition")
             .field("resource_count", &self.definition.graph.resources().len())
@@ -206,17 +205,17 @@ impl<C, K> fmt::Debug for VerifiedDefinition<'_, C, K> {
     }
 }
 
-impl<'a, C, K> VerifiedDefinition<'a, C, K> {
+impl<'a, K> VerifiedDefinition<'a, K> {
     /// Borrow the exact evaluated definition that was validated.
-    pub fn definition(&self) -> &'a EvaluatedDefinition<C, K> {
+    pub fn definition(&self) -> &'a EvaluatedDefinition<K> {
         self.definition
     }
 }
 
 /// Validate every concrete kind input without fabricating invocation facts.
-pub fn verify_definition<C, K: ProviderKind>(
-    definition: &EvaluatedDefinition<C, K>,
-) -> Result<VerifiedDefinition<'_, C, K>, VerificationReport> {
+pub fn verify_definition<K: ProviderKind>(
+    definition: &EvaluatedDefinition<K>,
+) -> Result<VerifiedDefinition<'_, K>, VerificationReport> {
     let findings =
         definition
             .graph
@@ -291,7 +290,7 @@ impl RealizedResources {
     }
 }
 
-impl<C, K: ProviderKind> VerifiedDefinition<'_, C, K> {
+impl<K: ProviderKind> VerifiedDefinition<'_, K> {
     /// Realize the verified set once with real invocation identity and placement.
     /// `definition_dir` names where the interpreted source was read from —
     /// the deployment root for a working realization, a retained revision

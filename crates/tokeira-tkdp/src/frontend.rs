@@ -11,9 +11,9 @@
 use serde::Serialize;
 use tokeira_orchestrator::DefinitionFormatId;
 use tokeira_platform::{
+    declaration::Vocabulary,
     definition::{DefinitionFrontend, FrontendOutput, FrontendSource},
     error::{DiagnosticCategory, FrontendDiagnostic, SourceRange},
-    kind::{KindFunctions, ProviderKind},
 };
 
 use crate::{
@@ -85,15 +85,14 @@ impl TkdpFrontend {
     /// everything `evaluate` does before Monty runs. Shared by `evaluate` and
     /// [`Self::transient_program`] so an inspected program is byte-for-byte
     /// the program that executes.
-    fn prepare<'a, C, K>(
+    fn prepare<'a, C>(
         &self,
         source: &FrontendSource<'a>,
         context: &C,
-        kinds: &KindFunctions<K>,
+        vocabulary: &Vocabulary,
     ) -> Result<Prepared<'a>, FrontendDiagnostic>
     where
         C: Serialize,
-        K: ProviderKind + 'static,
     {
         let text = std::str::from_utf8(source.bytes).map_err(|error| {
             self.diagnostic(
@@ -104,7 +103,8 @@ impl TkdpFrontend {
         })?;
 
         let label = source.source_name.to_string();
-        let names = facade::facade_names(kinds.names);
+        let kind_names: Vec<&str> = vocabulary.names().collect();
+        let names = facade::facade_names(&kind_names);
         let pf = preflight(text, &names).map_err(|findings| {
             self.diagnostic(
                 source,
@@ -120,7 +120,7 @@ impl TkdpFrontend {
                 format!("platform context did not serialize: {error}"),
             )
         })?;
-        let synthesized = facade::render(kinds.names, &pf.imports, &context_value);
+        let synthesized = facade::render(&kind_names, &pf.imports, &context_value);
 
         let lowered = lower(text, &pf.module, &label, &pf.import_ranges);
         let program = assemble(&synthesized, lowered);
@@ -139,17 +139,16 @@ impl TkdpFrontend {
     /// spike CLI): the returned [`Program`] holds the assembled text and its
     /// source map. No operator command surfaces it today, and the text is
     /// never persisted — evaluation always reassembles.
-    pub fn transient_program<C, K>(
+    pub fn transient_program<C>(
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        kinds: KindFunctions<K>,
+        vocabulary: &Vocabulary,
     ) -> Result<Program, FrontendDiagnostic>
     where
         C: Serialize,
-        K: ProviderKind + 'static,
     {
-        self.prepare(&source, context, &kinds)
+        self.prepare(&source, context, vocabulary)
             .map(|prepared| prepared.program)
     }
 }
@@ -159,24 +158,23 @@ impl DefinitionFrontend for TkdpFrontend {
         &self.format
     }
 
-    fn evaluate<C, K>(
+    fn evaluate<C>(
         &self,
         source: FrontendSource<'_>,
         context: &C,
-        kinds: KindFunctions<K>,
-    ) -> Result<FrontendOutput<K>, FrontendDiagnostic>
+        vocabulary: &Vocabulary,
+    ) -> Result<FrontendOutput, FrontendDiagnostic>
     where
         C: Serialize,
-        K: ProviderKind + 'static,
     {
-        let prepared = self.prepare(&source, context, &kinds)?;
+        let prepared = self.prepare(&source, context, vocabulary)?;
 
         let result = execute(&prepared.program, prepared.text).map_err(|failure| {
             self.diagnostic(&source, failure.range.and_then(to_range), failure.message)
         })?;
 
         let pf = prepared.preflight;
-        convert(result, &kinds, &pf.call_sites, pf.deployment_range)
+        convert(result, vocabulary, &pf.call_sites, pf.deployment_range)
             .map_err(|error| self.diagnostic(&source, to_range(error.range), error.message))
     }
 }

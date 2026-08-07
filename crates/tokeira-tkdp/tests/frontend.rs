@@ -7,21 +7,22 @@ use serde::{Deserialize, Serialize};
 use tokeira_orchestrator::RelativeDefinitionPath;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape, from_located_value},
+    declaration::{KindEntry, KindSet, Vocabulary},
     definition::{DefinitionFrontend, DefinitionSourceName, FrontendOutput, FrontendSource},
     error::KindError,
     graph::WritebackValue,
-    kind::{KindFunctions, PlacementContext, ProviderKind},
+    kind::{PlacementContext, ProviderKind},
 };
 use tokeira_tkdp::frontend;
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Store {
     path: String,
     replicas: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Probe {
     #[serde(default)]
@@ -30,13 +31,13 @@ struct Probe {
     mode: Option<Mode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum Mode {
     Fast,
     Careful(CarefulMode),
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CarefulMode {
     retries: u32,
@@ -67,8 +68,13 @@ impl ProviderKind for TestKind {
         }
     }
 
+    // The fixture manifest carries the decoded payload: boxing erases the
+    // concrete type, so tests observe decode results through the manifest.
     fn desired_manifest(&self, _placement: &PlacementContext) -> serde_json::Value {
-        serde_json::json!({})
+        match self {
+            Self::Store(store) => serde_json::to_value(store).expect("store serializes"),
+            Self::Probe(probe) => serde_json::to_value(probe).expect("probe serializes"),
+        }
     }
 
     fn realize(
@@ -79,39 +85,54 @@ impl ProviderKind for TestKind {
     }
 }
 
-fn kinds() -> KindFunctions<TestKind> {
-    KindFunctions {
-        names: &["Probe", "Store"],
-        contains: |name| matches!(name, "Probe" | "Store"),
-        defaults: |name| {
-            (name == "Store").then(|| {
-                LocatedValue::new(ValueShape::Struct {
-                    name: "Store".to_string(),
-                    fields: vec![
-                        ("path".to_string(), LocatedValue::string("")),
-                        (
-                            "replicas".to_string(),
-                            LocatedValue::new(ValueShape::Integer(1)),
-                        ),
-                    ],
-                })
-            })
-        },
-        decode: |name, value| {
+fn vocabulary() -> Vocabulary {
+    let probe = KindEntry {
+        name: "Probe",
+        defaults: || None,
+        decode: |value| {
             let range = value.range;
-            let located = |error: tokeira_platform::author::ValueDecodeError| {
-                KindError::new(error.to_string()).at(error.range().or(range))
-            };
-            match name {
-                "Store" => from_located_value::<Store>(value)
-                    .map(TestKind::Store)
-                    .map_err(located),
-                "Probe" => from_located_value::<Probe>(value)
-                    .map(TestKind::Probe)
-                    .map_err(located),
-                _ => Err(KindError::new(format!("unknown kind `{name}`"))),
-            }
+            from_located_value::<Probe>(value)
+                .map(|probe| Box::new(TestKind::Probe(probe)) as Box<dyn ProviderKind>)
+                .map_err(|error| KindError::new(error.to_string()).at(error.range().or(range)))
         },
+    };
+    let store = KindEntry {
+        name: "Store",
+        defaults: || {
+            Some(LocatedValue::new(ValueShape::Struct {
+                name: "Store".to_string(),
+                fields: vec![
+                    ("path".to_string(), LocatedValue::string("")),
+                    (
+                        "replicas".to_string(),
+                        LocatedValue::new(ValueShape::Integer(1)),
+                    ),
+                ],
+            }))
+        },
+        decode: |value| {
+            let range = value.range;
+            from_located_value::<Store>(value)
+                .map(|store| Box::new(TestKind::Store(store)) as Box<dyn ProviderKind>)
+                .map_err(|error| KindError::new(error.to_string()).at(error.range().or(range)))
+        },
+    };
+    Vocabulary::of(vec![KindSet::new("test", vec![probe, store])])
+        .expect("two-entry test vocabulary composes")
+}
+
+/// A placement for reading fixture manifests: the fixture ignores every
+/// field, so identity values suffice.
+fn probe_placement() -> PlacementContext {
+    PlacementContext {
+        deployment_id: "test".to_string(),
+        deployment_dir: std::path::PathBuf::new(),
+        definition_dir: std::path::PathBuf::new(),
+        module: String::new(),
+        logical_id: String::new(),
+        dependencies: Vec::new(),
+        dependency_content: Default::default(),
+        tags: Default::default(),
     }
 }
 
@@ -128,7 +149,7 @@ fn ctx() -> Ctx {
     }
 }
 
-fn evaluate(source: &str) -> Result<FrontendOutput<TestKind>, String> {
+fn evaluate(source: &str) -> Result<FrontendOutput, String> {
     let path = RelativeDefinitionPath::new("definition.tkdp").expect("path");
     let source_name = DefinitionSourceName::DeploymentRelative(path);
     frontend()
@@ -138,7 +159,7 @@ fn evaluate(source: &str) -> Result<FrontendOutput<TestKind>, String> {
                 bytes: source.as_bytes(),
             },
             &ctx(),
-            kinds(),
+            &vocabulary(),
         )
         .map_err(|diagnostic| diagnostic.message)
 }
@@ -266,23 +287,19 @@ fn exemplar_evaluates_to_the_expected_structure() {
     assert_eq!(resources.len(), 2);
     assert_eq!(resources[0].module(), "base");
     assert_eq!(resources[0].logical_id(), "state");
+    assert_eq!(resources[0].kind().kind_name(), "Store");
+    // Facade-derived context value plus the provider default for the
+    // omitted `replicas` field, observed through the fixture manifest.
     assert_eq!(
-        resources[0].kind(),
-        &TestKind::Store(Store {
-            // Facade-derived context value plus the provider default for the
-            // omitted `replicas` field.
-            path: "/var/lib/demo".to_string(),
-            replicas: 1,
-        })
+        resources[0].kind().desired_manifest(&probe_placement()),
+        serde_json::json!({ "path": "/var/lib/demo", "replicas": 1 })
     );
     assert_eq!(resources[1].module(), "data");
     assert_eq!(resources[1].logical_id(), "probe");
+    assert_eq!(resources[1].kind().kind_name(), "Probe");
     assert_eq!(
-        resources[1].kind(),
-        &TestKind::Probe(Probe {
-            label: Some("demo:eu-west-2".to_string()),
-            mode: None,
-        })
+        resources[1].kind().desired_manifest(&probe_placement()),
+        serde_json::json!({ "label": "demo:eu-west-2", "mode": null })
     );
     assert_eq!(resources[1].dependencies().len(), 1);
     assert_eq!(resources[1].dependencies()[0].logical_id(), "state");
@@ -360,19 +377,13 @@ class Fast:
         .graph
         .resources()
         .iter()
-        .map(|r| r.kind().clone())
+        .map(|r| r.kind().desired_manifest(&probe_placement()))
         .collect();
     assert_eq!(
         kinds,
         vec![
-            TestKind::Probe(Probe {
-                label: None,
-                mode: Some(Mode::Fast),
-            }),
-            TestKind::Probe(Probe {
-                label: None,
-                mode: Some(Mode::Careful(CarefulMode { retries: 4 })),
-            }),
+            serde_json::json!({ "label": null, "mode": "Fast" }),
+            serde_json::json!({ "label": null, "mode": { "Careful": { "retries": 4 } } }),
         ]
     );
 }
@@ -525,7 +536,7 @@ fn captured_print_output_is_attached_to_failures() {
 fn repeated_evaluation_is_identical() {
     let first = evaluate(EXEMPLAR).expect("first");
     let second = evaluate(EXEMPLAR).expect("second");
-    let render = |output: &FrontendOutput<TestKind>| {
+    let render = |output: &FrontendOutput| {
         let graph = &output.graph;
         format!(
             "{:?}|{:?}|{:?}",
@@ -536,7 +547,8 @@ fn repeated_evaluation_is_identical() {
                 .map(|r| (
                     r.module().to_string(),
                     r.logical_id().to_string(),
-                    r.kind().clone()
+                    r.kind().kind_name(),
+                    r.kind().desired_manifest(&probe_placement()),
                 ))
                 .collect::<Vec<_>>(),
             graph.writeback().len()
@@ -560,7 +572,7 @@ fn transient_program_is_assembled_without_executing() {
                     bytes: bytes.as_bytes(),
                 },
                 &ctx(),
-                kinds(),
+                &vocabulary(),
             )
             .expect("assembles")
     };

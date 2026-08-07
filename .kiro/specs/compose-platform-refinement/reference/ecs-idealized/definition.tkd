@@ -1,0 +1,143 @@
+// ECS deployment definition — the root document.
+//
+// The root is the deployment's wiring diagram: it declares the part files,
+// owns every inter-module edge, and carries the deployment-level facts —
+// tags, writeback, the provider attribute blocks. Each part encapsulates
+// one module's resource detail behind a single `declare` function; nothing
+// crosses between parts except through this file.
+
+mod networking;
+mod dsql;
+mod cluster;
+mod images;
+mod observability;
+mod services;
+
+// ---------------------------------------------------------------------
+// Configuration. Trimmed to what the sketched parts consume — the full
+// surface (service images, scaling, networking shape) arrives with
+// onboarding, when EcsConfig dissolves into this document the way
+// compose's config twin did.
+// ---------------------------------------------------------------------
+
+// The AWS provider's namespace block: deployment-level attributes the aws
+// selection resolves by its own precedence (block ▷ ambient SDK chain).
+struct Aws {
+    region: String,
+}
+
+// DSQL is either managed here or adopted from elsewhere. Adoption's
+// required coordinates are required fields — the Rust module's twenty
+// lines of `validate_preexisting` runtime checking are now a shape.
+enum Dsql {
+    Managed,
+    Preexisting(PreexistingDsql),
+}
+
+struct PreexistingDsql {
+    endpoint: String,
+    management_endpoint_id: String,
+    connection_endpoint_id: String,
+    runtime_role_arn: String,
+    admin_role_arn: String,
+}
+
+struct Ecs {
+    environment: String,
+    #[create] aws: Aws,
+    #[create] dsql: Dsql,
+    tags: Map<String, String>,
+}
+
+fn config() -> Ecs {
+    Ecs {
+        environment: "dev".into(),
+        aws: Aws {
+            region: "eu-west-2".into(),
+        },
+        dsql: Dsql::Managed,
+        tags: Map::from([("project", "tokeira"), ("environment", "dev")]),
+    }
+}
+
+// ---------------------------------------------------------------------
+// The deployment: seven modules, every edge visible on this one screen.
+// ---------------------------------------------------------------------
+
+fn deployment(cfg: Ecs, cx: Context) -> Deployment {
+    let d = Deployment::new(&["default"]);
+
+    // Deployment-level tags: authored once, transported to every
+    // placement, carried by the AWS resources onto the real API calls.
+    d.tags(cfg.tags);
+
+    // Bootstrap: the state backend itself — the graph's one
+    // dependency-free module, small enough to live in the root.
+    let state = d.module("remote_state", vec![]);
+    state.resource(
+        "bucket",
+        S3Bucket {
+            bucket: format!("{}-tokeira-state", cx.project_name),
+            versioning: true,
+        },
+    );
+
+    // Each part declares its module against the same graph. A part
+    // receives exactly the handles it consumes and returns the handles it
+    // exports; the root passes pieces onward, so this block IS the
+    // dependency diagram.
+    let net = networking::declare(d, cfg, cx, vec![state]);
+
+    let dsql = dsql::declare(
+        d,
+        cfg,
+        cx,
+        net.vpc,
+        net.endpoint_security_group,
+        vec![net.module],
+    );
+
+    let cluster = cluster::declare(d, cfg, cx, net.vpc, vec![net.module]);
+
+    let images = images::declare(d, cfg, cx, vec![state]);
+
+    // Observability declares both planes: its buckets, roles, and shipped
+    // documents as resources; grafana/mimir/loki/alloy as `.service(`
+    // nodes on the deploy plane.
+    let observability = observability::declare(d, cfg, cx, cluster.cluster, vec![cluster.module]);
+
+    services::declare(
+        d,
+        cfg,
+        cx,
+        cluster.cluster,
+        dsql.runtime_role,
+        images.repository,
+        vec![cluster.module, dsql.module, images.module],
+    );
+
+    // The applied infrastructure's identities feed the server
+    // configuration document — tokeirad.toml is the definitive story.
+    d.writeback(
+        "infrastructure.dsql.endpoint",
+        dsql.cluster.output("cluster_endpoint"),
+    );
+    d.writeback(
+        "infrastructure.dsql.management_endpoint_id",
+        dsql.management_endpoint.output("endpoint_id"),
+    );
+    d.writeback(
+        "infrastructure.dsql.connection_endpoint_id",
+        dsql.connection_endpoint.output("endpoint_id"),
+    );
+    d.writeback(
+        "infrastructure.dsql.runtime_role_arn",
+        dsql.runtime_role.output("role_arn"),
+    );
+    d.writeback(
+        "infrastructure.dsql.admin_role_arn",
+        dsql.admin_role.output("role_arn"),
+    );
+
+    d
+}

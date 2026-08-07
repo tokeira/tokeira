@@ -19,10 +19,11 @@ use monty_types::MontyObject;
 use ruff_text_size::TextRange;
 use tokeira_platform::{
     author::{LocatedValue, ValueShape},
+    declaration::Vocabulary,
     definition::FrontendOutput,
     error::GraphError,
     graph::{ResourceReference, StructuralGraphBuilder, WritebackValue},
-    kind::{KindFunctions, ProviderKind},
+    kind::DecodedKind,
 };
 
 use crate::preflight::CallSite;
@@ -46,12 +47,12 @@ impl ConvertError {
 }
 
 /// Decodes the driver's result into the frontend output.
-pub fn convert<K: ProviderKind + 'static>(
+pub fn convert(
     result: MontyObject,
-    kinds: &KindFunctions<K>,
+    vocabulary: &Vocabulary,
     sites: &[CallSite],
     fallback: TextRange,
-) -> Result<FrontendOutput<K>, ConvertError> {
+) -> Result<FrontendOutput, ConvertError> {
     let site = |verb: &str, name: &str| {
         sites
             .iter()
@@ -64,7 +65,7 @@ pub fn convert<K: ProviderKind + 'static>(
     let deployment = take(&mut top, "deployment", fallback)?;
     let mut envelope = expect_dict(deployment, "deployment envelope", fallback)?;
 
-    let mut builder: StructuralGraphBuilder<K> = StructuralGraphBuilder::new();
+    let mut builder: StructuralGraphBuilder<DecodedKind> = StructuralGraphBuilder::new();
     // References returned by `add_resource`, keyed for dependency and
     // writeback lookup. Envelope order is declaration order, and a handle can
     // only reference an earlier declaration, so lookup-before-insert is
@@ -116,8 +117,8 @@ pub fn convert<K: ProviderKind + 'static>(
                 })
                 .collect::<Result<Vec<_>, ConvertError>>()?,
         });
-        let merged = merge_defaults((kinds.defaults)(&kind_name), authored, &kind_name);
-        let kind = (kinds.decode)(&kind_name, merged).map_err(|error| {
+        let merged = merge_defaults(vocabulary.defaults(&kind_name), authored, &kind_name);
+        let kind = vocabulary.decode(&kind_name, merged).map_err(|error| {
             ConvertError::new(
                 format!(
                     "kind `{kind_name}` for resource `{module}/{id}`: {}",

@@ -44,7 +44,7 @@ pub(crate) async fn run(
                 }
                 PlatformDeploymentConfig::Ecs(config) => {
                     let mut engine =
-                        DeployEngine::new(EcsDeployment::new(), config, &ctx.path).await?;
+                        DeployEngine::new(EcsDeployment::new(&ctx.path), config, &ctx.path).await?;
                     print_plan(&engine.plan().await?);
                 }
             }

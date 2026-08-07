@@ -73,34 +73,6 @@ impl fmt::Display for FrontendDiagnostic {
 
 impl std::error::Error for FrontendDiagnostic {}
 
-/// Failure to decode or purely validate platform configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("invalid platform configuration: {message}")]
-pub struct ConfigError {
-    /// Actionable validation or decoding detail.
-    pub message: String,
-    /// Most specific frontend range involved in the failure.
-    pub range: Option<SourceRange>,
-}
-
-impl ConfigError {
-    /// Construct an unlocated pure validation failure.
-    pub fn validation(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            range: None,
-        }
-    }
-
-    /// Attach a range unless a nested failure already supplied one.
-    pub fn at(mut self, range: Option<SourceRange>) -> Self {
-        if self.range.is_none() {
-            self.range = range;
-        }
-        self
-    }
-}
-
 /// Failure to decode, validate, or realize one provider kind.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("provider kind error: {message}")]
@@ -209,16 +181,6 @@ pub enum DefinitionError {
     /// Frontend evaluation failed with a located diagnostic.
     #[error(transparent)]
     Frontend(#[from] FrontendDiagnostic),
-    /// Typed config admission failed after frontend evaluation.
-    #[error("{format} {source_name}: {error}")]
-    Config {
-        /// Selected definition format.
-        format: DefinitionFormatId,
-        /// Display-safe source identity.
-        source_name: DefinitionSourceName,
-        /// Typed decode or pure validation failure.
-        error: ConfigError,
-    },
 }
 
 /// One pure provider-kind verification finding.

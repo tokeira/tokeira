@@ -168,7 +168,7 @@ async fn run_push(
             ctx.name
         );
     };
-    let deployment = tokeira_ecs_deployment::EcsDeployment::new();
+    let deployment = tokeira_ecs_deployment::EcsDeployment::new(&ctx.path);
     let mut image_ctx = ImageContext::default();
     deployment
         .register_image_extensions(config, &mut image_ctx)
@@ -250,7 +250,7 @@ async fn run_mirror(
             ctx.name
         );
     };
-    let deployment = tokeira_ecs_deployment::EcsDeployment::new();
+    let deployment = tokeira_ecs_deployment::EcsDeployment::new(&ctx.path);
     let mut image_ctx = ImageContext::default();
     deployment
         .register_image_extensions(config, &mut image_ctx)
@@ -339,7 +339,7 @@ async fn run_list(
             ctx.name
         ),
         PlatformDeploymentConfig::Ecs(config) => {
-            let deployment = tokeira_ecs_deployment::EcsDeployment::new();
+            let deployment = tokeira_ecs_deployment::EcsDeployment::new(&ctx.path);
             deployment
                 .register_image_extensions(config, &mut image_ctx)
                 .await?;

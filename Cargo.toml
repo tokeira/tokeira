@@ -15,7 +15,6 @@ members = [
     "crates/tokeira-types",
     "crates/tokeira-proto",
     "crates/tokeira-kernel",
-    "crates/tokeira-kinds",
     "crates/tokeira-chasm-derive",
     "crates/tokeira-chasm",
     "crates/tokeira-chasm-activity",
@@ -163,7 +162,6 @@ tokeira-aws = { path = "crates/tokeira-aws" }
 tokeira-platform = { path = "crates/tokeira-platform" }
 tokeira-tkd = { path = "crates/tokeira-tkd" }
 tokeira-tkdp = { path = "crates/tokeira-tkdp" }
-tokeira-kinds = { path = "crates/tokeira-kinds" }
 tokeira-secrets = { path = "crates/tokeira-secrets" }
 tokeira-k8s = { path = "crates/tokeira-k8s" }
 tokeira-observability = { path = "crates/tokeira-observability" }

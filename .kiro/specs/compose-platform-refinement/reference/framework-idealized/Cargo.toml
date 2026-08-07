@@ -1,0 +1,37 @@
+# The framework-idealized sketch: the engine + platform-agnostic construction
+# for a bound tkp, reference exhibit for the compose-platform-refinement
+# spec. Deliberately non-compiling (bodies are sketch stubs) and detached
+# from the workspace via the empty [workspace] table, so no cargo invocation
+# ever builds it.
+#
+# In the real tree these two modules live in tokeira-provisioner-cli beside
+# the shell that drives them; the dependency list mirrors what the
+# construction consumes:
+#
+#   tokeira-platform      — the declaration surface (PlatformDeclaration,
+#                           Vocabulary, ProviderExecution, RuntimeReads) and
+#                           the definition machinery the engine evaluates with
+#   tokeira-orchestrator  — the infrastructure engine the lifecycle drives,
+#                           and the identity newtypes (PlatformId, format)
+#   tokeira-iac           — plans, changes, state, module selection
+#   tokeira-provisioner   — deployment binding metadata and bundle evidence
+#   tokeira-state         — the CAS state stores the engine owns
+#   anyhow / serde_json   — errors and metadata decoding
+
+[package]
+name = "tokeira-framework-idealized"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+# Detached on purpose. See the header comment.
+
+[dependencies]
+tokeira-platform = { path = "../../../../crates/tokeira-platform" }
+tokeira-orchestrator = { path = "../../../../crates/tokeira-orchestrator" }
+tokeira-iac = { path = "../../../../crates/tokeira-iac" }
+tokeira-provisioner = { path = "../../../../crates/tokeira-provisioner" }
+tokeira-state = { path = "../../../../crates/tokeira-state" }
+anyhow = "1"
+serde_json = "1"

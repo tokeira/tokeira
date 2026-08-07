@@ -29,12 +29,15 @@ mod config_seed;
 mod definition;
 mod deploy;
 mod describe;
+mod described;
 mod destroy;
+pub mod engine;
 mod gate;
 mod init;
 mod lock;
 mod marker;
 mod plan;
+pub mod platform;
 mod render;
 mod revert;
 mod rollback;
@@ -120,6 +123,15 @@ pub type DesiredSnapshot = std::collections::BTreeMap<tokeira_iac::ResourceId, s
 /// Incremental operator log output. Providers retain their native streaming
 /// behavior; the shell never collects logs into an in-memory snapshot.
 pub type LogStream = Pin<Box<dyn futures_util::Stream<Item = Result<String>> + Send>>;
+
+/// The platform declaration surface: what a platform's entry point returns
+/// and everything it carries. The framework defines what it consumes; the
+/// types live with the definition-boundary library and are re-exported here
+/// as the surface platforms speak.
+pub use tokeira_platform::declaration::{
+    AuthorableKind, DeploymentRef, KindEntry, KindSet, Ops, PlatformDeclaration, ProviderExecution,
+    ProviderExport, Vocabulary, kind,
+};
 
 /// The typed refusal a verb returns after emitting a platform-issue
 /// document: the document already said everything (output-templates §The

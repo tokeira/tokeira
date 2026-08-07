@@ -8,32 +8,25 @@ use std::{
 };
 
 use proptest::prelude::*;
-use serde::Deserialize;
 use tokeira_orchestrator::{DefinitionFormatId, RelativeDefinitionPath};
 
 use crate::{
     author::{LocatedValue, ValueShape, VariantShape, from_located_value},
-    config::admit_config,
     content::ContentIdentity,
     definition::{ConfigurationIdentity, EvaluatedDefinition, verify_definition},
-    error::{ConfigError, GraphError, KindError},
+    error::{GraphError, KindError},
     graph::{StructuralGraphBuilder, WritebackValue},
     inspection::publish_inspection,
     kind::{PlacementContext, ProviderKind},
 };
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct TestConfig {
-    name: String,
-}
-
-fn validate_config(config: &TestConfig) -> Result<(), ConfigError> {
-    if config.name.is_empty() {
-        Err(ConfigError::validation("name cannot be empty"))
-    } else {
-        Ok(())
-    }
+/// The evaluated-config placeholder: definitions author the shape and the
+/// framework holds the value as data, so tests carry an empty struct value.
+fn test_config_value() -> LocatedValue {
+    LocatedValue::new(ValueShape::Struct {
+        name: "TestConfig".to_string(),
+        fields: Vec::new(),
+    })
 }
 
 #[derive(Debug)]
@@ -253,21 +246,6 @@ fn probe_graph(
 }
 
 #[test]
-// Feature: platform-builder-abstraction, Property 5: config admission is pure Serde admission.
-fn located_config_admission_is_serde_backed_and_pure() {
-    let value = LocatedValue::new(ValueShape::Struct {
-        name: "TestConfig".to_string(),
-        fields: vec![("name".to_string(), LocatedValue::string("demo"))],
-    });
-    assert_eq!(
-        admit_config(value, validate_config).expect("valid config"),
-        TestConfig {
-            name: "demo".to_string()
-        }
-    );
-}
-
-#[test]
 // Feature: platform-builder-abstraction, Property 2: structural graph completion is exact.
 fn graph_preserves_declaration_order_and_checks_outputs() {
     let mut graph = StructuralGraphBuilder::new();
@@ -324,7 +302,7 @@ proptest! {
         let realizations = Arc::new(AtomicUsize::new(0));
         let placements = Arc::new(Mutex::new(Vec::new()));
         let definition = EvaluatedDefinition {
-            config: (),
+            config: test_config_value(),
             graph: probe_graph(
                 std::iter::repeat_n(true, resource_count),
                 &validations,
@@ -374,7 +352,7 @@ fn invalid_kind_input_never_reaches_invocation_bound_work() {
     let realizations = Arc::new(AtomicUsize::new(0));
     let placements = Arc::new(Mutex::new(Vec::new()));
     let definition = EvaluatedDefinition {
-        config: (),
+        config: test_config_value(),
         graph: probe_graph(
             [true, false, true],
             &validations,

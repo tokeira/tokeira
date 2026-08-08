@@ -279,9 +279,10 @@ pub type LogStream = Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>>;
 /// questions answered from the substrate itself.
 ///
 /// Implemented by providers that have one; the framework mounts the
-/// corresponding operator verbs by presence and validates service names
-/// against the evaluated definition before calling down — an implementation
-/// never guesses its own service list.
+/// corresponding operator verbs by presence and passes the operator's
+/// service name through — an implementation answers for the services it
+/// finds on the substrate, and an unknown name surfaces as the provider's
+/// own error.
 #[async_trait::async_trait]
 pub trait Ops: Send + Sync + fmt::Debug {
     /// Open incremental logs for one declared service.
@@ -300,6 +301,12 @@ pub trait Ops: Send + Sync + fmt::Debug {
         deployment: &DeploymentRef,
         service: &str,
     ) -> anyhow::Result<Vec<PortMapping>>;
+
+    /// Change workload capacity (`<dim>=<n>` specs), returning the change
+    /// count. Required, deliberately undefaulted: an ops surface answers
+    /// every one of its verbs in its own words — a provider without a scale
+    /// dimension states its own refusal as the error.
+    async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> anyhow::Result<usize>;
 }
 
 /// The provider's execution seam, invoked by the framework: reachability

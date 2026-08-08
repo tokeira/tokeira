@@ -531,6 +531,30 @@ mod tests {
         assert_eq!(artifacts[10].content_type, "application/yaml");
     }
 
+    // The platform owns its observability content, so it owns the style
+    // contract over it: every shipped dashboard and alert rule validates.
+    #[test]
+    fn dashboards_follow_the_style_contract() {
+        tokeira_observability::testing::DashboardValidator::validate_directory(
+            &content_dir().join("dashboards"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn alert_rules_follow_the_style_contract() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("platforms/ecs sits two levels below the workspace root")
+            .to_path_buf();
+        tokeira_observability::testing::AlertRuleValidator::validate_directory(
+            &content_dir().join("alerts"),
+            &repo_root,
+        )
+        .unwrap();
+    }
+
     // A deployment without staged content refuses with the expected layout
     // named — the operator learns what belongs where, not just "not found".
     #[test]

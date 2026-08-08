@@ -340,21 +340,6 @@ fn is_yaml_file(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("crate should live under crates/")
-            .to_path_buf()
-    }
-
-    #[test]
-    fn compose_dashboards_follow_style_contract() {
-        let dashboards = repo_root().join("crates/tokeira-compose/dashboards");
-
-        DashboardValidator::validate_directory(&dashboards).unwrap();
-    }
-
     #[test]
     fn dashboard_validator_rejects_missing_datasource_template() {
         let dashboard = r#"{"panels":[]}"#;
@@ -395,14 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn current_alert_directory_is_valid_when_present() {
-        let root = repo_root();
-        let alerts = root.join("platforms/compose/alerts");
-
-        AlertRuleValidator::validate_directory(&alerts, &root).unwrap();
-    }
-
-    #[test]
     fn alert_validator_requires_summary() {
         let alert = r#"
 groups:
@@ -417,8 +394,9 @@ groups:
           description: Reservoir exhausted
 "#;
 
-        let error = AlertRuleValidator::validate_str(Path::new("alerts.yaml"), alert, &repo_root())
-            .unwrap_err();
+        let error =
+            AlertRuleValidator::validate_str(Path::new("alerts.yaml"), alert, Path::new("."))
+                .unwrap_err();
 
         assert!(error.field.contains("summary"));
     }

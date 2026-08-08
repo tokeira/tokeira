@@ -34,6 +34,19 @@ pub struct Admitted {
     pub deployment_ref: DeploymentRef,
 }
 
+impl Admitted {
+    /// The recorded desired source, from the admitted metadata. Admission
+    /// guaranteed the definition record exists, so this cannot miss.
+    pub fn config_source(&self) -> crate::ConfigSource {
+        let definition = self
+            .metadata
+            .definition
+            .as_ref()
+            .expect("admission verified the definition record");
+        crate::ConfigSource::recorded(definition.format.clone(), definition.path.clone())
+    }
+}
+
 /// One platform, bound to the identity pair its binary was built as.
 ///
 /// Constructed once at process start. Construction composes the authoring

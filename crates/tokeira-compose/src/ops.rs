@@ -52,4 +52,33 @@ impl Ops for DockerOps {
             )
             .collect())
     }
+
+    /// Scale one or more services by replicating their recorded container
+    /// specs (`<service>=<n>`). Drives the platform's additive scale-up —
+    /// each spec creates `n` suffixed replica containers from the service's
+    /// recorded configuration; reducing capacity is not a Compose ops verb
+    /// (the deploy plane's reconcile owns desired-replica convergence).
+    /// Returns the number of containers created.
+    async fn scale(&self, deployment: &DeploymentRef, specs: &[String]) -> anyhow::Result<usize> {
+        let ledger = deployment.dir.join("state/compose-services.yaml");
+        let platform = ComposePlatform::connect(ledger, &deployment.name)?;
+        let mut created = 0usize;
+        for spec in specs {
+            let (service, replicas) = spec
+                .split_once('=')
+                .and_then(|(name, count)| Some((name.trim(), count.trim().parse::<u32>().ok()?)))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("scale spec `{spec}` is not `<service>=<replicas>`")
+                })?;
+            let recorded = platform.recorded_service(service)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "service `{service}` is not recorded in the deployment's compose state; \
+                     apply the deployment before scaling it"
+                )
+            })?;
+            platform.scale_service(&recorded, replicas).await?;
+            created += replicas as usize;
+        }
+        Ok(created)
+    }
 }

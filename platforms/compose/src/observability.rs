@@ -997,6 +997,30 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), iac::IacError> {
 
 #[cfg(test)]
 mod content_tests {
+    use tokeira_observability::testing::{AlertRuleValidator, DashboardValidator};
+
+    fn shipped_content() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("observability")
+    }
+
+    // The platform owns its observability content, so it owns the style
+    // contract over it: every shipped dashboard and alert rule validates.
+    #[test]
+    fn dashboards_follow_the_style_contract() {
+        DashboardValidator::validate_directory(&shipped_content().join("dashboards")).unwrap();
+    }
+
+    #[test]
+    fn alert_rules_follow_the_style_contract() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("platforms/compose sits two levels below the workspace root")
+            .to_path_buf();
+        AlertRuleValidator::validate_directory(&shipped_content().join("alerts"), &repo_root)
+            .unwrap();
+    }
+
     use super::*;
 
     /// Write a minimal companion-content tree: every template a

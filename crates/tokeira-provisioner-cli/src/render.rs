@@ -18,12 +18,12 @@ use tokeira_report::{Depth, Report};
 /// The read-only plan report: the deployment explanation, framed by the
 /// verb-level annotations (deployment header, attention-only binding).
 ///
-/// `--json` emits the **explanation model alone** (operator-explanation Req 9.3):
+/// `--json` emits the **explanation model alone**:
 /// the manual `Serialize` delegates to it, so the artifact and the `--json`
 /// output are one schema. The binding verdict is verb framing, not model
 /// content — `describe` owns it.
 ///
-/// C5 migration note (operator-explanation §Rendering): if a consumer outside `tkp`
+/// Migration note: if a consumer outside `tkp`
 /// ever needs to render an explanation — an artifact viewer, Feature 5's
 /// analysis bundles — this `Report` impl moves into `tokeira-explain` and
 /// that crate takes `tokeira-report` (a serde-only crate) as a dependency.
@@ -93,7 +93,7 @@ impl Report for ExplanationReport {
 /// versioning model lands (tkdp frontend spec) — until then it states the
 /// replacement alone; the spec section for this document lands with that
 /// work too. `--json` emits the applied explanation model (one schema
-/// between artifact and flag, Req 9.3 discipline).
+/// between artifact and flag).
 #[derive(Debug)]
 pub(crate) struct UpgradeReport {
     pub explanation: DeploymentExplanation,
@@ -264,8 +264,7 @@ fn cite(citation: &tokeira_iac::Citation) -> String {
     }
 }
 
-/// A behaviour claim in its confidence voice with its citation (Req 9.2/9.3
-/// at detail): an engine fact speaks plainly, a provider guarantee is
+/// A behaviour claim in its confidence voice with its citation: an engine fact speaks plainly, a provider guarantee is
 /// attributed by its linked document, an inference owns itself.
 fn voiced(claim: &str, confidence_citation: &tokeira_iac::Confidence<impl Sized>) -> String {
     use tokeira_iac::Confidence;
@@ -299,7 +298,7 @@ fn change_for<'a>(
 /// that changed outside the definition; derived causes name their concrete
 /// trigger. Creates and deletes from the operator's own edit carry no
 /// clause — the verb already states the change. `None` also for an unknown
-/// cause: detail carries its uncertainty in place (Req 6.3). No clause ever
+/// cause: detail carries its uncertainty in place. No clause ever
 /// references a revision number — the header anchors the revision once.
 fn cause_phrase(explanation: &DeploymentExplanation, change: &ExplainedChange) -> Option<String> {
     use tokeira_explain::Cause;
@@ -513,8 +512,8 @@ fn unchanged_section(explanation: &DeploymentExplanation, depth: Depth, out: &mu
 /// declared behaviour — mechanism, data effect, reversibility — each in its
 /// confidence voice with its citation, then the cause in its voice (or its
 /// uncertainty in place, output-templates.md §Detail sub-bullets), the dependants
-/// (Req 5.2/5.4), and — on a chain's first member — the story line
-/// (Req 6.4). Unknown semantic fields render nothing (knowledge renders;
+///, and — on a chain's first member — the story line
+///. Unknown semantic fields render nothing (knowledge renders;
 /// gaps enforce); an unknown *cause* renders its uncertainty, because a
 /// cause gap is operator-actionable knowledge about the plan.
 fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, out: &mut String) {
@@ -619,7 +618,7 @@ fn change_detail(explanation: &DeploymentExplanation, change: &ExplainedChange, 
 
     // The cause's voice line renders only where it adds information beyond
     // the line clause: a derived cause owns itself with its citation
-    // (Req 6.2). Engine-fact causes already state their concrete change on
+    //. Engine-fact causes already state their concrete change on
     // the line, and an unknown cause under an unreadable live state spoke
     // with the provenance line above. The remaining unknown arms (a missing
     // or broken baseline) state their one operator-usable fact — never the
@@ -1067,7 +1066,7 @@ mod tests {
         );
     }
 
-    // Requirement 4.5: no changes is a statement, not a silence — and the
+    // No changes is a statement, not a silence — and the
     // header is the plan's anchor alone (the templates agreement: coverage
     // never rides the header).
     // The upgrade document (accepted shape, 2026-08-03): deployment heading,
@@ -1143,7 +1142,7 @@ mod tests {
         );
     }
 
-    // Phase 6 checkpoint (task 6.7, in-crate half): the storage plan renders
+    // The storage plan renders
     // the Markdown target — declared behaviour in confidence voices with
     // citations, impacts per resource with consequences merged
     // permanent-first, and NO gap prose: the undeclared DSQL fields stay
@@ -1279,7 +1278,7 @@ mod tests {
         );
     }
 
-    // ---- Property suite (operator-explanation §Evidence, Properties 5, 6, 8, 11) ----
+    // ---- Property suite (Properties 5, 6, 8, 11) ----
     //
     // These bind the shipped renderer itself — the same `ExplanationReport`
     // the binary prints, binding lines included — so a copy change that leaks
@@ -1522,7 +1521,7 @@ mod tests {
         r
     }
 
-    // Causality Req 6.1–6.4/6.7 over the real-world reference: clauses on the
+    // Causality over the real-world reference: clauses on the
     // lines, the record-baseline provenance line, derived voices, dependants,
     // the chain, and `--json` carrying assessments, groups, and dependants.
     #[test]
@@ -1950,7 +1949,7 @@ mod tests {
 
         // Property 8 — not-determined slots make no claims. Evolved twice:
         // an undeclared field may appear as a *gap* (a SemanticsUndeclared
-        // uncertainty naming it), and the engine floor (Requirement 5.5) may
+        // uncertainty naming it), and the engine floor may
         // state unavailability/replacement for Replace and Delete kinds —
         // those are grounded in the kind, which is never Unknown. What can
         // never appear is a declaration-only consequence, and the

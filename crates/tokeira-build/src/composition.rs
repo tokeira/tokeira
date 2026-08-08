@@ -511,7 +511,7 @@ fn render_main(platform: &PlatformId, format: &DefinitionFormatId) -> String {
     let platform = serde_json::to_string(platform.as_str()).expect("platform ids serialize");
     let format = serde_json::to_string(format.as_str()).expect("format ids serialize");
     format!(
-        "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: {platform},\n    platform: selected_platform::provisioner,\n    expected_format: {format},\n    frontend: selected_frontend::frontend,\n);\n"
+        "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: {platform},\n    platform: selected_platform::platform,\n    expected_format: {format},\n    frontend: selected_frontend::frontend,\n);\n"
     )
 }
 
@@ -563,7 +563,7 @@ macro_rules! bound_provisioner_main {
         frontend: $frontend:path $(,)?
     ) => {
         fn main() {
-            let _ = ($platform, $format, $platform_factory($frontend()));
+            let _ = ($platform, $format, $platform_factory(), $frontend());
         }
     };
 }
@@ -574,7 +574,7 @@ macro_rules! bound_provisioner_main {
                 "platforms/alpha",
                 "alpha-platform",
                 "[package.metadata.tokeira.platform]\nid = \"alpha\"\nengine = \"0.1.0\"\ndefault = false\n",
-                "pub fn provisioner<T>(_frontend: T) {}\n",
+                "pub fn platform() {}\n",
             );
             package(
                 &root,
@@ -626,7 +626,7 @@ macro_rules! bound_provisioner_main {
         assert_eq!(first, second);
         assert_eq!(
             first.main_rs,
-            "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: \"alpha\",\n    platform: selected_platform::provisioner,\n    expected_format: \"tkd\",\n    frontend: selected_frontend::frontend,\n);\n"
+            "tokeira_provisioner_cli::bound_provisioner_main!(\n    expected_platform: \"alpha\",\n    platform: selected_platform::platform,\n    expected_format: \"tkd\",\n    frontend: selected_frontend::frontend,\n);\n"
         );
         let manifest: toml::Value = toml::from_str(&first.cargo_toml).expect("generated manifest");
         let dependencies = manifest

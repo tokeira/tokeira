@@ -1,4 +1,4 @@
-//! `tkp upgrade` — atomic ownership transfer, then apply B's plan (tasks 5.3 / 8.4).
+//! `tkp upgrade` — atomic ownership transfer, then apply B's plan.
 //!
 //! `upgrade` is the only verb that authoritatively advances the recorded engine
 //! identity. Its **first act is one atomic CAS commit** — flip the binding to the
@@ -11,8 +11,6 @@
 //! transfer and the close; state-schema migrations and multi-platform apply are
 //! follow-ons.
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::{
@@ -21,13 +19,16 @@ use tokeira_provisioner::{
 };
 use tokeira_state::DeploymentStore;
 
-use crate::{ProvisionerPlatform, envelope_store, init::running_integrity_manifest};
+use tokeira_platform::definition::DefinitionFrontend;
 
-pub(crate) async fn upgrade<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+use crate::{engine::Engine, envelope_store, init::running_integrity_manifest, platform::Admitted};
+
+pub(crate) async fn upgrade<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
     mode: tokeira_report::Mode,
 ) -> Result<()> {
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now()); // B
     let store = envelope_store(deployment_dir);
     let (mut envelope, mut version) = store
@@ -35,7 +36,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
-    // ── Operation-marker gate (task 19.4): a re-run of an interrupted
+    // ── Operation-marker gate: a re-run of an interrupted
     // upgrade RESUMES from the recorded phase — the transfer already
     // happened, the binding already names B, so the decision gate below
     // (which would now see B == B and refuse) is exactly what resume skips.
@@ -63,12 +64,11 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         // Idempotent remainder: drift gate, apply B's plan, record the audit
         // log, close the marker — the same tail the fresh path runs.
         check_baseline_drift(&envelope)?;
-        let outcome = platform
-            .infra_apply_with_artifacts(deployment_dir, None)
-            .await?;
+        let outcome = engine.apply(admitted, None).await?;
+        crate::persist_writeback(deployment_dir, &outcome.writeback)?;
         let applied = crate::change_log_entries(&outcome.changes);
         // B's creations join keys(S_B) − keys(S_A) — the rollback delete-set
-        // (task 19.3) — in the same save as the audit log.
+        // — in the same save as the audit log.
         envelope.record_post_checkpoint_changes(&applied);
         version = record_audit_log(store.as_ref(), &mut envelope, version, &applied).await?;
         envelope.close_operation();
@@ -77,11 +77,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
             .save(&envelope, &version)
             .await
             .context("failed to close the operation marker")?;
-        platform
-            .publish_inspection(deployment_dir)
-            .await
-            .context("upgrade is committed and recorded; inspection publication failed")?;
-        emit_upgrade_document(platform, deployment_dir, &envelope, &outcome, mode)?;
+        emit_upgrade_document(engine, admitted, &envelope, &outcome, mode)?;
         return Ok(());
     }
 
@@ -139,7 +135,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     // surfaced on the detail/JSON surface when `upgrade` migrates onto the
     // output contract — not narrated mid-ceremony.
 
-    // ── Advisory baseline gate (Req 4.7, task 19.2): the envelope heads must
+    // ── Advisory baseline gate: the envelope heads must
     // still be exactly [A final]'s — drift between the transfer and B's apply
     // means something else wrote state mid-upgrade. Refuse and surface;
     // `rollback` is the way out. (Provider-level live drift detection rides
@@ -147,13 +143,12 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
     check_baseline_drift(&envelope)?;
 
     // ── Apply B's plan (realized by the injected platform) ──
-    let outcome = platform
-        .infra_apply_with_artifacts(deployment_dir, None)
-        .await?;
+    let outcome = engine.apply(admitted, None).await?;
+    crate::persist_writeback(deployment_dir, &outcome.writeback)?;
     let applied = crate::change_log_entries(&outcome.changes);
 
-    // ── Record the ids-only audit change log in the open marker (19.2) and
-    // fold B's creations into the rollback delete-set (19.3), persisted
+    // ── Record the ids-only audit change log in the open marker and
+    // fold B's creations into the rollback delete-set, persisted
     // BEFORE the close: an interruption here leaves both the evidence and
     // the undo-set durable. ──
     envelope.record_post_checkpoint_changes(&applied);
@@ -165,11 +160,7 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to close the operation marker")?;
-    platform
-        .publish_inspection(deployment_dir)
-        .await
-        .context("upgrade is committed and recorded; inspection publication failed")?;
-    emit_upgrade_document(platform, deployment_dir, &envelope, &outcome, mode)?;
+    emit_upgrade_document(engine, admitted, &envelope, &outcome, mode)?;
     Ok(())
 }
 
@@ -179,14 +170,14 @@ pub(crate) async fn upgrade<P: ProvisionerPlatform>(
 /// narrative header is the applied narrative's own. No explanation artifact
 /// is retained here: upgrade re-applies the recorded revision, whose own
 /// apply's explanation stays authoritative for that revision.
-fn emit_upgrade_document<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+fn emit_upgrade_document<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
     envelope: &DeploymentStateEnvelope,
     outcome: &crate::AppliedOutcome,
     mode: tokeira_report::Mode,
 ) -> Result<()> {
-    let context = crate::explain_context(platform, deployment_dir, envelope, "upgrade");
+    let context = crate::explain_context(engine, admitted, envelope, "upgrade");
     let explanation =
         tokeira_explain::explain_applied(context, &crate::committed_changes(outcome), None);
     let report = crate::render::UpgradeReport { explanation };
@@ -194,7 +185,7 @@ fn emit_upgrade_document<P: ProvisionerPlatform>(
     Ok(())
 }
 
-/// The advisory baseline gate (Req 4.7, task 19.2): between the ownership
+/// The advisory baseline gate: between the ownership
 /// transfer and B's apply, the envelope heads must still be exactly what
 /// `[A final]` recorded — divergence means another writer touched state
 /// mid-upgrade (tampering, or an ungated older binary). Refuse and surface;
@@ -223,9 +214,9 @@ fn check_baseline_drift(envelope: &DeploymentStateEnvelope) -> Result<()> {
 }
 
 /// Persist the ids-only audit change log into the still-open marker
-/// (task 19.2): one save between B's apply and the close, so the evidence of
+///: one save between B's apply and the close, so the evidence of
 /// what B committed survives an interruption — visible to `describe` and the
-/// resume. Ids only, never before-images (Proposal 002); an empty apply
+/// resume. Ids only, never before-images; an empty apply
 /// records no log, but the phase still advances to `applied` (the resume
 /// waypoint).
 async fn record_audit_log(
@@ -254,7 +245,7 @@ async fn record_audit_log(
 /// (capturing the `[A final]` checkpoint — including A's integrity manifest,
 /// which rollback restores) and **re-record the integrity manifest for B**. The
 /// envelope's manifest must always describe the engine the binding names: the
-/// launcher's bound-class verification (`tkr`, task 9.1) checks the installed
+/// launcher's bound-class verification (`tkr`) checks the installed
 /// `tkp` against it, so a stale Day-0 manifest would permanently fail every
 /// post-upgrade bound launch.
 fn transfer_ownership(envelope: &mut DeploymentStateEnvelope, to: ProvenanceStamp) -> Result<()> {
@@ -270,13 +261,13 @@ fn transfer_ownership(envelope: &mut DeploymentStateEnvelope, to: ProvenanceStam
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestPlatform;
     use tokeira_provisioner::{BuildMode, DeploymentStateEnvelope};
 
     #[tokio::test]
     async fn upgrade_refuses_an_unstamped_deployment() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = upgrade(&engine, &admitted, tokeira_report::Mode::default())
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(err.to_string().contains("unstamped"), "unexpected: {err}");
@@ -302,7 +293,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = upgrade(&engine, &admitted, tokeira_report::Mode::default())
             .await
             .expect_err("versioned → dev refuses");
         assert!(err.to_string().contains("refused"), "unexpected: {err}");
@@ -365,7 +357,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        upgrade(&engine, &admitted, tokeira_report::Mode::default())
             .await
             .expect("the re-run resumes and completes");
 
@@ -385,7 +378,8 @@ mod tests {
         // tkp-side ceremony is unconditional; byte-level idempotency is the
         // launcher's gate (`tkr` compares candidate vs bound bytes and skips
         // the ceremony entirely when they match).
-        upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        upgrade(&engine, &admitted, tokeira_report::Mode::default())
             .await
             .expect("dev → dev proceeds as a refresh");
         let (after_refresh, _) = store.load().await.unwrap();
@@ -472,7 +466,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = upgrade(&engine, &admitted, tokeira_report::Mode::default())
             .await
             .expect_err("drift refuses the resume/apply");
         assert!(
@@ -503,7 +498,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = upgrade(&TestPlatform, tmp.path(), tokeira_report::Mode::default())
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = upgrade(&engine, &admitted, tokeira_report::Mode::default())
             .await
             .expect_err("a foreign marker refuses");
         assert!(

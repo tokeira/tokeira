@@ -260,9 +260,14 @@ impl<F: DefinitionFrontend> Engine<F> {
             .await
             .context("infrastructure apply failed")?;
         let display_by_id = engine.display_map(&composition)?;
+        // Writeback resolves against the state the apply just committed;
+        // the shell persists it (the engine returns, never writes files
+        // outside its stores).
+        let writeback = engine.collect_writeback();
         Ok(AppliedOutcome {
             changes,
             display_by_id,
+            writeback,
         })
     }
 
@@ -365,6 +370,56 @@ impl<F: DefinitionFrontend> Engine<F> {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Deploy verbs: the sibling family, reconciling the service set
+    // through the deploy engine against state/deploy. The set is the
+    // definition's service plane — empty until the plane split realizes
+    // service nodes — so today these verbs honestly reconcile nothing,
+    // and become real the moment `services()` fills.
+    // ------------------------------------------------------------------
+
+    /// Read-only service plan: which services would change, by desired
+    /// manifest hash against recorded runtime state. No substrate access —
+    /// the comparison is manifests against the recorded state — so no
+    /// probe gates it.
+    pub async fn deploy_plan(
+        &self,
+        admitted: &Admitted,
+    ) -> Result<Vec<tokeira_orchestrator::ServiceChange>> {
+        let execution = self.execution(admitted, None)?;
+        let mut deploy = self.open_deploy(admitted, &execution).await?;
+        deploy.plan().await.context("service plan failed")
+    }
+
+    /// Reconcile the service set to desired. Refuses on a provider issue —
+    /// applying manifests is substrate work.
+    pub async fn deploy_apply(
+        &self,
+        admitted: &Admitted,
+    ) -> Result<Vec<tokeira_orchestrator::ServiceChange>> {
+        let execution = self.execution(admitted, None)?;
+        self.refuse_on_issue(admitted).await?;
+        let mut deploy = self.open_deploy(admitted, &execution).await?;
+        deploy
+            .apply(&NoWorkloadApplier)
+            .await
+            .context("service apply failed")
+    }
+
+    async fn open_deploy(
+        &self,
+        admitted: &Admitted,
+        execution: &ExecutionState,
+    ) -> Result<tokeira_orchestrator::DeployEngine<DescribedDeployment>> {
+        let described = DescribedDeployment::new(
+            admitted.deployment_ref.clone(),
+            self.platform.infra_constructors(),
+        );
+        tokeira_orchestrator::DeployEngine::new(described, execution, &admitted.deployment_ref.dir)
+            .await
+            .context("failed to open the deploy engine")
+    }
+
     /// The mutating verbs' probe gate: a provider issue refuses the
     /// operation outright, in the platform's own words. The shell owns
     /// document rendering.
@@ -418,6 +473,27 @@ fn operation_selection(
             &iac::ModuleSelection::Only(vec![name.to_string()]),
             direction,
         )?),
+    }
+}
+
+/// The fail-closed workload applier: the declaration exports no service
+/// applier yet (the plane split delivers it beside the service realizers),
+/// and the service set is empty on this path — so a manifest reaching this
+/// impl is a programming error surfaced loudly, never a silent no-op.
+#[derive(Debug)]
+struct NoWorkloadApplier;
+
+#[async_trait::async_trait]
+impl tokeira_deploy_engine::Platform for NoWorkloadApplier {
+    async fn apply_manifests(
+        &self,
+        _manifests: &[serde_json::Value],
+    ) -> std::result::Result<usize, tokeira_deploy_engine::RuntimeError> {
+        Err(tokeira_deploy_engine::RuntimeError::Platform(
+            "this platform declares no workload applier; the service plane arrives with its \
+             realizers"
+                .to_string(),
+        ))
     }
 }
 

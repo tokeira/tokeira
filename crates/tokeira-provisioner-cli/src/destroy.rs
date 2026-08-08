@@ -1,4 +1,4 @@
-//! `tkp destroy` — gated teardown of the deployment's infrastructure (task 8.3).
+//! `tkp destroy` — gated teardown of the deployment's infrastructure.
 //!
 //! `destroy` is a mutating verb, so the binding gate runs **before any provider
 //! mutation** (versioned deployments refuse on a non-`Match` verdict; dev
@@ -11,23 +11,26 @@
 //! record that nothing is currently applied; `config_revision` is a property of
 //! the *configuration*, which the teardown does not change, so it is left as-is.
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
+use tokeira_platform::definition::DefinitionFrontend;
+
 use crate::{
-    ProvisionerPlatform, envelope_store,
+    engine::Engine,
+    envelope_store,
     gate::{GateOutcome, evaluate_gate},
+    platform::Admitted,
 };
 
-pub(crate) async fn destroy<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+pub(crate) async fn destroy<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
     module: Option<&str>,
     yes: bool,
 ) -> Result<()> {
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, version) = store
@@ -35,7 +38,7 @@ pub(crate) async fn destroy<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
-    // ── Operation-marker gate (task 19.4): an interrupted upgrade/rollback
+    // ── Operation-marker gate: an interrupted upgrade/rollback
     // is recovered by re-running THAT verb; everything else refuses. ──
     crate::marker::refuse_if_marked(&envelope, "destroy")?;
 
@@ -58,11 +61,11 @@ pub(crate) async fn destroy<P: ProvisionerPlatform>(
         );
     }
 
-    // ── Engine destroy (realized by the injected platform) ──
-    let removed = platform.infra_destroy(deployment_dir, module).await?;
+    // ── Engine destroy ──
+    let removed = engine.destroy(admitted, module).await?;
     println!(
         "[{}] infra destroy: {removed} resource(s) removed",
-        platform.label(deployment_dir)
+        engine.platform().id()
     );
 
     // ── Record the teardown ──
@@ -86,7 +89,6 @@ pub(crate) async fn destroy<P: ProvisionerPlatform>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestPlatform;
     use tokeira_provisioner::DeploymentStateEnvelope;
 
     #[tokio::test]
@@ -102,7 +104,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = destroy(&TestPlatform, tmp.path(), None, false)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = destroy(&engine, &admitted, None, false)
             .await
             .expect_err("destroy without --yes refuses");
         assert!(
@@ -115,7 +118,8 @@ mod tests {
     async fn destroy_refuses_an_unstamped_deployment() {
         // No binding → Unknown → gate refuses before the confirmation guard.
         let tmp = tempfile::tempdir().unwrap();
-        let err = destroy(&TestPlatform, tmp.path(), None, true)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = destroy(&engine, &admitted, None, true)
             .await
             .expect_err("an unstamped deployment refuses");
         assert!(
@@ -137,7 +141,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        destroy(&TestPlatform, tmp.path(), None, true)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        destroy(&engine, &admitted, None, true)
             .await
             .expect("local destroy succeeds");
 

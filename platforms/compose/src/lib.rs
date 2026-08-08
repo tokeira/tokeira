@@ -47,7 +47,7 @@
 pub mod observability;
 
 use tokeira_aws::kinds::{DsqlCluster, DynamoDbTable};
-use tokeira_provisioner_cli::{PlatformDeclaration, kind};
+use tokeira_platform::declaration::{PlatformDeclaration, kind};
 
 /// The platform entry point: the one declaration `tkp` invokes.
 ///

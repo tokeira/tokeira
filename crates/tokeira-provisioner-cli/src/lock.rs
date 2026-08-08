@@ -1,9 +1,9 @@
-//! The remote operation lock around mutating verbs (tasks 12.1/12.2, Req 11).
+//! The remote operation lock around mutating verbs.
 //!
 //! Every mutating `tkp` command acquires the deployment's operation lock before
 //! any provider-side work and releases it on completion, so two provisioners
 //! cannot make conflicting changes. `rollback` holds **one continuous** lock
-//! across its whole B-delete → re-pin → A-reconcile sequence (12.2), so no writer
+//! across its whole B-delete → re-pin → A-reconcile sequence, so no writer
 //! interleaves at the handoff.
 
 use std::{path::Path, process, time::Duration};
@@ -32,7 +32,7 @@ fn operation_lock(deployment_dir: &Path) -> OperationLock {
 ///
 /// - **Standalone** (the default): acquire before any work, renew on an
 ///   interval, release afterwards. Refuses if another provisioner holds it.
-/// - **Adopted** (task 19.3): when the orchestrator's env names a lease
+/// - **Adopted**: when the orchestrator's env names a lease
 ///   ([`ORCHESTRATED_LOCK_HOLDER_ENV`]/[`ORCHESTRATED_LOCK_TOKEN_ENV`]),
 ///   join it — renew around the body, but never acquire and never release:
 ///   the orchestrator owns the lease lifecycle, so the lock is held

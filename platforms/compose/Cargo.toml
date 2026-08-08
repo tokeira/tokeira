@@ -31,7 +31,6 @@ default-format = "tkd"
 [dependencies]
 tokeira-compose = { path = "../../crates/tokeira-compose" }
 tokeira-aws = { workspace = true }
-tokeira-provisioner-cli = { workspace = true }
 # The platform-owned observability kind's machinery.
 tokeira-platform = { workspace = true }
 tokeira-iac = { workspace = true }
@@ -45,6 +44,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tokeira-observability = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

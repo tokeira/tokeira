@@ -962,6 +962,12 @@ impl ComposePlatform {
         Ok(())
     }
 
+    /// The recorded spec for one service, from the deployment's compose
+    /// state — the container configuration a scale-up replicates.
+    pub fn recorded_service(&self, name: &str) -> Result<Option<ComposeService>, ComposeError> {
+        Ok(self.load_compose_state()?.services.get(name).cloned())
+    }
+
     fn load_compose_state(&self) -> Result<ComposeFile, ComposeError> {
         if !self.compose_file.exists() {
             return Ok(ComposeFile::default());

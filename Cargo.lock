@@ -8527,8 +8527,8 @@ dependencies = [
  "tokeira-aws",
  "tokeira-compose",
  "tokeira-iac",
+ "tokeira-observability",
  "tokeira-platform",
- "tokeira-provisioner-cli",
  "tracing",
 ]
 
@@ -8673,6 +8673,7 @@ dependencies = [
  "tokeira-config",
  "tokeira-deploy-engine",
  "tokeira-iac",
+ "tokeira-observability",
  "tokeira-orchestrator",
  "tokeira-state",
  "tokio",
@@ -8831,7 +8832,6 @@ dependencies = [
  "tokeira-deploy-engine",
  "tokeira-iac",
  "tokeira-orchestrator",
- "tokeira-provisioner-cli",
  "tokeira-state",
  "tokio",
 ]

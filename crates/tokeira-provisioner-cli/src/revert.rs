@@ -1,9 +1,9 @@
-//! `tkp revert --to <revision>` — config-revision revert (task 14.3, Req 13.3).
+//! `tkp revert --to <revision>` — config-revision revert.
 //!
 //! Reverting a configuration is a **same-engine `apply` of a prior recorded
 //! config revision** — deliberately *not* an `upgrade` (the engine identity is
 //! unchanged; `source_tree_hash` does not move) and *not* a two-binary
-//! `rollback` (Proposal 002; no `[A final]` checkpoint, no delete-only pass). The
+//! `rollback` (no `[A final]` checkpoint, no delete-only pass). The
 //! retained revision's config source is restored into the live config file and
 //! the ordinary gated apply reconciles the live footprint toward it.
 //!
@@ -12,24 +12,27 @@
 //! rewinding the counter. So `describe`'s history stays append-only and a revert
 //! is itself revertable.
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokeira_provisioner::ProvenanceStamp;
 
+use tokeira_platform::definition::DefinitionFrontend;
+
 use crate::{
-    ProvisionerPlatform,
     apply::config_ref,
-    config_history, envelope_store,
+    config_history,
+    engine::Engine,
+    envelope_store,
     gate::{GateOutcome, evaluate_gate},
+    platform::Admitted,
 };
 
-pub(crate) async fn revert<P: ProvisionerPlatform>(
-    platform: &P,
-    deployment_dir: &Path,
+pub(crate) async fn revert<F: DefinitionFrontend>(
+    engine: &Engine<F>,
+    admitted: &Admitted,
     to_revision: u64,
 ) -> Result<()> {
+    let deployment_dir = admitted.deployment_ref.dir.as_path();
     let running = ProvenanceStamp::current(Utc::now());
     let store = envelope_store(deployment_dir);
     let (mut envelope, version) = store
@@ -37,7 +40,7 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
         .await
         .context("failed to load the deployment envelope")?;
 
-    // ── Operation-marker gate (task 19.4): an interrupted upgrade/rollback
+    // ── Operation-marker gate: an interrupted upgrade/rollback
     // is recovered by re-running THAT verb; everything else refuses. ──
     crate::marker::refuse_if_marked(&envelope, "revert")?;
 
@@ -53,7 +56,7 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
     }
 
     // ── Target must be a prior, retained revision ──
-    let config_source = platform.config_source(deployment_dir)?;
+    let config_source = admitted.config_source();
     if to_revision >= envelope.config_revision {
         anyhow::bail!(
             "cannot revert to config revision {to_revision}: the current revision is {} \
@@ -76,18 +79,15 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
         config_history::config_file(deployment_dir, &config_source).display()
     );
 
-    let applied = crate::change_log_entries(
-        &platform
-            .infra_apply_with_artifacts(deployment_dir, None)
-            .await?
-            .changes,
-    );
+    let outcome = engine.apply(admitted, None).await?;
+    crate::persist_writeback(deployment_dir, &outcome.writeback)?;
+    let applied = crate::change_log_entries(&outcome.changes);
     // Under an open rollback checkpoint, creations join keys(S_B) − keys(S_A)
-    // — the set the rollback B-delete pass consumes (task 19.3).
+    // — the set the rollback B-delete pass consumes.
     envelope.record_post_checkpoint_changes(&applied);
     println!(
         "[{}] revert reconcile: {}",
-        platform.label(deployment_dir),
+        engine.platform().id(),
         tokeira_report::counted(applied.len(), "change")
     );
 
@@ -102,10 +102,6 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
         .save(&envelope, &version)
         .await
         .context("failed to persist the deployment envelope after revert")?;
-    platform
-        .publish_inspection(deployment_dir)
-        .await
-        .context("revert reconcile is committed and recorded; inspection publication failed")?;
     println!(
         "envelope: config_revision now {} (content of revision {to_revision})",
         envelope.config_revision
@@ -116,7 +112,6 @@ pub(crate) async fn revert<P: ProvisionerPlatform>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestPlatform;
     use tokeira_provisioner::DeploymentStateEnvelope;
 
     #[tokio::test]
@@ -132,7 +127,8 @@ mod tests {
         store.save(&env, &v).await.unwrap();
 
         // Reverting to the current (or a future) revision is rejected.
-        let err = revert(&TestPlatform, tmp.path(), 2)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = revert(&engine, &admitted, 2)
             .await
             .expect_err("revert to current revision refuses");
         assert!(err.to_string().contains("prior"), "unexpected: {err}");
@@ -150,7 +146,8 @@ mod tests {
         let (_, v) = store.load().await.unwrap();
         store.save(&env, &v).await.unwrap();
 
-        let err = revert(&TestPlatform, tmp.path(), 1)
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        let err = revert(&engine, &admitted, 1)
             .await
             .expect_err("no snapshot for revision 1 → refuse");
         assert!(
@@ -165,19 +162,15 @@ mod tests {
         // apply builds two retained revisions with distinct config, then revert to
         // the first restores its config and advances the counter forward.
         let tmp = tempfile::tempdir().unwrap();
-        crate::init::init(&TestPlatform, tmp.path())
-            .await
-            .expect("init");
+        let (engine, admitted) = crate::testkit::engine(tmp.path());
+        crate::init::init(&admitted).await.expect("init");
 
-        // Revision 1: a deployment.toml with project "one".
-        std::fs::write(
-            tmp.path().join("deployment.toml"),
-            "project_name = \"one\"\n",
-        )
-        .unwrap();
+        // Revision 1: a definition with marker content "one" (the stub
+        // frontend ignores the bytes; retention copies them).
+        std::fs::write(tmp.path().join("definition.tkd"), "// one\n").unwrap();
         crate::apply::apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             tokeira_report::Mode::resolve(false, false),
@@ -186,15 +179,11 @@ mod tests {
         .await
         .expect("apply rev 1");
 
-        // Revision 2: change the config source.
-        std::fs::write(
-            tmp.path().join("deployment.toml"),
-            "project_name = \"two\"\n",
-        )
-        .unwrap();
+        // Revision 2: change the recorded source.
+        std::fs::write(tmp.path().join("definition.tkd"), "// two\n").unwrap();
         crate::apply::apply(
-            &TestPlatform,
-            tmp.path(),
+            &engine,
+            &admitted,
             None,
             false,
             tokeira_report::Mode::resolve(false, false),
@@ -206,12 +195,12 @@ mod tests {
         let (before, _) = envelope_store(tmp.path()).load().await.unwrap();
         assert_eq!(before.config_revision, 2);
 
-        revert(&TestPlatform, tmp.path(), 1)
+        revert(&engine, &admitted, 1)
             .await
             .expect("revert to revision 1");
 
         // The live config source now holds revision 1's content...
-        let restored = std::fs::read_to_string(tmp.path().join("deployment.toml")).unwrap();
+        let restored = std::fs::read_to_string(tmp.path().join("definition.tkd")).unwrap();
         assert!(
             restored.contains("one"),
             "reverted to revision 1's config: {restored}"

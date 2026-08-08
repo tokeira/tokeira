@@ -1,11 +1,11 @@
 //! The `tkp` command surface and dispatch.
 //!
-//! [`run`] is the whole binary: a per-platform `tkp` parses the CLI here and
-//! dispatches every verb through the shell, injecting its
-//! [`ProvisionerPlatform`] for the resource realization. Read-only verbs never
-//! gate or lock; mutating verbs run under the deployment's operation lock
-//! (Req 11), with `rollback` holding one continuous lock across its whole
-//! sequence (12.2).
+//! [`run`] is the whole binary: a per-platform `tkp` parses the CLI here,
+//! admits the deployment once at this boundary, and dispatches every verb
+//! through the shell over the bound [`Engine`]. Read-only verbs never gate
+//! or lock; mutating verbs run under the deployment's operation lock
+//!, with `rollback` holding one continuous lock across its whole
+//! sequence.
 
 use std::path::PathBuf;
 
@@ -14,9 +14,11 @@ use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use tokeira_orchestrator::DefinitionFormatId;
 
+use tokeira_platform::definition::DefinitionFrontend;
+
 use crate::{
-    ProvisionerPlatform, apply, definition, deploy, describe, destroy, init, lock, plan, revert,
-    rollback, scale, upgrade,
+    apply, definition, deploy, describe, destroy, engine::Engine, init, lock, plan,
+    platform::Admitted, revert, rollback, scale, upgrade,
 };
 
 #[derive(Parser)]
@@ -42,7 +44,7 @@ struct Cli {
 enum Command {
     /// Day-0 mandatory versioning: write the first provenance stamp + integrity
     /// manifest before any resource create. Internal — an inception step of
-    /// `tkr deployment create` (Req 6.5), not an operator verb, so it is hidden
+    /// `tkr deployment create`, not an operator verb, so it is hidden
     /// from help.
     #[command(hide = true)]
     Init(LifecycleArgs),
@@ -57,7 +59,7 @@ enum Command {
     #[command(subcommand)]
     Config(ConfigCommand),
     /// Substrate — the infrastructure the deployment stands on. Namespaced to
-    /// mirror `tkr` so forwarding is a transparent pass-through (Req 7.3).
+    /// mirror `tkr` so forwarding is a transparent pass-through.
     #[command(subcommand)]
     Infra(InfraCommand),
     /// Workload — the services that run on the substrate. Conditionally
@@ -147,7 +149,7 @@ struct RollbackArgs {
     /// Deployment directory holding the state envelope.
     #[arg(long)]
     deployment_dir: PathBuf,
-    /// Two-binary orchestration (task 19.3): stop after B's delete-only pass
+    /// Two-binary orchestration: stop after B's delete-only pass
     /// and the re-pin commit, leaving the rollback marker open — the
     /// orchestrator relaunches the retained A, whose `rollback` re-run
     /// resumes at the reconcile. Internal — set by `tkr`, hidden from help.
@@ -279,79 +281,88 @@ struct RevertArgs {
     to: u64,
 }
 
-/// Parse the CLI and run the selected verb with `platform` supplying the
-/// resource realization. This is the per-platform binary's entire `main`.
+/// Parse the CLI and run the selected verb over the bound engine. This is
+/// the per-platform binary's entire `main`.
 ///
 /// The exit code is part of the output contract: a verb refused by a
 /// platform issue has already emitted the document that says everything, so
 /// that refusal becomes a bare non-zero exit — never an error line
 /// restating the report. Every other error propagates for the binary's
 /// error reporting.
-pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::ExitCode> {
+pub async fn run<F: DefinitionFrontend>(engine: Engine<F>) -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
-    if let Some(deployment_dir) = cli.command.admission_dir() {
-        platform.admit_deployment(deployment_dir)?;
-    }
+    // Admission once per command, at this boundary: identity is never
+    // re-derived, metadata never re-read, the executable never re-verified
+    // between the verbs one command drives. The authoring-mode definition
+    // check is the one admission-free path — no deployment exists to admit.
+    let admitted = match cli.command.admission_dir() {
+        Some(dir) => Some(engine.platform().admit_deployment(dir)?),
+        None => None,
+    };
+    let admitted = admitted.as_ref();
     // One resolution of the output contract's global flags; the collapse rule
     // (`--json` is depth-blind) is enforced inside `Mode::resolve`.
     let mode = tokeira_report::Mode::resolve(cli.json, cli.detail);
     let outcome: Result<()> = match cli.command {
         // Read-only: never gates, never locks.
-        Command::Describe(args) => {
-            describe::describe(&platform, &args.deployment_dir, cli.json, cli.detail).await
+        Command::Describe(_) => {
+            describe::describe(&engine, require(admitted), cli.json, cli.detail).await
         }
         Command::Definition(DefinitionCommand::Check(args)) => {
             definition::check(
-                &platform,
-                &args.deployment_dir,
+                &engine,
+                admitted,
                 args.definition.as_deref(),
                 args.format.as_ref(),
                 mode,
             )
             .await
         }
-        Command::Config(ConfigCommand::Seed(args)) => {
-            crate::config_seed::seed(&platform, &args.deployment_dir).await
+        Command::Config(ConfigCommand::Seed(_)) => crate::config_seed::seed(require(admitted)),
+        Command::Logs(args) => {
+            let Some(ops) = engine.platform().ops() else {
+                anyhow::bail!("not applicable: this platform declares no ops surface");
+            };
+            let mut stream = ops
+                .log_stream(
+                    &require(admitted).deployment_ref,
+                    &args.service,
+                    args.follow,
+                    args.tail,
+                )
+                .await?;
+            while let Some(line) = stream.next().await {
+                println!("{}", line?);
+            }
+            Ok(())
         }
-        Command::Logs(args) => match platform
-            .log_stream(&args.deployment_dir, &args.service, args.follow, args.tail)
-            .await?
-        {
-            crate::Realization::Realized(mut stream) => {
-                while let Some(line) = stream.next().await {
-                    println!("{}", line?);
+        Command::PortMappings(args) => {
+            let Some(ops) = engine.platform().ops() else {
+                anyhow::bail!("not applicable: this platform declares no ops surface");
+            };
+            let mappings = ops
+                .port_mappings(&require(admitted).deployment_ref, &args.service)
+                .await?;
+            if mappings.is_empty() {
+                println!("no port mappings for service {}", args.service);
+            } else {
+                for mapping in mappings {
+                    println!(
+                        "{}:{} -> {}:{}/{}",
+                        mapping.host_addr,
+                        mapping.host_port,
+                        args.service,
+                        mapping.container_port,
+                        mapping.protocol
+                    );
                 }
-                Ok(())
             }
-            crate::Realization::NotApplicable { reason } => anyhow::bail!(reason),
-        },
-        Command::PortMappings(args) => match platform
-            .port_mappings(&args.deployment_dir, &args.service)
-            .await?
-        {
-            crate::Realization::Realized(mappings) => {
-                if mappings.is_empty() {
-                    println!("no port mappings for service {}", args.service);
-                } else {
-                    for mapping in mappings {
-                        println!(
-                            "{}:{} -> {}:{}/{}",
-                            mapping.host_addr,
-                            mapping.host_port,
-                            args.service,
-                            mapping.container_port,
-                            mapping.protocol
-                        );
-                    }
-                }
-                Ok(())
-            }
-            crate::Realization::NotApplicable { reason } => anyhow::bail!(reason),
-        },
+            Ok(())
+        }
         Command::Infra(InfraCommand::Plan(args)) => {
             plan::plan(
-                &platform,
-                &args.deployment_dir,
+                &engine,
+                require(admitted),
                 args.module.as_deref(),
                 mode,
                 args.explanation.as_deref(),
@@ -365,28 +376,31 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
                 anyhow::bail!("`deploy plan` takes no `--module`; module filters are infra verbs");
             }
             deploy::deploy_plan(
-                &platform,
-                &args.deployment_dir,
+                &engine,
+                require(admitted),
                 mode,
                 args.explanation.as_deref(),
             )
             .await
         }
-        // Mutating verbs run under the deployment's operation lock (Req 11).
-        // `rollback` holds one continuous lock across its whole sequence (12.2).
-        Command::Init(args) => {
-            let dir = args.deployment_dir;
-            lock::with_operation_lock(&dir, "init", || init::init(&platform, &dir)).await
+        // Mutating verbs run under the deployment's operation lock.
+        // `rollback` holds one continuous lock across its whole sequence.
+        Command::Init(_) => {
+            let admitted = require(admitted);
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "init", || {
+                init::init(admitted)
+            })
+            .await
         }
         Command::Infra(InfraCommand::Apply(args)) => {
-            let dir = args.deployment_dir;
+            let admitted = require(admitted);
             let yes = args.yes;
             let module = args.module;
             let explanation = args.explanation;
-            lock::with_operation_lock(&dir, "apply", || {
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "apply", || {
                 apply::apply(
-                    &platform,
-                    &dir,
+                    &engine,
+                    admitted,
                     module.as_deref(),
                     yes,
                     mode,
@@ -396,11 +410,11 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
             .await
         }
         Command::Infra(InfraCommand::Destroy(args)) => {
-            let dir = args.deployment_dir;
+            let admitted = require(admitted);
             let yes = args.yes;
             let module = args.module;
-            lock::with_operation_lock(&dir, "destroy", || {
-                destroy::destroy(&platform, &dir, module.as_deref(), yes)
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "destroy", || {
+                destroy::destroy(&engine, admitted, module.as_deref(), yes)
             })
             .await
         }
@@ -409,39 +423,54 @@ pub async fn run<P: ProvisionerPlatform>(platform: P) -> Result<std::process::Ex
             if args.module.is_some() {
                 anyhow::bail!("`deploy apply` takes no `--module`; module filters are infra verbs");
             }
-            let dir = args.deployment_dir;
+            let admitted = require(admitted);
             let yes = args.yes;
             let explanation = args.explanation;
-            lock::with_operation_lock(&dir, "deploy-apply", || {
-                deploy::deploy_apply(&platform, &dir, yes, mode, explanation.as_deref())
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "deploy-apply", || {
+                deploy::deploy_apply(&engine, admitted, yes, mode, explanation.as_deref())
             })
             .await
         }
         Command::Scale(args) => {
-            let dir = args.deployment_dir;
+            let admitted = require(admitted);
             let specs = args.specs;
-            lock::with_operation_lock(&dir, "scale", || scale::scale(&platform, &dir, &specs)).await
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "scale", || {
+                scale::scale(&engine, admitted, &specs)
+            })
+            .await
         }
         Command::Revert(args) => {
-            let dir = args.deployment_dir;
+            let admitted = require(admitted);
             let to = args.to;
-            lock::with_operation_lock(&dir, "revert", || revert::revert(&platform, &dir, to)).await
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "revert", || {
+                revert::revert(&engine, admitted, to)
+            })
+            .await
         }
-        Command::Upgrade(args) => {
-            let dir = args.deployment_dir;
-            lock::with_operation_lock(&dir, "upgrade", || upgrade::upgrade(&platform, &dir, mode))
-                .await
+        Command::Upgrade(_) => {
+            let admitted = require(admitted);
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "upgrade", || {
+                upgrade::upgrade(&engine, admitted, mode)
+            })
+            .await
         }
         Command::Rollback(args) => {
-            let dir = args.deployment_dir;
+            let admitted = require(admitted);
             let handoff = args.handoff;
-            lock::with_operation_lock(&dir, "rollback", || {
-                rollback::rollback(&platform, &dir, handoff)
+            lock::with_operation_lock(&admitted.deployment_ref.dir, "rollback", || {
+                rollback::rollback(&engine, admitted, handoff)
             })
             .await
         }
     };
     exit_status(outcome)
+}
+
+/// The admission invariant, stated once: every deployment verb's
+/// `admission_dir` arm covers it, so absence here is a programming error,
+/// never an operator input.
+fn require(admitted: Option<&Admitted>) -> &Admitted {
+    admitted.expect("admission precedes every deployment verb")
 }
 
 /// Collapse the typed post-report platform refusal to a bare process status.
